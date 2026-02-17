@@ -159,7 +159,69 @@ type
 - [ ] Test failover scenarios
 - [ ] Backup strategy for `dataDir`
 
-### 12. Monitoring Metrics
+### 12. P2P Time Synchronization
+
+Fractio implements a decentralized time synchronization protocol to generate globally unique transaction IDs without requiring NTP or a central time server.
+
+**Purpose:**
+- Provide monotonically increasing timestamps for MVCC across nodes
+- Ensure transaction IDs are unique cluster-wide
+- Maintain sub-millisecond clock drift between nodes
+
+**Algorithm Details:**
+- Each node maintains offsets to multiple peers via NTP-style exchange
+- Four timestamps per exchange: t1 (send), t2 (receive), t3 (response send), t4 (response receive)
+- Offset calculation: `((t2 - t1) + (t3 - t4)) / 2`
+- Delay calculation: `(t4 - t1) - (t3 - t2)` (discard if >100ms)
+- Outlier rejection: measurements beyond 2σ from mean are filtered
+- Consensus: weighted median of remaining offsets (weight = confidence × peer weight)
+
+**Transaction ID Format:**
+- Synchronized (preferred): `[42-bit time(ms)][10-bit nodeId][12-bit counter]`
+  - Time component: milliseconds since Unix epoch, wraps after ~139,000 years
+  - Node ID: assigned via consistent hashing ring (10-bit space = 1024 nodes)
+  - Counter: 4096 IDs per millisecond per node (12-bit)
+- Unsynchronized fallback: `[16-bit nodeId][48-bit local counter]`
+  - Guarantees uniqueness even with no consensus
+
+**Performance Characteristics:**
+- Single sync tick: O(N) where N = number of peers (typically 3-10 for fast consensus)
+- Tested scalability: 200 peers × 3 ticks = ~1.2ms runtime (in-memory simulation)
+- Memory footprint: ~1KB per peer (stores recent offset history)
+- Network overhead: ~500 bytes per peer per tick (would be ~100KB for 200 peers)
+
+**Configuration Constants:**
+- `DEFAULT_SYNC_INTERVAL = 1_000_000_000 ns` (1 second between ticks)
+- `REQUEST_TIMEOUT_NS = 100_000_000 ns` (100ms max round-trip)
+- `MAX_HISTORY_SIZE = 100` (ring buffer for statistical filtering)
+- `OUTLIER_STDDEV_FACTOR = 2.0` (filter measurements 2σ from mean)
+- `MIN_PEERS_FOR_CONSENSUS = 2` (minimum peers to establish consensus)
+- `MAX_CLOCK_DRIFT_NS = 1_000_000 ns` (1ms drift warning threshold)
+
+**Integration with Transaction Manager:**
+- `TransactionManager.beginTransaction()` calls `timeSync.getTransactionID()`
+- `TimestampProvider` should use `timeSync.getSynchronizedTime()` for MVCC timestamps
+- `timeSync.tick()` should be invoked by an external scheduler (e.g., timer thread)
+
+**Testing Strategy:**
+- Unit tests verify offset calculation, filtering, consensus, and ID generation
+- Drift test: 5 ticks with 3 peers achieves ~0ns drift in symmetric simulation
+- Accuracy test: consensus error ~28µs vs naive average error ~677µs (with outlier)
+- Scalability test: 200 peers, 3 ticks completes in < 2ms, offset < 1ms
+
+**Known Limitations (Pre-Production):**
+- `syncRound` uses simulated network delays; real RPC not implemented
+- No network messaging layer (`network/` module pending)
+- No peer weight configuration (all peers equal weight currently)
+- No network fault injection testing
+
+**Next Steps:**
+- Implement real RPC messaging in `src/fractio/network/`
+- Add heartbeat and peer failure detection
+- Persist offset history across restarts for faster convergence
+- Support dynamic peer configuration updates
+
+### 13. Monitoring Metrics
 
 - `transactions_active`: Number of active transactions
 - `transactions_committed`: Total committed
@@ -170,15 +232,17 @@ type
 - `raft_leader`: Current leader ID (empty if none)
 - `network_bytes_in/out`: Network traffic
 - `gc_pause_seconds`: GC pause time
+- `timesync_drift_ns`: Current clock drift from consensus (nanoseconds)
+- `timesync_state`: Current sync state (uninitialized, syncing, synchronized, failed)
 
-### 13. Upgrade Path
+### 14. Upgrade Path
 
 1. Add new nodes with higher version
 2. Rebalance shards gradually
 3. Decommission old nodes after all shards moved
 4. No downtime if replicationFactor maintained
 
-### 14. Glossary
+### 15. Glossary
 
 - **MVCC**: Multi-Version Concurrency Control
 - **WAL**: Write-Ahead Log (not yet implemented)
@@ -187,7 +251,9 @@ type
 - **Snapshot**: Consistent view of database at point in time
 - **Primary**: Leader node for a shard
 - **Secondary**: Follower node replicating from primary
+- **NTP**: Network Time Protocol (inspiration for offset calculation)
+- **Weighted median**: Consensus method robust to outliers
 
 ---
 
-**Last updated**: Initial project setup
+**Last updated**: Added P2P time synchronization documentation (2026-02-17)
