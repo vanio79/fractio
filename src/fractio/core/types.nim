@@ -3,13 +3,15 @@
 
 import tables
 import sets
-import atomics
 import times
 
 type
   # Basic data types
   DataType* = enum
     dtInt, dtFloat, dtString, dtBool, dtDate, dtDateTime, dtBytes
+
+  Timestamp* = int64
+    ## Nanosecond-precision Unix timestamp
 
   Constraint* = object
     nullable*: bool
@@ -106,7 +108,7 @@ type
     load*: int
 
   NodeRole* = enum
-     nrCoordinator, nrPrimary, nrSecondary, nrClient
+    nrCoordinator, nrPrimary, nrSecondary, nrClient
 
 # Helper templates for safe type conversions
 template int64Value*(v: ValueRef): int64 =
