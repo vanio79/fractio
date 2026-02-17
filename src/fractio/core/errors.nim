@@ -19,7 +19,7 @@ type
     fekPermission,    # Permission denied
     fekNotImplemented # Not implemented
 
-  FractioError* = object
+  FractioError* = ref object of Exception
     kind*: FractioErrorKind
     message*: string
     code*: int
@@ -43,7 +43,8 @@ const
 
 proc newError*(kind: FractioErrorKind, message: string,
     context: string = ""): FractioError =
-  FractioError(kind: kind, message: message, code: ErrorCodes[kind],
+  let code = ErrorCodes.getOrDefault(kind, 0)
+  FractioError(kind: kind, message: message, code: code,
       context: context)
 
 proc isError*(err: FractioError): bool =

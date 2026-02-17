@@ -231,13 +231,23 @@ proc setVotedFor*(self: RaftLog, nodeId: uint64) {.raises: [].} =
   release(self.lock)
 
 proc getLastLogIndex*(self: RaftLog): uint64 {.raises: [].} =
+  ## Get the last log index, which is the maximum of the highest entry index
+  ## and the snapshot index (if any). Reflects the logical end of the log.
   acquire(self.lock)
-  result = self.lastIndex
+  if self.lastIndex > self.snapshotIndex:
+    result = self.lastIndex
+  else:
+    result = self.snapshotIndex
   release(self.lock)
 
 proc getLastLogTerm*(self: RaftLog): uint64 {.raises: [].} =
+  ## Get the term of the last log entry. If the log is compacted to a snapshot,
+  ## returns the snapshot's last term.
   acquire(self.lock)
-  result = self.lastTerm
+  if self.lastIndex > self.snapshotIndex:
+    result = self.lastTerm
+  else:
+    result = self.snapshotTerm
   release(self.lock)
 
 proc getCommitIndex*(self: RaftLog): uint64 {.raises: [].} =

@@ -93,3 +93,7 @@ type
       appendEntriesReply*: AppendEntriesReply
     of rmInstallSnapshot:
       installSnapshot*: InstallSnapshotArgs
+
+  # Transport sends messages to peers.
+  RaftTransport* {.inheritable.} = ref object
+    send*: proc(dest: NodeId, msg: RaftMessage) {.raises: [FractioError].}
