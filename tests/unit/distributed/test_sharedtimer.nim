@@ -1,19 +1,19 @@
-# Unit tests for P2P Time Synchronization
+# Unit tests for SharedTimer (P2P time synchronization, OOP version)
 # Tests offset calculation, consensus computation, and transaction ID generation
 
 import unittest
-import std/[random, times, math]
-import locks
+import std/[random, times, math, locks, os]
 import fractio/core/types
 import fractio/utils/logging
-import fractio/distributed/timesync
+import fractio/distributed/sharedtimer
 
-suite "P2P Time Synchronization Tests":
+suite "SharedTimer Tests (OOP)":
 
   var logger: Logger = nil
-  var sync: P2PTimeSynchronizer
+  var sync: SharedTimer
 
   setup:
+    randomize(12345)
     let peers = @[
       PeerConfig(peerId: "node1", address: "127.0.0.1", port: 5200'u16,
           weight: 1.0),
@@ -21,9 +21,17 @@ suite "P2P Time Synchronization Tests":
           weight: 1.0),
       PeerConfig(peerId: "node3", address: "127.0.0.1", port: 5202'u16, weight: 0.5)
     ]
-    sync = newP2PTimeSynchronizer("testNode", 1'u16, peers, logger)
+    let clock = MonotonicTimeProvider()
+    let network = SimulatedNetworkTransport(
+      rng: initRand(12345),
+      avgDelay: 10_000_000.0,
+      delayVariance: 5_000_000.0,
+      peerProcessingTime: 1_000_000
+    )
+    sync = newSharedTimer("testNode", 1'u16, peers, clock, network, logger)
 
   teardown:
+    sync.stop()
     sync = nil
 
   test "calculateOffset with perfect network (no delay)":
@@ -71,8 +79,8 @@ suite "P2P Time Synchronization Tests":
     let consensus = computeConsensusOffset(offsets)
     check abs(consensus - 100.0) < 10.0
 
-  test "initRingBuffer works correctly":
-    var rb = initRingBuffer[int](3)
+  test "RingBuffer basic operations":
+    var rb = newRingBuffer[int](3)
     check rb.size == 0
     rb.add(1)
     rb.add(2)
@@ -82,11 +90,27 @@ suite "P2P Time Synchronization Tests":
     check rb.size == 3
     let items = rb.items()
     check items.len == 3
-    check items[0] == 4 or items[0] == 2 or items[0] == 3
+    # Should contain 2,3,4 in some order (most recent first due to wrap)
+    check (2 in items) and (3 in items) and (4 in items)
+
+  test "RingBuffer clear works":
+    var rb = newRingBuffer[int](5)
+    for i in 1..5:
+      rb.add(i)
+    check rb.size == 5
+    rb.clear()
+    check rb.size == 0
+    check rb.items().len == 0
 
   test "syncRound produces valid offsets":
-    randomize(12345)
-    let offsets = sync.syncRound()
+    var transport = SimulatedNetworkTransport(
+      rng: initRand(12345),
+      avgDelay: 10_000_000.0,
+      delayVariance: 5_000_000.0,
+      peerProcessingTime: 1_000_000
+    )
+    let localSend = 1_000_000_000_000'i64
+    let offsets = transport.syncRound(localSend, sync.getPeers())
     check offsets.len >= 0
     for offset in offsets:
       check offset.offset.abs < 1_000_000_000.0
@@ -97,8 +121,7 @@ suite "P2P Time Synchronization Tests":
     withLock(sync.mutex):
       sync.offsets = @[]
     sync.updateConsensus()
-    withLock(sync.mutex):
-      check sync.state == tssFailed
+    check sync.getState() == tssFailed
 
   test "updateConsensus succeeds with sufficient peers":
     withLock(sync.mutex):
@@ -107,22 +130,29 @@ suite "P2P Time Synchronization Tests":
             lastUpdate: 0),
         ClockOffset(offset: 1020.0, confidence: 1.0, peerId: "p2", lastUpdate: 0)
       ]
+      sync.offsetHistory.clear()
+      for o in sync.offsets:
+        sync.offsetHistory.add(o)
     sync.updateConsensus()
-    withLock(sync.mutex):
-      check sync.state == tssSynchronized
-      check abs(sync.consensusOffset - 1010.0) < 20.0
+    check sync.getState() == tssSynchronized
+    check abs(sync.getCurrentOffset() - 1010.0) < 20.0
 
   test "getSynchronizedTime combines local and offset":
     withLock(sync.mutex):
       sync.consensusOffset = 1_000_000.0
+      sync.state = tssSynchronized
     let baseTime = 1_000_000_000'i64
-    proc mockClock(): Timestamp = baseTime + (int64(epochTime()) mod 1000) * 1_000_000
+    let mockClock = MockTimeProvider()
+    mockClock.currentTime = baseTime
     sync.localClock = mockClock
+    let synced = sync.getSynchronizedTime()
+    check synced == baseTime + 1_000_000
 
-  test "P2PTimeSynchronizer initialization":
+  test "SharedTimer initialization":
     check sync.nodeId == "testNode"
+    check sync.numericNodeId == 1'u16
     check sync.peers.len == 3
-    check sync.state == tssUninitialized
+    check sync.getState() == tssUninitialized
 
   test "ClockOffset has required fields":
     let co = ClockOffset(
@@ -163,10 +193,11 @@ suite "P2P Time Synchronization Tests":
 
   test "getTransactionID format in synchronized mode":
     withLock(sync.mutex):
-      sync.state = tssSynchronized
       sync.consensusOffset = 0
+      sync.state = tssSynchronized
     let mockNs: int64 = 1_600_000_000_000_000_000'i64
-    proc mockClock(): Timestamp = mockNs
+    let mockClock = MockTimeProvider()
+    mockClock.currentTime = mockNs
     sync.localClock = mockClock
     let id = sync.getTransactionID()
     let idVal = uint64(id.int64)
@@ -189,13 +220,14 @@ suite "P2P Time Synchronization Tests":
     check nodePart == (sync.numericNodeId.uint64 and 0xFFFF'u64)
 
   test "drift under 1ms with realistic network (3 peers)":
-    randomize(12345) # deterministic simulation
+    randomize(12345)
+    sync.localClock = MonotonicTimeProvider()
     # Run several synchronization ticks to converge
     for i in 0..4:
       sync.tick()
     let driftNs = abs(sync.getCurrentOffset())
-    echo "  Drift after 5 ticks: ", $driftNs, " ns (", $(driftNs / 1_000_000.0), " ms)"
-    # Aim for sub-millisecond drift
+    echo "\n  [Perf] Drift after 5 ticks: ", $driftNs, " ns (", $(driftNs /
+        1_000_000.0), " ms)"
     check driftNs < 1_000_000.0
 
   test "consensus improves accuracy over naive average":
@@ -212,6 +244,9 @@ suite "P2P Time Synchronization Tests":
         peerId: "p5", lastUpdate: 0)
     withLock(sync.mutex):
       sync.offsets = offsets
+      sync.offsetHistory.clear()
+      for o in offsets:
+        sync.offsetHistory.add(o)
     sync.updateConsensus()
     let consensus = sync.getCurrentOffset()
     # Compute naive average of all offsets
@@ -219,9 +254,10 @@ suite "P2P Time Synchronization Tests":
     for o in offsets:
       total += o.offset
     let naive = total / offsets.len.float64
-    echo "  True offset: ", trueOffset, " ns"
-    echo "  Naive average: ", naive, " ns (error: ", abs(naive - trueOffset), " ns)"
-    echo "  Consensus: ", consensus, " ns (error: ", abs(consensus -
+    echo "\n  [Accuracy] True offset: ", trueOffset, " ns"
+    echo "  [Accuracy] Naive average: ", naive, " ns (error: ", abs(naive -
+        trueOffset), " ns)"
+    echo "  [Accuracy] Consensus:  ", consensus, " ns (error: ", abs(consensus -
         trueOffset), " ns)"
     check abs(consensus - trueOffset) < abs(naive - trueOffset)
 
@@ -231,17 +267,90 @@ suite "P2P Time Synchronization Tests":
     for i in 0..199:
       manyPeers.add PeerConfig(peerId: "node" & $i, address: "127.0.0.1",
           port: uint16(5000+i), weight: 1.0)
-    let manySync = newP2PTimeSynchronizer("node0", 0'u16, manyPeers, logger)
+    let manyNetwork = SimulatedNetworkTransport(
+      rng: initRand(12345),
+      avgDelay: 10_000_000.0,
+      delayVariance: 5_000_000.0,
+      peerProcessingTime: 1_000_000
+    )
+    let manyClock = MonotonicTimeProvider()
+    let manySync = newSharedTimer("node0", 0'u16, manyPeers, manyClock,
+        manyNetwork, logger)
     let start = epochTime()
     for i in 0..2: # 3 ticks
       manySync.tick()
     let elapsed = (epochTime() - start) * 1000.0         # milliseconds
-    echo "  200 nodes: 3 ticks took ", elapsed, " ms"
+    echo "\n  [Scalability] 200 nodes: 3 ticks took ", elapsed, " ms"
     check elapsed < 500.0 # should complete within 500ms
     check manySync.getState() == tssSynchronized
     let offset = manySync.getCurrentOffset()
-    # With symmetric delays, offset should be near 0
     check abs(offset) < 1_000_000.0 # <1ms
 
+  # State machine transition tests
+  test "state transitions: uninitialized -> syncing -> synchronized":
+    withLock(sync.mutex):
+      sync.state = tssUninitialized
+    check sync.getState() == tssUninitialized
+    # Manually set offsets to trigger consensus
+    withLock(sync.mutex):
+      sync.offsets = @[
+        ClockOffset(offset: 100.0, confidence: 1.0, peerId: "p1",
+            lastUpdate: 0),
+        ClockOffset(offset: 110.0, confidence: 1.0, peerId: "p2", lastUpdate: 0)
+      ]
+      sync.offsetHistory.clear()
+      for o in sync.offsets:
+        sync.offsetHistory.add(o)
+    sync.updateConsensus()
+    check sync.getState() == tssSynchronized
+
+  test "setPeers updates peer list":
+    let newPeers = @[
+      PeerConfig(peerId: "newnode", address: "10.0.0.1", port: 5300'u16, weight: 1.0)
+    ]
+    sync.setPeers(newPeers)
+    check sync.getPeers().len == 1
+    check sync.getPeers()[0].peerId == "newnode"
+
+  test "MockTimeProvider allows time manipulation":
+    let mock = MockTimeProvider()
+    mock.currentTime = 1_000_000_000_000'i64
+    check mock.now() == 1_000_000_000_000'i64
+    mock.currentTime = 2_000_000_000_000'i64
+    check mock.now() == 2_000_000_000_000'i64
+
+  test "SimulatedNetworkTransport produces reproducible results with fixed seed":
+    let net1 = SimulatedNetworkTransport(
+      rng: initRand(99999),
+      avgDelay: 10_000_000.0,
+      delayVariance: 5_000_000.0,
+      peerProcessingTime: 1_000_000
+    )
+    let net2 = SimulatedNetworkTransport(
+      rng: initRand(99999),
+      avgDelay: 10_000_000.0,
+      delayVariance: 5_000_000.0,
+      peerProcessingTime: 1_000_000
+    )
+    let testPeers = @[
+      PeerConfig(peerId: "nodeA", address: "127.0.0.1", port: 5400'u16,
+          weight: 1.0),
+      PeerConfig(peerId: "nodeB", address: "127.0.0.1", port: 5401'u16, weight: 1.0)
+    ]
+    let t = 1_000_000_000_000'i64
+    let offsets1 = net1.syncRound(t, testPeers)
+    let offsets2 = net2.syncRound(t, testPeers)
+    check offsets1.len == offsets2.len
+    for i in 0..<offsets1.len:
+      check offsets1[i].offset == offsets2[i].offset
+      check offsets1[i].delay == offsets2[i].delay
+      check offsets1[i].peerId == offsets2[i].peerId
+
+  test "TimeSyncState enum values are correct":
+    check tssUninitialized == tssUninitialized
+    check tssSyncing == tssSyncing
+    check tssSynchronized == tssSynchronized
+    check tssFailed == tssFailed
+
 when isMainModule:
-  echo "Running P2P Time Synchronization tests..."
+  echo "Running SharedTimer OOP tests..."

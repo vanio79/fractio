@@ -106,12 +106,7 @@ type
     load*: int
 
   NodeRole* = enum
-    nrCoordinator, nrPrimary, nrSecondary, nrClient
-
-  # Global timestamp provider for MVCC
-  TimestampProvider* = object
-    lastTimestamp*: Atomic[int64]
-    nodeId*: NodeID
+     nrCoordinator, nrPrimary, nrSecondary, nrClient
 
 # Helper templates for safe type conversions
 template int64Value*(v: ValueRef): int64 =

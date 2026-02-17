@@ -1,5 +1,4 @@
-# Minimal logging utility for Fractio
-# Provides basic logger interface for diagnostic messages
+# Simple OOP Logger for Fractio
 
 import std/[tables, strformat]
 
@@ -8,44 +7,59 @@ type
     llDebug, llInfo, llWarn, llError
 
   Logger* = ref object
+    ## OOP logger with pluggable handlers
     name*: string
     minLevel*: LogLevel
-    # In production, would have output handlers
+    handlers*: seq[proc(level: LogLevel, msg: string, fields: Table[string, string])]
 
 proc newLogger*(name: string = "", minLevel: LogLevel = llInfo): Logger =
   ## Create a new logger with optional name and minimum level
-  Logger(name: name, minLevel: minLevel)
+  result = Logger(name: name, minLevel: minLevel, handlers: @[])
+  # Add default handler that prints to stdout
+  result.handlers.add(proc(level: LogLevel, msg: string, fields: Table[string, string]) =
+    echo msg
+  )
 
-proc shouldLog*(logger: Logger, level: LogLevel): bool =
-  level >= logger.minLevel
+proc setMinLevel*(self: Logger, level: LogLevel) =
+  self.minLevel = level
 
-proc log*(logger: Logger, level: LogLevel, msg: string,
-          fields: Table[string, string] = initTable[string, string]()) =
-  if not logger.shouldLog(level):
-    return
-  var fullMsg = msg
-  if fields.len > 0:
-    var fieldStr = ""
-    for k, v in fields.pairs:
-      fieldStr.add(fmt"{k}={v} ")
-    fullMsg = fmt"[{logger.name}] {msg} {fieldStr}"
+proc shouldLog*(self: Logger, level: LogLevel): bool =
+  level >= self.minLevel
+
+proc formatMessage*(self: Logger, level: LogLevel, msg: string, fields: Table[
+    string, string]): string =
+  var fieldStr = ""
+  for k, v in fields.pairs:
+    fieldStr.add(k & "=" & v & " ")
+  if fieldStr.len > 0:
+    result = fmt"[{self.name}] {msg} {fieldStr}"
   else:
-    fullMsg = fmt"[{logger.name}] {msg}"
-  # In production, would route to file/metrics
-  echo fullMsg
+    result = fmt"[{self.name}] {msg}"
 
-proc debug*(logger: Logger, msg: string, fields: Table[string,
-    string] = initTable[string, string]()) =
-  logger.log(llDebug, msg, fields)
+proc log*(self: Logger, level: LogLevel, msg: string,
+         fields: Table[string, string] = initTable[string, string]()) =
+  if not self.shouldLog(level):
+    return
+  let formatted = self.formatMessage(level, msg, fields)
+  for handler in self.handlers:
+    handler(level, formatted, fields)
 
-proc info*(logger: Logger, msg: string, fields: Table[string,
-    string] = initTable[string, string]()) =
-  logger.log(llInfo, msg, fields)
+proc debug*(self: Logger, msg: string,
+           fields: Table[string, string] = initTable[string, string]()) =
+  self.log(llDebug, msg, fields)
 
-proc warn*(logger: Logger, msg: string, fields: Table[string,
-    string] = initTable[string, string]()) =
-  logger.log(llWarn, msg, fields)
+proc info*(self: Logger, msg: string,
+          fields: Table[string, string] = initTable[string, string]()) =
+  self.log(llInfo, msg, fields)
 
-proc error*(logger: Logger, msg: string, fields: Table[string,
-    string] = initTable[string, string]()) =
-  logger.log(llError, msg, fields)
+proc warn*(self: Logger, msg: string,
+          fields: Table[string, string] = initTable[string, string]()) =
+  self.log(llWarn, msg, fields)
+
+proc error*(self: Logger, msg: string,
+           fields: Table[string, string] = initTable[string, string]()) =
+  self.log(llError, msg, fields)
+
+proc addHandler*(self: Logger, handler: proc(level: LogLevel, msg: string,
+    fields: Table[string, string])) =
+  self.handlers.add(handler)
