@@ -4,17 +4,17 @@ author        = "Fractio Team"
 description   = "A distributed SQL database with sharding and replication"
 license       = "MIT"
 
-# Dependencies
+# Dependencies (only Nim itself needed for current tests)
 requires "nim >= 1.6.0"
-requires "json"
-requires "msgpack4nim"
-requires "nimcrypto >= 0.2.0"
-requires "asyncdispatch"
-requires "asyncnet"
-requires "times"
-requires "unittest"
-requires "test_stats"
-requires "graphs"
 
 # Build targets
 skipDirs = @["docs", "tests", "benchmarks", "simulations", "tmp"]
+
+import os
+
+task test, "Run all unit, integration, and concurrency tests":
+  for file in walkDirRec("tests"):
+    let name = extractFilename(file)
+    if name.startsWith("test_") and name.endswith(".nim"):
+      echo "Running tests: ", file
+      exec "nim c -r --checks:on -p:src " & file

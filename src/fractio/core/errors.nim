@@ -1,20 +1,23 @@
 # Error definitions and handling for Fractio
 
+import tables
+import strutils
+
 type
   FractioErrorKind* = enum
-    fekNone,           # No error
-    fekSyntax,         # SQL syntax error
-    fekSemantic,       # Semantic error (unknown table/column)
-    fekConstraint,     # Constraint violation
-    fekTransaction,    # Transaction error
-    fekDeadlock,       # Deadlock detected
-    fekSharding,       # Sharding error
-    fekReplication,    # Replication error
-    fekNetwork,        # Network error
-    fekStorage,        # Storage error
-    fekConfig,         # Configuration error
-    fekPermission,     # Permission denied
-    fek NotImplemented # Not implemented
+    fekNone,          # No error
+    fekSyntax,        # SQL syntax error
+    fekSemantic,      # Semantic error (unknown table/column)
+    fekConstraint,    # Constraint violation
+    fekTransaction,   # Transaction error
+    fekDeadlock,      # Deadlock detected
+    fekSharding,      # Sharding error
+    fekReplication,   # Replication error
+    fekNetwork,       # Network error
+    fekStorage,       # Storage error
+    fekConfig,        # Configuration error
+    fekPermission,    # Permission denied
+    fekNotImplemented # Not implemented
 
   FractioError* = object
     kind*: FractioErrorKind

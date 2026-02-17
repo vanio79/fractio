@@ -1,7 +1,13 @@
 # Core types for Fractio distributed database
 # Thread-safe by design - immutable structs and atomic operations
 
+import tables
+import sets
+import atomics
+import times
+
 type
+  # Basic data types
   DataType* = enum
     dtInt, dtFloat, dtString, dtBool, dtDate, dtDateTime, dtBytes
 
@@ -9,7 +15,7 @@ type
     nullable*: bool
     unique*: bool
     primaryKey*: bool
-    defaultValue*: ValueRef # stores a default value
+    defaultValue*: ValueRef
 
   ValueRef* = ref object
     case kind*: DataType
@@ -22,9 +28,9 @@ type
     of dtBool:
       boolValue*: bool
     of dtDate:
-      dateValue*: int64     # Unix timestamp in milliseconds
+      dateValue*: int64
     of dtDateTime:
-      datetimeValue*: int64 # Unix timestamp in nanoseconds
+      datetimeValue*: int64
     of dtBytes:
       bytesValue*: seq[uint8]
 
@@ -32,7 +38,6 @@ type
     name*: string
     dataType*: DataType
     constraints*: Constraint
-    # For sharding: columns that participate in shard key
     isShardKey*: bool
 
   RowID* = distinct int64
@@ -40,36 +45,35 @@ type
   Row* = ref object
     id*: RowID
     values*: seq[ValueRef]
-    createdAt*: int64 # timestamp
-    updatedAt*: int64 # timestamp
-    version*: int64   # MVCC version
+    createdAt*: int64
+    updatedAt*: int64
+    version*: int64
 
   Table* = ref object
     name*: string
     columns*: seq[ColumnDef]
     rows*: seq[Row]
     indexes*: TableIndexes
-    mutex*: pointer # Thread-safe mutation lock (pthread_mutex_t in C)
-    version*: int64 # Schema version for compatibility checks
+    mutex*: pointer
+    version*: int64
 
   TableIndexes* = object
-    # Maps column name to index of values in rows
-    columnIndices*: Table[string, int]
+    columnIndices*: tables.Table[string, int]
 
   Schema* = ref object
-    tables*: Table[string, Table]
-    mutex*: pointer # Schema-level lock
-    version*: int64 # Global schema version
+    tables*: tables.Table[string, Table]
+    mutex*: pointer
+    version*: int64
 
   TransactionID* = distinct int64
 
   Transaction* = ref object
     id*: TransactionID
-    timestamp*: int64    # MVCC timestamp
+    timestamp*: int64
     status*: TransactionStatus
-    readSnapshot*: int64 # Snapshot for snapshot isolation
+    readSnapshot*: int64
     mutatedTables*: HashSet[string]
-    mutex*: pointer      # Transaction-local lock
+    mutex*: pointer
 
   TransactionStatus* = enum
     tsActive, tsCommitted, tsAborted
@@ -78,17 +82,17 @@ type
 
   Shard* = ref object
     id*: ShardID
-    rangeStart*: uint64         # Inclusive start of shard key range
-    rangeEnd*: uint64           # Exclusive end of shard key range
-    replicas*: seq[ReplicaInfo] # Primary + secondary replicas
-    primaryReplica*: int        # Index into replicas array
-    table*: string              # Table this shard belongs to
+    rangeStart*: uint64
+    rangeEnd*: uint64
+    replicas*: seq[ReplicaInfo]
+    primaryReplica*: int
+    table*: string
 
   ReplicaInfo* = object
     nodeId*: string
     address*: string
     port*: uint16
-    lastSeen*: int64 # Timestamp of last heartbeat
+    lastSeen*: int64
 
   NodeID* = distinct string
 
@@ -96,131 +100,17 @@ type
     id*: NodeID
     address*: string
     port*: uint16
-    role*: NodeRole # Primary, secondary, or coordinator
-    capacity*: int  # Total storage capacity in bytes
-    used*: int      # Used storage in bytes
-    load*: int      # Current load (active connections)
+    role*: NodeRole
+    capacity*: int
+    used*: int
+    load*: int
 
   NodeRole* = enum
     nrCoordinator, nrPrimary, nrSecondary, nrClient
 
-  Query* = ref object
-    sql*: string
-    ast*: SQLElement # Parsed AST
-    params*: seq[ValueRef]
-    executionPlan*: ExecutionPlan
-
-  SQLElement* = ref object
-    case kind*: SQLNodeKind
-    of sqlnSelect:
-      selectColumns*: seq[ColumnRef]
-      fromTable*: string
-      whereClause*: ConditionRef
-      joinClauses*: seq[JoinClause]
-    of sqlnInsert:
-      insertTable*: string
-      insertColumns*: seq[string]
-      insertValues*: seq[ValueRef]
-    of sqlnUpdate:
-      updateTable*: string
-      setClauses*: seq[SetClause]
-      whereClause*: ConditionRef
-    of sqlnDelete:
-      deleteTable*: string
-      whereClause*: ConditionRef
-    of sqlnCreateTable:
-      createTable*: string
-      createColumns*: seq[ColumnDef]
-    of sqlnDropTable:
-      dropTable*: string
-
-  ColumnRef* = object
-    table*: string
-    column*: string
-
-  ConditionRef* = ref object
-    left*: ConditionOperand
-    op*: ConditionOp
-    right*: ConditionOperand
-    # For composite conditions
-    next*: ConditionRef
-    combineOp*: LogicOp # AND or OR
-
-  ConditionOperand* = ref object
-    case kind*: OperandKind
-    of opkColumn:
-      columnName*: string
-    of opkValue:
-      value*: ValueRef
-    of opkSubquery:
-      subquery*: Query
-
-  ConditionOp* = enum
-    copEqual, copNotEqual, copGreater, copLess, copGreaterEq, copLessEq,
-      copLike, copIn
-
-  LogicOp* = enum
-    lopAnd, lopOr
-
-  SetClause* = object
-    column*: string
-    value*: ValueRef
-
-  JoinClause* = object
-    table*: string
-    condition*: ConditionRef
-    joinType*: JoinType # Inner, Left, Right, Full
-
-  JoinType* = enum
-    jtInner, jtLeft, jtRight, jtFull
-
-  ExecutionPlan* = ref object
-    steps*: seq[ExecutionStep]
-    estimatedCost*: float64
-
-  ExecutionStep* = ref object
-    case kind*: StepKind
-    of stepScan:
-      scanTable*: string
-      scanShard*: Option[ShardID]
-      scanIndex*: Option[string]
-    of stepFilter:
-      filterCondition*: ConditionRef
-    of stepProject:
-      projectColumns*: seq[ColumnRef]
-    of stepJoin:
-      joinTable*: string
-      joinCondition*: ConditionRef
-      joinType*: JoinType
-    of stepAggregate:
-      aggregateFunc*: AggregateFunc
-      groupBy*: seq[ColumnRef]
-
-  StepKind* = enum
-    stepScan, stepFilter, stepProject, stepJoin, stepAggregate
-
-  AggregateFunc* = enum
-    afCount, afSum, afAvg, afMin, afMax
-
-  SQLNodeKind* = enum
-    sqlnSelect, sqlnInsert, sqlnUpdate, sqlnDelete, sqlnCreateTable, sqlnDropTable
-
-  OpResult* = ref object
-    case kind*: ResultKind
-    of rkSuccess:
-      rows*: seq[Row]
-      rowCount*: int
-      lastInsertId*: RowID
-    of rkError:
-      errorMessage*: string
-      errorCode*: int
-
-  ResultKind* = enum
-    rkSuccess, rkError
-
   # Global timestamp provider for MVCC
   TimestampProvider* = object
-    lastTimestamp*: atomic[int64]
+    lastTimestamp*: Atomic[int64]
     nodeId*: NodeID
 
 # Helper templates for safe type conversions
@@ -264,12 +154,10 @@ proc newRow*(id: RowID = RowID(0)): Row =
   Row(id: id, values: @[], createdAt: getTime().toUnix * 1000,
        updatedAt: getTime().toUnix * 1000, version: 1)
 
-# Transaction ID generation
-proc genTransactionID*(): TransactionID =
-  var tp: TimestampProvider
-  let ts = atomicInc(tp.lastTimestamp)
-  TransactionID(ts)
+proc `==`*(a, b: TransactionID): bool = a.int64 == b.int64
+proc `!=`*(a, b: TransactionID): bool = not (a == b)
 
-# Row ID generation (could be from distributed ID generator)
+# Transaction ID generation (legacy - will be replaced by P2PTimeSynchronizer)
+# Row ID generation
 proc genRowID*(): RowID =
   RowID(getTime().toUnix * 1000000 + (getTime().toUnix*1000000 mod 1000000).int64)
