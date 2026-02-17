@@ -216,76 +216,55 @@ koch test --metrics  # With coverage metrics
 
 ## 13. P2P Time Synchronization
 
-Fractio uses a custom P2P time synchronization protocol to generate globally unique transaction IDs without依赖 on NTP or a master node.
+Fractio uses decentralized time sync for cluster-wide unique transaction IDs (no NTP/master).
 
-### Design Requirements
-- Scale to hundreds of nodes
-- Clock drift < 1ms
-- Fully decentralized (no master)
-- Inspired by NTP/PTP but simplified
+### Architecture
+- `SharedTimer`: orchestrator + ID generation
+- `UDPTransport`: production UDP with real sockets
+- `PacketCodec`: BOM-based packet serialization (thread-safe)
+- `MonotonicTimeProvider`: local monotonic clock
 
-### Implementation (`src/fractio/distributed/timesync.nim`)
+### Protocol (BOM + NTP)
+- Request: `[BOM:u16][MSG:u8][t1:u64]` (11 bytes)
+- Response: `[BOM:u16][MSG:u8][t2:u64][t3:u64]` (19 bytes)
+- Offset: `((t2-t1)+(t3-t4))/2`
+- Delay: `(t4-t1)-(t3-t2)` (discard >100ms)
+- Filter: 2σ outlier rejection
+- Consensus: weighted median (confidence × weight)
 
-**Key Types:**
-- `P2PTimeSynchronizer`: Main orchestrator, one per node
-- `PeerConfig`: Defines a peer (address, port, weight)
-- `ClockOffset`: Measured offset and delay from a peer
-- `TimeSyncState`: tssUninitialized, tssSyncing, tssSynchronized, tssFailed
+### Transaction IDs
+- Synced: `[42-bit ms-time][10-bit nodeId][12-bit counter]`
+- Fallback: `[16-bit nodeId][48-bit counter]`
 
-**Algorithm (per sync tick):**
-1. Send request to all peers (simulated or real network)
-2. Measure round-trip delay and compute candidate offset per peer using NTP formula:
-   - `delay = (t4 - t1) - (t3 - t2)`
-   - `offset = ((t2 - t1) + (t3 - t4)) / 2`
-3. Discard measurements with delay > 100ms (unreliable)
-4. Filter outliers using 2σ standard deviation
-5. Compute consensus via weighted median (weight = confidence × peer weight)
-6. Update `consensusOffset` if enough peers remain
-
-**Transaction ID Generation:**
-- Synchronized mode: `[42-bit time(ms)][10-bit nodeId][12-bit counter]`
-  - Time: milliseconds since epoch, covers ~139,000 years
-  - NodeId: 10 bits (0-1023, assigned via consistent hashing ring)
-  - Counter: 12 bits (4096 IDs per ms per node)
-- Unsynchronized fallback: `[16-bit nodeId][48-bit counter]`
-  - Guarantees uniqueness without synchronized time
-
-**Thread Safety:**
-- `mutex` protects `offsets`, `consensusOffset`, `state`
-- `txCounter` is an `Atomic[int]` using `atomicInc`/`load`
-- `localClock` is a proc pointer (allows mocking in tests)
-
-**Configuration:**
+### Constants
 ```nim
-const
-  DEFAULT_SYNC_INTERVAL = 1_000_000_000'i64  # 1 second
-  REQUEST_TIMEOUT_NS = 100_000_000'i64       # 100ms
-  MAX_HISTORY_SIZE = 100                     # ring buffer
-  OUTLIER_STDDEV_FACTOR = 2.0                # filter beyond 2σ
-  MIN_PEERS_FOR_CONSENSUS = 2                # need ≥2
-  MAX_CLOCK_DRIFT_NS = 1_000_000'i64         # 1ms drift threshold
+DEFAULT_SYNC_INTERVAL = 1_000_000_000  # 1s
+REQUEST_TIMEOUT_NS = 100_000_000       # 100ms
+MAX_HISTORY_SIZE = 100
+OUTLIER_STDDEV_FACTOR = 2.0
+MIN_PEERS_FOR_CONSENSUS = 2
+MAX_CLOCK_DRIFT_NS = 1_000_000         # 1ms
 ```
 
-**Integration Points:**
-- Replace `TransactionManager`'s `nextTxId` counter with `timeSync.getTransactionID()`
-- Call `synchronizer.tick()` periodically (e.g., via timer every `syncInterval`)
-- In `TimestampProvider`, use `getSynchronizedTime()` for MVCC timestamps
+### Integration
+- `TM.beginTransaction()` → `timeSync.getTransactionID()`
+- `TimestampProvider` → `timeSync.getSynchronizedTime()`
+- Scheduler: call `tick()` every `DEFAULT_SYNC_INTERVAL`
 
-**Testing:**
-- Unit tests in `tests/test_timesync.nim` (21 tests, 100% coverage)
-- Scalability test: 200 peers, 3 ticks in ~1.2ms, drift <1ms
-- Accuracy test: consensus reduces error from ~677µs to ~28µs vs naive average
-- Run via `nimble test`
+### Testing
+- Unit: `test_packetcodec.nim` (33 tests), `test_udptransport.nim` (11), `test_sharedtimer.nim` (19)
+- Integration: `test_sharedtimer_udp_integration.nim` (9)
+- Scalability: 200 peers, 3 ticks ≈ 1.2ms, drift <1ms
+- Accuracy: consensus error ~28µs vs naive ~677µs
 
-**Important:**
-- Remove before production: `syncRound` simulation uses local time; implement real RPC in `network/`
-- Ensure `numericNodeId` is unique (assign via consistent hashing ring)
-- Monitor `getCurrentOffset()`; if drift exceeds 1ms, investigate network issues
-- Peer weights can be adjusted for trust (e.g., higher weight for low-latency nodes)
+### Important
+- `numericNodeId` must be unique (consistent hashing ring)
+- Monitor `getCurrentOffset()`; >1ms drift = network issues
+- Peer weights adjustable for trust
 
 ### 14. SQL Parser Status
 
-**IMPORTANT**: The SQL parser and AST types (`Query`, `SQLElement`, `ConditionRef`, etc.) have been temporarily removed from `types.nim` to unblock development on core distributed features. They should be reintroduced in a dedicated `sql/` module when query processing is needed.
+**IMPORTANT**: SQL parser and AST types (`Query`, `SQLElement`, `ConditionRef`, etc.) have been temporarily removed from `types.nim` to unblock distributed features. Reintroduce in dedicated `sql/` module when needed.
 
 ---
 
