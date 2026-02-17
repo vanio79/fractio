@@ -12,6 +12,14 @@ Fractio will implement a distributed consensus system based on the Raft algorith
 - Linearizable reads and writes
 - Support for cluster reconfiguration (add/remove nodes, move shards)
 
+**Code Style:**
+All implementation will follow Fractio's OOP conventions:
+- `ref object` types for all nontrivial data structures
+- Methods (not procs) for operations on objects
+- Proper encapsulation with public/private fields
+- Thread-safety via `{.gcsafe.}` pragmas and mutexes
+- Comprehensive doc comments for all public types and procs
+
 ---
 
 ## 1. Single-Group Raft
@@ -644,4 +652,4 @@ Assume 3-node cluster `{A, B, C}`; we add `D`.
 8. Once committed on majority of `{A,B,D}`, new config active
 9. Node `C` realizes it's removed (receives RPC with term+config index) and steps down
 
-Note: In实践活动, we might remove one node at a time if reducing cluster, or add nodes before removing (if scaling).
+Note: In practice, we might remove one node at a time if reducing cluster, or add nodes before removing (if scaling).
