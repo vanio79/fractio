@@ -8,11 +8,10 @@ import ./timeprovider
 import ./networktransport
 import ./ringbuffer
 import ./monotonic
-import ./simulated
 import ../../core/types
-import ../../core/errors
 import ../../utils/logging
-import std/[times, math, algorithm, sequtils, os, tables, random]
+import ./udptransport
+import std/[times, math, algorithm, sequtils, tables]
 import locks
 
 const
@@ -122,12 +121,12 @@ proc computeConsensusOffset*(offsets: seq[ClockOffset]): float64 =
   result = weighted[weighted.len div 2][0]
 
 # Forward declarations to satisfy the compiler
-proc getState*(self: SharedTimer): TimeSyncState
-proc getSynchronizedTime*(self: SharedTimer): Timestamp
+proc getState*(self: SharedTimer): TimeSyncState {.gcsafe.}
+proc getSynchronizedTime*(self: SharedTimer): Timestamp {.gcsafe.}
 
 # SharedTimer implementation
 
-method now*(self: SharedTimer): Timestamp =
+method now*(self: SharedTimer): Timestamp {.gcsafe.} =
   ## Get the current synchronized time (offset-adjusted) if synchronized, else local time.
   let local = self.localClock.now()
   if self.getState() == tssSynchronized:
@@ -136,21 +135,19 @@ method now*(self: SharedTimer): Timestamp =
     result = local
 
 proc newSharedTimer*(nodeId: string, numericNodeId: uint16,
-                    peers: seq[PeerConfig] = @[],
-                    localClock: TimeProvider = nil,
-                    network: NetworkTransport = nil,
-                    logger: Logger = nil): SharedTimer =
+                     peers: seq[PeerConfig] = @[],
+                     localClock: TimeProvider = nil,
+                     network: NetworkTransport = nil,
+                     logger: Logger = nil): SharedTimer =
   ## Create a new SharedTimer instance.
   ## If localClock is nil, defaults to MonotonicTimeProvider.
-  ## If network is nil, defaults to SimulatedNetworkTransport with default parameters.
+  ## If network is nil, defaults to UDPTransport (production-ready).
   let clock = if localClock != nil: localClock else: MonotonicTimeProvider()
   let net = if network != nil: network else:
-    SimulatedNetworkTransport(
-      rng: initRand(12345),
-      avgDelay: 10_000_000.0,
-      delayVariance: 5_000_000.0,
-      peerProcessingTime: 1_000_000
-    )
+    newUDPTransport(port = 0, logger = logger, timeProvider = clock)
+
+  # Start the network transport (no-op for simulated)
+  net.start()
 
   result = SharedTimer(
     nodeId: nodeId,
@@ -182,7 +179,7 @@ proc getPeers*(self: SharedTimer): seq[PeerConfig] =
   withLock(self.mutex):
     result = self.peers
 
-proc getSynchronizedTime*(self: SharedTimer): Timestamp =
+proc getSynchronizedTime*(self: SharedTimer): Timestamp {.gcsafe.} =
   ## Return local time plus consensus offset.
   let local = self.localClock.now()
   withLock(self.mutex):
@@ -196,7 +193,7 @@ proc getCurrentOffset*(self: SharedTimer): float64 =
   withLock(self.mutex):
     result = self.consensusOffset
 
-proc getState*(self: SharedTimer): TimeSyncState =
+proc getState*(self: SharedTimer): TimeSyncState {.gcsafe.} =
   ## Get current synchronization state.
   withLock(self.mutex):
     result = self.state

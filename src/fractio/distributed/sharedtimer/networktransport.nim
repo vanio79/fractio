@@ -7,6 +7,10 @@ type
   NetworkTransport* = ref object of RootObj
     ## Base class for network transports.
 
+method start*(self: NetworkTransport) {.base.} =
+  ## Start the transport (if needed). Default implementation does nothing.
+  discard
+
 method syncRound*(self: NetworkTransport, localSend: Timestamp, peers: seq[
     PeerConfig]): seq[ClockOffset] {.base.} =
   ## Perform one synchronization round and return measured offsets.

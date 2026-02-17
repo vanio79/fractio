@@ -1,10 +1,10 @@
 ## Shared Timer Types and Constants
 ## Provides fundamental data structures used by the shared timer system.
 
-type
-  Timestamp* = int64
-    ## Nanosecond-precision Unix timestamp
+import ../../core/types
+export Timestamp
 
+type
   ClockOffset* = object
     offset*: float64
       ## Nanoseconds offset from local to peer time

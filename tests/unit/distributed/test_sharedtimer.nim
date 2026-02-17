@@ -9,11 +9,13 @@ import fractio/distributed/sharedtimer
 
 suite "SharedTimer Tests (OOP)":
 
-  var logger: Logger = nil
+  var logger: Logger
   var sync: SharedTimer
 
   setup:
     randomize(12345)
+    # Use quiet test logger to suppress info/debug output
+    logger = Logger(name: "Test", minLevel: llWarn, handlers: @[])
     let peers = @[
       PeerConfig(peerId: "node1", address: "127.0.0.1", port: 5200'u16,
           weight: 1.0),
@@ -226,8 +228,6 @@ suite "SharedTimer Tests (OOP)":
     for i in 0..4:
       sync.tick()
     let driftNs = abs(sync.getCurrentOffset())
-    echo "\n  [Perf] Drift after 5 ticks: ", $driftNs, " ns (", $(driftNs /
-        1_000_000.0), " ms)"
     check driftNs < 1_000_000.0
 
   test "consensus improves accuracy over naive average":
@@ -254,11 +254,6 @@ suite "SharedTimer Tests (OOP)":
     for o in offsets:
       total += o.offset
     let naive = total / offsets.len.float64
-    echo "\n  [Accuracy] True offset: ", trueOffset, " ns"
-    echo "  [Accuracy] Naive average: ", naive, " ns (error: ", abs(naive -
-        trueOffset), " ns)"
-    echo "  [Accuracy] Consensus:  ", consensus, " ns (error: ", abs(consensus -
-        trueOffset), " ns)"
     check abs(consensus - trueOffset) < abs(naive - trueOffset)
 
   test "scales to 200 nodes - latency and correctness":
@@ -280,7 +275,6 @@ suite "SharedTimer Tests (OOP)":
     for i in 0..2: # 3 ticks
       manySync.tick()
     let elapsed = (epochTime() - start) * 1000.0         # milliseconds
-    echo "\n  [Scalability] 200 nodes: 3 ticks took ", elapsed, " ms"
     check elapsed < 500.0 # should complete within 500ms
     check manySync.getState() == tssSynchronized
     let offset = manySync.getCurrentOffset()
@@ -353,4 +347,4 @@ suite "SharedTimer Tests (OOP)":
     check tssFailed == tssFailed
 
 when isMainModule:
-  echo "Running SharedTimer OOP tests..."
+  discard # Tests run via nimble

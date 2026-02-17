@@ -7,6 +7,6 @@ type
   TimeProvider* = ref object of RootObj
     ## Base class for time sources. Can be extended for monotonic, wall-clock, or mock time.
 
-method now*(self: TimeProvider): Timestamp {.base.} =
+method now*(self: TimeProvider): Timestamp {.base, gcsafe.} =
   ## Get current time in nanoseconds.
   result = 0
