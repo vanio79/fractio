@@ -2,9 +2,7 @@
 ## This module defines the core types used by the Raft consensus algorithm,
 ## including commands, log entries, and snapshots.
 
-import ../../core/types # for base types
 import ../../core/errors
-import std/tables
 
 type
   NodeId* = uint64
@@ -94,6 +92,25 @@ type
     of rmInstallSnapshot:
       installSnapshot*: InstallSnapshotArgs
 
-  # Transport sends messages to peers.
-  RaftTransport* {.inheritable.} = ref object
-    send*: proc(dest: NodeId, msg: RaftMessage) {.raises: [FractioError].}
+  # Transport interface for sending RPCs and managing lifecycle.
+  RaftTransport* {.inheritable.} = ref object of RootObj
+    ## Abstract base class for Raft network transport implementations.
+
+  # Network address of a Raft node (used by transport)
+  NodeAddress* = object
+    host*: string
+    port*: uint16
+
+# Abstract methods for RaftTransport
+method send*(self: RaftTransport, dest: NodeId, msg: RaftMessage) {.raises: [
+    FractioError], base.} =
+  ## Send a Raft message to the specified destination node.
+  raise notImplementedError("RaftTransport.send must be overridden by concrete transport", "")
+
+method start*(self: RaftTransport) {.base.} =
+  ## Start the transport (bind sockets, launch threads, etc.).
+  raise notImplementedError("RaftTransport.start must be overridden by concrete transport", "")
+
+method close*(self: RaftTransport) {.base.} =
+  ## Stop the transport and release resources.
+  raise notImplementedError("RaftTransport.close must be overridden by concrete transport", "")

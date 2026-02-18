@@ -16,13 +16,11 @@ type
     sentMsgs*: seq[tuple[dest: NodeId, msg: RaftMessage]]
     receivedMsgs*: seq[RaftMessage]
 
-proc initMockTransport*(t: MockTransport) =
-  t.send = proc(dest: NodeId, msg: RaftMessage) =
-    t.sentMsgs.add((dest, msg))
+method send*(self: MockTransport, dest: NodeId, msg: RaftMessage) =
+  self.sentMsgs.add((dest, msg))
 
 proc newMockTransport*(node: RaftNode): MockTransport =
   result = MockTransport(node: node, sentMsgs: @[], receivedMsgs: @[])
-  result.initMockTransport()
 
 proc deliver*(t: MockTransport, fromNodeId: NodeId, msg: RaftMessage,
     now: uint64) =
@@ -350,7 +348,7 @@ suite "RaftNode state machine":
         if dest == NodeId(1'u64):
           t1.deliver(NodeId(2'u64), msg, currentTime)
         elif dest == NodeId(3'u64):
-          t3.deliver(NodeId(2'u64), msg, currentTime)
+          t3.deliver(NodeId(3'u64), msg, currentTime)
 
     # n1 and n3 should now be followers of n2
     check n1.state == rsFollower
