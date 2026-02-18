@@ -45,6 +45,7 @@ Client → Query Router → Shard Manager → Transaction Manager → MVCC Stora
 - Transport: `RaftUDPTransport` with dedicated receiver thread; clean shutdown via `posix.shutdown`
 - Thread safety: `RaftNode` uses mutex for state mutations; `RaftLog` uses mutex for writes; `onApply` callback must be `gcsafe` and should avoid blocking
 - Configuration: `RaftConfig` with electionTimeoutMin/Max, heartbeatInterval, clusterSize, peerIds
+- Recent fixes: `handleAppendEntries` correctly handles `prevLogIndex == snapshotIndex` case; `handleInstallSnapshot` updates `lastApplied` and `commitIndex` to prevent re-applying compacted entries; `onApply` allowed to raise `CatchableError` for robustness; `applyEntries` is idempotent and exported for testing.
 
 **Transaction Lifecycle**
 1. `beginTransaction()` → unique timestamp
@@ -165,14 +166,11 @@ The P2P time sync implementation includes a production-ready UDP transport with 
 - States: uninitialized → syncing → synchronized (or failed)
 
 **Testing**
-- `test_packetcodec.nim`: 33 tests (100% coverage)
-- `test_udptransport.nim`: 11 tests (lifecycle, stats, threading)
-- `test_sharedtimer.nim`: 19 tests (unit, state, consensus)
-- `test_sharedtimer_udp_integration.nim`: 9 integration tests
-- `test_log.nim`: 16 tests (WAL, snapshot, recovery, checksums)
-- `test_node.nim`: 8 scenarios (election, replication, snapshots, step-down, re-election)
-- `test_raftudp.nim`: 15 tests (codec + integration)
-- Scalability: 200 peers, 3 ticks in ~1.2ms, drift <1ms
+- `test_node.nim`: 8 scenarios (election, heartbeats, replication, step-down, re-election, snapshots). 100% coverage of node.nim.
+- `test_replication.nim`: 7 tests targeting replication mechanics, conflict resolution, onApply errors, idempotence, leader change semantics, InstallSnapshot, and failure backoff. Ensures full coverage of replication logic.
+- `test_log.nim`: 16 tests (append, truncate, snapshot, recovery, checksums).
+- `test_raftudp.nim`: 15 tests (transport codec + integration: send/receive, large messages, errors).
+- Scalability: 200 peers, 3 ticks ≈ 1.2ms, drift <1ms
 - Accuracy: consensus error ~28µs vs naive average ~677µs
 
 ---

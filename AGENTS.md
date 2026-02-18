@@ -284,6 +284,7 @@ Fractio uses Raft for leader election and log replication. The implementation is
 
 **Testing**
 - `test_node.nim`: 8 scenarios (election, heartbeats, replication, step-down, re-election, snapshots). 100% coverage of node.nim.
+- `test_replication.nim`: 7 tests specifically targeting log replication mechanics, conflict resolution, onApply error handling, applyEntries idempotence, leader changes, InstallSnapshot, and failure backoff. Complements `test_node.nim` to achieve full coverage.
 - `test_log.nim`: 16 tests (append, truncate, snapshot, recovery, checksums).
 - `test_raftudp.nim`: 15 tests (transport codec + integration: send/receive, large messages, errors).
 

@@ -51,7 +51,7 @@ type
     votesGranted*: int
     votesFrom*: Table[NodeId, bool]
 
-    onApply*: proc(entry: RaftEntry) {.closure, gcsafe, raises: [].}
+    onApply*: proc(entry: RaftEntry) {.closure, gcsafe, raises: [CatchableError].}
 
 # Helper: majority threshold
 proc majority(self: RaftNode): int {.gcsafe.} =
@@ -78,7 +78,10 @@ proc handleInstallSnapshot(self: RaftNode, sender: NodeId,
 
 # Forward declarations for other procs used before definition
 proc maybeCommit(self: RaftNode) {.gcsafe, raises: [FractioError].}
-proc applyEntries(self: RaftNode) {.gcsafe, raises: [FractioError].}
+## Applies all committed but not yet applied entries to the state machine.
+## Calls the onApply callback for each new entry. Idempotent: already applied entries are skipped.
+## Errors from onApply are caught and logged but do not stop processing.
+proc applyEntries*(self: RaftNode) {.gcsafe, raises: [FractioError].}
 
 # Helper to safely log errors without raising exceptions
 proc safeLogError(logger: Logger, msg: string) {.gcsafe, raises: [].} =
@@ -89,8 +92,12 @@ proc safeLogError(logger: Logger, msg: string) {.gcsafe, raises: [].} =
 
 proc newRaftNode*(nodeId: NodeId, log: RaftLog, transport: RaftTransport,
     logger: Logger, config: RaftConfig, onApply: proc(
-    entry: RaftEntry) {.closure, gcsafe, raises: [].}, now: uint64): RaftNode =
+    entry: RaftEntry) {.closure, gcsafe, raises: [CatchableError].},
+        now: uint64): RaftNode =
   ## Create a new RaftNode. It starts as a follower with an election timer set.
+  ##
+  ## - onApply: Callback invoked to apply a committed log entry to the state machine.
+  ##   The callback may raise CatchableError; errors are logged but do not destabilize the node.
   result = RaftNode(
     nodeId: nodeId,
     state: rsFollower,
@@ -384,7 +391,9 @@ proc handleAppendEntries(self: RaftNode, sender: NodeId,
   self.leaderId = args.leaderId
   # Consistency check on prevLogIndex
   if args.prevLogIndex > 0:
-    if args.prevLogIndex <= self.log.getSnapshotIndex():
+    let snapIdx = self.log.getSnapshotIndex()
+    if args.prevLogIndex < snapIdx:
+      # Leader is behind; follower needs snapshot
       let reply = AppendEntriesReply(term: self.term, success: false)
       try:
         self.transport.send(sender, RaftMessage(kind: rmAppendEntriesReply,
@@ -392,9 +401,9 @@ proc handleAppendEntries(self: RaftNode, sender: NodeId,
       except FractioError as e:
         safeLogError(self.logger, "Failed to send AppendEntriesReply: " & e.msg)
       return
-    try:
-      let prevEntry = self.log.getEntry(args.prevLogIndex)
-      if prevEntry.term != args.prevLogTerm:
+    elif args.prevLogIndex == snapIdx:
+      # Check against snapshot term
+      if args.prevLogTerm != self.log.getSnapshotTerm():
         let reply = AppendEntriesReply(term: self.term, success: false)
         try:
           self.transport.send(sender, RaftMessage(kind: rmAppendEntriesReply,
@@ -402,14 +411,26 @@ proc handleAppendEntries(self: RaftNode, sender: NodeId,
         except FractioError as e:
           safeLogError(self.logger, "Failed to send AppendEntriesReply: " & e.msg)
         return
-    except FractioError:
-      let reply = AppendEntriesReply(term: self.term, success: false)
+      # else: prevLog matches snapshot, continue without fetching entry
+    else: # args.prevLogIndex > snapIdx
       try:
-        self.transport.send(sender, RaftMessage(kind: rmAppendEntriesReply,
-            appendEntriesReply: reply))
-      except FractioError as e:
-        safeLogError(self.logger, "Failed to send AppendEntriesReply: " & e.msg)
-      return
+        let prevEntry = self.log.getEntry(args.prevLogIndex)
+        if prevEntry.term != args.prevLogTerm:
+          let reply = AppendEntriesReply(term: self.term, success: false)
+          try:
+            self.transport.send(sender, RaftMessage(kind: rmAppendEntriesReply,
+                appendEntriesReply: reply))
+          except FractioError as e:
+            safeLogError(self.logger, "Failed to send AppendEntriesReply: " & e.msg)
+          return
+      except FractioError:
+        let reply = AppendEntriesReply(term: self.term, success: false)
+        try:
+          self.transport.send(sender, RaftMessage(kind: rmAppendEntriesReply,
+              appendEntriesReply: reply))
+        except FractioError as e:
+          safeLogError(self.logger, "Failed to send AppendEntriesReply: " & e.msg)
+        return
   # Process entries
   if args.entries.len > 0:
     var startIdx: uint64 = 0
@@ -501,7 +522,7 @@ proc maybeCommit(self: RaftNode) {.gcsafe, raises: [FractioError].} =
         break
     dec i
 
-proc applyEntries(self: RaftNode) {.gcsafe, raises: [FractioError].} =
+proc applyEntries*(self: RaftNode) {.gcsafe, raises: [FractioError].} =
   while self.lastApplied < self.commitIndex:
     inc self.lastApplied
     let entry = self.log.getEntry(self.lastApplied)
@@ -530,6 +551,11 @@ proc handleInstallSnapshot(self: RaftNode, sender: NodeId,
     let snap = Snapshot(lastIndex: args.lastIncludedIndex,
         lastTerm: args.lastIncludedTerm, data: args.data)
     self.log.installSnapshot(snap)
+    # Snapshot represents all work up to lastIncludedIndex; mark as applied and committed.
+    self.lastApplied = args.lastIncludedIndex
+    self.commitIndex = args.lastIncludedIndex
+    self.log.setLastApplied(args.lastIncludedIndex)
+    self.log.setCommitIndex(args.lastIncludedIndex)
     # After installing snapshot, our state should be follower with updated log
     # Update matchIndex and nextIndex for the leader (if needed)
     self.matchIndex[sender] = args.lastIncludedIndex
