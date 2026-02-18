@@ -10,6 +10,7 @@ import ../../core/errors
 import ../../utils/logging
 import ./types
 import ./log
+import ./states
 
 type
   RaftState* = enum
@@ -51,7 +52,7 @@ type
     votesGranted*: int
     votesFrom*: Table[NodeId, bool]
 
-    onApply*: proc(entry: RaftEntry) {.closure, gcsafe, raises: [CatchableError].}
+    stateMachine*: RaftStateMachine ## Applied to committed entries
 
 # Helper: majority threshold
 proc majority(self: RaftNode): int {.gcsafe.} =
@@ -78,9 +79,9 @@ proc handleInstallSnapshot(self: RaftNode, sender: NodeId,
 
 # Forward declarations for other procs used before definition
 proc maybeCommit(self: RaftNode) {.gcsafe, raises: [FractioError].}
-## Applies all committed but not yet applied entries to the state machine.
-## Calls the onApply callback for each new entry. Idempotent: already applied entries are skipped.
-## Errors from onApply are caught and logged but do not stop processing.
+  ## Applies all committed but not yet applied entries to the state machine.
+  ## Calls `stateMachine.applyImpl` for each new entry. Idempotent: already applied entries are skipped.
+  ## Errors from `applyImpl` are caught and logged but do not stop processing.
 proc applyEntries*(self: RaftNode) {.gcsafe, raises: [FractioError].}
 
 # Helper to safely log errors without raising exceptions
@@ -91,13 +92,12 @@ proc safeLogError(logger: Logger, msg: string) {.gcsafe, raises: [].} =
     discard
 
 proc newRaftNode*(nodeId: NodeId, log: RaftLog, transport: RaftTransport,
-    logger: Logger, config: RaftConfig, onApply: proc(
-    entry: RaftEntry) {.closure, gcsafe, raises: [CatchableError].},
+    logger: Logger, config: RaftConfig, stateMachine: RaftStateMachine,
         now: uint64): RaftNode =
   ## Create a new RaftNode. It starts as a follower with an election timer set.
   ##
-  ## - onApply: Callback invoked to apply a committed log entry to the state machine.
-  ##   The callback may raise CatchableError; errors are logged but do not destabilize the node.
+  ## - stateMachine: Implementation that applies committed entries to the state machine.
+  ##   Must be thread-safe and idempotent. Errors are logged but do not destabilize the node.
   result = RaftNode(
     nodeId: nodeId,
     state: rsFollower,
@@ -109,7 +109,7 @@ proc newRaftNode*(nodeId: NodeId, log: RaftLog, transport: RaftTransport,
     leaderId: 0,
     transport: transport,
     logger: logger,
-    onApply: onApply,
+    stateMachine: stateMachine,
     electionTimeoutMin: config.electionTimeoutMin,
     electionTimeoutMax: config.electionTimeoutMax,
     heartbeatInterval: config.heartbeatInterval,
@@ -526,11 +526,10 @@ proc applyEntries*(self: RaftNode) {.gcsafe, raises: [FractioError].} =
   while self.lastApplied < self.commitIndex:
     inc self.lastApplied
     let entry = self.log.getEntry(self.lastApplied)
-    try:
-      self.onApply(entry)
-    except CatchableError as e:
-      safeLogError(self.logger, "onApply failed at index " & $self.lastApplied &
-          ": " & e.msg)
+    let res = self.stateMachine.applyImpl(entry)
+    if res.isErr:
+      safeLogError(self.logger, "apply failed at index " & $self.lastApplied &
+          ": " & res.error.msg)
     self.log.setLastApplied(self.lastApplied)
   self.log.persistMeta()
 

@@ -44,8 +44,11 @@ Client → Query Router → Shard Manager → Transaction Manager → MVCC Stora
 - Snapshots: triggered when log exceeds threshold; `createSnapshot(index, term, data)`; followers install via `InstallSnapshot`
 - Transport: `RaftUDPTransport` with dedicated receiver thread; clean shutdown via `posix.shutdown`
 - Thread safety: `RaftNode` uses mutex for state mutations; `RaftLog` uses mutex for writes; `onApply` callback must be `gcsafe` and should avoid blocking
+- State Machine Thread Safety: `RaftStateMachine` is `{.gcsafe.}` and must be safe for concurrent `apply` calls; use explicit locking (atomic spinlock preferred over `Lock` to avoid double-finalization)
+- Threading API (Nim 2.2+): use `std/typedthreads` with `createThread`; worker procs `{.thread.}` taking typed tuple args; pass `ref` explicitly
+- Testing: spawn multiple threads applying same command; verify consistency after join; run with `nimble test -d:release --threads:on`
 - Configuration: `RaftConfig` with electionTimeoutMin/Max, heartbeatInterval, clusterSize, peerIds
-- Recent fixes: `handleAppendEntries` correctly handles `prevLogIndex == snapshotIndex` case; `handleInstallSnapshot` updates `lastApplied` and `commitIndex` to prevent re-applying compacted entries; `onApply` allowed to raise `CatchableError` for robustness; `applyEntries` is idempotent and exported for testing.
+- Recent fixes: `handleAppendEntries` correctly handles `prevLogIndex == snapshotIndex` case; `handleInstallSnapshot` updates `lastApplied` and `commitIndex` to prevent re-applying compacted entries; `onApply` allowed to raise `CatchableError` for robustness; `applyEntries` is idempotent and exported for testing; thread-safety tests rewritten using `std/typedthreads` with atomic spinlocks; replication test expectations corrected (commit propagation, heartbeat delivery)
 
 **Transaction Lifecycle**
 1. `beginTransaction()` → unique timestamp

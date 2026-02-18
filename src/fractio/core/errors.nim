@@ -44,7 +44,7 @@ const
 proc newError*(kind: FractioErrorKind, message: string,
     context: string = ""): FractioError =
   let code = ErrorCodes.getOrDefault(kind, 0)
-  FractioError(kind: kind, message: message, code: code,
+  result = FractioError(msg: message, kind: kind, message: message, code: code,
       context: context)
 
 proc isError*(err: FractioError): bool =

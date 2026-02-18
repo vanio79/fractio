@@ -157,7 +157,16 @@ Build in this sequence:
 - `async`/`await` for I/O operations
 - `atomic` for counters and flags
 - `Mutex` from `system` for critical sections
-- `spawn` from `threads` for CPU parallelism
+- `spawn` from `threads` **not available in Nim 2.2+**; use `std/typedthreads` with `createThread(threadVar, workerProc, args)` instead
+- Worker procs must be marked `{.thread.}` and accept a typed tuple argument
+- Sharing `ref` objects across threads under ORC is allowed but must be passed explicitly as arguments to worker procs (do not capture in closures created in a `gcsafe` context)
+- `{.gcsafe.}` types can be shared safely; ensure callbacks (e.g., `onApply`) are also `gcsafe`
+- After joining threads, access shared state directly; manual `GC_fullCollect()` and clearing thread arrays may cause segfaults
+
+**Gotcha:**
+- Base class methods with `method ... {.base.}`; derived overrides use `method name*` without `override`
+- Shutdown sockets: call `posix.shutdown(fd, SHUT_RD)` to unblock `recvFrom`, then `joinThread`
+- Socket creation with both `net` and `posix`: `newSocket(net.AF_INET, net.SOCK_DGRAM, net.IPPROTO_UDP)`
 
 ### 10. Documentation Requirements
 

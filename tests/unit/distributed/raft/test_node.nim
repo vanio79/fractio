@@ -7,6 +7,8 @@ import locks
 import fractio/distributed/raft/types
 import fractio/distributed/raft/node
 import fractio/distributed/raft/log
+import fractio/distributed/raft/states
+import fractio/distributed/raft/inmemory_states
 import fractio/core/errors
 import fractio/utils/logging
 
@@ -28,7 +30,7 @@ proc deliver*(t: MockTransport, fromNodeId: NodeId, msg: RaftMessage,
   t.node.receiveMessage(fromNodeId, msg, now)
 
 proc newNode*(nodeId: NodeId, peers: seq[NodeId], transport: RaftTransport,
-    now: int64, onApply: proc(entry: RaftEntry) {.closure, gcsafe, raises: [].}): RaftNode =
+    now: int64): RaftNode =
   if not existsDir("tmp"):
     createDir("tmp")
   let logDir = "tmp/raft_test_" & $nodeId
@@ -46,7 +48,8 @@ proc newNode*(nodeId: NodeId, peers: seq[NodeId], transport: RaftTransport,
     clusterSize: peers.len + 1,
     peerIds: peers
   )
-  result = newRaftNode(nodeId, log, transport, logger, config, onApply, now.uint64)
+  let stateMachine = newInMemoryStateMachine(peers)
+  result = newRaftNode(nodeId, log, transport, logger, config, stateMachine, now.uint64)
 
 # Removed appliedEntries; using node state directly.
 
@@ -66,27 +69,18 @@ suite "RaftNode state machine":
     t2 = newMockTransport(nil)
     t3 = newMockTransport(nil)
 
-    n1 = newNode(NodeId(1'u64), @[NodeId(2'u64), NodeId(3'u64)], t1, startTime,
-        proc(entry: RaftEntry) {.closure, gcsafe, raises: [].} = discard)
-    n2 = newNode(NodeId(2'u64), @[NodeId(1'u64), NodeId(3'u64)], t2, startTime,
-        proc(entry: RaftEntry) {.closure, gcsafe, raises: [].} = discard)
-    n3 = newNode(NodeId(3'u64), @[NodeId(1'u64), NodeId(2'u64)], t3, startTime,
-        proc(entry: RaftEntry) {.closure, gcsafe, raises: [].} = discard)
+    n1 = newNode(NodeId(1'u64), @[NodeId(2'u64), NodeId(3'u64)], t1, startTime)
+    n2 = newNode(NodeId(2'u64), @[NodeId(1'u64), NodeId(3'u64)], t2, startTime)
+    n3 = newNode(NodeId(3'u64), @[NodeId(1'u64), NodeId(2'u64)], t3, startTime)
 
     t1.node = n1
     t2.node = n2
     t3.node = n3
 
   teardown:
-    if not n1.isNil:
-      deinitLock(n1.lock)
-      n1 = nil
-    if not n2.isNil:
-      deinitLock(n2.lock)
-      n2 = nil
-    if not n3.isNil:
-      deinitLock(n3.lock)
-      n3 = nil
+    n1 = nil
+    n2 = nil
+    n3 = nil
     for dir in ["tmp/raft_test_1", "tmp/raft_test_2", "tmp/raft_test_3"]:
       if existsDir(dir):
         try:
