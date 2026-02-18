@@ -35,11 +35,16 @@ Client → Query Router → Shard Manager → Transaction Manager → MVCC Stora
 - Range scans: use ordered shard ranges
 
 **Raft Consensus**
-- Terms: 64-bit integers
-- Leader lease: 150ms (configurable)
-- Election timeout: 300-500ms randomized
-- Log entries: Commands (INSERT, UPDATE, DELETE)
-- Commit: majority of replicas
+- Terms: 64-bit integers, monotonically increasing
+- States: follower, candidate, leader; transitions via timeouts, votes, heartbeats
+- Election timeout: randomized (150-300ms typical); on expiry → candidate, vote for self, RequestVote
+- Leader: sends heartbeats (empty AppendEntries) every 50ms; followers reset election timer
+- Log replication: leader appends command, followers ack via AppendEntriesReply; commit when leader has `matchIndex >= i` from majority -> `commitIndex = i`
+- Commit safety: leader never overwrites entries from current term; `commitRule = last majority match from current term or any committed from previous term`
+- Snapshots: triggered when log exceeds threshold; `createSnapshot(index, term, data)`; followers install via `InstallSnapshot`
+- Transport: `RaftUDPTransport` with dedicated receiver thread; clean shutdown via `posix.shutdown`
+- Thread safety: `RaftNode` uses mutex for state mutations; `RaftLog` uses mutex for writes; `onApply` callback must be `gcsafe` and should avoid blocking
+- Configuration: `RaftConfig` with electionTimeoutMin/Max, heartbeatInterval, clusterSize, peerIds
 
 **Transaction Lifecycle**
 1. `beginTransaction()` → unique timestamp
@@ -159,19 +164,14 @@ The P2P time sync implementation includes a production-ready UDP transport with 
 - `getTransactionID()` uses synchronized time or fallback
 - States: uninitialized → syncing → synchronized (or failed)
 
-**Raft Transport** (`distributed/raft/`)
-- `RaftTransport` abstract base class with virtual `send`, `start`, `close`.
-- `RaftUDPTransport`: UDP-based, thread-safe, uses receive thread.
-- Clean shutdown: `shutdown(fd, SHUT_RD)` unblocks `recvFrom`.
-- Start: set `serverRunning` atomic before launching thread.
-- Socket creation: use `newSocket(net.AF_INET, net.SOCK_DGRAM, net.IPPROTO_UDP)` when `posix` imported.
-- Test suite: `test_raftudp.nim` – codec + integration (15 tests total).
-
 **Testing**
 - `test_packetcodec.nim`: 33 tests (100% coverage)
 - `test_udptransport.nim`: 11 tests (lifecycle, stats, threading)
 - `test_sharedtimer.nim`: 19 tests (unit, state, consensus)
 - `test_sharedtimer_udp_integration.nim`: 9 integration tests
+- `test_log.nim`: 16 tests (WAL, snapshot, recovery, checksums)
+- `test_node.nim`: 8 scenarios (election, replication, snapshots, step-down, re-election)
+- `test_raftudp.nim`: 15 tests (codec + integration)
 - Scalability: 200 peers, 3 ticks in ~1.2ms, drift <1ms
 - Accuracy: consensus error ~28µs vs naive average ~677µs
 

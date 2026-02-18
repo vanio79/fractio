@@ -51,6 +51,7 @@
 - Use `atomic` operations for counters
 - Mutexes only for mutating shared structures (schema changes)
 - Each connection gets its own transaction context
+- Callbacks crossing thread boundaries (e.g., `onApply`) must be `{.closure, gcsafe.}`; never capture GC-managed globals
 
 ### 3. File Organization
 
@@ -203,7 +204,7 @@ If you encounter:
 - `mvcc.nim` - Storage engine
 - `transaction.nim` - Transaction manager
 - `sharding.nim` - Sharding logic
-- `raft.nim` - Consensus protocol
+- `raft/{types,log,node,udp}.nim` - Raft consensus (state machine, log, transport)
 
 **Testing commands:**
 ```bash
@@ -266,16 +267,31 @@ MAX_CLOCK_DRIFT_NS = 1_000_000         # 1ms
 
 **IMPORTANT**: SQL parser and AST types (`Query`, `SQLElement`, `ConditionRef`, etc.) have been temporarily removed from `types.nim` to unblock distributed features. Reintroduce in dedicated `sql/` module when needed.
 
-### 15. Raft Transport Implementation
+### 15. Raft Consensus Implementation
 
-The Raft consensus requires a polymorphic transport interface for RPCs. Key lessons from recent fixes:
+Fractio uses Raft for leader election and log replication. The implementation is split across modules:
 
-- **Abstract Base Class**: `RaftTransport` is defined with virtual methods (`send`, `start`, `close`) using `method ... {.base.}` after the type block. Do NOT use fields for function pointers.
-- **Derived Overrides**: In derived classes (`RaftUDPTransport`), define `method send*`, `start*`, `close*` without `override` pragma unless base methods are visible across modules. Method definitions must be at column 0 (module level).
-- **Thread Start Order**: Set `serverRunning = true` BEFORE launching the receiver thread to avoid race where thread exits immediately due to false flag.
-- **Clean Shutdown**: In `close`, use `posix.shutdown(fd, SHUT_RD)` to unblock the `recvFrom` loop, then `joinThread`. This prevents hangs.
-- **Socket Creation**: When both `net` and `posix` are imported, disambiguate constants: `newSocket(net.AF_INET, net.SOCK_DGRAM, net.IPPROTO_UDP)`.
-- **Testing**: `test_raftudp.nim` provides codec (roundtrip) and integration (send/receive, large messages, errors) tests.
+- `raft/types.nim` - Core types: `RaftNode`, `RaftLog`, `RaftTransport` (abstract base), message types
+- `raft/log.nim` - Write-ahead log with atomic meta persistence, checksums, snapshot support
+- `raft/node.nim` - State machine (follower/candidate/leader), election timeouts, heartbeats, commit rule
+- `raft/udp.nim` - UDP transport with receiver thread, clean shutdown via `posix.shutdown`
+
+**Key Patterns**
+- **gcsafe callbacks**: `onApply` passed to `RaftNode` must be `{.closure, gcsafe, raises: [].}`. Never capture GC-managed globals; use node state directly.
+- **Thread safety**: `RaftLog` uses mutex for writes; reads via atomic snapshots. `RaftNode` protects `state`, `term`, `votedFor`, `commitIndex` with lock.
+- **Log replication**: Leader appends entry, followers ack, commit when `matchIndex` from majority reaches entry. `lastApplied` drives `onApply`.
+- **Snapshots**: Triggered when log grows too large; `createSnapshot(index, term, data)` compacts log to point, `InstallSnapshot` syncs followers.
+
+**Testing**
+- `test_node.nim`: 8 scenarios (election, heartbeats, replication, step-down, re-election, snapshots). 100% coverage of node.nim.
+- `test_log.nim`: 16 tests (append, truncate, snapshot, recovery, checksums).
+- `test_raftudp.nim`: 15 tests (transport codec + integration: send/receive, large messages, errors).
+
+**Gotchas**
+- Base class: `RaftTransport` uses `method ... {.base.}`; derived overrides use `method name*` without `override`.
+- Start order: set `serverRunning` atomic BEFORE spawning receiver thread.
+- Shutdown: call `posix.shutdown(fd, SHUT_RD)` to unblock `recvFrom`, then `joinThread`.
+- Socket creation: when both `net` and `posix` are imported, use `newSocket(net.AF_INET, net.SOCK_DGRAM, net.IPPROTO_UDP)`.
 
 ---
 
