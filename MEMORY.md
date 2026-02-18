@@ -159,6 +159,14 @@ The P2P time sync implementation includes a production-ready UDP transport with 
 - `getTransactionID()` uses synchronized time or fallback
 - States: uninitialized → syncing → synchronized (or failed)
 
+**Raft Transport** (`distributed/raft/`)
+- `RaftTransport` abstract base class with virtual `send`, `start`, `close`.
+- `RaftUDPTransport`: UDP-based, thread-safe, uses receive thread.
+- Clean shutdown: `shutdown(fd, SHUT_RD)` unblocks `recvFrom`.
+- Start: set `serverRunning` atomic before launching thread.
+- Socket creation: use `newSocket(net.AF_INET, net.SOCK_DGRAM, net.IPPROTO_UDP)` when `posix` imported.
+- Test suite: `test_raftudp.nim` – codec + integration (15 tests total).
+
 **Testing**
 - `test_packetcodec.nim`: 33 tests (100% coverage)
 - `test_udptransport.nim`: 11 tests (lifecycle, stats, threading)

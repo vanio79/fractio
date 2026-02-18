@@ -91,8 +91,8 @@ method start*(self: RaftUDPTransport) =
 # Send a message to the destination node.
 # Looks up the network address for dest, serializes, and transmits via UDP.
 # Raises FractioError if dest address is unknown or send fails.
-method send*(self: RaftUDPTransport, dest: NodeId, msg: RaftMessage) {.raises: [
-    FractioError].} =
+method send*(self: RaftUDPTransport, dest: NodeId, msg: RaftMessage) {.gcsafe,
+    raises: [FractioError].} =
   let peerAddr = self.peerAddrs.getOrDefault(dest)
   if peerAddr.host == "":
     raise newError(fekConfig, "No network address configured for node " & $dest)

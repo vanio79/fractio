@@ -198,7 +198,7 @@ proc writeMetaLocked(self: RaftLog) {.raises: [FractioError].} =
   finally:
     f.close()
 
-proc persistMeta*(self: RaftLog) {.raises: [FractioError].} =
+proc persistMeta*(self: RaftLog) {.gcsafe, raises: [FractioError].} =
   ## Public: acquire lock and write meta.
   acquire(self.lock)
   try:
@@ -208,29 +208,29 @@ proc persistMeta*(self: RaftLog) {.raises: [FractioError].} =
 
 # --- Public getters/setters with locking ---
 
-proc getCurrentTerm*(self: RaftLog): uint64 {.raises: [].} =
+proc getCurrentTerm*(self: RaftLog): uint64 {.gcsafe, raises: [].} =
   ## Get the current term from meta (thread-safe, no FractioError).
   acquire(self.lock)
   result = self.meta.currentTerm
   release(self.lock)
 
-proc setCurrentTerm*(self: RaftLog, term: uint64) {.raises: [].} =
+proc setCurrentTerm*(self: RaftLog, term: uint64) {.gcsafe, raises: [].} =
   ## Set the current term in meta (thread-safe, no FractioError).
   acquire(self.lock)
   self.meta.currentTerm = term
   release(self.lock)
 
-proc getVotedFor*(self: RaftLog): uint64 {.raises: [].} =
+proc getVotedFor*(self: RaftLog): uint64 {.gcsafe, raises: [].} =
   acquire(self.lock)
   result = self.meta.votedFor
   release(self.lock)
 
-proc setVotedFor*(self: RaftLog, nodeId: uint64) {.raises: [].} =
+proc setVotedFor*(self: RaftLog, nodeId: uint64) {.gcsafe, raises: [].} =
   acquire(self.lock)
   self.meta.votedFor = nodeId
   release(self.lock)
 
-proc getLastLogIndex*(self: RaftLog): uint64 {.raises: [].} =
+proc getLastLogIndex*(self: RaftLog): uint64 {.gcsafe, raises: [].} =
   ## Get the last log index, which is the maximum of the highest entry index
   ## and the snapshot index (if any). Reflects the logical end of the log.
   acquire(self.lock)
@@ -240,7 +240,7 @@ proc getLastLogIndex*(self: RaftLog): uint64 {.raises: [].} =
     result = self.snapshotIndex
   release(self.lock)
 
-proc getLastLogTerm*(self: RaftLog): uint64 {.raises: [].} =
+proc getLastLogTerm*(self: RaftLog): uint64 {.gcsafe, raises: [].} =
   ## Get the term of the last log entry. If the log is compacted to a snapshot,
   ## returns the snapshot's last term.
   acquire(self.lock)
@@ -250,27 +250,27 @@ proc getLastLogTerm*(self: RaftLog): uint64 {.raises: [].} =
     result = self.snapshotTerm
   release(self.lock)
 
-proc getCommitIndex*(self: RaftLog): uint64 {.raises: [].} =
+proc getCommitIndex*(self: RaftLog): uint64 {.gcsafe, raises: [].} =
   acquire(self.lock)
   result = self.meta.commitIndex
   release(self.lock)
 
-proc setCommitIndex*(self: RaftLog, idx: uint64) {.raises: [].} =
+proc setCommitIndex*(self: RaftLog, idx: uint64) {.gcsafe, raises: [].} =
   acquire(self.lock)
   self.meta.commitIndex = idx
   release(self.lock)
 
-proc getLastApplied*(self: RaftLog): uint64 {.raises: [].} =
+proc getLastApplied*(self: RaftLog): uint64 {.gcsafe, raises: [].} =
   acquire(self.lock)
   result = self.meta.lastApplied
   release(self.lock)
 
-proc setLastApplied*(self: RaftLog, idx: uint64) {.raises: [].} =
+proc setLastApplied*(self: RaftLog, idx: uint64) {.gcsafe, raises: [].} =
   acquire(self.lock)
   self.meta.lastApplied = idx
   release(self.lock)
 
-proc getSnapshotIndex*(self: RaftLog): uint64 {.raises: [].} =
+proc getSnapshotIndex*(self: RaftLog): uint64 {.gcsafe, raises: [].} =
   acquire(self.lock)
   result = self.snapshotIndex
   release(self.lock)
@@ -280,7 +280,8 @@ proc getSnapshotTerm*(self: RaftLog): uint64 {.raises: [].} =
   result = self.snapshotTerm
   release(self.lock)
 
-proc truncateFrom*(self: RaftLog, index: uint64) {.raises: [FractioError].} =
+proc truncateFrom*(self: RaftLog, index: uint64) {.gcsafe, raises: [
+    FractioError].} =
   ## Delete all entries at or after `index`. This includes removing them from
   ## memory and rewriting the log file to discard those bytes.
   ## Precondition: index > snapshotIndex and index <= lastIndex+1.
@@ -494,7 +495,7 @@ proc scanLog(self: RaftLog) {.raises: [FractioError].} =
       except:
         discard
 
-proc append*(self: RaftLog, entry: RaftEntry): uint64 {.raises: [
+proc append*(self: RaftLog, entry: RaftEntry): uint64 {.gcsafe, raises: [
     FractioError].} =
   ## Append a new entry to the log. The entry's index must be either lastIndex+1 or snapshotIndex+1 (if log empty).
   acquire(self.lock)
@@ -545,7 +546,7 @@ proc append*(self: RaftLog, entry: RaftEntry): uint64 {.raises: [
   self.meta.lastLogTerm = entry.term
   result = entry.index
 
-proc getEntry*(self: RaftLog, index: uint64): RaftEntry {.raises: [
+proc getEntry*(self: RaftLog, index: uint64): RaftEntry {.gcsafe, raises: [
     FractioError].} =
   ## Retrieve an entry by its index. Raises FractioError if index is compacted or missing.
   acquire(self.lock)
@@ -561,7 +562,7 @@ proc getEntry*(self: RaftLog, index: uint64): RaftEntry {.raises: [
     raise storageError("Entry vanished: " & $index, "")
 
 proc createSnapshot*(self: RaftLog, lastIncludedIndex, lastIncludedTerm: uint64,
-    data: seq[byte]): Snapshot {.raises: [FractioError].} =
+    data: seq[byte]): Snapshot {.gcsafe, raises: [FractioError].} =
   ## Create a snapshot of the state machine up to the given index. Removes compacted entries from memory.
   acquire(self.lock)
   defer: release(self.lock)
@@ -617,7 +618,7 @@ proc createSnapshot*(self: RaftLog, lastIncludedIndex, lastIncludedTerm: uint64,
   # Note: log file is NOT truncated
   result = Snapshot(lastIndex: lastIncludedIndex, lastTerm: lastIncludedTerm, data: data)
 
-proc installSnapshot*(self: RaftLog, snap: Snapshot) {.raises: [
+proc installSnapshot*(self: RaftLog, snap: Snapshot) {.gcsafe, raises: [
     FractioError].} =
   ## Install a snapshot received from the leader. This replaces the entire log state.
   acquire(self.lock)

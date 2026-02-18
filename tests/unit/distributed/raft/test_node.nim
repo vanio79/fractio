@@ -28,7 +28,7 @@ proc deliver*(t: MockTransport, fromNodeId: NodeId, msg: RaftMessage,
   t.node.receiveMessage(fromNodeId, msg, now)
 
 proc newNode*(nodeId: NodeId, peers: seq[NodeId], transport: RaftTransport,
-    now: int64, onApply: proc(entry: RaftEntry) {.raises: [].}): RaftNode =
+    now: int64, onApply: proc(entry: RaftEntry) {.closure, gcsafe, raises: [].}): RaftNode =
   if not existsDir("tmp"):
     createDir("tmp")
   let logDir = "tmp/raft_test_" & $nodeId
@@ -48,7 +48,7 @@ proc newNode*(nodeId: NodeId, peers: seq[NodeId], transport: RaftTransport,
   )
   result = newRaftNode(nodeId, log, transport, logger, config, onApply, now.uint64)
 
-var appliedEntries = newSeq[(NodeId, RaftEntry)]()
+# Removed appliedEntries; using node state directly.
 
 suite "RaftNode state machine":
 
@@ -59,7 +59,6 @@ suite "RaftNode state machine":
     currentTime: uint64
 
   setup:
-    appliedEntries = @[]
     startTime = 1_000_000_000
     currentTime = startTime.uint64
 
@@ -68,14 +67,11 @@ suite "RaftNode state machine":
     t3 = newMockTransport(nil)
 
     n1 = newNode(NodeId(1'u64), @[NodeId(2'u64), NodeId(3'u64)], t1, startTime,
-        proc(entry: RaftEntry) {.raises: [].} =
-      appliedEntries.add((NodeId(1'u64), entry)))
+        proc(entry: RaftEntry) {.closure, gcsafe, raises: [].} = discard)
     n2 = newNode(NodeId(2'u64), @[NodeId(1'u64), NodeId(3'u64)], t2, startTime,
-        proc(entry: RaftEntry) {.raises: [].} =
-      appliedEntries.add((NodeId(2'u64), entry)))
+        proc(entry: RaftEntry) {.closure, gcsafe, raises: [].} = discard)
     n3 = newNode(NodeId(3'u64), @[NodeId(1'u64), NodeId(2'u64)], t3, startTime,
-        proc(entry: RaftEntry) {.raises: [].} =
-      appliedEntries.add((NodeId(3'u64), entry)))
+        proc(entry: RaftEntry) {.closure, gcsafe, raises: [].} = discard)
 
     t1.node = n1
     t2.node = n2
@@ -199,9 +195,8 @@ suite "RaftNode state machine":
     check n1.matchIndex[NodeId(3'u64)] == 1
     check n1.commitIndex == 1
 
-    check appliedEntries.len >= 1
-    let (applier, appliedEntry) = appliedEntries[^1]
-    check applier == NodeId(1'u64)
+    check n1.lastApplied == 1'u64
+    let appliedEntry = n1.log.getEntry(n1.lastApplied)
     check appliedEntry.command.kind == expectedCmd.kind
 
   test "Non-leader command submission is rejected":

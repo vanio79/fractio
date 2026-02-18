@@ -103,7 +103,7 @@ type
 
 # Abstract methods for RaftTransport
 method send*(self: RaftTransport, dest: NodeId, msg: RaftMessage) {.raises: [
-    FractioError], base.} =
+    FractioError], gcsafe, base.} =
   ## Send a Raft message to the specified destination node.
   raise notImplementedError("RaftTransport.send must be overridden by concrete transport", "")
 

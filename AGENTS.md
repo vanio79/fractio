@@ -266,6 +266,17 @@ MAX_CLOCK_DRIFT_NS = 1_000_000         # 1ms
 
 **IMPORTANT**: SQL parser and AST types (`Query`, `SQLElement`, `ConditionRef`, etc.) have been temporarily removed from `types.nim` to unblock distributed features. Reintroduce in dedicated `sql/` module when needed.
 
+### 15. Raft Transport Implementation
+
+The Raft consensus requires a polymorphic transport interface for RPCs. Key lessons from recent fixes:
+
+- **Abstract Base Class**: `RaftTransport` is defined with virtual methods (`send`, `start`, `close`) using `method ... {.base.}` after the type block. Do NOT use fields for function pointers.
+- **Derived Overrides**: In derived classes (`RaftUDPTransport`), define `method send*`, `start*`, `close*` without `override` pragma unless base methods are visible across modules. Method definitions must be at column 0 (module level).
+- **Thread Start Order**: Set `serverRunning = true` BEFORE launching the receiver thread to avoid race where thread exits immediately due to false flag.
+- **Clean Shutdown**: In `close`, use `posix.shutdown(fd, SHUT_RD)` to unblock the `recvFrom` loop, then `joinThread`. This prevents hangs.
+- **Socket Creation**: When both `net` and `posix` are imported, disambiguate constants: `newSocket(net.AF_INET, net.SOCK_DGRAM, net.IPPROTO_UDP)`.
+- **Testing**: `test_raftudp.nim` provides codec (roundtrip) and integration (send/receive, large messages, errors) tests.
+
 ---
 
 **Remember:** Fractio must handle production loads. Think about concurrent access, memory usage, failure recovery, and monitoring from day one.
