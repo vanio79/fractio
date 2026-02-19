@@ -1,0 +1,51 @@
+# Build artifacts
+*.exe
+*.out
+*.app
+*.so
+*.dylib
+*.dll
+*.a
+*.lib
+*.o
+*.obj
+*.pdb
+*.idb
+*.ilk
+
+# Nim cache and build directories
+nimcache/
+.build/
+dist/
+
+# IDE and editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Testing
+tmp/
+testresults/
+test.txt
+test_*.nim
+test_*
+
+# Third-party libraries
+thirdparty/
+
+# Generated documentation
+docs/api/
+*.html
+
+# Logs
+*.log
+
+# Environment-specific
+.env
+config.local.nim
+
+# OS-specific
+Thumbs.db

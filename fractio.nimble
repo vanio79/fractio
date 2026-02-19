@@ -4,7 +4,7 @@ author        = "Fractio Team"
 description   = "A distributed SQL database with sharding and replication"
 license       = "MIT"
 
-# Dependencies (only Nim itself needed for current tests)
+# Dependencies
 requires "nim >= 1.6.0"
 
 # Build targets
@@ -17,4 +17,12 @@ task test, "Run all unit, integration, and concurrency tests":
     let name = extractFilename(file)
     if name.startsWith("test_") and name.endswith(".nim"):
       echo "Running tests: ", file
+      exec "nim c -r --checks:on -p:src " & file
+
+task test_storage, "Run only storage engine unit tests":
+  # Run storage tests from tests/unit/storage/
+  for file in walkDirRec("tests/unit/storage"):
+    let name = extractFilename(file)
+    if name.startsWith("test_") and name.endswith(".nim"):
+      echo "Running storage test: ", file
       exec "nim c -r --checks:on -p:src " & file

@@ -1,308 +1,220 @@
 # AGENTS.md - Guidelines for AI Agents Working on Fractio
 
-## Project Overview
+## 1. Memory & Context Protocol
 
-**Fractio** is a distributed SQL database implemented in Nim, featuring:
-- Sharding with consistent hashing
-- Replication with Raft consensus
-- ACID transactions with MVCC
-- Lock-free reads using version chains
-- High performance and thread safety
+**Dual-Stack Memory System** (OpenMemory + ChromaDB):
+- **Hot Memory**: Current sub-tasks, plans, local variables → `openmemory.recall_memory_abstract()` at session start; `openmemory_save_memory()` after edits.
+- **Cold Memory**: Full codebase index, architecture history → `chroma_search()` when entering new directories.
+- **Cleanup**: After feature completion, promote summary to ChromaDB and delete from OpenMemory.
 
-## Core Directives
+### Using OpenMemory (Short-term Memory)
+```nim
+# At the start of a session, recall previous context
+let memoryAbstract = openmemory.recall_memory_abstract()
 
-### 1. Code Quality Standards
+# Save important information during work
+openmemory_save_memory(
+  speaker="agent",
+  message="Completed implementation of snapshot tracking in LSMTree",
+  context="fractio-storage-snapshots"
+)
 
-**All code must be:**
-- Production-ready (no simplified examples)
-- Thread-safe (avoid shared mutable state, use atomic operations)
-- Fully unit tested with 100% coverage
-- Type-safe and compiled with strict Nim checks (`--checks:on`)
-- Error-handled with proper FractioError propagation
+# Get recent memories for detailed context
+let recentMemories = openmemory_get_recent_memories(max_days=3)
+```
 
-**Never:**
-- Use `// ... rest of code` or `// logic goes here` comments
-- Leave unimplemented stubs
-- Introduce blocking locks (distributed locks are forbidden unless explicitly requested)
-- Compromise on performance for "simplified" examples
+### Using ChromaDB (Long-term Memory)
+```nim
+# Create collections for different types of knowledge
+chroma_chroma_create_collection(collection_name="fractio-architecture")
+chroma_chroma_create_collection(collection_name="fractio-api-docs")
 
-### 2. Architecture Principles
+# Add documents to collections
+chroma_chroma_add_document_with_metadata(
+  collection_name="fractio-architecture",
+  document="LSMTree implementation uses WAL for durability and SSTables for persistence",
+  metadata=`{"module": "storage", "component": "lsm_tree"}`
+)
 
-**MVCC (Multi-Version Concurrency Control):**
-- All writes create new versions
-- Readers never block writers, writers never block readers
-- Use atomic timestamps from TimestampProvider
-- Implement version garbage collection
+# Query for relevant information
+let results = chroma_chroma_query_documents(
+  collection_name="fractio-architecture",
+  query_texts=@["How does LSMTree handle snapshots?"],
+  n_results=5
+)
+```
 
-**Sharding:**
-- Use consistent hashing ring (160-bit hash space)
-- Shard key must be immutable for row placement
-- Range-based sharding for sequential scans
-- Cross-shard queries use scatter-gather
+### Memory Cleanup Protocol
+After completing a feature:
+1. Summarize the work in a memory abstract
+2. Add the summary to the appropriate ChromaDB collection
+3. Clear temporary OpenMemory entries to avoid clutter
 
-**Replication:**
-- Primary-secondary topology with failover
-- Raft consensus for leader election and log replication
-- Synchronous replication for writes
-- Automatic rebalancing on node join/leave
+```nim
+# Example cleanup after implementing snapshot functionality
+let summary = "Implemented snapshot tracking in LSMTree with watermark-based garbage collection"
+chroma_chroma_add_document(
+  collection_name="fractio-architecture",
+  document=summary
+)
+# OpenMemory cleanup happens automatically after promoting to ChromaDB
+```
 
-**Thread Safety:**
-- Immutable data structures preferred
-- Use `atomic` operations for counters
-- Mutexes only for mutating shared structures (schema changes)
-- Each connection gets its own transaction context
-- Callbacks crossing thread boundaries (e.g., `onApply`) must be `{.closure, gcsafe.}`; never capture GC-managed globals
+---
 
-### 3. File Organization
+## 2. Build & Test Commands
+
+```bash
+# Run all tests (unit, integration, concurrency)
+nimble test
+
+# Run a single test file
+nim c -r --checks:on -p:src tests/unit/distributed/raft/test_node.nim
+
+# Run with race detector (if enabled)
+nim c -r --checks:on -d:release --threads:on -t:on tests/unit/...
+
+# Build the project (library)
+nimble build
+
+# Generate documentation
+nimble docs
+nim doc --project.json src/fractio/core/types.nim
+
+# coverage requires koch
+koch test --metrics  # with coverage metrics
+
+# Clean build artifacts
+nimble clean
+rm -rf tmp/
+```
+
+**Single Test Tip**: Find the exact path first with `find tests -name "test_*.nim"` then compile with `-r` to run immediately.
+
+---
+
+## 3. Code Style Guidelines
+
+### Formatting & Naming
+- **Indentation**: 2 spaces (no tabs)
+- **Procedures/variables**: `camelCase` (e.g., `beginTransaction`, `raftLog`)
+- **Types**: `UpperCamelCase` (e.g., `TransactionManager`, `RaftNode`)
+- **Filenames**: `snake_case.nim` (e.g., `raft_node.nim`, `mvcc_engine.nim`)
+- **Constants**: `SCREAMING_SNAKE_CASE` (e.g., `DEFAULT_TIMEOUT_NS`)
+
+### Imports
+- Use absolute imports from `src/fractio` root:
+  ```nim
+  import fractio/core/types
+  import fractio/distributed/raft/node
+  import fractio/storage/mvcc
+  ```
+- Group imports: std lib first, then third-party, then local; separate groups with blank line.
+- Avoid `*` wildcard imports.
+
+### Types & Structs
+- Prefer `ref object` for large/mutable structures; value objects for small, immutable data.
+- Discriminated unions (`case kind: DataType`) for sum types.
+- Use `distinct` for new types (e.g., `TransactionID = distinct int64`).
+
+### Error Handling
+- All public procs return `FractioError` or `Result[T, FractioError]`.
+- Use specific constructors: `syntaxError()`, `transactionError()`, etc. from `fractio/core/errors`.
+- Include context string for debugging.
+- Never use bare `raise`; wrap all errors.
+- Log errors via `fractio/utils/logging` with appropriate level.
+
+### Thread Safety
+- Immutable data preferred; share by copying.
+- Use `atomic` operations for counters/flags (`atomicInc`, `atomicLoad`).
+- Use `Mutex` only for mutating shared structures (e.g., schema changes). Protect with `acquire()`/`release()`.
+- Callbacks crossing threads must be `{.closure, gcsafe.}`; never capture GC-managed globals.
+- After `joinThread()`, access shared state directly; no manual `GC_fullCollect()`.
+
+### Memory
+- `ref object` for large structs; value semantics for small types (< 2 words).
+- Explicit `new()` for reference types.
+- `pointer` fields for OS mutexes; initialize via `createMutex()`.
+- ` destroy` only for non-GC resources; otherwise rely on GC.
+
+---
+
+## 4. Testing Standards
+
+- **100% line coverage required** - test every branch and edge case.
+- Framework: Nim `unittest` with `suite`, `test`, `setup`, `teardown`.
+- Tests must be deterministic (no `sleep` or wall-clock time); use mock clocks (`uint64` nanosecond time).
+- Concurrent tests: spawn threads, use barriers/latches, verify race conditions with `--threads:on -t:on`.
+- Save results to `tmp/test_results.txt` only for benchmark runs; otherwise rely on nimble output.
+- File organization:
+  ```
+  tests/
+    unit/        # module-level tests
+    integration/ # multi-component
+    concurrency/ # stress/race tests
+  ```
+
+---
+
+## 5. Project Architecture (Quick Reference)
 
 ```
 src/fractio/
-├── core/           # Types, errors, fundamental structures
-├── sql/            # Parser, planner, optimizer
-├── storage/        # MVCC engine, WAL, indexes
-├── distributed/    # Sharding, replication, consensus
-├── network/        # RPC, protocols, connection handling
-└── utils/          # Logging, metrics, config
-
-tests/
-├── unit/           # Unit tests for each module
-├── integration/    # Multi-component tests
-└── concurrency/    # Stress tests, race detection
-
-benchmarks/
-└── suite/          # Performance benchmarks
-
-simulations/
-└── cluster/        # Multi-node cluster simulations
-
-docs/
-├── api/            # API reference
-├── architecture/   # Design documents
-├── deployment/     # Production deployment guides
-└── examples/      # Usage examples
+├── core/         # types, errors, fundamental structs
+├── storage/      # MVCC engine, WAL, SSTables, indexes
+├── distributed/  # sharding, Raft consensus, time sync
+├── network/      # RPC, protocols, sockets
+├── sql/          # parser, planner (currently stubbed)
+└── utils/        # logging, config, metrics
 ```
 
-### 4. Testing Requirements
-
-- **100% line coverage required** - All code paths must be tested
-- Use Nim's built-in `unittest` framework
-- Tests must be deterministic (no timing dependencies)
-- Include edge cases and error conditions
-- Concurrent tests must demonstrate thread safety
-- Save latest test results to `tmp/test_results.txt`
-
-### 5. Implementation Order
-
-Build in this sequence:
-1. Core types and error handling
-2. MVCC storage engine
-3. Transaction manager
-4. SQL parser (minimal: SELECT, INSERT, CREATE)
-5. Query planner and executor
-6. Sharding manager
-7. Replication (Raft)
-8. Network layer
-9. Client protocol
-10. Integration tests
-
-### 6. Performance Considerations
-
-**Optimization priorities:**
-1. Lock-free reads (always)
-2. Zero-copy operations where possible
-3. Minimize allocations in hot paths
-4. Use `seq` instead of `array` for flexibility
-5. Cache frequent lookups (e.g., column positions)
-6. `{.noSideEffect.}` pragmas for pure functions
-
-**Do NOT optimize prematurely** - write clear code first, then profile.
-
-### 7. Error Handling
-
-- All public procedures return `FractioError` or use `Result[T, FractioError]`
-- Check and validate all inputs
-- Use specific error types from `errors.nim`
-- Log errors with context at appropriate level
-- Fail fast on unrecoverable errors
-
-### 8. Distributed Lock Policy
-
-**Absolute Rule:** Never introduce distributed locks (e.g., Zookeeper, etcd) unless:
-- User explicitly requests in issue/PR
-- Absolutely necessary for correctness (prove impossibility without)
-- Documented with justification in code comments
-
-**Alternatives:**
-- MVCC for read/write conflicts
-- Raft for consensus
-- CRDTs for convergent state
-- Gossip protocols for metadata
-
-### 9. Nim-Specific Guidelines
-
-**Style:**
-- 2-space indentation
-- `camelCase` for variables/procs
-- `UpperCamelCase` for types
-- `snake_case` for filenames
-- `[]` for generic parameters (no `<T>`)
-
-**Memory:**
-- Use `ref` objects for large structs
-- Prefer value semantics for small types
-- Explicit `new` for reference types
-- `destroy` for cleanup (GC is fine for most cases)
-
-**Concurrency:**
-- `async`/`await` for I/O operations
-- `atomic` for counters and flags
-- `Mutex` from `system` for critical sections
-- `spawn` from `threads` **not available in Nim 2.2+**; use `std/typedthreads` with `createThread(threadVar, workerProc, args)` instead
-- Worker procs must be marked `{.thread.}` and accept a typed tuple argument
-- Sharing `ref` objects across threads under ORC is allowed but must be passed explicitly as arguments to worker procs (do not capture in closures created in a `gcsafe` context)
-- `{.gcsafe.}` types can be shared safely; ensure callbacks (e.g., `onApply`) are also `gcsafe`
-- After joining threads, access shared state directly; manual `GC_fullCollect()` and clearing thread arrays may cause segfaults
-
-**Gotcha:**
-- Base class methods with `method ... {.base.}`; derived overrides use `method name*` without `override`
-- Shutdown sockets: call `posix.shutdown(fd, SHUT_RD)` to unblock `recvFrom`, then `joinThread`
-- Socket creation with both `net` and `posix`: `newSocket(net.AF_INET, net.SOCK_DGRAM, net.IPPROTO_UDP)`
-
-### 10. Documentation Requirements
-
-Every public proc/type must have:
-- Brief description (1-2 sentences)
-- Parameter descriptions
-- Return value description
-- Raised exceptions (if any)
-- Thread safety guarantees
-- Example usage (for complex APIs)
-
-Use Nim's doc comments: `##` for descriptions, `#` for inline.
-
-### 11. Git Workflow
-
-- Feature branches: `feature/feature-name`
-- Bugfix branches: `fix/bug-description`
-- Commit messages: imperative present tense ("Add X", not "Added X")
-- Include test coverage changes in PRs
-- Ensure `nimble test` passes before pushing
-
-### 12. When Stuck
-
-If you encounter:
-1. **Insufficient context** - Use `Read` on nearby files
-2. **Missing dependencies** - Check `fractio.nimble`
-3. **Unclear requirements** - Document assumptions and ask user
-4. **Performance vs simplicity** - Favor simplicity, add TODO comment
+**Key Modules**:
+- `core/types.nim` - Core domain types (`Row`, `Transaction`, `Shard`)
+- `core/errors.nim` - Error hierarchy (`FractioErrorKind`, constructors)
+- `storage/mvcc.nim` - Multi-version concurrency control
+- `distributed/raft/{types,log,node,udp}.nim` - Raft consensus
+- `distributed/sharedtimer.nim` - P2P time synchronization
+- `utils/logging.nim` - Structured logger
 
 ---
 
-## Quick Reference
+## 6. Critical Gotchas
 
-**Key types:**
-- `MVCCStorage` - storage engine
-- `TransactionManager` - transaction coordinator
-- `ShardManager` - shard placement
-- `RaftNode` - replication leader
-- `Query` - parsed SQL
-
-**Important modules:**
-- `types.nim` - All core types
-- `errors.nim` - Error definitions
-- `mvcc.nim` - Storage engine
-- `transaction.nim` - Transaction manager
-- `sharding.nim` - Sharding logic
-- `raft/{types,log,node,udp}.nim` - Raft consensus (state machine, log, transport)
-
-**Testing commands:**
-```bash
-nimble test          # Run all tests
-nimble docs          # Generate documentation
-koch test --metrics  # With coverage metrics
-```
-
----
-
-## 13. P2P Time Synchronization
-
-Fractio uses decentralized time sync for cluster-wide unique transaction IDs (no NTP/master).
-
-### Architecture
-- `SharedTimer`: orchestrator + ID generation
-- `UDPTransport`: production UDP with real sockets
-- `PacketCodec`: BOM-based packet serialization (thread-safe)
-- `MonotonicTimeProvider`: local monotonic clock
-
-### Protocol (BOM + NTP)
-- Request: `[BOM:u16][MSG:u8][t1:u64]` (11 bytes)
-- Response: `[BOM:u16][MSG:u8][t2:u64][t3:u64]` (19 bytes)
-- Offset: `((t2-t1)+(t3-t4))/2`
-- Delay: `(t4-t1)-(t3-t2)` (discard >100ms)
-- Filter: 2σ outlier rejection
-- Consensus: weighted median (confidence × weight)
-
-### Transaction IDs
-- Synced: `[42-bit ms-time][10-bit nodeId][12-bit counter]`
-- Fallback: `[16-bit nodeId][48-bit counter]`
-
-### Constants
-```nim
-DEFAULT_SYNC_INTERVAL = 1_000_000_000  # 1s
-REQUEST_TIMEOUT_NS = 100_000_000       # 100ms
-MAX_HISTORY_SIZE = 100
-OUTLIER_STDDEV_FACTOR = 2.0
-MIN_PEERS_FOR_CONSENSUS = 2
-MAX_CLOCK_DRIFT_NS = 1_000_000         # 1ms
-```
-
-### Integration
-- `TM.beginTransaction()` → `timeSync.getTransactionID()`
-- `TimestampProvider` → `timeSync.getSynchronizedTime()`
-- Scheduler: call `tick()` every `DEFAULT_SYNC_INTERVAL`
-
-### Testing
-- Unit: `test_packetcodec.nim` (33 tests), `test_udptransport.nim` (11), `test_sharedtimer.nim` (19)
-- Integration: `test_sharedtimer_udp_integration.nim` (9)
-- Scalability: 200 peers, 3 ticks ≈ 1.2ms, drift <1ms
-- Accuracy: consensus error ~28µs vs naive ~677µs
-
-### Important
-- `numericNodeId` must be unique (consistent hashing ring)
-- Monitor `getCurrentOffset()`; >1ms drift = network issues
-- Peer weights adjustable for trust
-
-### 14. SQL Parser Status
-
-**IMPORTANT**: SQL parser and AST types (`Query`, `SQLElement`, `ConditionRef`, etc.) have been temporarily removed from `types.nim` to unblock distributed features. Reintroduce in dedicated `sql/` module when needed.
-
-### 15. Raft Consensus Implementation
-
-Fractio uses Raft for leader election and log replication. The implementation is split across modules:
-
-- `raft/types.nim` - Core types: `RaftNode`, `RaftLog`, `RaftTransport` (abstract base), message types
-- `raft/log.nim` - Write-ahead log with atomic meta persistence, checksums, snapshot support
-- `raft/node.nim` - State machine (follower/candidate/leader), election timeouts, heartbeats, commit rule
-- `raft/udp.nim` - UDP transport with receiver thread, clean shutdown via `posix.shutdown`
-
-**Key Patterns**
-- **gcsafe callbacks**: `onApply` passed to `RaftNode` must be `{.closure, gcsafe, raises: [].}`. Never capture GC-managed globals; use node state directly.
-- **Thread safety**: `RaftLog` uses mutex for writes; reads via atomic snapshots. `RaftNode` protects `state`, `term`, `votedFor`, `commitIndex` with lock.
-- **Log replication**: Leader appends entry, followers ack, commit when `matchIndex` from majority reaches entry. `lastApplied` drives `onApply`.
-- **Snapshots**: Triggered when log grows too large; `createSnapshot(index, term, data)` compacts log to point, `InstallSnapshot` syncs followers.
-
-**Testing**
-- `test_node.nim`: 8 scenarios (election, heartbeats, replication, step-down, re-election, snapshots). 100% coverage of node.nim.
-- `test_replication.nim`: 7 tests specifically targeting log replication mechanics, conflict resolution, onApply error handling, applyEntries idempotence, leader changes, InstallSnapshot, and failure backoff. Complements `test_node.nim` to achieve full coverage.
-- `test_log.nim`: 16 tests (append, truncate, snapshot, recovery, checksums).
-- `test_raftudp.nim`: 15 tests (transport codec + integration: send/receive, large messages, errors).
-
-**Gotchas**
-- Base class: `RaftTransport` uses `method ... {.base.}`; derived overrides use `method name*` without `override`.
-- Start order: set `serverRunning` atomic BEFORE spawning receiver thread.
+### Raft
+- Base class: `RaftTransport` uses `method ... {.base.}`; overrides use `method name*` (no `override`).
+- Start order: set atomic `serverRunning` BEFORE spawning receiver thread.
 - Shutdown: call `posix.shutdown(fd, SHUT_RD)` to unblock `recvFrom`, then `joinThread`.
-- Socket creation: when both `net` and `posix` are imported, use `newSocket(net.AF_INET, net.SOCK_DGRAM, net.IPPROTO_UDP)`.
+- Socket creation: if both `net` and `posix` imported, use `newSocket(net.AF_INET, net.SOCK_DGRAM, net.IPPROTO_UDP)`.
+- `onApply` callback must be `{.closure, gcsafe, raises: [].}`; use node state, not globals.
+
+### MVCC
+- All writes create new versions; readers see consistent snapshot via `readSnapshot` timestamp.
+- Use `atomic` timestamps from `TimestampProvider`; never `getTime()` directly in transaction path.
+- Garbage collect old versions based on oldest active transaction.
+
+### Sharding
+- Shard key is immutable; row placement determined at INSERT.
+- Consistent hashing ring uses 160-bit hash space (`sha1`).
+- Cross-shard queries use scatter-gather; no distributed locks.
 
 ---
 
-**Remember:** Fractio must handle production loads. Think about concurrent access, memory usage, failure recovery, and monitoring from day one.
+## 7. Nim-Specific Notes
+
+- Compiler flags: Always `--checks:on` during development; `--define:release` for performance.
+- Concurrency: `std/typedthreads` with `createThread(threadVar, workerProc, args)`. Worker proc must be `{.thread.}` and accept typed tuple.
+- ORC GC: Sharing `ref` across threads allowed but must pass explicitly; do not capture in `gcsafe` closures.
+- Library target: Set `skipDirs` in `.nimble` to exclude `tests`, `benchmarks`, `docs`, `tmp`.
+
+---
+
+## 8. When Stuck
+
+1. **Missing context** → `Read` nearby files first.
+2. **Missing dependencies** → Check `fractio.nimble` `requires` section.
+3. **Unclear requirements** → Document assumptions, ask user; add `TODO` comments.
+4. **Performance vs clarity** → Favor clarity; profile before optimizing.
+
+---
+
+**Remember**: Fractio is production infrastructure. Prioritize correctness, thread safety, and deterministic behavior over cleverness.
