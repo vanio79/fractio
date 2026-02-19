@@ -107,12 +107,21 @@ proc diskSpace*(db: Database): StorageResult[uint64] =
 
 # Persistence
 proc persist*(db: Database, mode: PersistMode): StorageResult[void] =
-  if db.isPoisoned.load(moRelaxed):
+  # Check if database is already poisoned
+  if db.inner.isPoisoned.load(moRelaxed):
     return asErr(StorageError(kind: sePoisoned))
 
-  # In a full implementation, this would persist the journal
-  # For now, we'll return success
-  return okVoid()
+  # Get the journal from supervisor
+  if db.inner.supervisor.inner.journal != nil:
+    let journal = db.inner.supervisor.inner.journal[]
+    let persistResult = journal.persist(mode)
+    if persistResult.isErr:
+      # Mark database as poisoned on persist failure
+      # This prevents future writes as consistency cannot be guaranteed
+      db.inner.isPoisoned.store(true, moRelease)
+      return asErr(StorageError(kind: sePoisoned))
+
+  return okVoid
 
 proc cacheCapacity*(db: Database): uint64 =
   # In a full implementation, this would return cache capacity
@@ -213,13 +222,15 @@ proc createNew*(dbType: typeDesc[Database], config: Config): StorageResult[Datab
   try:
     createDir(config.path)
   except OSError:
-    return asErr(StorageError(kind: seIo, ioError: "Failed to create database directory"))
+    return asErr(StorageError(kind: seIo,
+        ioError: "Failed to create database directory"))
 
   let keyspacesFolderPath = config.path / KEYSPACES_FOLDER
   try:
     createDir(keyspacesFolderPath)
   except OSError:
-    return asErr(StorageError(kind: seIo, ioError: "Failed to create keyspaces directory"))
+    return asErr(StorageError(kind: seIo,
+        ioError: "Failed to create keyspaces directory"))
 
   # Create version marker
   let versionMarkerPath = config.path / VERSION_MARKER
@@ -230,7 +241,8 @@ proc createNew*(dbType: typeDesc[Database], config: Config): StorageResult[Datab
     versionFile.write(buffer)
     versionFile.close()
   else:
-    return asErr(StorageError(kind: seIo, ioError: "Failed to create version marker"))
+    return asErr(StorageError(kind: seIo,
+        ioError: "Failed to create version marker"))
 
   # Sync directories
   discard fsyncDirectory(keyspacesFolderPath)
