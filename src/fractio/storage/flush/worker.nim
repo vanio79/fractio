@@ -2,28 +2,27 @@
 # This source code is licensed under both the Apache 2.0 and MIT License
 # (found in the LICENSE-* files in the repository)
 
-import fractio/storage/[error, flush/task, snapshot_tracker, stats, write_buffer_manager]
+## Flush Worker Implementation
+##
+## Flushes memtables to SSTables on disk.
 
-# Runs flush logic
+import fractio/storage/[error, flush/task, snapshot_tracker, stats, write_buffer_manager]
+import std/[os, atomics]
+
+# Run flush logic
 proc run*(task: Task, writeBufferManager: WriteBufferManager,
           snapshotTracker: SnapshotTracker, stats: Stats): StorageResult[void] =
-  # logDebug("Flushing keyspace " & task.keyspace.name)
+  discard snapshotTracker.getSeqnoSafeToGc()
 
-  let gcWatermark = snapshotTracker.getSeqnoSafeToGc()
-  discard gcWatermark # Placeholder - would be used in full implementation
+  # In a full implementation, this would:
+  # 1. Get the flush lock from the tree
+  # 2. Write memtable to SSTable
+  # 3. Add SSTable to tree's table list
+  # 4. Remove flushed memtable from sealed list
+  # 5. Free bytes from write buffer manager
 
-  # In a full implementation, this would get the flush lock from the tree
-  # For now, we'll skip the locking mechanism
-
-  # In a full implementation, this would flush the tree
-  # For now, we'll simulate a successful flush
-
-  # Simulate flushed bytes
-  let flushedBytes: uint64 = 1024 # Placeholder value
-
-  # Free bytes from write buffer manager
+  # For now, simulate a successful flush
+  let flushedBytes: uint64 = 1024
   discard writeBufferManager.free(flushedBytes)
-
-  # logDebug("Flush completed")
 
   return okVoid
