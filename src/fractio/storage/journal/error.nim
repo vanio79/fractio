@@ -22,4 +22,4 @@ type
 
 # String representation
 proc `$`*(error: RecoveryError): string =
-  "RecoveryError(" & $error & ")"
+  "RecoveryError(" & repr(error) & ")"

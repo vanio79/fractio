@@ -14,31 +14,34 @@ const VERSION_MARKER* = "version"
 
 const LSM_CURRENT_VERSION_MARKER* = "current"
 
-# For non-Windows platforms, we can fsync directories
 when not defined(windows):
   proc fsyncDirectory*(path: string): StorageResult[void] =
     var fd = posix.open(path, posix.O_RDONLY)
     if fd == -1:
-      return StorageError(kind: seIo, ioError: "Failed to open directory: " &
-          path).toFractioError()
+      return asErr(StorageError(kind: seIo,
+          ioError: "Failed to open directory: " & path))
 
     defer:
       discard posix.close(fd)
 
-    let statBuf = posix.fstat(fd)
-    if statBuf.st_mode != S_IFDIR:
-      return StorageError(kind: seIo, ioError: "Path is not a directory: " &
-          path).toFractioError()
+    var statBuf: posix.Stat
+    if posix.fstat(fd, statBuf) != 0:
+      return asErr(StorageError(kind: seIo,
+          ioError: "Failed to stat directory: " & path))
+
+    if not posix.S_ISDIR(statBuf.st_mode):
+      return asErr(StorageError(kind: seIo,
+          ioError: "Path is not a directory: " & path))
 
     if posix.fsync(fd) == -1:
-      return StorageError(kind: seIo, ioError: "Failed to fsync directory: " &
-          path).toFractioError()
+      return asErr(StorageError(kind: seIo,
+          ioError: "Failed to fsync directory: " & path))
 
-    return ok()
+    return okVoid()
 
 # On Windows, fsync directory is a no-op
 when defined(windows):
   proc fsyncDirectory*(path: string): StorageResult[void] =
-    return ok()
+    return okVoid()
 
 

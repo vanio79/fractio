@@ -2,7 +2,11 @@
 # This source code is licensed under both the Apache 2.0 and MIT License
 # (found in the LICENSE-* files in the repository)
 
-import fractio/storage/[error, types, journal/[entry, reader]]
+import fractio/storage/[error, types]
+import fractio/storage/journal/entry
+import fractio/storage/journal/reader
+import fractio/storage/journal/writer # For Hasher type
+import fractio/storage/journal/error # For RecoveryError
 import std/[streams, os, hashes]
 
 # Forward declarations
@@ -55,14 +59,14 @@ proc truncateTo*(batchReader: JournalBatchReader,
   # In a full implementation, this would truncate the file
   # For now, we just update the position
   batchReader.lastValidPos = lastValidPos
-  return ok()
+  return okVoid()
 
 # On close
 proc onClose*(batchReader: JournalBatchReader): StorageResult[void] =
   if batchReader.isInBatch:
     # Discard batch
     return batchReader.truncateTo(batchReader.lastValidPos)
-  return ok()
+  return okVoid()
 
 # Iterator for JournalBatchReader
 iterator items*(batchReader: JournalBatchReader): StorageResult[Batch] =
@@ -75,25 +79,25 @@ iterator items*(batchReader: JournalBatchReader): StorageResult[Batch] =
     # For now, we'll simulate this with a simple check
     if not batchReader.reader.reader.atEnd:
       let decodeResult = decodeFrom(batchReader.reader.reader)
-      if decodeResult.isOk():
-        nextItem = ok(decodeResult.get())
+      if decodeResult.isOk:
+        nextItem = ok[Entry, StorageError](decodeResult.value)
         hasNext = true
       else:
-        nextItem = err(decodeResult.error())
+        nextItem = err[Entry, StorageError](decodeResult.err[])
         hasNext = true
 
     if not hasNext:
       let closeResult = batchReader.onClose()
-      if closeResult.isErr():
-        yield err(closeResult.error())
+      if not closeResult.isOk:
+        yield err[Batch, StorageError](closeResult.err[])
       break
 
     let itemResult = nextItem
-    if itemResult.isErr():
-      yield err(itemResult.error())
+    if not itemResult.isOk:
+      yield err[Batch, StorageError](itemResult.err[])
       break
 
-    let item = itemResult.get()
+    let item = itemResult.value
     let journalFilePos = batchReader.reader.lastValidPos
 
     case item.kind
@@ -101,8 +105,8 @@ iterator items*(batchReader: JournalBatchReader): StorageResult[Batch] =
       if batchReader.isInBatch:
         # Discard batch
         let truncateResult = batchReader.truncateTo(batchReader.lastValidPos)
-        if truncateResult.isErr():
-          yield err(truncateResult.error())
+        if not truncateResult.isOk:
+          yield err[Batch, StorageError](truncateResult.err[])
         break
 
       batchReader.isInBatch = true
@@ -111,15 +115,15 @@ iterator items*(batchReader: JournalBatchReader): StorageResult[Batch] =
 
     of ekEnd:
       if batchReader.batchCounter > 0:
-        yield err(StorageError(kind: seJournalRecovery,
+        yield err[Batch, StorageError](StorageError(kind: seJournalRecovery,
                               journalRecoveryError: reInsufficientLength))
         break
 
       if not batchReader.isInBatch:
         # Discard batch
         let truncateResult = batchReader.truncateTo(batchReader.lastValidPos)
-        if truncateResult.isErr():
-          yield err(truncateResult.error())
+        if not truncateResult.isOk:
+          yield err[Batch, StorageError](truncateResult.err[])
         break
 
       # In a full implementation, this would check the checksum
@@ -138,7 +142,7 @@ iterator items*(batchReader: JournalBatchReader): StorageResult[Batch] =
       batchReader.items.setLen(0)
       batchReader.clearedKeyspaces.setLen(0)
 
-      yield ok(Batch(
+      yield ok[Batch, StorageError](Batch(
         seqno: batchReader.batchSeqno,
         items: batchItems,
         clearedKeyspaces: clearedKeyspaces
@@ -151,12 +155,12 @@ iterator items*(batchReader: JournalBatchReader): StorageResult[Batch] =
       if not batchReader.isInBatch:
         # Discard batch
         let truncateResult = batchReader.truncateTo(batchReader.lastValidPos)
-        if truncateResult.isErr():
-          yield err(truncateResult.error())
+        if not truncateResult.isOk:
+          yield err[Batch, StorageError](truncateResult.err[])
         break
 
       if batchReader.batchCounter == 0:
-        yield err(StorageError(kind: seJournalRecovery,
+        yield err[Batch, StorageError](StorageError(kind: seJournalRecovery,
                               journalRecoveryError: reTooManyItems))
         break
 
@@ -176,12 +180,12 @@ iterator items*(batchReader: JournalBatchReader): StorageResult[Batch] =
       if not batchReader.isInBatch:
         # Discard batch
         let truncateResult = batchReader.truncateTo(batchReader.lastValidPos)
-        if truncateResult.isErr():
-          yield err(truncateResult.error())
+        if not truncateResult.isOk:
+          yield err[Batch, StorageError](truncateResult.err[])
         break
 
       if batchReader.batchCounter == 0:
-        yield err(StorageError(kind: seJournalRecovery,
+        yield err[Batch, StorageError](StorageError(kind: seJournalRecovery,
                               journalRecoveryError: reTooManyItems))
         break
 

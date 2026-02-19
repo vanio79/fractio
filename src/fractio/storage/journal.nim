@@ -2,16 +2,21 @@
 # This source code is licensed under both the Apache 2.0 and MIT License
 # (found in the LICENSE-* files in the repository)
 
-import fractio/storage/[error, types, file, journal/[writer, reader,
-    batch_reader, recovery, manager]]
+import fractio/storage/[error, types, file]
+import fractio/storage/journal/writer
+import fractio/storage/journal/reader
+import fractio/storage/journal/batch_reader
+import fractio/storage/journal/recovery
+import fractio/storage/journal/manager
 import std/[os, locks]
 
 # Journal type
 type
   Journal* = ref object
-    writer*: Lock[Writer] # Using Lock as equivalent to Mutex
+    writer*: Writer
+    lock*: Lock # Separate lock for synchronization
 
-# Debug representation
+                # Debug representation
 proc `$`*(journal: Journal): string =
   # In a full implementation, this would return the path
   "Journal"
@@ -19,47 +24,45 @@ proc `$`*(journal: Journal): string =
 # Constructor from file
 proc fromFile*(path: string): StorageResult[Journal] =
   let writerResult = fromFile(path)
-  if writerResult.isErr():
-    return err(writerResult.error())
+  if not writerResult.isOk:
+    return err[Journal, StorageError](writerResult.err[])
 
-  let writer = writerResult.get()
-  var lock: Lock[Writer]
+  let writer = writerResult.value
+  var lock: Lock
   initLock(lock)
   # In a full implementation, we would store the writer in the lock
   # For now, we'll just create a new journal
 
-  return ok(Journal())
+  return ok[Journal, StorageError](Journal())
 
 # Create new journal
 proc createNew*(path: string): StorageResult[Journal] =
-  logDebug("Creating new journal at " & path)
-
   # Create directory if it doesn't exist
   let folder = path.splitFile().dir
   try:
     createDir(folder)
   except OSError:
-    logError("Failed to create journal folder at: " & path)
-    return err(StorageError(kind: seIo, ioError: "Failed to create journal folder"))
+    return err[Journal, StorageError](StorageError(kind: seIo,
+        ioError: "Failed to create journal folder"))
 
   # Create writer
   let writerResult = createNew(path)
-  if writerResult.isErr():
-    return err(writerResult.error())
+  if not writerResult.isOk:
+    return err[Journal, StorageError](writerResult.err[])
 
-  let writer = writerResult.get()
+  let writer = writerResult.value
 
   # Sync directory
   let syncResult = fsyncDirectory(folder)
-  if syncResult.isErr():
-    return err(syncResult.error())
+  if not syncResult.isOk:
+    return err[Journal, StorageError](syncResult.err[])
 
-  var lock: Lock[Writer]
+  var lock: Lock
   initLock(lock)
   # In a full implementation, we would store the writer in the lock
   # For now, we'll just create a new journal
 
-  return ok(Journal())
+  return ok[Journal, StorageError](Journal())
 
 # Get writer
 proc getWriter*(journal: Journal): Writer =
@@ -77,11 +80,11 @@ proc path*(journal: Journal): string =
 proc getReader*(journal: Journal): StorageResult[JournalBatchReader] =
   let path = journal.path()
   let rawReaderResult = newJournalReader(path)
-  if rawReaderResult.isErr():
-    return err(rawReaderResult.error())
+  if not rawReaderResult.isOk:
+    return err[JournalBatchReader, StorageError](rawReaderResult.err[])
 
-  let rawReader = rawReaderResult.get()
-  return ok(newJournalBatchReader(rawReader))
+  let rawReader = rawReaderResult.value
+  return ok[JournalBatchReader, StorageError](newJournalBatchReader(rawReader))
 
 # Persist the journal
 proc persist*(journal: Journal, mode: PersistMode): StorageResult[void] =

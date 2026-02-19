@@ -38,6 +38,9 @@ type
     items*: seq[Item]
     diskSpaceInBytes*: uint64
 
+# Forward declaration - must be after JournalManager type
+proc sealedJournalCount*(manager: JournalManager): int
+
 # Constructor
 proc newJournalManager*(): JournalManager =
   JournalManager(
@@ -48,6 +51,7 @@ proc newJournalManager*(): JournalManager =
 # Clear all items
 proc clear*(manager: JournalManager) =
   manager.items.setLen(0)
+  manager.diskSpaceInBytes = 0
 
 # Enqueue an item
 proc enqueue*(manager: JournalManager, item: Item) =
@@ -57,7 +61,7 @@ proc enqueue*(manager: JournalManager, item: Item) =
 # Returns the amount of journals
 proc journalCount*(manager: JournalManager): int =
   # NOTE: + 1 = active journal
-  manager.sealedJournalCount() + 1
+  sealedJournalCount(manager) + 1
 
 # Returns the amount of sealed journals
 proc sealedJournalCount*(manager: JournalManager): int =
@@ -82,8 +86,6 @@ proc getKeyspacesToFlushForOldestJournalEviction*(manager: JournalManager): seq[
 
 # Performs maintenance, maybe deleting some old journals
 proc maintenance*(manager: JournalManager): StorageResult[void] =
-  logDebug("Running journal maintenance")
-
   while manager.items.len > 0:
     let item = manager.items[0]
 
@@ -103,26 +105,28 @@ proc maintenance*(manager: JournalManager): StorageResult[void] =
     try:
       removeFile(item.path)
     except OSError:
-      logError("Failed to clean up stale journal file at: " & item.path)
-      return err(StorageError(kind: seIo,
+      return err[void, StorageError](StorageError(kind: seIo,
           ioError: "Failed to remove journal file"))
 
     manager.diskSpaceInBytes = manager.diskSpaceInBytes - item.sizeInBytes
     manager.items.delete(0)
 
-  return ok()
+  return okVoid
 
 # Rotate journal
 proc rotateJournal*(manager: JournalManager, journalWriter: Writer,
                     watermarks: seq[EvictionWatermark]): StorageResult[void] =
-  let journalSize = journalWriter.len().valueOr:
-    return err(error)
+  let journalSizeResult = journalWriter.len()
+  if not journalSizeResult.isOk:
+    return err[void, StorageError](journalSizeResult.err[])
+
+  let journalSize = journalSizeResult.value
 
   let rotateResult = journalWriter.rotate()
-  if rotateResult.isErr():
-    return err(rotateResult.error())
+  if not rotateResult.isOk:
+    return err[void, StorageError](rotateResult.err[])
 
-  let (sealedPath, _) = rotateResult.get()
+  let sealedPath = rotateResult.value[0]
 
   manager.enqueue(Item(
     path: sealedPath,
@@ -130,4 +134,4 @@ proc rotateJournal*(manager: JournalManager, journalWriter: Writer,
     sizeInBytes: journalSize
   ))
 
-  return ok()
+  return okVoid

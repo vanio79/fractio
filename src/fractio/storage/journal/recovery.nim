@@ -2,7 +2,7 @@
 # This source code is licensed under both the Apache 2.0 and MIT License
 # (found in the LICENSE-* files in the repository)
 
-import fractio/storage/[error, types, journal/writer]
+import fractio/storage/[error, types, journal/writer, journal/error]
 import std/[os, strutils, algorithm]
 
 # Journal ID type
@@ -37,7 +37,7 @@ proc recoverJournals*(path: string, compression: CompressionType,
         let journalId = try:
           JournalId(parseBiggestInt(basename))
         except ValueError:
-          return err(StorageError(kind: seJournalRecovery,
+          return err[RecoveryResult, StorageError](StorageError(kind: seJournalRecovery,
                                  journalRecoveryError: reInvalidFileName))
 
         maxJournalId = max(maxJournalId, journalId)
@@ -50,12 +50,14 @@ proc recoverJournals*(path: string, compression: CompressionType,
   # Process the last fragment as active journal
   if journalFragments.len > 0:
     let activeFragment = journalFragments.pop()
-    let activeWriter = fromFile(activeFragment[1]).valueOr:
-      return err(error)
+    let activeWriterResult = fromFile(activeFragment[1])
+    if not activeWriterResult.isOk:
+      return err[RecoveryResult, StorageError](activeWriterResult.err[])
 
+    let activeWriter = activeWriterResult.value
     activeWriter.setCompression(compression, compressionThreshold)
 
-    return ok(RecoveryResult(
+    return ok[RecoveryResult, StorageError](RecoveryResult(
       active: activeWriter,
       sealed: journalFragments,
       wasActiveCreated: false
@@ -64,12 +66,14 @@ proc recoverJournals*(path: string, compression: CompressionType,
     # Create new journal
     let id = maxJournalId + 1
     let journalPath = path / $id & ".jnl"
-    let newWriter = createNew(journalPath).valueOr:
-      return err(error)
+    let newWriterResult = createNew(journalPath)
+    if not newWriterResult.isOk:
+      return err[RecoveryResult, StorageError](newWriterResult.err[])
 
+    let newWriter = newWriterResult.value
     newWriter.setCompression(compression, compressionThreshold)
 
-    return ok(RecoveryResult(
+    return ok[RecoveryResult, StorageError](RecoveryResult(
       active: newWriter,
       sealed: @[],
       wasActiveCreated: true

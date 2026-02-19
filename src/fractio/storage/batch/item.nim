@@ -28,7 +28,7 @@ proc `$`*(item: Item): string =
     of vtWeakTombstone: "W"
     of vtIndirection: "Vb" # Assuming this exists in ValueType
 
-  $item.keyspace.id & ":" & $item.key & ":" & valueTypeStr & " => " & $item.value
+  $item.keyspace.inner.id & ":" & $item.key & ":" & valueTypeStr & " => " & $item.value
 
 # Constructor
 proc newItem*(keyspace: Keyspace, key: UserKey, value: UserValue,
@@ -40,7 +40,7 @@ proc newItem*(keyspace: Keyspace, key: UserKey, value: UserValue,
   assert(key.len <= 65535, "Keys can be up to 65535 bytes long")
 
   # Validate value length (up to 2^32 bytes)
-  assert(value.len <= uint32.high, "Values can be up to 2^32 bytes long")
+  assert(value.len <= int(uint32.high), "Values can be up to 2^32 bytes long")
 
   Item(
     keyspace: keyspace,

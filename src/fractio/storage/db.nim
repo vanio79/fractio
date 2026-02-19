@@ -108,11 +108,11 @@ proc diskSpace*(db: Database): StorageResult[uint64] =
 # Persistence
 proc persist*(db: Database, mode: PersistMode): StorageResult[void] =
   if db.isPoisoned.load(moRelaxed):
-    return err(StorageError(kind: sePoisoned))
+    return asErr(StorageError(kind: sePoisoned))
 
   # In a full implementation, this would persist the journal
   # For now, we'll return success
-  return ok()
+  return okVoid()
 
 proc cacheCapacity*(db: Database): uint64 =
   # In a full implementation, this would return cache capacity
@@ -144,7 +144,7 @@ proc createOrRecover*(dbType: typeDesc[Database],
 proc deleteKeyspace*(db: Database, handle: Keyspace): StorageResult[void] =
   # In a full implementation, this would delete the keyspace
   # For now, we'll return success
-  return ok()
+  return okVoid()
 
 proc keyspace*(db: Database, name: string,
                createOptions: proc(): KeyspaceCreateOptions): StorageResult[Keyspace] =
@@ -154,7 +154,7 @@ proc keyspace*(db: Database, name: string,
 
   # In a full implementation, this would create or open a keyspace
   # For now, we'll return an error
-  return err(StorageError(kind: seStorage, storageError: "Not implemented"))
+  return asErr(StorageError(kind: seStorage, storageError: "Not implemented"))
 
 proc keyspaceCount*(db: Database): int =
   # In a full implementation, this would return the number of keyspaces
@@ -186,11 +186,11 @@ proc visibleSeqno*(db: Database): SeqNo =
 proc checkVersion*(path: string): StorageResult[void] =
   let versionMarkerPath = path / VERSION_MARKER
   if not existsFile(versionMarkerPath):
-    return err(StorageError(kind: seInvalidVersion, invalidVersion: none(uint32)))
+    return asErr(StorageError(kind: seInvalidVersion, invalidVersion: none(uint32)))
 
   # In a full implementation, this would read and parse the version
   # For now, we'll assume version 3
-  return ok()
+  return okVoid()
 
 # Recovery
 proc recover*(dbType: typeDesc[Database], config: Config): StorageResult[Database] =
@@ -203,7 +203,7 @@ proc recover*(dbType: typeDesc[Database], config: Config): StorageResult[Databas
 
   # In a full implementation, this would perform database recovery
   # For now, we'll return an error
-  return err(StorageError(kind: seStorage, storageError: "Not implemented"))
+  return asErr(StorageError(kind: seStorage, storageError: "Not implemented"))
 
 # Create new database
 proc createNew*(dbType: typeDesc[Database], config: Config): StorageResult[Database] =
@@ -213,13 +213,13 @@ proc createNew*(dbType: typeDesc[Database], config: Config): StorageResult[Datab
   try:
     createDir(config.path)
   except OSError:
-    return err(StorageError(kind: seIo, ioError: "Failed to create database directory"))
+    return asErr(StorageError(kind: seIo, ioError: "Failed to create database directory"))
 
   let keyspacesFolderPath = config.path / KEYSPACES_FOLDER
   try:
     createDir(keyspacesFolderPath)
   except OSError:
-    return err(StorageError(kind: seIo, ioError: "Failed to create keyspaces directory"))
+    return asErr(StorageError(kind: seIo, ioError: "Failed to create keyspaces directory"))
 
   # Create version marker
   let versionMarkerPath = config.path / VERSION_MARKER
@@ -230,7 +230,7 @@ proc createNew*(dbType: typeDesc[Database], config: Config): StorageResult[Datab
     versionFile.write(buffer)
     versionFile.close()
   else:
-    return err(StorageError(kind: seIo, ioError: "Failed to create version marker"))
+    return asErr(StorageError(kind: seIo, ioError: "Failed to create version marker"))
 
   # Sync directories
   discard fsyncDirectory(keyspacesFolderPath)
@@ -238,4 +238,4 @@ proc createNew*(dbType: typeDesc[Database], config: Config): StorageResult[Datab
 
   # In a full implementation, this would create a new database
   # For now, we'll return an error
-  return err(StorageError(kind: seStorage, storageError: "Not implemented"))
+  return asErr(StorageError(kind: seStorage, storageError: "Not implemented"))

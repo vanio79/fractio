@@ -2,12 +2,8 @@
 # This source code is licensed under both the Apache 2.0 and MIT License
 # (found in the LICENSE-* files in the repository)
 
-import fractio/storage/[error, types, guard, readable]
-
-# Forward declarations
-type
-  SnapshotNonce* = object
-    instant*: SeqNo
+import fractio/storage/[error, types, guard, readable, snapshot_tracker]
+import std/options
 
 type
   Snapshot* = ref object
@@ -25,30 +21,28 @@ proc seqno*(self: Snapshot): SeqNo =
 proc get*(self: Snapshot, keyspace: Keyspace, key: string): StorageResult[
     Option[UserValue]] =
   # Placeholder implementation
-  # In full implementation, this would call keyspace.tree.get(key, self.nonce.instant)
-  return err(StorageError(kind: seStorage, storageError: "Not implemented"))
+  return err[Option[UserValue], StorageError](StorageError(kind: seStorage,
+      storageError: "Not implemented"))
 
 proc containsKey*(self: Snapshot, keyspace: Keyspace,
     key: string): StorageResult[bool] =
   # Placeholder implementation
-  # In full implementation, this would call keyspace.tree.containsKey(key, self.nonce.instant)
-  return err(StorageError(kind: seStorage, storageError: "Not implemented"))
+  return err[bool, StorageError](StorageError(kind: seStorage,
+      storageError: "Not implemented"))
 
 proc firstKeyValue*(self: Snapshot, keyspace: Keyspace): Option[Guard] =
   # Placeholder implementation
-  # In full implementation, this would return self.iter(keyspace).next()
   return none(Guard)
 
 proc lastKeyValue*(self: Snapshot, keyspace: Keyspace): Option[Guard] =
   # Placeholder implementation
-  # In full implementation, this would return self.iter(keyspace).nextBack()
   return none(Guard)
 
 proc sizeOf*(self: Snapshot, keyspace: Keyspace, key: string): StorageResult[
     Option[uint32]] =
   # Placeholder implementation
-  # In full implementation, this would call keyspace.tree.sizeOf(key, self.nonce.instant)
-  return err(StorageError(kind: seStorage, storageError: "Not implemented"))
+  return err[Option[uint32], StorageError](StorageError(kind: seStorage,
+      storageError: "Not implemented"))
 
 proc iter*(self: Snapshot, keyspace: Keyspace): Iter =
   # Placeholder implementation

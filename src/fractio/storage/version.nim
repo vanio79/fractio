@@ -2,16 +2,13 @@
 # This source code is licensed under both the Apache 2.0 and MIT License
 # (found in the LICENSE-* files in the repository)
 
+import options
 import fractio/storage/error
+import fractio/storage/types
 
-# Disk format version
-type
-  FormatVersion* = enum
-    fvV1 # Version for 1.x.x releases
-    fvV2 # Version for 2.x.x releases
-    fvV3 # Version for 3.x.x releases
+export types.FormatVersion
 
-         # Convert FormatVersion to uint8
+# Convert FormatVersion to uint8
 proc toUint8*(version: FormatVersion): uint8 =
   case version
   of fvV1: 1
@@ -21,10 +18,13 @@ proc toUint8*(version: FormatVersion): uint8 =
 # Convert uint8 to FormatVersion
 proc fromUint8*(value: uint8): StorageResult[FormatVersion] =
   case value
-  of 1: ok(fvV1)
-  of 2: ok(fvV2)
-  of 3: ok(fvV3)
-  else: err(StorageError(kind: seInvalidVersion, invalidVersion: some(uint32(value))))
+  of 1: ok[FormatVersion, StorageError](fvV1)
+  of 2: ok[FormatVersion, StorageError](fvV2)
+  of 3: ok[FormatVersion, StorageError](fvV3)
+  else:
+    # Create error with proper discriminant and required field
+    err[FormatVersion, StorageError](StorageError(kind: seInvalidVersion,
+        invalidVersion: none(FormatVersion)))
 
 # String representation
 proc `$`*(version: FormatVersion): string =

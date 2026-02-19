@@ -2,9 +2,13 @@
 # This source code is licensed under both the Apache 2.0 and MIT License
 # (found in the LICENSE-* files in the repository)
 
-import fractio/storage/[error, types, file, keyspace/[options, name, write_delay, config],
-                       flush, journal, snapshot, snapshot_tracker, stats, supervisor]
-import std/[os, atomics, locks, times]
+import fractio/storage/[error, types, file, flush, journal, snapshot,
+    snapshot_tracker, stats, supervisor, lsm_tree]
+import fractio/storage/keyspace/options
+import fractio/storage/keyspace/name
+import fractio/storage/keyspace/write_delay
+import fractio/storage/keyspace/config
+import std/[os, atomics, locks, times, options]
 
 # Keyspace key (a.k.a. column family, locality group)
 type
@@ -18,6 +22,10 @@ type
   LockedFileGuard* = object
   AnyTree* = object
   WorkerMessage* = object
+  WorkerMessager* = object # Placeholder for message channel
+  Iter* = object # Placeholder for iterator type
+  Guard* = object # Placeholder for guard type
+  Writer* = object # Placeholder for journal writer type
 
 # Apply configuration to base config
 proc applyToBaseConfig*(config: lsm_tree.Config,
@@ -49,7 +57,7 @@ type
 
     supervisor*: Supervisor
     stats*: Stats
-    workerMessager*: object # Placeholder for message channel
+    workerMessager*: WorkerMessager # Placeholder for message channel
 
     lockFile*: LockedFileGuard
 
@@ -61,46 +69,23 @@ type
 # Constructor from database
 proc fromDatabase*(keyspaceId: InternalKeyspaceId, db: Database, tree: AnyTree,
                    name: KeyspaceKey, config: CreateOptions): Keyspace =
-  Keyspace(inner: KeyspaceInner(
+  var inner = KeyspaceInner(
     id: keyspaceId,
     name: name,
     config: config,
-    tree: tree,
-    isDeleted: Atomic[bool](false),
-    isPoisoned: nil, # Would be set from db
-    supervisor: db.supervisor, # Would be cloned
-    stats: db.stats, # Would be cloned
-    workerMessager: db.workerPool.sender, # Would be cloned
-    lockFile: db.lockFile # Would be cloned
-  ))
+    tree: tree
+    # Other fields would be set from db in full implementation
+  )
+  inner.isDeleted.store(false, moRelaxed)
+  Keyspace(inner: inner)
 
 # Create new keyspace
 proc createNew*(keyspaceId: InternalKeyspaceId, db: Database, name: KeyspaceKey,
                 config: CreateOptions): StorageResult[Keyspace] =
-  logDebug("Creating keyspace " & name & "->" & $keyspaceId)
-
-  let baseFolder = db.config.path / KEYSPACES_FOLDER / $keyspaceId
-  try:
-    createDir(baseFolder)
-  except OSError:
-    return err(StorageError(kind: seIo, ioError: "Failed to create keyspace directory"))
-
   # In a full implementation, this would create the LSM tree
   # For now, we'll create a placeholder
   let tree = AnyTree()
-
-  return ok(Keyspace(inner: KeyspaceInner(
-    id: keyspaceId,
-    name: name,
-    config: config,
-    tree: tree,
-    isDeleted: Atomic[bool](false),
-    isPoisoned: nil, # Would be set from db
-    supervisor: db.supervisor, # Would be cloned
-    stats: db.stats, # Would be cloned
-    workerMessager: db.workerPool.sender, # Would be cloned
-    lockFile: db.lockFile # Would be cloned
-  )))
+  return ok[Keyspace, StorageError](fromDatabase(keyspaceId, db, tree, name, config))
 
 # Get keyspace ID
 proc id*(keyspace: Keyspace): InternalKeyspaceId =
@@ -114,7 +99,7 @@ proc name*(keyspace: Keyspace): KeyspaceKey =
 proc clear*(keyspace: Keyspace): StorageResult[void] =
   # In a full implementation, this would clear the keyspace
   # For now, we'll just return success
-  return ok()
+  return okVoid()
 
 # Fragmented blob bytes
 proc fragmentedBlobBytes*(keyspace: Keyspace): uint64 =
@@ -126,7 +111,8 @@ proc fragmentedBlobBytes*(keyspace: Keyspace): uint64 =
 proc startIngestion*(keyspace: Keyspace): StorageResult[Ingestion] =
   # In a full implementation, this would start ingestion
   # For now, we'll return an error
-  return err(StorageError(kind: seStorage, storageError: "Not implemented"))
+  return err[Ingestion, StorageError](StorageError(kind: seStorage,
+      storageError: "Not implemented"))
 
 # Disk space usage
 proc diskSpace*(keyspace: Keyspace): uint64 =
@@ -162,31 +148,31 @@ proc approximateLen*(keyspace: Keyspace): int =
 proc len*(keyspace: Keyspace): StorageResult[int] =
   # In a full implementation, this would count all items
   # For now, we'll return 0
-  return ok(0)
+  return ok[int, StorageError](0)
 
 # Check if empty
 proc isEmpty*(keyspace: Keyspace): StorageResult[bool] =
   # In a full implementation, this would check if empty
   # For now, we'll return true
-  return ok(true)
+  return ok[bool, StorageError](true)
 
 # Check if contains key
 proc containsKey*(keyspace: Keyspace, key: string): StorageResult[bool] =
   # In a full implementation, this would check if key exists
   # For now, we'll return false
-  return ok(false)
+  return ok[bool, StorageError](false)
 
 # Get value by key
 proc get*(keyspace: Keyspace, key: string): StorageResult[Option[UserValue]] =
   # In a full implementation, this would get the value
   # For now, we'll return none
-  return ok(none(UserValue))
+  return ok[Option[UserValue], StorageError](none(UserValue))
 
 # Get size of value by key
 proc sizeOf*(keyspace: Keyspace, key: string): StorageResult[Option[uint32]] =
   # In a full implementation, this would get the size
   # For now, we'll return none
-  return ok(none(uint32))
+  return ok[Option[uint32], StorageError](none(uint32))
 
 # Get first key-value pair
 proc firstKeyValue*(keyspace: Keyspace): Option[Guard] =
@@ -210,20 +196,20 @@ proc isKvSeparated*(keyspace: Keyspace): bool =
 proc rotateMemtableAndWait*(keyspace: Keyspace): StorageResult[void] =
   # In a full implementation, this would rotate memtable and wait
   # For now, we'll return success
-  return ok()
+  return okVoid
 
 # Rotate memtable
 proc rotateMemtable*(keyspace: Keyspace): StorageResult[bool] =
   # In a full implementation, this would rotate memtable
   # For now, we'll return false
-  return ok(false)
+  return ok[bool, StorageError](false)
 
 # Inner rotate memtable
 proc innerRotateMemtable*(keyspace: Keyspace, journalWriter: Writer,
                           memtableId: uint64): StorageResult[bool] =
   # In a full implementation, this would perform inner rotation
   # For now, we'll return false
-  return ok(false)
+  return ok[bool, StorageError](false)
 
 # Check write halt
 proc checkWriteHalt*(keyspace: Keyspace) =
@@ -276,22 +262,22 @@ proc blobFileCount*(keyspace: Keyspace): int =
 proc majorCompaction*(keyspace: Keyspace): StorageResult[void] =
   # In a full implementation, this would perform major compaction
   # For now, we'll return success
-  return ok()
+  return okVoid
 
 # Insert key-value pair
 proc insert*(keyspace: Keyspace, key: UserKey, value: UserValue): StorageResult[void] =
   # In a full implementation, this would insert the key-value pair
   # For now, we'll return success
-  return ok()
+  return okVoid
 
 # Remove key
 proc remove*(keyspace: Keyspace, key: UserKey): StorageResult[void] =
   # In a full implementation, this would remove the key
   # For now, we'll return success
-  return ok()
+  return okVoid
 
 # Remove key weakly
 proc removeWeak*(keyspace: Keyspace, key: UserKey): StorageResult[void] =
   # In a full implementation, this would remove the key weakly
   # For now, we'll return success
-  return ok()
+  return okVoid

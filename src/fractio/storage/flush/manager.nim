@@ -3,7 +3,7 @@
 # (found in the LICENSE-* files in the repository)
 
 import fractio/storage/flush/task
-import std/[deques, locks, os]
+import std/[deques, locks, os, options]
 
 # Forward declarations
 type

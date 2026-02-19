@@ -50,7 +50,7 @@ proc intoConfig*[O](builder: Builder[O]): Config =
 proc open*[O](builder: Builder[O]): StorageResult[O] =
   # In a full implementation, this would open the database
   # For now, we'll return an error since O is unknown
-  return err(StorageError(kind: seStorage, storageError: "Not implemented"))
+  return asErr(StorageError(kind: seStorage, storageError: "Not implemented"))
 
 # Set journal compression
 proc journalCompression*[O](builder: Builder[O],

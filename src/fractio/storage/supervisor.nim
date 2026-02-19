@@ -17,13 +17,13 @@ type
 type
   SupervisorInner* = ref object
     dbConfig*: Config
-    keyspaces*: ptr RwLock[Keyspaces]
+    keyspaces*: ptr Lock
     writeBufferSize*: WriteBufferManager
     flushManager*: FlushManager
     seqno*: SequenceNumberCounter
     snapshotTracker*: SnapshotTracker
     journal*: ptr Journal
-    journalManager*: ptr RwLock[JournalManager]
+    journalManager*: ptr Lock
     backpressureLock*: Lock
 
   Supervisor* = ref object
@@ -35,4 +35,4 @@ proc newSupervisor*(inner: SupervisorInner): Supervisor =
 
 # Dereference operator equivalent
 proc get*(supervisor: Supervisor): SupervisorInner =
-  supervisor.inner[]
+  supervisor.inner

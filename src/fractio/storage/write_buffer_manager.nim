@@ -11,7 +11,8 @@ type
 
 # Constructor
 proc newWriteBufferManager*(): WriteBufferManager =
-  WriteBufferManager(value: Atomic[uint64](0))
+  result = WriteBufferManager()
+  result.value.store(0'u64, moRelaxed)
 
 # Get current value
 proc get*(manager: WriteBufferManager): uint64 =
@@ -20,15 +21,16 @@ proc get*(manager: WriteBufferManager): uint64 =
 # Adds some bytes to the write buffer counter.
 # Returns the counter *after* incrementing.
 proc allocate*(manager: WriteBufferManager, n: uint64): uint64 =
-  let before = manager.value.fetchAdd(n, moAcqRel)
+  let before = manager.value.fetchAdd(n, moRelaxed)
   before + n
 
 # Frees some bytes from the write buffer counter.
 # Returns the counter *after* decrementing.
 proc free*(manager: WriteBufferManager, n: uint64): uint64 =
   while true:
-    let now = manager.value.load(moAcquire)
-    let subbed = max(0, now - n)
+    var current = manager.value.load(moAcquire)
+    let subbed = if current > n: current - n else: 0'u64
 
-    if manager.value.compareExchange(now, subbed, moSeqCst, moSeqCst):
+    if manager.value.compareExchange(current, subbed, moSequentiallyConsistent,
+        moSequentiallyConsistent):
       return subbed

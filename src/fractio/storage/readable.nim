@@ -3,6 +3,7 @@
 # (found in the LICENSE-* files in the repository)
 
 import fractio/storage/[error, types, guard]
+import std/options
 
 # Forward declarations for types that will be defined later
 type

@@ -18,8 +18,7 @@ type
 
 # Constructor
 proc newStats*(): Stats =
-  Stats(
-    activeCompactionCount: Atomic[int](0),
-    timeCompacting: Atomic[uint64](0),
-    compactionsCompleted: Atomic[int](0)
-  )
+  result = Stats()
+  result.activeCompactionCount.store(0, moRelaxed)
+  result.timeCompacting.store(0, moRelaxed)
+  result.compactionsCompleted.store(0, moRelaxed)

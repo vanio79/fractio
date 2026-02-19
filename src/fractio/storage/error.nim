@@ -3,15 +3,9 @@
 # (found in the LICENSE-* files in the repository)
 
 import fractio/core/errors
-
-# Forward declarations for types that will be defined in other modules
-type
-  JournalRecoveryError* = object
-  FormatVersion* = uint32
-  CompressionType* = enum
-    ctNone
-    ctLz4
-    ctSnappy
+import options
+import fractio/storage/types
+import fractio/storage/journal/error # For RecoveryError
 
 # Storage errors that may occur in the storage engine
 type
@@ -31,20 +25,20 @@ type
   StorageError* = object
     case kind*: StorageErrorKind
     of seStorage:
-      storageError: string # Will be replaced with actual LSM tree error type
+      storageError*: string # Will be replaced with actual LSM tree error type
     of seIo:
-      ioError: string      # Will be replaced with actual IO error type
+      ioError*: string      # Will be replaced with actual IO error type
     of seJournalRecovery:
-      journalRecoveryError: JournalRecoveryError
+      journalRecoveryError*: RecoveryError
     of seInvalidVersion:
-      invalidVersion: Option[FormatVersion]
+      invalidVersion*: Option[FormatVersion]
     of seDecompress:
-      decompressType: CompressionType
+      decompressType*: CompressionType
     of seInvalidTrailer:
       discard
     of seInvalidTag:
-      tagName: string
-      tagValue: uint8
+      tagName*: string
+      tagValue*: uint8
     of sePoisoned:
       discard
     of seKeyspaceDeleted:
@@ -54,34 +48,98 @@ type
     of seUnrecoverable:
       discard
 
+# Simple Result type for storage operations
+type
+  Result*[T, E] = object
+    isOk*: bool
+    err*: ref E # Use ref to avoid case object initialization issues
+    when T isnot void:
+      value*: T
+
+# Helper constructors for Result
+proc ok*[T, E](val: T): Result[T, E] =
+  when T is void:
+    {.error: "Use okVoid() for void result types".}
+  else:
+    result.isOk = true
+    result.value = val
+
+# Helper to create error results
+proc err*[T, E](e: E): Result[T, E] =
+  when T is void:
+    result.isOk = false
+    new(result.err)
+    result.err[] = e
+  else:
+    result.isOk = false
+    new(result.err)
+    result.err[] = e
+    result.value = default(T)
+
+# Storage result alias - must be defined before procs using it
+type
+  StorageResult*[T] = Result[T, StorageError]
+
+# Convenience alias
+template asErr*[T, E](e: E): Result[T, E] =
+  err[T, E](e)
+
+# Convenience overload for StorageResult[void]
+proc asErr*(e: StorageError): StorageResult[void] =
+  result.isOk = false
+  new(result.err)
+  result.err[] = e
+
+# Helper methods for Result
+proc isOk*[T, E](r: Result[T, E]): bool =
+  r.isOk
+
+proc isErr*[T, E](r: Result[T, E]): bool =
+  not r.isOk
+
+proc get*[T, E](r: Result[T, E]): T =
+  when T is void:
+    if not r.isOk:
+      raise newException(ValueError, "Called get on an Err value")
+  else:
+    if r.isOk:
+      r.value
+    else:
+      raise newException(ValueError, "Called get on an Err value")
+
+proc error*[T, E](r: Result[T, E]): E =
+  if not r.isOk and r.err != nil:
+    r.err[]
+  else:
+    raise newException(ValueError, "Called error on an Ok value")
+
+# Helper to create void ok result
+template okVoid*: StorageResult[void] =
+  StorageResult[void](isOk: true)
+
 # Convert to FractioError for compatibility with the rest of the system
 proc toFractioError*(err: StorageError): FractioError =
   case err.kind
   of seStorage:
-    storageError("Storage error: " & err.storageError)
+    storageError("Storage error: " & err.storageError, "storage")
   of seIo:
-    ioError("IO error: " & err.ioError)
+    storageError("IO error: " & err.ioError, "io")
   of seJournalRecovery:
-    storageError("Journal recovery error")
+    storageError("Journal recovery error", "journal")
   of seInvalidVersion:
-    storageError("Invalid version")
+    storageError("Invalid version", "version")
   of seDecompress:
-    storageError("Decompression failed for: " & $err.decompressType)
+    storageError("Decompression failed for: " & $err.decompressType, "compression")
   of seInvalidTrailer:
-    storageError("Invalid journal trailer")
+    storageError("Invalid journal trailer", "journal")
   of seInvalidTag:
-    storageError("Invalid tag: " & err.tagName & " with value: " & $err.tagValue)
+    storageError("Invalid tag: " & err.tagName & " with value: " &
+        $err.tagValue, "journal")
   of sePoisoned:
-    storageError("Database poisoned - previous flush/commit failed")
+    storageError("Database poisoned - previous flush/commit failed", "database")
   of seKeyspaceDeleted:
-    storageError("Keyspace deleted")
+    storageError("Keyspace deleted", "keyspace")
   of seLocked:
-    storageError("Database locked")
+    storageError("Database locked", "database")
   of seUnrecoverable:
-    storageError("Database unrecoverable")
-
-# Result helper type
-type
-  StorageResult*[T] = Result[T, StorageError]
-
-
+    storageError("Database unrecoverable", "database")
