@@ -2,7 +2,7 @@
 # This source code is licensed under both the Apache 2.0 and MIT License
 # (found in the LICENSE-* files in the repository)
 
-import fractio/storage/error
+import fractio/storage/[error, logging]
 import std/[os, locks, times]
 
 # Locked file guard inner structure
@@ -39,7 +39,8 @@ proc createNew*(guardType: typeDesc[LockedFileGuard],
       return asErr(StorageError(kind: seIo,
           ioError: "Failed to open lock file: " & path))
   else:
-    return asErr(StorageError(kind: seIo, ioError: "Failed to create lock file: " & path))
+    return asErr(StorageError(kind: seIo,
+        ioError: "Failed to create lock file: " & path))
 
   # In a full implementation, this would try to lock the file
   # For now, we'll just create the guard
@@ -53,11 +54,13 @@ proc tryAcquire*(guardType: typeDesc[LockedFileGuard],
   logDebug("Acquiring database lock at " & path)
 
   if not existsFile(path):
-    return asErr(StorageError(kind: seIo, ioError: "Lock file does not exist: " & path))
+    return asErr(StorageError(kind: seIo,
+        ioError: "Lock file does not exist: " & path))
 
   var file: File
   if not open(file, path, fmRead):
-    return asErr(StorageError(kind: seIo, ioError: "Failed to open lock file: " & path))
+    return asErr(StorageError(kind: seIo,
+        ioError: "Failed to open lock file: " & path))
 
   # Try to acquire lock with retries
   for i in 1..RETRIES:

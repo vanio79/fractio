@@ -2,8 +2,9 @@
 # This source code is licensed under both the Apache 2.0 and MIT License
 # (found in the LICENSE-* files in the repository)
 
-import fractio/storage/[types, path]
-import std/[os, cpuinfo]
+import fractio/storage/types
+import fractio/storage/path as storage_path
+import std/[os, cpuinfo, options]
 
 # Forward declarations for shared components
 type
@@ -55,8 +56,8 @@ proc newConfig*(path: string): Config =
   let cpuCores = countProcessors()
   let workerThreads = min(cpuCores, DEFAULT_CPU_CORES)
 
-  # Get absolute path
-  let absolutePath = absolutePath(path)
+  # Get absolute path using our custom function
+  let absolutePath = storage_path.absolutePath(path)
 
   Config(
     path: absolutePath,

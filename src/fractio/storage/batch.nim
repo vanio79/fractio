@@ -3,7 +3,7 @@
 # (found in the LICENSE-* files in the repository)
 
 import fractio/storage/[error, types, batch/item, keyspace, journal]
-import std/[sets, atomics]
+import std/[sets, atomics, options]
 
 # Forward declarations
 type
@@ -31,8 +31,11 @@ proc newWriteBatch*(db: Database): WriteBatch =
 
 # Initializes a new write batch with preallocated capacity
 proc withCapacity*(db: Database, capacity: int): WriteBatch =
+  var data = newSeq[Item]()
+  data.setLen(capacity)
+  data.setLen(0) # Reset length but keep capacity
   WriteBatch(
-    data: newSeq[Item](0, capacity),
+    data: data,
     db: db,
     durability: none(PersistMode)
   )
@@ -67,9 +70,7 @@ proc removeWeak*(batch: var WriteBatch, keyspace: Keyspace, key: UserKey) =
 # Commits the batch to the Database atomically
 proc commit*(batch: WriteBatch): StorageResult[void] =
   if batch.isEmpty():
-    return ok()
-
-  logTrace("batch: Acquiring journal writer")
+    return okVoid
 
   # In a full implementation, this would get the journal writer
   # For now, we'll skip this
@@ -96,8 +97,6 @@ proc commit*(batch: WriteBatch): StorageResult[void] =
   # Apply batch to memtables
   var batchSize: uint64 = 0
 
-  logTrace("Applying batch (size=" & $batch.data.len & ") to memtable(s)")
-
   # In a full implementation, this would apply the batch to memtables
   # For now, we'll simulate this
 
@@ -115,4 +114,4 @@ proc commit*(batch: WriteBatch): StorageResult[void] =
     # For now, we'll skip this
     discard
 
-  return ok()
+  return okVoid
