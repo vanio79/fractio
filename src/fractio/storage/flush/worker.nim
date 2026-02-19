@@ -6,13 +6,14 @@
 ##
 ## Flushes memtables to SSTables on disk.
 
-import fractio/storage/[error, flush/task, snapshot_tracker, stats, write_buffer_manager]
+import fractio/storage/[error, flush/task, stats, write_buffer_manager]
+import fractio/storage/snapshot_tracker as st
 import std/[os, atomics]
 
-# Run flush logic
 proc run*(task: Task, writeBufferManager: WriteBufferManager,
-          snapshotTracker: SnapshotTracker, stats: Stats): StorageResult[void] =
-  discard snapshotTracker.getSeqnoSafeToGc()
+          snapshotTracker: st.SnapshotTracker, stats: var Stats): StorageResult[void] =
+  let gcWatermark = snapshotTracker.getSeqnoSafeToGc()
+  discard gcWatermark
 
   # In a full implementation, this would:
   # 1. Get the flush lock from the tree
@@ -21,8 +22,14 @@ proc run*(task: Task, writeBufferManager: WriteBufferManager,
   # 4. Remove flushed memtable from sealed list
   # 5. Free bytes from write buffer manager
 
+  # The Task type contains a simplified Keyspace for testing
+  # In production, it would contain the real Keyspace with an LsmTree
+
   # For now, simulate a successful flush
   let flushedBytes: uint64 = 1024
   discard writeBufferManager.free(flushedBytes)
+
+  # Update stats
+  discard stats.compactionsCompleted.fetchAdd(1.int, moRelaxed)
 
   return okVoid
