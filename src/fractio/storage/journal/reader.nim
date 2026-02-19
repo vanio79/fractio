@@ -14,12 +14,12 @@ import std/[streams, os]
 type
   JournalReader* = ref object
     path*: string
-    reader*: Stream
+    reader*: FileStream
     lastValidPos*: uint64
 
 # Constructor
 proc newJournalReader*(path: string): StorageResult[JournalReader] =
-  # In a full implementation, this would open the file with read+write permissions
+  # Open file with read+write permissions to allow truncation
   let file = newFileStream(path, fmReadWrite)
   if file.isNil:
     return err[JournalReader, StorageError](StorageError(kind: seIo,
@@ -33,39 +33,80 @@ proc newJournalReader*(path: string): StorageResult[JournalReader] =
 
 # Truncate file to position
 proc truncateFile*(reader: JournalReader, pos: uint64): StorageResult[void] =
-  # In a full implementation, this would truncate the file
-  # For now, we just update the position
-  reader.lastValidPos = pos
-  return okVoid()
+  # Close the stream first
+  reader.reader.close()
+
+  # Truncate the file using OS-level operation
+  try:
+    # Open source file for reading
+    let srcFile = open(reader.path, fmRead)
+
+    # Read the valid portion (up to pos bytes)
+    var buffer = newSeq[byte](int(pos))
+    if pos > 0:
+      let bytesRead = srcFile.readBuffer(addr buffer[0], int(pos))
+      buffer.setLen(bytesRead)
+    srcFile.close()
+
+    # Write to temp file
+    let tempPath = reader.path & ".tmp"
+    let tmpFile = open(tempPath, fmWrite)
+    if buffer.len > 0:
+      discard tmpFile.writeBuffer(addr buffer[0], buffer.len)
+    tmpFile.close()
+
+    # Replace original with temp
+    os.moveFile(tempPath, reader.path)
+
+    # Reopen the stream
+    let newFile = newFileStream(reader.path, fmReadWrite)
+    if newFile.isNil:
+      return err[void, StorageError](StorageError(kind: seIo,
+          ioError: "Failed to reopen journal file after truncation: " & reader.path))
+
+    reader.reader = newFile
+    reader.lastValidPos = pos
+
+    return okVoid
+  except OSError:
+    return err[void, StorageError](StorageError(kind: seIo,
+        ioError: "Failed to truncate journal file: " & reader.path))
 
 # Maybe truncate file to last valid position
 proc maybeTruncateFileToLastValidPos*(reader: JournalReader): StorageResult[void] =
-  # In a full implementation, this would get the stream position
-  # For now, we'll assume we're at the end
-  let streamPos = reader.lastValidPos
+  # Get the current stream position (where we tried to read and failed)
+  let currentStreamPos = uint64(reader.reader.getPosition())
 
-  if streamPos > reader.lastValidPos:
+  # If we're past the last valid position, truncate
+  if currentStreamPos > reader.lastValidPos:
     return reader.truncateFile(reader.lastValidPos)
-  return okVoid()
+
+  return okVoid
 
 # Iterator for JournalReader
 iterator items*(reader: JournalReader): StorageResult[Entry] =
   while not reader.reader.atEnd:
+    # Remember position before attempting to decode
+    let posBeforeDecode = uint64(reader.reader.getPosition())
+
     # Decode entry from reader
     let decodeResult = decodeFrom(reader.reader)
 
     if decodeResult.isOk:
       let item = decodeResult.value
-      # In a full implementation, this would get the stream position
+      # Update last valid position to current position after successful decode
       reader.lastValidPos = uint64(reader.reader.getPosition())
       yield ok[Entry, StorageError](item)
     else:
-      let e = decodeResult.err
+      # Decode failed - the file is corrupted at this point
+      # Seek back to before the failed decode attempt
+      reader.reader.setPosition(int(posBeforeDecode))
 
-      # Handle IO errors
-      # In a full implementation, we'd check the specific error type
-      # For now, we'll just truncate and stop
+      # Truncate if we're past the last valid position
       let truncateResult = reader.maybeTruncateFileToLastValidPos()
       if not truncateResult.isOk:
         yield err[Entry, StorageError](truncateResult.err[])
+      else:
+        # Return the decode error
+        yield decodeResult
       break

@@ -66,6 +66,81 @@ proc uint8FromTag*(tag: Tag): uint8 =
   of tEnd: 3
   of tClear: 4
 
+# Convert uint8 to ValueType
+proc valueTypeFromUint8*(value: uint8): StorageResult[ValueType] =
+  case value
+  of 0: ok[ValueType, StorageError](vtValue)
+  of 1: ok[ValueType, StorageError](vtTombstone)
+  of 2: ok[ValueType, StorageError](vtWeakTombstone)
+  of 3: ok[ValueType, StorageError](vtIndirection)
+  else: err[ValueType, StorageError](StorageError(kind: seInvalidTag,
+      tagName: "ValueType", tagValue: value))
+
+# Convert ValueType to uint8
+proc uint8FromValueType*(vt: ValueType): uint8 =
+  case vt
+  of vtValue: 0
+  of vtTombstone: 1
+  of vtWeakTombstone: 2
+  of vtIndirection: 3
+
+# Convert uint8 to CompressionType
+proc compressionTypeFromUint8*(value: uint8): StorageResult[CompressionType] =
+  case value
+  of 0: ok[CompressionType, StorageError](ctNone)
+  of 1: ok[CompressionType, StorageError](ctSnappy)
+  of 2: ok[CompressionType, StorageError](ctLz4)
+  else: err[CompressionType, StorageError](StorageError(kind: seInvalidTag,
+      tagName: "CompressionType", tagValue: value))
+
+# Convert CompressionType to uint8
+proc uint8FromCompressionType*(ct: CompressionType): uint8 =
+  case ct
+  of ctNone: 0
+  of ctSnappy: 1
+  of ctLz4: 2
+
+# Helper proc to write uint64 in little-endian format
+proc writeLe64*(writer: Stream, value: uint64) =
+  var leValue: uint64
+  # cpuToLE64 is not available in all Nim versions, use littleEndian64
+  # littleEndian64(dst, src) - converts from native (src) to little-endian (dst)
+  littleEndian64(addr leValue, addr value)
+  writer.write(leValue)
+
+# Helper proc to write uint32 in little-endian format
+proc writeLe32*(writer: Stream, value: uint32) =
+  var leValue: uint32
+  littleEndian32(addr leValue, addr value)
+  writer.write(leValue)
+
+# Helper proc to write uint16 in little-endian format
+proc writeLe16*(writer: Stream, value: uint16) =
+  var leValue: uint16
+  littleEndian16(addr leValue, addr value)
+  writer.write(leValue)
+
+# Helper proc to read uint64 in little-endian format
+proc readLe64*(reader: Stream): uint64 =
+  var rawValue = reader.readInt64()
+  var nativeValue: uint64
+  littleEndian64(addr nativeValue, addr rawValue)
+  return nativeValue
+
+# Helper proc to read uint32 in little-endian format
+proc readLe32*(reader: Stream): uint32 =
+  var rawValue = reader.readInt32()
+  var nativeValue: uint32
+  littleEndian32(addr nativeValue, addr rawValue)
+  return nativeValue
+
+# Helper proc to read uint16 in little-endian format
+proc readLe16*(reader: Stream): uint16 =
+  var rawValue = reader.readInt16()
+  var nativeValue: uint16
+  littleEndian16(addr nativeValue, addr rawValue)
+  return nativeValue
+
 # Serialize marker item
 proc serializeMarkerItem*(writer: Stream, keyspaceId: InternalKeyspaceId,
                          key: string, value: string, valueType: ValueType,
@@ -74,43 +149,44 @@ proc serializeMarkerItem*(writer: Stream, keyspaceId: InternalKeyspaceId,
   writer.write(uint8FromTag(tItem))
 
   # Write value type
-  writer.write(uint8(valueType))
+  writer.write(uint8FromValueType(valueType))
 
   # Write compression type
-  # In a full implementation, this would encode the compression type
+  writer.write(uint8FromCompressionType(compression))
 
   # For now, we'll simplify compression handling
+  # In a full implementation, this would compress the value
   let compressedValue = case compression
     of ctNone: value
-    of ctLz4, ctSnappy: value # Simplified - no actual compression in this translation
+    of ctLz4, ctSnappy: value # TODO: Implement actual compression
 
   # Write keyspace ID (little endian)
-  var keyspaceIdLe = keyspaceId
-  littleEndian64(addr keyspaceIdLe, addr keyspaceId)
-  writer.write(keyspaceIdLe)
+  writeLe64(writer, keyspaceId)
 
   # Write key length (16-bit, little endian)
-  var keyLenLe: uint16 = uint16(key.len)
-  littleEndian16(addr keyLenLe, addr keyLenLe)
-  writer.write(keyLenLe)
+  if key.len > 65535:
+    return err[void, StorageError](StorageError(kind: seIo,
+        ioError: "Key too long (max 65535 bytes)"))
+  writeLe16(writer, uint16(key.len))
 
   # Write value length (32-bit, little endian)
-  var valueLenLe: uint32 = uint32(value.len)
-  littleEndian32(addr valueLenLe, addr valueLenLe)
-  writer.write(valueLenLe)
+  if value.len > uint32.high.int:
+    return err[void, StorageError](StorageError(kind: seIo,
+        ioError: "Value too long (max 2^32 bytes)"))
+  writeLe32(writer, uint32(value.len))
 
   # Write compressed value length (32-bit, little endian)
-  var compressedValueLenLe: uint32 = uint32(compressedValue.len)
-  littleEndian32(addr compressedValueLenLe, addr compressedValueLenLe)
-  writer.write(compressedValueLenLe)
+  writeLe32(writer, uint32(compressedValue.len))
 
   # Write key
-  writer.write(key)
+  if key.len > 0:
+    writer.write(key)
 
   # Write compressed value
-  writer.write(compressedValue)
+  if compressedValue.len > 0:
+    writer.write(compressedValue)
 
-  return okVoid()
+  return okVoid
 
 # Encode entry into writer
 proc encodeInto*(entry: Entry, writer: Stream): StorageResult[void] =
@@ -119,13 +195,9 @@ proc encodeInto*(entry: Entry, writer: Stream): StorageResult[void] =
     # Write tag
     writer.write(uint8FromTag(tStart))
     # Write item count (little endian)
-    var itemCountLe = entry.itemCount
-    littleEndian32(addr itemCountLe, addr itemCountLe)
-    writer.write(itemCountLe)
+    writeLe32(writer, entry.itemCount)
     # Write seqno (little endian)
-    var seqnoLe = entry.seqno
-    littleEndian64(addr seqnoLe, addr seqnoLe)
-    writer.write(seqnoLe)
+    writeLe64(writer, entry.seqno)
 
   of ekItem:
     # Serialize item
@@ -136,9 +208,7 @@ proc encodeInto*(entry: Entry, writer: Stream): StorageResult[void] =
     # Write tag
     writer.write(uint8FromTag(tEnd))
     # Write checksum (little endian)
-    var checksumLe = entry.checksum
-    littleEndian64(addr checksumLe, addr checksumLe)
-    writer.write(checksumLe)
+    writeLe64(writer, entry.checksum)
     # Write magic bytes trailer
     writer.writeData(addr MAGIC_BYTES[0], MAGIC_BYTES.len)
 
@@ -146,85 +216,94 @@ proc encodeInto*(entry: Entry, writer: Stream): StorageResult[void] =
     # Write tag
     writer.write(uint8FromTag(tClear))
     # Write keyspace ID (little endian)
-    var keyspaceIdLe = entry.clearKeyspaceId
-    littleEndian64(addr keyspaceIdLe, addr keyspaceIdLe)
-    writer.write(keyspaceIdLe)
+    writeLe64(writer, entry.clearKeyspaceId)
 
-  return okVoid()
+  return okVoid
 
 # Decode entry from reader
 proc decodeFrom*(reader: Stream): StorageResult[Entry] =
   # Read tag
   let tagByte = reader.readInt8()
   let tagResult = tagFromUint8(uint8(tagByte))
-  if tagResult.isErr():
-    return err[Entry, StorageError](tagResult.error())
-  let tag = tagResult.get()
+  if tagResult.isErr:
+    return err[Entry, StorageError](tagResult.error)
+  let tag = tagResult.get
 
   case tag
   of tStart:
     # Read item count (little endian)
-    var itemCountLe = reader.readInt32()
-    var itemCount: uint32
-    littleEndian32(addr itemCount, addr itemCountLe)
+    let itemCount = readLe32(reader)
 
     # Read seqno (little endian)
-    var seqnoLe = reader.readInt64()
-    var seqno: SeqNo
-    littleEndian64(addr seqno, addr seqnoLe)
+    let seqno = readLe64(reader)
 
     return ok[Entry, StorageError](Entry(kind: ekStart, itemCount: itemCount, seqno: seqno))
 
   of tItem:
     # Read value type
     let valueTypeByte = reader.readInt8()
-    # In a full implementation, this would convert the byte to ValueType
+    let valueTypeResult = valueTypeFromUint8(uint8(valueTypeByte))
+    if valueTypeResult.isErr:
+      return err[Entry, StorageError](valueTypeResult.error)
+    let valueType = valueTypeResult.get
 
     # Read compression type
-    # In a full implementation, this would decode the compression type
+    let compressionByte = reader.readInt8()
+    let compressionResult = compressionTypeFromUint8(uint8(compressionByte))
+    if compressionResult.isErr:
+      return err[Entry, StorageError](compressionResult.error)
+    let compression = compressionResult.get
 
     # Read keyspace ID (little endian)
-    var keyspaceIdLe = reader.readInt64()
-    var keyspaceId: InternalKeyspaceId
-    littleEndian64(addr keyspaceId, addr keyspaceIdLe)
+    let keyspaceId = readLe64(reader)
 
     # Read key length (little endian)
-    var keyLenLe = reader.readInt16()
-    var keyLen: uint16
-    littleEndian16(addr keyLen, addr keyLenLe)
+    let keyLen = readLe16(reader)
 
     # Read value length (little endian)
-    var valueLenLe = reader.readInt32()
-    var valueLen: uint32
-    littleEndian32(addr valueLen, addr valueLenLe)
+    let valueLen = readLe32(reader)
 
     # Read compressed value length (little endian)
-    var compressedValueLenLe = reader.readInt32()
-    var compressedValueLen: uint32
-    littleEndian32(addr compressedValueLen, addr compressedValueLenLe)
+    let compressedValueLen = readLe32(reader)
 
     # Read key
     var key = newString(keyLen)
-    if reader.readData(addr key[0], keyLen.int) != keyLen.int:
-      return err[Entry, StorageError](StorageError(kind: seIo,
-          ioError: "Failed to read key"))
+    if keyLen > 0:
+      if reader.readData(addr key[0], keyLen.int) != keyLen.int:
+        return err[Entry, StorageError](StorageError(kind: seIo,
+            ioError: "Failed to read key"))
 
-    # Read value
-    var value = newString(compressedValueLen)
-    if reader.readData(addr value[0], compressedValueLen.int) !=
-        compressedValueLen.int:
-      return err[Entry, StorageError](StorageError(kind: seIo,
-          ioError: "Failed to read value"))
+    # Read compressed value
+    var compressedValue = newString(compressedValueLen)
+    if compressedValueLen > 0:
+      if reader.readData(addr compressedValue[0], compressedValueLen.int) !=
+          compressedValueLen.int:
+        return err[Entry, StorageError](StorageError(kind: seIo,
+            ioError: "Failed to read value"))
 
-    # Simplified - no decompression in this translation
-    return ok[Entry, StorageError](Entry(kind: ekItem, keyspaceId: keyspaceId, key: key, value: value,
-                   valueType: vtValue, compression: ctNone))
+    # Decompress if needed
+    var value: string
+    case compression
+    of ctNone:
+      # Value should match compressed value length when no compression
+      value = compressedValue
+    of ctLz4, ctSnappy:
+      # TODO: Implement actual decompression
+      # For now, just use the compressed value (this is a bug, but allows basic operation)
+      value = compressedValue
+
+    return ok[Entry, StorageError](Entry(
+      kind: ekItem,
+      keyspaceId: keyspaceId,
+      key: key,
+      value: value,
+      valueType: valueType,
+      compression: compression
+    ))
 
   of tEnd:
     # Read checksum (little endian)
-    var checksumLe = reader.readInt64()
-    var checksum: uint64
-    littleEndian64(addr checksum, addr checksumLe)
+    let checksum = readLe64(reader)
 
     # Read magic bytes trailer
     var magic: array[4, byte]
@@ -240,9 +319,7 @@ proc decodeFrom*(reader: Stream): StorageResult[Entry] =
 
   of tClear:
     # Read keyspace ID (little endian)
-    var keyspaceIdLe = reader.readInt64()
-    var keyspaceId: InternalKeyspaceId
-    littleEndian64(addr keyspaceId, addr keyspaceIdLe)
+    let keyspaceId = readLe64(reader)
 
     return ok[Entry, StorageError](Entry(kind: ekClear,
         clearKeyspaceId: keyspaceId))
