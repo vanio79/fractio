@@ -2,219 +2,104 @@
 # This source code is licensed under both the Apache 2.0 and MIT License
 # (found in the LICENSE-* files in the repository)
 
-import fractio/storage/[error, types, db_config, file, keyspace, batch, journal,
-                       snapshot, snapshot_tracker, stats, supervisor,
-                       worker_pool,
-                       write_buffer_manager, flush, poison_dart, version, path]
-import std/[os, atomics, locks, tables, times]
+## Database Implementation
+##
+## Main entry point for the storage engine.
 
-# Forward declarations
+import fractio/storage/[error, types, db_config, file, keyspace, batch, journal,
+                        snapshot, snapshot_tracker, stats, supervisor,
+                        write_buffer_manager, flush, poison_dart, version, path,
+                        recovery]
+import fractio/storage/lsm_tree/[types as lsm_types]
+import std/[os, atomics, locks, tables, times, options]
+
 type
   MetaKeyspace* = object
-  KeyspaceCreateOptions* = object
-  Keyspaces* = Table[string, Keyspace]
-  StopSignal* = object
-  Openable* = concept T
-    proc open*(config: Config): StorageResult[T]
+    ## Stores keyspace metadata
+    keyspaces*: Table[string, uint64]
+    reverseMap*: Table[uint64, string]
 
-# Database inner structure
+  KeyspaceCreateOptions* = object
+
+  Keyspaces* = Table[string, Keyspace]
+
+  StopSignal* = object
+    stop*: Atomic[bool]
+
 type
   DatabaseInner* = ref object
     metaKeyspace*: MetaKeyspace
 
-    # Database configuration
     config*: Config
 
     supervisor*: Supervisor
 
-    # Stop signal when database is dropped to stop background threads
     stopSignal*: StopSignal
-
-    # Counter of background threads
     activeThreadCounter*: Atomic[int]
-
-    # True if fsync failed
     isPoisoned*: Atomic[bool]
 
     stats*: Stats
-    keyspaceIdCounter*: uint64 # Simplified from SequenceNumberCounter
+    keyspaceIdCounter*: uint64
 
-    workerPool*: WorkerPool
-    lockFile*: object          # Placeholder for LockedFileGuard
+    keyspaces*: Keyspaces
+    keyspacesLock*: Lock
 
-# Database handle
-type
   Database* = ref object
     inner*: DatabaseInner
 
-# Implementation of Openable for Database
 proc open*(config: Config): StorageResult[Database] =
-  Database.open(config)
+  ## Open a database, creating if necessary
+  let versionMarkerPath = config.path / VERSION_MARKER
 
-# Database methods
+  if fileExists(versionMarkerPath):
+    return Database.recover(config)
+  else:
+    return Database.createNew(config)
+
 proc snapshot*(db: Database): Snapshot =
-  Snapshot.new(db.supervisor.snapshotTracker.open())
+  Snapshot.new(db.inner.supervisor.inner.snapshotTracker.open())
 
-proc builder*(path: string): Builder[Database] =
-  newBuilder[Database](path)
-
-proc batch*(db: Database): WriteBatch =
-  var batch = newWriteBatch(db[])
-
-  if not db.config.manualJournalPersist:
-    batch = batch.durability(some(pmBuffer))
-
-  return batch
-
-# Stats methods
-proc writeBufferSize*(db: Database): uint64 =
-  db.supervisor.writeBufferSize.get()
-
-proc outstandingFlushes*(db: Database): int =
-  db.supervisor.flushManager.len()
-
-proc timeCompacting*(db: Database): Duration =
-  let us = db.stats.timeCompacting.load(moRelaxed)
-  initDuration(microseconds = int64(us))
-
-proc activeCompactions*(db: Database): int =
-  db.stats.activeCompactionCount.load(moRelaxed)
-
-proc compactionsCompleted*(db: Database): int =
-  db.stats.compactionsCompleted.load(moRelaxed)
-
-# Journal methods
-proc journalCount*(db: Database): int =
-  # In a full implementation, this would read from the journal manager
-  # For now, we'll return 1 (active journal)
-  return 1
-
-proc journalDiskSpace*(db: Database): StorageResult[uint64] =
-  # In a full implementation, this would calculate journal disk space
-  # For now, we'll return 0
-  return ok(0)
-
-proc diskSpace*(db: Database): StorageResult[uint64] =
-  let journalSizeResult = db.journalDiskSpace()
-  if journalSizeResult.isErr():
-    return err(journalSizeResult.error())
-
-  let journalSize = journalSizeResult.get()
-
-  # In a full implementation, this would sum keyspace disk space
-  # For now, we'll return just the journal size
-  return ok(journalSize)
-
-# Persistence
 proc persist*(db: Database, mode: PersistMode): StorageResult[void] =
-  # Check if database is already poisoned
   if db.inner.isPoisoned.load(moRelaxed):
     return asErr(StorageError(kind: sePoisoned))
 
-  # Get the journal from supervisor
   if db.inner.supervisor.inner.journal != nil:
-    let journal = db.inner.supervisor.inner.journal[]
-    let persistResult = journal.persist(mode)
+    let persistResult = db.inner.supervisor.inner.journal.persist(mode)
     if persistResult.isErr:
-      # Mark database as poisoned on persist failure
-      # This prevents future writes as consistency cannot be guaranteed
       db.inner.isPoisoned.store(true, moRelease)
       return asErr(StorageError(kind: sePoisoned))
 
   return okVoid
 
-proc cacheCapacity*(db: Database): uint64 =
-  # In a full implementation, this would return cache capacity
-  # For now, we'll return 0
-  return 0
+proc writeBufferSize*(db: Database): uint64 =
+  db.inner.supervisor.inner.writeBufferSize.get()
 
-# Main open method
-proc open*(dbType: typeDesc[Database], config: Config): StorageResult[Database] =
-  logDebug("cache capacity=" & $(config.cache.capacity div (1024 * 1024)) & "MiB")
+proc outstandingFlushes*(db: Database): int =
+  # Placeholder
+  0
 
-  let dbResult = Database.createOrRecover(config)
-  if dbResult.isErr():
-    return err(dbResult.error())
+proc timeCompacting*(db: Database): Duration =
+  let us = db.inner.stats.timeCompacting.load(moRelaxed)
+  initDuration(microseconds = int64(us))
 
-  let db = dbResult.get()
+proc activeCompactions*(db: Database): int =
+  db.inner.stats.activeCompactionCount.load(moRelaxed)
 
-  return ok(db)
+proc compactionsCompleted*(db: Database): int =
+  db.inner.stats.compactionsCompleted.load(moRelaxed)
 
-# Create or recover
-proc createOrRecover*(dbType: typeDesc[Database],
-    config: Config): StorageResult[Database] =
-  let versionMarkerPath = config.path / VERSION_MARKER
-  if existsFile(versionMarkerPath):
-    return Database.recover(config)
-  else:
-    return Database.createNew(config)
-
-# Keyspace operations
-proc deleteKeyspace*(db: Database, handle: Keyspace): StorageResult[void] =
-  # In a full implementation, this would delete the keyspace
-  # For now, we'll return success
-  return okVoid()
-
-proc keyspace*(db: Database, name: string,
-               createOptions: proc(): KeyspaceCreateOptions): StorageResult[Keyspace] =
-  # Validate keyspace name
-  if not isValidKeyspaceName(name):
-    raise newException(ValueError, "Invalid keyspace name")
-
-  # In a full implementation, this would create or open a keyspace
-  # For now, we'll return an error
-  return asErr(StorageError(kind: seStorage, storageError: "Not implemented"))
-
-proc keyspaceCount*(db: Database): int =
-  # In a full implementation, this would return the number of keyspaces
-  # For now, we'll return 0
-  return 0
-
-proc listKeyspaceNames*(db: Database): seq[string] =
-  # In a full implementation, this would list keyspace names
-  # For now, we'll return an empty sequence
-  return @[]
-
-proc keyspaceExists*(db: Database, name: string): bool =
-  # In a full implementation, this would check if keyspace exists
-  # For now, we'll return false
-  return false
-
-# Sequence number methods
 proc seqno*(db: Database): SeqNo =
-  # In a full implementation, this would return the sequence number
-  # For now, we'll return 0
-  return 0
+  db.inner.supervisor.inner.seqno.get()
 
 proc visibleSeqno*(db: Database): SeqNo =
-  # In a full implementation, this would return the visible sequence number
-  # For now, we'll return 0
-  return 0
+  db.inner.supervisor.inner.snapshotTracker.get()
 
-# Version checking
 proc checkVersion*(path: string): StorageResult[void] =
   let versionMarkerPath = path / VERSION_MARKER
-  if not existsFile(versionMarkerPath):
+  if not fileExists(versionMarkerPath):
     return asErr(StorageError(kind: seInvalidVersion, invalidVersion: none(uint32)))
+  return okVoid
 
-  # In a full implementation, this would read and parse the version
-  # For now, we'll assume version 3
-  return okVoid()
-
-# Recovery
-proc recover*(dbType: typeDesc[Database], config: Config): StorageResult[Database] =
-  logInfo("Recovering database at " & config.path)
-
-  # Check version
-  let versionCheckResult = Database.checkVersion(config.path)
-  if versionCheckResult.isErr():
-    return err(versionCheckResult.error())
-
-  # In a full implementation, this would perform database recovery
-  # For now, we'll return an error
-  return asErr(StorageError(kind: seStorage, storageError: "Not implemented"))
-
-# Create new database
 proc createNew*(dbType: typeDesc[Database], config: Config): StorageResult[Database] =
   logInfo("Creating database at " & config.path)
 
@@ -232,6 +117,14 @@ proc createNew*(dbType: typeDesc[Database], config: Config): StorageResult[Datab
     return asErr(StorageError(kind: seIo,
         ioError: "Failed to create keyspaces directory"))
 
+  # Create journals directory
+  let journalsFolderPath = config.path / "journals"
+  try:
+    createDir(journalsFolderPath)
+  except OSError:
+    return asErr(StorageError(kind: seIo,
+        ioError: "Failed to create journals directory"))
+
   # Create version marker
   let versionMarkerPath = config.path / VERSION_MARKER
   var versionFile: File
@@ -248,6 +141,159 @@ proc createNew*(dbType: typeDesc[Database], config: Config): StorageResult[Datab
   discard fsyncDirectory(keyspacesFolderPath)
   discard fsyncDirectory(config.path)
 
-  # In a full implementation, this would create a new database
-  # For now, we'll return an error
-  return asErr(StorageError(kind: seStorage, storageError: "Not implemented"))
+  # Create database structure
+  var db = Database()
+  new(db.inner)
+
+  db.inner.config = config
+  db.inner.isPoisoned.store(false, moRelaxed)
+  db.inner.stopSignal.stop.store(false, moRelaxed)
+  db.inner.keyspaceIdCounter = 1'u64
+  initLock(db.inner.keyspacesLock)
+
+  # Create stats
+  db.inner.stats = newStats()
+
+  # Create supervisor
+  var supervisorInner = SupervisorInner(
+    seqno: newSequenceNumberCounter(),
+    snapshotTracker: newSnapshotTracker(),
+    writeBufferSize: newWriteBufferManager()
+  )
+
+  db.inner.supervisor = Supervisor(inner: supervisorInner)
+
+  # Create journal
+  let journalPath = journalsFolderPath / "0.jnl"
+  let journalResult = createJournal(journalPath)
+  if journalResult.isErr:
+    return err[Database, StorageError](journalResult.error)
+
+  db.inner.supervisor.inner.journal = journalResult.value
+
+  logInfo("Database created successfully")
+
+  return ok[Database, StorageError](db)
+
+proc recover*(dbType: typeDesc[Database], config: Config): StorageResult[Database] =
+  logInfo("Recovering database at " & config.path)
+
+  # Check version
+  let versionCheckResult = Database.checkVersion(config.path)
+  if versionCheckResult.isErr:
+    return err[Database, StorageError](versionCheckResult.error)
+
+  # Create database structure
+  var db = Database()
+  new(db.inner)
+
+  db.inner.config = config
+  db.inner.isPoisoned.store(false, moRelaxed)
+  db.inner.stopSignal.stop.store(false, moRelaxed)
+  db.inner.keyspaceIdCounter = 1'u64
+  initLock(db.inner.keyspacesLock)
+
+  # Create stats
+  db.inner.stats = newStats()
+
+  # Create supervisor
+  var supervisorInner = SupervisorInner(
+    seqno: newSequenceNumberCounter(),
+    snapshotTracker: newSnapshotTracker(),
+    writeBufferSize: newWriteBufferManager()
+  )
+
+  db.inner.supervisor = Supervisor(inner: supervisorInner)
+
+  # Recover journals
+  let journalsPath = config.path / "journals"
+  let recoveryResult = recoverJournals(journalsPath, ctNone, 0)
+  if recoveryResult.isErr:
+    return err[Database, StorageError](recoveryResult.error)
+
+  let recovery = recoveryResult.value
+  db.inner.supervisor.inner.journal = recovery.active
+
+  # Update sequence number counter based on recovery
+  let highestSeqno = recovery.active.pos()
+  if highestSeqno > 0:
+    db.inner.supervisor.inner.seqno.fetchMax(highestSeqno)
+
+  logInfo("Database recovered successfully. Seqno=" &
+      $db.inner.supervisor.inner.seqno.get())
+
+  return ok[Database, StorageError](db)
+
+proc keyspace*(db: Database, name: string): StorageResult[Keyspace] =
+  ## Get or create a keyspace
+  if not isValidKeyspaceName(name):
+    return asErr(StorageError(kind: seStorage,
+        storageError: "Invalid keyspace name"))
+
+  # Check if keyspace already exists
+  db.inner.keyspacesLock.acquire()
+  defer: db.inner.keyspacesLock.release()
+
+  if name in db.inner.keyspaces:
+    return ok[Keyspace, StorageError](db.inner.keyspaces[name])
+
+  # Create new keyspace
+  let keyspaceId = db.inner.keyspaceIdCounter
+  db.inner.keyspaceIdCounter += 1
+
+  let keyspacePath = db.inner.config.path / KEYSPACES_FOLDER / $keyspaceId
+  try:
+    createDir(keyspacePath)
+  except OSError:
+    return asErr(StorageError(kind: seIo,
+        ioError: "Failed to create keyspace directory"))
+
+  # Create LSM tree for keyspace
+  let treeConfig = LsmTreeConfig(
+    path: keyspacePath,
+    levelCount: 7,
+    maxMemtableSize: 64 * 1024 * 1024,
+    blockSize: 4096
+  )
+
+  let tree = newLsmTree(treeConfig,
+                        db.inner.supervisor.inner.seqno,
+                        db.inner.supervisor.inner.snapshotTracker)
+
+  var anyTree = AnyTree(kind: true, tree: tree)
+
+  let keyspaceOptions = defaultCreateOptions()
+
+  let ks = fromDatabase(keyspaceId, db.inner, anyTree, name, keyspaceOptions)
+
+  # Register keyspace
+  db.inner.keyspaces[name] = ks
+  db.inner.metaKeyspace.keyspaces[name] = keyspaceId
+  db.inner.metaKeyspace.reverseMap[keyspaceId] = name
+
+  logInfo("Created keyspace: " & name & " (id=" & $keyspaceId & ")")
+
+  return ok[Keyspace, StorageError](ks)
+
+proc keyspaceExists*(db: Database, name: string): bool =
+  db.inner.keyspacesLock.acquire()
+  defer: db.inner.keyspacesLock.release()
+  name in db.inner.keyspaces
+
+proc listKeyspaceNames*(db: Database): seq[string] =
+  db.inner.keyspacesLock.acquire()
+  defer: db.inner.keyspacesLock.release()
+
+  result = @[]
+  for name in db.inner.keyspaces.keys:
+    result.add(name)
+
+proc close*(db: Database) =
+  ## Close the database
+  db.inner.stopSignal.stop.store(true, moRelease)
+
+  # Close journal
+  if db.inner.supervisor.inner.journal != nil:
+    db.inner.supervisor.inner.journal.close()
+
+  logInfo("Database closed")
