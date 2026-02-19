@@ -12,8 +12,12 @@ import std/[os, atomics]
 
 proc run*(task: Task, writeBufferManager: WriteBufferManager,
           snapshotTracker: st.SnapshotTracker, stats: var Stats): StorageResult[void] =
+  ## Run the flush task.
+  ## This is a simplified version for testing.
+  ## In production, this would be called by the database with access to the real tree.
+
   let gcWatermark = snapshotTracker.getSeqnoSafeToGc()
-  discard gcWatermark
+  discard gcWatermark # Used for GC during compaction
 
   # In a full implementation, this would:
   # 1. Get the flush lock from the tree

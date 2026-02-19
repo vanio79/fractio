@@ -2,7 +2,12 @@
 # This source code is licensed under both the Apache 2.0 and MIT License
 # (found in the LICENSE-* files in the repository)
 
-# Forward declarations
+## Flush Task
+##
+## Represents a task to flush a keyspace's memtable to disk.
+
+# Forward declaration - simplified Keyspace for task definition
+# The real Keyspace type is in keyspace.nim
 type
   Keyspace* = object
     name*: string

@@ -9,6 +9,7 @@
 import fractio/storage/error
 import ./types
 import ./memtable
+import ./sstable/writer
 import std/[os, atomics, locks, options, tables, streams, strutils]
 
 export types except ItemSizeResult
@@ -301,3 +302,65 @@ proc maintenance*(lock: var VersionHistoryLock, path: string,
     gcWatermark: uint64): StorageResult[void] =
   # Placeholder for version history GC
   return okVoid
+
+# Flush oldest sealed memtable to SSTable
+proc flushOldestSealed*(tree: LsmTree): StorageResult[uint64] =
+  ## Flush the oldest sealed memtable to disk as an SSTable.
+  ## Returns the number of bytes flushed, or 0 if nothing to flush.
+
+  tree.versionLock.acquire()
+  defer: tree.versionLock.release()
+
+  if tree.sealedMemtables.len == 0:
+    return ok[uint64, StorageError](0'u64)
+
+  # Get the oldest sealed memtable
+  let memtable = tree.sealedMemtables[0]
+  let flushedBytes = memtable.size
+
+  # Generate SSTable ID
+  let tableId = tree.tableIdCounter.fetchAdd(1, moRelaxed) + 1
+
+  # Create SSTable file path
+  let sstablePath = tree.config.path / "L0" / ($tableId & ".sst")
+
+  # Ensure L0 directory exists
+  let l0Path = tree.config.path / "L0"
+  if not dirExists(l0Path):
+    try:
+      createDir(l0Path)
+    except OSError:
+      return err[uint64, StorageError](StorageError(kind: seIo,
+          ioError: "Failed to create L0 directory"))
+
+  # Write memtable to SSTable
+  let writeResult = writeMemtable(sstablePath, memtable)
+  if writeResult.isErr:
+    return err[uint64, StorageError](writeResult.error)
+
+  var sstable = writeResult.value
+  sstable.id = tableId
+  sstable.level = 0
+
+  # Add SSTable to level 0
+  tree.tables[0].add(sstable)
+
+  # Remove flushed memtable from sealed list
+  tree.sealedMemtables.delete(0)
+
+  echo "[INFO] Flushed memtable to SSTable: " & sstablePath &
+        " (id=" & $tableId & ", size=" & $flushedBytes & " bytes)"
+
+  return ok[uint64, StorageError](flushedBytes)
+
+# Check if tree has sealed memtables to flush
+proc hasSealedMemtables*(tree: LsmTree): bool =
+  tree.versionLock.acquire()
+  defer: tree.versionLock.release()
+  tree.sealedMemtables.len > 0
+
+# Get sealed memtable count
+proc sealedCount*(tree: LsmTree): int =
+  tree.versionLock.acquire()
+  defer: tree.versionLock.release()
+  tree.sealedMemtables.len
