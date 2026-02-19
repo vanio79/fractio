@@ -2,16 +2,14 @@
 # This source code is licensed under both the Apache 2.0 and MIT License
 # (found in the LICENSE-* files in the repository)
 
-import fractio/storage/[types, snapshot_tracker]
+import fractio/storage/[types, snapshot_tracker, journal, write_buffer_manager]
 import std/[locks, atomics]
 
 # Forward declarations for types that will be defined later
 type
   Config* = object
   Keyspaces* = object
-  WriteBufferManager* = object
   FlushManager* = object
-  Journal* = object
   JournalManager* = object
 
 type
@@ -22,7 +20,7 @@ type
     flushManager*: FlushManager
     seqno*: SequenceNumberCounter
     snapshotTracker*: SnapshotTracker
-    journal*: ptr Journal
+    journal*: Journal # Use the actual Journal type from journal.nim
     journalManager*: ptr Lock
     backpressureLock*: Lock
 

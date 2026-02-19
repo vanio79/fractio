@@ -3,7 +3,8 @@
 # (found in the LICENSE-* files in the repository)
 
 import fractio/storage/[error, types, file, flush, journal, snapshot,
-    snapshot_tracker, stats, supervisor, lsm_tree]
+    snapshot_tracker, stats, supervisor, lsm_tree, write_buffer_manager]
+import fractio/storage/journal/writer # For PersistMode
 import fractio/storage/keyspace/options
 import fractio/storage/keyspace/name
 import fractio/storage/keyspace/write_delay
@@ -25,11 +26,10 @@ type
   WorkerMessager* = object # Placeholder for message channel
   Iter* = object # Placeholder for iterator type
   Guard* = object # Placeholder for guard type
-  Writer* = object # Placeholder for journal writer type
 
 # Apply configuration to base config
-proc applyToBaseConfig*(config: lsm_tree.Config,
-    ourConfig: CreateOptions): lsm_tree.Config =
+proc applyToBaseConfig*(config: LsmTreeConfig,
+    ourConfig: CreateOptions): LsmTreeConfig =
   # In a full implementation, this would apply the configuration
   # For now, we'll just return the config
   return config
@@ -49,7 +49,7 @@ type
     # If true, the keyspace is marked as deleted
     isDeleted*: Atomic[bool]
 
-    # If true, fsync failed during persisting
+    # If true, fsync failed during persisting (shared with database)
     isPoisoned*: ptr Atomic[bool]
 
     # LSM-tree wrapper
@@ -97,9 +97,52 @@ proc name*(keyspace: Keyspace): KeyspaceKey =
 
 # Clear the entire keyspace
 proc clear*(keyspace: Keyspace): StorageResult[void] =
-  # In a full implementation, this would clear the keyspace
-  # For now, we'll just return success
-  return okVoid()
+  # Check if keyspace is deleted
+  if keyspace.inner.isDeleted.load(moRelaxed):
+    return asErr(StorageError(kind: seKeyspaceDeleted))
+
+  # Get journal writer guard (acquires lock)
+  if keyspace.inner.supervisor == nil or
+      keyspace.inner.supervisor.inner.journal == nil:
+    return asErr(StorageError(kind: seIo, ioError: "Journal not available"))
+
+  var guard = keyspace.inner.supervisor.inner.journal.getWriter()
+
+  # IMPORTANT: Check poisoned flag AFTER acquiring lock (TOCTOU prevention)
+  if keyspace.inner.isPoisoned != nil and keyspace.inner.isPoisoned[].load(moRelaxed):
+    guard.release()
+    return asErr(StorageError(kind: sePoisoned))
+
+  # Get next sequence number
+  var seqnoCounter = keyspace.inner.supervisor.inner.seqno
+  let seqno = seqnoCounter.next()
+
+  # Write clear marker to journal
+  let writeResult = guard.writeClear(keyspace.inner.id, seqno)
+  if writeResult.isErr:
+    guard.release()
+    return err[void, StorageError](writeResult.error)
+
+  # Persist if not manual
+  if not keyspace.inner.config.manualJournalPersist:
+    let persistResult = guard.persist(pmBuffer)
+    if persistResult.isErr:
+      # Mark as poisoned on persist failure
+      if keyspace.inner.isPoisoned != nil:
+        keyspace.inner.isPoisoned[].store(true, moRelease)
+      guard.release()
+      return asErr(StorageError(kind: sePoisoned))
+
+  # Clear the tree (in a full implementation, this would clear the LSM tree)
+  # self.tree.clear() ?
+
+  # Publish sequence number to snapshot tracker
+  keyspace.inner.supervisor.inner.snapshotTracker.publish(seqno)
+
+  # Release the lock
+  guard.release()
+
+  return okVoid
 
 # Fragmented blob bytes
 proc fragmentedBlobBytes*(keyspace: Keyspace): uint64 =
@@ -133,7 +176,7 @@ proc range*(keyspace: Keyspace, startKey: string, endKey: string): Iter =
   return Iter()
 
 # Prefix iterator
-proc prefix*(keyspace: Keyspace, prefix: string): Iter =
+proc prefix*(keyspace: Keyspace, prefixStr: string): Iter =
   # In a full implementation, this would return a prefix iterator
   # For now, we'll return a placeholder
   return Iter()
@@ -205,8 +248,8 @@ proc rotateMemtable*(keyspace: Keyspace): StorageResult[bool] =
   return ok[bool, StorageError](false)
 
 # Inner rotate memtable
-proc innerRotateMemtable*(keyspace: Keyspace, journalWriter: Writer,
-                          memtableId: uint64): StorageResult[bool] =
+proc innerRotateMemtable*(keyspace: Keyspace,
+    memtableId: uint64): StorageResult[bool] =
   # In a full implementation, this would perform inner rotation
   # For now, we'll return false
   return ok[bool, StorageError](false)
@@ -232,8 +275,8 @@ proc requestRotation*(keyspace: Keyspace) =
 # Check memtable rotate
 proc checkMemtableRotate*(keyspace: Keyspace, size: uint64) =
   # In a full implementation, this would check if memtable needs rotation
-  # For now, we'll do nothing
-  discard
+  if size > keyspace.inner.config.maxMemtableSize:
+    keyspace.requestRotation()
 
 # Maintenance
 proc maintenance*(keyspace: Keyspace, memtableSize: uint64) =
@@ -264,20 +307,185 @@ proc majorCompaction*(keyspace: Keyspace): StorageResult[void] =
   # For now, we'll return success
   return okVoid
 
-# Insert key-value pair
+# Insert key-value pair - implements the full write path from Rust
 proc insert*(keyspace: Keyspace, key: UserKey, value: UserValue): StorageResult[void] =
-  # In a full implementation, this would insert the key-value pair
-  # For now, we'll return success
+  # Check if keyspace is deleted
+  if keyspace.inner.isDeleted.load(moRelaxed):
+    return asErr(StorageError(kind: seKeyspaceDeleted))
+
+  # Get journal writer guard (acquires lock)
+  if keyspace.inner.supervisor == nil or
+      keyspace.inner.supervisor.inner.journal == nil:
+    return asErr(StorageError(kind: seIo, ioError: "Journal not available"))
+
+  var guard = keyspace.inner.supervisor.inner.journal.getWriter()
+
+  # IMPORTANT: Check poisoned flag AFTER acquiring lock (TOCTOU prevention)
+  # This prevents a race condition where the database becomes poisoned
+  # between the initial check and acquiring the lock
+  if keyspace.inner.isPoisoned != nil and keyspace.inner.isPoisoned[].load(moRelaxed):
+    guard.release()
+    return asErr(StorageError(kind: sePoisoned))
+
+  # Get next sequence number
+  var seqnoCounter = keyspace.inner.supervisor.inner.seqno
+  let seqno = seqnoCounter.next()
+
+  # Write to journal (WAL - Write Ahead Log)
+  # This ensures durability before the data is written to the tree
+  let writeResult = guard.writeRaw(keyspace.inner.id, key, value, vtValue, seqno)
+  if writeResult.isErr:
+    guard.release()
+    return err[void, StorageError](writeResult.error)
+
+  # Persist if not manual journal persist mode
+  if not keyspace.inner.config.manualJournalPersist:
+    let persistResult = guard.persist(pmBuffer)
+    if persistResult.isErr:
+      # Mark database as poisoned on persist failure
+      # This is a FATAL error - future writes will be rejected
+      # as consistency cannot be guaranteed
+      if keyspace.inner.isPoisoned != nil:
+        keyspace.inner.isPoisoned[].store(true, moRelease)
+      guard.release()
+      return asErr(StorageError(kind: sePoisoned))
+
+  # Insert into tree
+  # In a full implementation, this would insert into the LSM tree
+  # let (itemSize, memtableSize) = keyspace.inner.tree.insert(key, value, seqno)
+  # For now, use placeholder values
+  let itemSize = uint64(key.len + value.len)
+  let memtableSize = itemSize # Simplified
+
+  # Publish sequence number to snapshot tracker
+  # This allows readers to see the new write
+  keyspace.inner.supervisor.inner.snapshotTracker.publish(seqno)
+
+  # Release the lock
+  guard.release()
+
+  # Allocate write buffer size
+  # This tracks memory usage for backpressure
+  discard keyspace.inner.supervisor.inner.writeBufferSize.allocate(itemSize)
+
+  # Run maintenance (check rotation, backpressure)
+  keyspace.maintenance(memtableSize)
+
   return okVoid
 
-# Remove key
+# Remove key - implements the full delete path from Rust
 proc remove*(keyspace: Keyspace, key: UserKey): StorageResult[void] =
-  # In a full implementation, this would remove the key
-  # For now, we'll return success
+  # Check if keyspace is deleted
+  if keyspace.inner.isDeleted.load(moRelaxed):
+    return asErr(StorageError(kind: seKeyspaceDeleted))
+
+  # Get journal writer guard (acquires lock)
+  if keyspace.inner.supervisor == nil or
+      keyspace.inner.supervisor.inner.journal == nil:
+    return asErr(StorageError(kind: seIo, ioError: "Journal not available"))
+
+  var guard = keyspace.inner.supervisor.inner.journal.getWriter()
+
+  # IMPORTANT: Check poisoned flag AFTER acquiring lock (TOCTOU prevention)
+  if keyspace.inner.isPoisoned != nil and keyspace.inner.isPoisoned[].load(moRelaxed):
+    guard.release()
+    return asErr(StorageError(kind: sePoisoned))
+
+  # Get next sequence number
+  var seqnoCounter = keyspace.inner.supervisor.inner.seqno
+  let seqno = seqnoCounter.next()
+
+  # Write tombstone to journal
+  # Tombstones are special markers that indicate a key has been deleted
+  # They are necessary for LSM-tree compaction and MVCC
+  let writeResult = guard.writeRaw(keyspace.inner.id, key, "", vtTombstone, seqno)
+  if writeResult.isErr:
+    guard.release()
+    return err[void, StorageError](writeResult.error)
+
+  # Persist if not manual journal persist mode
+  if not keyspace.inner.config.manualJournalPersist:
+    let persistResult = guard.persist(pmBuffer)
+    if persistResult.isErr:
+      if keyspace.inner.isPoisoned != nil:
+        keyspace.inner.isPoisoned[].store(true, moRelease)
+      guard.release()
+      return asErr(StorageError(kind: sePoisoned))
+
+  # Remove from tree (writes a tombstone)
+  # In a full implementation, this would remove from the LSM tree
+  # let (itemSize, memtableSize) = keyspace.inner.tree.remove(key, seqno)
+  # For now, use placeholder values
+  let itemSize = uint64(key.len)
+  let memtableSize = itemSize
+
+  # Publish sequence number to snapshot tracker
+  keyspace.inner.supervisor.inner.snapshotTracker.publish(seqno)
+
+  # Release the lock
+  guard.release()
+
+  # Allocate write buffer size
+  discard keyspace.inner.supervisor.inner.writeBufferSize.allocate(itemSize)
+
+  # Run maintenance
+  keyspace.maintenance(memtableSize)
+
   return okVoid
 
-# Remove key weakly
+# Remove key weakly - for merge operations
+# Weak tombstones are removed during compaction when matched with a single write
 proc removeWeak*(keyspace: Keyspace, key: UserKey): StorageResult[void] =
-  # In a full implementation, this would remove the key weakly
-  # For now, we'll return success
+  # Check if keyspace is deleted
+  if keyspace.inner.isDeleted.load(moRelaxed):
+    return asErr(StorageError(kind: seKeyspaceDeleted))
+
+  # Get journal writer guard (acquires lock)
+  if keyspace.inner.supervisor == nil or
+      keyspace.inner.supervisor.inner.journal == nil:
+    return asErr(StorageError(kind: seIo, ioError: "Journal not available"))
+
+  var guard = keyspace.inner.supervisor.inner.journal.getWriter()
+
+  # IMPORTANT: Check poisoned flag AFTER acquiring lock (TOCTOU prevention)
+  if keyspace.inner.isPoisoned != nil and keyspace.inner.isPoisoned[].load(moRelaxed):
+    guard.release()
+    return asErr(StorageError(kind: sePoisoned))
+
+  # Get next sequence number
+  var seqnoCounter = keyspace.inner.supervisor.inner.seqno
+  let seqno = seqnoCounter.next()
+
+  # Write weak tombstone to journal
+  let writeResult = guard.writeRaw(keyspace.inner.id, key, "", vtWeakTombstone, seqno)
+  if writeResult.isErr:
+    guard.release()
+    return err[void, StorageError](writeResult.error)
+
+  # Persist if not manual journal persist mode
+  if not keyspace.inner.config.manualJournalPersist:
+    let persistResult = guard.persist(pmBuffer)
+    if persistResult.isErr:
+      if keyspace.inner.isPoisoned != nil:
+        keyspace.inner.isPoisoned[].store(true, moRelease)
+      guard.release()
+      return asErr(StorageError(kind: sePoisoned))
+
+  # Remove from tree (writes a weak tombstone)
+  # In a full implementation, this would remove from the LSM tree
+  let itemSize = uint64(key.len)
+  let memtableSize = itemSize
+
+  # Publish sequence number to snapshot tracker
+  keyspace.inner.supervisor.inner.snapshotTracker.publish(seqno)
+
+  # Release the lock
+  guard.release()
+
+  # Allocate write buffer size
+  discard keyspace.inner.supervisor.inner.writeBufferSize.allocate(itemSize)
+
+  # Run maintenance
+  keyspace.maintenance(memtableSize)
+
   return okVoid

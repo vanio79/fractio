@@ -2,9 +2,15 @@
 # This source code is licensed under both the Apache 2.0 and MIT License
 # (found in the LICENSE-* files in the repository)
 
-# LSM Tree configuration stub
-# This is a placeholder for the full LSM tree implementation
+## LSM Tree Module
+##
+## This module provides a Log-Structured Merge tree implementation
+## for efficient key-value storage.
 
-type
-  Config* = object
-    # Placeholder for LSM tree configuration
+import ./lsm_tree/types
+import ./lsm_tree/memtable
+import ./lsm_tree/lsm_tree
+
+export types
+export memtable
+export lsm_tree

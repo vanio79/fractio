@@ -10,19 +10,40 @@ import fractio/storage/journal/recovery
 import fractio/storage/journal/manager
 import std/[os, locks]
 
-# Journal type
+# Journal type with proper writer management
 type
   Journal* = ref object
     writer*: Writer
-    lock*: Lock # Separate lock for synchronization
+    lock*: Lock
+    path*: string
 
-                # Debug representation
+# Guard type that holds the journal lock and provides access to writer
+type
+  JournalWriterGuard* = object
+    journal*: Journal
+    lockHeld*: bool
+
+# Acquire the journal lock and return a guard with writer access
+proc getWriter*(journal: Journal): JournalWriterGuard =
+  journal.lock.acquire()
+  result = JournalWriterGuard(journal: journal, lockHeld: true)
+
+# Get the actual writer from the guard
+proc writer*(guard: JournalWriterGuard): Writer =
+  guard.journal.writer
+
+# Release the lock when guard goes out of scope
+proc release*(guard: var JournalWriterGuard) =
+  if guard.lockHeld:
+    guard.journal.lock.release()
+    guard.lockHeld = false
+
+# Debug representation
 proc `$`*(journal: Journal): string =
-  # In a full implementation, this would return the path
-  "Journal"
+  "Journal(" & journal.path & ")"
 
-# Constructor from file
-proc fromFile*(path: string): StorageResult[Journal] =
+# Constructor from file - opens existing journal
+proc openJournal*(path: string): StorageResult[Journal] =
   let writerResult = fromFile(path)
   if not writerResult.isOk:
     return err[Journal, StorageError](writerResult.err[])
@@ -30,13 +51,15 @@ proc fromFile*(path: string): StorageResult[Journal] =
   let writer = writerResult.value
   var lock: Lock
   initLock(lock)
-  # In a full implementation, we would store the writer in the lock
-  # For now, we'll just create a new journal
 
-  return ok[Journal, StorageError](Journal())
+  return ok[Journal, StorageError](Journal(
+    writer: writer,
+    lock: lock,
+    path: path
+  ))
 
 # Create new journal
-proc createNew*(path: string): StorageResult[Journal] =
+proc createJournal*(path: string): StorageResult[Journal] =
   # Create directory if it doesn't exist
   let folder = path.splitFile().dir
   try:
@@ -59,39 +82,48 @@ proc createNew*(path: string): StorageResult[Journal] =
 
   var lock: Lock
   initLock(lock)
-  # In a full implementation, we would store the writer in the lock
-  # For now, we'll just create a new journal
 
-  return ok[Journal, StorageError](Journal())
-
-# Get writer
-proc getWriter*(journal: Journal): Writer =
-  # In a full implementation, this would acquire the lock and return the writer
-  # For now, we'll just return a placeholder
-  return nil
+  return ok[Journal, StorageError](Journal(
+    writer: writer,
+    lock: lock,
+    path: path
+  ))
 
 # Get path
-proc path*(journal: Journal): string =
-  # In a full implementation, this would return the writer's path
-  # For now, we'll just return a placeholder
-  return ""
+proc getPath*(journal: Journal): string =
+  journal.path
 
 # Get reader
 proc getReader*(journal: Journal): StorageResult[JournalBatchReader] =
-  let path = journal.path()
-  let rawReaderResult = newJournalReader(path)
+  let rawReaderResult = newJournalReader(journal.path)
   if not rawReaderResult.isOk:
     return err[JournalBatchReader, StorageError](rawReaderResult.err[])
-
   let rawReader = rawReaderResult.value
   return ok[JournalBatchReader, StorageError](newJournalBatchReader(rawReader))
 
-# Persist the journal
-proc persist*(journal: Journal, mode: PersistMode): StorageResult[void] =
-  let writer = journal.getWriter()
-  return writer.persist(mode)
+# Persist the journal (must be called while holding the lock via guard)
+proc persist*(guard: JournalWriterGuard, mode: PersistMode): StorageResult[void] =
+  if guard.journal.writer == nil:
+    return err[void, StorageError](StorageError(kind: seIo,
+        ioError: "Journal writer is nil"))
+  return guard.journal.writer.persist(mode)
 
-# Recover journals
-proc recover*(path: string, compression: CompressionType,
-              compressionThreshold: int): StorageResult[RecoveryResult] =
-  return recoverJournals(path, compression, compressionThreshold)
+# Write raw entry (must be called while holding the lock via guard)
+proc writeRaw*(guard: JournalWriterGuard, keyspaceId: uint64, key: string,
+               value: string, valueType: ValueType,
+                   seqno: uint64): StorageResult[int] =
+  if guard.journal.writer == nil:
+    return err[int, StorageError](StorageError(kind: seIo,
+        ioError: "Journal writer is nil"))
+  return guard.journal.writer.writeRaw(keyspaceId, key, value, valueType, seqno)
+
+# Write clear entry (must be called while holding the lock via guard)
+proc writeClear*(guard: JournalWriterGuard, keyspaceId: uint64,
+    seqno: SeqNo): StorageResult[int] =
+  if guard.journal.writer == nil:
+    return err[int, StorageError](StorageError(kind: seIo,
+        ioError: "Journal writer is nil"))
+  return guard.journal.writer.writeClear(keyspaceId, seqno)
+
+# Re-export recoverJournals from recovery module
+export recovery.recoverJournals
