@@ -61,6 +61,46 @@ proc newLsmTree*(config: LsmTreeConfig,
   if not dirExists(config.path):
     createDir(config.path)
 
+# Load SSTables from disk for recovery
+proc loadSsTables*(tree: LsmTree) =
+  ## Load existing SSTables from disk into the tree.
+  ## This is called during recovery to restore persisted data.
+
+  tree.versionLock.acquire()
+  defer: tree.versionLock.release()
+
+  # Load SSTables for each level
+  for level in 0 ..< tree.config.levelCount:
+    let levelPath = if level == 0: tree.config.path / "L0"
+                    else: tree.config.path / ("L" & $level)
+
+    if not dirExists(levelPath):
+      continue
+
+    for kind, filePath in walkDir(levelPath):
+      if kind == pcFile and filePath.endsWith(".sst"):
+        # Get file info
+        let fileSize = getFileSize(filePath)
+
+        # Create SsTable entry
+        var sstable = SsTable(
+          id: tree.tableIdCounter.fetchAdd(1, moRelaxed) + 1,
+          path: filePath,
+          size: uint64(fileSize),
+          level: level
+        )
+
+        # Try to open SSTable to get key range
+        let readerResult = openSsTable(filePath)
+        if readerResult.isOk:
+          let reader = readerResult.value
+          sstable.smallestKey = reader.smallestKey
+          sstable.largestKey = reader.largestKey
+          reader.close()
+
+        # Add to tree
+        tree.tables[level].add(sstable)
+
 # Create a new LSM tree with defaults
 proc open*(config: LsmTreeConfig): LsmTree =
   let seqnoCounter = newSequenceNumberCounter()

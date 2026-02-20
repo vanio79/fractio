@@ -17,7 +17,9 @@ import fractio/storage/keyspace/options as ksopts
 import fractio/storage/lsm_tree/[types as lsm_types]
 import fractio/storage/lsm_tree/lsm_tree
 import fractio/storage/journal/writer # For PersistMode
-import std/[os, atomics, locks, tables, times, options, sequtils]
+import std/[os, atomics, locks, tables, times, options, sequtils, streams, strutils]
+
+const KEYSPACE_META_FILE* = "keyspaces.meta"
 
 type
   PersistMode* = writer.PersistMode # Use the journal writer's PersistMode
@@ -61,6 +63,57 @@ type
 # Forward declarations
 proc createNew*(dbType: typeDesc[Database], config: Config): StorageResult[Database]
 proc recover*(dbType: typeDesc[Database], config: Config): StorageResult[Database]
+
+# Save keyspace metadata to file (must be called with keyspacesLock held)
+proc saveKeyspaceMeta*(db: Database): StorageResult[void] =
+  let metaPath = db.inner.config.path / KEYSPACE_META_FILE
+  var strm = newFileStream(metaPath, fmWrite)
+  if strm == nil:
+    return err[void, StorageError](StorageError(kind: seIo,
+        ioError: "Failed to create keyspace metadata file"))
+
+  defer: strm.close()
+
+  # Write number of keyspaces
+  strm.write(uint64(db.inner.metaKeyspace.keyspaces.len))
+
+  # Write each name -> id mapping
+  for name, id in db.inner.metaKeyspace.keyspaces.pairs:
+    strm.write(uint32(name.len))
+    strm.write(name)
+    strm.write(id)
+
+  return okVoid
+
+# Load keyspace metadata from file
+proc loadKeyspaceMeta*(db: Database): StorageResult[void] =
+  let metaPath = db.inner.config.path / KEYSPACE_META_FILE
+
+  if not fileExists(metaPath):
+    return okVoid
+
+  var strm = newFileStream(metaPath, fmRead)
+  if strm == nil:
+    return err[void, StorageError](StorageError(kind: seIo,
+        ioError: "Failed to open keyspace metadata file"))
+
+  defer: strm.close()
+
+  let count = strm.readUInt64()
+
+  for i in 0 ..< int(count):
+    let nameLen = strm.readUInt32()
+    let name = strm.readStr(int(nameLen))
+    let id = strm.readUInt64()
+
+    db.inner.metaKeyspace.keyspaces[name] = id
+    db.inner.metaKeyspace.reverseMap[id] = name
+
+    # Update keyspace ID counter
+    if id >= db.inner.keyspaceIdCounter:
+      db.inner.keyspaceIdCounter = id + 1
+
+  return okVoid
 
 proc open*(config: Config): StorageResult[Database] =
   ## Open a database, creating if necessary
@@ -169,6 +222,12 @@ proc createNew*(dbType: typeDesc[Database], config: Config): StorageResult[Datab
   db.inner.keyspaceIdCounter = 1'u64
   initLock(db.inner.keyspacesLock)
 
+  # Initialize metaKeyspace
+  db.inner.metaKeyspace = MetaKeyspace(
+    keyspaces: initTable[string, uint64](),
+    reverseMap: initTable[uint64, string]()
+  )
+
   # Create stats
   db.inner.stats = newStats()
 
@@ -212,6 +271,12 @@ proc recover*(dbType: typeDesc[Database], config: Config): StorageResult[Databas
   db.inner.keyspaceIdCounter = 1'u64
   initLock(db.inner.keyspacesLock)
 
+  # Initialize metaKeyspace
+  db.inner.metaKeyspace = MetaKeyspace(
+    keyspaces: initTable[string, uint64](),
+    reverseMap: initTable[uint64, string]()
+  )
+
   # Create stats
   db.inner.stats = newStats()
 
@@ -247,6 +312,55 @@ proc recover*(dbType: typeDesc[Database], config: Config): StorageResult[Databas
   let posResult = recovery.active.pos()
   if posResult.isOk and posResult.value > 0:
     db.inner.supervisor.inner.seqno.fetchMax(posResult.value)
+
+  # Load keyspace metadata
+  let metaResult = db.loadKeyspaceMeta()
+  if metaResult.isErr:
+    logInfo("Warning: Failed to load keyspace metadata")
+
+  # Recover keyspaces from metadata
+  logInfo("Recovering " & $db.inner.metaKeyspace.keyspaces.len & " keyspaces")
+
+  for name, keyspaceId in db.inner.metaKeyspace.keyspaces.pairs:
+    let keyspaceFolder = config.path / KEYSPACES_FOLDER / $keyspaceId
+
+    if not dirExists(keyspaceFolder):
+      logInfo("Warning: Keyspace folder missing for " & name & ", skipping")
+      continue
+
+    logInfo("Recovering keyspace " & name & " with id " & $keyspaceId)
+
+    # Create LSM tree config
+    let treeConfig = lsm_tree.newConfig(keyspaceFolder)
+
+    # Create LSM tree
+    let tree = lsm_tree.newLsmTree(
+      treeConfig,
+      db.inner.supervisor.inner.seqno,
+      db.inner.supervisor.inner.snapshotTracker
+    )
+
+    # Load existing SSTables from disk
+    tree.loadSsTables()
+
+    # Create default options
+    let keyConfig = ksopts.defaultCreateOptions()
+
+    # Create keyspace
+    let keyspace = ks.newKeyspace(
+      keyspaceId,
+      tree,
+      name,
+      keyConfig,
+      db.inner.supervisor,
+      db.inner.stats,
+      addr db.inner.isPoisoned
+    )
+
+    # Store in cache
+    db.inner.keyspaces[name] = keyspace
+
+    logInfo("Keyspace " & name & " recovered successfully")
 
   logInfo("Database recovered successfully. Seqno=" &
       $db.inner.supervisor.inner.seqno.get())
@@ -308,6 +422,15 @@ proc keyspace*(db: Database, name: string): StorageResult[ks.Keyspace] =
 
   # Store in cache
   db.inner.keyspaces[name] = keyspace
+
+  # Store in metadata
+  db.inner.metaKeyspace.keyspaces[name] = keyspaceId
+  db.inner.metaKeyspace.reverseMap[keyspaceId] = name
+
+  # Persist metadata
+  let saveResult = db.saveKeyspaceMeta()
+  if saveResult.isErr:
+    logInfo("Warning: Failed to save keyspace metadata")
 
   logInfo("Keyspace " & name & " created successfully")
 
