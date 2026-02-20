@@ -13,11 +13,11 @@ import fractio/storage/recovery as db_recovery
 import fractio/storage/db_config as dbcfg
 import fractio/storage/keyspace as ks
 import fractio/storage/keyspace/name
-import fractio/storage/keyspace/options
+import fractio/storage/keyspace/options as ksopts
 import fractio/storage/lsm_tree/[types as lsm_types]
 import fractio/storage/lsm_tree/lsm_tree
 import fractio/storage/journal/writer # For PersistMode
-import std/[os, atomics, locks, tables, times, options]
+import std/[os, atomics, locks, tables, times, options, sequtils]
 
 type
   PersistMode* = writer.PersistMode # Use the journal writer's PersistMode
@@ -255,15 +255,73 @@ proc recover*(dbType: typeDesc[Database], config: Config): StorageResult[Databas
 
 proc keyspace*(db: Database, name: string): StorageResult[ks.Keyspace] =
   ## Get or create a keyspace
-  ## NOTE: This is a simplified implementation for testing
-  return err[ks.Keyspace, StorageError](StorageError(kind: seStorage,
-      storageError: "Keyspace creation not yet implemented"))
+
+  # Validate keyspace name
+  if not isValidKeyspaceName(name):
+    return err[ks.Keyspace, StorageError](StorageError(kind: seStorage,
+        storageError: "Invalid keyspace name: " & name))
+
+  # Check if keyspace already exists
+  db.inner.keyspacesLock.acquire()
+  defer: db.inner.keyspacesLock.release()
+
+  if name in db.inner.keyspaces:
+    return ok[ks.Keyspace, StorageError](db.inner.keyspaces[name])
+
+  # Create new keyspace
+  let keyspaceId = db.inner.keyspaceIdCounter
+  db.inner.keyspaceIdCounter += 1
+
+  logInfo("Creating keyspace " & name & " with id " & $keyspaceId)
+
+  # Create keyspace folder
+  let keyspaceFolder = db.inner.config.path / KEYSPACES_FOLDER / $keyspaceId
+  try:
+    createDir(keyspaceFolder)
+  except OSError:
+    return err[ks.Keyspace, StorageError](StorageError(kind: seIo,
+        ioError: "Failed to create keyspace directory: " & keyspaceFolder))
+
+  # Create LSM tree config
+  let treeConfig = lsm_tree.newConfig(keyspaceFolder)
+
+  # Create LSM tree with shared seqno counter and snapshot tracker
+  let tree = lsm_tree.newLsmTree(
+    treeConfig,
+    db.inner.supervisor.inner.seqno,
+    db.inner.supervisor.inner.snapshotTracker
+  )
+
+  # Create default options
+  let keyConfig = ksopts.defaultCreateOptions()
+
+  # Create keyspace with all required components
+  let keyspace = ks.newKeyspace(
+    keyspaceId,
+    tree,
+    name,
+    keyConfig,
+    db.inner.supervisor,
+    db.inner.stats,
+    addr db.inner.isPoisoned
+  )
+
+  # Store in cache
+  db.inner.keyspaces[name] = keyspace
+
+  logInfo("Keyspace " & name & " created successfully")
+
+  return ok[ks.Keyspace, StorageError](keyspace)
 
 proc keyspaceExists*(db: Database, name: string): bool =
-  false
+  db.inner.keyspacesLock.acquire()
+  defer: db.inner.keyspacesLock.release()
+  name in db.inner.keyspaces
 
 proc listKeyspaceNames*(db: Database): seq[string] =
-  @[]
+  db.inner.keyspacesLock.acquire()
+  defer: db.inner.keyspacesLock.release()
+  toSeq(db.inner.keyspaces.keys())
 
 proc close*(db: Database) =
   ## Close the database

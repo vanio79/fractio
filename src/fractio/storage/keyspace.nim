@@ -62,7 +62,27 @@ type
   Keyspace* = ref object
     inner*: KeyspaceInner
 
-# Constructor from database
+# Constructor from components
+proc newKeyspace*(keyspaceId: InternalKeyspaceId,
+                  tree: lsm_types.LsmTree,
+                  name: KeyspaceKey,
+                  config: CreateOptions,
+                  supervisor: Supervisor,
+                  stats: Stats,
+                  isPoisoned: ptr Atomic[bool]): Keyspace =
+  var inner = KeyspaceInner(
+    id: keyspaceId,
+    name: name,
+    config: config,
+    tree: tree,
+    supervisor: supervisor,
+    stats: stats,
+    isPoisoned: isPoisoned
+  )
+  inner.isDeleted.store(false, moRelaxed)
+  Keyspace(inner: inner)
+
+# Constructor from database (deprecated - use newKeyspace)
 proc fromDatabase*(keyspaceId: InternalKeyspaceId, db: Database,
                    tree: lsm_types.LsmTree, name: KeyspaceKey,
                    config: CreateOptions): Keyspace =
