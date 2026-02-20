@@ -8,7 +8,7 @@
 
 import fractio/storage/[error, snapshot_nonce, guard]
 import fractio/storage/lsm_tree/[types, memtable, lsm_tree]
-import std/[options, algorithm]
+import std/[options, algorithm, strutils]
 
 type
   # Entry returned by iterator

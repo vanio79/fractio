@@ -83,7 +83,7 @@ proc readIndexBlock(strm: Stream, hdl: BlockHandle): StorageResult[IndexBlock] =
 
   return ok[IndexBlock, StorageError](idxBlock)
 
-proc readDataBlock(strm: Stream, hdl: BlockHandle): StorageResult[DataBlock] =
+proc readDataBlock*(strm: Stream, hdl: BlockHandle): StorageResult[DataBlock] =
   # Position at start of block data (handle.offset is already past the block type byte)
   strm.setPosition(int(hdl.offset))
 

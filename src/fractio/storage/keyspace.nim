@@ -8,12 +8,14 @@
 ## within a database.
 
 import fractio/storage/[error, types, journal, snapshot_tracker, stats, supervisor,
-                        write_buffer_manager]
+                        write_buffer_manager, iter, snapshot]
 import fractio/storage/lsm_tree/[types as lsm_types, lsm_tree, memtable]
+import fractio/storage/lsm_tree/sstable/reader
+import fractio/storage/lsm_tree/sstable/types as sst_types
 import fractio/storage/journal/writer # For PersistMode
 import fractio/storage/keyspace/options
 import fractio/storage/keyspace/name
-import std/[atomics, options]
+import std/[atomics, options, algorithm, strutils, os]
 
 # Keyspace key (a.k.a. column family, locality group)
 type
@@ -355,3 +357,90 @@ proc flushOldestSealed*(keyspace: Keyspace): StorageResult[uint64] =
 proc majorCompaction*(keyspace: Keyspace): StorageResult[void] =
   let gcWatermark = keyspace.inner.supervisor.inner.snapshotTracker.getSeqnoSafeToGc()
   return keyspace.inner.tree.majorCompact(0'u64, gcWatermark)
+
+# Create an iterator over all keys in the keyspace
+proc iter*(keyspace: Keyspace): KeyspaceIter =
+  ## Creates an iterator over all key-value pairs in the keyspace.
+  ## The iterator holds a snapshot to ensure consistent reads.
+
+  # Open a snapshot to ensure consistent reads
+  let nonce = keyspace.inner.supervisor.inner.snapshotTracker.open()
+  let seqno = nonce.instant
+
+  result = newKeyspaceIter(nonce)
+
+  # Collect all entries from memtables
+  # Active memtable
+  let activeEntries = keyspace.inner.tree.activeMemtable.getSortedEntries()
+  for e in activeEntries:
+    if e.seqno <= seqno:
+      result.add(e.key, e.value, e.seqno, e.valueType)
+
+  # Sealed memtables
+  for memtable in keyspace.inner.tree.sealedMemtables:
+    let entries = memtable.getSortedEntries()
+    for e in entries:
+      if e.seqno <= seqno:
+        result.add(e.key, e.value, e.seqno, e.valueType)
+
+  # Collect entries from SSTables
+  for level in keyspace.inner.tree.tables:
+    for sstable in level:
+      if sstable.path.len > 0 and fileExists(sstable.path):
+        let readerResult = openSsTable(sstable.path)
+        if readerResult.isOk:
+          let reader = readerResult.value
+          # Read all entries from the SSTable
+          for idxEntry in reader.indexBlock.entries:
+            let blockResult = readDataBlock(reader.stream, idxEntry.handle)
+            if blockResult.isOk:
+              let dataBlk = blockResult.value
+              for entry in dataBlk.entries:
+                if entry.seqno <= seqno:
+                  # Map uint8 valueType to lsm_types.ValueType enum
+                  let vt = case entry.valueType
+                    of 0'u8: lsm_types.vtValue
+                    of 1'u8: lsm_types.vtTombstone
+                    of 2'u8: lsm_types.vtWeakTombstone
+                    else: lsm_types.vtIndirection
+                  result.add(entry.key, entry.value, entry.seqno, vt)
+          reader.close()
+
+  # Sort all entries by key
+  result.sortEntries()
+
+# Create an iterator over a range of keys
+proc rangeIter*(keyspace: Keyspace, startKey: string,
+    endKey: string): KeyspaceIter =
+  ## Creates an iterator over a range of keys [startKey, endKey].
+
+  let fullIter = keyspace.iter()
+
+  let nonce = keyspace.inner.supervisor.inner.snapshotTracker.open()
+  result = newKeyspaceIter(nonce)
+
+  # Filter entries within the range
+  for entry in fullIter.entries:
+    if entry.key >= startKey and entry.key <= endKey:
+      result.add(entry.key, entry.value, entry.seqno, entry.valueType)
+
+  result.sortEntries()
+
+# Create an iterator over keys with a prefix
+proc prefixIter*(keyspace: Keyspace, prefixStr: string): KeyspaceIter =
+  ## Creates an iterator over all keys starting with the given prefix.
+
+  let fullIter = keyspace.iter()
+
+  let nonce = keyspace.inner.supervisor.inner.snapshotTracker.open()
+  result = newKeyspaceIter(nonce)
+
+  # Filter entries with the prefix
+  for entry in fullIter.entries:
+    if entry.key.startsWith(prefixStr):
+      result.add(entry.key, entry.value, entry.seqno, entry.valueType)
+    elif entry.key > prefixStr:
+      # Entries are sorted, so we can stop once we pass the prefix
+      break
+
+  result.sortEntries()
