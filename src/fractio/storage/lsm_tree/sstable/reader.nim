@@ -10,7 +10,6 @@ import ./types
 import ./blocks
 import fractio/storage/error
 import fractio/storage/types
-import fractio/storage/lsm_tree/types
 import std/[streams, os, strutils, endians, options]
 
 type
@@ -23,8 +22,9 @@ type
     largestKey*: string
     seqnoRange*: (uint64, uint64)
 
-proc readFooter(strm: Stream): StorageResult[SsTableFooter] =
-  strm.setPosition(-32, spEnd)
+proc readFooter(strm: Stream, fileSize: int64): StorageResult[SsTableFooter] =
+  # Footer is at the end of the file - 32 bytes
+  strm.setPosition(int(fileSize - 32))
 
   var footer = SsTableFooter()
   var offsetLe: uint64
@@ -84,20 +84,22 @@ proc readIndexBlock(strm: Stream, hdl: BlockHandle): StorageResult[IndexBlock] =
   return ok[IndexBlock, StorageError](idxBlock)
 
 proc readDataBlock(strm: Stream, hdl: BlockHandle): StorageResult[DataBlock] =
+  # Position at start of block data (handle.offset is already past the block type byte)
   strm.setPosition(int(hdl.offset))
 
   var dataBlk = newDataBlock()
 
-  let blockType = BlockType(strm.readUInt8())
-  if blockType != btData:
-    return err[DataBlock, StorageError](StorageError(
-      kind: seIo, ioError: "Expected data block"))
-
+  # The handle points to the start of the block data (after the block type)
+  # size is the size of the block data (not including block type byte)
   let endPos = int(hdl.offset) + int(hdl.size)
   var prevKey = ""
   var entryCount = 0
 
-  while strm.getPosition() < endPos - 8:
+  while strm.getPosition() < endPos:
+    # Check if we have enough bytes for a minimal entry (3 * 4-byte lengths + 8-byte seqnoType = 20 bytes)
+    if strm.getPosition() + 20 > endPos:
+      break
+
     var entry = BlockEntry()
 
     var sharedLenLe: uint32 = strm.readUInt32()
@@ -143,8 +145,10 @@ proc openSsTable*(path: string): StorageResult[SsTableReader] =
     return err[SsTableReader, StorageError](StorageError(
       kind: seIo, ioError: "Failed to open SSTable file: " & path))
 
+  # Get file size
+  let fileSize = getFileSize(path)
 
-  let footerResult = readFooter(strm)
+  let footerResult = readFooter(strm, fileSize)
   if footerResult.isErr:
     strm.close()
     return err[SsTableReader, StorageError](footerResult.error)
@@ -156,16 +160,18 @@ proc openSsTable*(path: string): StorageResult[SsTableReader] =
     strm.close()
     return err[SsTableReader, StorageError](indexResult.error)
 
-  result = SsTableReader(
+  var reader = SsTableReader(
     path: path,
     stream: strm,
     indexBlock: indexResult.value,
     footer: footer
   )
 
-  if result.indexBlock.entries.len > 0:
-    result.smallestKey = result.indexBlock.entries[0].key
-    result.largestKey = result.indexBlock.entries[^1].key
+  if reader.indexBlock.entries.len > 0:
+    reader.smallestKey = reader.indexBlock.entries[0].key
+    reader.largestKey = reader.indexBlock.entries[^1].key
+
+  return ok[SsTableReader, StorageError](reader)
 
 proc close*(reader: SsTableReader) =
   if reader.stream != nil:
@@ -176,12 +182,17 @@ proc get*(reader: SsTableReader, key: string): Option[string] =
   var handle: BlockHandle
   var found = false
 
+  # Find the data block that might contain the key
+  # The index block stores the largest key in each data block
+  # We want the first block where the largest key >= our search key
   for entry in reader.indexBlock.entries:
-    if entry.key <= key:
+    if entry.key >= key:
       handle = entry.handle
       found = true
-    else:
       break
+    # Keep track of the last block we've seen that could contain our key
+    handle = entry.handle
+    found = true
 
   if not found:
     return none(string)

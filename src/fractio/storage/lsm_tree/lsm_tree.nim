@@ -10,6 +10,7 @@ import fractio/storage/error
 import ./types
 import ./memtable
 import ./sstable/writer
+import ./sstable/reader
 import std/[os, atomics, locks, options, tables, streams, strutils]
 
 export types except ItemSizeResult
@@ -130,12 +131,30 @@ proc get*(tree: LsmTree, key: string, seqno: uint64): Option[string] =
         of vtIndirection:
           return some(e.value)
 
-  # Check SSTables (from newest to oldest)
-  for level in 0 ..< tree.tables.len:
+  # Check SSTables (from newest to oldest, level 0 first)
+  # Level 0 tables are not sorted, need to check all
+  for table in tree.tables[0]:
+    if table.path.len > 0:
+      # Open and search the SSTable
+      let readerResult = openSsTable(table.path)
+      if readerResult.isOk:
+        let reader = readerResult.value
+        let value = reader.get(key)
+        reader.close()
+        if value.isSome:
+          return value
+
+  # Check other levels (sorted, can use binary search)
+  for level in 1 ..< tree.tables.len:
     for table in tree.tables[level]:
-      # In a full implementation, this would do a proper SSTable lookup
-      # For now, we skip this as SSTables are not yet implemented
-      discard
+      if table.path.len > 0:
+        let readerResult = openSsTable(table.path)
+        if readerResult.isOk:
+          let reader = readerResult.value
+          let value = reader.get(key)
+          reader.close()
+          if value.isSome:
+            return value
 
   return none(string)
 
