@@ -10,6 +10,8 @@ import ./types
 import ./blocks
 import fractio/storage/error
 import fractio/storage/types
+import fractio/storage/lsm_tree/block_cache
+import fractio/storage/lsm_tree/bloom_filter
 import std/[streams, os, strutils, endians, options]
 
 type
@@ -18,47 +20,84 @@ type
     stream*: FileStream
     indexBlock*: IndexBlock
     footer*: SsTableFooter
+    bloomFilter*: BloomFilter # Bloom filter for quick rejection
     smallestKey*: string
     largestKey*: string
     seqnoRange*: (uint64, uint64)
+    sstableId*: uint64        # ID of this SSTable
+    blockCache*: BlockCache   # Optional block cache (may be nil)
 
 proc readFooter(strm: Stream, fileSize: int64): StorageResult[SsTableFooter] =
-  # Footer is at the end of the file - 32 bytes
-  strm.setPosition(int(fileSize - 32))
+  ## Read the SSTable footer.
+  ## Supports both v1 (32 bytes) and v2 (44 bytes) footer formats.
+
+  # First, read the last 4 bytes to get footer size
+  strm.setPosition(int(fileSize - 4))
+  var footerSizeLe: uint32 = strm.readUInt32()
+  var footerSize: uint32
+  littleEndian32(addr footerSize, addr footerSizeLe)
 
   var footer = SsTableFooter()
-  var offsetLe: uint64
-  var sizeLe: uint32
 
-  offsetLe = strm.readUInt64()
-  littleEndian64(addr footer.indexHandle.offset, addr offsetLe)
+  if footerSize == 44:
+    # Version 2 footer (includes bloom filter)
+    strm.setPosition(int(fileSize - 44))
 
-  sizeLe = strm.readUInt32()
-  littleEndian32(addr footer.indexHandle.size, addr sizeLe)
+    var offsetLe: uint64 = strm.readUInt64()
+    littleEndian64(addr footer.indexHandle.offset, addr offsetLe)
 
-  for i in 0 ..< 8:
-    footer.magic[i] = strm.readUInt8()
+    var sizeLe: uint32 = strm.readUInt32()
+    littleEndian32(addr footer.indexHandle.size, addr sizeLe)
+
+    offsetLe = strm.readUInt64()
+    littleEndian64(addr footer.filterHandle.offset, addr offsetLe)
+
+    sizeLe = strm.readUInt32()
+    littleEndian32(addr footer.filterHandle.size, addr sizeLe)
+
+    for i in 0 ..< 8:
+      footer.magic[i] = strm.readUInt8()
+
+    var versionLe: uint32 = strm.readUInt32()
+    littleEndian32(addr footer.version, addr versionLe)
+
+    footer.checksum = strm.readUInt32()
+
+  elif footerSize == 32:
+    # Version 1 footer (no bloom filter)
+    strm.setPosition(int(fileSize - 32))
+
+    var offsetLe: uint64 = strm.readUInt64()
+    littleEndian64(addr footer.indexHandle.offset, addr offsetLe)
+
+    var sizeLe: uint32 = strm.readUInt32()
+    littleEndian32(addr footer.indexHandle.size, addr sizeLe)
+
+    for i in 0 ..< 8:
+      footer.magic[i] = strm.readUInt8()
+
+    var versionLe: uint32 = strm.readUInt32()
+    littleEndian32(addr footer.version, addr versionLe)
+
+    footer.checksum = strm.readUInt32()
+
+    # No filter in v1
+    footer.filterHandle = BlockHandle(offset: 0, size: 0)
+  else:
+    return err[SsTableFooter, StorageError](StorageError(
+      kind: seInvalidVersion, invalidVersion: none(FormatVersion)))
 
   if footer.magic != SSTABLE_MAGIC:
     return err[SsTableFooter, StorageError](StorageError(
       kind: seInvalidVersion, invalidVersion: none(FormatVersion)))
 
-  var versionLe: uint32 = strm.readUInt32()
-  littleEndian32(addr footer.version, addr versionLe)
-
-  footer.checksum = strm.readUInt32()
-
   return ok[SsTableFooter, StorageError](footer)
 
 proc readIndexBlock(strm: Stream, hdl: BlockHandle): StorageResult[IndexBlock] =
+  # Position at start of index block data (AFTER block type byte)
   strm.setPosition(int(hdl.offset))
 
   var idxBlock = newIndexBlock()
-
-  let blockType = BlockType(strm.readUInt8())
-  if blockType != btIndex:
-    return err[IndexBlock, StorageError](StorageError(
-      kind: seIo, ioError: "Expected index block"))
 
   let endPos = int(hdl.offset) + int(hdl.size)
 
@@ -84,7 +123,7 @@ proc readIndexBlock(strm: Stream, hdl: BlockHandle): StorageResult[IndexBlock] =
   return ok[IndexBlock, StorageError](idxBlock)
 
 proc readDataBlock*(strm: Stream, hdl: BlockHandle): StorageResult[DataBlock] =
-  # Position at start of block data (handle.offset is already past the block type byte)
+  # Position at start of block data (handle.offset is AFTER the block type byte)
   strm.setPosition(int(hdl.offset))
 
   var dataBlk = newDataBlock()
@@ -155,7 +194,145 @@ proc readDataBlock*(strm: Stream, hdl: BlockHandle): StorageResult[DataBlock] =
 
   return ok[DataBlock, StorageError](dataBlk)
 
-proc openSsTable*(path: string): StorageResult[SsTableReader] =
+proc parseDataBlock*(data: string): StorageResult[DataBlock] =
+  ## Parse a DataBlock from raw bytes.
+  ## Used by the block cache to avoid re-reading from disk.
+  var dataBlk = newDataBlock()
+
+  if data.len < 4:
+    return ok[DataBlock, StorageError](dataBlk)
+
+  # Read numRestarts from the last 4 bytes
+  var numRestartsLe: uint32
+  copyMem(addr numRestartsLe, addr data[data.len - 4], 4)
+  var numRestarts: uint32
+  littleEndian32(addr numRestarts, addr numRestartsLe)
+
+  # Calculate where entries end (before restart points)
+  let entriesEndPos = data.len - 4 - int(numRestarts * 4)
+
+  if entriesEndPos < 0:
+    return ok[DataBlock, StorageError](dataBlk)
+
+  var pos = 0
+  var prevKey = ""
+  var entryCount = 0
+
+  while pos < entriesEndPos:
+    # Check if we have enough bytes for a minimal entry
+    if pos + 20 > entriesEndPos:
+      break
+
+    var entry = BlockEntry()
+
+    var sharedLenLe: uint32
+    copyMem(addr sharedLenLe, addr data[pos], 4)
+    pos += 4
+    var sharedLen: uint32
+    littleEndian32(addr sharedLen, addr sharedLenLe)
+
+    var unsharedLenLe: uint32
+    copyMem(addr unsharedLenLe, addr data[pos], 4)
+    pos += 4
+    var unsharedLen: uint32
+    littleEndian32(addr unsharedLen, addr unsharedLenLe)
+
+    var valueLenLe: uint32
+    copyMem(addr valueLenLe, addr data[pos], 4)
+    pos += 4
+    var valueLen: uint32
+    littleEndian32(addr valueLen, addr valueLenLe)
+
+    var seqnoTypeLe: uint64
+    copyMem(addr seqnoTypeLe, addr data[pos], 8)
+    pos += 8
+    var seqnoType: uint64
+    littleEndian64(addr seqnoType, addr seqnoTypeLe)
+    entry.seqno = seqnoType shr 8
+    entry.valueType = uint8(seqnoType and 0xFF)
+
+    if sharedLen > 0:
+      entry.key = prevKey[0 ..< int(sharedLen)]
+    if unsharedLen > 0:
+      var unshared = newString(int(unsharedLen))
+      copyMem(addr unshared[0], addr data[pos], int(unsharedLen))
+      pos += int(unsharedLen)
+      entry.key &= unshared
+
+    if valueLen > 0:
+      entry.value = newString(int(valueLen))
+      copyMem(addr entry.value[0], addr data[pos], int(valueLen))
+      pos += int(valueLen)
+
+    dataBlk.entries.add(entry)
+    prevKey = entry.key
+    entryCount += 1
+
+    if entryCount > 100000:
+      break
+
+  return ok[DataBlock, StorageError](dataBlk)
+
+proc readRawBlock*(strm: Stream, hdl: BlockHandle): StorageResult[string] =
+  ## Read raw block data from disk (for caching).
+  ## The handle.offset points AFTER the block type byte, so we read directly.
+  strm.setPosition(int(hdl.offset))
+  let size = int(hdl.size)
+  var data = newString(size)
+  if size > 0:
+    discard strm.readData(addr data[0], size)
+  return ok[string, StorageError](data)
+
+proc readDataBlockWithCache*(reader: SsTableReader,
+    hdl: BlockHandle): StorageResult[DataBlock] =
+  ## Read a data block, using the block cache if available.
+  if reader.blockCache != nil:
+    let cacheKey = BlockKey(sstableId: reader.sstableId,
+        blockOffset: hdl.offset)
+    let cached = reader.blockCache.get(cacheKey)
+    if cached.isSome:
+      # Cache hit - parse the cached data
+      return parseDataBlock(cached.get)
+
+  # Cache miss - read from disk
+  let rawResult = readRawBlock(reader.stream, hdl)
+  if rawResult.isErr:
+    return err[DataBlock, StorageError](rawResult.error)
+
+  let rawData = rawResult.value
+
+  # Store in cache
+  if reader.blockCache != nil:
+    let cacheKey = BlockKey(sstableId: reader.sstableId,
+        blockOffset: hdl.offset)
+    reader.blockCache.put(cacheKey, rawData)
+
+  # Parse the data
+  return parseDataBlock(rawData)
+
+proc readBloomFilter*(strm: Stream, hdl: BlockHandle): StorageResult[BloomFilter] =
+  ## Read a bloom filter from disk.
+  ## The handle.offset points AFTER the block type byte (consistent with other blocks).
+  if hdl.size == 0:
+    return ok[BloomFilter, StorageError](nil)
+
+  strm.setPosition(int(hdl.offset))
+
+  # Read the bloom filter (handle already points after block type byte)
+  try:
+    result = ok[BloomFilter, StorageError](deserializeBloomFilter(strm))
+  except IOError:
+    return err[BloomFilter, StorageError](StorageError(
+      kind: seIo, ioError: "Failed to read bloom filter"))
+
+proc openSsTable*(path: string, sstableId: uint64 = 0,
+                  cache: BlockCache = nil): StorageResult[SsTableReader] =
+  ## Open an SSTable file for reading.
+  ##
+  ## Parameters:
+  ##   path: Path to the SSTable file
+  ##   sstableId: ID of the SSTable (used for cache key)
+  ##   cache: Optional block cache for caching data blocks
   let strm = newFileStream(path, fmRead)
   if strm == nil:
     return err[SsTableReader, StorageError](StorageError(
@@ -176,16 +353,40 @@ proc openSsTable*(path: string): StorageResult[SsTableReader] =
     strm.close()
     return err[SsTableReader, StorageError](indexResult.error)
 
+  # Read bloom filter if present
+  var bloomFilter: BloomFilter = nil
+  if footer.filterHandle.size > 0:
+    let filterResult = readBloomFilter(strm, footer.filterHandle)
+    if filterResult.isOk:
+      bloomFilter = filterResult.value
+
   var reader = SsTableReader(
     path: path,
     stream: strm,
     indexBlock: indexResult.value,
-    footer: footer
+    footer: footer,
+    bloomFilter: bloomFilter,
+    sstableId: sstableId,
+    blockCache: cache
   )
 
+  # Get key range from index block
+  # Index entries store the LARGEST key in each block
+  # So smallest key overall is the first entry's smallest key (need to read from data block)
+  # And largest key overall is the last index entry's key
   if reader.indexBlock.entries.len > 0:
-    reader.smallestKey = reader.indexBlock.entries[0].key
+    # The largest key is the last index entry's key
     reader.largestKey = reader.indexBlock.entries[^1].key
+
+    # To get the smallest key, we need to read from the first data block
+    # For efficiency, we'll read just the first entry
+    let firstHandle = reader.indexBlock.entries[0].handle
+    let blockResult = readDataBlock(strm, firstHandle)
+    if blockResult.isOk and blockResult.value.entries.len > 0:
+      reader.smallestKey = blockResult.value.entries[0].key
+    else:
+      # Fallback to index entry key (may not be accurate)
+      reader.smallestKey = reader.indexBlock.entries[0].key
 
   return ok[SsTableReader, StorageError](reader)
 
@@ -195,6 +396,11 @@ proc close*(reader: SsTableReader) =
     reader.stream = nil
 
 proc get*(reader: SsTableReader, key: string): Option[string] =
+  # Check bloom filter first for quick rejection
+  if reader.bloomFilter != nil:
+    if not reader.bloomFilter.mayContain(key):
+      return none(string)
+
   var handle: BlockHandle
   var found = false
 
@@ -213,7 +419,12 @@ proc get*(reader: SsTableReader, key: string): Option[string] =
   if not found:
     return none(string)
 
-  let blockResult = readDataBlock(reader.stream, handle)
+  # Use cached read if block cache is available
+  let blockResult = if reader.blockCache != nil:
+    reader.readDataBlockWithCache(handle)
+  else:
+    readDataBlock(reader.stream, handle)
+
   if blockResult.isErr:
     return none(string)
 
@@ -238,10 +449,19 @@ proc get*(reader: SsTableReader, key: string): Option[string] =
   return none(string)
 
 proc mightContain*(reader: SsTableReader, key: string): bool =
+  ## Check if the key might be in this SSTable.
+  ## Uses bloom filter for fast rejection, then key range check.
+
+  # First check key range
   if reader.smallestKey.len == 0:
     return false
   if key < reader.smallestKey or key > reader.largestKey:
     return false
+
+  # Then check bloom filter if available
+  if reader.bloomFilter != nil:
+    return reader.bloomFilter.mayContain(key)
+
   return true
 
 proc getKeyRange*(reader: SsTableReader): (string, string) =

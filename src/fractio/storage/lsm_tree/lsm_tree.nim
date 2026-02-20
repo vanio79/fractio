@@ -12,6 +12,7 @@ import ./memtable
 import ./sstable/writer
 import ./sstable/reader
 import ./compaction
+import ./block_cache
 import fractio/storage/snapshot_tracker
 import std/[os, atomics, locks, options, tables, streams, strutils, algorithm]
 
@@ -68,7 +69,8 @@ proc newLsmTree*(config: LsmTreeConfig,
     memtableIdCounter: memtableIdCounter,
     tableIdCounter: tableIdCounter,
     seqnoCounter: seqnoCounter,
-    snapshotTracker: snapshotTracker
+    snapshotTracker: snapshotTracker,
+    blockCache: newBlockCache(config.cacheCapacity)
   )
   initLock(result.versionLock)
 
@@ -100,15 +102,16 @@ proc loadSsTables*(tree: LsmTree) =
         let fileSize = getFileSize(filePath)
 
         # Create SsTable entry
+        let tableId = tree.tableIdCounter.fetchAdd(1, moRelaxed) + 1
         var sstable = SsTable(
-          id: tree.tableIdCounter.fetchAdd(1, moRelaxed) + 1,
+          id: tableId,
           path: filePath,
           size: uint64(fileSize),
           level: level
         )
 
         # Try to open SSTable to get key range and highest seqno
-        let readerResult = openSsTable(filePath)
+        let readerResult = openSsTable(filePath, tableId, tree.blockCache)
         if readerResult.isOk:
           let reader = readerResult.value
           sstable.smallestKey = reader.smallestKey
@@ -207,8 +210,8 @@ proc get*(tree: LsmTree, key: string, seqno: uint64): Option[string] =
   # Level 0 tables are not sorted, need to check all
   for table in tree.tables[0]:
     if table.path.len > 0:
-      # Open and search the SSTable
-      let readerResult = openSsTable(table.path)
+      # Open and search the SSTable with block cache
+      let readerResult = openSsTable(table.path, table.id, tree.blockCache)
       if readerResult.isOk:
         let reader = readerResult.value
         let value = reader.get(key)
@@ -220,7 +223,7 @@ proc get*(tree: LsmTree, key: string, seqno: uint64): Option[string] =
   for level in 1 ..< tree.tables.len:
     for table in tree.tables[level]:
       if table.path.len > 0:
-        let readerResult = openSsTable(table.path)
+        let readerResult = openSsTable(table.path, table.id, tree.blockCache)
         if readerResult.isOk:
           let reader = readerResult.value
           let value = reader.get(key)
@@ -472,6 +475,11 @@ proc majorCompact*(tree: LsmTree, targetSize: uint64,
   if mergedEntries.len == 0:
     # All entries were tombstones and got GC'd
     # Just delete the old tables
+
+    # Invalidate block cache for old tables
+    for table in tablesToCompact:
+      tree.blockCache.invalidateSsTable(table.id)
+
     let deleteResult = deleteOldTables(tablesToCompact)
     if deleteResult.isErr:
       return err[void, StorageError](deleteResult.error)
@@ -509,6 +517,10 @@ proc majorCompact*(tree: LsmTree, targetSize: uint64,
 
   let newTables = writeResult.value
   tree.tableIdCounter.store(tableIdCounter, moRelaxed)
+
+  # Invalidate block cache for old tables before deletion
+  for table in tablesToCompact:
+    tree.blockCache.invalidateSsTable(table.id)
 
   # Delete old tables
   let deleteResult = deleteOldTables(tablesToCompact)
@@ -627,3 +639,18 @@ proc sealedCount*(tree: LsmTree): int =
   tree.versionLock.acquire()
   defer: tree.versionLock.release()
   tree.sealedMemtables.len
+
+# Get block cache statistics
+proc blockCacheStats*(tree: LsmTree): tuple[hits, misses: uint64, hitRate: float,
+                                            size: uint64, count: int] =
+  ## Get statistics from the block cache.
+  ## Returns (hits, misses, hitRate, size, count).
+  if tree.blockCache != nil:
+    return tree.blockCache.stats()
+  return (0'u64, 0'u64, 0.0, 0'u64, 0)
+
+# Clear block cache
+proc clearBlockCache*(tree: LsmTree) =
+  ## Clear all entries from the block cache.
+  if tree.blockCache != nil:
+    tree.blockCache.clear()

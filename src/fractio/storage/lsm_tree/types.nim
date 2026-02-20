@@ -8,6 +8,7 @@
 
 import fractio/storage/snapshot_tracker
 import fractio/storage/lsm_tree/compaction_strategy
+import fractio/storage/lsm_tree/block_cache
 import std/[tables, atomics, locks, options]
 
 # Re-export SequenceNumberCounter and SnapshotTracker from snapshot_tracker
@@ -18,6 +19,9 @@ export SequenceNumberCounter, SnapshotTracker, newSequenceNumberCounter,
 export CompactionStrategy, CompactionStrategyKind, defaultLeveled, defaultTiered,
        defaultFifo, newFifo, newLeveled, newTiered, getTargetTableSize, getName,
        shouldCompact
+
+# Re-export block cache types
+export BlockCache, newBlockCache
 
 # Forward declarations
 type
@@ -106,6 +110,7 @@ type
     versionLock*: Lock
     seqnoCounter*: SequenceNumberCounter
     snapshotTracker*: SnapshotTracker
+    blockCache*: BlockCache    # LRU cache for SSTable data blocks
 
 # Abstract tree interface
 type

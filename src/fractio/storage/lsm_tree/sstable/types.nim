@@ -6,7 +6,7 @@
 ##
 ## Blocks are the basic unit of storage in SSTables.
 
-import std/[streams, tables]
+import std/streams
 
 # Block header size
 const BLOCK_HEADER_SIZE* = 8
@@ -59,21 +59,13 @@ type
   IndexBlock* = ref object
     entries*: seq[IndexEntry]
 
-# Bloom filter
-type
-  BloomFilter* = ref object
-    data*: seq[byte]
-    numKeys*: uint32
-    numBits*: uint32
-    numHashes*: uint8
-
 # SSTable footer
 type
   SsTableFooter* = object
     magic*: array[8, byte]
     version*: uint32
     indexHandle*: BlockHandle
-    filterHandle*: BlockHandle
+    filterHandle*: BlockHandle # Points to bloom filter block
     metaIndexHandle*: BlockHandle
     checksum*: uint32
 
