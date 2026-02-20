@@ -3,6 +3,7 @@
 # (found in the LICENSE-* files in the repository)
 
 import fractio/storage/[types]
+import fractio/storage/lsm_tree/compaction_strategy
 import std/[tables, strutils, options]
 
 # Forward declarations
@@ -96,8 +97,8 @@ type
 
     manualJournalPersist*: bool
 
-    # Compaction strategy (placeholder)
-    compactionStrategy*: string
+    # Compaction strategy
+    compactionStrategy*: CompactionStrategy
 
     kvSeparationOpts*: Option[KvSeparationOptions]
 
@@ -126,7 +127,7 @@ proc defaultCreateOptions*(): CreateOptions =
     levelCount: 7,
     dataBlockCompressionPolicy: CompressionPolicy(compressionTypes: @[ctNone]),
     indexBlockCompressionPolicy: CompressionPolicy(compressionTypes: @[ctNone]),
-    compactionStrategy: "Leveled", # Default to Leveled compaction
+    compactionStrategy: defaultLeveled(), # Default to Leveled compaction
     kvSeparationOpts: none(KvSeparationOptions)
   )
 

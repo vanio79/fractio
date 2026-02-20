@@ -11,8 +11,9 @@ import ./types
 import ./memtable
 import ./sstable/writer
 import ./sstable/reader
+import ./compaction
 import fractio/storage/snapshot_tracker
-import std/[os, atomics, locks, options, tables, streams, strutils]
+import std/[os, atomics, locks, options, tables, streams, strutils, algorithm]
 
 export types except ItemSizeResult
 
@@ -29,7 +30,20 @@ proc newConfig*(path: string): LsmTreeConfig =
     levelCount: DefaultLevelCount,
     maxMemtableSize: DefaultMaxMemtableSize,
     blockSize: DefaultBlockSize,
-    cacheCapacity: 256 * 1024 * 1024 # 256 MiB
+    cacheCapacity: 256 * 1024 * 1024, # 256 MiB
+    compactionStrategy: defaultLeveled()
+  )
+
+# Create configuration with custom compaction strategy
+proc newConfigWithStrategy*(path: string,
+                            strategy: CompactionStrategy): LsmTreeConfig =
+  LsmTreeConfig(
+    path: path,
+    levelCount: DefaultLevelCount,
+    maxMemtableSize: DefaultMaxMemtableSize,
+    blockSize: DefaultBlockSize,
+    cacheCapacity: 256 * 1024 * 1024,
+    compactionStrategy: strategy
   )
 
 # Create a new LSM tree
@@ -294,8 +308,8 @@ proc clear*(tree: LsmTree): StorageResult[void] =
 
   return okVoid
 
-# Get highest sequence number in tree
-proc getHighestSeqno*(tree: LsmTree): Option[uint64] =
+# Get highest sequence number in memtables (not persisted)
+proc getHighestMemtableSeqno*(tree: LsmTree): Option[uint64] =
   tree.versionLock.acquire()
   defer: tree.versionLock.release()
 
@@ -313,10 +327,25 @@ proc getHighestSeqno*(tree: LsmTree): Option[uint64] =
     return some(highest)
   return none(uint64)
 
-# Get highest persisted sequence number
+# Get highest sequence number in tree (alias for compatibility)
+proc getHighestSeqno*(tree: LsmTree): Option[uint64] =
+  tree.getHighestMemtableSeqno()
+
+# Get highest persisted sequence number (from SSTables)
 proc getHighestPersistedSeqno*(tree: LsmTree): Option[uint64] =
-  # In a full implementation, this would check the SSTables
-  # For now, return none
+  tree.versionLock.acquire()
+  defer: tree.versionLock.release()
+
+  var highest: uint64 = 0
+
+  # Check all levels for highest seqno in SSTables
+  for level in tree.tables:
+    for table in level:
+      if table.seqnoRange[1] > highest:
+        highest = table.seqnoRange[1]
+
+  if highest > 0:
+    return some(highest)
   return none(uint64)
 
 # L0 run count (for compaction triggers)
@@ -356,11 +385,168 @@ proc staleBlobBytes*(tree: LsmTree): uint64 =
 # Major compaction
 proc majorCompact*(tree: LsmTree, targetSize: uint64,
     gcWatermark: uint64): StorageResult[void] =
-  # Not fully implemented yet
-  # In a full implementation, this would:
-  # 1. Take all SSTables
-  # 2. Merge them into new SSTables
-  # 3. Remove old SSTables
+  ## Performs compaction on the LSM tree.
+  ##
+  ## This implementation does leveled compaction:
+  ## 1. Compacts L0 tables into L1
+  ## 2. Merges overlapping tables
+  ## 3. Removes tombstones older than gcWatermark
+
+  tree.versionLock.acquire()
+  defer: tree.versionLock.release()
+
+  # Find levels with tables to compact
+  var sourceLevel = -1
+  for level in 0 ..< tree.config.levelCount - 1:
+    if tree.tables[level].len > 0:
+      sourceLevel = level
+      break
+
+  if sourceLevel < 0:
+    # No tables to compact
+    return okVoid
+
+  let targetLevel = sourceLevel + 1
+
+  # Collect tables to compact from source level
+  var tablesToCompact: seq[SsTable] = @[]
+
+  if sourceLevel == 0:
+    # For L0, compact all tables
+    tablesToCompact = tree.tables[0]
+  else:
+    # For other levels, pick tables that overlap with next level
+    for srcTable in tree.tables[sourceLevel]:
+      var hasOverlap = false
+      for tgtTable in tree.tables[targetLevel]:
+        let srcRange = (srcTable.smallestKey, srcTable.largestKey)
+        let tgtRange = (tgtTable.smallestKey, tgtTable.largestKey)
+        if keyRangesOverlap(srcRange, tgtRange):
+          hasOverlap = true
+          break
+      if hasOverlap or tree.tables[targetLevel].len == 0:
+        tablesToCompact.add(srcTable)
+
+    # Also include overlapping tables from target level
+    for tgtTable in tree.tables[targetLevel]:
+      for srcTable in tablesToCompact:
+        let srcRange = (srcTable.smallestKey, srcTable.largestKey)
+        let tgtRange = (tgtTable.smallestKey, tgtTable.largestKey)
+        if keyRangesOverlap(srcRange, tgtRange):
+          if tgtTable notin tablesToCompact:
+            tablesToCompact.add(tgtTable)
+          break
+
+  if tablesToCompact.len == 0:
+    return okVoid
+
+  # Read all entries from tables to compact
+  var allEntries: seq[seq[MergeEntry]] = @[]
+  var loadedPaths: seq[string] = @[]
+
+  for table in tablesToCompact:
+    if table.path.len > 0 and fileExists(table.path):
+      let entriesResult = readSsTableEntries(table.path)
+      if entriesResult.isErr:
+        return err[void, StorageError](entriesResult.error)
+      allEntries.add(entriesResult.value)
+      loadedPaths.add(table.path)
+
+  if allEntries.len == 0:
+    return okVoid
+
+  # Merge entries with tombstone GC
+  # Use provided targetSize, or get from strategy, or use default
+  let usedTargetSize = if targetSize > 0:
+                         targetSize
+                       elif tree.config.compactionStrategy.getTargetTableSize() > 0:
+                         tree.config.compactionStrategy.getTargetTableSize()
+                       else:
+                         DEFAULT_TARGET_TABLE_SIZE
+  let mergeResult = mergeEntries(allEntries, gcWatermark)
+  if mergeResult.isErr:
+    return err[void, StorageError](mergeResult.error)
+
+  let mergedEntries = mergeResult.value
+
+  if mergedEntries.len == 0:
+    # All entries were tombstones and got GC'd
+    # Just delete the old tables
+    let deleteResult = deleteOldTables(tablesToCompact)
+    if deleteResult.isErr:
+      return err[void, StorageError](deleteResult.error)
+
+    # Remove tables from tree
+    if sourceLevel == 0:
+      tree.tables[0] = @[]
+    else:
+      var remainingSource: seq[SsTable] = @[]
+      for t in tree.tables[sourceLevel]:
+        if t notin tablesToCompact:
+          remainingSource.add(t)
+      tree.tables[sourceLevel] = remainingSource
+
+    if sourceLevel > 0:
+      var remainingTarget: seq[SsTable] = @[]
+      for t in tree.tables[targetLevel]:
+        if t notin tablesToCompact:
+          remainingTarget.add(t)
+      tree.tables[targetLevel] = remainingTarget
+
+    return okVoid
+
+  # Write new compacted tables
+  var tableIdCounter = tree.tableIdCounter.load(moRelaxed)
+  let writeResult = writeCompactedTables(
+    mergedEntries,
+    tree.config.path,
+    targetLevel,
+    usedTargetSize,
+    tableIdCounter
+  )
+  if writeResult.isErr:
+    return err[void, StorageError](writeResult.error)
+
+  let newTables = writeResult.value
+  tree.tableIdCounter.store(tableIdCounter, moRelaxed)
+
+  # Delete old tables
+  let deleteResult = deleteOldTables(tablesToCompact)
+  if deleteResult.isErr:
+    # Rollback: delete the new tables we just created
+    for newTable in newTables:
+      if newTable.path.len > 0 and fileExists(newTable.path):
+        try:
+          removeFile(newTable.path)
+        except OSError:
+          discard
+    return err[void, StorageError](deleteResult.error)
+
+  # Update tree: remove old tables, add new ones
+  if sourceLevel == 0:
+    tree.tables[0] = @[]
+  else:
+    var remainingSource: seq[SsTable] = @[]
+    for t in tree.tables[sourceLevel]:
+      if t notin tablesToCompact:
+        remainingSource.add(t)
+    tree.tables[sourceLevel] = remainingSource
+
+  if sourceLevel > 0:
+    # Remove compacted tables from target level too
+    var remainingTarget: seq[SsTable] = @[]
+    for t in tree.tables[targetLevel]:
+      if t notin tablesToCompact:
+        remainingTarget.add(t)
+    tree.tables[targetLevel] = remainingTarget
+
+  # Add new compacted tables to target level
+  for newTable in newTables:
+    tree.tables[targetLevel].add(newTable)
+
+  echo "[INFO] Compaction complete: ", tablesToCompact.len, " tables -> ",
+        newTables.len, " tables at level ", targetLevel
+
   return okVoid
 
 # Tree config accessor

@@ -7,11 +7,17 @@
 ## Core types for the LSM (Log-Structured Merge) tree implementation.
 
 import fractio/storage/snapshot_tracker
+import fractio/storage/lsm_tree/compaction_strategy
 import std/[tables, atomics, locks, options]
 
 # Re-export SequenceNumberCounter and SnapshotTracker from snapshot_tracker
 export SequenceNumberCounter, SnapshotTracker, newSequenceNumberCounter,
        newSnapshotTracker, fetchMax
+
+# Re-export compaction strategy types
+export CompactionStrategy, CompactionStrategyKind, defaultLeveled, defaultTiered,
+       defaultFifo, newFifo, newLeveled, newTiered, getTargetTableSize, getName,
+       shouldCompact
 
 # Forward declarations
 type
@@ -21,6 +27,7 @@ type
     maxMemtableSize*: uint64
     blockSize*: int
     cacheCapacity*: uint64
+    compactionStrategy*: CompactionStrategy
 
 # Value types for LSM tree entries
 type

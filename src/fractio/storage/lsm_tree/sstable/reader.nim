@@ -91,13 +91,29 @@ proc readDataBlock*(strm: Stream, hdl: BlockHandle): StorageResult[DataBlock] =
 
   # The handle points to the start of the block data (after the block type)
   # size is the size of the block data (not including block type byte)
-  let endPos = int(hdl.offset) + int(hdl.size)
+  # At the end of the block are: numRestarts (4 bytes) + restartPoints (4 bytes each)
+
+  # First, read the number of restart points from the end of the block
+  let blockEndPos = int(hdl.offset) + int(hdl.size)
+
+  # Read numRestarts from the last 4 bytes
+  strm.setPosition(blockEndPos - 4)
+  var numRestartsLe: uint32 = strm.readUInt32()
+  var numRestarts: uint32
+  littleEndian32(addr numRestarts, addr numRestartsLe)
+
+  # Calculate where entries end (before restart points)
+  # restart points are at: blockEndPos - 4 - (numRestarts * 4)
+  let entriesEndPos = blockEndPos - 4 - int(numRestarts * 4)
+
+  # Reset to start and read entries
+  strm.setPosition(int(hdl.offset))
   var prevKey = ""
   var entryCount = 0
 
-  while strm.getPosition() < endPos:
+  while strm.getPosition() < entriesEndPos:
     # Check if we have enough bytes for a minimal entry (3 * 4-byte lengths + 8-byte seqnoType = 20 bytes)
-    if strm.getPosition() + 20 > endPos:
+    if strm.getPosition() + 20 > entriesEndPos:
       break
 
     var entry = BlockEntry()

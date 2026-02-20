@@ -127,3 +127,10 @@ proc writeClear*(guard: JournalWriterGuard, keyspaceId: uint64,
 
 # Re-export recoverJournals from recovery module
 export recovery.recoverJournals
+
+# Re-export JournalManager types and procs
+export manager.newJournalManager, manager.JournalManager, manager.JournalItem,
+       manager.EvictionWatermark, manager.KeyspaceId, manager.clear,
+       manager.sealedJournalCount, manager.journalCount, manager.diskSpaceUsed,
+       manager.getKeyspaceIdsNeedingFlush, manager.getOldestJournalWatermarks,
+       manager.evictOldestJournal, manager.rotateJournal

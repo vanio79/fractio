@@ -2,49 +2,53 @@
 # This source code is licensed under both the Apache 2.0 and MIT License
 # (found in the LICENSE-* files in the repository)
 
-import fractio/storage/[error, types, journal/writer]
-import std/[os, locks]
+## Journal Manager
+##
+## Tracks sealed journals and handles garbage collection when journals
+## are no longer needed (all keyspaces have flushed past the journal's watermark).
+##
+## Design note: Uses keyspace IDs (not references) to avoid GC reference cycles.
+## The caller provides accessors to check keyspace state.
 
-# Forward declarations
+import fractio/storage/[error, types, journal/writer]
+import std/[os, options]
+
+# Keyspace ID type
 type
-  Keyspace* = object
-    name*: string
-    isDeleted*: bool # Placeholder for atomic boolean
+  KeyspaceId* = uint64
 
 # Stores the highest seqno of a keyspace found in a journal
 type
   EvictionWatermark* = object
-    keyspace*: Keyspace
-    lsn*: SeqNo
+    keyspaceId*: KeyspaceId
+    lsn*: uint64
 
 # Debug representation
 proc `$`*(watermark: EvictionWatermark): string =
-  watermark.keyspace.name & ":" & $watermark.lsn
+  "ks:" & $watermark.keyspaceId & "@" & $watermark.lsn
 
 # Journal manager item
 type
-  Item* = object
+  JournalItem* = object
     path*: string
     sizeInBytes*: uint64
     watermarks*: seq[EvictionWatermark]
 
 # Debug representation
-proc `$`*(item: Item): string =
-  "JournalManagerItem " & item.path & " => " & $item.watermarks
+proc `$`*(item: JournalItem): string =
+  "JournalItem " & item.path & " (" & $item.sizeInBytes & " bytes, " &
+    $item.watermarks.len & " watermarks)"
 
 # The JournalManager keeps track of sealed journals that are being flushed
 type
   JournalManager* = ref object
-    items*: seq[Item]
+    items*: seq[JournalItem]
     diskSpaceInBytes*: uint64
-
-# Forward declaration - must be after JournalManager type
-proc sealedJournalCount*(manager: JournalManager): int
 
 # Constructor
 proc newJournalManager*(): JournalManager =
   JournalManager(
-    items: newSeq[Item](0),
+    items: newSeq[JournalItem](0),
     diskSpaceInBytes: 0
   )
 
@@ -54,66 +58,60 @@ proc clear*(manager: JournalManager) =
   manager.diskSpaceInBytes = 0
 
 # Enqueue an item
-proc enqueue*(manager: JournalManager, item: Item) =
+proc enqueue*(manager: JournalManager, item: JournalItem) =
   manager.diskSpaceInBytes = manager.diskSpaceInBytes + item.sizeInBytes
   manager.items.add(item)
-
-# Returns the amount of journals
-proc journalCount*(manager: JournalManager): int =
-  # NOTE: + 1 = active journal
-  sealedJournalCount(manager) + 1
 
 # Returns the amount of sealed journals
 proc sealedJournalCount*(manager: JournalManager): int =
   manager.items.len
 
+# Returns the amount of journals (including active)
+proc journalCount*(manager: JournalManager): int =
+  # NOTE: + 1 = active journal
+  manager.sealedJournalCount() + 1
+
 # Returns the amount of bytes used on disk by journals
 proc diskSpaceUsed*(manager: JournalManager): uint64 =
   manager.diskSpaceInBytes
 
-# Gets keyspaces to be flushed so that the oldest journal can be safely evicted
-proc getKeyspacesToFlushForOldestJournalEviction*(manager: JournalManager): seq[Keyspace] =
-  var items: seq[Keyspace] = @[]
+# Get keyspace IDs that need flushing before oldest journal can be evicted
+proc getKeyspaceIdsNeedingFlush*(manager: JournalManager): seq[KeyspaceId] =
+  result = @[]
+  if manager.items.len == 0:
+    return
 
-  if manager.items.len > 0:
-    let firstItem = manager.items[0]
-    for watermark in firstItem.watermarks:
-      # In a full implementation, this would check the keyspace tree's highest persisted seqno
-      # For now, we'll just add the keyspace
-      items.add(watermark.keyspace)
+  let firstItem = manager.items[0]
+  for watermark in firstItem.watermarks:
+    result.add(watermark.keyspaceId)
 
-  return items
+# Get all watermarks for oldest journal
+proc getOldestJournalWatermarks*(manager: JournalManager): seq[
+    EvictionWatermark] =
+  if manager.items.len == 0:
+    return @[]
+  return manager.items[0].watermarks
 
-# Performs maintenance, maybe deleting some old journals
-proc maintenance*(manager: JournalManager): StorageResult[void] =
-  while manager.items.len > 0:
-    let item = manager.items[0]
+# Evict oldest journal (caller must ensure it's safe)
+proc evictOldestJournal*(manager: JournalManager): StorageResult[void] =
+  if manager.items.len == 0:
+    return okVoid
 
-    # Check if all keyspaces have been flushed enough to evict the journal
-    var canEvict = true
-    for watermark in item.watermarks:
-      # Only check keyspace seqno if not deleted
-      if not watermark.keyspace.isDeleted: # Placeholder for atomic load
-        # In a full implementation, this would check the keyspace tree's highest persisted seqno
-        # For now, we'll assume it can be evicted
-        discard
+  let item = manager.items[0]
 
-    if not canEvict:
-      break
+  # Remove the journal file
+  try:
+    removeFile(item.path)
+  except OSError:
+    return err[void, StorageError](StorageError(kind: seIo,
+        ioError: "Failed to remove journal file: " & item.path))
 
-    # Remove the journal file
-    try:
-      removeFile(item.path)
-    except OSError:
-      return err[void, StorageError](StorageError(kind: seIo,
-          ioError: "Failed to remove journal file"))
-
-    manager.diskSpaceInBytes = manager.diskSpaceInBytes - item.sizeInBytes
-    manager.items.delete(0)
+  manager.diskSpaceInBytes = manager.diskSpaceInBytes - item.sizeInBytes
+  manager.items.delete(0)
 
   return okVoid
 
-# Rotate journal
+# Rotate journal with watermarks
 proc rotateJournal*(manager: JournalManager, journalWriter: Writer,
                     watermarks: seq[EvictionWatermark]): StorageResult[void] =
   let journalSizeResult = journalWriter.len()
@@ -128,7 +126,7 @@ proc rotateJournal*(manager: JournalManager, journalWriter: Writer,
 
   let sealedPath = rotateResult.value[0]
 
-  manager.enqueue(Item(
+  manager.enqueue(JournalItem(
     path: sealedPath,
     watermarks: watermarks,
     sizeInBytes: journalSize

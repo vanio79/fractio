@@ -5,14 +5,16 @@
 ## Worker Pool
 ##
 ## Manages background worker threads for flushing and compaction.
+## Also handles journal maintenance through JournalManager.
 
 import fractio/storage/[error, snapshot_tracker, stats, supervisor,
-                        write_buffer_manager, flush/manager]
+                        write_buffer_manager, flush/manager, journal/manager]
 import fractio/storage/flush/worker as flush_worker
 import fractio/storage/compaction/worker as compaction_worker
 import fractio/storage/logging
 import fractio/storage/keyspace as ks
-import std/[atomics, locks, typedthreads, times, tables, os]
+import fractio/storage/lsm_tree/lsm_tree
+import std/[atomics, locks, typedthreads, times, tables, os, options]
 
 # L0 compaction trigger threshold - when L0 table count exceeds this, trigger compaction
 const L0_COMPACTION_TRIGGER* = 4
@@ -53,6 +55,9 @@ type
     poolSize*: int
     keyspaces*: ptr Table[string, ks.Keyspace] # Pointer to keyspaces table
     keyspacesLock*: ptr Lock
+    # JournalManager for maintenance - stored directly to avoid Supervisor reference cycle
+    journalManager*: JournalManager
+    journalManagerLock*: ptr Lock
 
 # Debug representation
 proc `$`*(msg: WorkerMessage): string =
@@ -76,6 +81,54 @@ proc findKeyspace(pool: WorkerPool, id: uint64): ks.Keyspace =
     if ks.inner.id == id:
       return ks
   return nil
+
+# Run journal maintenance - cleans up sealed journals that have been flushed
+proc runJournalMaintenance(pool: WorkerPool) {.gcsafe.} =
+  if pool.journalManager == nil or pool.journalManagerLock == nil:
+    return
+
+  pool.journalManagerLock[].acquire()
+  try:
+    let jm = pool.journalManager
+
+    # Try to evict journals in a loop
+    while jm.sealedJournalCount() > 0:
+      # Get watermarks for oldest journal
+      let watermarks = jm.getOldestJournalWatermarks()
+      if watermarks.len == 0:
+        break
+
+      # Check if all keyspaces have been flushed enough
+      var canEvict = true
+
+      for watermark in watermarks:
+        # Find the keyspace by ID
+        let keyspace = pool.findKeyspace(watermark.keyspaceId)
+        if keyspace != nil and keyspace.inner != nil:
+          # Check if keyspace is deleted
+          if not keyspace.inner.isDeleted.load(moAcquire):
+            # Check if persisted seqno is high enough
+            let persistedSeqno = keyspace.inner.tree.getHighestPersistedSeqno()
+            if persistedSeqno.isNone:
+              canEvict = false
+              break
+            if persistedSeqno.get() < watermark.lsn:
+              canEvict = false
+              break
+        # If keyspace is nil (deleted), we can evict
+
+      if not canEvict:
+        break
+
+      # Evict the oldest journal
+      let evictResult = jm.evictOldestJournal()
+      if evictResult.isErr:
+        logError("Journal maintenance failed: " & $evictResult.error)
+        break
+      else:
+        logInfo("Evicted sealed journal")
+  finally:
+    pool.journalManagerLock[].release()
 
 # Worker thread proc
 proc workerProc(args: WorkerThreadArgs) {.thread.} =
@@ -114,6 +167,9 @@ proc workerProc(args: WorkerThreadArgs) {.thread.} =
                                                 pool.snapshotTracker, statsVal)
             pool.stats[] = statsVal
             if flushResult.isOk:
+              # Run journal maintenance after flush
+              pool.runJournalMaintenance()
+
               # After successful flush, check L0 threshold and request compaction if needed
               let l0Count = keyspace.l0TableCount()
               if l0Count >= L0_COMPACTION_TRIGGER:
@@ -189,13 +245,17 @@ proc start*(pool: WorkerPool, flushManager: FlushManager,
             writeBufferSize: WriteBufferManager,
             snapshotTracker: SnapshotTracker, stats: ptr Stats,
             keyspaces: ptr Table[string, ks.Keyspace],
-            keyspacesLock: ptr Lock) =
+            keyspacesLock: ptr Lock,
+            journalManager: JournalManager,
+            journalManagerLock: ptr Lock) =
   pool.flushManager = flushManager
   pool.writeBufferSize = writeBufferSize
   pool.snapshotTracker = snapshotTracker
   pool.stats = stats
   pool.keyspaces = keyspaces
   pool.keyspacesLock = keyspacesLock
+  pool.journalManager = journalManager
+  pool.journalManagerLock = journalManagerLock
 
   pool.running.store(true, moRelease)
 
@@ -235,6 +295,8 @@ proc stop*(pool: WorkerPool) =
   pool.stats = nil
   pool.keyspaces = nil
   pool.keyspacesLock = nil
+  pool.journalManager = nil
+  pool.journalManagerLock = nil
 
   logInfo("Worker pool stopped")
 

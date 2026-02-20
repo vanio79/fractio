@@ -234,14 +234,21 @@ proc createNew*(dbType: typeDesc[Database], config: Config): StorageResult[Datab
   # Create stats
   db.inner.stats = newStats()
 
-  # Create supervisor
+  # Create supervisor with JournalManager
   let seqnoCounter = snapshot_tracker.newSequenceNumberCounter()
   var supervisorInner = SupervisorInner(
     seqno: seqnoCounter,
     snapshotTracker: snapshot_tracker.newSnapshotTracker(seqnoCounter),
     writeBufferSize: newWriteBufferManager(),
-    flushManager: newFlushManager()
+    flushManager: newFlushManager(),
+    journalManager: newJournalManager(),
+    dbConfig: DbConfig(
+      maxJournalingSizeInBytes: 256'u64 * 1024'u64 * 1024'u64,
+      maxWriteBufferSizeInBytes: 64'u64 * 1024'u64 * 1024'u64
+    )
   )
+  initLock(supervisorInner.journalManagerLock)
+  initLock(supervisorInner.backpressureLock)
 
   db.inner.supervisor = Supervisor(inner: supervisorInner)
 
@@ -261,7 +268,9 @@ proc createNew*(dbType: typeDesc[Database], config: Config): StorageResult[Datab
     db.inner.supervisor.inner.snapshotTracker,
     addr db.inner.stats,
     addr db.inner.keyspaces,
-    addr db.inner.keyspacesLock
+    addr db.inner.keyspacesLock,
+    db.inner.supervisor.inner.journalManager,
+    addr db.inner.supervisor.inner.journalManagerLock
   )
 
   logInfo("Database created successfully")
@@ -295,14 +304,21 @@ proc recover*(dbType: typeDesc[Database], config: Config): StorageResult[Databas
   # Create stats
   db.inner.stats = newStats()
 
-  # Create supervisor
+  # Create supervisor with JournalManager
   let seqnoCounter2 = snapshot_tracker.newSequenceNumberCounter()
   var supervisorInner = SupervisorInner(
     seqno: seqnoCounter2,
     snapshotTracker: snapshot_tracker.newSnapshotTracker(seqnoCounter2),
     writeBufferSize: newWriteBufferManager(),
-    flushManager: newFlushManager()
+    flushManager: newFlushManager(),
+    journalManager: newJournalManager(),
+    dbConfig: DbConfig(
+      maxJournalingSizeInBytes: 256'u64 * 1024'u64 * 1024'u64,
+      maxWriteBufferSizeInBytes: 64'u64 * 1024'u64 * 1024'u64
+    )
   )
+  initLock(supervisorInner.journalManagerLock)
+  initLock(supervisorInner.backpressureLock)
 
   db.inner.supervisor = Supervisor(inner: supervisorInner)
 
@@ -400,7 +416,9 @@ proc recover*(dbType: typeDesc[Database], config: Config): StorageResult[Databas
     db.inner.supervisor.inner.snapshotTracker,
     addr db.inner.stats,
     addr db.inner.keyspaces,
-    addr db.inner.keyspacesLock
+    addr db.inner.keyspacesLock,
+    db.inner.supervisor.inner.journalManager,
+    addr db.inner.supervisor.inner.journalManagerLock
   )
 
   logInfo("Database recovered successfully. Seqno=" &
