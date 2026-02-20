@@ -237,6 +237,7 @@ proc recover*(dbType: typeDesc[Database], config: Config): StorageResult[Databas
   var lock: Lock
   initLock(lock)
   var journal: Journal
+  new(journal)
   journal.writer = recovery.active
   journal.lock = lock
   journal.path = journalsPath / "0.jnl"

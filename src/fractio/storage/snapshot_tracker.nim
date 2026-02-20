@@ -2,13 +2,17 @@
 # This source code is licensed under both the Apache 2.0 and MIT License
 # (found in the LICENSE-* files in the repository)
 
+## Snapshot Tracker
+##
+## Tracks open snapshots for MVCC (Multi-Version Concurrency Control).
+
 import fractio/storage/types
 import std/[atomics, tables, locks]
 
 # Forward declarations
 type
-  SequenceNumberCounter* = object
-    value: Atomic[SeqNo]
+  SequenceNumberCounter* = ref object
+    value*: Atomic[SeqNo]
 
   SnapshotTracker* = ref object
     inner*: SnapshotTrackerInner
@@ -30,19 +34,18 @@ proc gc*(tracker: SnapshotTracker)
 # Constructor for SequenceNumberCounter
 proc newSequenceNumberCounter*(): SequenceNumberCounter =
   result = SequenceNumberCounter()
-  # Initialize the atomic value
   result.value.store(0.SeqNo, moRelaxed)
 
 # Get current sequence number
-proc get*(counter: var SequenceNumberCounter): SeqNo =
+proc get*(counter: SequenceNumberCounter): SeqNo =
   counter.value.load(moAcquire)
 
 # Get next sequence number
-proc next*(counter: var SequenceNumberCounter): SeqNo =
+proc next*(counter: SequenceNumberCounter): SeqNo =
   counter.value.fetchAdd(1, moRelaxed) + 1
 
 # Fetch max
-proc fetchMax*(counter: var SequenceNumberCounter, value: SeqNo) =
+proc fetchMax*(counter: SequenceNumberCounter, value: SeqNo) =
   var current = counter.value.load(moAcquire)
   while value > current:
     if counter.value.compareExchange(current, value, moAcquire, moAcquire):
@@ -68,6 +71,10 @@ proc newSnapshotTracker*(seqno: SequenceNumberCounter): SnapshotTracker =
   )
   initLock(inner.gcLock)
   SnapshotTracker(inner: inner)
+
+# Constructor for SnapshotTracker with its own counter
+proc newSnapshotTracker*(): SnapshotTracker =
+  newSnapshotTracker(newSequenceNumberCounter())
 
 # Get reference to sequence number counter
 proc getRef*(tracker: SnapshotTracker): SequenceNumberCounter =

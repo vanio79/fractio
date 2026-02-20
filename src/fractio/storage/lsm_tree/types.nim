@@ -6,7 +6,12 @@
 ##
 ## Core types for the LSM (Log-Structured Merge) tree implementation.
 
-import std/[tables, atomics, locks, options, times]
+import fractio/storage/snapshot_tracker
+import std/[tables, atomics, locks, options]
+
+# Re-export SequenceNumberCounter and SnapshotTracker from snapshot_tracker
+export SequenceNumberCounter, SnapshotTracker, newSequenceNumberCounter,
+       newSnapshotTracker
 
 # Forward declarations
 type
@@ -16,40 +21,6 @@ type
     maxMemtableSize*: uint64
     blockSize*: int
     cacheCapacity*: uint64
-
-  SequenceNumberCounter* = ref object
-    value*: Atomic[uint64]
-
-  SnapshotTracker* = ref object
-    lowestFreedInstant*: Atomic[uint64]
-
-# Sequence number operations
-proc newSequenceNumberCounter*(): SequenceNumberCounter =
-  result = SequenceNumberCounter()
-  result.value.store(0'u64, moRelaxed)
-
-proc get*(counter: SequenceNumberCounter): uint64 =
-  counter.value.load(moAcquire)
-
-proc next*(counter: SequenceNumberCounter): uint64 =
-  counter.value.fetchAdd(1, moRelaxed) + 1
-
-proc fetchMax*(counter: SequenceNumberCounter, value: uint64) =
-  var current = counter.value.load(moAcquire)
-  while value > current:
-    if counter.value.compareExchange(current, value, moAcquire, moAcquire):
-      break
-    current = counter.value.load(moAcquire)
-
-# Snapshot tracker operations
-proc newSnapshotTracker*(): SnapshotTracker =
-  result = SnapshotTracker()
-  result.lowestFreedInstant.store(0'u64, moRelaxed)
-
-proc getRef*(tracker: SnapshotTracker): SequenceNumberCounter =
-  # Return a reference to a shared counter
-  # In a full implementation, this would return the actual counter
-  result = newSequenceNumberCounter()
 
 # Value types for LSM tree entries
 type
