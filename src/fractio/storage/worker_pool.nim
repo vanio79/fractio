@@ -14,6 +14,9 @@ import fractio/storage/logging
 import fractio/storage/keyspace as ks
 import std/[atomics, locks, typedthreads, times, tables, os]
 
+# L0 compaction trigger threshold - when L0 table count exceeds this, trigger compaction
+const L0_COMPACTION_TRIGGER* = 4
+
 type
   WorkerMessageKind* = enum
     wmFlush
@@ -111,11 +114,15 @@ proc workerProc(args: WorkerThreadArgs) {.thread.} =
                                                 pool.snapshotTracker, statsVal)
             pool.stats[] = statsVal
             if flushResult.isOk:
-              # After successful flush, request compaction
-              pool.queueLock.acquire()
-              pool.queue.add(WorkerMessage(kind: wmCompact,
-                  keyspaceId: keyspace.inner.id))
-              pool.queueLock.release()
+              # After successful flush, check L0 threshold and request compaction if needed
+              let l0Count = keyspace.l0TableCount()
+              if l0Count >= L0_COMPACTION_TRIGGER:
+                logInfo("L0 table count (" & $l0Count & ") >= threshold (" &
+                        $L0_COMPACTION_TRIGGER & "), triggering compaction")
+                pool.queueLock.acquire()
+                pool.queue.add(WorkerMessage(kind: wmCompact,
+                    keyspaceId: keyspace.inner.id))
+                pool.queueLock.release()
 
     of wmCompact:
       let keyspace = pool.findKeyspace(msg.keyspaceId)
