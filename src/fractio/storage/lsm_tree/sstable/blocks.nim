@@ -18,7 +18,7 @@ const DEFAULT_BLOCK_SIZE* = 4096
 const DEFAULT_RESTART_INTERVAL* = 16
 
 # Create a new data block
-proc newDataBlock*(): DataBlock =
+proc newDataBlock*(): DataBlock {.gcsafe.} =
   DataBlock(
     entries: @[],
     size: 0,
@@ -26,7 +26,7 @@ proc newDataBlock*(): DataBlock =
   )
 
 # Create a new index block
-proc newIndexBlock*(): IndexBlock =
+proc newIndexBlock*(): IndexBlock {.gcsafe.} =
   IndexBlock(entries: @[])
 
 # Calculate shared prefix length between two strings
@@ -131,7 +131,7 @@ proc serialize*(indexBlock: IndexBlock, stream: Stream): StorageResult[void] =
     # Write key
     stream.write(entry.key)
 
-    # Write block handle (offset + size)
+    # Write block handle (offset + size + uncompressedSize)
     var offsetLe = entry.handle.offset
     littleEndian64(addr offsetLe, addr offsetLe)
     stream.write(offsetLe)
@@ -139,6 +139,10 @@ proc serialize*(indexBlock: IndexBlock, stream: Stream): StorageResult[void] =
     var sizeLe = entry.handle.size
     littleEndian32(addr sizeLe, addr sizeLe)
     stream.write(sizeLe)
+
+    var uncompressedSizeLe = entry.handle.uncompressedSize
+    littleEndian32(addr uncompressedSizeLe, addr uncompressedSizeLe)
+    stream.write(uncompressedSizeLe)
 
   return okVoid
 

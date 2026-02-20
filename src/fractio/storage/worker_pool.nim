@@ -183,9 +183,12 @@ proc workerProc(args: WorkerThreadArgs) {.thread.} =
     of wmCompact:
       let keyspace = pool.findKeyspace(msg.keyspaceId)
       if keyspace != nil:
-        var statsVal = pool.stats[]
-        discard compaction_worker.run(keyspace, pool.snapshotTracker, statsVal)
-        pool.stats[] = statsVal
+        # Use cast(gcsafe) because compaction allocates memory
+        # but we're using ORC which handles this correctly
+        {.cast(gcsafe).}:
+          var statsVal = pool.stats[]
+          discard compaction_worker.run(keyspace, pool.snapshotTracker, statsVal)
+          pool.stats[] = statsVal
 
     of wmRotateMemtable:
       let keyspace = pool.findKeyspace(msg.keyspaceId2)

@@ -250,10 +250,13 @@ We have `batch.nim` but it's not fully integrated with the database.
 
 ## 13. BLOOM FILTERS
 
-### Status: NOT IMPLEMENTED ❌
+### Status: IMPLEMENTED ✅
 
-Rust uses bloom filters for faster key lookups.
-Our implementation does linear/binary search without filters.
+- MurmurHash3-based bloom filter in `lsm_tree/bloom_filter.nim`
+- 1% default false positive rate
+- Serialized in SSTable v2 format
+- Used in get() for quick rejection of absent keys
+- 12 unit tests passing
 
 ---
 
@@ -268,10 +271,24 @@ Our SSTables store uncompressed data.
 
 ## 15. BLOCK CACHE
 
-### Status: NOT IMPLEMENTED ❌
+### Status: IMPLEMENTED ✅
 
-Rust has an LRU block cache for frequently accessed blocks.
-We re-read blocks from disk on each access.
+- LRU cache in `lsm_tree/block_cache.nim`
+- Configurable capacity (default 256 MiB)
+- Thread-safe with lock, hit/miss statistics
+- Cache invalidation during compaction
+- 20 unit tests passing
+
+---
+
+## 16. LAZY ITERATORS
+
+### Status: IMPLEMENTED ✅
+
+- MemtableIter, SsTableBlockIter in `lsm_tree/lazy_iter.nim`
+- MergeIterator with heap-based k-way merge
+- RangeIterator and PrefixIterator
+- 8 unit tests passing
 
 ---
 
@@ -280,17 +297,17 @@ We re-read blocks from disk on each access.
 1. ~~**Working Compaction**~~ - DONE: majorCompact() now merges SSTables with tombstone GC
 2. ~~**JournalManager Integration**~~ - DONE: Journal cleanup after flush with GC-safe design
 3. ~~**Compaction Strategy Selection**~~ - DONE: Leveled, Tiered, FIFO strategies implemented
-4. **Lazy Iterators** - Current implementation loads all data into memory
-5. **Block Cache** - Performance issue for repeated reads
-6. **Bloom Filters** - Performance issue for point lookups
-7. **Compression** - Storage size and I/O performance
+4. ~~**Lazy Iterators**~~ - DONE: MemtableIter, SsTableBlockIter, MergeIterator
+5. ~~**Block Cache**~~ - DONE: LRU cache for SSTable blocks
+6. ~~**Bloom Filters**~~ - DONE: MurmurHash3-based filters for fast lookups
+7. **Compression** - Storage size and I/O performance (LZ4)
 8. **Transactions** - ACID guarantees
 
 ## Moderate Priority
 
-8. `delete_keyspace()` - Can't delete keyspaces
-9. Write batch integration
-10. Key-value separation for large values
+9. `delete_keyspace()` - Can't delete keyspaces
+10. Write batch integration
+11. Key-value separation for large values
 
 ## Lower Priority
 

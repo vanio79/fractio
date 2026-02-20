@@ -10,6 +10,7 @@ import fractio/storage/error
 import fractio/storage/lsm_tree/types
 import fractio/storage/lsm_tree/memtable
 import fractio/storage/lsm_tree/bloom_filter
+import fractio/storage/lsm_tree/compression
 import std/[streams, os, strutils, endians, hashes]
 
 type
@@ -26,9 +27,12 @@ type
     firstKey: string
     smallestSeqno: uint64
     largestSeqno: uint64
-    expectedKeys: int # For bloom filter sizing
+    expectedKeys: int                        # For bloom filter sizing
+    compression: compression.CompressionType # Compression type for data blocks
+    compressionStats: CompressionStats
 
-proc newSsTableWriter*(path: string, expectedKeys: int = 1000): StorageResult[
+proc newSsTableWriter*(path: string, expectedKeys: int = 1000,
+                      compression: compression.CompressionType = compression.ctZlib): StorageResult[
     SsTableWriter] =
   let stream = newFileStream(path, fmWrite)
   if stream == nil:
@@ -46,6 +50,8 @@ proc newSsTableWriter*(path: string, expectedKeys: int = 1000): StorageResult[
   writer.blockSize = 4096'u32
   writer.numEntries = 0'u64
   writer.expectedKeys = expectedKeys
+  writer.compression = compression
+  writer.compressionStats = newCompressionStats()
   writer.smallestSeqno = high(uint64)
   writer.largestSeqno = 0'u64
 
@@ -55,21 +61,41 @@ proc flushBlock*(writer: SsTableWriter): StorageResult[void] =
   if writer.dataBlock.isEmpty:
     return okVoid
 
+  # Serialize data block to a memory stream first
+  var memStream = newStringStream()
+  let serializeResult = writer.dataBlock.serialize(memStream)
+  if serializeResult.isErr:
+    return err[void, StorageError](serializeResult.error)
+
+  let uncompressedData = memStream.data
+  let uncompressedSize = int(uncompressedData.len)
+
+  # Compress if enabled
+  var (dataToWrite, wasCompressed) = compressBlock(uncompressedData,
+      writer.compression)
+  writer.compressionStats.recordCompression(uncompressedSize, dataToWrite.len,
+      wasCompressed)
+
   # Write block type
   writer.stream.write(uint8(btData))
 
-  # Get start offset for handle
+  # Write compression flag
+  writer.stream.write(uint8(if wasCompressed: 1 else: 0))
+
+  # Get start offset for handle (after block type and compression flag)
   let startOffset = writer.stream.getPosition()
 
-  # Serialize data block
-  let serializeResult = writer.dataBlock.serialize(writer.stream)
-  if serializeResult.isErr:
-    return err[void, StorageError](serializeResult.error)
+  # Write the (possibly compressed) data
+  writer.stream.writeData(addr dataToWrite[0], dataToWrite.len)
 
   let endOffset = writer.stream.getPosition()
 
   # Create block handle and add to index
-  let handle = BlockHandle(offset: uint64(startOffset), size: uint32(endOffset - startOffset))
+  var handle = BlockHandle(
+    offset: uint64(startOffset),
+    size: uint32(endOffset - startOffset),
+    uncompressedSize: if wasCompressed: uint32(uncompressedSize) else: 0
+  )
   writer.indexBlock.add(writer.lastKey, handle)
 
   # Reset data block

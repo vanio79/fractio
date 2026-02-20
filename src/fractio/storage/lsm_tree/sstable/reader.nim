@@ -12,6 +12,7 @@ import fractio/storage/error
 import fractio/storage/types
 import fractio/storage/lsm_tree/block_cache
 import fractio/storage/lsm_tree/bloom_filter
+import fractio/storage/lsm_tree/compression
 import std/[streams, os, strutils, endians, options]
 
 type
@@ -101,16 +102,18 @@ proc readIndexBlock(strm: Stream, hdl: BlockHandle): StorageResult[IndexBlock] =
 
   let endPos = int(hdl.offset) + int(hdl.size)
 
-  while strm.getPosition() < endPos:
+  while strm.getPosition() + 20 <= endPos: # Min entry size: 4 + key + 8 + 4 + 4
     var entry = IndexEntry()
 
     var keyLenLe: uint32 = strm.readUInt32()
     var keyLen: uint32
     littleEndian32(addr keyLen, addr keyLenLe)
 
-    if keyLen > 0:
+    if keyLen > 0 and keyLen < 10000: # Sanity check
       entry.key = newString(int(keyLen))
       discard strm.readData(addr entry.key[0], int(keyLen))
+    else:
+      break
 
     var offsetLe: uint64 = strm.readUInt64()
     littleEndian64(addr entry.handle.offset, addr offsetLe)
@@ -118,89 +121,63 @@ proc readIndexBlock(strm: Stream, hdl: BlockHandle): StorageResult[IndexBlock] =
     var sizeLe: uint32 = strm.readUInt32()
     littleEndian32(addr entry.handle.size, addr sizeLe)
 
+    # Read uncompressed size (may be 0 for v1 format or uncompressed blocks)
+    if strm.getPosition() + 4 <= endPos:
+      var uncompressedSizeLe: uint32 = strm.readUInt32()
+      littleEndian32(addr entry.handle.uncompressedSize,
+          addr uncompressedSizeLe)
+    else:
+      entry.handle.uncompressedSize = 0
+
     idxBlock.entries.add(entry)
 
   return ok[IndexBlock, StorageError](idxBlock)
 
+# Forward declaration
+proc parseDataBlock*(data: string): StorageResult[DataBlock]
+
 proc readDataBlock*(strm: Stream, hdl: BlockHandle): StorageResult[DataBlock] =
-  # Position at start of block data (handle.offset is AFTER the block type byte)
-  strm.setPosition(int(hdl.offset))
+  ## Read a data block from the stream.
+  ## Handles both compressed and uncompressed blocks.
+  ## The handle.offset points AFTER the compression flag byte.
 
-  var dataBlk = newDataBlock()
+  # Use cast(gcsafe) to allow memory allocation
+  # ORC handles thread-local GC correctly
+  {.cast(gcsafe).}:
+    # Determine if compressed based on uncompressedSize > 0
+    let isCompressed = hdl.uncompressedSize > 0
 
-  # The handle points to the start of the block data (after the block type)
-  # size is the size of the block data (not including block type byte)
-  # At the end of the block are: numRestarts (4 bytes) + restartPoints (4 bytes each)
+    var blockData: string
 
-  # First, read the number of restart points from the end of the block
-  let blockEndPos = int(hdl.offset) + int(hdl.size)
+    if isCompressed:
+      # Read compressed data
+      let compressedSize = int(hdl.size)
+      blockData = newString(compressedSize)
+      strm.setPosition(int(hdl.offset))
+      discard strm.readData(addr blockData[0], compressedSize)
 
-  # Read numRestarts from the last 4 bytes
-  strm.setPosition(blockEndPos - 4)
-  var numRestartsLe: uint32 = strm.readUInt32()
-  var numRestarts: uint32
-  littleEndian32(addr numRestarts, addr numRestartsLe)
+      # Decompress
+      try:
+        blockData = decompressBlock(blockData, ctZlib)
+      except CompressionError as e:
+        return err[DataBlock, StorageError](StorageError(
+          kind: seIo, ioError: "Failed to decompress block: " & e.msg))
+    else:
+      # Read uncompressed data directly
+      let dataSize = int(hdl.size)
+      blockData = newString(dataSize)
+      strm.setPosition(int(hdl.offset))
+      discard strm.readData(addr blockData[0], dataSize)
 
-  # Calculate where entries end (before restart points)
-  # restart points are at: blockEndPos - 4 - (numRestarts * 4)
-  let entriesEndPos = blockEndPos - 4 - int(numRestarts * 4)
+    # Parse the block data
+    return parseDataBlock(blockData)
 
-  # Reset to start and read entries
-  strm.setPosition(int(hdl.offset))
-  var prevKey = ""
-  var entryCount = 0
-
-  while strm.getPosition() < entriesEndPos:
-    # Check if we have enough bytes for a minimal entry (3 * 4-byte lengths + 8-byte seqnoType = 20 bytes)
-    if strm.getPosition() + 20 > entriesEndPos:
-      break
-
-    var entry = BlockEntry()
-
-    var sharedLenLe: uint32 = strm.readUInt32()
-    var sharedLen: uint32
-    littleEndian32(addr sharedLen, addr sharedLenLe)
-
-    var unsharedLenLe: uint32 = strm.readUInt32()
-    var unsharedLen: uint32
-    littleEndian32(addr unsharedLen, addr unsharedLenLe)
-
-    var valueLenLe: uint32 = strm.readUInt32()
-    var valueLen: uint32
-    littleEndian32(addr valueLen, addr valueLenLe)
-
-    var seqnoType: uint64 = strm.readUInt64()
-    littleEndian64(addr seqnoType, addr seqnoType)
-    entry.seqno = seqnoType shr 8
-    entry.valueType = uint8(seqnoType and 0xFF)
-
-    if sharedLen > 0:
-      entry.key = prevKey[0 ..< int(sharedLen)]
-    if unsharedLen > 0:
-      var unshared = newString(int(unsharedLen))
-      discard strm.readData(addr unshared[0], int(unsharedLen))
-      entry.key &= unshared
-
-    if valueLen > 0:
-      entry.value = newString(int(valueLen))
-      discard strm.readData(addr entry.value[0], int(valueLen))
-
-    dataBlk.entries.add(entry)
-    prevKey = entry.key
-    entryCount += 1
-
-    if entryCount > 100000:
-      break
-
-  return ok[DataBlock, StorageError](dataBlk)
-
-proc parseDataBlock*(data: string): StorageResult[DataBlock] =
-  ## Parse a DataBlock from raw bytes.
-  ## Used by the block cache to avoid re-reading from disk.
-  var dataBlk = newDataBlock()
+proc parseDataBlockImpl(data: string): DataBlock =
+  ## Internal implementation that allocates memory.
+  result = DataBlock(entries: @[], size: 0, restartPoints: @[])
 
   if data.len < 4:
-    return ok[DataBlock, StorageError](dataBlk)
+    return
 
   # Read numRestarts from the last 4 bytes
   var numRestartsLe: uint32
@@ -212,7 +189,7 @@ proc parseDataBlock*(data: string): StorageResult[DataBlock] =
   let entriesEndPos = data.len - 4 - int(numRestarts * 4)
 
   if entriesEndPos < 0:
-    return ok[DataBlock, StorageError](dataBlk)
+    return
 
   var pos = 0
   var prevKey = ""
@@ -264,14 +241,19 @@ proc parseDataBlock*(data: string): StorageResult[DataBlock] =
       copyMem(addr entry.value[0], addr data[pos], int(valueLen))
       pos += int(valueLen)
 
-    dataBlk.entries.add(entry)
+    result.entries.add(entry)
     prevKey = entry.key
     entryCount += 1
 
     if entryCount > 100000:
       break
 
-  return ok[DataBlock, StorageError](dataBlk)
+proc parseDataBlock*(data: string): StorageResult[DataBlock] =
+  ## Parse a DataBlock from raw bytes.
+  ## Used by the block cache to avoid re-reading from disk.
+  {.cast(gcsafe).}:
+    var dataBlk = parseDataBlockImpl(data)
+    return ok[DataBlock, StorageError](dataBlk)
 
 proc readRawBlock*(strm: Stream, hdl: BlockHandle): StorageResult[string] =
   ## Read raw block data from disk (for caching).
@@ -286,13 +268,22 @@ proc readRawBlock*(strm: Stream, hdl: BlockHandle): StorageResult[string] =
 proc readDataBlockWithCache*(reader: SsTableReader,
     hdl: BlockHandle): StorageResult[DataBlock] =
   ## Read a data block, using the block cache if available.
+  let isCompressed = hdl.uncompressedSize > 0
+
   if reader.blockCache != nil:
     let cacheKey = BlockKey(sstableId: reader.sstableId,
         blockOffset: hdl.offset)
     let cached = reader.blockCache.get(cacheKey)
     if cached.isSome:
-      # Cache hit - parse the cached data
-      return parseDataBlock(cached.get)
+      # Cache hit - decompress if needed, then parse
+      var dataToParse = cached.get
+      if isCompressed:
+        try:
+          dataToParse = decompressBlock(dataToParse, ctZlib)
+        except CompressionError as e:
+          return err[DataBlock, StorageError](StorageError(
+            kind: seIo, ioError: "Failed to decompress cached block: " & e.msg))
+      return parseDataBlock(dataToParse)
 
   # Cache miss - read from disk
   let rawResult = readRawBlock(reader.stream, hdl)
@@ -301,14 +292,23 @@ proc readDataBlockWithCache*(reader: SsTableReader,
 
   let rawData = rawResult.value
 
-  # Store in cache
+  # Store in cache (store compressed data)
   if reader.blockCache != nil:
     let cacheKey = BlockKey(sstableId: reader.sstableId,
         blockOffset: hdl.offset)
     reader.blockCache.put(cacheKey, rawData)
 
+  # Decompress if needed, then parse
+  var dataToParse = rawData
+  if isCompressed:
+    try:
+      dataToParse = decompressBlock(dataToParse, ctZlib)
+    except CompressionError as e:
+      return err[DataBlock, StorageError](StorageError(
+        kind: seIo, ioError: "Failed to decompress block: " & e.msg))
+
   # Parse the data
-  return parseDataBlock(rawData)
+  return parseDataBlock(dataToParse)
 
 proc readBloomFilter*(strm: Stream, hdl: BlockHandle): StorageResult[BloomFilter] =
   ## Read a bloom filter from disk.

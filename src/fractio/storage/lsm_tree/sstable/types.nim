@@ -31,7 +31,8 @@ type
 type
   BlockHandle* = object
     offset*: uint64 ## Offset in file
-    size*: uint32   ## Size of block
+    size*: uint32   ## Size of block (compressed size if compressed)
+    uncompressedSize*: uint32 ## Original size before compression (0 if not compressed)
 
 # Data block entry
 type
