@@ -11,7 +11,7 @@ import std/[tables, atomics, locks, options]
 
 # Re-export SequenceNumberCounter and SnapshotTracker from snapshot_tracker
 export SequenceNumberCounter, SnapshotTracker, newSequenceNumberCounter,
-       newSnapshotTracker
+       newSnapshotTracker, fetchMax
 
 # Forward declarations
 type

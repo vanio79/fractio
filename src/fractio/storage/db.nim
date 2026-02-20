@@ -441,10 +441,37 @@ proc keyspaceExists*(db: Database, name: string): bool =
   defer: db.inner.keyspacesLock.release()
   name in db.inner.keyspaces
 
+proc keyspaceCount*(db: Database): int =
+  ## Returns the number of keyspaces in the database.
+  db.inner.keyspacesLock.acquire()
+  defer: db.inner.keyspacesLock.release()
+  db.inner.keyspaces.len
+
 proc listKeyspaceNames*(db: Database): seq[string] =
   db.inner.keyspacesLock.acquire()
   defer: db.inner.keyspacesLock.release()
   toSeq(db.inner.keyspaces.keys())
+
+proc diskSpace*(db: Database): uint64 =
+  ## Returns the total disk space used by the database in bytes.
+  ## This includes all SSTables across all keyspaces.
+  db.inner.keyspacesLock.acquire()
+  defer: db.inner.keyspacesLock.release()
+
+  result = 0
+  for name, keyspace in db.inner.keyspaces.pairs:
+    result += keyspace.diskSpace()
+
+proc journalDiskSpace*(db: Database): uint64 =
+  ## Returns the disk space used by journals.
+  let journalsPath = db.inner.config.path / "journals"
+  if not dirExists(journalsPath):
+    return 0
+
+  result = 0
+  for kind, path in walkDir(journalsPath):
+    if kind == pcFile:
+      result += uint64(getFileSize(path))
 
 proc close*(db: Database) =
   ## Close the database

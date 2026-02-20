@@ -11,6 +11,7 @@ import ./types
 import ./memtable
 import ./sstable/writer
 import ./sstable/reader
+import fractio/storage/snapshot_tracker
 import std/[os, atomics, locks, options, tables, streams, strutils]
 
 export types except ItemSizeResult
@@ -69,6 +70,8 @@ proc loadSsTables*(tree: LsmTree) =
   tree.versionLock.acquire()
   defer: tree.versionLock.release()
 
+  var highestSeqno: uint64 = 0
+
   # Load SSTables for each level
   for level in 0 ..< tree.config.levelCount:
     let levelPath = if level == 0: tree.config.path / "L0"
@@ -90,16 +93,31 @@ proc loadSsTables*(tree: LsmTree) =
           level: level
         )
 
-        # Try to open SSTable to get key range
+        # Try to open SSTable to get key range and highest seqno
         let readerResult = openSsTable(filePath)
         if readerResult.isOk:
           let reader = readerResult.value
           sstable.smallestKey = reader.smallestKey
           sstable.largestKey = reader.largestKey
+
+          # Read all entries to find highest seqno
+          for idxEntry in reader.indexBlock.entries:
+            let blockResult = readDataBlock(reader.stream, idxEntry.handle)
+            if blockResult.isOk:
+              let dataBlk = blockResult.value
+              for entry in dataBlk.entries:
+                if entry.seqno > highestSeqno:
+                  highestSeqno = entry.seqno
+
           reader.close()
 
         # Add to tree
         tree.tables[level].add(sstable)
+
+  # Update seqno counter to at least the highest seqno found
+  if highestSeqno > 0:
+    tree.seqnoCounter.fetchMax(highestSeqno + 1)
+    snapshot_tracker.set(tree.snapshotTracker, highestSeqno + 1)
 
 # Create a new LSM tree with defaults
 proc open*(config: LsmTreeConfig): LsmTree =
