@@ -9,6 +9,7 @@
 
 import fractio/storage/[error, types, journal, snapshot_tracker, stats, supervisor,
                         write_buffer_manager, iter, snapshot]
+import fractio/storage/flush/manager
 import fractio/storage/lsm_tree/[types as lsm_types, lsm_tree, memtable]
 import fractio/storage/lsm_tree/sstable/reader
 import fractio/storage/lsm_tree/sstable/types as sst_types
@@ -56,6 +57,9 @@ type
     supervisor*: Supervisor
     stats*: Stats
     workerMessager*: WorkerMessager # Placeholder for message channel
+    flushManager*: FlushManager     # Reference to flush manager
+                                    # Callback to request rotation - takes keyspace ID
+    requestRotationCb*: proc(ksId: uint64) {.closure.}
 
     lockFile*: LockedFileGuard
 
@@ -71,7 +75,10 @@ proc newKeyspace*(keyspaceId: InternalKeyspaceId,
                   config: CreateOptions,
                   supervisor: Supervisor,
                   stats: Stats,
-                  isPoisoned: ptr Atomic[bool]): Keyspace =
+                  isPoisoned: ptr Atomic[bool],
+                  flushManager: FlushManager = nil,
+                  requestRotationCb: proc(
+                      ksId: uint64) {.closure.} = nil): Keyspace =
   var inner = KeyspaceInner(
     id: keyspaceId,
     name: name,
@@ -79,7 +86,9 @@ proc newKeyspace*(keyspaceId: InternalKeyspaceId,
     tree: tree,
     supervisor: supervisor,
     stats: stats,
-    isPoisoned: isPoisoned
+    isPoisoned: isPoisoned,
+    flushManager: flushManager,
+    requestRotationCb: requestRotationCb
   )
   inner.isDeleted.store(false, moRelaxed)
   Keyspace(inner: inner)
@@ -178,9 +187,16 @@ proc checkWriteHalt*(keyspace: Keyspace) =
 proc localBackpressure*(keyspace: Keyspace): bool =
   false
 
-# Request rotation
+# Request rotation - calls the registered callback to request background memtable rotation
 proc requestRotation*(keyspace: Keyspace) =
-  discard
+  if keyspace.inner.requestRotationCb != nil:
+    keyspace.inner.requestRotationCb(keyspace.inner.id)
+
+# Request flush - enqueues a flush task for this keyspace
+proc requestFlush*(keyspace: Keyspace) =
+  if keyspace.inner.flushManager != nil:
+    let task = Task(keyspacePtr: cast[pointer](keyspace))
+    keyspace.inner.flushManager.enqueue(task)
 
 # Check memtable rotate
 proc checkMemtableRotate*(keyspace: Keyspace, size: uint64) =

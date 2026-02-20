@@ -6,17 +6,19 @@
 ##
 ## Represents a task to flush a keyspace's memtable to disk.
 
-# Forward declaration - simplified Keyspace for task definition
-# The real Keyspace type is in keyspace.nim
+# Forward declaration - actual Keyspace type is in keyspace.nim
 type
-  Keyspace* = object
-    name*: string
+  Keyspace* = ref object
 
 # Flush task
 type
   Task* = object
     keyspace*: Keyspace
 
+# Create a new flush task
+proc newTask*(keyspace: Keyspace): Task =
+  Task(keyspace: keyspace)
+
 # Debug representation
 proc `$`*(task: Task): string =
-  "FlushTask(" & task.keyspace.name & ")"
+  "FlushTask(keyspace=" & (if task.keyspace != nil: "set" else: "nil") & ")"

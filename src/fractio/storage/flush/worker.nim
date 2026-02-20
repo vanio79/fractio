@@ -2,38 +2,34 @@
 # This source code is licensed under both the Apache 2.0 and MIT License
 # (found in the LICENSE-* files in the repository)
 
-## Flush Worker Implementation
+## Flush Worker
 ##
-## Flushes memtables to SSTables on disk.
+## Performs background flushing of memtables to SSTables.
 
-import fractio/storage/[error, flush/task, stats, write_buffer_manager]
-import fractio/storage/snapshot_tracker as st
-import std/[os, atomics]
+import fractio/storage/[error, snapshot_tracker, stats, write_buffer_manager]
+import fractio/storage/lsm_tree/[lsm_tree]
+import fractio/storage/keyspace as ks
 
-proc run*(task: Task, writeBufferManager: WriteBufferManager,
-          snapshotTracker: st.SnapshotTracker, stats: var Stats): StorageResult[void] =
-  ## Run the flush task.
-  ## This is a simplified version for testing.
-  ## In production, this would be called by the database with access to the real tree.
+# Run flush logic for a task
+proc run*(keyspace: ks.Keyspace,
+          writeBufferManager: WriteBufferManager,
+          snapshotTracker: SnapshotTracker,
+          stats: var Stats): StorageResult[void] =
+  ## Flushes the oldest sealed memtable to disk.
 
-  let gcWatermark = snapshotTracker.getSeqnoSafeToGc()
-  discard gcWatermark # Used for GC during compaction
+  if keyspace == nil:
+    return okVoid
 
-  # In a full implementation, this would:
-  # 1. Get the flush lock from the tree
-  # 2. Write memtable to SSTable
-  # 3. Add SSTable to tree's table list
-  # 4. Remove flushed memtable from sealed list
-  # 5. Free bytes from write buffer manager
+  # Try to flush the oldest sealed memtable
+  let flushResult = keyspace.flushOldestSealed()
 
-  # The Task type contains a simplified Keyspace for testing
-  # In production, it would contain the real Keyspace with an LsmTree
+  if flushResult.isErr:
+    return err[void, StorageError](flushResult.error)
 
-  # For now, simulate a successful flush
-  let flushedBytes: uint64 = 1024
-  discard writeBufferManager.free(flushedBytes)
+  let flushedBytes = flushResult.value
 
-  # Update stats
-  discard stats.compactionsCompleted.fetchAdd(1.int, moRelaxed)
+  if flushedBytes > 0:
+    # Free the write buffer space
+    discard writeBufferManager.free(flushedBytes)
 
   return okVoid

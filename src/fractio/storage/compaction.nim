@@ -2,13 +2,20 @@
 # This source code is licensed under both the Apache 2.0 and MIT License
 # (found in the LICENSE-* files in the repository)
 
-# Export compaction modules
+## Compaction Module
+##
+## Provides background compaction of SSTables.
+
 import fractio/storage/compaction/worker
 export worker
 
-# Re-export compaction strategies
-# In a full implementation, these would come from the LSM tree module
+# Compaction strategies
 type
   Fifo* = object
+    ## FIFO compaction strategy
+
   Leveled* = object
+    ## Leveled compaction strategy
+
   Levelled* = object
+    ## Levelled compaction strategy (alias for Leveled)

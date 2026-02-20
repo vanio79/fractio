@@ -2,56 +2,70 @@
 # This source code is licensed under both the Apache 2.0 and MIT License
 # (found in the LICENSE-* files in the repository)
 
-import fractio/storage/flush/task
-import std/[deques, locks, os, options]
+## Flush Manager
+##
+## Manages a queue of pending flush tasks for background flushing.
 
-# Forward declarations
-type
-  TaskRef* = ref Task
+import std/[locks, deques, os]
 
-# Flush manager
 type
+  Task* = ref object
+    ## A flush task for a keyspace
+    ## keyspace is stored as a pointer to avoid circular dependencies
+    keyspacePtr*: pointer
+
   FlushManager* = ref object
-    queue*: Deque[TaskRef]
+    ## Thread-safe queue of flush tasks
     lock*: Lock
+    tasks*: Deque[Task]
+    count*: int
 
-# Constructor
+# Create a new flush manager
 proc newFlushManager*(): FlushManager =
-  var lock: Lock
-  initLock(lock)
-
-  FlushManager(
-    queue: initDeque[TaskRef](),
-    lock: lock
+  result = FlushManager(
+    tasks: initDeque[Task](),
+    count: 0
   )
+  initLock(result.lock)
 
-# Get queue length
+# Get number of pending tasks
 proc len*(manager: FlushManager): int =
-  withLock(manager.lock):
-    return manager.queue.len
+  manager.lock.acquire()
+  defer: manager.lock.release()
+  manager.tasks.len
 
-# Clear queue
+# Clear all pending tasks
 proc clear*(manager: FlushManager) =
-  withLock(manager.lock):
-    manager.queue.clear()
+  manager.lock.acquire()
+  defer: manager.lock.release()
+  manager.tasks.clear()
+  manager.count = 0
 
-# Wait for empty queue
-proc waitForEmpty*(manager: FlushManager) =
-  while true:
-    withLock(manager.lock):
-      if manager.queue.len == 0:
-        break
-    sleep(10) # Sleep 10ms
+# Wait for queue to be empty
+proc waitForEmpty*(manager: FlushManager, timeoutMs: int = 5000) =
+  var waited = 0
+  while waited < timeoutMs:
+    manager.lock.acquire()
+    let empty = manager.tasks.len == 0
+    manager.lock.release()
+    if empty:
+      return
+    sleep(10)
+    waited += 10
 
-# Enqueue task
-proc enqueue*(manager: FlushManager, task: TaskRef) =
-  withLock(manager.lock):
-    manager.queue.addLast(task)
+# Enqueue a flush task
+proc enqueue*(manager: FlushManager, task: Task) =
+  manager.lock.acquire()
+  defer: manager.lock.release()
+  manager.tasks.addLast(task)
+  manager.count += 1
 
-# Dequeue task
-proc dequeue*(manager: FlushManager): Option[TaskRef] =
-  withLock(manager.lock):
-    if manager.queue.len > 0:
-      return some(manager.queue.popFirst())
-    else:
-      return none(TaskRef)
+# Dequeue a flush task (non-blocking)
+proc dequeue*(manager: FlushManager): Task =
+  manager.lock.acquire()
+  defer: manager.lock.release()
+  if manager.tasks.len > 0:
+    result = manager.tasks.popFirst()
+    manager.count -= 1
+  else:
+    result = nil

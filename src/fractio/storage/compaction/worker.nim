@@ -2,48 +2,54 @@
 # This source code is licensed under both the Apache 2.0 and MIT License
 # (found in the LICENSE-* files in the repository)
 
+## Compaction Worker
+##
+## Performs background compaction of SSTables.
+
 import fractio/storage/[error, snapshot_tracker, stats]
-import std/[times, os, atomics]
-
-# Forward declarations
-type
-  KeyspaceConfig* = object
-    compactionStrategy*: string # Placeholder
-
-  Keyspace* = object
-    name*: string
-    isDeleted*: bool # Placeholder for atomic boolean
-    config*: KeyspaceConfig
-    tree*: string    # Placeholder for LSM tree
+import fractio/storage/keyspace as ks
+import fractio/storage/lsm_tree/lsm_tree
+import std/[times, atomics, os]
 
 # Runs a single run of compaction
-proc run*(keyspace: Keyspace, snapshotTracker: SnapshotTracker,
-    stats: var Stats): StorageResult[void] =
-  # Check if keyspace is deleted
-  if keyspace.isDeleted: # Placeholder for atomic load
+proc run*(keyspace: ks.Keyspace,
+          snapshotTracker: SnapshotTracker,
+          stats: var Stats): StorageResult[void] =
+  ## Runs compaction on a keyspace.
+
+  if keyspace == nil:
     return okVoid
 
-  # In a full implementation, this would get the compaction strategy
-  # For now, we'll skip this
+  # Check if keyspace is deleted
+  if keyspace.inner.isDeleted.load(moRelaxed):
+    return okVoid
 
   # Increment active compaction count
-  discard stats.activeCompactionCount.fetchAdd(1, moRelaxed)
+  discard fetchAdd(stats.activeCompactionCount, 1, moRelaxed)
 
   let start = getTime()
 
-  # In a full implementation, this would run compaction on the tree
-  # For now, we'll simulate a successful compaction
+  # Get GC watermark
+  let gcWatermark = snapshotTracker.getSeqnoSafeToGc()
 
-  # Sleep to simulate work
-  sleep(1)
+  # Run compaction on the tree
+  let compactResult = keyspace.inner.tree.majorCompact(0'u64, gcWatermark)
 
   # Calculate elapsed time
   let elapsed = getTime() - start
   let elapsedMicros = elapsed.inMicroseconds
 
   # Update stats
-  discard stats.timeCompacting.fetchAdd(uint64(elapsedMicros), moRelaxed)
-  discard stats.activeCompactionCount.fetchSub(1, moRelaxed)
-  discard stats.compactionsCompleted.fetchAdd(1, moRelaxed)
+  discard fetchAdd(stats.timeCompacting, uint64(elapsedMicros), moRelaxed)
+  discard fetchSub(stats.activeCompactionCount, 1, moRelaxed)
+
+  if compactResult.isErr:
+    discard fetchAdd(stats.compactionsCompleted, 1, moRelaxed)
+    return compactResult
+
+  discard fetchAdd(stats.compactionsCompleted, 1, moRelaxed)
+
+  # Small delay to avoid compaction storm
+  sleep(1)
 
   return okVoid

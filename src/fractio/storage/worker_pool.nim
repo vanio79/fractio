@@ -2,17 +2,18 @@
 # This source code is licensed under both the Apache 2.0 and MIT License
 # (found in the LICENSE-* files in the repository)
 
-import fractio/storage/[error, types, poison_dart]
-import std/[locks, atomics, os]
+## Worker Pool
+##
+## Manages background worker threads for flushing and compaction.
 
-# Forward declarations
-type
-  Keyspace* = object
-  MemtableId* = uint64
-  Supervisor* = object
-  Stats* = object
+import fractio/storage/[error, snapshot_tracker, stats, supervisor,
+                        write_buffer_manager, flush/manager]
+import fractio/storage/flush/worker as flush_worker
+import fractio/storage/compaction/worker as compaction_worker
+import fractio/storage/logging
+import fractio/storage/keyspace as ks
+import std/[atomics, locks, typedthreads, times, tables, os]
 
-# Worker messages
 type
   WorkerMessageKind* = enum
     wmFlush
@@ -21,14 +22,34 @@ type
     wmRotateMemtable
 
   WorkerMessage* = object
+    ## Message sent to worker threads
     case kind*: WorkerMessageKind
     of wmCompact:
-      compactKeyspace*: Keyspace
+      keyspaceId*: uint64 # Use ID instead of ref to avoid cycles
     of wmRotateMemtable:
-      rotateKeyspace*: Keyspace
-      memtableId*: MemtableId
+      keyspaceId2*: uint64
+      memtableId*: uint64
     else:
       discard
+
+  WorkerThreadArgs* = object
+    ## Arguments passed to worker thread
+    poolPtr*: pointer
+    workerId*: int
+    poolSize*: int
+
+  WorkerPool* = ref object
+    threadHandles*: seq[Thread[WorkerThreadArgs]]
+    running*: Atomic[bool]
+    queue*: seq[WorkerMessage]
+    queueLock*: Lock
+    flushManager*: FlushManager
+    writeBufferSize*: WriteBufferManager
+    snapshotTracker*: SnapshotTracker
+    stats*: ptr Stats
+    poolSize*: int
+    keyspaces*: ptr Table[string, ks.Keyspace] # Pointer to keyspaces table
+    keyspacesLock*: ptr Lock
 
 # Debug representation
 proc `$`*(msg: WorkerMessage): string =
@@ -36,62 +57,192 @@ proc `$`*(msg: WorkerMessage): string =
   of wmFlush:
     "WorkerMessage:Flush"
   of wmCompact:
-    "WorkerMessage:Compact"
+    "WorkerMessage:Compact(" & $msg.keyspaceId & ")"
   of wmClose:
     "WorkerMessage:Close"
   of wmRotateMemtable:
     "WorkerMessage:Rotate"
 
-# Channel types (using queues as flume equivalent)
-type
-  MessageQueue* = object
-    queue*: seq[WorkerMessage]
-    lock*: Lock
-    maxSize*: int
+# Find keyspace by ID
+proc findKeyspace(pool: WorkerPool, id: uint64): ks.Keyspace =
+  if pool.keyspaces == nil or pool.keyspacesLock == nil:
+    return nil
+  pool.keyspacesLock[].acquire()
+  defer: pool.keyspacesLock[].release()
+  for name, ks in pool.keyspaces[].pairs:
+    if ks.inner.id == id:
+      return ks
+  return nil
 
-# Worker pool
-type
-  WorkerPool* = ref object
-    threadHandles*: ptr Lock # In Nim, we'd use ThreadGroup or similar
-    rx*: MessageQueue
-    sender*: MessageQueue
+# Worker thread proc
+proc workerProc(args: WorkerThreadArgs) {.thread.} =
+  let pool = cast[WorkerPool](args.poolPtr)
+  let workerId = args.workerId
 
-# Worker state
-type
-  WorkerState* = object
-    poolSize*: int
-    workerId*: int
-    supervisor*: Supervisor
-    rx*: MessageQueue
-    sender*: MessageQueue
-    stats*: Stats
+  logInfo("Worker #" & $workerId & " started")
 
-# Prepare worker pool
-proc prepare*(): WorkerPool =
-  # In a full implementation, this would create bounded channels
-  # For now, we create simple queues
-  let rx = MessageQueue(queue: @[], maxSize: 1000)
-  initLock(rx.lock)
+  while pool.running.load(moRelaxed):
+    # Get message from queue
+    pool.queueLock.acquire()
+    var msg: WorkerMessage
+    if pool.queue.len > 0:
+      msg = pool.queue[0]
+      pool.queue.delete(0)
+      pool.queueLock.release()
+    else:
+      pool.queueLock.release()
+      # Sleep briefly if queue is empty
+      sleep(10)
+      continue
 
-  let sender = MessageQueue(queue: @[], maxSize: 1000)
-  initLock(sender.lock)
+    case msg.kind
+    of wmClose:
+      break
 
-  WorkerPool(
-    threadHandles: nil, # Would be initialized with proper lock in full implementation
-    rx: rx,
-    sender: sender
+    of wmFlush:
+      # Dequeue flush task from flush manager
+      if pool.flushManager != nil:
+        let task = pool.flushManager.dequeue()
+        if task != nil and task.keyspacePtr != nil:
+          let keyspace = cast[ks.Keyspace](task.keyspacePtr)
+          if keyspace != nil:
+            var statsVal = pool.stats[]
+            let flushResult = flush_worker.run(keyspace, pool.writeBufferSize,
+                                                pool.snapshotTracker, statsVal)
+            pool.stats[] = statsVal
+            if flushResult.isOk:
+              # After successful flush, request compaction
+              pool.queueLock.acquire()
+              pool.queue.add(WorkerMessage(kind: wmCompact,
+                  keyspaceId: keyspace.inner.id))
+              pool.queueLock.release()
+
+    of wmCompact:
+      let keyspace = pool.findKeyspace(msg.keyspaceId)
+      if keyspace != nil:
+        var statsVal = pool.stats[]
+        discard compaction_worker.run(keyspace, pool.snapshotTracker, statsVal)
+        pool.stats[] = statsVal
+
+    of wmRotateMemtable:
+      let keyspace = pool.findKeyspace(msg.keyspaceId2)
+      if keyspace != nil:
+        # Rotate the memtable
+        let rotateResult = ks.rotateMemtable(keyspace)
+        if rotateResult.isOk and rotateResult.value:
+          # Memtable was rotated, enqueue a flush task
+          if pool.flushManager != nil:
+            let task = Task(keyspacePtr: cast[pointer](keyspace))
+            pool.flushManager.enqueue(task)
+            logInfo("Enqueued flush task for keyspace " & keyspace.inner.name)
+
+  logInfo("Worker #" & $workerId & " stopped")
+
+# Create a new worker pool
+proc newWorkerPool*(poolSize: int = 4): WorkerPool =
+  result = WorkerPool(
+    threadHandles: newSeq[Thread[WorkerThreadArgs]](),
+    queue: @[],
+    poolSize: poolSize,
+    keyspaces: nil,
+    keyspacesLock: nil
   )
+  result.running.store(false, moRelaxed)
+  initLock(result.queueLock)
 
-# Worker tick function
-proc workerTick*(ctx: WorkerState): StorageResult[bool] =
-  # This is a placeholder implementation
-  # In a full implementation, this would process messages from the queue
-  return ok(false)
+# Request flush
+proc requestFlush*(pool: WorkerPool) =
+  pool.queueLock.acquire()
+  pool.queue.add(WorkerMessage(kind: wmFlush))
+  pool.queueLock.release()
 
-# Start worker pool
-proc start*(pool: WorkerPool, poolSize: int, supervisor: Supervisor,
-            stats: Stats, poisonDart: PoisonDart, threadCounter: Atomic[
-                int]): StorageResult[void] =
-  # This is a placeholder implementation
-  # In a full implementation, this would spawn worker threads
-  return ok()
+# Request flush for a specific keyspace
+proc requestFlush*(pool: WorkerPool, keyspace: ks.Keyspace) =
+  # Enqueue a flush task directly to the flush manager
+  if pool.flushManager != nil:
+    let task = Task(keyspacePtr: cast[pointer](keyspace))
+    pool.flushManager.enqueue(task)
+
+# Request compaction by keyspace
+proc requestCompaction*(pool: WorkerPool, keyspace: ks.Keyspace) =
+  pool.queueLock.acquire()
+  pool.queue.add(WorkerMessage(kind: wmCompact, keyspaceId: keyspace.inner.id))
+  pool.queueLock.release()
+
+# Request memtable rotation for a keyspace
+proc requestMemtableRotation*(pool: WorkerPool, keyspace: ks.Keyspace) =
+  pool.queueLock.acquire()
+  pool.queue.add(WorkerMessage(kind: wmRotateMemtable,
+                               keyspaceId2: keyspace.inner.id,
+                               memtableId: 0))
+  pool.queueLock.release()
+
+# Start the worker pool
+proc start*(pool: WorkerPool, flushManager: FlushManager,
+            writeBufferSize: WriteBufferManager,
+            snapshotTracker: SnapshotTracker, stats: ptr Stats,
+            keyspaces: ptr Table[string, ks.Keyspace],
+            keyspacesLock: ptr Lock) =
+  pool.flushManager = flushManager
+  pool.writeBufferSize = writeBufferSize
+  pool.snapshotTracker = snapshotTracker
+  pool.stats = stats
+  pool.keyspaces = keyspaces
+  pool.keyspacesLock = keyspacesLock
+
+  pool.running.store(true, moRelease)
+
+  # Start worker threads
+  pool.threadHandles.setLen(pool.poolSize)
+  for i in 0 ..< pool.poolSize:
+    var args = WorkerThreadArgs(
+      poolPtr: cast[pointer](pool),
+      workerId: i,
+      poolSize: pool.poolSize
+    )
+    createThread(pool.threadHandles[i], workerProc, args)
+
+  logInfo("Worker pool started with " & $pool.poolSize & " threads")
+
+# Stop the worker pool
+proc stop*(pool: WorkerPool) =
+  if not pool.running.load(moRelaxed):
+    return # Already stopped
+
+  pool.running.store(false, moRelease)
+
+  # Wait for all threads to finish
+  for i in 0 ..< pool.threadHandles.len:
+    if pool.threadHandles[i].running:
+      joinThread(pool.threadHandles[i])
+
+  # Clear the queue to break cycles
+  pool.queueLock.acquire()
+  pool.queue.setLen(0)
+  pool.queueLock.release()
+
+  # Clear pointers to break reference cycles
+  pool.flushManager = nil
+  pool.writeBufferSize = nil
+  pool.snapshotTracker = nil
+  pool.stats = nil
+  pool.keyspaces = nil
+  pool.keyspacesLock = nil
+
+  logInfo("Worker pool stopped")
+
+# Check if pool is running
+proc isRunning*(pool: WorkerPool): bool =
+  pool.running.load(moRelaxed)
+
+# Wait for queue to be empty
+proc waitForEmpty*(pool: WorkerPool, timeoutMs: int = 5000) =
+  var waited = 0
+  while waited < timeoutMs:
+    pool.queueLock.acquire()
+    let empty = pool.queue.len == 0
+    pool.queueLock.release()
+    if empty:
+      return
+    sleep(10)
+    waited += 10

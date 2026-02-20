@@ -7,8 +7,9 @@
 ## Main entry point for the storage engine.
 
 import fractio/storage/[error, types, file, snapshot, snapshot_tracker, stats, supervisor,
-                        write_buffer_manager, flush, poison_dart, version, path,
-                        logging, journal]
+                        write_buffer_manager, flush, flush/manager, poison_dart,
+                        version, path,
+                        logging, journal, worker_pool]
 import fractio/storage/recovery as db_recovery
 import fractio/storage/db_config as dbcfg
 import fractio/storage/keyspace as ks
@@ -46,6 +47,8 @@ type
     config*: Config
 
     supervisor*: Supervisor
+
+    workerPool*: WorkerPool
 
     stopSignal*: StopSignal
     activeThreadCounter*: Atomic[int]
@@ -236,7 +239,8 @@ proc createNew*(dbType: typeDesc[Database], config: Config): StorageResult[Datab
   var supervisorInner = SupervisorInner(
     seqno: seqnoCounter,
     snapshotTracker: snapshot_tracker.newSnapshotTracker(seqnoCounter),
-    writeBufferSize: newWriteBufferManager()
+    writeBufferSize: newWriteBufferManager(),
+    flushManager: newFlushManager()
   )
 
   db.inner.supervisor = Supervisor(inner: supervisorInner)
@@ -248,6 +252,17 @@ proc createNew*(dbType: typeDesc[Database], config: Config): StorageResult[Datab
     return err[Database, StorageError](journalResult.error)
 
   db.inner.supervisor.inner.journal = journalResult.value
+
+  # Create and start worker pool
+  db.inner.workerPool = newWorkerPool(4) # 4 worker threads
+  db.inner.workerPool.start(
+    db.inner.supervisor.inner.flushManager,
+    db.inner.supervisor.inner.writeBufferSize,
+    db.inner.supervisor.inner.snapshotTracker,
+    addr db.inner.stats,
+    addr db.inner.keyspaces,
+    addr db.inner.keyspacesLock
+  )
 
   logInfo("Database created successfully")
 
@@ -285,7 +300,8 @@ proc recover*(dbType: typeDesc[Database], config: Config): StorageResult[Databas
   var supervisorInner = SupervisorInner(
     seqno: seqnoCounter2,
     snapshotTracker: snapshot_tracker.newSnapshotTracker(seqnoCounter2),
-    writeBufferSize: newWriteBufferManager()
+    writeBufferSize: newWriteBufferManager(),
+    flushManager: newFlushManager()
   )
 
   db.inner.supervisor = Supervisor(inner: supervisorInner)
@@ -312,6 +328,9 @@ proc recover*(dbType: typeDesc[Database], config: Config): StorageResult[Databas
   let posResult = recovery.active.pos()
   if posResult.isOk and posResult.value > 0:
     db.inner.supervisor.inner.seqno.fetchMax(posResult.value)
+
+  # Create worker pool (before recovering keyspaces so they can reference it)
+  db.inner.workerPool = newWorkerPool(4) # 4 worker threads
 
   # Load keyspace metadata
   let metaResult = db.loadKeyspaceMeta()
@@ -346,7 +365,17 @@ proc recover*(dbType: typeDesc[Database], config: Config): StorageResult[Databas
     # Create default options
     let keyConfig = ksopts.defaultCreateOptions()
 
-    # Create keyspace
+    # Create rotation callback
+    let onRotateCb = proc(ksId: uint64) =
+      if db.inner.workerPool != nil:
+        db.inner.keyspacesLock.acquire()
+        defer: db.inner.keyspacesLock.release()
+        for name, ks in db.inner.keyspaces.pairs:
+          if ks.inner.id == ksId:
+            db.inner.workerPool.requestMemtableRotation(ks)
+            break
+
+    # Create keyspace with worker pool reference
     let keyspace = ks.newKeyspace(
       keyspaceId,
       tree,
@@ -354,13 +383,25 @@ proc recover*(dbType: typeDesc[Database], config: Config): StorageResult[Databas
       keyConfig,
       db.inner.supervisor,
       db.inner.stats,
-      addr db.inner.isPoisoned
+      addr db.inner.isPoisoned,
+      db.inner.supervisor.inner.flushManager,
+      onRotateCb
     )
 
     # Store in cache
     db.inner.keyspaces[name] = keyspace
 
     logInfo("Keyspace " & name & " recovered successfully")
+
+  # Now start the worker pool
+  db.inner.workerPool.start(
+    db.inner.supervisor.inner.flushManager,
+    db.inner.supervisor.inner.writeBufferSize,
+    db.inner.supervisor.inner.snapshotTracker,
+    addr db.inner.stats,
+    addr db.inner.keyspaces,
+    addr db.inner.keyspacesLock
+  )
 
   logInfo("Database recovered successfully. Seqno=" &
       $db.inner.supervisor.inner.seqno.get())
@@ -409,6 +450,19 @@ proc keyspace*(db: Database, name: string): StorageResult[ks.Keyspace] =
   # Create default options
   let keyConfig = ksopts.defaultCreateOptions()
 
+  # Create rotation callback that will be called when memtable needs rotation
+  let onRotateCb = proc(ksId: uint64) =
+    # This callback is called when memtable size exceeds threshold
+    # It enqueues a rotation task to the worker pool
+    if db.inner.workerPool != nil:
+      # Find the keyspace and request rotation
+      db.inner.keyspacesLock.acquire()
+      defer: db.inner.keyspacesLock.release()
+      for name, ks in db.inner.keyspaces.pairs:
+        if ks.inner.id == ksId:
+          db.inner.workerPool.requestMemtableRotation(ks)
+          break
+
   # Create keyspace with all required components
   let keyspace = ks.newKeyspace(
     keyspaceId,
@@ -417,7 +471,9 @@ proc keyspace*(db: Database, name: string): StorageResult[ks.Keyspace] =
     keyConfig,
     db.inner.supervisor,
     db.inner.stats,
-    addr db.inner.isPoisoned
+    addr db.inner.isPoisoned,
+    db.inner.supervisor.inner.flushManager,
+    onRotateCb
   )
 
   # Store in cache
@@ -476,6 +532,10 @@ proc journalDiskSpace*(db: Database): uint64 =
 proc close*(db: Database) =
   ## Close the database
   db.inner.stopSignal.stop.store(true, moRelease)
+
+  # Stop worker pool
+  if db.inner.workerPool != nil:
+    db.inner.workerPool.stop()
 
   # Journal will be cleaned up by GC
   logInfo("Database closed")
