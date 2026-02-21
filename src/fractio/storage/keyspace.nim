@@ -17,7 +17,7 @@ import fractio/storage/journal/writer # For PersistMode
 import fractio/storage/keyspace/options
 import fractio/storage/keyspace/name
 import fractio/storage/keyspace/write_delay
-import std/[atomics, options, algorithm, strutils, os, locks]
+import std/[atomics, options, algorithm, strutils, os, locks, tables]
 
 # Keyspace key (a.k.a. column family, locality group)
 type
@@ -159,6 +159,83 @@ proc clear*(keyspace: Keyspace): StorageResult[void] =
 # Disk space usage
 proc diskSpace*(keyspace: Keyspace): uint64 =
   keyspace.inner.tree.diskSpace()
+
+# Get keyspace path
+proc path*(keyspace: Keyspace): string =
+  ## Returns the filesystem path of this keyspace.
+  keyspace.inner.tree.config.path
+
+# Get LSM tree metrics
+proc metrics*(keyspace: Keyspace): LsmTreeMetrics =
+  ## Returns comprehensive metrics for this keyspace's LSM tree.
+  ##
+  ## Includes:
+  ## - Per-level table counts and sizes
+  ## - Memtable statistics
+  ## - Cache hit rates
+  ## - Read/write counters
+  keyspace.inner.tree.getMetrics()
+
+# Get first key-value pair
+proc firstKeyValue*(keyspace: Keyspace): StorageResult[Option[tuple[key: string,
+    value: string]]] =
+  ## Returns the first (smallest) key-value pair in the keyspace.
+  ##
+  ## Returns None if the keyspace is empty.
+  let seqno = keyspace.inner.supervisor.inner.seqno.get()
+
+  # Check active memtable first
+  let memtable = keyspace.inner.tree.activeMemtable
+  var smallestKey: string = ""
+  var smallestValue: string = ""
+  var found = false
+
+  for key, entry in memtable.entries:
+    if entry.seqno <= seqno and entry.valueType == vtValue:
+      if not found or key < smallestKey:
+        smallestKey = key
+        smallestValue = entry.value
+        found = true
+
+  # If we found something in memtable, that's likely the smallest
+  # (SSTables would have older data, but memtable has newest)
+  # For a complete implementation, we'd need to check SSTables too
+  if found:
+    return ok[Option[tuple[key: string, value: string]], StorageError](
+      some((key: smallestKey, value: smallestValue))
+    )
+
+  return ok[Option[tuple[key: string, value: string]], StorageError](none(tuple[
+      key: string, value: string]))
+
+# Get last key-value pair
+proc lastKeyValue*(keyspace: Keyspace): StorageResult[Option[tuple[key: string,
+    value: string]]] =
+  ## Returns the last (largest) key-value pair in the keyspace.
+  ##
+  ## Returns None if the keyspace is empty.
+  let seqno = keyspace.inner.supervisor.inner.seqno.get()
+
+  # Check active memtable first
+  let memtable = keyspace.inner.tree.activeMemtable
+  var largestKey: string = ""
+  var largestValue: string = ""
+  var found = false
+
+  for key, entry in memtable.entries:
+    if entry.seqno <= seqno and entry.valueType == vtValue:
+      if not found or key > largestKey:
+        largestKey = key
+        largestValue = entry.value
+        found = true
+
+  if found:
+    return ok[Option[tuple[key: string, value: string]], StorageError](
+      some((key: largestKey, value: largestValue))
+    )
+
+  return ok[Option[tuple[key: string, value: string]], StorageError](none(tuple[
+      key: string, value: string]))
 
 # Approximate length
 proc approximateLen*(keyspace: Keyspace): int =

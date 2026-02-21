@@ -70,7 +70,8 @@ proc newLsmTree*(config: LsmTreeConfig,
     tableIdCounter: tableIdCounter,
     seqnoCounter: seqnoCounter,
     snapshotTracker: snapshotTracker,
-    blockCache: newBlockCache(config.cacheCapacity)
+    blockCache: newBlockCache(config.cacheCapacity),
+    counters: newMetricCounters()
   )
   initLock(result.versionLock)
 
@@ -151,6 +152,9 @@ proc insert*(tree: LsmTree, key: string, value: string,
   let itemSize = uint64(key.len + value.len)
   let memtableSize = tree.activeMemtable.insert(key, value, seqno, vtValue)
 
+  # Update metrics (atomic, no lock needed)
+  incWrites(tree.counters, itemSize)
+
   result = (itemSize: itemSize, memtableSize: memtableSize)
 
 # Remove a key (inserts a tombstone)
@@ -160,6 +164,9 @@ proc remove*(tree: LsmTree, key: string, seqno: uint64): ItemSizeResult =
 
   let itemSize = uint64(key.len)
   let memtableSize = tree.activeMemtable.remove(key, seqno, weak = false)
+
+  # Update metrics
+  incWrites(tree.counters, itemSize)
 
   result = (itemSize: itemSize, memtableSize: memtableSize)
 
@@ -171,10 +178,16 @@ proc removeWeak*(tree: LsmTree, key: string, seqno: uint64): ItemSizeResult =
   let itemSize = uint64(key.len)
   let memtableSize = tree.activeMemtable.remove(key, seqno, weak = true)
 
+  # Update metrics
+  incWrites(tree.counters, itemSize)
+
   result = (itemSize: itemSize, memtableSize: memtableSize)
 
 # Get a value by key
 proc get*(tree: LsmTree, key: string, seqno: uint64): Option[string] =
+  # Update metrics (atomic, before lock)
+  incReads(tree.counters)
+
   tree.versionLock.acquire()
   defer: tree.versionLock.release()
 
@@ -661,3 +674,49 @@ proc clearBlockCache*(tree: LsmTree) =
   ## Clear all entries from the block cache.
   if tree.blockCache != nil:
     tree.blockCache.clear()
+
+# Get comprehensive LSM tree metrics
+proc getMetrics*(tree: LsmTree): LsmTreeMetrics =
+  ## Returns comprehensive metrics for this LSM tree.
+  ##
+  ## Includes:
+  ## - Per-level table counts and sizes
+  ## - Memtable statistics
+  ## - Cache hit rates
+  ## - Read/write counters
+  tree.versionLock.acquire()
+  defer: tree.versionLock.release()
+
+  result = LsmTreeMetrics()
+  result.levelCount = tree.config.levelCount
+
+  # Level metrics
+  result.levelMetrics = newSeq[LevelMetrics](tree.config.levelCount)
+  for level in 0 ..< tree.config.levelCount:
+    var levelMetrics = LevelMetrics()
+    levelMetrics.tableCount = tree.tables[level].len
+    for table in tree.tables[level]:
+      levelMetrics.sizeBytes += table.size
+    result.levelMetrics[level] = levelMetrics
+    result.diskSpaceBytes += levelMetrics.sizeBytes
+
+  # Memtable metrics
+  result.activeMemtableSize = tree.activeMemtable.size
+  result.sealedMemtableCount = tree.sealedMemtables.len
+  for memtable in tree.sealedMemtables:
+    result.sealedMemtableSize += memtable.size
+
+  # Block cache metrics
+  if tree.blockCache != nil:
+    let cacheStats = tree.blockCache.stats()
+    result.cacheHits = cacheStats.hits
+    result.cacheMisses = cacheStats.misses
+    result.blockCacheMemoryBytes = cacheStats.size
+
+  # Counter metrics
+  result.reads = tree.counters.getReads()
+  result.writes = tree.counters.getWrites()
+  result.writeBytes = tree.counters.getWriteBytes()
+  result.batches = tree.counters.getBatches()
+
+

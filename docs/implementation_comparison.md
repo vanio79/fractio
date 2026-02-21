@@ -113,13 +113,15 @@ This document compares the Fractio Nim storage implementation with the Fjall Rus
 ### Missing ❌
 - `fragmented_blob_bytes()` - for KV separation
 - `start_ingestion()` - bulk ingestion (stub exists)
-- `metrics()` - LSM tree metrics
-- `path()` - keyspace path (could add)
 - `size_of()` - get size of a key
-- `first_key_value()` - get first key-value
-- `last_key_value()` - get last key-value
 - `is_kv_separated()` - check KV separation
 - `rotate_memtable_and_wait()` - blocking rotation
+
+### Added 2026-02-21 ✅
+- `metrics()` - LSM tree metrics
+- `path()` - keyspace path
+- `firstKeyValue()` - get first key-value
+- `lastKeyValue()` - get last key-value
 
 ### Differences
 

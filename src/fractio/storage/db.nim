@@ -604,6 +604,42 @@ proc journalDiskSpace*(db: Database): uint64 =
     if kind == pcFile:
       result += uint64(getFileSize(path))
 
+proc getMetrics*(db: Database): DatabaseMetrics =
+  ## Returns aggregate metrics for the entire database.
+  ##
+  ## Includes:
+  ## - Total keyspaces count
+  ## - Aggregate disk space
+  ## - Write buffer size
+  ## - Total reads/writes across all keyspaces
+  ## - Compaction statistics
+
+  db.inner.keyspacesLock.acquire()
+  defer: db.inner.keyspacesLock.release()
+
+  result = DatabaseMetrics()
+  result.keyspaceCount = db.inner.keyspaces.len
+
+  # Aggregate metrics from all keyspaces
+  for name, keyspace in db.inner.keyspaces.pairs:
+    let ksMetrics = keyspace.metrics()
+    result.totalDiskSpace += ksMetrics.diskSpaceBytes
+    result.totalReads += ksMetrics.reads
+    result.totalWrites += ksMetrics.writes
+    result.totalCacheHits += ksMetrics.cacheHits
+    result.totalCacheMisses += ksMetrics.cacheMisses
+
+  # Add journal disk space
+  result.totalJournalSpace = db.journalDiskSpace()
+
+  # Write buffer size
+  result.writeBufferSize = db.inner.supervisor.inner.writeBufferSize.get()
+
+  # Compaction stats
+  result.activeCompactions = db.inner.stats.activeCompactionCount.load(moRelaxed)
+  result.compactionsCompleted = db.inner.stats.compactionsCompleted.load(moRelaxed)
+  result.timeCompactingUs = db.inner.stats.timeCompacting.load(moRelaxed)
+
 proc close*(db: Database) =
   ## Close the database
   db.inner.stopSignal.stop.store(true, moRelease)
