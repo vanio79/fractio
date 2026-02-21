@@ -2,116 +2,88 @@
 # This source code is licensed under both the Apache 2.0 and MIT License
 # (found in the LICENSE-* files in the repository)
 
-import fractio/storage/[error, types, batch/item, keyspace, journal]
-import std/[sets, atomics, options]
+## Write Batch Implementation
+##
+## An atomic write batch allows atomically writing across keyspaces.
 
-# Forward declarations
+import fractio/storage/[types, batch/item]
+import fractio/storage/keyspace as ks
+import std/options
+
+# Persist mode for durability control
 type
-  Database* = object
   PersistMode* = enum
-    pmBuffer
-    pmSyncData
-    pmSyncAll
+    pmBuffer   ## Buffer in memory, no sync
+    pmSyncData ## Sync data to disk
+    pmSyncAll  ## Sync data and metadata to disk
+
+# Forward declaration - actual type is in db.nim
+type
+  Database* = ref object
 
 # An atomic write batch
-# Allows atomically writing across keyspaces inside the Database
 type
-  WriteBatch* = object
+  WriteBatch* = ref object
     data*: seq[Item]
     db*: Database
     durability*: Option[PersistMode]
 
-# Initializes a new write batch
+# Creates a new write batch
 proc newWriteBatch*(db: Database): WriteBatch =
-  WriteBatch(
-    data: newSeq[Item](),
+  ## Creates a new write batch for the given database.
+  result = WriteBatch(
+    data: @[],
     db: db,
     durability: none(PersistMode)
   )
 
-# Initializes a new write batch with preallocated capacity
+# Creates a new write batch with preallocated capacity
 proc withCapacity*(db: Database, capacity: int): WriteBatch =
-  var data = newSeq[Item]()
-  data.setLen(capacity)
-  data.setLen(0) # Reset length but keep capacity
-  WriteBatch(
-    data: data,
+  ## Creates a new write batch with preallocated capacity.
+  result = WriteBatch(
+    data: newSeqOfCap[Item](capacity),
     db: db,
     durability: none(PersistMode)
   )
 
 # Gets the number of batched items
 proc len*(batch: WriteBatch): int =
+  ## Returns the number of items in the batch.
   batch.data.len
 
 # Returns true if there are no batched items
 proc isEmpty*(batch: WriteBatch): bool =
+  ## Returns true if the batch is empty.
   batch.len == 0
 
 # Sets the durability level
-proc durability*(batch: WriteBatch, mode: Option[PersistMode]): WriteBatch =
-  var result = batch
-  result.durability = mode
-  return result
+proc setDurability*(batch: WriteBatch, mode: PersistMode) =
+  ## Sets the durability level for the batch.
+  batch.durability = some(mode)
 
 # Inserts a key-value pair into the batch
-proc insert*(batch: var WriteBatch, keyspace: Keyspace, key: UserKey,
+proc insert*(batch: WriteBatch, keyspace: ks.Keyspace, key: UserKey,
     value: UserValue) =
+  ## Inserts a key-value pair into the batch.
   batch.data.add(newItem(keyspace, key, value, vtValue))
 
 # Removes a key-value pair
-proc remove*(batch: var WriteBatch, keyspace: Keyspace, key: UserKey) =
+proc remove*(batch: WriteBatch, keyspace: ks.Keyspace, key: UserKey) =
+  ## Removes a key from the batch (adds a tombstone).
   batch.data.add(newItem(keyspace, key, "", vtTombstone))
 
 # Adds a weak tombstone marker for a key
-proc removeWeak*(batch: var WriteBatch, keyspace: Keyspace, key: UserKey) =
+proc removeWeak*(batch: WriteBatch, keyspace: ks.Keyspace, key: UserKey) =
+  ## Adds a weak tombstone marker for a key.
   batch.data.add(newItem(keyspace, key, "", vtWeakTombstone))
 
-# Commits the batch to the Database atomically
-proc commit*(batch: WriteBatch): StorageResult[void] =
-  if batch.isEmpty():
-    return okVoid
+# Clears the batch
+proc clear*(batch: WriteBatch) =
+  ## Clears all items from the batch.
+  batch.data.setLen(0)
 
-  # In a full implementation, this would get the journal writer
-  # For now, we'll skip this
-
-  # Check if database is poisoned
-  # In a full implementation, this would check the atomic boolean
-  # For now, we'll assume it's not poisoned
-
-  # Get batch sequence number
-  # In a full implementation, this would get the next sequence number
-  # For now, we'll use a placeholder
-
-  # Write batch to journal
-  # In a full implementation, this would write the batch
-  # For now, we'll skip this
-
-  # Persist if durability is set
-  # In a full implementation, this would persist based on durability setting
-  # For now, we'll skip this
-
-  # Track keyspaces that might need stalling
-  var keyspacesWithPossibleStall: HashSet[Keyspace] = initHashSet[Keyspace]()
-
-  # Apply batch to memtables
-  var batchSize: uint64 = 0
-
-  # In a full implementation, this would apply the batch to memtables
-  # For now, we'll simulate this
-
-  # Update snapshot tracker
-  # In a full implementation, this would publish the batch sequence number
-  # For now, we'll skip this
-
-  # Add batch size to write buffer
-  # In a full implementation, this would update the write buffer size
-  # For now, we'll skip this
-
-  # Check for write stalls
-  for keyspace in keyspacesWithPossibleStall:
-    # In a full implementation, this would check for write stalls
-    # For now, we'll skip this
-    discard
-
-  return okVoid
+# Gets the total size of the batch in bytes
+proc size*(batch: WriteBatch): uint64 =
+  ## Calculates the approximate size of the batch in bytes.
+  for item in batch.data:
+    result += uint64(item.key.len + item.value.len)

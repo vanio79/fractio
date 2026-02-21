@@ -614,3 +614,69 @@ proc close*(db: Database) =
 
   # Journal will be cleaned up by GC
   logInfo("Database closed")
+
+# ============================================================================
+# Write Batch Support
+# ============================================================================
+
+# Import batch after Database type is defined
+import fractio/storage/batch as batch_module
+
+proc batch*(db: Database): batch_module.WriteBatch =
+  ## Creates a new write batch for this database.
+  ##
+  ## Example:
+  ##   var wb = db.batch()
+  ##   wb.insert(ks1, "key1", "value1")
+  ##   wb.insert(ks2, "key2", "value2")
+  ##   let result = db.commit(wb)
+  ##
+  ## Note: Currently commit() applies entries individually. For true atomicity,
+  ## the journal would need to be used. This is a simplified implementation.
+  # Cast to the batch's Database type (they're both ref objects)
+  result = batch_module.newWriteBatch(cast[batch_module.Database](db))
+
+proc commit*(db: Database, wb: batch_module.WriteBatch): StorageResult[void] =
+  ## Commits a write batch to the database.
+  ##
+  ## This applies all operations in the batch to the appropriate keyspaces.
+  ## The operations are applied in order but not atomically - each operation
+  ## is applied individually. For true atomicity, the journal would need to
+  ## be used.
+  ##
+  ## Returns an error if any operation fails.
+  if wb.isEmpty:
+    return okVoid
+
+  # Apply each item to the appropriate keyspace
+  for item in wb.data:
+    if item.keyspace == nil:
+      continue
+
+    let keyspace = item.keyspace
+
+    # Check if keyspace is deleted
+    if keyspace.inner.isDeleted.load(moRelaxed):
+      return err[void, StorageError](StorageError(
+        kind: seKeyspaceDeleted
+      ))
+
+    # Apply the operation
+    let applyResult = case item.valueType
+      of vtValue:
+        keyspace.insert(item.key, item.value)
+      of vtTombstone:
+        keyspace.remove(item.key)
+      of vtWeakTombstone:
+        keyspace.removeWeak(item.key)
+      of vtIndirection:
+        # Indirection values should not be in batches
+        return err[void, StorageError](StorageError(
+          kind: seStorage,
+          storageError: "Cannot apply indirection value to batch"
+        ))
+
+    if applyResult.isErr:
+      return err[void, StorageError](applyResult.error)
+
+  return okVoid
