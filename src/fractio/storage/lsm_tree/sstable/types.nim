@@ -11,6 +11,10 @@ import std/streams
 # Block header size
 const BLOCK_HEADER_SIZE* = 8
 
+# Hash index special values
+const HASH_INDEX_EMPTY* = 255'u8
+const HASH_INDEX_COLLISION* = 254'u8
+
 # Block type
 type
   BlockType* = enum
@@ -42,12 +46,21 @@ type
     seqno*: uint64
     valueType*: uint8
 
+# Block hash index for fast point lookups
+type
+  BlockHashIndex* = ref object
+    ## Hash index for fast point lookups within a data block.
+    ## Maps key hashes to restart interval indices.
+    buckets*: seq[uint8] # Array of restart indices (or EMPTY/COLLISION)
+    numBuckets*: uint32
+
 # Data block
 type
   DataBlock* = ref object
     entries*: seq[BlockEntry]
     size*: uint32
     restartPoints*: seq[uint32] # Restart points for binary search
+    hashIndex*: BlockHashIndex  # Optional hash index for fast lookups
 
 # Index block entry
 type
