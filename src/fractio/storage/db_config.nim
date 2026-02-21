@@ -4,12 +4,12 @@
 
 import fractio/storage/types
 import fractio/storage/path as storage_path
+import fractio/storage/descriptor_table
 import std/[os, cpuinfo, options]
 
 # Forward declarations for shared components
 type
   Cache* = object
-  DescriptorTable* = object
 
 # Global database configuration
 type
@@ -23,7 +23,8 @@ type
     cache*: Cache
 
     # Descriptor table that will be shared between keyspaces
-    descriptorTable*: Option[DescriptorTable]
+    # Set to maxFiles = 0 to use default based on system limits
+    descriptorTableMaxFiles*: int
 
     # Max size of all journals in bytes
     maxJournalingSizeInBytes*: uint64
@@ -59,10 +60,14 @@ proc newConfig*(path: string): Config =
   # Get absolute path using our custom function
   let absolutePath = storage_path.absolutePath(path)
 
+  # Use 50% of system file limit for descriptor table, minimum 32
+  let openFileLimit = getOpenFileLimit()
+  let maxDescriptorFiles = max(32, openFileLimit div 2)
+
   Config(
     path: absolutePath,
     cleanPathOnDrop: false,
-    descriptorTable: some(DescriptorTable()), # Placeholder
+    descriptorTableMaxFiles: maxDescriptorFiles,
     maxWriteBufferSizeInBytes: none(uint64),
     maxJournalingSizeInBytes: 512 * 1024 * 1024, # 512 MiB
     workerThreads: workerThreads,

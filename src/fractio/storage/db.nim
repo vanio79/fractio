@@ -9,7 +9,7 @@
 import fractio/storage/[error, types, file, snapshot, snapshot_tracker, stats, supervisor,
                         write_buffer_manager, flush, flush/manager, poison_dart,
                         version, path,
-                        logging, journal, worker_pool]
+                        logging, journal, worker_pool, descriptor_table]
 import fractio/storage/recovery as db_recovery
 import fractio/storage/db_config as dbcfg
 import fractio/storage/keyspace as ks
@@ -59,6 +59,9 @@ type
 
     keyspaces*: Keyspaces
     keyspacesLock*: Lock
+
+    # Shared descriptor table for caching file handles
+    descriptorTable*: DescriptorTable
 
   Database* = ref object
     inner*: DatabaseInner
@@ -234,6 +237,13 @@ proc createNew*(dbType: typeDesc[Database], config: Config): StorageResult[Datab
   # Create stats
   db.inner.stats = newStats()
 
+  # Create descriptor table for file handle caching
+  let maxDescriptorFiles = if config.descriptorTableMaxFiles > 0:
+                             config.descriptorTableMaxFiles
+                           else:
+                             64 # Default
+  db.inner.descriptorTable = newDescriptorTable(maxDescriptorFiles)
+
   # Create supervisor with JournalManager
   let seqnoCounter = snapshot_tracker.newSequenceNumberCounter()
   var supervisorInner = SupervisorInner(
@@ -303,6 +313,13 @@ proc recover*(dbType: typeDesc[Database], config: Config): StorageResult[Databas
 
   # Create stats
   db.inner.stats = newStats()
+
+  # Create descriptor table for file handle caching
+  let maxDescriptorFiles = if config.descriptorTableMaxFiles > 0:
+                             config.descriptorTableMaxFiles
+                           else:
+                             64 # Default
+  db.inner.descriptorTable = newDescriptorTable(maxDescriptorFiles)
 
   # Create supervisor with JournalManager
   let seqnoCounter2 = snapshot_tracker.newSequenceNumberCounter()
@@ -640,6 +657,12 @@ proc getMetrics*(db: Database): DatabaseMetrics =
   result.compactionsCompleted = db.inner.stats.compactionsCompleted.load(moRelaxed)
   result.timeCompactingUs = db.inner.stats.timeCompacting.load(moRelaxed)
 
+proc descriptorTable*(db: Database): DescriptorTable =
+  ## Returns the shared descriptor table for file handle caching.
+  ##
+  ## This can be used by keyspaces and LSM trees to cache open file handles.
+  db.inner.descriptorTable
+
 proc close*(db: Database) =
   ## Close the database
   db.inner.stopSignal.stop.store(true, moRelease)
@@ -647,6 +670,10 @@ proc close*(db: Database) =
   # Stop worker pool
   if db.inner.workerPool != nil:
     db.inner.workerPool.stop()
+
+  # Close descriptor table
+  if db.inner.descriptorTable != nil:
+    db.inner.descriptorTable.close()
 
   # Journal will be cleaned up by GC
   logInfo("Database closed")

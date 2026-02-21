@@ -457,7 +457,7 @@ Rust supports storing large values in separate blob files to keep SSTables small
 10. ~~**Read path blob resolution**~~ - ✅ COMPLETED (was already implemented)
 
 ### Lower Priority
-11. **Descriptor table** - File handle caching
+11. ~~**Descriptor table**~~ - ✅ COMPLETED (2026-02-21, file handle caching)
 12. **Partitioned blocks** - For very large SSTables
 13. **Block hash index** - Optimization for point lookups
 14. ~~**Ingestion API**~~ - ✅ COMPLETED (2026-02-21, full bulk loading)
@@ -513,6 +513,7 @@ Rust supports storing large values in separate blob files to keep SSTables small
 10. ~~**Priority 10: Tiered/FIFO compaction**~~ - ✅ COMPLETED (2026-02-21)
 11. ~~**Priority 11: Cross-keyspace snapshots**~~ - ✅ COMPLETED (2026-02-21)
 12. ~~**Priority 12: Ingestion API**~~ - ✅ COMPLETED (2026-02-21)
+13. ~~**Priority 13: Descriptor table**~~ - ✅ COMPLETED (2026-02-21)
 
 ---
 
