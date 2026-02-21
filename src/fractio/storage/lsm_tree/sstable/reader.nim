@@ -20,17 +20,19 @@ type
     path*: string
     stream*: FileStream
     indexBlock*: IndexBlock
+    topLevelIndex*: TopLevelIndex # For partitioned index
     footer*: SsTableFooter
-    bloomFilter*: BloomFilter # Bloom filter for quick rejection
+    bloomFilter*: BloomFilter     # Bloom filter for quick rejection
     smallestKey*: string
     largestKey*: string
     seqnoRange*: (uint64, uint64)
-    sstableId*: uint64        # ID of this SSTable
-    blockCache*: BlockCache   # Optional block cache (may be nil)
+    sstableId*: uint64            # ID of this SSTable
+    blockCache*: BlockCache       # Optional block cache (may be nil)
+    indexMode*: IndexMode         # Full or partitioned index mode
 
 proc readFooter(strm: Stream, fileSize: int64): StorageResult[SsTableFooter] =
   ## Read the SSTable footer.
-  ## Supports both v1 (32 bytes) and v2 (44 bytes) footer formats.
+  ## Supports v1 (32 bytes), v2 (44 bytes), and v3 (53 bytes) footer formats.
 
   # First, read the last 4 bytes to get footer size
   strm.setPosition(int(fileSize - 4))
@@ -40,7 +42,42 @@ proc readFooter(strm: Stream, fileSize: int64): StorageResult[SsTableFooter] =
 
   var footer = SsTableFooter()
 
-  if footerSize == 44:
+  if footerSize == 53:
+    # Version 3 footer (includes index mode)
+    strm.setPosition(int(fileSize - 53))
+
+    var offsetLe: uint64 = strm.readUInt64()
+    littleEndian64(addr footer.indexHandle.offset, addr offsetLe)
+
+    var sizeLe: uint32 = strm.readUInt32()
+    littleEndian32(addr footer.indexHandle.size, addr sizeLe)
+
+    var uncompressedLe: uint32 = strm.readUInt32()
+    littleEndian32(addr footer.indexHandle.uncompressedSize,
+        addr uncompressedLe)
+
+    offsetLe = strm.readUInt64()
+    littleEndian64(addr footer.filterHandle.offset, addr offsetLe)
+
+    sizeLe = strm.readUInt32()
+    littleEndian32(addr footer.filterHandle.size, addr sizeLe)
+
+    uncompressedLe = strm.readUInt32()
+    littleEndian32(addr footer.filterHandle.uncompressedSize,
+        addr uncompressedLe)
+
+    for i in 0 ..< 8:
+      footer.magic[i] = strm.readUInt8()
+
+    var versionLe: uint32 = strm.readUInt32()
+    littleEndian32(addr footer.version, addr versionLe)
+
+    # Read index mode
+    footer.indexMode = IndexMode(strm.readUInt8())
+
+    footer.checksum = strm.readUInt32()
+
+  elif footerSize == 44:
     # Version 2 footer (includes bloom filter)
     strm.setPosition(int(fileSize - 44))
 
@@ -63,6 +100,7 @@ proc readFooter(strm: Stream, fileSize: int64): StorageResult[SsTableFooter] =
     littleEndian32(addr footer.version, addr versionLe)
 
     footer.checksum = strm.readUInt32()
+    footer.indexMode = imFull # v2 always uses full index
 
   elif footerSize == 32:
     # Version 1 footer (no bloom filter)
@@ -84,6 +122,7 @@ proc readFooter(strm: Stream, fileSize: int64): StorageResult[SsTableFooter] =
 
     # No filter in v1
     footer.filterHandle = BlockHandle(offset: 0, size: 0)
+    footer.indexMode = imFull # v1 always uses full index
   else:
     return err[SsTableFooter, StorageError](StorageError(
       kind: seInvalidVersion, invalidVersion: none(FormatVersion)))
@@ -325,6 +364,77 @@ proc readBloomFilter*(strm: Stream, hdl: BlockHandle): StorageResult[BloomFilter
     return err[BloomFilter, StorageError](StorageError(
       kind: seIo, ioError: "Failed to read bloom filter"))
 
+proc readTopLevelIndex*(strm: Stream, hdl: BlockHandle): StorageResult[
+    TopLevelIndex] =
+  ## Read a top level index from disk.
+  ## The handle.offset points AFTER the block type byte.
+  var tli = TopLevelIndex(entries: @[], isPartitioned: true)
+
+  strm.setPosition(int(hdl.offset))
+  let endPos = int(hdl.offset) + int(hdl.size)
+
+  # Read number of entries
+  if strm.getPosition() + 4 > endPos:
+    return ok[TopLevelIndex, StorageError](tli)
+
+  var numEntriesLe: uint32 = strm.readUInt32()
+  var numEntries: uint32
+  littleEndian32(addr numEntries, addr numEntriesLe)
+
+  for i in 0 ..< int(numEntries):
+    if strm.getPosition() + 4 > endPos:
+      break
+
+    var entry = TopLevelIndexEntry()
+
+    # Read key length
+    var keyLenLe: uint32 = strm.readUInt32()
+    var keyLen: uint32
+    littleEndian32(addr keyLen, addr keyLenLe)
+
+    if keyLen > 0 and keyLen < 10000:
+      entry.key = newString(int(keyLen))
+      discard strm.readData(addr entry.key[0], int(keyLen))
+
+    # Read handle
+    var offsetLe: uint64 = strm.readUInt64()
+    littleEndian64(addr entry.handle.offset, addr offsetLe)
+
+    var sizeLe: uint32 = strm.readUInt32()
+    littleEndian32(addr entry.handle.size, addr sizeLe)
+
+    var uncompressedLe: uint32 = strm.readUInt32()
+    littleEndian32(addr entry.handle.uncompressedSize, addr uncompressedLe)
+
+    tli.entries.add(entry)
+
+  return ok[TopLevelIndex, StorageError](tli)
+
+proc findIndexBlockForPartitioned*(reader: SsTableReader,
+    key: string): StorageResult[IndexBlock] =
+  ## Find and read the index block that may contain the key.
+  ## Used for partitioned index mode.
+  if reader.topLevelIndex.entries.len == 0:
+    return ok[IndexBlock, StorageError](newIndexBlock())
+
+  # Find the TLI entry that may contain the key
+  var targetHandle: BlockHandle
+  var found = false
+
+  for entry in reader.topLevelIndex.entries:
+    if entry.key >= key:
+      targetHandle = entry.handle
+      found = true
+      break
+    targetHandle = entry.handle
+    found = true
+
+  if not found:
+    return ok[IndexBlock, StorageError](newIndexBlock())
+
+  # Read the index block
+  return readIndexBlock(reader.stream, targetHandle)
+
 proc openSsTable*(path: string, sstableId: uint64 = 0,
                   cache: BlockCache = nil): StorageResult[SsTableReader] =
   ## Open an SSTable file for reading.
@@ -348,11 +458,6 @@ proc openSsTable*(path: string, sstableId: uint64 = 0,
 
   let footer = footerResult.value
 
-  let indexResult = readIndexBlock(strm, footer.indexHandle)
-  if indexResult.isErr:
-    strm.close()
-    return err[SsTableReader, StorageError](indexResult.error)
-
   # Read bloom filter if present
   var bloomFilter: BloomFilter = nil
   if footer.filterHandle.size > 0:
@@ -363,30 +468,56 @@ proc openSsTable*(path: string, sstableId: uint64 = 0,
   var reader = SsTableReader(
     path: path,
     stream: strm,
-    indexBlock: indexResult.value,
+    indexBlock: newIndexBlock(),
+    topLevelIndex: TopLevelIndex(entries: @[], isPartitioned: false),
     footer: footer,
     bloomFilter: bloomFilter,
     sstableId: sstableId,
-    blockCache: cache
+    blockCache: cache,
+    indexMode: footer.indexMode
   )
 
-  # Get key range from index block
-  # Index entries store the LARGEST key in each block
-  # So smallest key overall is the first entry's smallest key (need to read from data block)
-  # And largest key overall is the last index entry's key
-  if reader.indexBlock.entries.len > 0:
-    # The largest key is the last index entry's key
-    reader.largestKey = reader.indexBlock.entries[^1].key
+  if footer.indexMode == imPartitioned:
+    # Read top level index
+    let tliResult = readTopLevelIndex(strm, footer.indexHandle)
+    if tliResult.isErr:
+      strm.close()
+      return err[SsTableReader, StorageError](tliResult.error)
 
-    # To get the smallest key, we need to read from the first data block
-    # For efficiency, we'll read just the first entry
-    let firstHandle = reader.indexBlock.entries[0].handle
-    let blockResult = readDataBlock(strm, firstHandle)
-    if blockResult.isOk and blockResult.value.entries.len > 0:
-      reader.smallestKey = blockResult.value.entries[0].key
-    else:
-      # Fallback to index entry key (may not be accurate)
-      reader.smallestKey = reader.indexBlock.entries[0].key
+    reader.topLevelIndex = tliResult.value
+
+    # Get key range from TLI
+    if reader.topLevelIndex.entries.len > 0:
+      reader.largestKey = reader.topLevelIndex.entries[^1].key
+
+      # Read first index block to get smallest key
+      let firstIdxResult = readIndexBlock(strm, reader.topLevelIndex.entries[0].handle)
+      if firstIdxResult.isOk and firstIdxResult.value.entries.len > 0:
+        let firstHandle = firstIdxResult.value.entries[0].handle
+        let blockResult = readDataBlock(strm, firstHandle)
+        if blockResult.isOk and blockResult.value.entries.len > 0:
+          reader.smallestKey = blockResult.value.entries[0].key
+        else:
+          reader.smallestKey = firstIdxResult.value.entries[0].key
+  else:
+    # Read full index block
+    let indexResult = readIndexBlock(strm, footer.indexHandle)
+    if indexResult.isErr:
+      strm.close()
+      return err[SsTableReader, StorageError](indexResult.error)
+
+    reader.indexBlock = indexResult.value
+
+    # Get key range from index block
+    if reader.indexBlock.entries.len > 0:
+      reader.largestKey = reader.indexBlock.entries[^1].key
+
+      let firstHandle = reader.indexBlock.entries[0].handle
+      let blockResult = readDataBlock(strm, firstHandle)
+      if blockResult.isOk and blockResult.value.entries.len > 0:
+        reader.smallestKey = blockResult.value.entries[0].key
+      else:
+        reader.smallestKey = reader.indexBlock.entries[0].key
 
   return ok[SsTableReader, StorageError](reader)
 
@@ -416,8 +547,19 @@ proc getEntry*(reader: SsTableReader, key: string): SsTableGetResult =
   var handle: BlockHandle
   var found = false
 
+  # Get the appropriate index block
+  var idxBlock: IndexBlock
+  if reader.indexMode == imPartitioned:
+    # Find the index block that may contain the key
+    let idxResult = reader.findIndexBlockForPartitioned(key)
+    if idxResult.isErr:
+      return
+    idxBlock = idxResult.value
+  else:
+    idxBlock = reader.indexBlock
+
   # Find the data block that might contain the key
-  for entry in reader.indexBlock.entries:
+  for entry in idxBlock.entries:
     if entry.key >= key:
       handle = entry.handle
       found = true
@@ -465,10 +607,21 @@ proc get*(reader: SsTableReader, key: string): Option[string] =
   var handle: BlockHandle
   var found = false
 
+  # Get the appropriate index block
+  var idxBlock: IndexBlock
+  if reader.indexMode == imPartitioned:
+    # Find the index block that may contain the key
+    let idxResult = reader.findIndexBlockForPartitioned(key)
+    if idxResult.isErr:
+      return none(string)
+    idxBlock = idxResult.value
+  else:
+    idxBlock = reader.indexBlock
+
   # Find the data block that might contain the key
   # The index block stores the largest key in each data block
   # We want the first block where the largest key >= our search key
-  for entry in reader.indexBlock.entries:
+  for entry in idxBlock.entries:
     if entry.key >= key:
       handle = entry.handle
       found = true
@@ -529,4 +682,21 @@ proc getKeyRange*(reader: SsTableReader): (string, string) =
   (reader.smallestKey, reader.largestKey)
 
 proc numDataBlocks*(reader: SsTableReader): int =
-  reader.indexBlock.entries.len
+  ## Returns the number of data blocks in the SSTable.
+  ## For partitioned index, this is an estimate based on TLI entries.
+  if reader.indexMode == imPartitioned:
+    # For partitioned index, estimate based on TLI entries * avg entries per index block
+    return reader.topLevelIndex.entries.len * INDEX_BLOCK_ENTRIES
+  else:
+    return reader.indexBlock.entries.len
+
+proc numIndexBlocks*(reader: SsTableReader): int =
+  ## Returns the number of index blocks (1 for full, N for partitioned).
+  if reader.indexMode == imPartitioned:
+    return reader.topLevelIndex.entries.len
+  else:
+    return 1
+
+proc isPartitioned*(reader: SsTableReader): bool =
+  ## Returns true if this SSTable uses partitioned index.
+  reader.indexMode == imPartitioned

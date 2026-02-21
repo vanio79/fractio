@@ -15,13 +15,24 @@ const BLOCK_HEADER_SIZE* = 8
 const HASH_INDEX_EMPTY* = 255'u8
 const HASH_INDEX_COLLISION* = 254'u8
 
+# Index partitioning threshold - levels >= this use partitioned index
+const PARTITIONED_INDEX_THRESHOLD* = 2
+
+# Target entries per index block for partitioned index
+const INDEX_BLOCK_ENTRIES* = 64
+
+# Minimum index entries to trigger partitioning
+# This is the number of data blocks, not key-value entries
+const MIN_INDEX_ENTRIES_FOR_PARTITION* = 8
+
 # Block type
 type
   BlockType* = enum
-    btData = 1   ## Data block (key-value pairs)
-    btIndex = 2  ## Index block (pointers to data blocks)
-    btFilter = 3 ## Filter block (bloom filter)
-    btFooter = 4 ## Footer (file metadata)
+    btData = 1          ## Data block (key-value pairs)
+    btIndex = 2         ## Index block (pointers to data blocks)
+    btFilter = 3        ## Filter block (bloom filter)
+    btFooter = 4        ## Footer (file metadata)
+    btTopLevelIndex = 5 ## Top level index block (for partitioned index)
 
 # Block header
 type
@@ -68,20 +79,42 @@ type
     key*: string         # Last key in the data block
     handle*: BlockHandle # Pointer to data block
 
-# Index block
+# Index block (single-level or partitioned level-2)
 type
   IndexBlock* = ref object
     entries*: seq[IndexEntry]
+
+# Top Level Index entry - points to an index block
+type
+  TopLevelIndexEntry* = object
+    key*: string         # Largest key in the index block
+    handle*: BlockHandle # Pointer to index block
+
+# Top Level Index (TLI) - always in memory, very small
+type
+  TopLevelIndex* = ref object
+    ## Top-level index for partitioned block index.
+    ## Always loaded in memory, contains pointers to index blocks.
+    ## Each entry points to an index block that contains data block handles.
+    entries*: seq[TopLevelIndexEntry]
+    isPartitioned*: bool # True if this SSTable uses partitioned index
+
+# Index mode
+type
+  IndexMode* = enum
+    imFull        ## Full index - single level, all entries in memory
+    imPartitioned ## Partitioned index - two level, TLI in memory
 
 # SSTable footer
 type
   SsTableFooter* = object
     magic*: array[8, byte]
     version*: uint32
-    indexHandle*: BlockHandle
+    indexHandle*: BlockHandle  # Points to index block (full) or TLI (partitioned)
     filterHandle*: BlockHandle # Points to bloom filter block
     metaIndexHandle*: BlockHandle
     checksum*: uint32
+    indexMode*: IndexMode      # v3+: Index mode (full or partitioned)
 
 const SSTABLE_MAGIC* = [byte('S'), byte('S'), byte('T'), byte('B'),
                         byte('L'), byte('K'), byte('V'), byte('1')]

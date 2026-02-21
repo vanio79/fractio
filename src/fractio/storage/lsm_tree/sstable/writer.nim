@@ -30,9 +30,13 @@ type
     expectedKeys: int                        # For bloom filter sizing
     compression: compression.CompressionType # Compression type for data blocks
     compressionStats: CompressionStats
+    usePartitionedIndex: bool                # Whether to use partitioned index
+    indexBlockEntries: seq[IndexBlock]       # Partitioned index blocks
+    topLevelIndex: TopLevelIndex             # Top level index for partitioned mode
 
 proc newSsTableWriter*(path: string, expectedKeys: int = 1000,
-                      compression: compression.CompressionType = compression.ctZlib): StorageResult[
+                      compression: compression.CompressionType = compression.ctZlib,
+                      usePartitionedIndex: bool = false): StorageResult[
     SsTableWriter] =
   let stream = newFileStream(path, fmWrite)
   if stream == nil:
@@ -54,6 +58,10 @@ proc newSsTableWriter*(path: string, expectedKeys: int = 1000,
   writer.compressionStats = newCompressionStats()
   writer.smallestSeqno = high(uint64)
   writer.largestSeqno = 0'u64
+  writer.usePartitionedIndex = usePartitionedIndex
+  writer.indexBlockEntries = @[]
+  writer.topLevelIndex = TopLevelIndex(entries: @[],
+      isPartitioned: usePartitionedIndex)
 
   return ok[SsTableWriter, StorageError](writer)
 
@@ -131,6 +139,62 @@ proc add*(writer: SsTableWriter, key: string, value: string,
 proc add*(writer: SsTableWriter, entry: MemtableEntry): StorageResult[void] =
   return writer.add(entry.key, entry.value, entry.seqno, entry.valueType)
 
+# Helper to write an index block and return its handle
+proc writeIndexBlock(writer: SsTableWriter,
+    idxBlock: IndexBlock): StorageResult[BlockHandle] =
+  writer.stream.write(uint8(btIndex))
+  let startOffset = writer.stream.getPosition()
+  let serializeResult = idxBlock.serialize(writer.stream)
+  if serializeResult.isErr:
+    return err[BlockHandle, StorageError](serializeResult.error)
+  let endOffset = writer.stream.getPosition()
+  # Note: Index blocks are not compressed, so uncompressedSize is 0
+  return ok[BlockHandle, StorageError](BlockHandle(
+    offset: uint64(startOffset),
+    size: uint32(endOffset - startOffset),
+    uncompressedSize: 0
+  ))
+
+# Helper to write top level index block
+proc writeTopLevelIndex(writer: SsTableWriter,
+    tli: TopLevelIndex): StorageResult[BlockHandle] =
+  writer.stream.write(uint8(btTopLevelIndex))
+  let startOffset = writer.stream.getPosition()
+
+  # Write number of entries
+  var numEntriesLe = uint32(tli.entries.len)
+  littleEndian32(addr numEntriesLe, addr numEntriesLe)
+  writer.stream.write(numEntriesLe)
+
+  # Write each entry
+  for entry in tli.entries:
+    # Write key length
+    var keyLenLe = uint32(entry.key.len)
+    littleEndian32(addr keyLenLe, addr keyLenLe)
+    writer.stream.write(keyLenLe)
+
+    # Write key
+    writer.stream.write(entry.key)
+
+    # Write handle
+    var offsetLe = entry.handle.offset
+    littleEndian64(addr offsetLe, addr offsetLe)
+    writer.stream.write(offsetLe)
+
+    var sizeLe = entry.handle.size
+    littleEndian32(addr sizeLe, addr sizeLe)
+    writer.stream.write(sizeLe)
+
+    var uncompressedLe = entry.handle.uncompressedSize
+    littleEndian32(addr uncompressedLe, addr uncompressedLe)
+    writer.stream.write(uncompressedLe)
+
+  let endOffset = writer.stream.getPosition()
+  return ok[BlockHandle, StorageError](BlockHandle(
+    offset: uint64(startOffset),
+    size: uint32(endOffset - startOffset)
+  ))
+
 proc finish*(writer: SsTableWriter): StorageResult[SsTable] =
   # Flush remaining data
   let flushResult = writer.flushBlock()
@@ -148,32 +212,87 @@ proc finish*(writer: SsTableWriter): StorageResult[SsTable] =
     size: uint32(filterEndOffset - filterStartOffset)
   )
 
-  # Write index block
-  # Write block type first
-  writer.stream.write(uint8(btIndex))
+  # Determine if we should use partitioned index
+  let numIndexEntries = writer.indexBlock.entries.len
+  let usePartitioned = writer.usePartitionedIndex or
+                       numIndexEntries >= MIN_INDEX_ENTRIES_FOR_PARTITION
 
-  # Get start offset AFTER block type byte (consistent with data block)
-  let indexStartOffset = writer.stream.getPosition()
+  var indexHandle: BlockHandle
+  var indexMode: IndexMode
 
-  let indexSerializeResult = writer.indexBlock.serialize(writer.stream)
-  if indexSerializeResult.isErr:
-    return err[SsTable, StorageError](indexSerializeResult.error)
+  if usePartitioned and numIndexEntries > 0:
+    # Partition the index into multiple blocks
+    indexMode = imPartitioned
 
-  let indexEndOffset = writer.stream.getPosition()
+    # Split index entries into blocks of INDEX_BLOCK_ENTRIES each
+    var tli = TopLevelIndex(entries: @[], isPartitioned: true)
+    var currentBlock = newIndexBlock()
+    var count = 0
 
-  let indexHandle = BlockHandle(
-    offset: uint64(indexStartOffset),
-    size: uint32(indexEndOffset - indexStartOffset)
-  )
+    for entry in writer.indexBlock.entries:
+      currentBlock.entries.add(entry)
+      count += 1
 
-  # Write footer (48 bytes total)
-  # - indexHandle (offset: 8, size: 4) = 12 bytes
-  # - filterHandle (offset: 8, size: 4) = 12 bytes
+      if count >= INDEX_BLOCK_ENTRIES:
+        # Write this index block
+        let handleResult = writer.writeIndexBlock(currentBlock)
+        if handleResult.isErr:
+          return err[SsTable, StorageError](handleResult.error)
+
+        # Add to top level index (use last key of this block)
+        tli.entries.add(TopLevelIndexEntry(
+          key: currentBlock.entries[^1].key,
+          handle: handleResult.value
+        ))
+
+        # Start new block
+        currentBlock = newIndexBlock()
+        count = 0
+
+    # Write remaining entries
+    if currentBlock.entries.len > 0:
+      let handleResult = writer.writeIndexBlock(currentBlock)
+      if handleResult.isErr:
+        return err[SsTable, StorageError](handleResult.error)
+
+      tli.entries.add(TopLevelIndexEntry(
+        key: currentBlock.entries[^1].key,
+        handle: handleResult.value
+      ))
+
+    # Write top level index
+    let tliResult = writer.writeTopLevelIndex(tli)
+    if tliResult.isErr:
+      return err[SsTable, StorageError](tliResult.error)
+
+    indexHandle = tliResult.value
+  else:
+    # Use full (single-level) index
+    indexMode = imFull
+
+    writer.stream.write(uint8(btIndex))
+    let indexStartOffset = writer.stream.getPosition()
+
+    let indexSerializeResult = writer.indexBlock.serialize(writer.stream)
+    if indexSerializeResult.isErr:
+      return err[SsTable, StorageError](indexSerializeResult.error)
+
+    let indexEndOffset = writer.stream.getPosition()
+
+    indexHandle = BlockHandle(
+      offset: uint64(indexStartOffset),
+      size: uint32(indexEndOffset - indexStartOffset)
+    )
+
+  # Write footer (48 bytes for v3 with index mode)
+  # - indexHandle (offset: 8, size: 4, uncompressedSize: 4) = 16 bytes
+  # - filterHandle (offset: 8, size: 4, uncompressedSize: 4) = 16 bytes
   # - magic (8 bytes)
   # - version (4 bytes)
+  # - indexMode (1 byte)
   # - checksum (4 bytes)
   # - footerSize (4 bytes)
-  # Total = 44 bytes
+  # Total = 53 bytes
 
   # Index handle
   var indexOffsetLe = indexHandle.offset
@@ -184,6 +303,10 @@ proc finish*(writer: SsTableWriter): StorageResult[SsTable] =
   littleEndian32(addr indexSizeLe, addr indexSizeLe)
   writer.stream.write(indexSizeLe)
 
+  var indexUncompressedLe = indexHandle.uncompressedSize
+  littleEndian32(addr indexUncompressedLe, addr indexUncompressedLe)
+  writer.stream.write(indexUncompressedLe)
+
   # Filter handle
   var filterOffsetLe = filterHandle.offset
   littleEndian64(addr filterOffsetLe, addr filterOffsetLe)
@@ -193,20 +316,27 @@ proc finish*(writer: SsTableWriter): StorageResult[SsTable] =
   littleEndian32(addr filterSizeLe, addr filterSizeLe)
   writer.stream.write(filterSizeLe)
 
+  var filterUncompressedLe = filterHandle.uncompressedSize
+  littleEndian32(addr filterUncompressedLe, addr filterUncompressedLe)
+  writer.stream.write(filterUncompressedLe)
+
   # Magic
   writer.stream.writeData(addr SSTABLE_MAGIC[0], 8)
 
-  # Version
-  var versionLe: uint32 = 2 # Version 2 includes bloom filter
+  # Version (3 = partitioned index support)
+  var versionLe: uint32 = 3
   littleEndian32(addr versionLe, addr versionLe)
   writer.stream.write(versionLe)
+
+  # Index mode
+  writer.stream.write(uint8(indexMode))
 
   # Checksum (placeholder)
   var checksumLe: uint32 = 0
   writer.stream.write(checksumLe)
 
   # Footer size
-  var footerSizeLe: uint32 = 44
+  var footerSizeLe: uint32 = 53
   littleEndian32(addr footerSizeLe, addr footerSizeLe)
   writer.stream.write(footerSizeLe)
 

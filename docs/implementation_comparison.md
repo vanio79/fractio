@@ -171,11 +171,10 @@ This document compares the Fractio Nim storage implementation with the Fjall Rus
 - Compaction
 
 ### Missing ❌
-- **KV Separation (Blob files)** - Large values stored separately
 - **Level count configuration** - Fixed number of levels
-- **Descriptor table** - File handle cache
-- **Partitioned index/filter blocks** - For very large SSTables
-- **Block hash index** - Hash-based block lookup optimization
+
+### Added 2026-02-22 ✅
+- **Partitioned index/filter blocks** - Two-level index for very large SSTables (reduces memory footprint)
 
 ### Differences
 
@@ -440,6 +439,40 @@ Rust supports storing large values in separate blob files to keep SSTables small
 
 ---
 
+## 17. PARTITIONED INDEX BLOCKS
+
+### Status: ✅ COMPLETE (2026-02-22)
+
+For very large SSTables, the index block can become large enough to cause memory pressure. Partitioned index blocks solve this by using a two-level index structure.
+
+**Implementation:**
+
+| Feature | Rust (fjall) | Nim (fractio) | Status |
+|---------|-------------|---------------|--------|
+| Two-level index | ✅ | ✅ | TopLevelIndex + IndexBlocks |
+| Lazy index loading | ✅ | ✅ | Load index blocks on demand |
+| TLI always in memory | ✅ | ✅ | Small, contains pointers only |
+| Footer v3 format | ✅ | ✅ | 53 bytes with indexMode |
+| Backward compatibility | ✅ | ✅ | Reads v1/v2/v3 formats |
+| Auto-partition threshold | Configurable | 8 data blocks | MIN_INDEX_ENTRIES_FOR_PARTITION |
+| Explicit partitioning | ✅ | ✅ | usePartitionedIndex flag |
+
+**Key Types:**
+- `TopLevelIndex` - Always in memory, contains pointers to index blocks
+- `TopLevelIndexEntry` - Key + BlockHandle for each index block
+- `IndexMode` - `imFull` or `imPartitioned`
+
+**Files:**
+- `storage/lsm_tree/sstable/types.nim` - TopLevelIndex, IndexMode types
+- `storage/lsm_tree/sstable/writer.nim` - writeTopLevelIndex, partitioned finish()
+- `storage/lsm_tree/sstable/reader.nim` - readTopLevelIndex, findIndexBlockForPartitioned()
+- Tests: 8 partitioned index tests passing
+
+**Memory Benefit:**
+For an SSTable with 1000 data blocks, a full index would load all 1000 entries into memory. With partitioned index, only the TLI (16 entries at 64 entries per index block) is loaded initially, and individual index blocks are loaded on demand.
+
+---
+
 ## Critical Missing Features for Production Parity
 
 ### High Priority
@@ -458,7 +491,7 @@ Rust supports storing large values in separate blob files to keep SSTables small
 
 ### Lower Priority
 11. ~~**Descriptor table**~~ - ✅ COMPLETED (2026-02-21, file handle caching)
-12. **Partitioned blocks** - For very large SSTables
+12. **Partitioned blocks** - ✅ COMPLETED (2026-02-22, two-level index for large SSTables)
 13. ~~**Block hash index**~~ - ✅ COMPLETED (2026-02-21, point lookup optimization)
 14. ~~**Ingestion API**~~ - ✅ COMPLETED (2026-02-21, full bulk loading)
 15. ~~**Cross-keyspace snapshots**~~ - ✅ COMPLETED (2026-02-21)
@@ -515,6 +548,7 @@ Rust supports storing large values in separate blob files to keep SSTables small
 12. ~~**Priority 12: Ingestion API**~~ - ✅ COMPLETED (2026-02-21)
 13. ~~**Priority 13: Descriptor table**~~ - ✅ COMPLETED (2026-02-21)
 14. ~~**Priority 14: Block hash index**~~ - ✅ COMPLETED (2026-02-21)
+15. ~~**Priority 15: Partitioned blocks**~~ - ✅ COMPLETED (2026-02-22, two-level index for large SSTables)
 
 ---
 
@@ -620,10 +654,6 @@ The Fractio Nim implementation now covers nearly all core functionality of Fjall
 
 **Remaining Work for Full Parity:**
 1. Optimistic transactions (MVCC with conflict detection) - Lower priority
-2. Descriptor table (file handle caching) - Lower priority
-3. Partitioned blocks (for very large SSTables) - Lower priority
-4. Block hash index (optimization for point lookups) - Lower priority
-5. Ingestion API (bulk loading) - Stub exists
 
 **Tests Status:**
 - 9 batch tests
@@ -635,6 +665,7 @@ The Fractio Nim implementation now covers nearly all core functionality of Fjall
 - 16 tx unit tests
 - 12 per-level config tests
 - 14 compaction strategy tests
-- **Total: 112+ tests passing**
+- 8 partitioned index tests
+- **Total: 120+ tests passing**
 
-For production key-value workloads, Fractio is now feature-complete with proper atomicity, flow control, metrics, transactions, blob storage, per-level configuration, all three compaction strategies, and cross-keyspace snapshots. The only major remaining feature is optimistic transactions for concurrent write workloads.
+For production key-value workloads, Fractio is now feature-complete with proper atomicity, flow control, metrics, transactions, blob storage, per-level configuration, all three compaction strategies, cross-keyspace snapshots, and partitioned index blocks for large SSTables. The only remaining feature is optimistic transactions for concurrent write workloads.
