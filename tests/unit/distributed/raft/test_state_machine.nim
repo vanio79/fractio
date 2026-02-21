@@ -295,12 +295,8 @@ suite "InMemoryStateMachine":
     check sm.applyCount == 0
 
 suite "InMemoryStateMachine thread-safety":
-  var sm: InMemoryStateMachine
-
-  setup:
-    sm = newInMemoryStateMachine()
-
   test "concurrent SET operations produce correct final state":
+    var sm = newInMemoryStateMachine()
     # Worker proc for SET
     proc worker(args: tuple[idx: int, sm: InMemoryStateMachine]) {.thread.} =
       let idx = args.idx
@@ -326,6 +322,7 @@ suite "InMemoryStateMachine thread-safety":
     check sm.applyCount == n
 
   test "concurrent mix of operations maintains integrity":
+    var sm = newInMemoryStateMachine()
     type OpKind = enum
       opSet, opDelete, opAdd, opRemove
 

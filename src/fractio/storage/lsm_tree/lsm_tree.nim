@@ -470,6 +470,114 @@ proc get*(tree: LsmTree, key: string, seqno: uint64): Option[string] =
 
   return none(string)
 
+# Get a value by key with its sequence number (for optimistic transactions)
+proc getWithSeqno*(tree: LsmTree, key: string, seqno: uint64): tuple[
+    value: Option[string], entrySeqno: uint64] =
+  ## Get a value by key with its sequence number.
+  ## Returns (some(value), seqno) if found, (none(string), 0) if not found.
+  ## Used by optimistic transactions for conflict detection.
+
+  # Update metrics (atomic, before lock)
+  incReads(tree.counters)
+
+  tree.versionLock.acquire()
+  defer: tree.versionLock.release()
+
+  # Check if blob resolution is needed
+  let needsBlobResolution = tree.config.kvSeparationOpts.isSome
+  var blobCache: blob_reader_module.BlobReaderCache = nil
+  let blobPath = tree.config.path / "blobs"
+
+  # Check active memtable first
+  let memtableEntry = tree.activeMemtable.get(key)
+  if memtableEntry.isSome:
+    let entry = memtableEntry.get
+    if entry.seqno <= seqno:
+      case entry.valueType
+      of vtValue:
+        return (some(entry.value), entry.seqno)
+      of vtTombstone, vtWeakTombstone:
+        return (none(string), entry.seqno)
+      of vtIndirection:
+        if needsBlobResolution:
+          if blobCache == nil:
+            blobCache = blob_reader_module.newBlobReaderCache()
+          let resolved = resolveBlobValue(entry.value, blobPath, blobCache)
+          return (resolved, entry.seqno)
+        else:
+          return (some(entry.value), entry.seqno)
+
+  # Check sealed memtables
+  for memtable in tree.sealedMemtables:
+    let entry = memtable.get(key)
+    if entry.isSome:
+      let e = entry.get
+      if e.seqno <= seqno:
+        case e.valueType
+        of vtValue:
+          return (some(e.value), e.seqno)
+        of vtTombstone, vtWeakTombstone:
+          return (none(string), e.seqno)
+        of vtIndirection:
+          if needsBlobResolution:
+            if blobCache == nil:
+              blobCache = blob_reader_module.newBlobReaderCache()
+            let resolved = resolveBlobValue(e.value, blobPath, blobCache)
+            return (resolved, e.seqno)
+          else:
+            return (some(e.value), e.seqno)
+
+  # Check SSTables (from newest to oldest, level 0 first)
+  for table in tree.tables[0]:
+    if table.path.len > 0:
+      let readerResult = openSsTable(table.path, table.id, tree.blockCache)
+      if readerResult.isOk:
+        let reader = readerResult.value
+        let entry = reader.getEntry(key)
+        reader.close()
+        if entry.found and entry.seqno <= seqno:
+          let vt = cast[ValueType](entry.valueType)
+          case vt
+          of vtValue:
+            return (some(entry.value), entry.seqno)
+          of vtTombstone, vtWeakTombstone:
+            return (none(string), entry.seqno)
+          of vtIndirection:
+            if needsBlobResolution:
+              if blobCache == nil:
+                blobCache = blob_reader_module.newBlobReaderCache()
+              let resolved = resolveBlobValue(entry.value, blobPath, blobCache)
+              return (resolved, entry.seqno)
+            else:
+              return (some(entry.value), entry.seqno)
+
+  # Check other levels (sorted, can use binary search)
+  for level in 1 ..< tree.tables.len:
+    for table in tree.tables[level]:
+      if table.path.len > 0:
+        let readerResult = openSsTable(table.path, table.id, tree.blockCache)
+        if readerResult.isOk:
+          let reader = readerResult.value
+          let entry = reader.getEntry(key)
+          reader.close()
+          if entry.found and entry.seqno <= seqno:
+            let vt = cast[ValueType](entry.valueType)
+            case vt
+            of vtValue:
+              return (some(entry.value), entry.seqno)
+            of vtTombstone, vtWeakTombstone:
+              return (none(string), entry.seqno)
+            of vtIndirection:
+              if needsBlobResolution:
+                if blobCache == nil:
+                  blobCache = blob_reader_module.newBlobReaderCache()
+                let resolved = resolveBlobValue(entry.value, blobPath, blobCache)
+                return (resolved, entry.seqno)
+              else:
+                return (some(entry.value), entry.seqno)
+
+  return (none(string), 0'u64)
+
 # Check if key exists
 proc containsKey*(tree: LsmTree, key: string, seqno: uint64): bool =
   let value = tree.get(key, seqno)

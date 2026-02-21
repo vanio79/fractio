@@ -4,20 +4,28 @@
 
 ## Transaction Support
 ##
-## This module provides single-writer transaction support.
+## This module provides two types of transaction support:
+##
+## 1. Single-writer transactions (WriteTransaction, TxDatabase):
+##    - Only one write transaction can be active at a time
+##    - Simpler implementation, good for low-contention workloads
+##    - Uses a mutex lock to enforce single-writer
+##
+## 2. Optimistic transactions (OptimisticTransaction, OptimisticTxDatabase):
+##    - Multiple transactions can run concurrently
+##    - Uses MVCC conflict detection at commit time
+##    - Better for read-heavy workloads with occasional writes
+##    - Transactions that conflict are aborted and must be retried
 ##
 ## Transactions provide:
 ## - Atomicity: All writes succeed or none do
 ## - Isolation: Read-your-own-writes (RYOW) semantics
 ## - Consistency: Snapshot-based reads
-##
-## Single-writer means only one write transaction can be active at a time.
-## This is enforced by a mutex lock.
 
 import fractio/storage/[error, types, snapshot_tracker, journal/writer]
 import fractio/storage/keyspace as ks
 import fractio/storage/lsm_tree/[memtable, types as lsm_types, lsm_tree]
-import std/[options, tables, locks, atomics]
+import std/[options, tables, locks, atomics, sets, hashes, strutils]
 
 # Transaction sequence numbers start with high bit set
 const TX_SEQNO_START* = 0x8000_0000_0000_0000'u64
@@ -29,6 +37,10 @@ type
   # Snapshot for transaction reads
   TxSnapshot* = object
     seqno*: uint64
+
+  # ============================================================================
+  # SINGLE-WRITER TRANSACTIONS
+  # ============================================================================
 
   # Write transaction - holds uncommitted changes
   WriteTransaction* = object
@@ -52,7 +64,7 @@ type
     # Durability mode for commit
     durability*: Option[PersistMode]
 
-  # Transactional database wrapper
+  # Transactional database wrapper (single-writer)
   TxDatabase* = ref object
     ## A database wrapper that enforces single-writer transaction semantics.
 
@@ -73,6 +85,69 @@ type
     ## A keyspace reference for use in transactions.
     inner*: ks.Keyspace
     name*: string
+
+  # ============================================================================
+  # OPTIMISTIC TRANSACTIONS (MVCC with conflict detection)
+  # ============================================================================
+
+  # Read set entry - tracks a key that was read and its seqno at read time
+  ReadSetEntry* = object
+    ## Tracks a key that was read during an optimistic transaction.
+    ## The seqno is the sequence number of the value that was read.
+    ## If the key's seqno has changed by commit time, we have a conflict.
+    keyspaceId*: uint64
+    key*: string
+    seqno*: uint64 # The seqno of the value when read (0 means key didn't exist)
+
+  # Optimistic transaction - tracks read/write sets for conflict detection
+  OptimisticTransaction* = object
+    ## An optimistic transaction with MVCC conflict detection.
+    ##
+    ## Reads track the seqno of values, and at commit time we check if
+    ## any read key has been modified by another committed transaction.
+    ## If a conflict is detected, the commit fails and must be retried.
+
+    # Per-keyspace uncommitted writes (keyspace id -> entries)
+    writeSet*: Table[uint64, Memtable]
+
+    # Per-keyspace read set (composite key: keyspaceId + "|" + key -> seqno)
+    readSet*: Table[string, ReadSetEntry]
+
+    # Snapshot sequence number for consistent reads
+    snapshotSeqno*: uint64
+
+    # Current sequence number for new writes (starts at high bit)
+    currentSeqno*: uint64
+
+    # Whether transaction is still active
+    isActive*: bool
+
+    # Durability mode for commit
+    durability*: Option[PersistMode]
+
+  # Transaction conflict error
+  TransactionConflict* = object
+    ## Error returned when an optimistic transaction has a conflict.
+    conflictingKeys*: seq[string]
+
+  # Optimistic transactional database wrapper
+  OptimisticTxDatabase* = ref object
+    ## A database wrapper that allows concurrent optimistic transactions.
+    ##
+    ## Multiple transactions can run concurrently, but conflicts are
+    ## detected at commit time. Transactions that conflict are aborted.
+
+    # The underlying database
+    db*: DatabaseRef
+
+    # Lock for commit serialization (only one commit at a time)
+    commitLock*: Lock
+
+    # Keyspace references for commit
+    keyspaces*: Table[string, ks.Keyspace]
+
+    # Counter for transaction IDs (for debugging/logging)
+    nextTxId*: Atomic[uint64]
 
 # Create a new write transaction
 proc newWriteTransaction*(snapshotSeqno: uint64): WriteTransaction =
@@ -428,3 +503,441 @@ proc keyspaceNames*(txDb: TxDatabase): seq[string] =
 
 # Note: TxDatabase cleanup is handled by Nim's GC
 # The Lock will be cleaned up when the TxDatabase object is collected
+
+# ============================================================================
+# OPTIMISTIC TRANSACTION IMPLEMENTATION
+# ============================================================================
+
+# Helper to create a composite key for the read set
+proc makeReadSetKey(keyspaceId: uint64, key: string): string =
+  ## Creates a composite key for storing in the read set.
+  result = $keyspaceId & ":" & key
+
+# Create a new optimistic transaction
+proc newOptimisticTransaction*(snapshotSeqno: uint64): OptimisticTransaction =
+  ## Creates a new optimistic transaction with the given snapshot sequence number.
+  result = OptimisticTransaction(
+    writeSet: initTable[uint64, Memtable](),
+    readSet: initTable[string, ReadSetEntry](),
+    snapshotSeqno: snapshotSeqno,
+    currentSeqno: TX_SEQNO_START,
+    isActive: true,
+    durability: none(PersistMode)
+  )
+
+# Set durability mode for optimistic transaction
+proc durability*(tx: var OptimisticTransaction, mode: Option[
+    PersistMode]): var OptimisticTransaction =
+  ## Sets the durability mode for the transaction.
+  tx.durability = mode
+  return tx
+
+# Create a new optimistic transactional database wrapper
+proc newOptimisticTxDatabase*(): OptimisticTxDatabase =
+  ## Creates a new empty optimistic transactional database wrapper.
+  new(result)
+  initLock(result.commitLock)
+  result.keyspaces = initTable[string, ks.Keyspace]()
+  result.nextTxId.store(0, moRelaxed)
+
+# Get or create write memtable for a keyspace
+proc getWriteMemtable*(tx: var OptimisticTransaction,
+    keyspaceId: uint64): Memtable =
+  ## Gets or creates a write memtable for the given keyspace ID.
+  if keyspaceId notin tx.writeSet:
+    tx.writeSet[keyspaceId] = newMemtable()
+  return tx.writeSet[keyspaceId]
+
+# Check if optimistic transaction is active
+proc checkActive*(tx: OptimisticTransaction): StorageResult[void] =
+  ## Returns an error if the transaction is not active.
+  if not tx.isActive:
+    return err[void, StorageError](StorageError(
+      kind: seStorage,
+      storageError: "Transaction is not active"
+    ))
+  return okVoid
+
+# Record a read in the read set (for conflict detection)
+proc recordRead*(tx: var OptimisticTransaction, keyspaceId: uint64, key: string,
+    seqno: uint64) =
+  ## Records a read operation in the read set for conflict detection.
+  ## If the key is already in the write set (RYOW), we don't need to track it.
+  let readSetKey = makeReadSetKey(keyspaceId, key)
+  if readSetKey notin tx.readSet:
+    tx.readSet[readSetKey] = ReadSetEntry(
+      keyspaceId: keyspaceId,
+      key: key,
+      seqno: seqno
+    )
+
+# Insert into optimistic transaction
+proc otxInsert*(tx: var OptimisticTransaction, keyspace: ks.Keyspace,
+    key: string, value: string): StorageResult[void] =
+  ## Inserts a key-value pair into the optimistic transaction.
+  let check = tx.checkActive()
+  if check.isErr:
+    return check
+
+  let keyspaceId = keyspace.inner.id
+
+  # Remove from read set if present (write overrides read tracking)
+  let readSetKey = makeReadSetKey(keyspaceId, key)
+  tx.readSet.del(readSetKey)
+
+  let memtable = tx.getWriteMemtable(keyspaceId)
+  discard memtable.insert(key, value, tx.currentSeqno, lsm_types.vtValue)
+  tx.currentSeqno += 1
+  return okVoid
+
+# Remove from optimistic transaction (inserts tombstone)
+proc otxRemove*(tx: var OptimisticTransaction, keyspace: ks.Keyspace,
+    key: string): StorageResult[void] =
+  ## Removes a key from the optimistic transaction by inserting a tombstone.
+  let check = tx.checkActive()
+  if check.isErr:
+    return check
+
+  let keyspaceId = keyspace.inner.id
+
+  # Remove from read set if present (write overrides read tracking)
+  let readSetKey = makeReadSetKey(keyspaceId, key)
+  tx.readSet.del(readSetKey)
+
+  let memtable = tx.getWriteMemtable(keyspaceId)
+  discard memtable.remove(key, tx.currentSeqno, weak = false)
+  tx.currentSeqno += 1
+  return okVoid
+
+# Remove weak from optimistic transaction
+proc otxRemoveWeak*(tx: var OptimisticTransaction, keyspace: ks.Keyspace,
+    key: string): StorageResult[void] =
+  ## Removes a key from the optimistic transaction by inserting a weak tombstone.
+  let check = tx.checkActive()
+  if check.isErr:
+    return check
+
+  let keyspaceId = keyspace.inner.id
+  let readSetKey = makeReadSetKey(keyspaceId, key)
+  tx.readSet.del(readSetKey)
+
+  let memtable = tx.getWriteMemtable(keyspaceId)
+  discard memtable.remove(key, tx.currentSeqno, weak = true)
+  tx.currentSeqno += 1
+  return okVoid
+
+# Get value with RYOW support (optimistic)
+proc otxGet*(tx: var OptimisticTransaction, keyspace: ks.Keyspace,
+    key: string): StorageResult[Option[string]] =
+  ## Gets a value, checking uncommitted writes first (RYOW).
+  ## Records the read in the read set for conflict detection.
+  let check = tx.checkActive()
+  if check.isErr:
+    return err[Option[string], StorageError](check.err[])
+
+  let keyspaceId = keyspace.inner.id
+
+  # Check write set first (RYOW)
+  if keyspaceId in tx.writeSet:
+    let memtable = tx.writeSet[keyspaceId]
+    let entry = memtable.get(key)
+    if entry.isSome:
+      let e = entry.get
+      if e.valueType == lsm_types.vtTombstone or e.valueType ==
+          lsm_types.vtWeakTombstone:
+        # Record as read (key didn't exist) but don't include in conflict set
+        # Actually, we should still track that we read "not exists"
+        return ok[Option[string], StorageError](none(string))
+      return ok[Option[string], StorageError](some(e.value))
+
+  # Read from keyspace at snapshot seqno
+  let (value, seqno) = keyspace.inner.tree.getWithSeqno(key, tx.snapshotSeqno)
+
+  # Record the read with its seqno (0 means key didn't exist)
+  let readSeqno = if value.isSome: seqno else: 0'u64
+  tx.recordRead(keyspaceId, key, readSeqno)
+
+  return ok[Option[string], StorageError](value)
+
+# Check if key exists with RYOW support (optimistic)
+proc otxContainsKey*(tx: var OptimisticTransaction, keyspace: ks.Keyspace,
+    key: string): StorageResult[bool] =
+  ## Checks if a key exists, checking uncommitted writes first (RYOW).
+  let check = tx.checkActive()
+  if check.isErr:
+    return err[bool, StorageError](check.err[])
+
+  let keyspaceId = keyspace.inner.id
+
+  if keyspaceId in tx.writeSet:
+    let memtable = tx.writeSet[keyspaceId]
+    let entry = memtable.get(key)
+    if entry.isSome:
+      let e = entry.get
+      if e.valueType == lsm_types.vtTombstone or e.valueType ==
+          lsm_types.vtWeakTombstone:
+        return ok[bool, StorageError](false)
+      return ok[bool, StorageError](true)
+
+  let exists = keyspace.inner.tree.containsKey(key, tx.snapshotSeqno)
+
+  # Record the read (we need to track that this key was checked)
+  # For containsKey, we track the current seqno of the key
+  if exists:
+    let (_, seqno) = keyspace.inner.tree.getWithSeqno(key, tx.snapshotSeqno)
+    tx.recordRead(keyspaceId, key, seqno)
+  else:
+    # Key doesn't exist - record with seqno 0
+    tx.recordRead(keyspaceId, key, 0)
+
+  return ok[bool, StorageError](exists)
+
+# Get size of value with RYOW support (optimistic)
+proc otxSizeOf*(tx: var OptimisticTransaction, keyspace: ks.Keyspace,
+    key: string): StorageResult[Option[uint32]] =
+  ## Gets the size of a value, checking uncommitted writes first (RYOW).
+  let check = tx.checkActive()
+  if check.isErr:
+    return err[Option[uint32], StorageError](check.err[])
+
+  let keyspaceId = keyspace.inner.id
+
+  if keyspaceId in tx.writeSet:
+    let memtable = tx.writeSet[keyspaceId]
+    let entry = memtable.get(key)
+    if entry.isSome:
+      let e = entry.get
+      if e.valueType == lsm_types.vtTombstone or e.valueType ==
+          lsm_types.vtWeakTombstone:
+        return ok[Option[uint32], StorageError](none(uint32))
+      return ok[Option[uint32], StorageError](some(uint32(e.value.len)))
+
+  # Would need size_of in LsmTree - for now return none
+  return ok[Option[uint32], StorageError](none(uint32))
+
+# Rollback the optimistic transaction
+proc rollback*(tx: var OptimisticTransaction) =
+  ## Rolls back the optimistic transaction, discarding all uncommitted changes.
+  tx.isActive = false
+  tx.writeSet.clear()
+  tx.readSet.clear()
+
+# Detect conflicts between read set and current database state
+proc detectConflicts*(tx: OptimisticTransaction, keyspaces: Table[string,
+    ks.Keyspace]): seq[string] =
+  ## Checks if any key in the read set has been modified since the transaction started.
+  ## Returns a list of conflicting keys (empty if no conflicts).
+  result = @[]
+
+  # Build a lookup from keyspace id to keyspace
+  var idToKeyspace: Table[uint64, ks.Keyspace]
+  for name, keyspace in keyspaces:
+    idToKeyspace[keyspace.inner.id] = keyspace
+
+  # Check each read key
+  for readSetKey, entry in tx.readSet:
+    if entry.keyspaceId notin idToKeyspace:
+      continue
+
+    let keyspace = idToKeyspace[entry.keyspaceId]
+
+    # Get the current seqno of this key
+    let (currentValue, currentSeqno) = keyspace.inner.tree.getWithSeqno(
+        entry.key, high(uint64))
+
+    if entry.seqno == 0:
+      # Key didn't exist when we read it
+      # Conflict if key now exists
+      if currentValue.isSome:
+        result.add(entry.key)
+    else:
+      # Key existed with seqno when we read it
+      # Conflict if seqno has changed (including if key was deleted)
+      if currentValue.isNone or currentSeqno != entry.seqno:
+        result.add(entry.key)
+
+# Commit the optimistic transaction with conflict detection
+proc otxCommit*(tx: var OptimisticTransaction, keyspaces: Table[string,
+    ks.Keyspace]): StorageResult[void] =
+  ## Commits the optimistic transaction with conflict detection.
+  ##
+  ## Returns an error if there are conflicts. The transaction should be
+  ## rolled back and retried in that case.
+  let check = tx.checkActive()
+  if check.isErr:
+    return check
+
+  # Mark as inactive immediately to prevent re-entrance
+  tx.isActive = false
+
+  # Check for conflicts
+  let conflicts = tx.detectConflicts(keyspaces)
+  if conflicts.len > 0:
+    tx.writeSet.clear()
+    tx.readSet.clear()
+    return err[void, StorageError](StorageError(
+      kind: seStorage,
+      storageError: "Transaction conflict detected for keys: " & conflicts.join(", ")
+    ))
+
+  # If no changes, nothing to do
+  if tx.writeSet.len == 0:
+    tx.readSet.clear()
+    return okVoid
+
+  # Build a lookup from keyspace id to keyspace
+  var idToKeyspace: Table[uint64, ks.Keyspace]
+  for name, keyspace in keyspaces:
+    idToKeyspace[keyspace.inner.id] = keyspace
+
+  # Apply changes from each memtable
+  for keyspaceId, memtable in tx.writeSet:
+    if keyspaceId notin idToKeyspace:
+      continue
+
+    let keyspace = idToKeyspace[keyspaceId]
+    let entries = memtable.getSortedEntries()
+
+    # Track which keys we've already applied (keep last version)
+    var appliedKeys: Table[string, bool]
+
+    # Apply in reverse order to get the latest version
+    for i in countdown(entries.len - 1, 0):
+      let entry = entries[i]
+
+      # Skip if we've already applied this key
+      if entry.key in appliedKeys:
+        continue
+      appliedKeys[entry.key] = true
+
+      # Apply the operation
+      case entry.valueType
+      of lsm_types.vtValue:
+        let applyResult = keyspace.insert(entry.key, entry.value)
+        if applyResult.isErr:
+          return err[void, StorageError](applyResult.error)
+      of lsm_types.vtTombstone:
+        let applyResult = keyspace.remove(entry.key)
+        if applyResult.isErr:
+          return err[void, StorageError](applyResult.error)
+      of lsm_types.vtWeakTombstone:
+        let applyResult = keyspace.removeWeak(entry.key)
+        if applyResult.isErr:
+          return err[void, StorageError](applyResult.error)
+      of lsm_types.vtIndirection:
+        let applyResult = keyspace.insert(entry.key, entry.value)
+        if applyResult.isErr:
+          return err[void, StorageError](applyResult.error)
+
+  tx.writeSet.clear()
+  tx.readSet.clear()
+  return okVoid
+
+# Take - remove and return value (optimistic)
+proc otxTake*(tx: var OptimisticTransaction, keyspace: ks.Keyspace,
+    key: string): StorageResult[Option[string]] =
+  ## Removes a key and returns its previous value atomically.
+  let prev = tx.otxGet(keyspace, key)
+  if prev.isErr:
+    return prev
+
+  if prev.value.isSome:
+    let removeResult = tx.otxRemove(keyspace, key)
+    if removeResult.isErr:
+      return err[Option[string], StorageError](removeResult.err[])
+
+  return prev
+
+# Fetch update - atomically update and return previous value (optimistic)
+proc otxFetchUpdate*(tx: var OptimisticTransaction, keyspace: ks.Keyspace,
+    key: string, f: proc(v: Option[string]): Option[string]): StorageResult[
+        Option[string]] =
+  ## Atomically updates a key and returns the previous value.
+  let prev = tx.otxGet(keyspace, key)
+  if prev.isErr:
+    return prev
+
+  let updated = f(prev.value)
+
+  if updated.isSome:
+    let insertResult = tx.otxInsert(keyspace, key, updated.get)
+    if insertResult.isErr:
+      return err[Option[string], StorageError](insertResult.err[])
+  elif prev.value.isSome:
+    let removeResult = tx.otxRemove(keyspace, key)
+    if removeResult.isErr:
+      return err[Option[string], StorageError](removeResult.err[])
+
+  return prev
+
+# Update fetch - atomically update and return new value (optimistic)
+proc otxUpdateFetch*(tx: var OptimisticTransaction, keyspace: ks.Keyspace,
+    key: string, f: proc(v: Option[string]): Option[string]): StorageResult[
+        Option[string]] =
+  ## Atomically updates a key and returns the new value.
+  let prev = tx.otxGet(keyspace, key)
+  if prev.isErr:
+    return prev
+
+  let updated = f(prev.value)
+
+  if updated.isSome:
+    let insertResult = tx.otxInsert(keyspace, key, updated.get)
+    if insertResult.isErr:
+      return err[Option[string], StorageError](insertResult.err[])
+  elif prev.value.isSome:
+    let removeResult = tx.otxRemove(keyspace, key)
+    if removeResult.isErr:
+      return err[Option[string], StorageError](removeResult.err[])
+
+  return ok[Option[string], StorageError](updated)
+
+# Begin an optimistic transaction on the database wrapper
+proc beginOptimisticTx*(txDb: var OptimisticTxDatabase,
+    snapshotSeqno: uint64): OptimisticTransaction =
+  ## Begins a new optimistic transaction.
+  ## Multiple optimistic transactions can run concurrently.
+  let txId = txDb.nextTxId.fetchAdd(1, moRelaxed) + 1
+  result = newOptimisticTransaction(snapshotSeqno)
+  # txId can be used for logging/debugging
+
+# Begin an optimistic transaction with durability mode
+proc beginOptimisticTx*(txDb: var OptimisticTxDatabase, snapshotSeqno: uint64,
+    durability: Option[PersistMode]): OptimisticTransaction =
+  ## Begins a new optimistic transaction with the specified durability mode.
+  discard txDb.nextTxId.fetchAdd(1, moRelaxed)
+  result = newOptimisticTransaction(snapshotSeqno)
+  result.durability = durability
+
+# Commit an optimistic transaction with commit serialization
+proc commitOptimisticTx*(txDb: var OptimisticTxDatabase,
+    tx: var OptimisticTransaction): StorageResult[void] =
+  ## Commits an optimistic transaction.
+  ## This acquires a commit lock to serialize commits.
+  acquire(txDb.commitLock)
+  defer: release(txDb.commitLock)
+
+  return tx.otxCommit(txDb.keyspaces)
+
+# Register a keyspace with the optimistic transaction database
+proc registerKeyspace*(txDb: var OptimisticTxDatabase, name: string,
+    keyspace: ks.Keyspace) =
+  ## Registers a keyspace for use in optimistic transactions.
+  txDb.keyspaces[name] = keyspace
+
+# Unregister a keyspace from optimistic transaction database
+proc unregisterKeyspace*(txDb: var OptimisticTxDatabase, name: string) =
+  ## Unregisters a keyspace from the optimistic transaction database.
+  txDb.keyspaces.del(name)
+
+# Check if keyspace is registered (optimistic)
+proc hasKeyspace*(txDb: OptimisticTxDatabase, name: string): bool =
+  ## Returns true if the keyspace is registered.
+  name in txDb.keyspaces
+
+# Get registered keyspace names (optimistic)
+proc keyspaceNames*(txDb: OptimisticTxDatabase): seq[string] =
+  ## Returns the names of all registered keyspaces.
+  result = @[]
+  for name in txDb.keyspaces.keys:
+    result.add(name)

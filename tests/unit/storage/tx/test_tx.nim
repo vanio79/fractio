@@ -5,7 +5,7 @@
 ## Tests for transaction functionality
 
 import unittest
-import fractio/storage/tx
+import fractio/storage/tx as tx_module
 import fractio/storage/db
 import fractio/storage/db_config
 import fractio/storage/keyspace as ks_module
@@ -112,7 +112,7 @@ suite "Transaction Tests":
     var tx = txDb.beginTx(100'u64)
 
     # Insert in transaction
-    let insertResult = tx.txInsert(ks, "key1", "value1")
+    let insertResult = tx_module.txInsert(tx, ks, "key1", "value1")
     check insertResult.isOk
     check tx.memtables.len() == 1
 
@@ -150,7 +150,7 @@ suite "Transaction Tests":
     var tx = txDb.beginTx(100'u64)
 
     # Remove in transaction
-    let removeResult = tx.txRemove(ks, "key1")
+    let removeResult = tx_module.txRemove(tx, ks, "key1")
     check removeResult.isOk
 
     # Commit
@@ -181,10 +181,10 @@ suite "Transaction Tests":
     var tx = txDb.beginTx(100'u64)
 
     # Insert in transaction
-    discard tx.txInsert(ks, "key1", "tx_value")
+    discard tx_module.txInsert(tx, ks, "key1", "tx_value")
 
     # Read should see uncommitted value
-    let getResult = tx.txGet(ks, "key1")
+    let getResult = tx_module.txGet(tx, ks, "key1")
     check getResult.isOk
     check getResult.value.isSome
     check getResult.value.get == "tx_value"
@@ -212,10 +212,10 @@ suite "Transaction Tests":
     var tx = txDb.beginTx(100'u64)
 
     # Remove in transaction
-    discard tx.txRemove(ks, "key1")
+    discard tx_module.txRemove(tx, ks, "key1")
 
     # Read should see tombstone (key doesn't exist)
-    let getResult = tx.txGet(ks, "key1")
+    let getResult = tx_module.txGet(tx, ks, "key1")
     check getResult.isOk
     check getResult.value.isNone
 
@@ -239,15 +239,15 @@ suite "Transaction Tests":
     var tx = txDb.beginTx(100'u64)
 
     # Insert in transaction
-    discard tx.txInsert(ks, "key1", "value1")
+    discard tx_module.txInsert(tx, ks, "key1", "value1")
 
     # containsKey should see uncommitted value
-    let containsResult = tx.txContainsKey(ks, "key1")
+    let containsResult = tx_module.txContainsKey(tx, ks, "key1")
     check containsResult.isOk
     check containsResult.value
 
     # Key not in transaction should check keyspace
-    let containsResult2 = tx.txContainsKey(ks, "key_notexist")
+    let containsResult2 = tx_module.txContainsKey(tx, ks, "key_notexist")
     check containsResult2.isOk
     check not containsResult2.value
 
@@ -271,7 +271,7 @@ suite "Transaction Tests":
     var tx = txDb.beginTx(100'u64)
 
     # Insert in transaction
-    discard tx.txInsert(ks, "key1", "value1")
+    discard tx_module.txInsert(tx, ks, "key1", "value1")
 
     # Rollback
     tx.rollback()
@@ -300,9 +300,9 @@ suite "Transaction Tests":
     var tx = txDb.beginTx(100'u64)
 
     # Insert multiple items
-    discard tx.txInsert(ks, "key1", "value1")
-    discard tx.txInsert(ks, "key2", "value2")
-    discard tx.txInsert(ks, "key3", "value3")
+    discard tx_module.txInsert(tx, ks, "key1", "value1")
+    discard tx_module.txInsert(tx, ks, "key2", "value2")
+    discard tx_module.txInsert(tx, ks, "key3", "value3")
 
     # Commit
     let commitResult = tx.commit(txDb.keyspaces)
@@ -341,7 +341,7 @@ suite "Transaction Tests":
     txDb.registerKeyspace("test_ks", ks)
 
     var tx = txDb.beginTx(100'u64)
-    discard tx.txInsert(ks, "key1", "value1")
+    discard tx_module.txInsert(tx, ks, "key1", "value1")
 
     let commitResult = tx.commit(txDb.keyspaces)
     check commitResult.isOk
