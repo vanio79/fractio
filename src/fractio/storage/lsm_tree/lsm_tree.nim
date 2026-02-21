@@ -8,8 +8,10 @@
 
 import fractio/storage/error
 import fractio/storage/blob/types as blob_types
-import fractio/storage/blob/writer as blob_writer
-import fractio/storage/blob/reader as blob_reader
+import fractio/storage/blob/writer as blob_writer_module
+import fractio/storage/blob/reader as blob_reader_module
+import fractio/storage/types as storage_types
+import fractio/storage/keyspace/options
 import ./types
 import ./memtable
 import ./sstable/writer
@@ -21,34 +23,206 @@ import fractio/storage/snapshot_tracker
 import std/[os, atomics, locks, options, tables, streams, strutils, algorithm]
 
 export types except ItemSizeResult
+export storage_types.CompressionType
 
 # Default configuration values
 const
   DefaultLevelCount* = 7
   DefaultMaxMemtableSize* = 64 * 1024 * 1024 # 64 MiB
   DefaultBlockSize* = 4 * 1024               # 4 KiB
+  DefaultRestartInterval* = 16
+  DefaultBloomFpr* = 0.01                    # 1% false positive rate
+
+# Get block size for a level
+proc getBlockSize*(config: LsmTreeConfig, level: int): uint32 =
+  ## Returns the block size for a specific level.
+  if config.blockSizes.len > level:
+    return config.blockSizes[level]
+  elif config.blockSizes.len > 0:
+    # Fall back to last configured level
+    return config.blockSizes[^1]
+  else:
+    # Fall back to default (backward compatibility)
+    return uint32(config.blockSize)
+
+# Get restart interval for a level
+proc getRestartInterval*(config: LsmTreeConfig, level: int): int =
+  ## Returns the restart interval for a specific level.
+  if config.restartIntervals.len > level:
+    return config.restartIntervals[level]
+  elif config.restartIntervals.len > 0:
+    return config.restartIntervals[^1]
+  else:
+    return DefaultRestartInterval
+
+# Get compression type for a level
+proc getCompressionType*(config: LsmTreeConfig,
+    level: int): storage_types.CompressionType =
+  ## Returns the compression type for a specific level.
+  if config.compressionTypes.len > level:
+    return config.compressionTypes[level]
+  elif config.compressionTypes.len > 0:
+    return config.compressionTypes[^1]
+  else:
+    return storage_types.ctNone
+
+# Get bloom filter FPR for a level
+proc getBloomFpr*(config: LsmTreeConfig, level: int): float64 =
+  ## Returns the bloom filter false positive rate for a specific level.
+  ## Returns 0.0 if bloom filter is disabled for this level.
+  if config.bloomFpr.len > level:
+    return config.bloomFpr[level]
+  elif config.bloomFpr.len > 0:
+    return config.bloomFpr[^1]
+  else:
+    return DefaultBloomFpr
+
+# Get bloom filter bits per key for a level
+proc getBloomBitsPerKey*(config: LsmTreeConfig, level: int): float64 =
+  ## Returns bloom filter bits per key for a specific level.
+  ## Returns 0.0 if not configured (will use FPR instead).
+  if config.bloomBitsPerKey.len > level:
+    return config.bloomBitsPerKey[level]
+  elif config.bloomBitsPerKey.len > 0:
+    return config.bloomBitsPerKey[^1]
+  else:
+    return 0.0
+
+# Check if bloom filter is enabled for a level
+proc isBloomFilterEnabled*(config: LsmTreeConfig, level: int): bool =
+  ## Returns true if bloom filter is enabled for this level.
+  let fpr = config.getBloomFpr(level)
+  let bitsPerKey = config.getBloomBitsPerKey(level)
+  return fpr > 0.0 or bitsPerKey > 0.0
+
+# Blob resolution helper - resolves vtIndirection values
+proc resolveBlobValue*(serializedHandle: string,
+                       blobPath: string,
+                       cache: var blob_reader_module.BlobReaderCache): Option[string] =
+  ## Resolves a blob indirection by reading from the blob file.
+  ## Returns the actual value, or none if resolution fails.
+  try:
+    let handle = blob_writer_module.deserializeHandle(serializedHandle)
+    let result = blob_reader_module.readValue(cache, handle, blobPath)
+    if result.isOk:
+      return some(result.value)
+  except:
+    discard
+  return none(string)
 
 # Create default configuration
 proc newConfig*(path: string): LsmTreeConfig =
+  # Initialize per-level defaults for 7 levels
+  var blockSizes: seq[uint32] = @[]
+  var restartIntervals: seq[int] = @[]
+  var compressionTypes: seq[CompressionType] = @[]
+  var bloomFpr: seq[float64] = @[]
+  var bloomBitsPerKey: seq[float64] = @[]
+
+  for i in 0 ..< DefaultLevelCount:
+    blockSizes.add(uint32(DefaultBlockSize))
+    restartIntervals.add(DefaultRestartInterval)
+    compressionTypes.add(ctNone)
+    bloomFpr.add(DefaultBloomFpr)
+    bloomBitsPerKey.add(0.0)
+
+  # Disable bloom filter for last level (optimization)
+  bloomFpr[^1] = 0.0
+
   LsmTreeConfig(
     path: path,
     levelCount: DefaultLevelCount,
     maxMemtableSize: DefaultMaxMemtableSize,
     blockSize: DefaultBlockSize,
+    blockSizes: blockSizes,
+    restartIntervals: restartIntervals,
     cacheCapacity: 256 * 1024 * 1024, # 256 MiB
-    compactionStrategy: defaultLeveled()
+    compactionStrategy: defaultLeveled(),
+    compressionTypes: compressionTypes,
+    bloomFpr: bloomFpr,
+    bloomBitsPerKey: bloomBitsPerKey
   )
 
 # Create configuration with custom compaction strategy
 proc newConfigWithStrategy*(path: string,
                             strategy: CompactionStrategy): LsmTreeConfig =
+  result = newConfig(path)
+  result.compactionStrategy = strategy
+
+# Create configuration from CreateOptions
+proc newConfigFromOptions*(path: string, opts: CreateOptions): LsmTreeConfig =
+  ## Creates an LsmTreeConfig from CreateOptions with per-level settings.
+
+  var blockSizes: seq[uint32] = @[]
+  var restartIntervals: seq[int] = @[]
+  var compressionTypes: seq[storage_types.CompressionType] = @[]
+  var bloomFpr: seq[float64] = @[]
+  var bloomBitsPerKey: seq[float64] = @[]
+
+  let levelCount = int(opts.levelCount)
+
+  for level in 0 ..< levelCount:
+    # Block size
+    if level < opts.dataBlockSizePolicy.sizes.len:
+      blockSizes.add(opts.dataBlockSizePolicy.sizes[level])
+    elif blockSizes.len > 0:
+      blockSizes.add(blockSizes[^1])
+    else:
+      blockSizes.add(uint32(DefaultBlockSize))
+
+    # Restart interval
+    if level < opts.dataBlockRestartIntervalPolicy.intervals.len:
+      restartIntervals.add(opts.dataBlockRestartIntervalPolicy.intervals[level])
+    elif restartIntervals.len > 0:
+      restartIntervals.add(restartIntervals[^1])
+    else:
+      restartIntervals.add(DefaultRestartInterval)
+
+    # Compression
+    if level < opts.dataBlockCompressionPolicy.compressionTypes.len:
+      compressionTypes.add(opts.dataBlockCompressionPolicy.compressionTypes[level])
+    elif compressionTypes.len > 0:
+      compressionTypes.add(compressionTypes[^1])
+    else:
+      compressionTypes.add(storage_types.ctNone)
+
+    # Bloom filter
+    if level < opts.filterPolicy.entries.len:
+      let entry = opts.filterPolicy.entries[level]
+      if entry.kind == fpeBloom:
+        case entry.bloomPolicy.kind
+        of bcpFalsePositiveRate:
+          bloomFpr.add(entry.bloomPolicy.falsePositiveRate)
+          bloomBitsPerKey.add(0.0)
+        of bcpBitsPerKey:
+          bloomFpr.add(0.0)
+          bloomBitsPerKey.add(entry.bloomPolicy.bitsPerKey)
+    else:
+      bloomFpr.add(DefaultBloomFpr)
+      bloomBitsPerKey.add(0.0)
+
+  # Disable bloom filter for last level if expectPointReadHits is true
+  if opts.expectPointReadHits and bloomFpr.len > 0:
+    bloomFpr[^1] = 0.0
+    bloomBitsPerKey[^1] = 0.0
+
+  # Get default block size from first level or default
+  let defaultBlockSize = if blockSizes.len > 0: int(blockSizes[
+      0]) else: DefaultBlockSize
+
   LsmTreeConfig(
     path: path,
-    levelCount: DefaultLevelCount,
-    maxMemtableSize: DefaultMaxMemtableSize,
-    blockSize: DefaultBlockSize,
+    levelCount: levelCount,
+    maxMemtableSize: opts.maxMemtableSize,
+    blockSize: defaultBlockSize,
+    blockSizes: blockSizes,
+    restartIntervals: restartIntervals,
     cacheCapacity: 256 * 1024 * 1024,
-    compactionStrategy: strategy
+    compactionStrategy: opts.compactionStrategy,
+    compressionTypes: compressionTypes,
+    bloomFpr: bloomFpr,
+    bloomBitsPerKey: bloomBitsPerKey,
+    kvSeparationOpts: opts.kvSeparationOpts
   )
 
 # Create a new LSM tree
@@ -189,11 +363,18 @@ proc removeWeak*(tree: LsmTree, key: string, seqno: uint64): ItemSizeResult =
 
 # Get a value by key
 proc get*(tree: LsmTree, key: string, seqno: uint64): Option[string] =
+  ## Get a value by key, resolving blob indirections if KV separation is enabled.
+
   # Update metrics (atomic, before lock)
   incReads(tree.counters)
 
   tree.versionLock.acquire()
   defer: tree.versionLock.release()
+
+  # Check if blob resolution is needed
+  let needsBlobResolution = tree.config.kvSeparationOpts.isSome
+  var blobCache: blob_reader_module.BlobReaderCache = nil
+  let blobPath = tree.config.path / "blobs"
 
   # Check active memtable first
   let memtableEntry = tree.activeMemtable.get(key)
@@ -206,8 +387,12 @@ proc get*(tree: LsmTree, key: string, seqno: uint64): Option[string] =
       of vtTombstone, vtWeakTombstone:
         return none(string)
       of vtIndirection:
-        # In a full implementation, this would resolve the indirection
-        return some(entry.value)
+        if needsBlobResolution:
+          if blobCache == nil:
+            blobCache = blob_reader_module.newBlobReaderCache()
+          return resolveBlobValue(entry.value, blobPath, blobCache)
+        else:
+          return some(entry.value)
 
   # Check sealed memtables
   for memtable in tree.sealedMemtables:
@@ -221,20 +406,39 @@ proc get*(tree: LsmTree, key: string, seqno: uint64): Option[string] =
         of vtTombstone, vtWeakTombstone:
           return none(string)
         of vtIndirection:
-          return some(e.value)
+          if needsBlobResolution:
+            if blobCache == nil:
+              blobCache = blob_reader_module.newBlobReaderCache()
+            return resolveBlobValue(e.value, blobPath, blobCache)
+          else:
+            return some(e.value)
 
   # Check SSTables (from newest to oldest, level 0 first)
-  # Level 0 tables are not sorted, need to check all
   for table in tree.tables[0]:
     if table.path.len > 0:
-      # Open and search the SSTable with block cache
       let readerResult = openSsTable(table.path, table.id, tree.blockCache)
       if readerResult.isOk:
         let reader = readerResult.value
-        let value = reader.get(key)
-        reader.close()
-        if value.isSome:
-          return value
+
+        if needsBlobResolution:
+          let entry = reader.getEntry(key)
+          reader.close()
+          if entry.found:
+            let vt = cast[ValueType](entry.valueType)
+            case vt
+            of vtValue:
+              return some(entry.value)
+            of vtTombstone, vtWeakTombstone:
+              return none(string)
+            of vtIndirection:
+              if blobCache == nil:
+                blobCache = blob_reader_module.newBlobReaderCache()
+              return resolveBlobValue(entry.value, blobPath, blobCache)
+        else:
+          let value = reader.get(key)
+          reader.close()
+          if value.isSome:
+            return value
 
   # Check other levels (sorted, can use binary search)
   for level in 1 ..< tree.tables.len:
@@ -243,10 +447,26 @@ proc get*(tree: LsmTree, key: string, seqno: uint64): Option[string] =
         let readerResult = openSsTable(table.path, table.id, tree.blockCache)
         if readerResult.isOk:
           let reader = readerResult.value
-          let value = reader.get(key)
-          reader.close()
-          if value.isSome:
-            return value
+
+          if needsBlobResolution:
+            let entry = reader.getEntry(key)
+            reader.close()
+            if entry.found:
+              let vt = cast[ValueType](entry.valueType)
+              case vt
+              of vtValue:
+                return some(entry.value)
+              of vtTombstone, vtWeakTombstone:
+                return none(string)
+              of vtIndirection:
+                if blobCache == nil:
+                  blobCache = blob_reader_module.newBlobReaderCache()
+                return resolveBlobValue(entry.value, blobPath, blobCache)
+          else:
+            let value = reader.get(key)
+            reader.close()
+            if value.isSome:
+              return value
 
   return none(string)
 

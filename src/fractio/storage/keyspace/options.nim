@@ -15,7 +15,7 @@ type
 # Configuration policies (simplified versions)
 type
   BlockSizePolicy* = object
-    size*: uint32
+    sizes*: seq[uint32] ## Block size per level (empty = use default)
 
   BloomConstructionPolicyKind* = enum
     bcpFalsePositiveRate
@@ -108,7 +108,7 @@ proc defaultCreateOptions*(): CreateOptions =
     manualJournalPersist: false,
     maxMemtableSize: 64 * 1024 * 1024, # 64 MiB
     dataBlockHashRatioPolicy: HashRatioPolicy(ratio: 0.0),
-    dataBlockSizePolicy: BlockSizePolicy(size: 4 * 1024), # 4 KiB
+    dataBlockSizePolicy: BlockSizePolicy(sizes: @[4096'u32]), # 4 KiB default for all levels
     dataBlockRestartIntervalPolicy: RestartIntervalPolicy(intervals: @[10, 16]),
     indexBlockRestartIntervalPolicy: RestartIntervalPolicy(intervals: @[1]),
     indexBlockPinningPolicy: PinningPolicy(pinned: @[true, true, false]),
@@ -229,3 +229,15 @@ proc dataBlockSizePolicy*(options: CreateOptions,
   var result = options
   result.dataBlockSizePolicy = policy
   return result
+
+# Helper to create a BlockSizePolicy with a single size for all levels
+proc uniformBlockSize*(size: uint32): BlockSizePolicy =
+  BlockSizePolicy(sizes: @[size])
+
+# Helper to create per-level block sizes
+proc perLevelBlockSizes*(sizes: varargs[uint32]): BlockSizePolicy =
+  BlockSizePolicy(sizes: @sizes)
+
+# Helper to create per-level compression
+proc perLevelCompression*(types: varargs[CompressionType]): CompressionPolicy =
+  CompressionPolicy(compressionTypes: @types)

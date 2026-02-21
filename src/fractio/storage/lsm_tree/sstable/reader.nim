@@ -395,6 +395,67 @@ proc close*(reader: SsTableReader) =
     reader.stream.close()
     reader.stream = nil
 
+# Result type for get operations that include value type
+type
+  SsTableGetResult* = object
+    value*: string
+    valueType*: uint8 # Raw value type byte (cast to ValueType when needed)
+    seqno*: uint64
+    found*: bool
+
+proc getEntry*(reader: SsTableReader, key: string): SsTableGetResult =
+  ## Get a value and its metadata from the SSTable.
+  ## Returns the value, value type, and sequence number.
+  result = SsTableGetResult(found: false)
+
+  # Check bloom filter first for quick rejection
+  if reader.bloomFilter != nil:
+    if not reader.bloomFilter.mayContain(key):
+      return
+
+  var handle: BlockHandle
+  var found = false
+
+  # Find the data block that might contain the key
+  for entry in reader.indexBlock.entries:
+    if entry.key >= key:
+      handle = entry.handle
+      found = true
+      break
+    handle = entry.handle
+    found = true
+
+  if not found:
+    return
+
+  # Use cached read if block cache is available
+  let blockResult = if reader.blockCache != nil:
+    reader.readDataBlockWithCache(handle)
+  else:
+    readDataBlock(reader.stream, handle)
+
+  if blockResult.isErr:
+    return
+
+  let dataBlk = blockResult.value
+  var lo = 0
+  var hi = dataBlk.entries.len - 1
+
+  while lo <= hi:
+    let mid = (lo + hi) div 2
+    let entry = dataBlk.entries[mid]
+
+    if entry.key == key:
+      result.value = entry.value
+      result.valueType = entry.valueType # Keep as uint8
+      result.seqno = entry.seqno
+      result.found = true
+      return
+    elif entry.key < key:
+      lo = mid + 1
+    else:
+      hi = mid - 1
+
 proc get*(reader: SsTableReader, key: string): Option[string] =
   # Check bloom filter first for quick rejection
   if reader.bloomFilter != nil:

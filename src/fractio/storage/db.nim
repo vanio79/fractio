@@ -781,3 +781,130 @@ proc commit*(db: Database, wb: batch_module.WriteBatch): StorageResult[void] =
           item.keyspace.inner.requestRotationCb(item.keyspace.inner.id)
 
   return okVoid
+
+# ============================================================================
+# Transaction Support
+# ============================================================================
+
+import fractio/storage/tx as tx_module
+
+type
+  WriteTransaction* = tx_module.WriteTransaction
+
+proc beginTx*(db: Database): tx_module.WriteTransaction =
+  ## Begins a new write transaction.
+  ##
+  ## Transactions provide:
+  ## - Atomicity: All writes succeed or none do
+  ## - Isolation: Read-your-own-writes (RYOW) semantics
+  ## - Consistency: Snapshot-based reads
+  ##
+  ## Only one write transaction can be active at a time (single-writer).
+  ## This call will block if another transaction is active.
+  ##
+  ## Example:
+  ##   var tx = db.beginTx()
+  ##   txInsert(tx, ks, "key1", "value1")
+  ##   txInsert(tx, ks, "key2", "value2")
+  ##   if db.commitTx(tx).isOk:
+  ##     echo "Transaction committed"
+  ##   else:
+  ##     db.rollbackTx(tx)
+  let snapshotSeqno = db.visibleSeqno()
+  return tx_module.newWriteTransaction(snapshotSeqno)
+
+proc beginTx*(db: Database, durability: Option[
+    PersistMode]): tx_module.WriteTransaction =
+  ## Begins a new write transaction with the specified durability mode.
+  let snapshotSeqno = db.visibleSeqno()
+  var tx = tx_module.newWriteTransaction(snapshotSeqno)
+  tx.durability = durability
+  return tx
+
+proc commitTx*(db: Database, tx: var tx_module.WriteTransaction): StorageResult[void] =
+  ## Commits a write transaction.
+  ##
+  ## All changes made in the transaction are applied atomically.
+  ## After commit, the transaction is no longer active.
+  ##
+  ## Returns an error if:
+  ## - The transaction is not active
+  ## - Any keyspace was deleted
+  ## - The database is poisoned
+  if not tx.isActive:
+    return err[void, StorageError](StorageError(
+      kind: seStorage,
+      storageError: "Transaction is not active"
+    ))
+
+  # Check if database is poisoned
+  if db.inner.isPoisoned.load(moRelaxed):
+    return err[void, StorageError](StorageError(kind: sePoisoned))
+
+  # Build keyspaces table for commit
+  var keyspaces: Table[string, ks.Keyspace]
+  db.inner.keyspacesLock.acquire()
+  for name, keyspace in db.inner.keyspaces:
+    keyspaces[name] = keyspace
+  db.inner.keyspacesLock.release()
+
+  # Commit the transaction
+  let result = tx.commit(keyspaces)
+
+  return result
+
+proc rollbackTx*(db: Database, tx: var tx_module.WriteTransaction) =
+  ## Rolls back a write transaction.
+  ##
+  ## All changes made in the transaction are discarded.
+  ## After rollback, the transaction is no longer active.
+  tx.rollback()
+
+proc txInsert*(tx: var WriteTransaction, keyspace: ks.Keyspace,
+               key: string, value: string): StorageResult[void] =
+  ## Inserts a key-value pair into the transaction.
+  tx_module.txInsert(tx, keyspace, key, value)
+
+proc txRemove*(tx: var WriteTransaction, keyspace: ks.Keyspace,
+               key: string): StorageResult[void] =
+  ## Removes a key from the transaction (inserts a tombstone).
+  tx_module.txRemove(tx, keyspace, key)
+
+proc txRemoveWeak*(tx: var WriteTransaction, keyspace: ks.Keyspace,
+                   key: string): StorageResult[void] =
+  ## Removes a key from the transaction (inserts a weak tombstone).
+  tx_module.txRemoveWeak(tx, keyspace, key)
+
+proc txGet*(tx: var WriteTransaction, keyspace: ks.Keyspace,
+            key: string): StorageResult[Option[string]] =
+  ## Gets a value, checking uncommitted writes first (RYOW).
+  tx_module.txGet(tx, keyspace, key)
+
+proc txContainsKey*(tx: var WriteTransaction, keyspace: ks.Keyspace,
+                    key: string): StorageResult[bool] =
+  ## Checks if a key exists, checking uncommitted writes first.
+  tx_module.txContainsKey(tx, keyspace, key)
+
+proc txSizeOf*(tx: var WriteTransaction, keyspace: ks.Keyspace,
+               key: string): StorageResult[Option[uint32]] =
+  ## Gets the size of a value, checking uncommitted writes first.
+  tx_module.txSizeOf(tx, keyspace, key)
+
+proc txTake*(tx: var WriteTransaction, keyspace: ks.Keyspace,
+             key: string): StorageResult[Option[string]] =
+  ## Removes a key and returns its previous value atomically.
+  tx_module.txTake(tx, keyspace, key)
+
+proc txFetchUpdate*(tx: var WriteTransaction, keyspace: ks.Keyspace,
+                    key: string,
+                    f: proc(v: Option[string]): Option[string]): StorageResult[
+                        Option[string]] =
+  ## Atomically updates a key and returns the previous value.
+  tx_module.txFetchUpdate(tx, keyspace, key, f)
+
+proc txUpdateFetch*(tx: var WriteTransaction, keyspace: ks.Keyspace,
+                    key: string,
+                    f: proc(v: Option[string]): Option[string]): StorageResult[
+                        Option[string]] =
+  ## Atomically updates a key and returns the new value.
+  tx_module.txUpdateFetch(tx, keyspace, key, f)

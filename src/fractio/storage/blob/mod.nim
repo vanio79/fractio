@@ -32,6 +32,7 @@
 import ./types
 import ./writer
 import ./reader
+import ./gc
 import fractio/storage/keyspace/options
 
 # Re-export KvSeparationOptions from keyspace options
@@ -55,3 +56,9 @@ export writer.serializeHandle, writer.deserializeHandle
 export reader.newBlobReaderCache, reader.getStream, reader.readValue
 export reader.closeAll, reader.readHeader, reader.scanBlobFile,
     reader.BlobScanEntry
+
+# Re-export GC functions
+export gc.BlobGCResult, gc.BlobGCMetrics, gc.LiveBlobRefs
+export gc.defaultBlobGCResult, gc.defaultBlobGCMetrics
+export gc.shouldGCFile, gc.newLiveBlobRefs, gc.addRef
+export gc.rewriteBlobFile, gc.gcBlobFile, gc.runBlobGC, gc.getGCStats

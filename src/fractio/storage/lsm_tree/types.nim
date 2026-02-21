@@ -11,6 +11,7 @@ import fractio/storage/lsm_tree/compaction_strategy
 import fractio/storage/lsm_tree/block_cache
 import fractio/storage/metrics
 import fractio/storage/keyspace/options
+import fractio/storage/types as storage_types
 import std/[tables, atomics, locks, options]
 
 # Re-export SequenceNumberCounter and SnapshotTracker from snapshot_tracker
@@ -27,11 +28,14 @@ export BlockCache, newBlockCache
 
 # Re-export metrics types
 export MetricCounters, newMetricCounters, incReads, incWrites, incBatches,
-       incCacheHit, incCacheMiss, getReads, getWrites, getWriteBytes,
-           getBatches,
-       getCacheHits, getCacheMisses, LsmTreeMetrics, LevelMetrics,
-           KeyspaceMetrics,
-       DatabaseMetrics, cacheHitRate, l0TableCount, l0SizeBytes
+        incCacheHit, incCacheMiss, getReads, getWrites, getWriteBytes,
+            getBatches,
+        getCacheHits, getCacheMisses, LsmTreeMetrics, LevelMetrics,
+            KeyspaceMetrics,
+        DatabaseMetrics, cacheHitRate, l0TableCount, l0SizeBytes
+
+# Re-export storage types
+export storage_types.CompressionType
 
 # Forward declarations
 type
@@ -39,25 +43,28 @@ type
     path*: string
     levelCount*: int
     maxMemtableSize*: uint64
-    blockSize*: int
+    blockSize*: int # Default block size (deprecated - use blockSizes)
+    blockSizes*: seq[uint32]                       # Block size per level (index = level)
+    restartIntervals*: seq[int]                    # Restart interval per level
     cacheCapacity*: uint64
     compactionStrategy*: CompactionStrategy
     kvSeparationOpts*: Option[KvSeparationOptions] ## Blob storage options
+    # Compression per level
+    compressionTypes*: seq[storage_types.CompressionType] # Compression type per level
+                                                   # Bloom filter per level
+    bloomFpr*: seq[float64] # Bloom filter false positive rate per level (0.0 = disabled)
+                              # Bloom filter bits per key per level (alternative to FPR)
+    bloomBitsPerKey*: seq[float64] # If non-zero, use bits per key instead of FPR
 
-# Value types for LSM tree entries
-type
-  ValueType* = enum
-    vtValue         ## Regular value
-    vtTombstone     ## Tombstone (deleted key)
-    vtWeakTombstone ## Weak tombstone (for merge operations)
-    vtIndirection   ## Blob value indirection (for KV separation)
+# Re-export ValueType from storage_types for backward compatibility
+export storage_types.ValueType
 
 # Internal key representation (key + seqno + type)
 type
   InternalKey* = object
     key*: string
     seqno*: uint64
-    valueType*: ValueType
+    valueType*: storage_types.ValueType
 
 # Compare internal keys (for sorting)
 proc `<`*(a, b: InternalKey): bool =
@@ -72,7 +79,7 @@ type
     key*: string
     value*: string
     seqno*: uint64
-    valueType*: ValueType
+    valueType*: storage_types.ValueType
 
 # Memtable ID type
 type
