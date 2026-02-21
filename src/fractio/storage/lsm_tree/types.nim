@@ -10,6 +10,7 @@ import fractio/storage/snapshot_tracker
 import fractio/storage/lsm_tree/compaction_strategy
 import fractio/storage/lsm_tree/block_cache
 import fractio/storage/metrics
+import fractio/storage/keyspace/options
 import std/[tables, atomics, locks, options]
 
 # Re-export SequenceNumberCounter and SnapshotTracker from snapshot_tracker
@@ -41,6 +42,7 @@ type
     blockSize*: int
     cacheCapacity*: uint64
     compactionStrategy*: CompactionStrategy
+    kvSeparationOpts*: Option[KvSeparationOptions] ## Blob storage options
 
 # Value types for LSM tree entries
 type

@@ -7,10 +7,14 @@
 ## A Log-Structured Merge tree for efficient key-value storage.
 
 import fractio/storage/error
+import fractio/storage/blob/types as blob_types
+import fractio/storage/blob/writer as blob_writer
+import fractio/storage/blob/reader as blob_reader
 import ./types
 import ./memtable
 import ./sstable/writer
 import ./sstable/reader
+import ./sstable/blob_integration
 import ./compaction
 import ./block_cache
 import fractio/storage/snapshot_tracker
@@ -595,6 +599,9 @@ proc maintenance*(lock: var VersionHistoryLock, path: string,
 proc flushOldestSealed*(tree: LsmTree): StorageResult[uint64] =
   ## Flush the oldest sealed memtable to disk as an SSTable.
   ## Returns the number of bytes flushed, or 0 if nothing to flush.
+  ##
+  ## If KV separation is enabled, large values are stored in blob files
+  ## and the SSTable stores BlobHandles as vtIndirection values.
 
   tree.versionLock.acquire()
   defer: tree.versionLock.release()
@@ -621,17 +628,56 @@ proc flushOldestSealed*(tree: LsmTree): StorageResult[uint64] =
       return err[uint64, StorageError](StorageError(kind: seIo,
           ioError: "Failed to create L0 directory"))
 
-  # Write memtable to SSTable
-  let writeResult = writeMemtable(sstablePath, memtable)
-  if writeResult.isErr:
-    return err[uint64, StorageError](writeResult.error)
+  # Check if KV separation is enabled
+  if tree.config.kvSeparationOpts.isSome:
+    # Use blob separation during flush
+    var blobCtx = newBlobSeparationContext(tree.config.path,
+        tree.config.kvSeparationOpts)
 
-  var sstable = writeResult.value
-  sstable.id = tableId
-  sstable.level = 0
+    let writerResult = newSsTableWriter(sstablePath, memtable.len)
+    if writerResult.isErr:
+      return err[uint64, StorageError](writerResult.error)
 
-  # Add SSTable to level 0
-  tree.tables[0].add(sstable)
+    let writer = writerResult.value
+
+    # Process each entry, separating large values to blob files
+    for entry in memtable.getSortedEntries():
+      let processResult = blobCtx.processEntry(entry)
+      if processResult.isErr:
+        return err[uint64, StorageError](processResult.error)
+
+      let (key, value, valueType, seqno) = processResult.value
+      let addResult = writer.add(key, value, seqno, valueType)
+      if addResult.isErr:
+        return err[uint64, StorageError](addResult.error)
+
+    # Finalize blob files
+    let blobFinalizeResult = blobCtx.finalize()
+    if blobFinalizeResult.isErr:
+      return err[uint64, StorageError](blobFinalizeResult.error)
+
+    let writeResult = writer.finish()
+    if writeResult.isErr:
+      return err[uint64, StorageError](writeResult.error)
+
+    var sstable = writeResult.value
+    sstable.id = tableId
+    sstable.level = 0
+
+    # Add SSTable to level 0
+    tree.tables[0].add(sstable)
+  else:
+    # Standard flush without blob separation
+    let writeResult = writeMemtable(sstablePath, memtable)
+    if writeResult.isErr:
+      return err[uint64, StorageError](writeResult.error)
+
+    var sstable = writeResult.value
+    sstable.id = tableId
+    sstable.level = 0
+
+    # Add SSTable to level 0
+    tree.tables[0].add(sstable)
 
   # Remove flushed memtable from sealed list
   tree.sealedMemtables.delete(0)
