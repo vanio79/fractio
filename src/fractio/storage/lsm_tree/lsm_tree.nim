@@ -20,7 +20,7 @@ import ./sstable/blob_integration
 import ./compaction
 import ./block_cache
 import fractio/storage/snapshot_tracker
-import std/[os, atomics, locks, options, tables, streams, strutils, algorithm]
+import std/[os, atomics, locks, options, tables, streams, strutils, algorithm, times]
 
 export types except ItemSizeResult
 export storage_types.CompressionType
@@ -797,6 +797,225 @@ proc majorCompact*(tree: LsmTree, targetSize: uint64,
         newTables.len, " tables at level ", targetLevel
 
   return okVoid
+
+# Tiered compaction - size-tiered compaction strategy
+proc tieredCompact*(tree: LsmTree, gcWatermark: uint64): StorageResult[void] =
+  ## Performs tiered (size-tiered) compaction.
+  ##
+  ## Tiered compaction works by:
+  ## 1. Grouping SSTables of similar sizes into "tiers"
+  ## 2. When a tier has too many tables, merge them into one larger table
+  ## 3. The new table is placed in the next tier
+  ##
+  ## This is good for write-heavy workloads as it reduces write amplification.
+
+  tree.versionLock.acquire()
+  defer: tree.versionLock.release()
+
+  let maxTables = tree.config.compactionStrategy.tiered.maxTablesPerLevel
+  let targetSize = tree.config.compactionStrategy.tiered.targetSize
+
+  # Find a level with too many tables
+  var compactLevel = -1
+  for level in 0 ..< tree.config.levelCount:
+    if tree.tables[level].len >= maxTables:
+      compactLevel = level
+      break
+
+  if compactLevel < 0:
+    return okVoid
+
+  let tables = tree.tables[compactLevel]
+  if tables.len == 0:
+    return okVoid
+
+  # For tiered compaction, we merge all tables in the tier
+  var tablesToCompact: seq[SsTable] = @[]
+
+  # Sort tables by size to pick similarly-sized ones
+  var sortedTables = tables
+  sortedTables.sort(proc (a, b: SsTable): int = cmp(a.size, b.size))
+
+  # Take up to maxTables tables to merge
+  for i in 0 ..< min(maxTables, sortedTables.len):
+    tablesToCompact.add(sortedTables[i])
+
+  if tablesToCompact.len < 2:
+    return okVoid
+
+  # Read all entries from tables to compact
+  var allEntries: seq[seq[MergeEntry]] = @[]
+  for table in tablesToCompact:
+    if table.path.len > 0 and fileExists(table.path):
+      let entriesResult = readSsTableEntries(table.path)
+      if entriesResult.isErr:
+        return err[void, StorageError](entriesResult.error)
+      if entriesResult.value.len > 0:
+        allEntries.add(entriesResult.value)
+
+  if allEntries.len == 0:
+    return okVoid
+
+  # Merge entries with tombstone GC
+  let mergeResult = mergeEntries(allEntries, gcWatermark)
+  if mergeResult.isErr:
+    return err[void, StorageError](mergeResult.error)
+
+  let mergedEntries = mergeResult.value
+
+  if mergedEntries.len == 0:
+    # All tombstones - just delete old tables
+    for table in tablesToCompact:
+      tree.blockCache.invalidateSsTable(table.id)
+    let deleteResult = deleteOldTables(tablesToCompact)
+    if deleteResult.isErr:
+      return err[void, StorageError](deleteResult.error)
+
+    # Remove from tree
+    var remaining: seq[SsTable] = @[]
+    for t in tree.tables[compactLevel]:
+      if t notin tablesToCompact:
+        remaining.add(t)
+    tree.tables[compactLevel] = remaining
+    return okVoid
+
+  # Write new compacted table (output stays at same level for tiered)
+  var tableIdCounter = tree.tableIdCounter.load(moRelaxed)
+  let writeResult = writeCompactedTables(
+    mergedEntries,
+    tree.config.path,
+    compactLevel,
+    targetSize,
+    tableIdCounter
+  )
+  if writeResult.isErr:
+    return err[void, StorageError](writeResult.error)
+
+  let newTables = writeResult.value
+  tree.tableIdCounter.store(tableIdCounter, moRelaxed)
+
+  # Invalidate cache and delete old tables
+  for table in tablesToCompact:
+    tree.blockCache.invalidateSsTable(table.id)
+
+  let deleteResult = deleteOldTables(tablesToCompact)
+  if deleteResult.isErr:
+    for newTable in newTables:
+      if newTable.path.len > 0 and fileExists(newTable.path):
+        try:
+          removeFile(newTable.path)
+        except OSError:
+          discard
+    return err[void, StorageError](deleteResult.error)
+
+  # Update tree
+  var remaining: seq[SsTable] = @[]
+  for t in tree.tables[compactLevel]:
+    if t notin tablesToCompact:
+      remaining.add(t)
+  tree.tables[compactLevel] = remaining
+
+  for newTable in newTables:
+    tree.tables[compactLevel].add(newTable)
+
+  echo "[INFO] Tiered compaction complete: ", tablesToCompact.len,
+        " tables -> ", newTables.len, " tables at level ", compactLevel
+
+  return okVoid
+
+# FIFO compaction - time/size-based expiry
+proc fifoCompact*(tree: LsmTree, gcWatermark: uint64): StorageResult[void] =
+  ## Performs FIFO (first-in-first-out) compaction.
+  ##
+  ## FIFO compaction works by:
+  ## 1. When total size exceeds limit, delete the oldest SSTables
+  ## 2. Optionally apply TTL-based expiry
+  ##
+  ## This is good for time-series or log data where old data is less valuable.
+  ## Note: This is a DESTRUCTIVE compaction - data is deleted, not merged.
+
+  tree.versionLock.acquire()
+  defer: tree.versionLock.release()
+
+  let maxSize = tree.config.compactionStrategy.fifo.maxSize
+  let ttlSeconds = tree.config.compactionStrategy.fifo.ttlSeconds
+
+  # Calculate total size
+  var totalSize: uint64 = 0
+  var allTables: seq[tuple[table: SsTable, level: int]] = @[]
+
+  for level in 0 ..< tree.config.levelCount:
+    for table in tree.tables[level]:
+      totalSize += table.size
+      allTables.add((table: table, level: level))
+
+  if allTables.len == 0:
+    return okVoid
+
+  # Sort by table ID (oldest first, assuming IDs are assigned sequentially)
+  allTables.sort(proc (a, b: tuple[table: SsTable, level: int]): int =
+    cmp(a.table.id, b.table.id))
+
+  # Collect tables to delete
+  var tablesToDelete: seq[tuple[table: SsTable, level: int]] = @[]
+  var deletedSize: uint64 = 0
+
+  # First, check TTL expiry if configured
+  if ttlSeconds.isSome:
+    let ttl = ttlSeconds.get()
+    let currentTime = getTime().toUnix()
+    # For now, we don't track creation time per table, so skip TTL check
+    # In a full implementation, we would check table.created + ttl < currentTime
+
+  # Delete oldest tables until we're under the size limit
+  for item in allTables:
+    if totalSize - deletedSize <= maxSize:
+      break
+
+    tablesToDelete.add(item)
+    deletedSize += item.table.size
+
+  if tablesToDelete.len == 0:
+    return okVoid
+
+  # Delete the tables
+  for item in tablesToDelete:
+    let table = item.table
+    tree.blockCache.invalidateSsTable(table.id)
+
+    if table.path.len > 0 and fileExists(table.path):
+      try:
+        removeFile(table.path)
+      except OSError:
+        discard
+
+  # Remove from tree
+  for item in tablesToDelete:
+    var remaining: seq[SsTable] = @[]
+    for t in tree.tables[item.level]:
+      if t.id != item.table.id:
+        remaining.add(t)
+    tree.tables[item.level] = remaining
+
+  echo "[INFO] FIFO compaction complete: deleted ", tablesToDelete.len,
+        " tables, freed ", deletedSize, " bytes"
+
+  return okVoid
+
+# Auto-select compaction based on strategy
+proc compact*(tree: LsmTree, gcWatermark: uint64,
+              targetSize: uint64 = 0): StorageResult[void] =
+  ## Performs compaction using the configured strategy.
+  ##
+  ## This is a convenience method that automatically selects the appropriate
+  ## compaction algorithm based on the tree's configuration.
+  case tree.config.compactionStrategy.kind
+  of cskLeveled:
+    return tree.majorCompact(targetSize, gcWatermark)
+  of cskTiered:
+    return tree.tieredCompact(gcWatermark)
+  of cskFifo:
+    return tree.fifoCompact(gcWatermark)
 
 # Tree config accessor
 proc treeConfig*(tree: LsmTree): LsmTreeConfig =

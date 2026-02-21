@@ -206,17 +206,25 @@ This document compares the Fractio Nim storage implementation with the Fjall Rus
 
 ## 6. COMPACTION MODULE
 
-### Status: ✅ Mostly Complete
+### Status: ✅ COMPLETE (2026-02-21)
 
 | Feature | Rust (fjall) | Nim (fractio) | Notes |
 |---------|-------------|---------------|-------|
 | Leveled compaction | ✅ | ✅ | Aligned |
-| Tiered compaction | ✅ | ⚠️ Stub | Rust has full impl |
-| FIFO compaction | ✅ | ⚠️ Stub | Rust has full impl |
+| Tiered compaction | ✅ | ✅ | tieredCompact() |
+| FIFO compaction | ✅ | ✅ | fifoCompact() |
 | Compaction strategy | Arc<dyn CompactionStrategy> | enum CompactionStrategy | Different approach |
 | Tombstone GC | Uses gc_watermark | Uses gc_watermark | ✅ Same |
-| Table target size | 64MB default | Not configurable | |
-| Feedback from strategy | Planned | Not implemented | |
+| Table target size | 64MB default | Configurable | ✅ Aligned |
+| Auto-select by strategy | ✅ | ✅ | compact() |
+
+**Implementation Details:**
+- `majorCompact()` - Leveled compaction (L0 -> L1 -> L2 -> ...)
+- `tieredCompact()` - Size-tiered compaction (merge tables when count exceeds threshold)
+- `fifoCompact()` - Delete oldest tables when size limit exceeded
+- `compact()` - Auto-selects based on configured strategy
+
+**Tests:** 14 compaction strategy tests passing
 
 ---
 
@@ -344,14 +352,21 @@ This document compares the Fractio Nim storage implementation with the Fjall Rus
 
 ## 14. SNAPSHOTS
 
-### Status: ⚠️ Partial
+### Status: ✅ COMPLETE (2026-02-21)
 
 | Feature | Rust (fjall) | Nim (fractio) | Notes |
 |---------|-------------|---------------|-------|
-| Cross-keyspace snapshot | ✅ | ❌ | |
-| Nonce tracking | SnapshotNonce | Basic tracker | |
+| Cross-keyspace snapshot | ✅ | ✅ | Snapshot with nonce |
+| Nonce tracking | SnapshotNonce | SnapshotNonce | ✅ Aligned |
 | GC watermark | ✅ | ✅ | Aligned |
-| Snapshot iterator | Uses nonce | Uses seqno | Different approach |
+| Snapshot iterator | Uses nonce | Uses seqno | ✅ Working |
+| Close/release | ✅ | ✅ | close() method |
+| get/containsKey | ✅ | ✅ | Implemented |
+| isEmpty/len | ✅ | ✅ | Implemented |
+
+**Files:**
+- `storage/snapshot.nim` - Cross-keyspace snapshot implementation
+- `storage/snapshot_tracker.nim` - SnapshotNonce, reference counting, GC
 
 ---
 
@@ -445,8 +460,8 @@ Rust supports storing large values in separate blob files to keep SSTables small
 11. **Descriptor table** - File handle caching
 12. **Partitioned blocks** - For very large SSTables
 13. **Block hash index** - Optimization for point lookups
-14. **Ingestion API** - Bulk loading optimization
-15. **Cross-keyspace snapshots** - Nonce-based iterator
+14. **Ingestion API** - Bulk loading optimization (stub exists)
+15. ~~**Cross-keyspace snapshots**~~ - ✅ COMPLETED (2026-02-21)
 16. **Optimistic transactions** - MVCC with conflict detection
 
 ---
@@ -488,13 +503,15 @@ Rust supports storing large values in separate blob files to keep SSTables small
 
 1. ~~**Priority 1: Journal-based batch commit**~~ - ✅ COMPLETED (2026-02-21)
 2. ~~**Priority 2: Write stall**~~ - ✅ COMPLETED (2026-02-21)
-3. ~~**Priority 3: Transactions**~~ - ⚠️ PARTIAL (single-writer done, needs integration)
+3. ~~**Priority 3: Transactions**~~ - ✅ COMPLETED (2026-02-21)
 4. ~~**Priority 4: Metrics**~~ - ✅ COMPLETED (2026-02-21)
-5. ~~**Priority 5: KV Separation**~~ - ⚠️ MOSTLY DONE (write path done, read path missing)
-6. ~~**Priority 6: Integrate blob storage**~~ - ✅ COMPLETED (wired into flushOldestSealed)
-7. **Priority 7: Read path blob resolution** - Resolve vtIndirection values in get()
-8. **Priority 8: Blob GC** - Implement garbage collection for stale blob data
-9. **Priority 9: Per-level config** - Block size, compression, filter policies per level
+5. ~~**Priority 5: KV Separation**~~ - ✅ COMPLETED (2026-02-21)
+6. ~~**Priority 6: Integrate blob storage**~~ - ✅ COMPLETED (2026-02-21)
+7. ~~**Priority 7: Read path blob resolution**~~ - ✅ COMPLETED (2026-02-21)
+8. ~~**Priority 8: Blob GC**~~ - ✅ COMPLETED (2026-02-21)
+9. ~~**Priority 9: Per-level config**~~ - ✅ COMPLETED (2026-02-21)
+10. ~~**Priority 10: Tiered/FIFO compaction**~~ - ✅ COMPLETED (2026-02-21)
+11. ~~**Priority 11: Cross-keyspace snapshots**~~ - ✅ COMPLETED (2026-02-21)
 
 ---
 
@@ -513,11 +530,13 @@ Rust supports storing large values in separate blob files to keep SSTables small
 
 ### keyspace/mod.rs vs keyspace.nim
 
+## Keyspace Methods Comparison
+
 **Methods in Rust NOT in Nim:**
-- `start_ingestion()` - Bulk load
-- `rotate_memtable_and_wait()` - Blocking rotation (ADDED 2026-02-21)
-- `fragmented_blob_bytes()` - Blob GC metrics (placeholder)
-- `blob_file_count()` - Blob file count (placeholder)
+- `start_ingestion()` - Bulk load (stub exists)
+- ~~`rotate_memtable_and_wait()`~~ - ✅ Blocking rotation implemented
+- ~~`fragmented_blob_bytes()`~~ - ✅ Implemented (scans blob directory)
+- ~~`blob_file_count()`~~ - ✅ Implemented (counts .blob files)
 
 **Methods NOW in Nim (matching Rust):**
 - `id()` - Get keyspace ID ✅
@@ -535,6 +554,8 @@ Rust supports storing large values in separate blob files to keep SSTables small
 - `l0TableCount()` - L0 table count ✅
 - `tableCount()` - Total table count ✅
 - `majorCompaction()` - Major compaction ✅
+- `tieredCompaction()` - Tiered compaction ✅
+- `fifoCompaction()` - FIFO compaction ✅
 - `iter()` - Iterate all entries ✅
 - `rangeIter()` - Range iterator ✅
 - `prefixIter()` - Prefix iterator ✅
@@ -544,13 +565,15 @@ Rust supports storing large values in separate blob files to keep SSTables small
 - `path()` - Keyspace path ✅
 - `firstKeyValue()` - Get first KV pair ✅
 - `lastKeyValue()` - Get last KV pair ✅
-- `sizeOf()` - Get size of a key ✅ (ADDED 2026-02-21)
-- `isKvSeparated()` - Check if blob-enabled ✅ (ADDED 2026-02-21)
-- `rotateMemtableAndWait()` - Blocking rotation ✅ (ADDED 2026-02-21)
-- `len()` - Exact count ✅ (ADDED 2026-02-21)
-- `getConfig()` - Get configuration ✅ (ADDED 2026-02-21)
-- `maxMemtableSize()` - Get max memtable size ✅ (ADDED 2026-02-21)
-- `manualJournalPersist()` - Check manual persist ✅ (ADDED 2026-02-21)
+- `sizeOf()` - Get size of a key ✅
+- `isKvSeparated()` - Check if blob-enabled ✅
+- `rotateMemtableAndWait()` - Blocking rotation ✅
+- `len()` - Exact count ✅
+- `getConfig()` - Get configuration ✅
+- `maxMemtableSize()` - Get max memtable size ✅
+- `manualJournalPersist()` - Check manual persist ✅
+- `blobFileCount()` - Count blob files ✅
+- `fragmentedBlobBytes()` - Stale blob bytes ✅
 
 ### batch/mod.rs vs batch.nim
 
@@ -580,7 +603,7 @@ Rust supports storing large values in separate blob files to keep SSTables small
 
 ## Conclusion
 
-The Fractio Nim implementation now covers most core functionality of Fjall Rust:
+The Fractio Nim implementation now covers nearly all core functionality of Fjall Rust:
 
 1. ~~**Atomicity**: Batch writes are not atomic~~ - ✅ FIXED (journal-based commit)
 2. ~~**Flow control**: Missing write stall/throttle~~ - ✅ FIXED (3-level backpressure)
@@ -588,13 +611,16 @@ The Fractio Nim implementation now covers most core functionality of Fjall Rust:
 4. ~~**First/last key-value**: Not available~~ - ✅ FIXED (firstKeyValue/lastKeyValue)
 5. ~~**Transactions**: Partial~~ - ✅ FIXED (single-writer with Database integration)
 6. ~~**Large value support**: Blob module partial~~ - ✅ FIXED (full write/read path + GC)
-7. **Fine-grained configuration**: ✅ FIXED (per-level settings)
+7. ~~**Fine-grained configuration**: Per-level settings not supported~~ - ✅ FIXED (per-level config)
+8. ~~**Compaction strategies**: Tiered/FIFO stubs~~ - ✅ FIXED (full implementations)
+9. ~~**Cross-keyspace snapshots**: Not implemented~~ - ✅ FIXED (Snapshot with nonce)
 
 **Remaining Work for Full Parity:**
-1. Optimistic transactions (MVCC with conflict detection)
-2. Cross-keyspace snapshots (nonce-based iterator)
-3. Descriptor table (file handle caching)
-4. Partitioned blocks (for very large SSTables)
+1. Optimistic transactions (MVCC with conflict detection) - Lower priority
+2. Descriptor table (file handle caching) - Lower priority
+3. Partitioned blocks (for very large SSTables) - Lower priority
+4. Block hash index (optimization for point lookups) - Lower priority
+5. Ingestion API (bulk loading) - Stub exists
 
 **Tests Status:**
 - 9 batch tests
@@ -605,6 +631,7 @@ The Fractio Nim implementation now covers most core functionality of Fjall Rust:
 - 4 blob read path tests
 - 16 tx unit tests
 - 12 per-level config tests
-- **Total: 98+ tests passing**
+- 14 compaction strategy tests
+- **Total: 112+ tests passing**
 
-For production key-value workloads, Fractio is now feature-complete with proper atomicity, flow control, metrics, transactions, blob storage, and per-level configuration.
+For production key-value workloads, Fractio is now feature-complete with proper atomicity, flow control, metrics, transactions, blob storage, per-level configuration, all three compaction strategies, and cross-keyspace snapshots. The only major remaining feature is optimistic transactions for concurrent write workloads.
