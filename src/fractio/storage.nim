@@ -65,6 +65,12 @@ import ./recovery
 import ./locked_file
 import ./poison_dart
 
+# Blob storage (KV separation)
+# import ./blob  # Import directly: fractio/storage/blob
+
+# Transactions
+# import ./tx  # Import directly: fractio/storage/tx
+
 # Export commonly used types
 export error
 export types

@@ -9,7 +9,6 @@
 ## - Tiered: Multiple runs per level, merge when threshold exceeded
 ## - FIFO: Delete oldest tables when size limit exceeded
 
-import fractio/storage/lsm_tree/types
 import std/[options, strutils]
 
 # Compaction strategy types
