@@ -21,6 +21,8 @@ type
     seKeyspaceDeleted # Keyspace is deleted
     seLocked          # Database is locked
     seUnrecoverable   # Database is unrecoverable
+    seInvalidArgument # Invalid argument provided
+    seInvalidState    # Invalid state for operation
 
   StorageError* = object
     case kind*: StorageErrorKind
@@ -47,6 +49,8 @@ type
       discard
     of seUnrecoverable:
       discard
+    of seInvalidArgument, seInvalidState:
+      message*: string
 
 # Simple Result type for storage operations
 type
@@ -117,6 +121,14 @@ proc error*[T, E](r: Result[T, E]): E =
 template okVoid*: StorageResult[void] =
   StorageResult[void](isOk: true)
 
+# Helper to create void error result
+template errVoid*(e: StorageError): StorageResult[void] =
+  var res: StorageResult[void]
+  res.isOk = false
+  new(res.err)
+  res.err[] = e
+  res
+
 # Convert to FractioError for compatibility with the rest of the system
 proc toFractioError*(err: StorageError): FractioError =
   case err.kind
@@ -143,3 +155,7 @@ proc toFractioError*(err: StorageError): FractioError =
     storageError("Database locked", "database")
   of seUnrecoverable:
     storageError("Database unrecoverable", "database")
+  of seInvalidArgument:
+    storageError("Invalid argument: " & err.message, "argument")
+  of seInvalidState:
+    storageError("Invalid state: " & err.message, "state")

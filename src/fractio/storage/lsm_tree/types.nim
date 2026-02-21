@@ -16,7 +16,7 @@ import std/[tables, atomics, locks, options]
 
 # Re-export SequenceNumberCounter and SnapshotTracker from snapshot_tracker
 export SequenceNumberCounter, SnapshotTracker, newSequenceNumberCounter,
-       newSnapshotTracker, fetchMax
+       newSnapshotTracker, fetchMax, next
 
 # Re-export compaction strategy types
 export CompactionStrategy, CompactionStrategyKind, defaultLeveled, defaultTiered,
