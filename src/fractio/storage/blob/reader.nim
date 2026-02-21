@@ -8,9 +8,9 @@
 
 import ./types
 import ./writer
-import fractio/storage/[types, error]
-import fractio/storage/lsm_tree/[types as lsm_types, compression]
-import std/[os, streams, strutils, tables, locks]
+import ../error
+import ../lsm_tree/compression as lsm_compression
+import std/[os, streams, tables, locks]
 
 # Blob file reader cache (simple LRU-like cache)
 type
@@ -100,7 +100,7 @@ proc readValue*(cache: BlobReaderCache, handle: BlobHandle,
 
   # Decompress if needed
   if compressed:
-    value = decompress(value, ctZlib)
+    value = lsm_compression.decompress(value, lsm_compression.ctZlib)
 
   return ok[string, StorageError](value)
 

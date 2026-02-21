@@ -6,7 +6,7 @@
 ##
 ## Types for KV separation - storing large values in separate blob files.
 
-import std/[atomics, locks, options, tables, times]
+import std/[atomics, locks, tables, times]
 
 # Blob file header magic
 const BLOB_MAGIC* = "FJBLOB01"

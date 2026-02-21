@@ -7,9 +7,9 @@
 ## Writes blob files containing large values that are separated from SSTables.
 
 import ./types
-import fractio/storage/[types, error]
-import fractio/storage/lsm_tree/[types as lsm_types, compression]
-import std/[os, streams, strutils]
+import ../error
+import ../lsm_tree/compression as lsm_compression
+import std/[os, streams]
 
 # Create a new blob writer
 proc newBlobWriter*(path: string, fileId: BlobFileId,
@@ -33,7 +33,7 @@ proc writeHeader*(writer: BlobWriter, stream: FileStream): StorageResult[void] =
 # Write a blob entry and return its handle
 proc writeEntry*(writer: BlobWriter, stream: FileStream, key: string,
                  value: string, seqno: uint64,
-                     compress: bool = false): StorageResult[BlobHandle] =
+                 compress: bool = false): StorageResult[BlobHandle] =
   ## Writes a blob entry to the stream.
   ## Returns a BlobHandle that can be used to read the value later.
 
@@ -45,7 +45,7 @@ proc writeEntry*(writer: BlobWriter, stream: FileStream, key: string,
   var compressedSize = 0'u32
 
   if compress and value.len > 64: # Only compress if value is reasonably large
-    let compressedData = compress(value, ctZlib)
+    let compressedData = lsm_compression.compress(value, lsm_compression.ctZlib)
     if compressedData.len < value.len:
       valueToWrite = compressedData
       compressed = true
@@ -106,7 +106,7 @@ proc readEntry*(stream: FileStream, handle: BlobHandle): StorageResult[string] =
   let keyLen = stream.readUInt32()
   let valueLen = stream.readUInt32()
   let seqno = stream.readUInt64()
-  let compressed = stream.readUInt8() == 1
+  let isCompressed = stream.readUInt8() == 1
   discard stream.readUInt8() # Reserved
   discard stream.readUInt8() # Reserved
   discard stream.readUInt8() # Reserved
@@ -115,18 +115,19 @@ proc readEntry*(stream: FileStream, handle: BlobHandle): StorageResult[string] =
   stream.setPosition(stream.getPosition() + int(keyLen))
 
   # Read value
-  let actualValueLen = if compressed: handle.compressedSize else: handle.size
+  let actualValueLen = if isCompressed: handle.compressedSize else: handle.size
   var value = stream.readStr(int(actualValueLen))
 
   # Decompress if needed
-  if compressed:
-    value = decompress(value, ctZlib)
+  if isCompressed:
+    value = lsm_compression.decompress(value, lsm_compression.ctZlib)
 
   return ok[string, StorageError](value)
 
 # Create a blob file path
 proc blobFilePath*(basePath: string, fileId: BlobFileId): string =
   ## Returns the path for a blob file.
+  ## The path includes the "blobs" subdirectory.
   basePath / "blobs" / ($fileId & ".blob")
 
 # Serialize blob handle for storage in SSTable
