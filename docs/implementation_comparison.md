@@ -511,19 +511,43 @@ Rust supports storing large values in separate blob files to keep SSTables small
 ### keyspace/mod.rs vs keyspace.nim
 
 **Methods in Rust NOT in Nim:**
-- `fragmented_blob_bytes()` - Blob GC metrics
 - `start_ingestion()` - Bulk load
-- `metrics()` - LSM tree metrics (gated by feature flag)
-- `path()` - Get keyspace path
-- `size_of()` - Get size of a key
-- `first_key_value()` - Get first KV pair
-- `last_key_value()` - Get last KV pair
-- `is_kv_separated()` - Check if blob-enabled
-- `rotate_memtable_and_wait()` - Blocking rotation
+- `rotate_memtable_and_wait()` - Blocking rotation (ADDED 2026-02-21)
+- `fragmented_blob_bytes()` - Blob GC metrics (placeholder)
+- `blob_file_count()` - Blob file count (placeholder)
 
 **Methods NOW in Nim (matching Rust):**
+- `id()` - Get keyspace ID ✅
+- `name()` - Get keyspace name ✅
+- `clear()` - Clear keyspace ✅
+- `diskSpace()` - Disk space used ✅
+- `approximateLen()` - Approximate length ✅
+- `isEmpty()` - Check if empty ✅
+- `containsKey()` - Check if key exists ✅
+- `get()` - Get value ✅
+- `insert()` - Insert key-value ✅
+- `remove()` - Remove key (tombstone) ✅
+- `removeWeak()` - Weak remove ✅
+- `rotateMemtable()` - Rotate memtable ✅
+- `l0TableCount()` - L0 table count ✅
+- `tableCount()` - Total table count ✅
+- `majorCompaction()` - Major compaction ✅
+- `iter()` - Iterate all entries ✅
+- `rangeIter()` - Range iterator ✅
+- `prefixIter()` - Prefix iterator ✅
 - `checkWriteHalt()` - Write stall check ✅
 - `localBackpressure()` - Per-keyspace flow control ✅
+- `metrics()` - LSM tree metrics ✅
+- `path()` - Keyspace path ✅
+- `firstKeyValue()` - Get first KV pair ✅
+- `lastKeyValue()` - Get last KV pair ✅
+- `sizeOf()` - Get size of a key ✅ (ADDED 2026-02-21)
+- `isKvSeparated()` - Check if blob-enabled ✅ (ADDED 2026-02-21)
+- `rotateMemtableAndWait()` - Blocking rotation ✅ (ADDED 2026-02-21)
+- `len()` - Exact count ✅ (ADDED 2026-02-21)
+- `getConfig()` - Get configuration ✅ (ADDED 2026-02-21)
+- `maxMemtableSize()` - Get max memtable size ✅ (ADDED 2026-02-21)
+- `manualJournalPersist()` - Check manual persist ✅ (ADDED 2026-02-21)
 
 ### batch/mod.rs vs batch.nim
 
