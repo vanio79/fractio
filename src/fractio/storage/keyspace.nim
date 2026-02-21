@@ -576,3 +576,134 @@ proc prefixIter*(keyspace: Keyspace, prefixStr: string): KeyspaceIter =
       break
 
   result.sortEntries()
+
+# ============================================================================
+# Additional Keyspace Methods (matching Rust fjall API)
+# ============================================================================
+
+# Get size of a value
+proc sizeOf*(keyspace: Keyspace, key: string): StorageResult[Option[uint32]] =
+  ## Returns the size of a value in bytes, or None if the key doesn't exist.
+  let seqno = keyspace.inner.supervisor.inner.seqno.get()
+
+  # Check memtables first
+  let activeEntry = keyspace.inner.tree.activeMemtable.get(key)
+  if activeEntry.isSome:
+    let e = activeEntry.get
+    if e.seqno <= seqno:
+      if e.valueType == vtTombstone or e.valueType == vtWeakTombstone:
+        return ok[Option[uint32], StorageError](none(uint32))
+      return ok[Option[uint32], StorageError](some(uint32(e.value.len)))
+
+  # Check sealed memtables
+  for memtable in keyspace.inner.tree.sealedMemtables:
+    let entry = memtable.get(key)
+    if entry.isSome:
+      let e = entry.get
+      if e.seqno <= seqno:
+        if e.valueType == vtTombstone or e.valueType == vtWeakTombstone:
+          return ok[Option[uint32], StorageError](none(uint32))
+        return ok[Option[uint32], StorageError](some(uint32(e.value.len)))
+
+  # For now, return the value from get() and compute size
+  # A more efficient implementation would read directly from SSTables
+  let valueResult = keyspace.get(key)
+  if valueResult.isErr:
+    return err[Option[uint32], StorageError](valueResult.err[])
+
+  if valueResult.value.isSome:
+    return ok[Option[uint32], StorageError](some(uint32(
+        valueResult.value.get.len)))
+
+  return ok[Option[uint32], StorageError](none(uint32))
+
+# Check if KV separation is enabled
+proc isKvSeparated*(keyspace: Keyspace): bool =
+  ## Returns true if KV separation (blob storage) is enabled for this keyspace.
+  keyspace.inner.config.kvSeparationOpts.isSome
+
+# Get blob file count (placeholder - would need BlobManager integration)
+proc blobFileCount*(keyspace: Keyspace): int =
+  ## Returns the number of blob files for this keyspace.
+  ## Returns 0 if KV separation is not enabled.
+  if not keyspace.isKvSeparated():
+    return 0
+  # TODO: Integrate with BlobManager
+  return 0
+
+# Get fragmented blob bytes (placeholder - would need BlobManager integration)
+proc fragmentedBlobBytes*(keyspace: Keyspace): uint64 =
+  ## Returns the total bytes of stale/fragmented data in blob files.
+  ## Returns 0 if KV separation is not enabled.
+  if not keyspace.isKvSeparated():
+    return 0
+  # TODO: Integrate with BlobManager
+  return 0
+
+# Rotate memtable and wait for flush to complete
+proc rotateMemtableAndWait*(keyspace: Keyspace,
+    timeoutMs: int = 30000): StorageResult[bool] =
+  ## Rotates the memtable and waits for the flush to complete.
+  ##
+  ## Parameters:
+  ##   timeoutMs: Maximum time to wait in milliseconds (default 30 seconds)
+  ##
+  ## Returns:
+  ##   true if rotation occurred and flush completed
+  ##   false if no rotation was needed (memtable was empty)
+  ##
+  ## Raises StorageError if:
+  ##   - Keyspace is deleted
+  ##   - Timeout exceeded
+  ##   - Flush failed
+
+  if keyspace.inner.isDeleted.load(moRelaxed):
+    return err[bool, StorageError](StorageError(kind: seKeyspaceDeleted))
+
+  # Try to rotate
+  let rotated = keyspace.inner.tree.rotateMemtable()
+  if rotated.isNone:
+    return ok[bool, StorageError](false)
+
+  let startSealedCount = keyspace.inner.tree.sealedMemtableCount()
+
+  # Wait for sealed memtable to be flushed
+  var elapsed = 0
+  while keyspace.inner.tree.sealedMemtableCount() >= startSealedCount:
+    if elapsed >= timeoutMs:
+      return err[bool, StorageError](StorageError(kind: seIo,
+          ioError: "Timeout waiting for memtable flush"))
+    sleep(10)
+    elapsed += 10
+
+  return ok[bool, StorageError](true)
+
+# Get len (exact count, scans all data)
+proc len*(keyspace: Keyspace): StorageResult[int] =
+  ## Returns the exact number of items in the keyspace.
+  ## This is an O(n) operation that scans all data.
+  ##
+  ## For an approximate count, use approximateLen() instead.
+  var count = 0
+
+  let iter = keyspace.iter()
+  for entry in iter.entries:
+    if entry.valueType == vtValue:
+      count += 1
+
+  return ok[int, StorageError](count)
+
+# Get keyspace configuration
+proc getConfig*(keyspace: Keyspace): CreateOptions =
+  ## Returns a copy of the keyspace configuration.
+  keyspace.inner.config
+
+# Get max memtable size
+proc maxMemtableSize*(keyspace: Keyspace): uint64 =
+  ## Returns the configured maximum memtable size.
+  keyspace.inner.config.maxMemtableSize
+
+# Check if manual journal persist is enabled
+proc manualJournalPersist*(keyspace: Keyspace): bool =
+  ## Returns true if manual journal persist is enabled.
+  keyspace.inner.config.manualJournalPersist
