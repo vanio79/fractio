@@ -17,7 +17,7 @@ import fractio/storage/keyspace/name
 import fractio/storage/keyspace/options as ksopts
 import fractio/storage/lsm_tree/[types as lsm_types]
 import fractio/storage/lsm_tree/lsm_tree
-import fractio/storage/journal/writer # For PersistMode
+import fractio/storage/journal/writer # For PersistMode, BatchItem
 import std/[os, atomics, locks, tables, times, options, sequtils, streams, strutils]
 
 const KEYSPACE_META_FILE* = "keyspaces.meta"
@@ -637,46 +637,111 @@ proc batch*(db: Database): batch_module.WriteBatch =
   result = batch_module.newWriteBatch(cast[batch_module.Database](db))
 
 proc commit*(db: Database, wb: batch_module.WriteBatch): StorageResult[void] =
-  ## Commits a write batch to the database.
+  ## Commits a write batch to the database atomically.
   ##
-  ## This applies all operations in the batch to the appropriate keyspaces.
-  ## The operations are applied in order but not atomically - each operation
-  ## is applied individually. For true atomicity, the journal would need to
-  ## be used.
+  ## The batch is first written to the journal (for durability), then applied
+  ## to memtables. If a crash occurs after journal write but before memtable
+  ## apply, recovery will replay the batch from the journal.
   ##
   ## Returns an error if any operation fails.
   if wb.isEmpty:
     return okVoid
 
-  # Apply each item to the appropriate keyspace
+  # Check poisoned flag first
+  if db.inner.isPoisoned.load(moRelaxed):
+    return err[void, StorageError](StorageError(kind: sePoisoned))
+
+  # Acquire journal lock
+  var guard = db.inner.supervisor.inner.journal.getWriter()
+
+  # Check poisoned flag again after acquiring lock (TOCTOU)
+  if db.inner.isPoisoned.load(moRelaxed):
+    guard.release()
+    return err[void, StorageError](StorageError(kind: sePoisoned))
+
+  # Get a single sequence number for the entire batch
+  let batchSeqno = db.inner.supervisor.inner.seqno.next()
+
+  # Convert batch items to journal format
+  var journalItems: seq[writer.BatchItem] = @[]
+  for item in wb.data:
+    if item.keyspace == nil:
+      continue
+
+    # Check if keyspace is deleted
+    if item.keyspace.inner.isDeleted.load(moRelaxed):
+      guard.release()
+      return err[void, StorageError](StorageError(kind: seKeyspaceDeleted))
+
+    journalItems.add(writer.BatchItem(
+      keyspace: writer.BatchItemKeyspace(id: item.keyspace.inner.id),
+      key: item.key,
+      value: item.value,
+      valueType: item.valueType
+    ))
+
+  # Write entire batch to journal (atomicity guarantee)
+  let writeResult = guard.journal.writer.writeBatch(journalItems, batchSeqno)
+  if writeResult.isErr:
+    guard.release()
+    return err[void, StorageError](writeResult.error)
+
+  # Persist if durability mode is set
+  if wb.durability.isSome:
+    let persistResult = guard.persist(wb.durability.get())
+    if persistResult.isErr:
+      db.inner.isPoisoned.store(true, moRelease)
+      guard.release()
+      return err[void, StorageError](StorageError(kind: sePoisoned))
+
+  # Track batch size for write buffer management
+  var batchSize: uint64 = 0
+
+  # Apply to memtables (still holding journal lock for consistency)
   for item in wb.data:
     if item.keyspace == nil:
       continue
 
     let keyspace = item.keyspace
 
-    # Check if keyspace is deleted
-    if keyspace.inner.isDeleted.load(moRelaxed):
+    # Apply the operation with the batch seqno
+    var itemSize: uint64 = 0
+    case item.valueType
+    of vtValue:
+      let res = keyspace.inner.tree.insert(item.key, item.value, batchSeqno)
+      itemSize = res.itemSize
+    of vtTombstone:
+      let res = keyspace.inner.tree.remove(item.key, batchSeqno)
+      itemSize = res.itemSize
+    of vtWeakTombstone:
+      let res = keyspace.inner.tree.removeWeak(item.key, batchSeqno)
+      itemSize = res.itemSize
+    of vtIndirection:
+      guard.release()
       return err[void, StorageError](StorageError(
-        kind: seKeyspaceDeleted
+        kind: seStorage,
+        storageError: "Cannot apply indirection value to batch"
       ))
 
-    # Apply the operation
-    let applyResult = case item.valueType
-      of vtValue:
-        keyspace.insert(item.key, item.value)
-      of vtTombstone:
-        keyspace.remove(item.key)
-      of vtWeakTombstone:
-        keyspace.removeWeak(item.key)
-      of vtIndirection:
-        # Indirection values should not be in batches
-        return err[void, StorageError](StorageError(
-          kind: seStorage,
-          storageError: "Cannot apply indirection value to batch"
-        ))
+    batchSize += itemSize
 
-    if applyResult.isErr:
-      return err[void, StorageError](applyResult.error)
+  # Publish the batch seqno to snapshot tracker
+  db.inner.supervisor.inner.snapshotTracker.publish(batchSeqno)
+
+  # Release journal lock
+  guard.release()
+
+  # Update write buffer size
+  discard db.inner.supervisor.inner.writeBufferSize.allocate(batchSize)
+
+  # Check for memtable rotation on affected keyspaces
+  # (This could trigger write stall in a future implementation)
+  for item in wb.data:
+    if item.keyspace != nil:
+      let memtableSize = item.keyspace.inner.tree.activeMemtableSize()
+      if memtableSize > item.keyspace.inner.config.maxMemtableSize:
+        # Request rotation through callback
+        if item.keyspace.inner.requestRotationCb != nil:
+          item.keyspace.inner.requestRotationCb(item.keyspace.inner.id)
 
   return okVoid

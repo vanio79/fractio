@@ -16,6 +16,7 @@ import fractio/storage/lsm_tree/sstable/types as sst_types
 import fractio/storage/journal/writer # For PersistMode
 import fractio/storage/keyspace/options
 import fractio/storage/keyspace/name
+import fractio/storage/keyspace/write_delay
 import std/[atomics, options, algorithm, strutils, os, locks]
 
 # Keyspace key (a.k.a. column family, locality group)
@@ -179,13 +180,44 @@ proc get*(keyspace: Keyspace, key: string): StorageResult[Option[UserValue]] =
   let value = keyspace.inner.tree.get(key, seqno)
   return ok[Option[UserValue], StorageError](value)
 
-# Check write halt
+# Check write halt - blocks until L0 count is below halt threshold
 proc checkWriteHalt*(keyspace: Keyspace) =
-  discard
+  ## Blocks the calling thread until L0 table count drops below the halt threshold.
+  ## This is used when L0 has grown too large and writes must be stopped
+  ## to allow compaction to catch up.
+  ##
+  ## Sleep duration: 10ms per iteration
+  while keyspace.inner.tree.l0RunCount() >= write_delay.HaltThreshold:
+    sleep(10)
 
-# Local backpressure
+# Local backpressure - throttles or halts writes based on L0 growth
 proc localBackpressure*(keyspace: Keyspace): bool =
-  false
+  ## Implements per-keyspace write backpressure.
+  ##
+  ## Returns true if backpressure was applied (write was throttled/halted).
+  ##
+  ## Backpressure levels:
+  ## 1. Throttle (L0 >= 20): CPU busy-wait with increasing delay
+  ## 2. Halt (L0 >= 30): Sleep until L0 drops below threshold
+  ## 3. Memtable halt (sealed >= 4): Sleep until memtables are flushed
+  var throttled = false
+
+  let l0RunCount = keyspace.inner.tree.l0RunCount()
+
+  # Level 1 & 2: L0-based backpressure
+  if l0RunCount >= write_delay.Threshold:
+    write_delay.performWriteStall(l0RunCount)
+    keyspace.checkWriteHalt()
+    throttled = true
+
+  # Level 3: Sealed memtable backpressure
+  while keyspace.inner.tree.sealedCount() >= write_delay.MaxSealedMemtables:
+    # Too many sealed memtables waiting to be flushed
+    # Halt writes until flush catches up
+    sleep(100)
+    throttled = true
+
+  return throttled
 
 # Request rotation - calls the registered callback to request background memtable rotation
 proc requestRotation*(keyspace: Keyspace) =

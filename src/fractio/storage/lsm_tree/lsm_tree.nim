@@ -640,6 +640,13 @@ proc sealedCount*(tree: LsmTree): int =
   defer: tree.versionLock.release()
   tree.sealedMemtables.len
 
+# Get active memtable size
+proc activeMemtableSize*(tree: LsmTree): uint64 =
+  ## Returns the size of the active memtable in bytes.
+  tree.versionLock.acquire()
+  defer: tree.versionLock.release()
+  tree.activeMemtable.size
+
 # Get block cache statistics
 proc blockCacheStats*(tree: LsmTree): tuple[hits, misses: uint64, hitRate: float,
                                             size: uint64, count: int] =

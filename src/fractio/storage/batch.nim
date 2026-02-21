@@ -8,14 +8,11 @@
 
 import fractio/storage/[types, batch/item]
 import fractio/storage/keyspace as ks
+import fractio/storage/journal/writer # For PersistMode
 import std/options
 
-# Persist mode for durability control
-type
-  PersistMode* = enum
-    pmBuffer   ## Buffer in memory, no sync
-    pmSyncData ## Sync data to disk
-    pmSyncAll  ## Sync data and metadata to disk
+# Re-export PersistMode from journal writer
+export writer.PersistMode
 
 # Forward declaration - actual type is in db.nim
 type

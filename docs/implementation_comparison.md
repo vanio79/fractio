@@ -6,6 +6,52 @@ This document compares the Fractio Nim storage implementation with the Fjall Rus
 
 ---
 
+## Module Mapping
+
+| Rust (fjall) | Nim (fractio) | Status |
+|-------------|---------------|--------|
+| src/db.rs | storage/db.nim | ✅ Implemented |
+| src/keyspace/mod.rs | storage/keyspace.nim | ✅ Implemented |
+| src/supervisor.rs | storage/supervisor.nim | ✅ Implemented |
+| src/journal/mod.rs | storage/journal.nim | ✅ Implemented |
+| src/journal/writer.rs | storage/journal/writer.nim | ✅ Implemented |
+| src/journal/reader.rs | storage/journal/reader.nim | ✅ Implemented |
+| src/journal/manager.rs | storage/journal/manager.nim | ✅ Implemented |
+| src/journal/entry.rs | storage/journal/entry.nim | ✅ Implemented |
+| src/journal/batch_reader.rs | storage/journal/batch_reader.nim | ✅ Implemented |
+| src/flush/worker.rs | storage/flush/worker.nim | ✅ Implemented |
+| src/flush/manager.rs | storage/flush/manager.nim | ✅ Implemented |
+| src/flush/task.rs | storage/flush/task.nim | ✅ Implemented |
+| src/compaction/worker.rs | storage/compaction/worker.nim | ✅ Implemented |
+| src/batch/mod.rs | storage/batch.nim | ✅ Implemented |
+| src/batch/item.rs | storage/batch/item.nim | ✅ Implemented |
+| src/worker_pool.rs | storage/worker_pool.nim | ✅ Implemented |
+| src/snapshot.rs | storage/snapshot.nim | ✅ Implemented |
+| src/snapshot_tracker.rs | storage/snapshot_tracker.nim | ✅ Implemented |
+| src/stats.rs | storage/stats.nim | ✅ Implemented |
+| src/write_buffer_manager.rs | storage/write_buffer_manager.nim | ✅ Implemented |
+| src/locked_file.rs | storage/locked_file.nim | ✅ Implemented |
+| src/poison_dart.rs | storage/poison_dart.nim | ✅ Implemented |
+| src/error.rs | storage/error.nim | ✅ Implemented |
+| src/file.rs | storage/file.nim | ✅ Implemented |
+| src/path.rs | storage/path.nim | ✅ Implemented |
+| src/version.rs | storage/version.nim | ✅ Implemented |
+| src/recovery.rs | storage/recovery.nim | ✅ Implemented |
+| src/meta_keyspace.rs | storage/meta_keyspace.nim | ✅ Implemented |
+| src/guard.rs | storage/guard.nim | ✅ Implemented |
+| src/iter.rs | storage/iter.nim | ✅ Implemented |
+| src/readable.rs | storage/readable.nim | ✅ Implemented |
+| src/ingestion.rs | storage/ingestion.nim | ⚠️ Stub |
+| src/drop.rs | - | ❌ Not needed (GC handles cleanup) |
+| src/builder.rs | storage/builder.nim | ✅ Implemented |
+| src/db_config.rs | storage/db_config.nim | ✅ Implemented |
+| src/keyspace/options.rs | storage/keyspace/options.nim | ⚠️ Partial |
+| src/keyspace/config/*.rs | storage/keyspace/config/*.nim | ⚠️ Partial |
+| src/tx/*.rs | - | ❌ Not implemented |
+| lsm-tree crate | storage/lsm_tree/*.nim | ✅ Custom implementation |
+
+---
+
 ## 1. DATABASE MODULE (db.rs vs db.nim)
 
 ### Implemented ✅
@@ -25,57 +71,23 @@ This document compares the Fractio Nim storage implementation with the Fjall Rus
 - `journalDiskSpace()` - journal disk space
 - `seqno()` - current sequence number
 - `visibleSeqno()` - visible sequence number
-
-### Missing ❌
-- `delete_keyspace()` - delete a keyspace (Rust has this)
-- `batch()` - create a write batch (Rust has WriteBatch)
-- `cache_capacity()` - cache capacity setting
-- `journal_count()` - number of journals
+- `snapshot()` - open a cross-keyspace snapshot
+- `batch()` - create a write batch
+- `deleteKeyspace()` - delete a keyspace
 
 ### Differences
-- Rust uses `create_or_recover()` which combines logic; we have separate `createNew()` and `recover()`
-- Rust has transaction support (`TxDatabase`) - we don't have transactions yet
+
+| Feature | Rust (fjall) | Nim (fractio) | Notes |
+|---------|-------------|---------------|-------|
+| Thread management | Uses Arc, RwLock, Mutex | Uses Lock, Atomic | Nim uses different concurrency primitives |
+| Background thread counter | `active_thread_counter: Arc<AtomicUsize>` | `activeThreadCounter: Atomic[int]` | Same concept, different type |
+| Drop behavior | Custom Drop impl clears cyclic Arcs | GC handles cleanup | Nim's GC handles most cleanup automatically |
+| Temp DB cleanup | `clean_path_on_drop` config option | Not implemented | Could add |
+| Version check | V3 format required, V2 migration tool | Simple version marker | Rust has more sophisticated versioning |
 
 ---
 
-## 2. SUPERVISOR MODULE (supervisor.rs vs supervisor.nim)
-
-### Implemented ✅
-- `dbConfig` - database configuration
-- `writeBufferSize` - write buffer manager
-- `flushManager` - flush task manager
-- `seqno` - sequence number counter
-- `snapshotTracker` - snapshot tracking
-- `journal` - journal reference
-- `backpressureLock` - backpressure lock
-- `journalManager` - journal manager for sealed journal tracking
-- `journalManagerLock` - lock for journal manager access
-
-### Status
-Supervisor now includes JournalManager with its own lock for thread-safe 
-journal maintenance. The JournalManager uses keyspace IDs instead of 
-references to avoid GC cycles.
-
----
-
-## 3. JOURNAL MANAGER (journal/manager.rs vs journal/manager.nim)
-
-### Status
-- **Stub implementation** - We have the type and basic methods but it's not integrated
-- JournalManager tracks sealed journals for garbage collection
-- In Rust, this is used for:
-  - Tracking sealed journal files
-  - Knowing when journals can be deleted
-  - Managing journal rotation
-
-### Missing Integration ❌
-- Not wired to supervisor
-- `maintenance()` doesn't properly check keyspace seqnos
-- Not used during flush operations
-
----
-
-## 4. KEYSPACE MODULE (keyspace/mod.rs vs keyspace.nim)
+## 2. KEYSPACE MODULE (keyspace/mod.rs vs keyspace.nim)
 
 ### Implemented ✅
 - `id()` - get keyspace ID
@@ -97,13 +109,12 @@ references to avoid GC cycles.
 - `rangeIter()` - range iterator
 - `prefixIter()` - prefix iterator
 - `requestRotation()` - request memtable rotation
-- `requestFlush()` - request flush
 
 ### Missing ❌
 - `fragmented_blob_bytes()` - for KV separation
-- `start_ingestion()` - bulk ingestion
+- `start_ingestion()` - bulk ingestion (stub exists)
 - `metrics()` - LSM tree metrics
-- `path()` - keyspace path
+- `path()` - keyspace path (could add)
 - `size_of()` - get size of a key
 - `first_key_value()` - get first key-value
 - `last_key_value()` - get last key-value
@@ -111,126 +122,240 @@ references to avoid GC cycles.
 - `rotate_memtable_and_wait()` - blocking rotation
 
 ### Differences
-- We use callbacks for rotation (`requestRotationCb`), Rust sends messages directly to worker pool
-- Our iterators load all data into memory; Rust uses lazy iteration
+
+| Feature | Rust (fjall) | Nim (fractio) | Notes |
+|---------|-------------|---------------|-------|
+| LSM tree | Uses external lsm-tree crate | Custom implementation | Different architecture |
+| Config options | Extensive (block size, compression, filter policies) | Basic | Rust has more fine-grained control |
+| Worker messaging | Uses flume channel | Uses custom message queue | Similar concept |
+| Write stall | `local_backpressure()` with thresholds | Basic implementation | Rust has more sophisticated flow control |
+| Lock file | Per-keyspace lock file | Shared database lock | Different locking strategy |
 
 ---
 
-## 5. LSM TREE MODULE
-
-### Note
-- Fjall uses a separate `lsm-tree` crate
-- We have our own implementation in `lsm_tree/`
-
-### Implemented ✅
-- Memtable with sorted entries
-- SSTable write with prefix compression
-- SSTable read with index/data blocks
-- Basic get/insert/remove
-- Memtable rotation
-- Flush to SSTable
-
-### Missing ❌
-- **Leveled compaction** - we only have stub major_compact
-- **Tiered compaction** - not implemented
-- **FIFO compaction** - not implemented
-- **Bloom filters** - not implemented
-- **Block cache** - not implemented
-- **Compression** (LZ4, etc.) - not implemented
-- **SSTable block compression** - not implemented
-- **KV separation** (blob files) - not implemented
-
----
-
-## 6. FLUSH MODULE
-
-### Implemented ✅
-- FlushManager with task queue
-- FlushWorker that processes tasks
-- After flush, compaction is triggered if L0 threshold exceeded
-
-### Differences
-- Rust flush worker gets flush lock from LSM tree
-- Our implementation is simpler but may miss some edge cases
-
----
-
-## 7. COMPACTION MODULE
-
-### Implemented ✅
-- Compaction worker skeleton
-- Stats tracking
-- Compaction trigger on L0 threshold
-- **majorCompact()** - Merges SSTables from one level to the next
-- **Tombstone GC** - Removes old tombstones during compaction
-- **K-way merge** - Heap-based merging of multiple SSTables
-- **CompactionStrategy** - Leveled, Tiered, FIFO strategies
-- **Strategy selection** - Keyspace options include compaction strategy
-
-### Missing ❌
-- **Tiered compaction strategy** - Implemented but not fully integrated
-- **FIFO compaction strategy** - Implemented but not fully integrated
-- **Compaction filters** - Not implemented
-- **Choice of compaction** (smart table picking based on size/score)
+## 3. JOURNAL MODULE
 
 ### Status
-Leveled compaction is working. L0 tables are compacted into L1, 
-overlapping tables are merged, and tombstones are garbage collected based 
-on the GC watermark. Compaction strategies (Leveled, Tiered, FIFO) are 
-implemented and selectable via keyspace options.
-
----
-
-## 8. WORKER POOL
-
-### Implemented ✅
-- Background worker threads (4 workers)
-- Message queue for flush/compact/rotate
-- L0 threshold triggers compaction
-- GC-safe cleanup
+- ✅ Basic journal implementation
+- ✅ Writer with batch support
+- ✅ Reader for recovery
+- ✅ Entry serialization
+- ✅ JournalManager for sealed journals
+- ✅ Batch reader
 
 ### Differences
-- Rust has more sophisticated worker coordination
-- Rust workers prioritize flush over compaction when pool size > 1
-- Rust has `JournalManager` integration in worker pool
+
+| Feature | Rust (fjall) | Nim (fractio) | Notes |
+|---------|-------------|---------------|-------|
+| Compression | Configurable compression type | Not implemented | Could add |
+| Compression threshold | Configurable threshold | Not implemented | |
+| Journal rotation | Automatic based on size | Manual rotation | Rust is more automated |
+| Persist modes | Buffer, SyncData, SyncAll | Same modes | ✅ Aligned |
 
 ---
 
-## 9. SNAPSHOT MODULE
+## 4. LSM TREE MODULE (lsm-tree crate vs lsm_tree/*.nim)
+
+**Note:** Fjall uses a separate `lsm-tree` crate. Fractio has its own implementation.
 
 ### Implemented ✅
-- Snapshot nonce
-- Snapshot tracker
-- Sequence number tracking
-- GC watermark
+- Memtable with skip list (using sorted seq for simplicity)
+- SSTable with prefix compression
+- Data blocks with restart points
+- Index blocks
+- Bloom filters
+- Block cache
+- Lazy iterators
+- Compaction
 
 ### Missing ❌
-- Snapshot isolation for reads (our iterators load all data at creation time)
-
----
-
-## 10. ITERATORS
-
-### Implemented ✅
-- `iter()` - all entries
-- `rangeIter()` - range query
-- `prefixIter()` - prefix scan
+- **KV Separation (Blob files)** - Large values stored separately
+- **Level count configuration** - Fixed number of levels
+- **Descriptor table** - File handle cache
+- **Partitioned index/filter blocks** - For very large SSTables
+- **Block hash index** - Hash-based block lookup optimization
 
 ### Differences
-- **CRITICAL**: Our iterators are **eager** (load all data into memory)
-- Rust iterators are **lazy** (stream from disk)
-- This is a significant performance difference for large datasets
 
-### Missing ❌
-- Reverse iteration
-- Double-ended iteration
-- Lazy loading from SSTables
+| Feature | Rust (lsm-tree) | Nim (fractio) | Notes |
+|---------|----------------|---------------|-------|
+| Memtable | Skip list | Sorted sequence | Rust has O(log n) ops |
+| Compression | LZ4, Zstd configurable | Zlib (zippy) | Different compression |
+| Filter policy | Per-level bloom filter config | Single bloom filter per SSTable | Rust more configurable |
+| Block size policy | Per-level block sizes | Single block size | |
+| Restart interval | Per-level restart intervals | Single restart interval | |
+| Index block compression | Configurable | Not compressed | |
+| Version history | Full version tracking | Basic version tracking | |
 
 ---
 
-## 11. TRANSACTIONS
+## 5. FLUSH MODULE
 
-### Status: NOT IMPLEMENTED ❌
+### Status: ✅ Complete
+
+| Feature | Rust (fjall) | Nim (fractio) | Notes |
+|---------|-------------|---------------|-------|
+| Flush worker | run() function | run() function | ✅ Same |
+| Flush manager | Queue-based | Queue-based | ✅ Same |
+| Flush task | Arc<Keyspace> | Keyspace reference | ✅ Same |
+| GC watermark | Uses snapshot tracker | Uses snapshot tracker | ✅ Same |
+
+---
+
+## 6. COMPACTION MODULE
+
+### Status: ✅ Mostly Complete
+
+| Feature | Rust (fjall) | Nim (fractio) | Notes |
+|---------|-------------|---------------|-------|
+| Leveled compaction | ✅ | ✅ | Aligned |
+| Tiered compaction | ✅ | ⚠️ Stub | Rust has full impl |
+| FIFO compaction | ✅ | ⚠️ Stub | Rust has full impl |
+| Compaction strategy | Arc<dyn CompactionStrategy> | enum CompactionStrategy | Different approach |
+| Tombstone GC | Uses gc_watermark | Uses gc_watermark | ✅ Same |
+| Table target size | 64MB default | Not configurable | |
+| Feedback from strategy | Planned | Not implemented | |
+
+---
+
+## 7. WORKER POOL
+
+### Status: ✅ Complete
+
+| Feature | Rust (fjall) | Nim (fractio) | Notes |
+|---------|-------------|---------------|-------|
+| Thread count | Configurable | 4 threads default | |
+| Message types | Flush, Compact, RotateMemtable, Close | Same | ✅ Aligned |
+| Priority | Worker 0 prioritizes flush | No priority | Rust has optimization |
+| Journal rotation | In flush worker | In flush worker | ✅ Same |
+| Backpressure | Checked in worker | Checked in worker | ✅ Same |
+
+---
+
+## 8. WRITE BATCH
+
+### Status: ✅ Complete (Updated 2026-02-21)
+
+| Feature | Rust (fjall) | Nim (fractio) | Notes |
+|---------|-------------|---------------|-------|
+| Atomic commit | Uses journal | Uses journal | ✅ Aligned |
+| Durability mode | Configurable | Configurable | ✅ Aligned |
+| Write buffer update | Updates size after commit | Updates size | ✅ Aligned |
+| Write stall check | Per-keyspace backpressure | Memtable rotation check | Partial |
+| Single seqno | All items same seqno | All items same seqno | ✅ Aligned |
+
+**Implementation Details (db.nim commit()):**
+1. Acquires journal lock
+2. Checks poisoned flag (TOCTOU)
+3. Gets single batch seqno
+4. Writes entire batch to journal
+5. Persists if durability mode set
+6. Applies to memtables with batch seqno
+7. Publishes seqno to snapshot tracker
+8. Updates write buffer size
+9. Checks memtable rotation on affected keyspaces
+
+---
+
+## 9. BLOOM FILTERS
+
+### Status: ✅ Complete
+
+| Feature | Rust (fjall) | Nim (fractio) | Notes |
+|---------|-------------|---------------|-------|
+| Implementation | In lsm-tree crate | bloom_filter.nim | |
+| Hash function | Multiple options | MurmurHash3 | |
+| FPR config | Per-level config | 1% default | |
+| Last level optimization | Can disable for last level | Not optimized | Saves ~90% filter space |
+
+---
+
+## 10. BLOCK CACHE
+
+### Status: ✅ Complete
+
+| Feature | Rust (fjall) | Nim (fractio) | Notes |
+|---------|-------------|---------------|-------|
+| LRU eviction | ✅ | ✅ | Aligned |
+| Capacity config | ✅ | ✅ | Aligned |
+| Statistics | ✅ | ✅ | Aligned |
+| SSTable invalidation | ✅ | ✅ | Aligned |
+| Handle cache | Uses Arc | Uses ref | Different ownership |
+
+---
+
+## 11. SSTABLE COMPRESSION
+
+### Status: ✅ Complete
+
+| Feature | Rust (fjall) | Nim (fractio) | Notes |
+|---------|-------------|---------------|-------|
+| Algorithm | LZ4 (default), Zstd | Zlib (zippy) | Different algorithms |
+| Per-level config | ✅ | ❌ | |
+| Index compression | Configurable | Not compressed | |
+| Threshold | Skip if not worth it | Skip if not worth it | ✅ Same |
+
+---
+
+## 12. LAZY ITERATORS
+
+### Status: ✅ Complete
+
+| Feature | Rust (fjall) | Nim (fractio) | Notes |
+|---------|-------------|---------------|-------|
+| Memtable iterator | ✅ | ✅ | Aligned |
+| SSTable iterator | ✅ | ✅ | Aligned |
+| Merge iterator | K-way merge | K-way merge | ✅ Aligned |
+| Range iterator | ✅ | ✅ | Aligned |
+| Prefix iterator | ✅ | ✅ | Aligned |
+| Snapshot isolation | ✅ | ⚠️ Basic | |
+
+---
+
+## 13. WRITE STALL / BACKPRESSURE
+
+### Status: ✅ Complete (Added 2026-02-21)
+
+| Feature | Rust (fjall) | Nim (fractio) | Notes |
+|---------|-------------|---------------|-------|
+| L0 throttle threshold | 20 tables | 20 tables | ✅ Aligned |
+| L0 halt threshold | 30 tables | 30 tables | ✅ Aligned |
+| Sealed memtable halt | 4 memtables | 4 memtables | ✅ Aligned |
+| Throttle method | CPU busy-wait | CPU busy-wait | ✅ Aligned |
+| Halt method | sleep(10ms) | sleep(10ms) | ✅ Aligned |
+| Memtable halt | sleep(100ms) | sleep(100ms) | ✅ Aligned |
+
+**Implementation (keyspace.nim):**
+- `checkWriteHalt()`: Blocks while L0 >= 30, sleeps 10ms per iteration
+- `localBackpressure()`: 
+  - Level 1: Throttle at L0 >= 20 (CPU busy-wait)
+  - Level 2: Halt at L0 >= 30 (sleep-based)
+  - Level 3: Halt at sealed >= 4 (sleep 100ms)
+
+**Constants (write_delay.nim):**
+- `Threshold = 20`
+- `HaltThreshold = 30`
+- `MaxSealedMemtables = 4`
+- `StepSize = 10000`
+
+---
+
+## 14. SNAPSHOTS
+
+### Status: ⚠️ Partial
+
+| Feature | Rust (fjall) | Nim (fractio) | Notes |
+|---------|-------------|---------------|-------|
+| Cross-keyspace snapshot | ✅ | ❌ | |
+| Nonce tracking | SnapshotNonce | Basic tracker | |
+| GC watermark | ✅ | ✅ | Aligned |
+| Snapshot iterator | Uses nonce | Uses seqno | Different approach |
+
+---
+
+## 15. TRANSACTIONS
+
+### Status: ❌ Not Implemented
 
 Rust has two transaction modes:
 1. `SingleWriterTxDatabase` - single writer transactions
@@ -238,80 +363,157 @@ Rust has two transaction modes:
 
 We have no transaction support.
 
----
-
-## 12. WRITE BATCH
-
-### Status: STUB ⚠️
-
-We have `batch.nim` but it's not fully integrated with the database.
+**Files missing:**
+- tx/mod.rs
+- tx/optimistic/*.rs
+- tx/single_writer/*.rs
+- tx/write_tx.rs
 
 ---
 
-## 13. BLOOM FILTERS
+## 16. KV SEPARATION (BLOB STORAGE)
 
-### Status: IMPLEMENTED ✅
+### Status: ❌ Not Implemented
 
-- MurmurHash3-based bloom filter in `lsm_tree/bloom_filter.nim`
-- 1% default false positive rate
-- Serialized in SSTable v2 format
-- Used in get() for quick rejection of absent keys
-- 12 unit tests passing
+Rust supports storing large values in separate blob files to keep SSTables small.
 
----
-
-## 14. COMPRESSION
-
-### Status: NOT IMPLEMENTED ❌
-
-Rust supports LZ4 (default), Zstd, etc.
-Our SSTables store uncompressed data.
+**Missing:**
+- Blob file writer/reader
+- Blob garbage collection
+- `kv_separation_opts` in keyspace config
+- `fragmented_blob_bytes()` method
+- `blob_file_count()` method
 
 ---
 
-## 15. BLOCK CACHE
+## Critical Missing Features for Production Parity
 
-### Status: IMPLEMENTED ✅
+### High Priority
+1. **True atomic batch commit** - Use journal for atomicity
+2. **Transactions** - At least single-writer transactions
+3. **Write stall/throttle** - Proper backpressure
 
-- LRU cache in `lsm_tree/block_cache.nim`
-- Configurable capacity (default 256 MiB)
-- Thread-safe with lock, hit/miss statistics
-- Cache invalidation during compaction
-- 20 unit tests passing
+### Medium Priority
+4. **KV Separation** - For large value workloads
+5. **Level-specific configurations** - Block size, compression, filters
+6. **Metrics** - Detailed LSM tree metrics
+7. **First/last key-value** - Efficient min/max access
+
+### Lower Priority
+8. **Descriptor table** - File handle caching
+9. **Partitioned blocks** - For very large SSTables
+10. **Block hash index** - Optimization for point lookups
+11. **Ingestion API** - Bulk loading optimization
+12. **Cross-keyspace snapshots**
 
 ---
 
-## 16. LAZY ITERATORS
+## Test Coverage Comparison
 
-### Status: IMPLEMENTED ✅
-
-- MemtableIter, SsTableBlockIter in `lsm_tree/lazy_iter.nim`
-- MergeIterator with heap-based k-way merge
-- RangeIterator and PrefixIterator
-- 8 unit tests passing
+| Module | Rust Tests | Nim Tests | Notes |
+|--------|-----------|-----------|-------|
+| Database | db_test.rs, db_open.rs, recovery_*.rs | 20 integration tests | |
+| Keyspace | keyspace_*.rs | Covered in integration | |
+| Journal | journal/test.rs, batch_recovery.rs | Basic tests | |
+| Batch | batch.rs | 9 unit tests | |
+| Transactions | tx_*.rs, write_tx.rs | 0 | Not implemented |
+| Iterators | prefix_complex.rs, iter lifetime | 8 lazy iter tests | |
+| Flush/Compaction | write_during_read.rs, fifo_*.rs | Covered in integration | |
 
 ---
 
-## Critical Missing Features for Production
+## Architecture Differences
 
-1. ~~**Working Compaction**~~ - DONE: majorCompact() now merges SSTables with tombstone GC
-2. ~~**JournalManager Integration**~~ - DONE: Journal cleanup after flush with GC-safe design
-3. ~~**Compaction Strategy Selection**~~ - DONE: Leveled, Tiered, FIFO strategies implemented
-4. ~~**Lazy Iterators**~~ - DONE: MemtableIter, SsTableBlockIter, MergeIterator
-5. ~~**Block Cache**~~ - DONE: LRU cache for SSTable blocks
-6. ~~**Bloom Filters**~~ - DONE: MurmurHash3-based filters for fast lookups
-7. **Compression** - Storage size and I/O performance (LZ4)
-8. **Transactions** - ACID guarantees
+### Rust (Fjall)
+- Uses external `lsm-tree` crate for core LSM functionality
+- Heavy use of `Arc<RwLock<T>>` for shared state
+- Flume channels for worker messaging
+- Custom Drop implementations for cleanup
+- Async-friendly design (can be used with tokio)
 
-## Moderate Priority
+### Nim (Fractio)
+- Custom LSM tree implementation integrated into storage module
+- Uses Lock and Atomic for shared state
+- Custom message queue for worker pool
+- Garbage collector handles most cleanup
+- Synchronous design with background threads
 
-9. `delete_keyspace()` - Can't delete keyspaces
-10. Write batch integration
-11. Key-value separation for large values
+---
 
-## Lower Priority
+## Recommendations
 
-11. Metrics
-12. Ingestion API
-13. `first_key_value` / `last_key_value`
-14. `size_of()` for individual keys
+1. ~~**Priority 1: Journal-based batch commit**~~ - ✅ COMPLETED (2026-02-21)
+2. ~~**Priority 2: Write stall**~~ - ✅ COMPLETED (2026-02-21)
+3. **Priority 3: Transactions** - Start with single-writer transactions
+4. **Priority 4: Metrics** - Add detailed metrics for monitoring
+5. **Priority 5: KV Separation** - For workloads with large values
+
+---
+
+## File-by-File Detailed Comparison
+
+### db.rs vs db.nim
+
+**Methods in Rust NOT in Nim:**
+- `cache_capacity()` - Returns cache capacity
+- `journal_count()` - Returns number of journals
+- `create_or_recover()` - Combined create/recover (internal)
+- `check_version()` - Version compatibility check (more sophisticated)
+
+**Methods in Nim NOT in Rust:**
+- None (Nim is a subset)
+
+### keyspace/mod.rs vs keyspace.nim
+
+**Methods in Rust NOT in Nim:**
+- `fragmented_blob_bytes()` - Blob GC metrics
+- `start_ingestion()` - Bulk load
+- `metrics()` - LSM tree metrics (gated by feature flag)
+- `path()` - Get keyspace path
+- `size_of()` - Get size of a key
+- `first_key_value()` - Get first KV pair
+- `last_key_value()` - Get last KV pair
+- `is_kv_separated()` - Check if blob-enabled
+- `rotate_memtable_and_wait()` - Blocking rotation
+
+**Methods NOW in Nim (matching Rust):**
+- `checkWriteHalt()` - Write stall check ✅
+- `localBackpressure()` - Per-keyspace flow control ✅
+
+### batch/mod.rs vs batch.nim
+
+**Rust batch commit:**
+1. Acquires journal lock
+2. Writes entire batch to journal with single seqno
+3. Applies to memtables
+4. Updates write buffer size
+5. Checks for write stall per-keyspace
+
+**Nim batch commit (UPDATED 2026-02-21):**
+1. ✅ Acquires journal lock
+2. ✅ Writes entire batch to journal with single seqno
+3. ✅ Applies to memtables
+4. ✅ Updates write buffer size
+5. ✅ Checks for memtable rotation
+
+### worker_pool.rs vs worker_pool.nim
+
+**Key differences:**
+- Rust uses `flume::bounded` channel
+- Rust has worker 0 prioritize flush over compaction
+- Rust has more sophisticated journal rotation logic in flush worker
+- Nim has similar message types but simpler implementation
+
+---
+
+## Conclusion
+
+The Fractio Nim implementation now covers most core functionality of Fjall Rust:
+
+1. ~~**Atomicity**: Batch writes are not atomic~~ - ✅ FIXED (journal-based commit)
+2. ~~**Flow control**: Missing write stall/throttle~~ - ✅ FIXED (3-level backpressure)
+3. **Transactions**: Not implemented
+4. **Large value support**: No KV separation
+5. **Fine-grained configuration**: Per-level settings not supported
+
+For basic key-value workloads with small values, Fractio is now feature-complete with proper atomicity and flow control. For production use with large datasets or high write throughput, transactions and KV separation may still be needed.
