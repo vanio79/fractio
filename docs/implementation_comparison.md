@@ -414,6 +414,29 @@ Rust has two transaction modes:
 - Conflict detected when: key was read, then modified by another committed transaction
 - Write to a key removes it from read set (write overrides previous reads)
 
+### Optimistic Transaction Implementation Differences
+
+| Feature | Rust (fjall) | Nim (fractio) | Impact |
+|---------|-------------|---------------|--------|
+| **Oracle pattern** | BTreeMap<u64, ConflictManager> tracks committed txns | Check current DB state at commit | Rust tracks all in-flight commits |
+| **Conflict detection** | Compares against other committed transactions | Compares against current key seqnos | Different granularity |
+| **Range read tracking** | ✅ Full support (Read::Range, Read::All) | ❌ Not implemented | Range scans don't cause conflicts in Nim |
+| **ConflictManager** | Separate type with reads + conflict_keys | Combined in ReadSetEntry | Rust more modular |
+| **Iterator conflict tracking** | mark_range() for iter/range/prefix | Not tracked | SSI not fully supported |
+| **GC of committed txns** | Automatic based on GC watermark | N/A (no transaction history) | Rust cleans up old commit info |
+
+**Missing for Full SSI (Serializable Snapshot Isolation):**
+- Range read conflict detection
+- Prefix scan conflict detection
+- Full table scan tracking (Read::All)
+- Oracle-based commit ordering
+
+**Current Nim Approach:**
+- Point-read conflict detection only
+- Compares read set against current database state
+- Works correctly for simple read-modify-write patterns
+- May miss conflicts involving range scans
+
 ---
 
 ## 16. KV SEPARATION (BLOB STORAGE)
@@ -485,7 +508,119 @@ For an SSTable with 1000 data blocks, a full index would load all 1000 entries i
 
 ---
 
-## Critical Missing Features for Production Parity
+## 18. DETAILED IMPLEMENTATION DIFFERENCES
+
+After a thorough file-by-file comparison with the Rust fjall codebase, the following implementation differences were identified:
+
+### 18.1 Database (db.rs vs db.nim)
+
+| Feature | Rust (fjall) | Nim (fractio) | Notes |
+|---------|-------------|---------------|-------|
+| `clean_path_on_drop` config | ✅ | ❌ | Temp database auto-cleanup |
+| `journal_count()` method | ✅ | ❌ | Returns number of journal files |
+| `cache_capacity()` method | ✅ | ❌ | Returns block cache capacity |
+| Version migration | V2->V3 migration tool | Simple version check | Rust has more sophisticated versioning |
+| Hash function for HashMap | xxhash (Xxh3Builder) | Default Nim hash | Different performance characteristics |
+
+### 18.2 Keyspace (keyspace/mod.rs vs keyspace.nim)
+
+| Feature | Rust (fjall) | Nim (fractio) | Notes |
+|---------|-------------|---------------|-------|
+| Per-keyspace lock file | ✅ | ❌ | Shared database lock instead |
+| Version history GC | ✅ (in maintenance()) | ❌ | Old versions may accumulate |
+| Snapshot tracker pullup | ✅ (during rotation) | ❌ | Watermark may not advance without snapshots |
+| `write_clear` journal entry | ✅ | ⚠️ May differ | Clear operation logging |
+| Keyspace deletion | Deletes folder on Drop | Marks as deleted | Different cleanup strategy |
+
+### 18.3 Journal Entry Types (journal/entry.rs vs journal/entry.nim)
+
+| Entry Type | Rust (fjall) | Nim (fractio) | Notes |
+|------------|-------------|---------------|-------|
+| Start | ✅ | ✅ | Batch start marker |
+| Item | ✅ | ✅ | Key-value entry |
+| End | ✅ | ✅ | Batch end with checksum |
+| Clear | ✅ | ❓ | Keyspace clear operation |
+
+**Note:** Need to verify if Nim implementation has Clear entry type for atomic clear operations.
+
+### 18.4 Worker Pool (worker_pool.rs vs worker_pool.nim)
+
+| Feature | Rust (fjall) | Nim (fractio) | Notes |
+|---------|-------------|---------------|-------|
+| Channel implementation | flume::bounded | Custom message queue | Different semantics |
+| Worker 0 flush priority | ✅ | ❌ | Rust prioritizes flush on worker 0 |
+| Thread coordination | Arc<AtomicUsize> counter | Atomic[int] counter | Same concept |
+
+### 18.5 Batch (batch/mod.rs vs batch.nim)
+
+| Feature | Rust (fjall) | Nim (fractio) | Notes |
+|---------|-------------|---------------|-------|
+| with_capacity() | ✅ | ❌ | Preallocate batch capacity |
+| write stall check | Per-keyspace HashSet | Memtable rotation check | Similar approach |
+| Batch size tracking | ✅ | ✅ | Both track bytes written |
+
+### 18.6 LSM Tree (lsm-tree crate vs lsm_tree/*.nim)
+
+| Feature | Rust (lsm-tree) | Nim (fractio) | Notes |
+|---------|----------------|---------------|-------|
+| Memtable implementation | Skip list | Sorted sequence | Rust has O(log n) guaranteed |
+| Compression algorithms | LZ4, Zstd | Zlib (zippy) | Different libraries |
+| Index block compression | Configurable per-level | Not compressed | Memory vs CPU tradeoff |
+| Filter block partitioning | ✅ | ❌ | Reduces memory for large tables |
+| Block pinning policy | Configurable | Not implemented | Control what stays in cache |
+
+---
+
+## 19. MINOR DIFFERENCES (Low Priority)
+
+### Error Handling
+- Rust uses `thiserror` for error types
+- Nim uses custom `StorageError` enum with case objects
+
+### Logging
+- Rust uses `log` crate with `log::debug!`, `log::info!`, etc.
+- Nim uses custom logging module with `logDebug`, `logInfo`, etc.
+
+### Concurrency Primitives
+- Rust: `Arc<RwLock<T>>`, `Arc<Mutex<T>>`, `AtomicBool`, `AtomicUsize`
+- Nim: `ref T` with GC, `Lock`, `Atomic[bool]`, `Atomic[int]`
+
+### Testing
+- Rust: `#[test]` attributes, `tempfile` crate
+- Nim: `unittest` module, manual temp dir creation
+
+---
+
+## 20. FEATURES NOT CRITICAL FOR PRODUCTION
+
+These features exist in Rust but are not essential for core functionality:
+
+1. **Metrics feature flag** - Rust has `#[cfg(feature = "metrics")]` for optional metrics
+2. **LZ4 compression** - Rust supports LZ4 via feature flag, we use zlib
+3. **Internal whitebox testing** - Rust has `__internal_whitebox` feature for internal tests
+4. **Drop counter** - Debug feature for testing cleanup in Rust
+
+---
+
+## 21. POTENTIAL IMPROVEMENTS
+
+Based on the comparison, these improvements could be made:
+
+### High Value
+1. **Range conflict detection** for optimistic transactions (SSI compliance)
+2. **Version history GC** to prevent unbounded version accumulation
+3. **Snapshot tracker pullup** during memtable rotation
+
+### Medium Value
+4. **`journal_count()`** and **`cache_capacity()`** methods
+5. **Per-keyspace lock files** for better isolation
+6. **Worker 0 flush priority** optimization
+
+### Low Value
+7. **xxhash** for HashMap hashing (performance)
+8. **`clean_path_on_drop`** for temp databases
+9. **Batch preallocation** (`with_capacity`)
+10. **Filter block partitioning**
 
 ### High Priority
 1. ~~**True atomic batch commit**~~ - ✅ COMPLETED (2026-02-21)
@@ -652,7 +787,7 @@ For an SSTable with 1000 data blocks, a full index would load all 1000 entries i
 
 ## Conclusion
 
-The Fractio Nim implementation now covers ALL core functionality of Fjall Rust:
+The Fractio Nim implementation covers all core functionality of Fjall Rust:
 
 1. ~~**Atomicity**: Batch writes are not atomic~~ - ✅ FIXED (journal-based commit)
 2. ~~**Flow control**: Missing write stall/throttle~~ - ✅ FIXED (3-level backpressure)
@@ -665,7 +800,19 @@ The Fractio Nim implementation now covers ALL core functionality of Fjall Rust:
 9. ~~**Cross-keyspace snapshots**: Not implemented~~ - ✅ FIXED (Snapshot with nonce)
 10. ~~**Optimistic transactions**: Not implemented~~ - ✅ FIXED (MVCC with conflict detection)
 
-**No Remaining Work for Full Parity** - All features implemented!
+**Core Feature Parity Achieved** - All essential features implemented!
+
+### Remaining Implementation Differences
+
+| Category | Difference | Impact | Priority |
+|----------|------------|--------|----------|
+| **Optimistic TX** | No range conflict detection | SSI not fully supported | Medium |
+| **Optimistic TX** | Check current state vs Oracle | Simpler but less precise | Low |
+| **Keyspace** | No version history GC | Versions may accumulate | Medium |
+| **Keyspace** | No snapshot tracker pullup | Watermark may lag | Low |
+| **Database** | Missing `journal_count()`, `cache_capacity()` | Minor API gap | Low |
+| **Worker Pool** | No worker 0 flush priority | Slightly slower under load | Low |
+| **LSM Tree** | No filter block partitioning | Higher memory for large tables | Low |
 
 **Tests Status:**
 - 9 batch tests
@@ -681,14 +828,14 @@ The Fractio Nim implementation now covers ALL core functionality of Fjall Rust:
 - 8 partitioned index tests
 - **Total: 150+ tests passing**
 
-Fractio is now feature-complete with full parity to the Rust fjall implementation:
+Fractio provides production-ready key-value storage with:
 - **Atomicity**: Journal-based batch commits
 - **Flow control**: 3-level write stall/throttle
-- **Transactions**: Both single-writer and optimistic (MVCC)
+- **Transactions**: Both single-writer and optimistic (point-read conflict detection)
 - **Blob storage**: KV separation with GC
 - **Compaction**: Leveled, Tiered, and FIFO strategies
 - **Snapshots**: Cross-keyspace with nonce tracking
 - **Configuration**: Per-level block sizes, compression, bloom filters
 - **Performance**: Partitioned index blocks, block hash index, descriptor table
 
-For production key-value workloads, Fractio provides all essential features with proper atomicity, flow control, metrics, both transaction modes, blob storage, per-level configuration, all three compaction strategies, cross-keyspace snapshots, and partitioned index blocks for large SSTables.
+**Note on Optimistic Transactions:** The current implementation provides correct conflict detection for point reads and writes. For workloads involving range scans or prefix scans, consider using single-writer transactions to ensure serializability.
