@@ -357,56 +357,95 @@ This document compares the Fractio Nim storage implementation with the Fjall Rus
 
 ## 15. TRANSACTIONS
 
-### Status: ❌ Not Implemented
+### Status: ⚠️ Partially Implemented (2026-02-21)
 
 Rust has two transaction modes:
 1. `SingleWriterTxDatabase` - single writer transactions
 2. `OptimisticTxDatabase` - optimistic concurrency control
 
-We have no transaction support.
+**Nim Implementation (tx.nim):**
 
-**Files missing:**
-- tx/mod.rs
-- tx/optimistic/*.rs
-- tx/single_writer/*.rs
-- tx/write_tx.rs
+| Feature | Rust (fjall) | Nim (fractio) | Status |
+|---------|-------------|---------------|--------|
+| Single-writer transactions | ✅ | ✅ | Implemented |
+| RYOW (read-your-own-writes) | ✅ | ✅ | Implemented |
+| Per-keyspace memtables | ✅ | ✅ | Implemented |
+| txInsert/txRemove | ✅ | ✅ | Implemented |
+| txGet with RYOW | ✅ | ✅ | Implemented |
+| txContainsKey with RYOW | ✅ | ✅ | Implemented |
+| commit() | Uses WriteBatch | Applies directly | Different |
+| rollback() | ✅ | ✅ | Implemented |
+| durability mode | ✅ | ❌ | Not implemented |
+| take() - remove and return | ✅ | ❌ | Not implemented |
+| fetch_update() | ✅ | ❌ | Not implemented |
+| update_fetch() | ✅ | ❌ | Not implemented |
+| remove_weak() | ✅ | ❌ | Not implemented |
+| TxDatabase wrapper | ✅ | ⚠️ | Basic impl |
+| TxKeyspace wrapper | ✅ | ⚠️ | Basic impl |
+| Optimistic transactions | ✅ | ❌ | Not implemented |
+
+**Files:**
+- `storage/tx.nim` - Single-writer transaction implementation
+- Tests: 16 unit tests passing
 
 ---
 
 ## 16. KV SEPARATION (BLOB STORAGE)
 
-### Status: ❌ Not Implemented
+### Status: ⚠️ Partially Implemented (2026-02-21)
 
 Rust supports storing large values in separate blob files to keep SSTables small.
 
-**Missing:**
-- Blob file writer/reader
-- Blob garbage collection
-- `kv_separation_opts` in keyspace config
-- `fragmented_blob_bytes()` method
-- `blob_file_count()` method
+**Nim Implementation (blob/ module):**
+
+| Feature | Rust (fjall) | Nim (fractio) | Status |
+|---------|-------------|---------------|--------|
+| BlobHandle type | ✅ | ✅ | Implemented |
+| Blob file writer | ✅ | ✅ | Implemented |
+| Blob file reader | ✅ | ✅ | Implemented |
+| Compression support | ✅ | ✅ | zlib via zippy |
+| BlobReaderCache | ✅ | ✅ | LRU cache for open files |
+| scanBlobFile for recovery | ✅ | ✅ | Implemented |
+| serializeHandle/deserializeHandle | ✅ | ✅ | Implemented |
+| BlobManager | ✅ | ✅ | Type defined |
+| Blob garbage collection | ✅ | ❌ | Not implemented |
+| Integration with SSTable writer | ✅ | ❌ | Not implemented |
+| fragmented_blob_bytes() | ✅ | ❌ | Not implemented |
+| blob_file_count() | ✅ | ❌ | Not implemented |
+| KvSeparationOptions in config | ✅ | ⚠️ | Type exists, not wired |
+
+**Files:**
+- `storage/blob/types.nim` - BlobHandle, BlobFile, BlobManager types
+- `storage/blob/writer.nim` - writeEntry, serializeHandle
+- `storage/blob/reader.nim` - readValue, BlobReaderCache, scanBlobFile
+- `storage/blob/mod.nim` - Module re-exports
+- Tests: 19 unit tests passing
 
 ---
 
 ## Critical Missing Features for Production Parity
 
 ### High Priority
-1. **True atomic batch commit** - Use journal for atomicity
-2. **Transactions** - At least single-writer transactions
-3. **Write stall/throttle** - Proper backpressure
+1. ~~**True atomic batch commit**~~ - ✅ COMPLETED (2026-02-21)
+2. ~~**Transactions**~~ - ⚠️ PARTIAL (single-writer implemented, optimistic not done)
+3. ~~**Write stall/throttle**~~ - ✅ COMPLETED (2026-02-21)
+4. ~~**Metrics**~~ - ✅ COMPLETED (2026-02-21)
+5. ~~**First/last key-value**~~ - ✅ COMPLETED (2026-02-21)
 
 ### Medium Priority
-4. **KV Separation** - For large value workloads
-5. **Level-specific configurations** - Block size, compression, filters
-6. **Metrics** - Detailed LSM tree metrics
-7. **First/last key-value** - Efficient min/max access
+6. ~~**KV Separation**~~ - ⚠️ PARTIAL (blob module exists, not integrated)
+7. **Level-specific configurations** - Block size, compression, filters per level
+8. **Integrate blob storage with SSTable writer** - Auto-separate large values
+9. **Blob garbage collection** - Reclaim space from overwritten/deleted values
 
 ### Lower Priority
-8. **Descriptor table** - File handle caching
-9. **Partitioned blocks** - For very large SSTables
-10. **Block hash index** - Optimization for point lookups
-11. **Ingestion API** - Bulk loading optimization
-12. **Cross-keyspace snapshots**
+10. **Descriptor table** - File handle caching
+11. **Partitioned blocks** - For very large SSTables
+12. **Block hash index** - Optimization for point lookups
+13. **Ingestion API** - Bulk loading optimization
+14. **Cross-keyspace snapshots** - Nonce-based iterator
+15. **Optimistic transactions** - MVCC with conflict detection
+16. **transaction durability mode** - PersistMode in commit
 
 ---
 
@@ -417,8 +456,9 @@ Rust supports storing large values in separate blob files to keep SSTables small
 | Database | db_test.rs, db_open.rs, recovery_*.rs | 20 integration tests | |
 | Keyspace | keyspace_*.rs | Covered in integration | |
 | Journal | journal/test.rs, batch_recovery.rs | Basic tests | |
-| Batch | batch.rs | 9 unit tests | |
-| Transactions | tx_*.rs, write_tx.rs | 0 | Not implemented |
+| Batch | batch.rs | 9 unit tests | ✅ |
+| Transactions | tx_*.rs, write_tx.rs | 16 unit tests | ⚠️ Partial |
+| Blob storage | blob_*.rs | 19 unit tests | ⚠️ Partial |
 | Iterators | prefix_complex.rs, iter lifetime | 8 lazy iter tests | |
 | Flush/Compaction | write_during_read.rs, fifo_*.rs | Covered in integration | |
 
@@ -446,9 +486,12 @@ Rust supports storing large values in separate blob files to keep SSTables small
 
 1. ~~**Priority 1: Journal-based batch commit**~~ - ✅ COMPLETED (2026-02-21)
 2. ~~**Priority 2: Write stall**~~ - ✅ COMPLETED (2026-02-21)
-3. **Priority 3: Transactions** - Start with single-writer transactions
-4. **Priority 4: Metrics** - Add detailed metrics for monitoring
-5. **Priority 5: KV Separation** - For workloads with large values
+3. ~~**Priority 3: Transactions**~~ - ⚠️ PARTIAL (single-writer done, needs integration)
+4. ~~**Priority 4: Metrics**~~ - ✅ COMPLETED (2026-02-21)
+5. ~~**Priority 5: KV Separation**~~ - ⚠️ PARTIAL (blob module done, needs integration)
+6. **Priority 6: Integrate blob storage** - Wire blob writer into SSTable flush
+7. **Priority 7: Blob GC** - Implement garbage collection for stale blob data
+8. **Priority 8: Per-level config** - Block size, compression, filter policies per level
 
 ---
 
@@ -514,8 +557,16 @@ The Fractio Nim implementation now covers most core functionality of Fjall Rust:
 
 1. ~~**Atomicity**: Batch writes are not atomic~~ - ✅ FIXED (journal-based commit)
 2. ~~**Flow control**: Missing write stall/throttle~~ - ✅ FIXED (3-level backpressure)
-3. **Transactions**: Not implemented
-4. **Large value support**: No KV separation
-5. **Fine-grained configuration**: Per-level settings not supported
+3. ~~**Metrics**: Not available~~ - ✅ FIXED (LsmTreeMetrics, DatabaseMetrics)
+4. ~~**First/last key-value**: Not available~~ - ✅ FIXED (firstKeyValue/lastKeyValue)
+5. **Transactions**: ⚠️ PARTIAL (single-writer implemented, needs Database integration)
+6. **Large value support**: ⚠️ PARTIAL (blob module implemented, needs SSTable integration)
+7. **Fine-grained configuration**: Per-level settings not supported
 
-For basic key-value workloads with small values, Fractio is now feature-complete with proper atomicity and flow control. For production use with large datasets or high write throughput, transactions and KV separation may still be needed.
+**Next Steps for Production Parity:**
+1. Integrate blob storage with SSTable writer (auto-separate large values during flush)
+2. Wire transactions into Database (add beginTx/endTx methods)
+3. Implement blob garbage collection
+4. Add per-level configuration support
+
+For basic key-value workloads with small values, Fractio is now feature-complete with proper atomicity, flow control, and metrics. For production use with large datasets, high write throughput, or transactional semantics, the remaining integration work is needed.
