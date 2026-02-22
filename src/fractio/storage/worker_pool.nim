@@ -141,9 +141,23 @@ proc workerProc(args: WorkerThreadArgs) {.thread.} =
     # Get message from queue
     pool.queueLock.acquire()
     var msg: WorkerMessage
+    var msgIndex = 0
+
     if pool.queue.len > 0:
-      msg = pool.queue[0]
-      pool.queue.delete(0)
+      # Worker 0 prioritizes flush over compaction
+      if workerId == 0:
+        # Look for a flush message first
+        for i in 0 ..< pool.queue.len:
+          if pool.queue[i].kind == wmFlush:
+            msgIndex = i
+            break
+        # If we found a flush message and the first message is compaction,
+        # prioritize the flush
+        if msgIndex > 0 and pool.queue[0].kind == wmCompact:
+          discard # Will use the flush message at msgIndex
+
+      msg = pool.queue[msgIndex]
+      pool.queue.delete(msgIndex)
       pool.queueLock.release()
     else:
       pool.queueLock.release()

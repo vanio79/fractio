@@ -318,6 +318,9 @@ proc checkMemtableRotate*(keyspace: Keyspace, size: uint64) =
 proc maintenance*(keyspace: Keyspace, memtableSize: uint64) =
   keyspace.checkMemtableRotate(memtableSize)
   discard keyspace.localBackpressure()
+  # Pull up snapshot tracker watermark to allow GC of old versions
+  # This advances the GC watermark when there are no active snapshots
+  keyspace.inner.supervisor.inner.snapshotTracker.pullup()
 
 # Insert key-value pair
 proc insert*(keyspace: Keyspace, key: UserKey, value: UserValue): StorageResult[void] =
@@ -458,6 +461,9 @@ proc removeWeak*(keyspace: Keyspace, key: UserKey): StorageResult[void] =
 # Rotate memtable
 proc rotateMemtable*(keyspace: Keyspace): StorageResult[bool] =
   let rotated = keyspace.inner.tree.rotateMemtable()
+  # Pull up snapshot tracker watermark after rotation
+  # This allows old versions in the sealed memtable to be GC'd during flush/compaction
+  keyspace.inner.supervisor.inner.snapshotTracker.pullup()
   return ok[bool, StorageError](rotated.isSome)
 
 # L0 table count
@@ -700,6 +706,9 @@ proc rotateMemtableAndWait*(keyspace: Keyspace,
   let rotated = keyspace.inner.tree.rotateMemtable()
   if rotated.isNone:
     return ok[bool, StorageError](false)
+
+  # Pull up snapshot tracker watermark after rotation
+  keyspace.inner.supervisor.inner.snapshotTracker.pullup()
 
   let startSealedCount = keyspace.inner.tree.sealedMemtableCount()
 

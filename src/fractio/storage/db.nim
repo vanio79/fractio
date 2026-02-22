@@ -621,6 +621,28 @@ proc journalDiskSpace*(db: Database): uint64 =
     if kind == pcFile:
       result += uint64(getFileSize(path))
 
+proc journalCount*(db: Database): int =
+  ## Returns the number of journal files (sealed + active).
+  ## This is useful for monitoring and debugging.
+  db.inner.supervisor.inner.journalManagerLock.acquire()
+  defer: db.inner.supervisor.inner.journalManagerLock.release()
+  return db.inner.supervisor.inner.journalManager.journalCount()
+
+proc cacheCapacity*(db: Database): uint64 =
+  ## Returns the block cache capacity in bytes.
+  ## This is the configured capacity for each keyspace's block cache.
+  ## Returns 0 if no keyspaces exist yet.
+  db.inner.keyspacesLock.acquire()
+  defer: db.inner.keyspacesLock.release()
+
+  # Return the cache capacity from the first keyspace's config
+  # (all keyspaces use the same default cache capacity)
+  for name, keyspace in db.inner.keyspaces.pairs:
+    return keyspace.inner.tree.config.cacheCapacity
+
+  # No keyspaces yet, return default
+  return 256 * 1024 * 1024'u64 # 256 MiB default
+
 proc getMetrics*(db: Database): DatabaseMetrics =
   ## Returns aggregate metrics for the entire database.
   ##

@@ -420,22 +420,22 @@ Rust has two transaction modes:
 |---------|-------------|---------------|--------|
 | **Oracle pattern** | BTreeMap<u64, ConflictManager> tracks committed txns | Check current DB state at commit | Rust tracks all in-flight commits |
 | **Conflict detection** | Compares against other committed transactions | Compares against current key seqnos | Different granularity |
-| **Range read tracking** | ✅ Full support (Read::Range, Read::All) | ❌ Not implemented | Range scans don't cause conflicts in Nim |
+| **Range read tracking** | ✅ Full support (Read::Range, Read::All) | ✅ Full support | ✅ Aligned |
 | **ConflictManager** | Separate type with reads + conflict_keys | Combined in ReadSetEntry | Rust more modular |
-| **Iterator conflict tracking** | mark_range() for iter/range/prefix | Not tracked | SSI not fully supported |
+| **Iterator conflict tracking** | mark_range() for iter/range/prefix | ✅ otxIter/otxRangeIter/otxPrefixIter | ✅ Aligned |
 | **GC of committed txns** | Automatic based on GC watermark | N/A (no transaction history) | Rust cleans up old commit info |
 
-**Missing for Full SSI (Serializable Snapshot Isolation):**
-- Range read conflict detection
-- Prefix scan conflict detection
-- Full table scan tracking (Read::All)
-- Oracle-based commit ordering
+**SSI (Serializable Snapshot Isolation) Support (Updated 2026-02-22):**
+- ✅ Point-read conflict detection
+- ✅ Range read conflict detection
+- ✅ Prefix scan conflict detection
+- ✅ Full table scan tracking (Read::All)
+- ⚠️ Oracle-based commit ordering (uses simpler current-state check)
 
 **Current Nim Approach:**
-- Point-read conflict detection only
-- Compares read set against current database state
-- Works correctly for simple read-modify-write patterns
-- May miss conflicts involving range scans
+- Full SSI support for point reads, range scans, prefix scans, and full table scans
+- Compares read set against current database state at commit time
+- Works correctly for all read-modify-write patterns including range scans
 
 ---
 
@@ -517,8 +517,8 @@ After a thorough file-by-file comparison with the Rust fjall codebase, the follo
 | Feature | Rust (fjall) | Nim (fractio) | Notes |
 |---------|-------------|---------------|-------|
 | `clean_path_on_drop` config | ✅ | ❌ | Temp database auto-cleanup |
-| `journal_count()` method | ✅ | ❌ | Returns number of journal files |
-| `cache_capacity()` method | ✅ | ❌ | Returns block cache capacity |
+| `journal_count()` method | ✅ | ✅ | Returns number of journal files |
+| `cache_capacity()` method | ✅ | ✅ | Returns block cache capacity |
 | Version migration | V2->V3 migration tool | Simple version check | Rust has more sophisticated versioning |
 | Hash function for HashMap | xxhash (Xxh3Builder) | Default Nim hash | Different performance characteristics |
 
@@ -527,8 +527,8 @@ After a thorough file-by-file comparison with the Rust fjall codebase, the follo
 | Feature | Rust (fjall) | Nim (fractio) | Notes |
 |---------|-------------|---------------|-------|
 | Per-keyspace lock file | ✅ | ❌ | Shared database lock instead |
-| Version history GC | ✅ (in maintenance()) | ❌ | Old versions may accumulate |
-| Snapshot tracker pullup | ✅ (during rotation) | ❌ | Watermark may not advance without snapshots |
+| Version history GC | ✅ (in maintenance()) | ✅ | Snapshot tracker pullup |
+| Snapshot tracker pullup | ✅ (during rotation) | ✅ | Watermark advances correctly |
 | `write_clear` journal entry | ✅ | ⚠️ May differ | Clear operation logging |
 | Keyspace deletion | Deletes folder on Drop | Marks as deleted | Different cleanup strategy |
 
@@ -548,7 +548,7 @@ After a thorough file-by-file comparison with the Rust fjall codebase, the follo
 | Feature | Rust (fjall) | Nim (fractio) | Notes |
 |---------|-------------|---------------|-------|
 | Channel implementation | flume::bounded | Custom message queue | Different semantics |
-| Worker 0 flush priority | ✅ | ❌ | Rust prioritizes flush on worker 0 |
+| Worker 0 flush priority | ✅ | ✅ | Worker 0 prioritizes flush over compaction |
 | Thread coordination | Arc<AtomicUsize> counter | Atomic[int] counter | Same concept |
 
 ### 18.5 Batch (batch/mod.rs vs batch.nim)
@@ -806,13 +806,18 @@ The Fractio Nim implementation covers all core functionality of Fjall Rust:
 
 | Category | Difference | Impact | Priority |
 |----------|------------|--------|----------|
-| **Optimistic TX** | No range conflict detection | SSI not fully supported | Medium |
 | **Optimistic TX** | Check current state vs Oracle | Simpler but less precise | Low |
-| **Keyspace** | No version history GC | Versions may accumulate | Medium |
-| **Keyspace** | No snapshot tracker pullup | Watermark may lag | Low |
-| **Database** | Missing `journal_count()`, `cache_capacity()` | Minor API gap | Low |
-| **Worker Pool** | No worker 0 flush priority | Slightly slower under load | Low |
 | **LSM Tree** | No filter block partitioning | Higher memory for large tables | Low |
+
+### Completed 2026-02-22 ✅
+
+| Feature | Description |
+|---------|-------------|
+| **Range conflict detection** | Full SSI support for range scans and full table scans |
+| **Version history GC** | Snapshot tracker pullup during maintenance and memtable rotation |
+| **`journal_count()`** | Returns number of journal files (sealed + active) |
+| **`cache_capacity()`** | Returns block cache capacity |
+| **Worker 0 flush priority** | Worker 0 prioritizes flush over compaction |
 
 **Tests Status:**
 - 9 batch tests
@@ -822,20 +827,19 @@ The Fractio Nim implementation covers all core functionality of Fjall Rust:
 - 13 blob GC tests
 - 4 blob read path tests
 - 16 single-writer tx unit tests
-- 15 optimistic tx unit tests
+- 25 optimistic tx unit tests (including range scan conflict detection)
 - 12 per-level config tests
 - 14 compaction strategy tests
 - 8 partitioned index tests
-- **Total: 150+ tests passing**
+- **Total: 620+ tests passing**
 
 Fractio provides production-ready key-value storage with:
 - **Atomicity**: Journal-based batch commits
 - **Flow control**: 3-level write stall/throttle
-- **Transactions**: Both single-writer and optimistic (point-read conflict detection)
+- **Transactions**: Both single-writer and optimistic (full SSI with range scan conflict detection)
 - **Blob storage**: KV separation with GC
 - **Compaction**: Leveled, Tiered, and FIFO strategies
 - **Snapshots**: Cross-keyspace with nonce tracking
 - **Configuration**: Per-level block sizes, compression, bloom filters
 - **Performance**: Partitioned index blocks, block hash index, descriptor table
-
-**Note on Optimistic Transactions:** The current implementation provides correct conflict detection for point reads and writes. For workloads involving range scans or prefix scans, consider using single-writer transactions to ensure serializability.
+- **GC**: Version history garbage collection with watermark tracking

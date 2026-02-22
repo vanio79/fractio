@@ -22,7 +22,7 @@
 ## - Isolation: Read-your-own-writes (RYOW) semantics
 ## - Consistency: Snapshot-based reads
 
-import fractio/storage/[error, types, snapshot_tracker, journal/writer]
+import fractio/storage/[error, types, snapshot_tracker, journal/writer, iter]
 import fractio/storage/keyspace as ks
 import fractio/storage/lsm_tree/[memtable, types as lsm_types, lsm_tree]
 import std/[options, tables, locks, atomics, sets, hashes, strutils]
@@ -99,6 +99,23 @@ type
     key*: string
     seqno*: uint64 # The seqno of the value when read (0 means key didn't exist)
 
+  # Read range entry - tracks a range that was scanned
+  ReadRangeEntry* = object
+    ## Tracks a range scan during an optimistic transaction.
+    ## At commit time, we check if any key in this range was modified.
+    keyspaceId*: uint64
+    startKey*: string
+    endKey*: string
+    # We track the highest seqno seen in this range for conflict detection
+    highestSeqno*: uint64
+
+  # Read all entry - tracks a full table scan
+  ReadAllEntry* = object
+    ## Tracks a full table scan during an optimistic transaction.
+    ## Any write to this keyspace is a conflict.
+    keyspaceId*: uint64
+    highestSeqno*: uint64
+
   # Optimistic transaction - tracks read/write sets for conflict detection
   OptimisticTransaction* = object
     ## An optimistic transaction with MVCC conflict detection.
@@ -106,12 +123,23 @@ type
     ## Reads track the seqno of values, and at commit time we check if
     ## any read key has been modified by another committed transaction.
     ## If a conflict is detected, the commit fails and must be retried.
+    ##
+    ## Supports three types of read tracking:
+    ## - Point reads: Track individual keys
+    ## - Range reads: Track key ranges [start, end]
+    ## - Full scans: Track entire keyspace
 
     # Per-keyspace uncommitted writes (keyspace id -> entries)
     writeSet*: Table[uint64, Memtable]
 
     # Per-keyspace read set (composite key: keyspaceId + "|" + key -> seqno)
     readSet*: Table[string, ReadSetEntry]
+
+    # Range reads (keyspace id -> list of ranges)
+    readRanges*: Table[uint64, seq[ReadRangeEntry]]
+
+    # Full keyspace scans (keyspace id -> entry)
+    readAll*: Table[uint64, ReadAllEntry]
 
     # Snapshot sequence number for consistent reads
     snapshotSeqno*: uint64
@@ -519,6 +547,8 @@ proc newOptimisticTransaction*(snapshotSeqno: uint64): OptimisticTransaction =
   result = OptimisticTransaction(
     writeSet: initTable[uint64, Memtable](),
     readSet: initTable[string, ReadSetEntry](),
+    readRanges: initTable[uint64, seq[ReadRangeEntry]](),
+    readAll: initTable[uint64, ReadAllEntry](),
     snapshotSeqno: snapshotSeqno,
     currentSeqno: TX_SEQNO_START,
     isActive: true,
@@ -570,6 +600,51 @@ proc recordRead*(tx: var OptimisticTransaction, keyspaceId: uint64, key: string,
       key: key,
       seqno: seqno
     )
+
+# Record a range read (for SSI conflict detection)
+proc recordRangeRead*(tx: var OptimisticTransaction, keyspaceId: uint64,
+                      startKey: string, endKey: string, highestSeqno: uint64) =
+  ## Records a range scan in the read ranges for conflict detection.
+  ## At commit time, we check if any key in this range was modified.
+  if keyspaceId notin tx.readRanges:
+    tx.readRanges[keyspaceId] = @[]
+
+  # Check if this range overlaps with an existing range - merge if so
+  var merged = false
+  for i in 0 ..< tx.readRanges[keyspaceId].len:
+    var entry = tx.readRanges[keyspaceId][i]
+    # Check for overlap or adjacency
+    if startKey <= entry.endKey and endKey >= entry.startKey:
+      # Merge ranges
+      entry.startKey = min(entry.startKey, startKey)
+      entry.endKey = max(entry.endKey, endKey)
+      entry.highestSeqno = max(entry.highestSeqno, highestSeqno)
+      tx.readRanges[keyspaceId][i] = entry
+      merged = true
+      break
+
+  if not merged:
+    tx.readRanges[keyspaceId].add(ReadRangeEntry(
+      keyspaceId: keyspaceId,
+      startKey: startKey,
+      endKey: endKey,
+      highestSeqno: highestSeqno
+    ))
+
+# Record a full keyspace scan (for SSI conflict detection)
+proc recordFullScan*(tx: var OptimisticTransaction, keyspaceId: uint64,
+                     highestSeqno: uint64) =
+  ## Records a full keyspace scan for conflict detection.
+  ## Any write to this keyspace is a conflict.
+  if keyspaceId notin tx.readAll:
+    tx.readAll[keyspaceId] = ReadAllEntry(
+      keyspaceId: keyspaceId,
+      highestSeqno: highestSeqno
+    )
+  else:
+    # Update highest seqno if needed
+    if highestSeqno > tx.readAll[keyspaceId].highestSeqno:
+      tx.readAll[keyspaceId].highestSeqno = highestSeqno
 
 # Insert into optimistic transaction
 proc otxInsert*(tx: var OptimisticTransaction, keyspace: ks.Keyspace,
@@ -721,12 +796,19 @@ proc rollback*(tx: var OptimisticTransaction) =
   tx.isActive = false
   tx.writeSet.clear()
   tx.readSet.clear()
+  tx.readRanges.clear()
+  tx.readAll.clear()
 
 # Detect conflicts between read set and current database state
 proc detectConflicts*(tx: OptimisticTransaction, keyspaces: Table[string,
     ks.Keyspace]): seq[string] =
   ## Checks if any key in the read set has been modified since the transaction started.
   ## Returns a list of conflicting keys (empty if no conflicts).
+  ##
+  ## Checks three types of conflicts:
+  ## 1. Point read conflicts: A key was read and then modified
+  ## 2. Range read conflicts: A range was scanned and a key in that range was modified
+  ## 3. Full scan conflicts: A keyspace was fully scanned and any key was modified
   result = @[]
 
   # Build a lookup from keyspace id to keyspace
@@ -734,7 +816,7 @@ proc detectConflicts*(tx: OptimisticTransaction, keyspaces: Table[string,
   for name, keyspace in keyspaces:
     idToKeyspace[keyspace.inner.id] = keyspace
 
-  # Check each read key
+  # Check 1: Point read conflicts
   for readSetKey, entry in tx.readSet:
     if entry.keyspaceId notin idToKeyspace:
       continue
@@ -756,6 +838,69 @@ proc detectConflicts*(tx: OptimisticTransaction, keyspaces: Table[string,
       if currentValue.isNone or currentSeqno != entry.seqno:
         result.add(entry.key)
 
+  # Check 2: Range read conflicts
+  # For each range we read, check if any key in that range was modified
+  for keyspaceId, ranges in tx.readRanges:
+    if keyspaceId notin idToKeyspace:
+      continue
+
+    let keyspace = idToKeyspace[keyspaceId]
+
+    for rangeEntry in ranges:
+      # Check if any write in this transaction overlaps with the range
+      # If we wrote to this range, skip conflict detection (RYOW)
+      var wroteToRange = false
+      if keyspaceId in tx.writeSet:
+        let memtable = tx.writeSet[keyspaceId]
+        for key, _ in memtable.entries:
+          if key >= rangeEntry.startKey and key <= rangeEntry.endKey:
+            wroteToRange = true
+            break
+
+      if wroteToRange:
+        continue
+
+      # Check if any key in the range has been modified since our scan
+      # We compare against the highest seqno we saw during the scan
+      let iter = keyspace.rangeIter(rangeEntry.startKey, rangeEntry.endKey)
+      for entry in iter.entries:
+        # Get the current seqno of this key
+        let (_, currentSeqno) = keyspace.inner.tree.getWithSeqno(entry.key,
+            high(uint64))
+        # If the current seqno is higher than what we recorded, there's a conflict
+        if currentSeqno > rangeEntry.highestSeqno:
+          result.add("range:" & rangeEntry.startKey & "-" & rangeEntry.endKey &
+              ":" & entry.key)
+          break
+
+  # Check 3: Full scan conflicts
+  # If we did a full scan, any write to the keyspace by another transaction is a conflict
+  # Note: RYOW does NOT apply here - even if we wrote to the keyspace, we still need to
+  # check if OTHER transactions wrote to it after our scan
+  for keyspaceId, fullScan in tx.readAll:
+    if keyspaceId notin idToKeyspace:
+      continue
+
+    let keyspace = idToKeyspace[keyspaceId]
+
+    # For full scan conflicts, we check if the keyspace has any writes
+    # since our scan. We do this by checking if the highest seqno in the
+    # memtable is higher than what we recorded.
+    let highestMemtableSeqno = keyspace.inner.tree.getHighestMemtableSeqno()
+    if highestMemtableSeqno.isSome and highestMemtableSeqno.get() >
+        fullScan.highestSeqno:
+      result.add("fullscan:" & $keyspaceId & ":new_writes_detected")
+      continue
+
+    # Also check if any existing key has been modified
+    # by comparing current seqno with recorded highest
+    let iter = keyspace.iter()
+    for entry in iter.entries:
+      let (_, currentSeqno) = keyspace.inner.tree.getWithSeqno(entry.key, high(uint64))
+      if currentSeqno > fullScan.highestSeqno:
+        result.add("fullscan:" & $keyspaceId & ":" & entry.key)
+        break
+
 # Commit the optimistic transaction with conflict detection
 proc otxCommit*(tx: var OptimisticTransaction, keyspaces: Table[string,
     ks.Keyspace]): StorageResult[void] =
@@ -775,6 +920,8 @@ proc otxCommit*(tx: var OptimisticTransaction, keyspaces: Table[string,
   if conflicts.len > 0:
     tx.writeSet.clear()
     tx.readSet.clear()
+    tx.readRanges.clear()
+    tx.readAll.clear()
     return err[void, StorageError](StorageError(
       kind: seStorage,
       storageError: "Transaction conflict detected for keys: " & conflicts.join(", ")
@@ -783,6 +930,8 @@ proc otxCommit*(tx: var OptimisticTransaction, keyspaces: Table[string,
   # If no changes, nothing to do
   if tx.writeSet.len == 0:
     tx.readSet.clear()
+    tx.readRanges.clear()
+    tx.readAll.clear()
     return okVoid
 
   # Build a lookup from keyspace id to keyspace
@@ -831,6 +980,8 @@ proc otxCommit*(tx: var OptimisticTransaction, keyspaces: Table[string,
 
   tx.writeSet.clear()
   tx.readSet.clear()
+  tx.readRanges.clear()
+  tx.readAll.clear()
   return okVoid
 
 # Take - remove and return value (optimistic)
@@ -941,3 +1092,110 @@ proc keyspaceNames*(txDb: OptimisticTxDatabase): seq[string] =
   result = @[]
   for name in txDb.keyspaces.keys:
     result.add(name)
+
+# ============================================================================
+# RANGE AND PREFIX ITERATION WITH CONFLICT TRACKING
+# ============================================================================
+
+# Range iteration with conflict tracking
+proc otxRangeIter*(tx: var OptimisticTransaction, keyspace: ks.Keyspace,
+                   startKey: string, endKey: string): StorageResult[KeyspaceIter] =
+  ## Creates a range iterator with conflict tracking.
+  ##
+  ## The range [startKey, endKey] is recorded in the read set for SSI.
+  ## At commit time, if any key in this range was modified by another
+  ## transaction, a conflict will be detected.
+  let check = tx.checkActive()
+  if check.isErr:
+    return err[KeyspaceIter, StorageError](check.err[])
+
+  let keyspaceId = keyspace.inner.id
+
+  # Create the iterator
+  let iter = keyspace.rangeIter(startKey, endKey)
+
+  # Track the highest seqno in the range for conflict detection
+  var highestSeqno: uint64 = 0
+  for entry in iter.entries:
+    if entry.seqno > highestSeqno:
+      highestSeqno = entry.seqno
+
+  # Record the range read
+  tx.recordRangeRead(keyspaceId, startKey, endKey, highestSeqno)
+
+  return ok[KeyspaceIter, StorageError](iter)
+
+# Prefix iteration with conflict tracking
+proc otxPrefixIter*(tx: var OptimisticTransaction, keyspace: ks.Keyspace,
+                    prefix: string): StorageResult[KeyspaceIter] =
+  ## Creates a prefix iterator with conflict tracking.
+  ##
+  ## The prefix range is recorded in the read set for SSI.
+  ## At commit time, if any key with this prefix was modified by another
+  ## transaction, a conflict will be detected.
+  let check = tx.checkActive()
+  if check.isErr:
+    return err[KeyspaceIter, StorageError](check.err[])
+
+  let keyspaceId = keyspace.inner.id
+
+  # Create the iterator
+  let iter = keyspace.prefixIter(prefix)
+
+  # For prefix iteration, we track it as a range
+  # The end key is the prefix with all 0xFF bytes appended (lexicographic upper bound)
+  var endKey = prefix
+  for i in 0 ..< 8: # Add enough 0xFF to cover most key lengths
+    endKey.add('\xFF')
+
+  # Track the highest seqno in the prefix range
+  var highestSeqno: uint64 = 0
+  for entry in iter.entries:
+    if entry.seqno > highestSeqno:
+      highestSeqno = entry.seqno
+
+  # Record the range read
+  tx.recordRangeRead(keyspaceId, prefix, endKey, highestSeqno)
+
+  return ok[KeyspaceIter, StorageError](iter)
+
+# Full keyspace scan with conflict tracking
+proc otxIter*(tx: var OptimisticTransaction,
+    keyspace: ks.Keyspace): StorageResult[KeyspaceIter] =
+  ## Creates a full keyspace iterator with conflict tracking.
+  ##
+  ## The entire keyspace scan is recorded for SSI.
+  ## At commit time, if any key in this keyspace was modified by another
+  ## transaction, a conflict will be detected.
+  let check = tx.checkActive()
+  if check.isErr:
+    return err[KeyspaceIter, StorageError](check.err[])
+
+  let keyspaceId = keyspace.inner.id
+
+  # Create the iterator
+  let iter = keyspace.iter()
+
+  # Track the highest seqno in the keyspace
+  var highestSeqno: uint64 = 0
+  for entry in iter.entries:
+    if entry.seqno > highestSeqno:
+      highestSeqno = entry.seqno
+
+  # Record the full scan
+  tx.recordFullScan(keyspaceId, highestSeqno)
+
+  return ok[KeyspaceIter, StorageError](iter)
+
+# Check if transaction has any range reads
+proc hasRangeReads*(tx: OptimisticTransaction): bool =
+  ## Returns true if this transaction performed any range or prefix scans.
+  tx.readRanges.len > 0 or tx.readAll.len > 0
+
+# Get the number of tracked reads (for debugging/metrics)
+proc readSetSize*(tx: OptimisticTransaction): int =
+  ## Returns the total number of tracked reads (point + range + full).
+  result = tx.readSet.len
+  for _, ranges in tx.readRanges:
+    result += ranges.len
+  result += tx.readAll.len
