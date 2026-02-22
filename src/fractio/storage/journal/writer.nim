@@ -352,22 +352,20 @@ proc persist*(writer: Writer, mode: PersistMode): StorageResult[void] =
     return err[void, StorageError](StorageError(kind: seIo,
         ioError: "Writer file is nil"))
 
-  # Flush I/O buffer first
-  let flushResult = writer.flushIoBuffer()
-  if flushResult.isErr:
-    return flushResult
-
-  # Flush application buffers
-  writer.file.flush()
-  writer.isBufferDirty = false
-
   case mode
   of pmBuffer:
+    # Don't flush for buffer mode - let the IO buffer accumulate writes
+    # The buffer will be flushed when full or on sync
     discard
-  of pmSyncData:
-    discard
-  of pmSyncAll:
-    discard
+  of pmSyncData, pmSyncAll:
+    # Flush I/O buffer first for sync modes
+    let flushResult = writer.flushIoBuffer()
+    if flushResult.isErr:
+      return flushResult
+
+    # Flush application buffers
+    writer.file.flush()
+    writer.isBufferDirty = false
 
   return okVoid
 

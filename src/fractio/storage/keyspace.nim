@@ -312,15 +312,16 @@ proc requestFlush*(keyspace: Keyspace) =
 # Check memtable rotate
 proc checkMemtableRotate*(keyspace: Keyspace, size: uint64) =
   if size > keyspace.inner.config.maxMemtableSize:
+    # Pull up snapshot tracker watermark before rotation to allow GC of old versions
+    keyspace.inner.supervisor.inner.snapshotTracker.pullup()
     keyspace.requestRotation()
 
-# Maintenance
+# Maintenance - called on every write
 proc maintenance*(keyspace: Keyspace, memtableSize: uint64) =
   keyspace.checkMemtableRotate(memtableSize)
   discard keyspace.localBackpressure()
-  # Pull up snapshot tracker watermark to allow GC of old versions
-  # This advances the GC watermark when there are no active snapshots
-  keyspace.inner.supervisor.inner.snapshotTracker.pullup()
+  # NOTE: snapshot tracker pullup is now done during memtable rotation
+  # not on every write, to reduce lock contention in the hot path
 
 # Insert key-value pair
 proc insert*(keyspace: Keyspace, key: UserKey, value: UserValue): StorageResult[void] =
