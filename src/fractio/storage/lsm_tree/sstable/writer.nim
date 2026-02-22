@@ -14,12 +14,24 @@ import fractio/storage/lsm_tree/compression
 import std/[streams, os, strutils, endians, hashes]
 
 type
+  FilterPartition* = object
+    ## A single filter partition containing a bloom filter and key range.
+    filter*: BloomFilter
+    firstKey*: string
+    lastKey*: string
+    startBlockIdx*: int # Index in indexBlock where this partition starts
+
   SsTableWriter* = ref object
     path: string
     stream: Stream
     dataBlock: DataBlock
     indexBlock: IndexBlock
-    bloomFilter: BloomFilter
+    bloomFilter: BloomFilter                 # Single filter for non-partitioned mode
+    filterPartitions: seq[FilterPartition]   # Partitioned filters
+    currentFilter: BloomFilter               # Current partition being built
+    currentFilterFirstKey: string            # First key in current partition
+    currentFilterStartBlock: int             # Block index where current partition started
+    keysInCurrentFilter: int                 # Keys added to current filter partition
     lastKey: string
     blockOffset: uint64
     blockSize: uint32
@@ -31,12 +43,15 @@ type
     compression: compression.CompressionType # Compression type for data blocks
     compressionStats: CompressionStats
     usePartitionedIndex: bool                # Whether to use partitioned index
+    usePartitionedFilter: bool               # Whether to use partitioned filters
     indexBlockEntries: seq[IndexBlock]       # Partitioned index blocks
     topLevelIndex: TopLevelIndex             # Top level index for partitioned mode
+    dataBlockCount: int                      # Number of data blocks written
 
 proc newSsTableWriter*(path: string, expectedKeys: int = 1000,
-                      compression: compression.CompressionType = compression.ctZlib,
-                      usePartitionedIndex: bool = false): StorageResult[
+                      compression: compression.CompressionType = compression.ctNone,
+                      usePartitionedIndex: bool = false,
+                      usePartitionedFilter: bool = false): StorageResult[
     SsTableWriter] =
   let stream = newFileStream(path, fmWrite)
   if stream == nil:
@@ -50,6 +65,11 @@ proc newSsTableWriter*(path: string, expectedKeys: int = 1000,
   writer.dataBlock = newDataBlock()
   writer.indexBlock = newIndexBlock()
   writer.bloomFilter = newBloomFilter(expectedKeys, 0.01) # 1% false positive rate
+  writer.filterPartitions = @[]
+  writer.currentFilter = newBloomFilter(FILTER_BLOCK_ENTRIES, 0.01)
+  writer.currentFilterFirstKey = ""
+  writer.currentFilterStartBlock = 0
+  writer.keysInCurrentFilter = 0
   writer.blockOffset = 0'u64
   writer.blockSize = 4096'u32
   writer.numEntries = 0'u64
@@ -59,11 +79,31 @@ proc newSsTableWriter*(path: string, expectedKeys: int = 1000,
   writer.smallestSeqno = high(uint64)
   writer.largestSeqno = 0'u64
   writer.usePartitionedIndex = usePartitionedIndex
+  writer.usePartitionedFilter = usePartitionedFilter
   writer.indexBlockEntries = @[]
   writer.topLevelIndex = TopLevelIndex(entries: @[],
       isPartitioned: usePartitionedIndex)
+  writer.dataBlockCount = 0
 
   return ok[SsTableWriter, StorageError](writer)
+
+# Finalize the current filter partition and start a new one
+proc finalizeFilterPartition(writer: SsTableWriter) =
+  if writer.keysInCurrentFilter == 0:
+    return
+
+  writer.filterPartitions.add(FilterPartition(
+    filter: writer.currentFilter,
+    firstKey: writer.currentFilterFirstKey,
+    lastKey: writer.lastKey,
+    startBlockIdx: writer.currentFilterStartBlock
+  ))
+
+  # Start new partition
+  writer.currentFilter = newBloomFilter(FILTER_BLOCK_ENTRIES, 0.01)
+  writer.currentFilterFirstKey = ""
+  writer.currentFilterStartBlock = writer.dataBlockCount + 1
+  writer.keysInCurrentFilter = 0
 
 proc flushBlock*(writer: SsTableWriter): StorageResult[void] =
   if writer.dataBlock.isEmpty:
@@ -106,6 +146,15 @@ proc flushBlock*(writer: SsTableWriter): StorageResult[void] =
   )
   writer.indexBlock.add(writer.lastKey, handle)
 
+  # Track data block count for filter partitioning
+  inc writer.dataBlockCount
+
+  # Check if we should finalize filter partition (based on data blocks)
+  if writer.usePartitionedFilter and
+     writer.dataBlockCount mod FILTER_BLOCK_ENTRIES == 0 and
+     writer.keysInCurrentFilter > 0:
+    writer.finalizeFilterPartition()
+
   # Reset data block
   writer.dataBlock = newDataBlock()
   writer.blockOffset = uint64(writer.stream.getPosition())
@@ -125,7 +174,15 @@ proc add*(writer: SsTableWriter, key: string, value: string,
 
   # Add key to bloom filter (only for regular values, not tombstones)
   if valueType == vtValue:
+    # Always add to main filter for non-partitioned mode
     writer.bloomFilter.add(key)
+
+    # Also add to current partition for partitioned mode
+    if writer.usePartitionedFilter:
+      if writer.currentFilterFirstKey.len == 0:
+        writer.currentFilterFirstKey = key
+      writer.currentFilter.add(key)
+      inc writer.keysInCurrentFilter
 
   if not writer.dataBlock.add(key, value, seqno, valueType):
     let flushResult = writer.flushBlock()
@@ -153,6 +210,18 @@ proc writeIndexBlock(writer: SsTableWriter,
     offset: uint64(startOffset),
     size: uint32(endOffset - startOffset),
     uncompressedSize: 0
+  ))
+
+# Helper to write a single filter block and return its handle
+proc writeFilterBlock(writer: SsTableWriter,
+    filter: BloomFilter): StorageResult[BlockHandle] =
+  writer.stream.write(uint8(btFilter))
+  let startOffset = writer.stream.getPosition()
+  filter.serialize(writer.stream)
+  let endOffset = writer.stream.getPosition()
+  return ok[BlockHandle, StorageError](BlockHandle(
+    offset: uint64(startOffset),
+    size: uint32(endOffset - startOffset)
   ))
 
 # Helper to write top level index block
@@ -195,22 +264,112 @@ proc writeTopLevelIndex(writer: SsTableWriter,
     size: uint32(endOffset - startOffset)
   ))
 
+# Helper to write top level filter index block
+proc writeTopLevelFilterIndex(writer: SsTableWriter,
+    tlfi: TopLevelFilterIndex): StorageResult[BlockHandle] =
+  writer.stream.write(uint8(btTopLevelFilter))
+  let startOffset = writer.stream.getPosition()
+
+  # Write number of entries
+  var numEntriesLe = uint32(tlfi.entries.len)
+  littleEndian32(addr numEntriesLe, addr numEntriesLe)
+  writer.stream.write(numEntriesLe)
+
+  # Write each entry
+  for entry in tlfi.entries:
+    # Write firstKey length and firstKey
+    var firstKeyLenLe = uint32(entry.firstKey.len)
+    littleEndian32(addr firstKeyLenLe, addr firstKeyLenLe)
+    writer.stream.write(firstKeyLenLe)
+    writer.stream.write(entry.firstKey)
+
+    # Write lastKey length and lastKey
+    var lastKeyLenLe = uint32(entry.lastKey.len)
+    littleEndian32(addr lastKeyLenLe, addr lastKeyLenLe)
+    writer.stream.write(lastKeyLenLe)
+    writer.stream.write(entry.lastKey)
+
+    # Write handle
+    var offsetLe = entry.handle.offset
+    littleEndian64(addr offsetLe, addr offsetLe)
+    writer.stream.write(offsetLe)
+
+    var sizeLe = entry.handle.size
+    littleEndian32(addr sizeLe, addr sizeLe)
+    writer.stream.write(sizeLe)
+
+    var uncompressedLe = entry.handle.uncompressedSize
+    littleEndian32(addr uncompressedLe, addr uncompressedLe)
+    writer.stream.write(uncompressedLe)
+
+  let endOffset = writer.stream.getPosition()
+  return ok[BlockHandle, StorageError](BlockHandle(
+    offset: uint64(startOffset),
+    size: uint32(endOffset - startOffset)
+  ))
+
 proc finish*(writer: SsTableWriter): StorageResult[SsTable] =
   # Flush remaining data
   let flushResult = writer.flushBlock()
   if flushResult.isErr:
     return err[SsTable, StorageError](flushResult.error)
 
-  # Write bloom filter block
-  writer.stream.write(uint8(btFilter))
-  let filterStartOffset = writer.stream.getPosition()
-  writer.bloomFilter.serialize(writer.stream)
-  let filterEndOffset = writer.stream.getPosition()
+  var filterHandle: BlockHandle
+  var filterMode: FilterMode
 
-  let filterHandle = BlockHandle(
-    offset: uint64(filterStartOffset),
-    size: uint32(filterEndOffset - filterStartOffset)
-  )
+  # Determine if we should use partitioned filters
+  let shouldPartitionFilter = writer.usePartitionedFilter or
+                              writer.dataBlockCount >= MIN_FILTER_ENTRIES_FOR_PARTITION
+
+  if shouldPartitionFilter and writer.dataBlockCount > 0:
+    # Finalize any remaining filter partition
+    if writer.keysInCurrentFilter > 0:
+      writer.finalizeFilterPartition()
+
+    # If we have partitions, write partitioned filters
+    if writer.filterPartitions.len > 1:
+      filterMode = fmPartitioned
+
+      # Write each filter partition
+      var tlfi = TopLevelFilterIndex(entries: @[], isPartitioned: true)
+
+      for partition in writer.filterPartitions:
+        let handleResult = writer.writeFilterBlock(partition.filter)
+        if handleResult.isErr:
+          return err[SsTable, StorageError](handleResult.error)
+
+        tlfi.entries.add(TopLevelFilterEntry(
+          firstKey: partition.firstKey,
+          lastKey: partition.lastKey,
+          handle: handleResult.value
+        ))
+
+      # Write top level filter index
+      let tlfiResult = writer.writeTopLevelFilterIndex(tlfi)
+      if tlfiResult.isErr:
+        return err[SsTable, StorageError](tlfiResult.error)
+
+      filterHandle = tlfiResult.value
+    else:
+      # Only one partition, use full filter
+      filterMode = fmFull
+      let filterResult = writer.writeFilterBlock(writer.bloomFilter)
+      if filterResult.isErr:
+        return err[SsTable, StorageError](filterResult.error)
+      filterHandle = filterResult.value
+  else:
+    # Use full (single) filter
+    filterMode = fmFull
+
+    writer.stream.write(uint8(btFilter))
+    let filterStartOffset = writer.stream.getPosition()
+    writer.bloomFilter.serialize(writer.stream)
+    let filterEndOffset = writer.stream.getPosition()
+
+    filterHandle = BlockHandle(
+      offset: uint64(filterStartOffset),
+      size: uint32(filterEndOffset - filterStartOffset)
+    )
 
   # Determine if we should use partitioned index
   let numIndexEntries = writer.indexBlock.entries.len
@@ -284,15 +443,16 @@ proc finish*(writer: SsTableWriter): StorageResult[SsTable] =
       size: uint32(indexEndOffset - indexStartOffset)
     )
 
-  # Write footer (48 bytes for v3 with index mode)
+  # Write footer (v4 with filter mode)
   # - indexHandle (offset: 8, size: 4, uncompressedSize: 4) = 16 bytes
   # - filterHandle (offset: 8, size: 4, uncompressedSize: 4) = 16 bytes
   # - magic (8 bytes)
   # - version (4 bytes)
   # - indexMode (1 byte)
+  # - filterMode (1 byte)
   # - checksum (4 bytes)
   # - footerSize (4 bytes)
-  # Total = 53 bytes
+  # Total = 54 bytes
 
   # Index handle
   var indexOffsetLe = indexHandle.offset
@@ -323,20 +483,23 @@ proc finish*(writer: SsTableWriter): StorageResult[SsTable] =
   # Magic
   writer.stream.writeData(addr SSTABLE_MAGIC[0], 8)
 
-  # Version (3 = partitioned index support)
-  var versionLe: uint32 = 3
+  # Version (4 = partitioned filter support)
+  var versionLe: uint32 = 4
   littleEndian32(addr versionLe, addr versionLe)
   writer.stream.write(versionLe)
 
   # Index mode
   writer.stream.write(uint8(indexMode))
 
+  # Filter mode
+  writer.stream.write(uint8(filterMode))
+
   # Checksum (placeholder)
   var checksumLe: uint32 = 0
   writer.stream.write(checksumLe)
 
   # Footer size
-  var footerSizeLe: uint32 = 53
+  var footerSizeLe: uint32 = 54
   littleEndian32(addr footerSizeLe, addr footerSizeLe)
   writer.stream.write(footerSizeLe)
 

@@ -47,21 +47,48 @@ proc readSsTableEntries*(path: string): StorageResult[seq[MergeEntry]] =
   let reader = readerResult.value
   var entries: seq[MergeEntry] = @[]
 
-  for idxEntry in reader.indexBlock.entries:
-    let blockResult = readDataBlock(reader.stream, idxEntry.handle)
-    if blockResult.isErr:
-      reader.close()
-      return err[seq[MergeEntry], StorageError](blockResult.error)
+  # Handle both partitioned and full index modes
+  if reader.indexMode == imPartitioned:
+    # Partitioned index: iterate through top level index and load each index block
+    for tliEntry in reader.topLevelIndex.entries:
+      let idxBlockResult = readIndexBlock(reader.stream, tliEntry.handle)
+      if idxBlockResult.isErr:
+        reader.close()
+        return err[seq[MergeEntry], StorageError](idxBlockResult.error)
 
-    let dataBlk = blockResult.value
-    for blkEntry in dataBlk.entries:
-      entries.add(MergeEntry(
-        key: blkEntry.key,
-        value: blkEntry.value,
-        seqno: blkEntry.seqno,
-        valueType: ValueType(blkEntry.valueType),
-        sourceIdx: 0
-      ))
+      let idxBlock = idxBlockResult.value
+      for idxEntry in idxBlock.entries:
+        let blockResult = readDataBlock(reader.stream, idxEntry.handle)
+        if blockResult.isErr:
+          reader.close()
+          return err[seq[MergeEntry], StorageError](blockResult.error)
+
+        let dataBlk = blockResult.value
+        for blkEntry in dataBlk.entries:
+          entries.add(MergeEntry(
+            key: blkEntry.key,
+            value: blkEntry.value,
+            seqno: blkEntry.seqno,
+            valueType: ValueType(blkEntry.valueType),
+            sourceIdx: 0
+          ))
+  else:
+    # Full index: use the single index block
+    for idxEntry in reader.indexBlock.entries:
+      let blockResult = readDataBlock(reader.stream, idxEntry.handle)
+      if blockResult.isErr:
+        reader.close()
+        return err[seq[MergeEntry], StorageError](blockResult.error)
+
+      let dataBlk = blockResult.value
+      for blkEntry in dataBlk.entries:
+        entries.add(MergeEntry(
+          key: blkEntry.key,
+          value: blkEntry.value,
+          seqno: blkEntry.seqno,
+          valueType: ValueType(blkEntry.valueType),
+          sourceIdx: 0
+        ))
 
   reader.close()
   return ok[seq[MergeEntry], StorageError](entries)

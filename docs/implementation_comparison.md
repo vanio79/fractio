@@ -807,7 +807,8 @@ The Fractio Nim implementation covers all core functionality of Fjall Rust:
 | Category | Difference | Impact | Priority |
 |----------|------------|--------|----------|
 | **Optimistic TX** | Check current state vs Oracle | Simpler but less precise | Low |
-| **LSM Tree** | No filter block partitioning | Higher memory for large tables | Low |
+
+**Note:** This is a design difference, not a bug. Both approaches are correct; the Nim implementation is simpler but may have slightly higher false-positive conflict rates in high-contention scenarios.
 
 ### Completed 2026-02-22 ✅
 
@@ -818,6 +819,16 @@ The Fractio Nim implementation covers all core functionality of Fjall Rust:
 | **`journal_count()`** | Returns number of journal files (sealed + active) |
 | **`cache_capacity()`** | Returns block cache capacity |
 | **Worker 0 flush priority** | Worker 0 prioritizes flush over compaction |
+| **Filter block partitioning** | Two-level filter index for large SSTables (reduces memory) |
+| **v4 footer format** | 54-byte footer with indexMode and filterMode |
+
+### Bug Fixes 2026-02-22
+
+| Issue | Fix |
+|-------|-----|
+| readSsTableEntries with partitioned index | Now iterates through TLI entries and loads index blocks on demand |
+| Reader v4 footer support | Added 54-byte footer parsing (was only v1-v3) |
+| readIndexBlock export | Exported for use in compaction module |
 
 **Tests Status:**
 - 9 batch tests

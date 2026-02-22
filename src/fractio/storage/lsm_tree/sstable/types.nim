@@ -25,6 +25,12 @@ const INDEX_BLOCK_ENTRIES* = 64
 # This is the number of data blocks, not key-value entries
 const MIN_INDEX_ENTRIES_FOR_PARTITION* = 8
 
+# Minimum data blocks to trigger filter partitioning
+const MIN_FILTER_ENTRIES_FOR_PARTITION * = 16
+
+# Target data blocks per filter partition
+const FILTER_BLOCK_ENTRIES* = 128
+
 # Block type
 type
   BlockType* = enum
@@ -33,6 +39,7 @@ type
     btFilter = 3        ## Filter block (bloom filter)
     btFooter = 4        ## Footer (file metadata)
     btTopLevelIndex = 5 ## Top level index block (for partitioned index)
+    btTopLevelFilter = 6 ## Top level filter index block (for partitioned filters)
 
 # Block header
 type
@@ -105,16 +112,39 @@ type
     imFull        ## Full index - single level, all entries in memory
     imPartitioned ## Partitioned index - two level, TLI in memory
 
+# Filter mode
+type
+  FilterMode* = enum
+    fmFull        ## Full filter - single bloom filter for entire SSTable
+    fmPartitioned ## Partitioned filter - multiple bloom filters, TLI in memory
+
+# Top Level Filter Index entry - points to a filter block
+type
+  TopLevelFilterEntry* = object
+    firstKey*: string    # First key in the data blocks covered by this filter
+    lastKey*: string     # Last key in the data blocks covered by this filter
+    handle*: BlockHandle # Pointer to filter block
+
+# Top Level Filter Index - always in memory for partitioned filters
+type
+  TopLevelFilterIndex* = ref object
+    ## Top-level index for partitioned bloom filters.
+    ## Always loaded in memory, contains pointers to filter blocks.
+    ## Each entry points to a bloom filter that covers a range of data blocks.
+    entries*: seq[TopLevelFilterEntry]
+    isPartitioned*: bool # True if this SSTable uses partitioned filters
+
 # SSTable footer
 type
   SsTableFooter* = object
     magic*: array[8, byte]
     version*: uint32
-    indexHandle*: BlockHandle  # Points to index block (full) or TLI (partitioned)
-    filterHandle*: BlockHandle # Points to bloom filter block
+    indexHandle*: BlockHandle # Points to index block (full) or TLI (partitioned)
+    filterHandle*: BlockHandle # Points to bloom filter block or TLI (partitioned)
     metaIndexHandle*: BlockHandle
     checksum*: uint32
-    indexMode*: IndexMode      # v3+: Index mode (full or partitioned)
+    indexMode*: IndexMode     # v3+: Index mode (full or partitioned)
+    filterMode*: FilterMode   # v4+: Filter mode (full or partitioned)
 
 const SSTABLE_MAGIC* = [byte('S'), byte('S'), byte('T'), byte('B'),
                         byte('L'), byte('K'), byte('V'), byte('1')]

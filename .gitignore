@@ -49,3 +49,6 @@ config.local.nim
 
 # OS-specific
 Thumbs.db
+# Benchmark binaries
+benchmarks/fractio_bench
+benchmarks/fjall_bench/target/

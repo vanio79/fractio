@@ -32,7 +32,7 @@ type
 
 proc readFooter(strm: Stream, fileSize: int64): StorageResult[SsTableFooter] =
   ## Read the SSTable footer.
-  ## Supports v1 (32 bytes), v2 (44 bytes), and v3 (53 bytes) footer formats.
+  ## Supports v1 (32 bytes), v2 (44 bytes), v3 (53 bytes), and v4 (54 bytes) footer formats.
 
   # First, read the last 4 bytes to get footer size
   strm.setPosition(int(fileSize - 4))
@@ -42,7 +42,45 @@ proc readFooter(strm: Stream, fileSize: int64): StorageResult[SsTableFooter] =
 
   var footer = SsTableFooter()
 
-  if footerSize == 53:
+  if footerSize == 54:
+    # Version 4 footer (includes filter mode)
+    strm.setPosition(int(fileSize - 54))
+
+    var offsetLe: uint64 = strm.readUInt64()
+    littleEndian64(addr footer.indexHandle.offset, addr offsetLe)
+
+    var sizeLe: uint32 = strm.readUInt32()
+    littleEndian32(addr footer.indexHandle.size, addr sizeLe)
+
+    var uncompressedLe: uint32 = strm.readUInt32()
+    littleEndian32(addr footer.indexHandle.uncompressedSize,
+        addr uncompressedLe)
+
+    offsetLe = strm.readUInt64()
+    littleEndian64(addr footer.filterHandle.offset, addr offsetLe)
+
+    sizeLe = strm.readUInt32()
+    littleEndian32(addr footer.filterHandle.size, addr sizeLe)
+
+    uncompressedLe = strm.readUInt32()
+    littleEndian32(addr footer.filterHandle.uncompressedSize,
+        addr uncompressedLe)
+
+    for i in 0 ..< 8:
+      footer.magic[i] = strm.readUInt8()
+
+    var versionLe: uint32 = strm.readUInt32()
+    littleEndian32(addr footer.version, addr versionLe)
+
+    # Read index mode
+    footer.indexMode = IndexMode(strm.readUInt8())
+
+    # Read filter mode
+    footer.filterMode = FilterMode(strm.readUInt8())
+
+    footer.checksum = strm.readUInt32()
+
+  elif footerSize == 53:
     # Version 3 footer (includes index mode)
     strm.setPosition(int(fileSize - 53))
 
@@ -76,6 +114,7 @@ proc readFooter(strm: Stream, fileSize: int64): StorageResult[SsTableFooter] =
     footer.indexMode = IndexMode(strm.readUInt8())
 
     footer.checksum = strm.readUInt32()
+    footer.filterMode = fmFull # v3 always uses full filter
 
   elif footerSize == 44:
     # Version 2 footer (includes bloom filter)
@@ -101,6 +140,7 @@ proc readFooter(strm: Stream, fileSize: int64): StorageResult[SsTableFooter] =
 
     footer.checksum = strm.readUInt32()
     footer.indexMode = imFull # v2 always uses full index
+    footer.filterMode = fmFull # v2 always uses full filter
 
   elif footerSize == 32:
     # Version 1 footer (no bloom filter)
@@ -123,6 +163,7 @@ proc readFooter(strm: Stream, fileSize: int64): StorageResult[SsTableFooter] =
     # No filter in v1
     footer.filterHandle = BlockHandle(offset: 0, size: 0)
     footer.indexMode = imFull # v1 always uses full index
+    footer.filterMode = fmFull # v1 always uses full filter
   else:
     return err[SsTableFooter, StorageError](StorageError(
       kind: seInvalidVersion, invalidVersion: none(FormatVersion)))
@@ -133,7 +174,7 @@ proc readFooter(strm: Stream, fileSize: int64): StorageResult[SsTableFooter] =
 
   return ok[SsTableFooter, StorageError](footer)
 
-proc readIndexBlock(strm: Stream, hdl: BlockHandle): StorageResult[IndexBlock] =
+proc readIndexBlock*(strm: Stream, hdl: BlockHandle): StorageResult[IndexBlock] =
   # Position at start of index block data (AFTER block type byte)
   strm.setPosition(int(hdl.offset))
 
