@@ -248,36 +248,38 @@ compare_results() {
     echo "  fjall:   $(basename $FJALL_JSON)"
     echo ""
     
-    # Create comparison table
-    echo -e "${BOLD}"
+    # Create comparison table for throughput
+    echo -e "${BOLD}Throughput (ops/sec):${NC}"
     printf "%-25s %15s %15s %15s %15s\n" "Benchmark" "Fractio" "fjall" "Diff %" "Winner"
     echo "-----------------------------------------------------------------------------------------------------------"
-    echo -e "${NC}"
-    
-    # List of benchmarks to compare
-    BENCHMARKS=("sequential_writes" "random_writes" "sequential_reads" "random_reads" 
-                "range_scan" "prefix_scan" "deletions" "batch_writes" "contains_key")
     
     FRACTIO_WINS=0
     FJALL_WINS=0
     
     for bench in sequential_writes random_writes sequential_reads random_reads range_scan prefix_scan deletions batch_writes contains_key; do
-        # Extract ops_per_sec from JSON files using grep and sed
-        FRACTIO_OPS=$(grep "\"$bench\"" "$FRACTIO_JSON" 2>/dev/null | grep -oE '"ops_per_sec": [0-9.]+' | grep -oE '[0-9.]+$')
-        FJALL_OPS=$(grep "\"$bench\"" "$FJALL_JSON" 2>/dev/null | grep -oE '"ops_per_sec": [0-9.]+' | grep -oE '[0-9.]+$')
+        # Extract ops_per_sec from JSON files using jq if available, otherwise use grep
+        if command -v jq &> /dev/null; then
+            FRACTIO_OPS=$(jq -r ".results[\"$bench\"].ops_per_sec" "$FRACTIO_JSON" 2>/dev/null)
+            FJALL_OPS=$(jq -r ".results[\"$bench\"].ops_per_sec" "$FJALL_JSON" 2>/dev/null)
+        else
+            # Fallback to grep for systems without jq
+            FRACTIO_OPS=$(grep -A 10 "\"$bench\"" "$FRACTIO_JSON" 2>/dev/null | grep '"ops_per_sec"' | grep -oE '[0-9.]+')
+            FJALL_OPS=$(grep -A 10 "\"$bench\"" "$FJALL_JSON" 2>/dev/null | grep '"ops_per_sec"' | grep -oE '[0-9.]+')
+        fi
         
-        if [ -z "$FRACTIO_OPS" ] || [ -z "$FJALL_OPS" ]; then
+        # Validate that we got numeric values
+        if [ -z "$FRACTIO_OPS" ] || [ -z "$FJALL_OPS" ] || ! [[ "$FRACTIO_OPS" =~ ^[0-9.]+$ ]] || ! [[ "$FJALL_OPS" =~ ^[0-9.]+$ ]]; then
             continue
         fi
         
         # Calculate percentage difference
-        IS_FRACTIO_FASTER=$(echo "$FRACTIO_OPS > $FJALL_OPS" | bc -l)
+        IS_FRACTIO_FASTER=$(echo "$FRACTIO_OPS > $FJALL_OPS" | bc -l 2>/dev/null)
         if [ "$IS_FRACTIO_FASTER" = "1" ]; then
-            DIFF=$(echo "scale=2; (($FRACTIO_OPS - $FJALL_OPS) / $FJALL_OPS) * 100" | bc)
+            DIFF=$(echo "scale=2; (($FRACTIO_OPS - $FJALL_OPS) / $FJALL_OPS) * 100" | bc 2>/dev/null)
             WINNER="${GREEN}Fractio${NC}"
             FRACTIO_WINS=$((FRACTIO_WINS + 1))
         else
-            DIFF=$(echo "scale=2; (($FJALL_OPS - $FRACTIO_OPS) / $FRACTIO_OPS) * 100" | bc)
+            DIFF=$(echo "scale=2; (($FJALL_OPS - $FRACTIO_OPS) / $FRACTIO_OPS) * 100" | bc 2>/dev/null)
             WINNER="${BLUE}fjall${NC}"
             FJALL_WINS=$((FJALL_WINS + 1))
         fi
@@ -287,9 +289,212 @@ compare_results() {
     done
     
     echo ""
+    
+    # Create comparison table for latency (lower is better)
+    echo -e "${BOLD}Latency (microseconds):${NC}"
+    printf "%-25s %15s %15s %15s %15s\n" "Benchmark" "Fractio" "fjall" "Diff %" "Winner"
+    echo "-----------------------------------------------------------------------------------------------------------"
+    
+    FRACTIO_LATENCY_WINS=0
+    FJALL_LATENCY_WINS=0
+    
+    for bench in sequential_writes random_writes sequential_reads random_reads range_scan prefix_scan deletions batch_writes contains_key; do
+        # Extract latency from JSON files
+        if command -v jq &> /dev/null; then
+            FRACTIO_LATENCY=$(jq -r ".results[\"$bench\"].latency_us" "$FRACTIO_JSON" 2>/dev/null)
+            FJALL_LATENCY=$(jq -r ".results[\"$bench\"].latency_us" "$FJALL_JSON" 2>/dev/null)
+        else
+            # Fallback to grep
+            FRACTIO_LATENCY=$(grep -A 10 "\"$bench\"" "$FRACTIO_JSON" 2>/dev/null | grep '"latency_us"' | grep -oE '[0-9.]+')
+            FJALL_LATENCY=$(grep -A 10 "\"$bench\"" "$FJALL_JSON" 2>/dev/null | grep '"latency_us"' | grep -oE '[0-9.]+')
+        fi
+        
+        # Validate that we got numeric values
+        if [ -z "$FRACTIO_LATENCY" ] || [ -z "$FJALL_LATENCY" ] || ! [[ "$FRACTIO_LATENCY" =~ ^[0-9.]+$ ]] || ! [[ "$FJALL_LATENCY" =~ ^[0-9.]+$ ]]; then
+            continue
+        fi
+        
+        # For latency, lower is better
+        IS_FRACTIO_FASTER=$(echo "$FRACTIO_LATENCY < $FJALL_LATENCY" | bc -l 2>/dev/null)
+        if [ "$IS_FRACTIO_FASTER" = "1" ]; then
+            if [ "$(echo "$FJALL_LATENCY > 0" | bc -l 2>/dev/null)" = "1" ]; then
+                DIFF=$(echo "scale=2; (($FJALL_LATENCY - $FRACTIO_LATENCY) / $FJALL_LATENCY) * 100" | bc 2>/dev/null)
+            else
+                DIFF=0
+            fi
+            WINNER="${GREEN}Fractio${NC}"
+            FRACTIO_LATENCY_WINS=$((FRACTIO_LATENCY_WINS + 1))
+        else
+            if [ "$(echo "$FRACTIO_LATENCY > 0" | bc -l 2>/dev/null)" = "1" ]; then
+                DIFF=$(echo "scale=2; (($FRACTIO_LATENCY - $FJALL_LATENCY) / $FRACTIO_LATENCY) * 100" | bc 2>/dev/null)
+            else
+                DIFF=0
+            fi
+            WINNER="${BLUE}fjall${NC}"
+            FJALL_LATENCY_WINS=$((FJALL_LATENCY_WINS + 1))
+        fi
+        
+        printf "%-25s %15.2f %15.2f %+14.1f%% " "$bench" "$FRACTIO_LATENCY" "$FJALL_LATENCY" "$DIFF"
+        echo -e "$WINNER"
+    done
+    
+    echo ""
+    
+    # Create comparison table for memory usage
+    echo -e "${BOLD}Memory Usage (MB):${NC}"
+    printf "%-25s %15s %15s %15s %15s\n" "Benchmark" "Fractio" "fjall" "Diff %" "Winner"
+    echo "-----------------------------------------------------------------------------------------------------------"
+    
+    FRACTIO_MEMORY_WINS=0
+    FJALL_MEMORY_WINS=0
+    
+    for bench in sequential_writes random_writes sequential_reads random_reads range_scan prefix_scan deletions batch_writes contains_key; do
+        # Extract memory usage from JSON files
+        if command -v jq &> /dev/null; then
+            FRACTIO_MEMORY=$(jq -r ".results[\"$bench\"].memory_mb" "$FRACTIO_JSON" 2>/dev/null)
+            FJALL_MEMORY=$(jq -r ".results[\"$bench\"].memory_mb" "$FJALL_JSON" 2>/dev/null)
+        else
+            # Fallback to grep
+            FRACTIO_MEMORY=$(grep -A 10 "\"$bench\"" "$FRACTIO_JSON" 2>/dev/null | grep '"memory_mb"' | grep -oE '[0-9.]+')
+            FJALL_MEMORY=$(grep -A 10 "\"$bench\"" "$FJALL_JSON" 2>/dev/null | grep '"memory_mb"' | grep -oE '[0-9.]+')
+        fi
+        
+        # Validate that we got numeric values
+        if [ -z "$FRACTIO_MEMORY" ] || [ -z "$FJALL_MEMORY" ] || ! [[ "$FRACTIO_MEMORY" =~ ^[0-9.]+$ ]] || ! [[ "$FJALL_MEMORY" =~ ^[0-9.]+$ ]]; then
+            continue
+        fi
+        
+        # For memory, lower is better
+        IS_FRACTIO_BETTER=$(echo "$FRACTIO_MEMORY < $FJALL_MEMORY" | bc -l 2>/dev/null)
+        if [ "$IS_FRACTIO_BETTER" = "1" ]; then
+            if [ "$(echo "$FJALL_MEMORY > 0" | bc -l 2>/dev/null)" = "1" ]; then
+                DIFF=$(echo "scale=2; (($FJALL_MEMORY - $FRACTIO_MEMORY) / $FJALL_MEMORY) * 100" | bc 2>/dev/null)
+            else
+                DIFF=0
+            fi
+            WINNER="${GREEN}Fractio${NC}"
+            FRACTIO_MEMORY_WINS=$((FRACTIO_MEMORY_WINS + 1))
+        else
+            if [ "$(echo "$FRACTIO_MEMORY > 0" | bc -l 2>/dev/null)" = "1" ]; then
+                DIFF=$(echo "scale=2; (($FRACTIO_MEMORY - $FJALL_MEMORY) / $FRACTIO_MEMORY) * 100" | bc 2>/dev/null)
+            else
+                DIFF=0
+            fi
+            WINNER="${BLUE}fjall${NC}"
+            FJALL_MEMORY_WINS=$((FJALL_MEMORY_WINS + 1))
+        fi
+        
+        printf "%-25s %15.2f %15.2f %+14.1f%% " "$bench" "$FRACTIO_MEMORY" "$FJALL_MEMORY" "$DIFF"
+        echo -e "$WINNER"
+    done
+    
+    echo ""
+    
+    # Create comparison table for CPU usage
+    echo -e "${BOLD}CPU Usage (%):${NC}"
+    printf "%-25s %15s %15s %15s %15s\n" "Benchmark" "Fractio" "fjall" "Diff %" "Winner"
+    echo "-----------------------------------------------------------------------------------------------------------"
+    
+    FRACTIO_CPU_WINS=0
+    FJALL_CPU_WINS=0
+    
+    for bench in sequential_writes random_writes sequential_reads random_reads range_scan prefix_scan deletions batch_writes contains_key; do
+        # Extract CPU usage from JSON files
+        if command -v jq &> /dev/null; then
+            FRACTIO_CPU=$(jq -r ".results[\"$bench\"].cpu_percent" "$FRACTIO_JSON" 2>/dev/null)
+            FJALL_CPU=$(jq -r ".results[\"$bench\"].cpu_percent" "$FJALL_JSON" 2>/dev/null)
+        else
+            # Fallback to grep
+            FRACTIO_CPU=$(grep -A 10 "\"$bench\"" "$FRACTIO_JSON" 2>/dev/null | grep '"cpu_percent"' | grep -oE '[0-9.]+')
+            FJALL_CPU=$(grep -A 10 "\"$bench\"" "$FJALL_JSON" 2>/dev/null | grep '"cpu_percent"' | grep -oE '[0-9.]+')
+        fi
+        
+        # Validate that we got numeric values
+        if [ -z "$FRACTIO_CPU" ] || [ -z "$FJALL_CPU" ] || ! [[ "$FRACTIO_CPU" =~ ^[0-9.]+$ ]] || ! [[ "$FJALL_CPU" =~ ^[0-9.]+$ ]]; then
+            continue
+        fi
+        
+        # For CPU, lower is better
+        IS_FRACTIO_BETTER=$(echo "$FRACTIO_CPU < $FJALL_CPU" | bc -l 2>/dev/null)
+        if [ "$IS_FRACTIO_BETTER" = "1" ]; then
+            if [ "$(echo "$FJALL_CPU > 0" | bc -l 2>/dev/null)" = "1" ]; then
+                DIFF=$(echo "scale=2; (($FJALL_CPU - $FRACTIO_CPU) / $FJALL_CPU) * 100" | bc 2>/dev/null)
+            else
+                DIFF=0
+            fi
+            WINNER="${GREEN}Fractio${NC}"
+            FRACTIO_CPU_WINS=$((FRACTIO_CPU_WINS + 1))
+        else
+            if [ "$(echo "$FRACTIO_CPU > 0" | bc -l 2>/dev/null)" = "1" ]; then
+                DIFF=$(echo "scale=2; (($FRACTIO_CPU - $FJALL_CPU) / $FRACTIO_CPU) * 100" | bc 2>/dev/null)
+            else
+                DIFF=0
+            fi
+            WINNER="${BLUE}fjall${NC}"
+            FJALL_CPU_WINS=$((FJALL_CPU_WINS + 1))
+        fi
+        
+        printf "%-25s %15.2f %15.2f %+14.1f%% " "$bench" "$FRACTIO_CPU" "$FJALL_CPU" "$DIFF"
+        echo -e "$WINNER"
+    done
+    
+    echo ""
+    
+    # Create comparison table for disk I/O
+    echo -e "${BOLD}Disk I/O (MB):${NC}"
+    printf "%-25s %15s %15s %15s %15s\n" "Benchmark" "Fractio" "fjall" "Diff %" "Winner"
+    echo "-----------------------------------------------------------------------------------------------------------"
+    
+    FRACTIO_IO_WINS=0
+    FJALL_IO_WINS=0
+    
+    for bench in sequential_writes random_writes sequential_reads random_reads range_scan prefix_scan deletions batch_writes contains_key; do
+        # Extract disk usage from JSON files
+        if command -v jq &> /dev/null; then
+            FRACTIO_DISK=$(jq -r ".results[\"$bench\"].disk_mb" "$FRACTIO_JSON" 2>/dev/null)
+            FJALL_DISK=$(jq -r ".results[\"$bench\"].disk_mb" "$FJALL_JSON" 2>/dev/null)
+        else
+            # Fallback to grep
+            FRACTIO_DISK=$(grep -A 10 "\"$bench\"" "$FRACTIO_JSON" 2>/dev/null | grep '"disk_mb"' | grep -oE '[0-9.]+')
+            FJALL_DISK=$(grep -A 10 "\"$bench\"" "$FJALL_JSON" 2>/dev/null | grep '"disk_mb"' | grep -oE '[0-9.]+')
+        fi
+        
+        # Validate that we got numeric values
+        if [ -z "$FRACTIO_DISK" ] || [ -z "$FJALL_DISK" ] || ! [[ "$FRACTIO_DISK" =~ ^[0-9.]+$ ]] || ! [[ "$FJALL_DISK" =~ ^[0-9.]+$ ]]; then
+            continue
+        fi
+        
+        # For disk I/O, lower is better
+        IS_FRACTIO_BETTER=$(echo "$FRACTIO_DISK < $FJALL_DISK" | bc -l 2>/dev/null)
+        if [ "$IS_FRACTIO_BETTER" = "1" ]; then
+            if [ "$(echo "$FJALL_DISK > 0" | bc -l 2>/dev/null)" = "1" ]; then
+                DIFF=$(echo "scale=2; (($FJALL_DISK - $FRACTIO_DISK) / $FJALL_DISK) * 100" | bc 2>/dev/null)
+            else
+                DIFF=0
+            fi
+            WINNER="${GREEN}Fractio${NC}"
+            FRACTIO_IO_WINS=$((FRACTIO_IO_WINS + 1))
+        else
+            if [ "$(echo "$FRACTIO_DISK > 0" | bc -l 2>/dev/null)" = "1" ]; then
+                DIFF=$(echo "scale=2; (($FRACTIO_DISK - $FJALL_DISK) / $FRACTIO_DISK) * 100" | bc 2>/dev/null)
+            else
+                DIFF=0
+            fi
+            WINNER="${BLUE}fjall${NC}"
+            FJALL_IO_WINS=$((FJALL_IO_WINS + 1))
+        fi
+        
+        printf "%-25s %15.2f %15.2f %+14.1f%% " "$bench" "$FRACTIO_DISK" "$FJALL_DISK" "$DIFF"
+        echo -e "$WINNER"
+    done
+    
+    echo ""
     echo -e "${BOLD}Summary:${NC}"
-    echo -e "  Fractio wins: ${GREEN}$FRACTIO_WINS${NC} benchmarks"
-    echo -e "  fjall wins:   ${BLUE}$FJALL_WINS${NC} benchmarks"
+    echo -e "  Throughput - Fractio wins: ${GREEN}$FRACTIO_WINS${NC} | fjall wins: ${BLUE}$FJALL_WINS${NC}"
+    echo -e "  Latency    - Fractio wins: ${GREEN}$FRACTIO_LATENCY_WINS${NC} | fjall wins: ${BLUE}$FJALL_LATENCY_WINS${NC}"
+    echo -e "  Memory     - Fractio wins: ${GREEN}$FRACTIO_MEMORY_WINS${NC} | fjall wins: ${BLUE}$FJALL_MEMORY_WINS${NC}"
+    echo -e "  CPU        - Fractio wins: ${GREEN}$FRACTIO_CPU_WINS${NC} | fjall wins: ${BLUE}$FJALL_CPU_WINS${NC}"
+    echo -e "  Disk I/O   - Fractio wins: ${GREEN}$FRACTIO_IO_WINS${NC} | fjall wins: ${BLUE}$FJALL_IO_WINS${NC}"
     echo ""
     
     # Save comparison results
@@ -302,8 +507,11 @@ compare_results() {
         echo "  - Value size: $VALUE_SIZE bytes"
         echo ""
         echo "Results:"
-        echo "  - Fractio wins: $FRACTIO_WINS"
-        echo "  - fjall wins: $FJALL_WINS"
+        echo "  Throughput - Fractio wins: $FRACTIO_WINS | fjall wins: $FJALL_WINS"
+        echo "  Latency    - Fractio wins: $FRACTIO_LATENCY_WINS | fjall wins: $FJALL_LATENCY_WINS"
+        echo "  Memory     - Fractio wins: $FRACTIO_MEMORY_WINS | fjall wins: $FJALL_MEMORY_WINS"
+        echo "  CPU        - Fractio wins: $FRACTIO_CPU_WINS | fjall wins: $FJALL_CPU_WINS"
+        echo "  Disk I/O   - Fractio wins: $FRACTIO_IO_WINS | fjall wins: $FJALL_IO_WINS"
     } > "$RESULTS_DIR/comparison_$TIMESTAMP.md"
     
     echo "Results saved to: $RESULTS_DIR/"

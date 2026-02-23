@@ -17,6 +17,7 @@ import fractio/storage/keyspace/name
 import fractio/storage/keyspace/options as ksopts
 import fractio/storage/lsm_tree/[types as lsm_types]
 import fractio/storage/lsm_tree/lsm_tree
+import fractio/storage/lsm_tree/table_cache
 import fractio/storage/journal/writer # For PersistMode, BatchItem
 import std/[os, atomics, locks, tables, times, options, sequtils, streams, strutils]
 
@@ -692,6 +693,16 @@ proc close*(db: Database) =
   # Stop worker pool
   if db.inner.workerPool != nil:
     db.inner.workerPool.stop()
+
+  # Close table caches for each keyspace
+  db.inner.keyspacesLock.acquire()
+  defer: db.inner.keyspacesLock.release()
+  for name, ks in db.inner.keyspaces:
+    if ks.inner != nil and ks.inner.tree != nil and ks.inner.tree.tableCache != nil:
+      let cache = cast[TableReaderCache](ks.inner.tree.tableCache)
+      if cache != nil:
+        cache.close()
+        ks.inner.tree.tableCache = nil
 
   # Close descriptor table
   if db.inner.descriptorTable != nil:

@@ -129,6 +129,7 @@ type
     seqnoCounter*: SequenceNumberCounter
     snapshotTracker*: SnapshotTracker
     blockCache*: BlockCache    # LRU cache for SSTable data blocks
+    tableCache*: pointer       # TableReaderCache - cast to avoid circular dep
     counters*: MetricCounters  # Metric counters for this tree
 
 # Abstract tree interface

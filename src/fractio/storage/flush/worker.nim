@@ -17,7 +17,7 @@ proc run*(keyspace: ks.Keyspace,
           stats: var Stats): StorageResult[void] =
   ## Flushes the oldest sealed memtable to disk.
 
-  if keyspace == nil:
+  if keyspace == nil or keyspace.inner == nil or keyspace.inner.tree == nil:
     return okVoid
 
   # Try to flush the oldest sealed memtable
@@ -28,7 +28,7 @@ proc run*(keyspace: ks.Keyspace,
 
   let flushedBytes = flushResult.value
 
-  if flushedBytes > 0:
+  if flushedBytes > 0 and writeBufferManager != nil:
     # Free the write buffer space
     discard writeBufferManager.free(flushedBytes)
 

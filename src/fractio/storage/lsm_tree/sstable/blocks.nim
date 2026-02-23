@@ -8,7 +8,7 @@
 ## Optional hash index for fast point lookups.
 
 import ./types
-import fractio/storage/lsm_tree/types
+import fractio/storage/types as storage_types
 import fractio/storage/error
 import std/[streams, strutils, algorithm, endians, hashes]
 
@@ -105,7 +105,7 @@ proc buildHashIndex*(dataBlock: DataBlock,
 
 # Add entry to data block with prefix compression
 proc add*(dataBlock: DataBlock, key: string, value: string,
-          seqno: uint64, valueType: ValueType): bool =
+          seqno: uint64, valueType: storage_types.ValueType): bool =
   # Check if block is full
   let entrySize = 4 + key.len + 4 + value.len + 8 + 1 # Rough estimate
   if dataBlock.size > 0 and dataBlock.size + uint32(entrySize) > DEFAULT_BLOCK_SIZE:

@@ -11,7 +11,7 @@ suite "Keyspace Options Unit Tests":
   test "Default CreateOptions":
     let options = defaultCreateOptions()
     check options.manualJournalPersist == false
-    let expectedMemtable: uint64 = 64 * 1024 * 1024         # 64 MiB
+    let expectedMemtable: uint64 = 8 * 1024 * 1024 # 8 MiB (reduced for more frequent flushes)
     check options.maxMemtableSize == expectedMemtable
     check options.dataBlockHashRatioPolicy.ratio == 0.0
     check options.dataBlockSizePolicy.sizes.len == 1 # Has default size

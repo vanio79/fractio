@@ -64,6 +64,9 @@ type
                                     # Callback to request rotation - takes keyspace ID
     requestRotationCb*: proc(ksId: uint64) {.closure.}
 
+    # Flag to prevent multiple rotation requests
+    rotationPending*: bool
+
     lockFile*: LockedFileGuard
 
 # Handle to a keyspace
@@ -311,7 +314,10 @@ proc requestFlush*(keyspace: Keyspace) =
 
 # Check memtable rotate
 proc checkMemtableRotate*(keyspace: Keyspace, size: uint64) =
-  if size > keyspace.inner.config.maxMemtableSize:
+  # Only request rotation if not already pending and size exceeds threshold
+  if not keyspace.inner.rotationPending and size >
+      keyspace.inner.config.maxMemtableSize:
+    keyspace.inner.rotationPending = true
     # Pull up snapshot tracker watermark before rotation to allow GC of old versions
     keyspace.inner.supervisor.inner.snapshotTracker.pullup()
     keyspace.requestRotation()

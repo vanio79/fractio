@@ -1,17 +1,141 @@
-# Fractio (Nim) Storage Benchmark
+# Fractio (Nim) Storage Benchmark with OS-Level Metrics
 #
-# Measures performance of:
-# - Sequential writes
-# - Random writes
-# - Sequential reads
-# - Random reads
-# - Range scans
-# - Deletions
-# - Mixed workload
+# Measures performance using /proc filesystem:
+# - CPU time from /proc/self/stat
+# - Memory from /proc/self/status  
+# - I/O from /proc/self/io
+# - Disk space from directory listing
 
-import std/[os, strutils, strformat, times, random, tables, parseopt, json]
+import std/[os, strutils, strformat, times, random, tables, parseopt, json,
+    cpuinfo, algorithm]
 
 import fractio/storage/[db, keyspace, db_config, types, error, batch]
+
+# System resource usage metrics from /proc filesystem
+type
+  ResourceMetrics = object
+    cpuUserMs: uint64      # User CPU time in milliseconds
+    cpuSystemMs: uint64    # System CPU time in milliseconds
+    cpuTotalMs: uint64     # Total CPU time
+    memoryRssKb: uint64    # Resident set size in KB
+    memoryPeakKb: uint64   # Peak memory (high water mark) in KB
+    diskReadBytes: uint64  # Bytes read from disk
+    diskWriteBytes: uint64 # Bytes written to disk
+    diskReadOps: uint64    # Number of read syscalls
+    diskWriteOps: uint64   # Number of write syscalls
+
+proc readResourceMetrics(): ResourceMetrics =
+  result = ResourceMetrics()
+
+  # Read /proc/self/stat for CPU time
+  # Fields: pid (1), comm (2), state (3), ... utime (14), stime (15)
+  # Times are in jiffies (typically 100 Hz)
+  try:
+    let stat = readFile("/proc/self/stat")
+    let parts = stat.splitWhitespace()
+    if parts.len >= 17:
+      let clkTck = 100'u64 # sysconf(_SC_CLK_TCK), typically 100
+      let utime = parts[13].parseUInt()
+      let stime = parts[14].parseUInt()
+      result.cpuUserMs = utime * 1000'u64 div clkTck
+      result.cpuSystemMs = stime * 1000'u64 div clkTck
+      result.cpuTotalMs = result.cpuUserMs + result.cpuSystemMs
+  except:
+    discard
+
+  # Read /proc/self/status for memory
+  try:
+    let status = readFile("/proc/self/status")
+    for line in status.splitLines():
+      if line.startsWith("VmRSS:"):
+        let parts = line.splitWhitespace()
+        if parts.len >= 2:
+          result.memoryRssKb = parts[1].parseUInt()
+      elif line.startsWith("VmHWM:"):
+        let parts = line.splitWhitespace()
+        if parts.len >= 2:
+          result.memoryPeakKb = parts[1].parseUInt()
+  except:
+    discard
+
+  # Read /proc/self/io for I/O stats
+  try:
+    let io = readFile("/proc/self/io")
+    for line in io.splitLines():
+      if line.startsWith("read_bytes:"):
+        let parts = line.split(':')
+        if parts.len >= 2:
+          result.diskReadBytes = parts[1].strip().parseUInt()
+      elif line.startsWith("write_bytes:"):
+        let parts = line.split(':')
+        if parts.len >= 2:
+          result.diskWriteBytes = parts[1].strip().parseUInt()
+      elif line.startsWith("syscr:"):
+        let parts = line.split(':')
+        if parts.len >= 2:
+          result.diskReadOps = parts[1].strip().parseUInt()
+      elif line.startsWith("syscw:"):
+        let parts = line.split(':')
+        if parts.len >= 2:
+          result.diskWriteOps = parts[1].strip().parseUInt()
+  except:
+    discard
+
+proc diff(a, b: ResourceMetrics): ResourceMetrics =
+  result = ResourceMetrics(
+    cpuUserMs: a.cpuUserMs - b.cpuUserMs,
+    cpuSystemMs: a.cpuSystemMs - b.cpuSystemMs,
+    cpuTotalMs: a.cpuTotalMs - b.cpuTotalMs,
+    memoryRssKb: a.memoryRssKb,
+    memoryPeakKb: a.memoryPeakKb,
+    diskReadBytes: a.diskReadBytes - b.diskReadBytes,
+    diskWriteBytes: a.diskWriteBytes - b.diskWriteBytes,
+    diskReadOps: a.diskReadOps - b.diskReadOps,
+    diskWriteOps: a.diskWriteOps - b.diskWriteOps
+  )
+
+# Latency histogram for percentile calculation
+type
+  LatencyHistogram = object
+    samples: seq[uint64] # in microseconds
+
+proc initLatencyHistogram(): LatencyHistogram =
+  result.samples = @[]
+
+proc record(h: var LatencyHistogram, latencyUs: uint64) =
+  h.samples.add(latencyUs)
+
+proc percentile(h: LatencyHistogram, p: float): uint64 =
+  if h.samples.len == 0:
+    return 0
+  var sorted = h.samples
+  sorted.sort(system.cmp[uint64])
+  let idx = int((p / 100.0) * float(sorted.len - 1) + 0.5)
+  return sorted[min(idx, sorted.len - 1)]
+
+proc avg(h: LatencyHistogram): float =
+  if h.samples.len == 0:
+    return 0.0
+  var sum: uint64 = 0
+  for s in h.samples:
+    sum += s
+  return float(sum) / float(h.samples.len)
+
+proc minLatency(h: LatencyHistogram): uint64 =
+  if h.samples.len == 0:
+    return 0
+  result = high(uint64)
+  for s in h.samples:
+    if s < result:
+      result = s
+
+proc maxLatency(h: LatencyHistogram): uint64 =
+  if h.samples.len == 0:
+    return 0
+  result = 0
+  for s in h.samples:
+    if s > result:
+      result = s
 
 # Benchmark result for a single operation type
 type
@@ -20,27 +144,71 @@ type
     totalOps: uint64
     durationMs: uint64
     opsPerSec: float64
-    latencyUs: float64
-
-proc newBenchResult(name: string, totalOps: uint64,
-    duration: Duration): BenchResult =
-  let durationMs = duration.inMilliseconds.uint64
-  let durationSecs = duration.inMicroseconds.float64 / 1_000_000.0
-  let opsPerSec = if durationSecs > 0.0: totalOps.float64 /
-      durationSecs else: 0.0
-  let latencyUs = if totalOps > 0: duration.inMicroseconds.float64 /
-      totalOps.float64 else: 0.0
-
-  BenchResult(
-    name: name,
-    totalOps: totalOps,
-    durationMs: durationMs,
-    opsPerSec: opsPerSec,
-    latencyUs: latencyUs
-  )
+    latencyAvgUs: float64
+    latencyP50Us: uint64
+    latencyP95Us: uint64
+    latencyP99Us: uint64
+    latencyMinUs: uint64
+    latencyMaxUs: uint64
+    cpuUserMs: uint64
+    cpuSystemMs: uint64
+    cpuTotalMs: uint64
+    cpuPercent: float64
+    memoryRssMb: float64
+    memoryPeakMb: float64
+    diskReadMb: float64
+    diskWriteMb: float64
+    diskReadOps: uint64
+    diskWriteOps: uint64
+    iops: float64
+    diskTotalMb: float64
+    throughputMbPerSec: float64
+    diskReadBytes: uint64
+    diskWriteBytes: uint64
 
 proc print(self: BenchResult) =
-  echo fmt"  {self.name:<25} {self.totalOps:>10} ops in {self.durationMs:>6} ms | {self.opsPerSec:>12.2f} ops/s | {self.latencyUs:>8.2f} us/op"
+  echo fmt"  {self.name:<25} {self.totalOps:>10} ops in {self.durationMs:>6} ms | {self.opsPerSec:>12.2f} ops/s"
+  echo fmt"    Latency: avg={self.latencyAvgUs:.2f}us p50={self.latencyP50Us}us p95={self.latencyP95Us}us p99={self.latencyP99Us}us [min={self.latencyMinUs} max={self.latencyMaxUs}]"
+  echo fmt"    CPU: user={self.cpuUserMs}ms sys={self.cpuSystemMs}ms total={self.cpuTotalMs}ms ({self.cpuPercent:.1f}%)"
+  echo fmt"    Memory: RSS={self.memoryRssMb:.2f}MB Peak={self.memoryPeakMb:.2f}MB"
+  echo fmt"    Disk: read={self.diskReadMb:.2f}MB write={self.diskWriteMb:.2f}MB IOPS={self.iops:.0f} throughput={self.throughputMbPerSec:.2f}MB/s"
+
+proc toJson(self: BenchResult): string =
+  fmt"""{{ "ops": {self.totalOps}, "ops_per_sec": {self.opsPerSec:.2f}, "latency_us": {self.latencyAvgUs:.2f}, "cpu_percent": {self.cpuPercent:.2f}, "memory_mb": {self.memoryRssMb:.2f}, "disk_mb": {self.diskTotalMb:.2f}, "disk_read_bytes": {self.diskReadBytes}, "disk_write_bytes": {self.diskWriteBytes} }}"""
+
+# Get actual disk usage in bytes (using block count, not file size)
+# This properly accounts for sparse files
+proc getDirDiskUsage(path: string): uint64 =
+  result = 0
+  if dirExists(path):
+    for kind, entry in walkDir(path):
+      if kind == pcFile:
+        try:
+          # Use stat to get actual block count
+          let info = getFileInfo(entry)
+          # Block size is typically 512 bytes on Linux
+          # blocks * 512 = actual disk usage
+          let blockSize = 512'u64
+          let blocks = (info.size.uint64 + blockSize - 1) div blockSize
+          result += blocks * blockSize
+        except:
+          discard
+      elif kind == pcDir:
+        result += getDirDiskUsage(entry)
+
+# Legacy function for file size (kept for reference)
+proc getDirSize(path: string): uint64 =
+  result = 0
+  if dirExists(path):
+    for kind, entry in walkDir(path):
+      if kind == pcFile:
+        try:
+          let info = getFileInfo(entry)
+          result += info.size.uint64
+        except:
+          discard
+      elif kind == pcDir:
+        result += getDirSize(entry)
 
 # Generate a key of the specified size
 proc makeKey(prefix: string, i: uint64, keySize: int): string =
@@ -113,7 +281,7 @@ proc parseArgs(): Config =
           if p.kind == cmdArgument:
             result.dbPath = p.key
       of "help", "h":
-        echo "Fractio benchmark"
+        echo "Fractio benchmark with OS-level metrics"
         echo ""
         echo "Usage: fractio_bench [OPTIONS]"
         echo ""
@@ -128,6 +296,54 @@ proc parseArgs(): Config =
     of cmdEnd:
       break
 
+proc makeResult(name: string, totalOps: uint64, duration: Duration,
+                latency: LatencyHistogram,
+                    startRes: ResourceMetrics): BenchResult =
+  let endRes = readResourceMetrics()
+  let diff = endRes.diff(startRes)
+  let durationMs = duration.inMilliseconds.uint64
+  let durationSecs = duration.inMicroseconds.float64 / 1_000_000.0
+
+  let cpuPercent = if durationMs > 0:
+    (diff.cpuTotalMs.float64 / durationMs.float64) * 100.0
+  else:
+    0.0
+
+  let diskTotalMb = (diff.diskReadBytes + diff.diskWriteBytes).float64 / (
+      1024.0 * 1024.0)
+  let throughputMb = if durationSecs > 0.0: diskTotalMb / durationSecs else: 0.0
+  let iops = if durationSecs > 0.0:
+    (diff.diskReadOps + diff.diskWriteOps).float64 / durationSecs
+  else:
+    0.0
+
+  result = BenchResult(
+    name: name,
+    totalOps: totalOps,
+    durationMs: durationMs,
+    opsPerSec: if durationSecs > 0.0: totalOps.float64 / durationSecs else: 0.0,
+    latencyAvgUs: latency.avg(),
+    latencyP50Us: latency.percentile(50.0),
+    latencyP95Us: latency.percentile(95.0),
+    latencyP99Us: latency.percentile(99.0),
+    latencyMinUs: latency.minLatency(),
+    latencyMaxUs: latency.maxLatency(),
+    cpuUserMs: diff.cpuUserMs,
+    cpuSystemMs: diff.cpuSystemMs,
+    cpuTotalMs: diff.cpuTotalMs,
+    cpuPercent: cpuPercent,
+    memoryRssMb: endRes.memoryRssKb.float64 / 1024.0,
+    memoryPeakMb: endRes.memoryPeakKb.float64 / 1024.0,
+    diskReadMb: diff.diskReadBytes.float64 / (1024.0 * 1024.0),
+    diskWriteMb: diff.diskWriteBytes.float64 / (1024.0 * 1024.0),
+    diskReadOps: diff.diskReadOps,
+    diskWriteOps: diff.diskWriteOps,
+    iops: iops,
+    diskTotalMb: diskTotalMb,
+    throughputMbPerSec: throughputMb,
+    diskReadBytes: diff.diskReadBytes,
+    diskWriteBytes: diff.diskWriteBytes
+  )
 
 proc main() =
   let config = parseArgs()
@@ -139,6 +355,11 @@ proc main() =
   echo fmt"  Key size:    {config.keySize} bytes"
   echo fmt"  Value size:  {config.valueSize} bytes"
   echo fmt"  DB path:     {config.dbPath}"
+  echo ""
+
+  # Print system information
+  echo "System Information:"
+  echo fmt"  CPU:         {countProcessors()} cores"
   echo ""
 
   # Clean up existing database
@@ -165,23 +386,31 @@ proc main() =
 
   let ks = ksResult.value
 
+  # Track initial resources
+  discard readResourceMetrics()
+
   # ===========================================================================
   # Benchmark 1: Sequential Writes
   # ===========================================================================
   echo "Running sequential write benchmark..."
+  var latency = initLatencyHistogram()
+  var startRes = readResourceMetrics()
+  var startTime = cpuTime()
 
-  let startTime = cpuTime()
   for i in 0'u64 ..< config.numOps:
+    let opStart = cpuTime()
     let key = makeKey("seq", i, config.keySize)
     let value = makeValue(config.valueSize)
     let insertResult = ks.insert(key, value)
     if insertResult.isErr:
       echo "Insert error: ", insertResult.error
       break
-  let endTime = cpuTime()
-  let duration = initDuration(nanoseconds = ((endTime - startTime) *
+    latency.record(uint64((cpuTime() - opStart) * 1_000_000))
+
+  var endTime = cpuTime()
+  var duration = initDuration(nanoseconds = ((endTime - startTime) *
       1_000_000_000).int64)
-  let result = newBenchResult("sequential_writes", config.numOps, duration)
+  var result = makeResult("sequential_writes", config.numOps, duration, latency, startRes)
   result.print()
   results.add(result)
 
@@ -196,52 +425,70 @@ proc main() =
     indices.add(i)
   shuffle(indices)
 
-  let startTime2 = cpuTime()
+  latency = initLatencyHistogram()
+  startRes = readResourceMetrics()
+  startTime = cpuTime()
+
   for i in indices:
+    let opStart = cpuTime()
     let key = makeKey("rand", i, config.keySize)
     let value = makeValue(config.valueSize)
     let insertResult = ks.insert(key, value)
     if insertResult.isErr:
       echo "Insert error: ", insertResult.error
       break
-  let endTime2 = cpuTime()
-  let duration2 = initDuration(nanoseconds = ((endTime2 - startTime2) *
+    latency.record(uint64((cpuTime() - opStart) * 1_000_000))
+
+  endTime = cpuTime()
+  duration = initDuration(nanoseconds = ((endTime - startTime) *
       1_000_000_000).int64)
-  let result2 = newBenchResult("random_writes", config.numOps, duration2)
-  result2.print()
-  results.add(result2)
+  result = makeResult("random_writes", config.numOps, duration, latency, startRes)
+  result.print()
+  results.add(result)
 
   # ===========================================================================
   # Benchmark 3: Sequential Reads
   # ===========================================================================
   echo "Running sequential read benchmark..."
 
-  let startTime3 = cpuTime()
+  latency = initLatencyHistogram()
+  startRes = readResourceMetrics()
+  startTime = cpuTime()
+
   for i in 0'u64 ..< config.numOps:
+    let opStart = cpuTime()
     let key = makeKey("seq", i, config.keySize)
     discard ks.get(key)
-  let endTime3 = cpuTime()
-  let duration3 = initDuration(nanoseconds = ((endTime3 - startTime3) *
+    latency.record(uint64((cpuTime() - opStart) * 1_000_000))
+
+  endTime = cpuTime()
+  duration = initDuration(nanoseconds = ((endTime - startTime) *
       1_000_000_000).int64)
-  let result3 = newBenchResult("sequential_reads", config.numOps, duration3)
-  result3.print()
-  results.add(result3)
+  result = makeResult("sequential_reads", config.numOps, duration, latency, startRes)
+  result.print()
+  results.add(result)
 
   # ===========================================================================
   # Benchmark 4: Random Reads
   # ===========================================================================
   echo "Running random read benchmark..."
 
-  let startTime4 = cpuTime()
+  latency = initLatencyHistogram()
+  startRes = readResourceMetrics()
+  startTime = cpuTime()
+
   for i in indices:
+    let opStart = cpuTime()
     let key = makeKey("rand", i, config.keySize)
     discard ks.get(key)
-  let endTime4 = cpuTime()
-  let duration4 = initDuration(nanoseconds = ((endTime4 - startTime4) *
+    latency.record(uint64((cpuTime() - opStart) * 1_000_000))
+
+  endTime = cpuTime()
+  duration = initDuration(nanoseconds = ((endTime - startTime) *
       1_000_000_000).int64)
-  let result4 = newBenchResult("random_reads", config.numOps, duration4)
-  result4.print()
-  results.add(result4)
+  result = makeResult("random_reads", config.numOps, duration, latency, startRes)
+  result.print()
+  results.add(result)
 
   # ===========================================================================
   # Benchmark 5: Range Scan
@@ -255,36 +502,48 @@ proc main() =
     let value = makeValue(config.valueSize)
     discard ks.insert(key, value)
 
-  let startTime5 = cpuTime()
-  let iter = ks.rangeIter("scan_00000000", "scan_00009999")
+  latency = initLatencyHistogram()
+  startRes = readResourceMetrics()
+  startTime = cpuTime()
+
   var scanned: uint64 = 0
+  let opStart = cpuTime()
+  let iter = ks.rangeIter("scan_00000000", "scan_00009999")
   for entry in iter.entries:
     if entry.valueType == vtValue:
       scanned += 1
-  let endTime5 = cpuTime()
-  let duration5 = initDuration(nanoseconds = ((endTime5 - startTime5) *
+  latency.record(uint64((cpuTime() - opStart) * 1_000_000))
+
+  endTime = cpuTime()
+  duration = initDuration(nanoseconds = ((endTime - startTime) *
       1_000_000_000).int64)
-  let result5 = newBenchResult("range_scan", scanned, duration5)
-  result5.print()
-  results.add(result5)
+  result = makeResult("range_scan", scanned, duration, latency, startRes)
+  result.print()
+  results.add(result)
 
   # ===========================================================================
   # Benchmark 6: Prefix Scan
   # ===========================================================================
   echo "Running prefix scan benchmark..."
 
-  let startTime6 = cpuTime()
-  let prefixIter = ks.prefixIter("scan_")
+  latency = initLatencyHistogram()
+  startRes = readResourceMetrics()
+  startTime = cpuTime()
+
   var prefixScanned: uint64 = 0
+  let opStart2 = cpuTime()
+  let prefixIter = ks.prefixIter("scan_")
   for entry in prefixIter.entries:
     if entry.valueType == vtValue:
       prefixScanned += 1
-  let endTime6 = cpuTime()
-  let duration6 = initDuration(nanoseconds = ((endTime6 - startTime6) *
+  latency.record(uint64((cpuTime() - opStart2) * 1_000_000))
+
+  endTime = cpuTime()
+  duration = initDuration(nanoseconds = ((endTime - startTime) *
       1_000_000_000).int64)
-  let result6 = newBenchResult("prefix_scan", prefixScanned, duration6)
-  result6.print()
-  results.add(result6)
+  result = makeResult("prefix_scan", prefixScanned, duration, latency, startRes)
+  result.print()
+  results.add(result)
 
   # ===========================================================================
   # Benchmark 7: Deletions
@@ -292,16 +551,23 @@ proc main() =
   echo "Running deletion benchmark..."
 
   let deleteCount = config.numOps div 2
-  let startTime7 = cpuTime()
+
+  latency = initLatencyHistogram()
+  startRes = readResourceMetrics()
+  startTime = cpuTime()
+
   for i in 0'u64 ..< deleteCount:
+    let opStart = cpuTime()
     let key = makeKey("seq", i, config.keySize)
     discard ks.remove(key)
-  let endTime7 = cpuTime()
-  let duration7 = initDuration(nanoseconds = ((endTime7 - startTime7) *
+    latency.record(uint64((cpuTime() - opStart) * 1_000_000))
+
+  endTime = cpuTime()
+  duration = initDuration(nanoseconds = ((endTime - startTime) *
       1_000_000_000).int64)
-  let result7 = newBenchResult("deletions", deleteCount, duration7)
-  result7.print()
-  results.add(result7)
+  result = makeResult("deletions", deleteCount, duration, latency, startRes)
+  result.print()
+  results.add(result)
 
   # ===========================================================================
   # Benchmark 8: Batch Writes
@@ -311,11 +577,15 @@ proc main() =
   let batchOps = config.numOps div 10
   var batchOpsCount: uint64 = 0
 
-  let startTime8 = cpuTime()
+  latency = initLatencyHistogram()
+  startRes = readResourceMetrics()
+  startTime = cpuTime()
+
   var batchStart = 0'u64
   while batchStart < batchOps:
     let batchEnd = min(batchStart + config.batchSize.uint64, batchOps)
     var wb = db.batch()
+    let opStart = cpuTime()
 
     for i in batchStart ..< batchEnd:
       let key = makeKey("batch", i, config.keySize)
@@ -326,30 +596,45 @@ proc main() =
     let commitResult = db.commit(wb)
     if commitResult.isErr:
       echo "Batch commit error: ", commitResult.error
+    latency.record(uint64((cpuTime() - opStart) * 1_000_000))
 
     batchStart = batchEnd
-  let endTime8 = cpuTime()
-  let duration8 = initDuration(nanoseconds = ((endTime8 - startTime8) *
+
+  endTime = cpuTime()
+  duration = initDuration(nanoseconds = ((endTime - startTime) *
       1_000_000_000).int64)
-  let result8 = newBenchResult("batch_writes", batchOpsCount, duration8)
-  result8.print()
-  results.add(result8)
+  result = makeResult("batch_writes", batchOpsCount, duration, latency, startRes)
+  result.print()
+  results.add(result)
 
   # ===========================================================================
   # Benchmark 9: Contains Key
   # ===========================================================================
   echo "Running contains_key benchmark..."
 
-  let startTime9 = cpuTime()
+  latency = initLatencyHistogram()
+  startRes = readResourceMetrics()
+  startTime = cpuTime()
+
   for i in 0'u64 ..< config.numOps:
+    let opStart = cpuTime()
     let key = makeKey("rand", i, config.keySize)
     discard ks.containsKey(key)
-  let endTime9 = cpuTime()
-  let duration9 = initDuration(nanoseconds = ((endTime9 - startTime9) *
+    latency.record(uint64((cpuTime() - opStart) * 1_000_000))
+
+  endTime = cpuTime()
+  duration = initDuration(nanoseconds = ((endTime - startTime) *
       1_000_000_000).int64)
-  let result9 = newBenchResult("contains_key", config.numOps, duration9)
-  result9.print()
-  results.add(result9)
+  result = makeResult("contains_key", config.numOps, duration, latency, startRes)
+  result.print()
+  results.add(result)
+
+  # ===========================================================================
+  # Disk Space Summary
+  # ===========================================================================
+  let diskSize = getDirDiskUsage(config.dbPath) # Use actual disk blocks, not file size
+  echo ""
+  echo fmt"Disk Space Usage (actual blocks): {diskSize.float64 / (1024.0 * 1024.0):.2f} MB"
 
   # ===========================================================================
   # Summary
@@ -357,10 +642,10 @@ proc main() =
   echo ""
   echo "=== Summary ==="
   echo ""
-  echo "Benchmark                   Total Ops        Ops/sec Latency (us)"
-  echo "-".repeat(65)
+  echo "Benchmark                   Total Ops        Ops/sec Latency (us)   CPU%   Memory(MB)"
+  echo "-".repeat(85)
   for r in results:
-    echo fmt"{r.name:<25} {r.totalOps:>12} {r.opsPerSec:>15.2f} {r.latencyUs:>12.2f}"
+    echo fmt"{r.name:<25} {r.totalOps:>12} {r.opsPerSec:>15.2f} {r.latencyAvgUs:>12.2f} {r.cpuPercent:>6.1f}% {r.memoryRssMb:>12.2f}"
 
   # Output results in JSON format for comparison
   echo ""
@@ -372,15 +657,11 @@ proc main() =
   echo "    \"key_size\": " & $config.keySize & ","
   echo "    \"value_size\": " & $config.valueSize
   echo "  },"
+  echo "  \"disk_space_mb\": " & fmt"{diskSize.float64 / (1024.0 * 1024.0):.2f}" & ","
   echo "  \"results\": {"
   for i, r in results:
     let comma = if i < results.len - 1: "," else: ""
-    let opsPerSecStr = fmt"{r.opsPerSec:.2f}"
-    let latencyUsStr = fmt"{r.latencyUs:.2f}"
-    let line = "    \"" & r.name & "\": { \"ops\": " & $r.totalOps &
-               ", \"ops_per_sec\": " & opsPerSecStr &
-               ", \"latency_us\": " & latencyUsStr & " }" & comma
-    echo line
+    echo "    \"" & r.name & "\": " & r.toJson() & comma
   echo "  }"
   echo "}"
 

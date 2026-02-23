@@ -12,6 +12,7 @@ import fractio/storage/blob/writer as blob_writer_module
 import fractio/storage/blob/reader as blob_reader_module
 import fractio/storage/types as storage_types
 import fractio/storage/keyspace/options
+import fractio/storage/logging
 import ./types
 import ./memtable
 import ./sstable/writer
@@ -19,6 +20,7 @@ import ./sstable/reader
 import ./sstable/blob_integration
 import ./compaction
 import ./block_cache
+import ./table_cache
 import fractio/storage/snapshot_tracker
 import std/[os, atomics, locks, options, tables, streams, strutils, algorithm, times]
 
@@ -28,10 +30,10 @@ export storage_types.CompressionType
 # Default configuration values
 const
   DefaultLevelCount* = 7
-  DefaultMaxMemtableSize* = 64 * 1024 * 1024 # 64 MiB
-  DefaultBlockSize* = 4 * 1024               # 4 KiB
+  DefaultMaxMemtableSize* = 8 * 1024 * 1024 # 8 MiB - lowered for more frequent flushes
+  DefaultBlockSize* = 4 * 1024 # 4 KiB
   DefaultRestartInterval* = 16
-  DefaultBloomFpr* = 0.01                    # 1% false positive rate
+  DefaultBloomFpr* = 0.01      # 1% false positive rate
 
 # Get block size for a level
 proc getBlockSize*(config: LsmTreeConfig, level: int): uint32 =
@@ -239,6 +241,8 @@ proc newLsmTree*(config: LsmTreeConfig,
   memtableIdCounter.store(1'u64, moRelaxed)
   tableIdCounter.store(1'u64, moRelaxed)
 
+  let tableCache = newTableReaderCache(64) # Cache up to 64 open SSTables
+
   result = LsmTree(
     config: config,
     activeMemtable: newMemtable(),
@@ -249,6 +253,7 @@ proc newLsmTree*(config: LsmTreeConfig,
     seqnoCounter: seqnoCounter,
     snapshotTracker: snapshotTracker,
     blockCache: newBlockCache(config.cacheCapacity),
+    tableCache: cast[pointer](tableCache),
     counters: newMetricCounters()
   )
   initLock(result.versionLock)
@@ -414,16 +419,17 @@ proc get*(tree: LsmTree, key: string, seqno: uint64): Option[string] =
             return some(e.value)
 
   # Check SSTables (from newest to oldest, level 0 first)
+  let cache = cast[TableReaderCache](tree.tableCache)
   for table in tree.tables[0]:
     if table.path.len > 0:
-      let readerResult = openSsTable(table.path, table.id, tree.blockCache)
+      let readerResult = cache.get(table.path, table.id, tree.blockCache)
       if readerResult.isOk:
         let reader = readerResult.value
+        # Don't close - cache manages lifecycle
 
         if needsBlobResolution:
           let entry = reader.getEntry(key)
-          reader.close()
-          if entry.found:
+          if entry.found and entry.seqno <= seqno:
             let vt = cast[ValueType](entry.valueType)
             case vt
             of vtValue:
@@ -435,23 +441,31 @@ proc get*(tree: LsmTree, key: string, seqno: uint64): Option[string] =
                 blobCache = blob_reader_module.newBlobReaderCache()
               return resolveBlobValue(entry.value, blobPath, blobCache)
         else:
-          let value = reader.get(key)
-          reader.close()
-          if value.isSome:
-            return value
+          let entry = reader.getEntry(key)
+          if entry.found and entry.seqno <= seqno:
+            let vt = cast[ValueType](entry.valueType)
+            case vt
+            of vtValue:
+              return some(entry.value)
+            of vtTombstone, vtWeakTombstone:
+              return none(string)
+            of vtIndirection:
+              if blobCache == nil:
+                blobCache = blob_reader_module.newBlobReaderCache()
+              return resolveBlobValue(entry.value, blobPath, blobCache)
 
   # Check other levels (sorted, can use binary search)
   for level in 1 ..< tree.tables.len:
     for table in tree.tables[level]:
       if table.path.len > 0:
-        let readerResult = openSsTable(table.path, table.id, tree.blockCache)
+        let readerResult = cache.get(table.path, table.id, tree.blockCache)
         if readerResult.isOk:
           let reader = readerResult.value
+          # Don't close - cache manages lifecycle
 
           if needsBlobResolution:
             let entry = reader.getEntry(key)
-            reader.close()
-            if entry.found:
+            if entry.found and entry.seqno <= seqno:
               let vt = cast[ValueType](entry.valueType)
               case vt
               of vtValue:
@@ -463,10 +477,18 @@ proc get*(tree: LsmTree, key: string, seqno: uint64): Option[string] =
                   blobCache = blob_reader_module.newBlobReaderCache()
                 return resolveBlobValue(entry.value, blobPath, blobCache)
           else:
-            let value = reader.get(key)
-            reader.close()
-            if value.isSome:
-              return value
+            let entry = reader.getEntry(key)
+            if entry.found and entry.seqno <= seqno:
+              let vt = cast[ValueType](entry.valueType)
+              case vt
+              of vtValue:
+                return some(entry.value)
+              of vtTombstone, vtWeakTombstone:
+                return none(string)
+              of vtIndirection:
+                if blobCache == nil:
+                  blobCache = blob_reader_module.newBlobReaderCache()
+                return resolveBlobValue(entry.value, blobPath, blobCache)
 
   return none(string)
 
@@ -528,13 +550,15 @@ proc getWithSeqno*(tree: LsmTree, key: string, seqno: uint64): tuple[
             return (some(e.value), e.seqno)
 
   # Check SSTables (from newest to oldest, level 0 first)
+  let cache = cast[TableReaderCache](tree.tableCache)
   for table in tree.tables[0]:
     if table.path.len > 0:
-      let readerResult = openSsTable(table.path, table.id, tree.blockCache)
+      let readerResult = cache.get(table.path, table.id, tree.blockCache)
       if readerResult.isOk:
         let reader = readerResult.value
+        # Don't close - cache manages lifecycle
+
         let entry = reader.getEntry(key)
-        reader.close()
         if entry.found and entry.seqno <= seqno:
           let vt = cast[ValueType](entry.valueType)
           case vt
@@ -555,11 +579,12 @@ proc getWithSeqno*(tree: LsmTree, key: string, seqno: uint64): tuple[
   for level in 1 ..< tree.tables.len:
     for table in tree.tables[level]:
       if table.path.len > 0:
-        let readerResult = openSsTable(table.path, table.id, tree.blockCache)
+        let readerResult = cache.get(table.path, table.id, tree.blockCache)
         if readerResult.isOk:
           let reader = readerResult.value
+          # Don't close - cache manages lifecycle
+
           let entry = reader.getEntry(key)
-          reader.close()
           if entry.found and entry.seqno <= seqno:
             let vt = cast[ValueType](entry.valueType)
             case vt
@@ -825,6 +850,13 @@ proc majorCompact*(tree: LsmTree, targetSize: uint64,
     for table in tablesToCompact:
       tree.blockCache.invalidateSsTable(table.id)
 
+    # Invalidate table reader cache for old tables
+    let cache = cast[TableReaderCache](tree.tableCache)
+    if cache != nil:
+      for table in tablesToCompact:
+        if table.path.len > 0:
+          cache.invalidate(table.path)
+
     let deleteResult = deleteOldTables(tablesToCompact)
     if deleteResult.isErr:
       return err[void, StorageError](deleteResult.error)
@@ -866,6 +898,13 @@ proc majorCompact*(tree: LsmTree, targetSize: uint64,
   # Invalidate block cache for old tables before deletion
   for table in tablesToCompact:
     tree.blockCache.invalidateSsTable(table.id)
+
+  # Invalidate table reader cache for old tables
+  let cache = cast[TableReaderCache](tree.tableCache)
+  if cache != nil:
+    for table in tablesToCompact:
+      if table.path.len > 0:
+        cache.invalidate(table.path)
 
   # Delete old tables
   let deleteResult = deleteOldTables(tablesToCompact)
@@ -1150,10 +1189,13 @@ proc flushOldestSealed*(tree: LsmTree): StorageResult[uint64] =
   ## If KV separation is enabled, large values are stored in blob files
   ## and the SSTable stores BlobHandles as vtIndirection values.
 
+
   tree.versionLock.acquire()
+
   defer: tree.versionLock.release()
 
   if tree.sealedMemtables.len == 0:
+
     return ok[uint64, StorageError](0'u64)
 
   # Get the oldest sealed memtable
@@ -1171,6 +1213,7 @@ proc flushOldestSealed*(tree: LsmTree): StorageResult[uint64] =
   if not dirExists(l0Path):
     try:
       createDir(l0Path)
+
     except OSError:
       return err[uint64, StorageError](StorageError(kind: seIo,
           ioError: "Failed to create L0 directory"))
@@ -1229,8 +1272,8 @@ proc flushOldestSealed*(tree: LsmTree): StorageResult[uint64] =
   # Remove flushed memtable from sealed list
   tree.sealedMemtables.delete(0)
 
-  echo "[INFO] Flushed memtable to SSTable: " & sstablePath &
-        " (id=" & $tableId & ", size=" & $flushedBytes & " bytes)"
+  logInfo("Flushed memtable to SSTable: " & sstablePath &
+        " (id=" & $tableId & ", size=" & $flushedBytes & " bytes)")
 
   return ok[uint64, StorageError](flushedBytes)
 

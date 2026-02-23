@@ -455,7 +455,15 @@ proc findIndexBlockForPartitioned*(reader: SsTableReader,
     key: string): StorageResult[IndexBlock] =
   ## Find and read the index block that may contain the key.
   ## Used for partitioned index mode.
-  if reader.topLevelIndex.entries.len == 0:
+
+  # Safety checks
+  if reader.stream == nil:
+    return ok[IndexBlock, StorageError](newIndexBlock())
+  if reader.topLevelIndex == nil:
+    return ok[IndexBlock, StorageError](newIndexBlock())
+
+  let entries = reader.topLevelIndex.entries
+  if entries.len == 0:
     return ok[IndexBlock, StorageError](newIndexBlock())
 
   # Find the TLI entry that may contain the key
@@ -580,6 +588,10 @@ proc getEntry*(reader: SsTableReader, key: string): SsTableGetResult =
   ## Returns the value, value type, and sequence number.
   result = SsTableGetResult(found: false)
 
+  # Safety check - ensure reader is valid
+  if reader.stream == nil:
+    return
+
   # Check bloom filter first for quick rejection
   if reader.bloomFilter != nil:
     if not reader.bloomFilter.mayContain(key):
@@ -598,6 +610,10 @@ proc getEntry*(reader: SsTableReader, key: string): SsTableGetResult =
     idxBlock = idxResult.value
   else:
     idxBlock = reader.indexBlock
+
+  # Safety check - ensure index block is valid
+  if idxBlock.entries.len == 0:
+    return
 
   # Find the data block that might contain the key
   for entry in idxBlock.entries:

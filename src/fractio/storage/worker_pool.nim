@@ -175,7 +175,10 @@ proc workerProc(args: WorkerThreadArgs) {.thread.} =
         let task = pool.flushManager.dequeue()
         if task != nil and task.keyspacePtr != nil:
           let keyspace = cast[ks.Keyspace](task.keyspacePtr)
-          if keyspace != nil:
+          # Add comprehensive nil checks before dereferencing
+          if keyspace != nil and keyspace.inner != nil and
+             pool.stats != nil and pool.writeBufferSize != nil and
+             pool.snapshotTracker != nil:
             var statsVal = pool.stats[]
             let flushResult = flush_worker.run(keyspace, pool.writeBufferSize,
                                                 pool.snapshotTracker, statsVal)
@@ -196,7 +199,8 @@ proc workerProc(args: WorkerThreadArgs) {.thread.} =
 
     of wmCompact:
       let keyspace = pool.findKeyspace(msg.keyspaceId)
-      if keyspace != nil:
+      if keyspace != nil and keyspace.inner != nil and
+         pool.stats != nil and pool.snapshotTracker != nil:
         # Use cast(gcsafe) because compaction allocates memory
         # but we're using ORC which handles this correctly
         {.cast(gcsafe).}:
@@ -206,15 +210,22 @@ proc workerProc(args: WorkerThreadArgs) {.thread.} =
 
     of wmRotateMemtable:
       let keyspace = pool.findKeyspace(msg.keyspaceId2)
-      if keyspace != nil:
+      if keyspace != nil and keyspace.inner != nil:
         # Rotate the memtable
         let rotateResult = ks.rotateMemtable(keyspace)
+        # Clear the rotation pending flag regardless of result
+        keyspace.inner.rotationPending = false
         if rotateResult.isOk and rotateResult.value:
           # Memtable was rotated, enqueue a flush task
           if pool.flushManager != nil:
             let task = Task(keyspacePtr: cast[pointer](keyspace))
             pool.flushManager.enqueue(task)
             logInfo("Enqueued flush task for keyspace " & keyspace.inner.name)
+            # Also enqueue a wmFlush message to trigger the worker to process it
+            pool.queueLock.acquire()
+            pool.queue.add(WorkerMessage(kind: wmFlush))
+            pool.queueLock.release()
+
 
   logInfo("Worker #" & $workerId & " stopped")
 

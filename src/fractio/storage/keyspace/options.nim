@@ -106,7 +106,7 @@ type
 proc defaultCreateOptions*(): CreateOptions =
   CreateOptions(
     manualJournalPersist: false,
-    maxMemtableSize: 64 * 1024 * 1024, # 64 MiB
+    maxMemtableSize: 8 * 1024 * 1024, # 8 MiB - lowered for more frequent flushes
     dataBlockHashRatioPolicy: HashRatioPolicy(ratio: 0.0),
     dataBlockSizePolicy: BlockSizePolicy(sizes: @[4096'u32]), # 4 KiB default for all levels
     dataBlockRestartIntervalPolicy: RestartIntervalPolicy(intervals: @[10, 16]),
