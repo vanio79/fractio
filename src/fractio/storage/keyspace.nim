@@ -253,11 +253,15 @@ proc isEmpty*(keyspace: Keyspace): StorageResult[bool] =
 
 # Check if contains key
 proc containsKey*(keyspace: Keyspace, key: string): StorageResult[bool] =
+  if keyspace == nil or keyspace.inner == nil or keyspace.inner.tree == nil:
+    return ok[bool, StorageError](false)
   let seqno = keyspace.inner.supervisor.inner.seqno.get()
   return ok[bool, StorageError](keyspace.inner.tree.containsKey(key, seqno))
 
 # Get value by key
 proc get*(keyspace: Keyspace, key: string): StorageResult[Option[UserValue]] =
+  if keyspace == nil or keyspace.inner == nil or keyspace.inner.tree == nil:
+    return ok[Option[UserValue], StorageError](none(string))
   let seqno = keyspace.inner.supervisor.inner.seqno.get()
   let value = keyspace.inner.tree.get(key, seqno)
   return ok[Option[UserValue], StorageError](value)
@@ -561,7 +565,8 @@ proc rangeIter*(keyspace: Keyspace, startKey: string,
     endKey: string): KeyspaceIter =
   ## Creates an iterator over a range of keys [startKey, endKey].
 
-  let fullIter = keyspace.iter()
+  var fullIter = keyspace.iter()
+  defer: fullIter.close()
 
   let nonce = keyspace.inner.supervisor.inner.snapshotTracker.open()
   result = newKeyspaceIter(nonce)
@@ -577,7 +582,8 @@ proc rangeIter*(keyspace: Keyspace, startKey: string,
 proc prefixIter*(keyspace: Keyspace, prefixStr: string): KeyspaceIter =
   ## Creates an iterator over all keys starting with the given prefix.
 
-  let fullIter = keyspace.iter()
+  var fullIter = keyspace.iter()
+  defer: fullIter.close()
 
   let nonce = keyspace.inner.supervisor.inner.snapshotTracker.open()
   result = newKeyspaceIter(nonce)
@@ -738,7 +744,9 @@ proc len*(keyspace: Keyspace): StorageResult[int] =
   ## For an approximate count, use approximateLen() instead.
   var count = 0
 
-  let iter = keyspace.iter()
+  var iter = keyspace.iter()
+  defer: iter.close()
+
   for entry in iter.entries:
     if entry.valueType == vtValue:
       count += 1

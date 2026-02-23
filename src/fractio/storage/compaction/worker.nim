@@ -6,7 +6,7 @@
 ##
 ## Performs background compaction of SSTables.
 
-import fractio/storage/[error, snapshot_tracker, stats]
+import fractio/storage/[error, snapshot_tracker, stats, logging]
 import fractio/storage/keyspace as ks
 import fractio/storage/lsm_tree/lsm_tree
 import std/[times, atomics, os]
@@ -18,10 +18,16 @@ proc run*(keyspace: ks.Keyspace,
   ## Runs compaction on a keyspace.
 
   if keyspace == nil:
+    logInfo("Compaction: keyspace is nil, skipping")
+    return okVoid
+
+  if keyspace.inner == nil:
+    logInfo("Compaction: keyspace.inner is nil, skipping")
     return okVoid
 
   # Check if keyspace is deleted
   if keyspace.inner.isDeleted.load(moRelaxed):
+    logInfo("Compaction: keyspace is deleted, skipping")
     return okVoid
 
   # Increment active compaction count
@@ -31,6 +37,9 @@ proc run*(keyspace: ks.Keyspace,
 
   # Get GC watermark
   let gcWatermark = snapshotTracker.getSeqnoSafeToGc()
+
+  logInfo("Compaction: starting on keyspace " & keyspace.inner.name &
+      " with gcWatermark=" & $gcWatermark)
 
   # Run compaction on the tree
   let compactResult = keyspace.inner.tree.majorCompact(0'u64, gcWatermark)
@@ -44,10 +53,12 @@ proc run*(keyspace: ks.Keyspace,
   discard fetchSub(stats.activeCompactionCount, 1, moRelaxed)
 
   if compactResult.isErr:
+    logError("Compaction failed: " & $compactResult.error)
     discard fetchAdd(stats.compactionsCompleted, 1, moRelaxed)
     return compactResult
 
   discard fetchAdd(stats.compactionsCompleted, 1, moRelaxed)
+  logInfo("Compaction: completed in " & $elapsedMicros & "us")
 
   # Small delay to avoid compaction storm
   sleep(1)

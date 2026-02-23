@@ -862,7 +862,8 @@ proc detectConflicts*(tx: OptimisticTransaction, keyspaces: Table[string,
 
       # Check if any key in the range has been modified since our scan
       # We compare against the highest seqno we saw during the scan
-      let iter = keyspace.rangeIter(rangeEntry.startKey, rangeEntry.endKey)
+      var iter = keyspace.rangeIter(rangeEntry.startKey, rangeEntry.endKey)
+      defer: iter.close()
       for entry in iter.entries:
         # Get the current seqno of this key
         let (_, currentSeqno) = keyspace.inner.tree.getWithSeqno(entry.key,
@@ -894,7 +895,8 @@ proc detectConflicts*(tx: OptimisticTransaction, keyspaces: Table[string,
 
     # Also check if any existing key has been modified
     # by comparing current seqno with recorded highest
-    let iter = keyspace.iter()
+    var iter = keyspace.iter()
+    defer: iter.close()
     for entry in iter.entries:
       let (_, currentSeqno) = keyspace.inner.tree.getWithSeqno(entry.key, high(uint64))
       if currentSeqno > fullScan.highestSeqno:

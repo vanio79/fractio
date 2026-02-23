@@ -6,7 +6,7 @@
 ##
 ## Provides iterators for scanning key-value pairs in a keyspace.
 
-import fractio/storage/[error, snapshot_nonce, guard]
+import fractio/storage/[error, snapshot_nonce, guard, snapshot_tracker]
 import fractio/storage/lsm_tree/[types, memtable, lsm_tree]
 import std/[options, algorithm, strutils]
 
@@ -113,6 +113,15 @@ proc sortEntries*(iter: KeyspaceIter, reverse: bool = false) =
     iter.entries.sort(proc(a, b: IteratorEntry): int = cmp(b.key, a.key))
   else:
     iter.entries.sort(proc(a, b: IteratorEntry): int = cmp(a.key, b.key))
+
+# Close the iterator and release its snapshot
+proc close*(iter: var KeyspaceIter) =
+  ## Releases the snapshot held by this iterator.
+  ## Safe to call multiple times; after closing the iterator should not be used.
+  if iter != nil and iter.nonce != nil:
+    if iter.nonce.tracker != nil:
+      iter.nonce.tracker.close(iter.nonce)
+    iter.nonce = nil
 
 # Create iterator from memtable entries
 proc fromMemtable*(iter: KeyspaceIter, memtable: Memtable) =

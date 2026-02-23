@@ -105,6 +105,11 @@ proc mergeEntries*(allEntries: seq[seq[MergeEntry]],
   if allEntries.len == 0:
     return ok[seq[MergeEntry], StorageError](result)
 
+  # Count total entries for progress logging
+  var totalEntries = 0
+  for entries in allEntries:
+    totalEntries += entries.len
+
   # Create heap with first entry from each source
   var heap: HeapQueue[HeapMergeEntry] = initHeapQueue[HeapMergeEntry]()
   var indices = newSeq[int](allEntries.len)
@@ -121,11 +126,13 @@ proc mergeEntries*(allEntries: seq[seq[MergeEntry]],
 
   var lastKey = ""
   var lastAdded = false
+  var processedCount = 0
 
   while heap.len > 0:
     let top = heap.pop()
     let entry = top.entry
     let readerIdx = top.readerIdx
+    inc(processedCount)
 
     # Check if this is a new key or same key with newer seqno
     if entry.key != lastKey:

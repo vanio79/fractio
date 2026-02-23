@@ -73,12 +73,12 @@ proc `$`*(msg: WorkerMessage): string =
 
 # Find keyspace by ID
 proc findKeyspace(pool: WorkerPool, id: uint64): ks.Keyspace =
-  if pool.keyspaces == nil or pool.keyspacesLock == nil:
+  if pool == nil or pool.keyspaces == nil or pool.keyspacesLock == nil:
     return nil
   pool.keyspacesLock[].acquire()
   defer: pool.keyspacesLock[].release()
   for name, ks in pool.keyspaces[].pairs:
-    if ks.inner.id == id:
+    if ks != nil and ks.inner != nil and ks.inner.id == id:
       return ks
   return nil
 
@@ -144,20 +144,36 @@ proc workerProc(args: WorkerThreadArgs) {.thread.} =
     var msgIndex = 0
 
     if pool.queue.len > 0:
+      # Make a copy of the queue length to avoid "seq changed while iterating" error
+      # This can happen if stop() adds messages while we're iterating
+      let queueLen = pool.queue.len
+
       # Worker 0 prioritizes flush over compaction
+      # Workers 1+ prioritize compaction over flush to ensure compaction runs
       if workerId == 0:
         # Look for a flush message first
-        for i in 0 ..< pool.queue.len:
-          if pool.queue[i].kind == wmFlush:
+        for i in 0 ..< queueLen:
+          if i < pool.queue.len and pool.queue[i].kind == wmFlush:
             msgIndex = i
             break
-        # If we found a flush message and the first message is compaction,
-        # prioritize the flush
-        if msgIndex > 0 and pool.queue[0].kind == wmCompact:
-          discard # Will use the flush message at msgIndex
+      else:
+        # Other workers prioritize compaction
+        for i in 0 ..< queueLen:
+          if i < pool.queue.len and pool.queue[i].kind == wmCompact:
+            msgIndex = i
+            break
 
-      msg = pool.queue[msgIndex]
-      pool.queue.delete(msgIndex)
+      # Only process if message index is valid and queue still has that position
+      if msgIndex < pool.queue.len:
+        msg = pool.queue[msgIndex]
+        pool.queue.delete(msgIndex)
+      else:
+        # Queue changed under us, get first available message or default
+        if pool.queue.len > 0:
+          msg = pool.queue[0]
+          pool.queue.delete(0)
+        else:
+          msg = WorkerMessage(kind: wmClose) # Default to close to exit
       pool.queueLock.release()
     else:
       pool.queueLock.release()
@@ -170,6 +186,9 @@ proc workerProc(args: WorkerThreadArgs) {.thread.} =
       break
 
     of wmFlush:
+      # Check if we should stop first
+      if not pool.running.load(moRelaxed):
+        break
       # Dequeue flush task from flush manager
       if pool.flushManager != nil:
         let task = pool.flushManager.dequeue()
@@ -198,6 +217,9 @@ proc workerProc(args: WorkerThreadArgs) {.thread.} =
                 pool.queueLock.release()
 
     of wmCompact:
+      # Check if we should stop first
+      if not pool.running.load(moRelaxed):
+        break
       let keyspace = pool.findKeyspace(msg.keyspaceId)
       if keyspace != nil and keyspace.inner != nil and
          pool.stats != nil and pool.snapshotTracker != nil:
@@ -205,10 +227,18 @@ proc workerProc(args: WorkerThreadArgs) {.thread.} =
         # but we're using ORC which handles this correctly
         {.cast(gcsafe).}:
           var statsVal = pool.stats[]
-          discard compaction_worker.run(keyspace, pool.snapshotTracker, statsVal)
+          let compactResult = compaction_worker.run(keyspace,
+              pool.snapshotTracker, statsVal)
           pool.stats[] = statsVal
+          if compactResult.isErr:
+            logError("Compaction failed: " & $compactResult.error)
+      else:
+        logError("Compaction skipped: keyspace or stats nil")
 
     of wmRotateMemtable:
+      # Check if we should stop first
+      if not pool.running.load(moRelaxed):
+        break
       let keyspace = pool.findKeyspace(msg.keyspaceId2)
       if keyspace != nil and keyspace.inner != nil:
         # Rotate the memtable
@@ -304,12 +334,26 @@ proc stop*(pool: WorkerPool) =
   if not pool.running.load(moRelaxed):
     return # Already stopped
 
+  # Signal workers to stop FIRST
   pool.running.store(false, moRelease)
 
-  # Wait for all threads to finish
-  for i in 0 ..< pool.threadHandles.len:
+  # CRITICAL: Wake up sleeping workers by adding close messages
+  # Do this multiple times to ensure workers see them
+  for attempt in 0 ..< 3:
+    pool.queueLock.acquire()
+    pool.queue.setLen(0) # Clear all pending messages
+    for i in 0 ..< pool.poolSize:
+      pool.queue.add(WorkerMessage(kind: wmClose))
+    pool.queueLock.release()
+    sleep(20) # Small delay between attempts
+
+  # Now just try once to join - if it fails, too bad
+  for i in 0 ..< pool.poolSize:
     if pool.threadHandles[i].running:
-      joinThread(pool.threadHandles[i])
+      try:
+        joinThread(pool.threadHandles[i])
+      except:
+        discard # Ignore failures
 
   # Clear the queue to break cycles
   pool.queueLock.acquire()

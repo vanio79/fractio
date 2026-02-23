@@ -126,6 +126,7 @@ type
     memtableIdCounter*: Atomic[uint64]
     tableIdCounter*: Atomic[uint64]
     versionLock*: Lock
+    compactionLock*: Lock      # Separate lock for compaction to prevent parallel compactions
     seqnoCounter*: SequenceNumberCounter
     snapshotTracker*: SnapshotTracker
     blockCache*: BlockCache    # LRU cache for SSTable data blocks

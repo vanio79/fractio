@@ -38,11 +38,11 @@ proc newTableReaderCache*(maxSize: int = 64): TableReaderCache =
 
 proc free*(cache: TableReaderCache) =
   ## Frees the cache and all resources.
+  ## Note: We don't close readers to avoid use-after-free.
+  ## Readers may still be in use by other threads.
   if cache != nil:
     acquire(cache.lock)
-    for path, entry in cache.entries:
-      if entry.reader != nil:
-        entry.reader.close()
+    # Just clear entries without closing readers
     cache.entries.clear()
     release(cache.lock)
     deinitLock(cache.lock)
@@ -86,9 +86,8 @@ proc get*(cache: TableReaderCache, path: string, sstableId: uint64,
         lruPath = p
 
     if lruPath.len > 0:
-      let oldEntry = cache.entries[lruPath]
-      if oldEntry.reader != nil:
-        oldEntry.reader.close()
+      # Just remove from cache, don't close the reader
+      # The reader might be in use by another thread
       cache.entries.del(lruPath)
     else:
       break
@@ -103,7 +102,10 @@ proc get*(cache: TableReaderCache, path: string, sstableId: uint64,
   return ok[SsTableReader, StorageError](reader)
 
 proc invalidate*(cache: TableReaderCache, path: string) =
-  ## Removes a reader from the cache and closes it.
+  ## Removes a reader from the cache.
+  ## Note: We don't close the reader here to avoid use-after-free.
+  ## The reader may still be in use by another thread. It will be
+  ## closed when the cache is destroyed or when it's eventually evicted.
   ## Thread-safe.
   if cache == nil:
     return
@@ -112,13 +114,14 @@ proc invalidate*(cache: TableReaderCache, path: string) =
   defer: release(cache.lock)
 
   if path in cache.entries:
-    let entry = cache.entries[path]
-    if entry.reader != nil:
-      entry.reader.close()
+    # Just remove from cache, don't close the reader
+    # The reader might be in use by another thread
     cache.entries.del(path)
 
 proc clear*(cache: TableReaderCache) =
-  ## Clears the cache and closes all readers.
+  ## Clears the cache.
+  ## Note: We don't close the readers to avoid use-after-free.
+  ## Readers may still be in use by other threads.
   ## Thread-safe.
   if cache == nil:
     return
@@ -126,9 +129,8 @@ proc clear*(cache: TableReaderCache) =
   acquire(cache.lock)
   defer: release(cache.lock)
 
-  for path, entry in cache.entries:
-    if entry.reader != nil:
-      entry.reader.close()
+  # Just clear the cache entries without closing readers
+  # Readers will be closed when they're no longer referenced
   cache.entries.clear()
 
 proc close*(cache: TableReaderCache) =

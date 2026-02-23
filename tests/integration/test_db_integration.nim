@@ -315,7 +315,8 @@ suite "Database Integration Tests":
         discard ks.insert("d", "value_d")
 
         # Create iterator
-        let iter = ks.iter()
+        var iter = ks.iter()
+        defer: iter.close()
 
         # Verify iterator has all entries
         check iter.isValid()
@@ -351,7 +352,8 @@ suite "Database Integration Tests":
         discard ks.insert("e", "value_e")
 
         # Create range iterator [b, d]
-        let iter = ks.rangeIter("b", "d")
+        var iter = ks.rangeIter("b", "d")
+        defer: iter.close()
 
         # Verify iterator has correct entries
         check iter.isValid()
@@ -384,7 +386,8 @@ suite "Database Integration Tests":
         discard ks.insert("item:2", "gadget")
 
         # Create prefix iterator for "user:"
-        let iter = ks.prefixIter("user:")
+        var iter = ks.prefixIter("user:")
+        defer: iter.close()
 
         # Verify iterator has correct entries
         check iter.isValid()
@@ -768,7 +771,7 @@ suite "Database Integration Tests":
 
         # Request a flush - this should trigger compaction due to L0 threshold
         ks.requestFlush()
-        sleep(500)  # Give time for flush and compaction
+        sleep(500) # Give time for flush and compaction
 
         # Verify compaction was triggered
         # After flush of the 6th table, L0 count >= 5, so compaction should trigger

@@ -257,6 +257,7 @@ proc newLsmTree*(config: LsmTreeConfig,
     counters: newMetricCounters()
   )
   initLock(result.versionLock)
+  initLock(result.compactionLock)
 
   # Create directory if it doesn't exist
   if not dirExists(config.path):
@@ -764,9 +765,21 @@ proc majorCompact*(tree: LsmTree, targetSize: uint64,
   ## 1. Compacts L0 tables into L1
   ## 2. Merges overlapping tables
   ## 3. Removes tombstones older than gcWatermark
+  ##
+  ## IMPORTANT: This function releases versionLock during expensive I/O operations
+  ## to avoid blocking reads for extended periods. A separate compactionLock ensures
+  ## only one compaction runs at a time.
 
+  # First, try to acquire compactionLock - if we can't get it immediately,
+  # another compaction is already running, so skip this one
+  if not tree.compactionLock.tryAcquire():
+    logInfo("majorCompact: another compaction is in progress, skipping")
+    return okVoid
+
+  defer: tree.compactionLock.release()
+
+  logInfo("majorCompact: acquiring versionLock to collect tables")
   tree.versionLock.acquire()
-  defer: tree.versionLock.release()
 
   # Find levels with tables to compact
   var sourceLevel = -1
@@ -777,6 +790,8 @@ proc majorCompact*(tree: LsmTree, targetSize: uint64,
 
   if sourceLevel < 0:
     # No tables to compact
+    tree.versionLock.release()
+    logInfo("majorCompact: no tables to compact")
     return okVoid
 
   let targetLevel = sourceLevel + 1
@@ -811,7 +826,15 @@ proc majorCompact*(tree: LsmTree, targetSize: uint64,
           break
 
   if tablesToCompact.len == 0:
+    tree.versionLock.release()
+    logInfo("majorCompact: no tables to compact after filtering")
     return okVoid
+
+  logInfo("majorCompact: compacting " & $tablesToCompact.len &
+      " tables from level " & $sourceLevel & " to level " & $targetLevel)
+
+  # Release lock while reading entries (I/O bound)
+  tree.versionLock.release()
 
   # Read all entries from tables to compact
   var allEntries: seq[seq[MergeEntry]] = @[]
@@ -821,15 +844,19 @@ proc majorCompact*(tree: LsmTree, targetSize: uint64,
     if table.path.len > 0 and fileExists(table.path):
       let entriesResult = readSsTableEntries(table.path)
       if entriesResult.isErr:
+        logError("majorCompact: failed to read table " & table.path & ": " &
+            $entriesResult.error)
         return err[void, StorageError](entriesResult.error)
       allEntries.add(entriesResult.value)
       loadedPaths.add(table.path)
 
   if allEntries.len == 0:
+    logInfo("majorCompact: no entries read, returning")
     return okVoid
 
-  # Merge entries with tombstone GC
-  # Use provided targetSize, or get from strategy, or use default
+  logInfo("majorCompact: read " & $allEntries.len & " entry sets, merging...")
+
+  # Merge entries with tombstone GC (CPU bound, no lock needed)
   let usedTargetSize = if targetSize > 0:
                          targetSize
                        elif tree.config.compactionStrategy.getTargetTableSize() > 0:
@@ -838,73 +865,43 @@ proc majorCompact*(tree: LsmTree, targetSize: uint64,
                          DEFAULT_TARGET_TABLE_SIZE
   let mergeResult = mergeEntries(allEntries, gcWatermark)
   if mergeResult.isErr:
+    logError("majorCompact: merge failed: " & $mergeResult.error)
     return err[void, StorageError](mergeResult.error)
 
   let mergedEntries = mergeResult.value
+  logInfo("majorCompact: merged into " & $mergedEntries.len & " entries")
 
-  if mergedEntries.len == 0:
-    # All entries were tombstones and got GC'd
-    # Just delete the old tables
+  # Write new compacted tables (I/O bound, no lock needed)
+  var newTables: seq[SsTable] = @[]
+  if mergedEntries.len > 0:
+    var tableIdCounter = tree.tableIdCounter.load(moRelaxed)
+    let writeResult = writeCompactedTables(
+      mergedEntries,
+      tree.config.path,
+      targetLevel,
+      usedTargetSize,
+      tableIdCounter
+    )
+    if writeResult.isErr:
+      return err[void, StorageError](writeResult.error)
+    newTables = writeResult.value
+    tree.tableIdCounter.store(tableIdCounter, moRelaxed)
 
-    # Invalidate block cache for old tables
-    for table in tablesToCompact:
-      tree.blockCache.invalidateSsTable(table.id)
-
-    # Invalidate table reader cache for old tables
-    let cache = cast[TableReaderCache](tree.tableCache)
-    if cache != nil:
-      for table in tablesToCompact:
-        if table.path.len > 0:
-          cache.invalidate(table.path)
-
-    let deleteResult = deleteOldTables(tablesToCompact)
-    if deleteResult.isErr:
-      return err[void, StorageError](deleteResult.error)
-
-    # Remove tables from tree
-    if sourceLevel == 0:
-      tree.tables[0] = @[]
-    else:
-      var remainingSource: seq[SsTable] = @[]
-      for t in tree.tables[sourceLevel]:
-        if t notin tablesToCompact:
-          remainingSource.add(t)
-      tree.tables[sourceLevel] = remainingSource
-
-    if sourceLevel > 0:
-      var remainingTarget: seq[SsTable] = @[]
-      for t in tree.tables[targetLevel]:
-        if t notin tablesToCompact:
-          remainingTarget.add(t)
-      tree.tables[targetLevel] = remainingTarget
-
-    return okVoid
-
-  # Write new compacted tables
-  var tableIdCounter = tree.tableIdCounter.load(moRelaxed)
-  let writeResult = writeCompactedTables(
-    mergedEntries,
-    tree.config.path,
-    targetLevel,
-    usedTargetSize,
-    tableIdCounter
-  )
-  if writeResult.isErr:
-    return err[void, StorageError](writeResult.error)
-
-  let newTables = writeResult.value
-  tree.tableIdCounter.store(tableIdCounter, moRelaxed)
-
-  # Invalidate block cache for old tables before deletion
-  for table in tablesToCompact:
-    tree.blockCache.invalidateSsTable(table.id)
-
-  # Invalidate table reader cache for old tables
+  # Invalidate table reader cache for old tables (no lock needed)
   let cache = cast[TableReaderCache](tree.tableCache)
   if cache != nil:
     for table in tablesToCompact:
       if table.path.len > 0:
         cache.invalidate(table.path)
+
+  # Now acquire lock to update tree structure
+  logInfo("majorCompact: acquiring versionLock to update tree")
+  tree.versionLock.acquire()
+  defer: tree.versionLock.release()
+
+  # Invalidate block cache for old tables
+  for table in tablesToCompact:
+    tree.blockCache.invalidateSsTable(table.id)
 
   # Delete old tables
   let deleteResult = deleteOldTables(tablesToCompact)
@@ -940,8 +937,8 @@ proc majorCompact*(tree: LsmTree, targetSize: uint64,
   for newTable in newTables:
     tree.tables[targetLevel].add(newTable)
 
-  echo "[INFO] Compaction complete: ", tablesToCompact.len, " tables -> ",
-        newTables.len, " tables at level ", targetLevel
+  logInfo("Compaction complete: " & $tablesToCompact.len & " tables -> " &
+        $newTables.len & " tables at level " & $targetLevel)
 
   return okVoid
 

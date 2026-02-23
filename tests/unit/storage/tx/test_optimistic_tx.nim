@@ -9,6 +9,7 @@ import fractio/storage/tx as tx_module
 import fractio/storage/db
 import fractio/storage/db_config
 import fractio/storage/keyspace as ks_module
+import fractio/storage/iter # For KeyspaceIter.close
 import fractio/storage/journal/writer
 import std/[os, tempfiles, options, tables]
 
@@ -439,6 +440,8 @@ suite "Optimistic Transaction Tests":
     # Range iteration should track the range
     let iterResult = tx_module.otxRangeIter(tx, ks, "key_a", "key_z")
     check iterResult.isOk
+    var iter = iterResult.value
+    defer: iter.close()
     check tx.hasRangeReads()
     check tx.readRanges.len == 1
 
@@ -468,6 +471,8 @@ suite "Optimistic Transaction Tests":
     # Prefix iteration should track as a range
     let iterResult = tx_module.otxPrefixIter(tx, ks, "user:")
     check iterResult.isOk
+    var iter = iterResult.value
+    defer: iter.close()
     check tx.hasRangeReads()
 
     tx.rollback()
@@ -495,6 +500,8 @@ suite "Optimistic Transaction Tests":
     # Full iteration should track as full scan
     let iterResult = tx_module.otxIter(tx, ks)
     check iterResult.isOk
+    var iter = iterResult.value
+    defer: iter.close()
     check tx.hasRangeReads()
     check tx.readAll.len == 1
 
@@ -523,6 +530,8 @@ suite "Optimistic Transaction Tests":
     var tx1 = txDb.beginOptimisticTx(100'u64)
     let iterResult = tx_module.otxRangeIter(tx1, ks, "key_a", "key_z")
     check iterResult.isOk
+    var iter1 = iterResult.value
+    defer: iter1.close()
 
     # Transaction 2: Write to a key in the range and commit
     var tx2 = txDb.beginOptimisticTx(100'u64)
@@ -557,6 +566,8 @@ suite "Optimistic Transaction Tests":
     var tx1 = txDb.beginOptimisticTx(100'u64)
     let iterResult = tx_module.otxIter(tx1, ks)
     check iterResult.isOk
+    var iter1 = iterResult.value
+    defer: iter1.close()
 
     # Transaction 2: Write any key and commit
     var tx2 = txDb.beginOptimisticTx(100'u64)
