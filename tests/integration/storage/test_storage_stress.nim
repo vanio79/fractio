@@ -71,6 +71,7 @@ suite "Storage Stress Tests - Large Dataset (1M Records)":
       discard
 
   test "Write 1 million sequential records":
+    echo "\n  [START] Write 1M sequential records test"
     let config = db_config_module.newConfig(StressTestDbPath)
     let dbResult = db_module.open(config)
     check dbResult.isOk
@@ -85,6 +86,8 @@ suite "Storage Stress Tests - Large Dataset (1M Records)":
 
     const batchSize = 10000
     let totalRecords = 1_000_000
+    var batchesCompleted = 0
+    let totalBatches = totalRecords div batchSize
 
     for batchStart in countup(0, totalRecords, batchSize):
       let batchEnd = min(batchStart + batchSize, totalRecords)
@@ -99,6 +102,14 @@ suite "Storage Stress Tests - Large Dataset (1M Records)":
       if commitResult.isErr:
         errors += 1
 
+      batchesCompleted += 1
+      if batchesCompleted mod 10 == 0:
+        let elapsed = epochTime() - startTime
+        let progress = float(batchesCompleted) / float(totalBatches) * 100.0
+        echo "    Progress: ", progress.formatFloat(ffDecimal, 1), "% (",
+            batchesCompleted, "/", totalBatches, " batches) - ",
+            elapsed.formatFloat(ffDecimal, 1), "s elapsed"
+
       if batchEnd mod 100000 == 0:
         discard ks.rotateMemtable()
         discard ks.flushOldestSealed()
@@ -107,7 +118,7 @@ suite "Storage Stress Tests - Large Dataset (1M Records)":
     let endTime = epochTime()
     let duration = endTime - startTime
 
-    echo "\n  Write 1M records: ", duration.formatFloat(ffDecimal, 2), "s (",
+    echo "  [DONE] Write 1M records: ", duration.formatFloat(ffDecimal, 2), "s (",
          (float(totalRecords) / duration).formatFloat(ffDecimal, 0), " ops/s)"
 
     check errors == 0
@@ -116,6 +127,7 @@ suite "Storage Stress Tests - Large Dataset (1M Records)":
     db.close()
 
   test "Read 1 million sequential records":
+    echo "\n  [START] Read 1M sequential records test (setup phase)"
     let config = db_config_module.newConfig(StressTestDbPath)
     let dbResult = db_module.open(config)
     check dbResult.isOk
@@ -127,7 +139,9 @@ suite "Storage Stress Tests - Large Dataset (1M Records)":
 
     const writeBatch = 50000
     let totalRecords = 1_000_000
+    var setupBatches = 0
 
+    echo "    Writing ", totalRecords, " records for read test..."
     for batchStart in countup(0, totalRecords, writeBatch):
       let batchEnd = min(batchStart + writeBatch, totalRecords)
       var wb = db.batch()
@@ -136,12 +150,17 @@ suite "Storage Stress Tests - Large Dataset (1M Records)":
         let value = "value_" & $i
         wb.insert(ks, key, value)
       discard db.commit(wb)
+      setupBatches += 1
+      if setupBatches mod 5 == 0:
+        echo "    Setup progress: ", (float(setupBatches) / float(
+            totalRecords div writeBatch) * 100.0).formatFloat(ffDecimal, 0), "%"
 
       if batchEnd mod 200000 == 0:
         discard ks.rotateMemtable()
         discard ks.flushOldestSealed()
 
     db.close()
+    echo "    Setup complete. Now reading..."
 
     let dbResult2 = db_module.open(config)
     check dbResult2.isOk
@@ -165,10 +184,16 @@ suite "Storage Stress Tests - Large Dataset (1M Records)":
         if getResult.value.get != "value_" & $i:
           errors += 1
 
+      if i mod 100000 == 0 and i > 0:
+        let elapsed = epochTime() - startTime
+        echo "    Read progress: ", (float(i) / float(totalRecords) *
+            100.0).formatFloat(ffDecimal, 1), "% - ", elapsed.formatFloat(
+            ffDecimal, 1), "s"
+
     let endTime = epochTime()
     let duration = endTime - startTime
 
-    echo "\n  Read 1M records: ", duration.formatFloat(ffDecimal, 2), "s (",
+    echo "  [DONE] Read 1M records: ", duration.formatFloat(ffDecimal, 2), "s (",
          (float(totalRecords) / duration).formatFloat(ffDecimal, 0), " ops/s)"
 
     check errors == 0
@@ -177,6 +202,7 @@ suite "Storage Stress Tests - Large Dataset (1M Records)":
     db2.close()
 
   test "Random read/write 100k records with 1M dataset":
+    echo "\n  [START] Random R/W 100k with 1M dataset test (setup)"
     let config = db_config_module.newConfig(StressTestDbPath)
     let dbResult = db_module.open(config)
     check dbResult.isOk
@@ -187,6 +213,8 @@ suite "Storage Stress Tests - Large Dataset (1M Records)":
     let ks = ksResult.value
 
     const prepBatch = 100000
+    var prepCount = 0
+    echo "    Writing 1M records for dataset..."
     for batchStart in countup(0, 1_000_000, prepBatch):
       let batchEnd = min(batchStart + prepBatch, 1_000_000)
       var wb = db.batch()
@@ -195,12 +223,17 @@ suite "Storage Stress Tests - Large Dataset (1M Records)":
         let value = "value_" & $i
         wb.insert(ks, key, value)
       discard db.commit(wb)
+      prepCount += 1
+      if prepCount mod 5 == 0:
+        echo "    Setup: ", (float(prepCount) / 10.0 * 100.0).formatFloat(
+            ffDecimal, 0), "%"
 
       if batchEnd mod 500000 == 0:
         discard ks.rotateMemtable()
         discard ks.flushOldestSealed()
 
     db.close()
+    echo "    Setup done. Running random R/W..."
 
     let dbResult2 = db_module.open(config)
     check dbResult2.isOk
@@ -226,6 +259,9 @@ suite "Storage Stress Tests - Large Dataset (1M Records)":
       let getResult = ks2.get(key)
       if getResult.isErr or getResult.value.isNone:
         readErrors += 1
+      if i mod 25000 == 0 and i > 0:
+        echo "    Random read progress: ", (float(i) / float(testCount) *
+            100.0).formatFloat(ffDecimal, 0), "%"
 
     for i in 0..<testCount:
       let idx = indices[i]
@@ -234,11 +270,16 @@ suite "Storage Stress Tests - Large Dataset (1M Records)":
       let updateResult = ks2.insert(key, newValue)
       if updateResult.isErr:
         writeErrors += 1
+      if i mod 25000 == 0 and i > 0:
+        echo "    Random write progress: ", (float(i) / float(testCount) *
+            100.0).formatFloat(ffDecimal, 0), "%"
+      if updateResult.isErr:
+        writeErrors += 1
 
     let endTime = epochTime()
     let duration = endTime - startTime
 
-    echo "\n  Random R/W 100k: ", duration.formatFloat(ffDecimal, 2), "s (",
+    echo "  [DONE] Random R/W 100k: ", duration.formatFloat(ffDecimal, 2), "s (",
          (float(testCount * 2) / duration).formatFloat(ffDecimal, 0), " ops/s)"
 
     check readErrors == 0
@@ -247,6 +288,7 @@ suite "Storage Stress Tests - Large Dataset (1M Records)":
     db2.close()
 
   test "Range scan over 100k records":
+    echo "\n  [START] Range scan 100k records test"
     let config = db_config_module.newConfig(StressTestDbPath)
     let dbResult = db_module.open(config)
     check dbResult.isOk
@@ -548,6 +590,7 @@ suite "Storage Stress Tests - Batch Operations":
       discard
 
   test "Large batch commit (100k records)":
+    echo "\n  [START] Large batch commit (100k records) test"
     let config = db_config_module.newConfig(BatchKeyspaceName)
     let dbResult = db_module.open(config)
     check dbResult.isOk
@@ -562,16 +605,21 @@ suite "Storage Stress Tests - Batch Operations":
 
     let startTime = epochTime()
 
+    echo "    Building batch of ", batchSize, " records..."
     for i in 0..<batchSize:
       let key = "batch_" & $i
       let value = "value_" & $i
       wb.insert(ks, key, value)
+      if i mod 25000 == 0 and i > 0:
+        echo "    Building: ", (float(i) / float(batchSize) *
+            100.0).formatFloat(ffDecimal, 0), "%"
 
+    echo "    Committing batch..."
     let commitResult = db.commit(wb)
     let endTime = epochTime()
     let duration = endTime - startTime
 
-    echo "\n  Large batch (100k): ", duration.formatFloat(ffDecimal, 2), "s (",
+    echo "  [DONE] Large batch (100k): ", duration.formatFloat(ffDecimal, 2), "s (",
          (float(batchSize) / duration).formatFloat(ffDecimal, 0), " ops/s)"
 
     check commitResult.isOk
