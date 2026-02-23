@@ -8,7 +8,7 @@
 ## within a database.
 
 import fractio/storage/[error, types, journal, snapshot_tracker, stats, supervisor,
-                        write_buffer_manager, iter, snapshot]
+                        write_buffer_manager, iter, snapshot, logging]
 import fractio/storage/blob/types as blob_types
 import fractio/storage/blob/gc as blob_gc
 import fractio/storage/flush/manager
@@ -495,7 +495,16 @@ proc hasSealedMemtables*(keyspace: Keyspace): bool =
 
 # Flush oldest sealed memtable
 proc flushOldestSealed*(keyspace: Keyspace): StorageResult[uint64] =
-  keyspace.inner.tree.flushOldestSealed()
+  let result = keyspace.inner.tree.flushOldestSealed()
+
+  # After flush, check if L0 threshold is exceeded and log warning
+  if result.isOk and result.value > 0:
+    let l0Count = keyspace.l0TableCount()
+    if l0Count >= 4: # L0_COMPACTION_TRIGGER
+      logInfo("flushOldestSealed: L0 table count (" & $l0Count &
+              ") >= threshold (4) - consider triggering compaction")
+
+  return result
 
 # Major compaction
 proc majorCompaction*(keyspace: Keyspace): StorageResult[void] =
