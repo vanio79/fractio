@@ -30,8 +30,20 @@ dist/
 tmp/
 testresults/
 test.txt
-test_*.nim
-test_*
+# Ignore compiled test binaries in root (no extension = binary)
+test_err
+test_newerror
+test_recovery_only
+test_rotate_only
+test_simple
+/test_db_integration
+/test_sharedtimer_udp_integration
+# Ignore compiled test binaries in src
+src/fractio/test_*
+!src/fractio/test_*.nim
+# Ignore compiled test binaries in tests directories  
+tests/**/test_*
+!tests/**/*.nim
 
 # Third-party libraries
 thirdparty/
