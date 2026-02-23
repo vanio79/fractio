@@ -497,12 +497,15 @@ proc hasSealedMemtables*(keyspace: Keyspace): bool =
 proc flushOldestSealed*(keyspace: Keyspace): StorageResult[uint64] =
   let result = keyspace.inner.tree.flushOldestSealed()
 
-  # After flush, check if L0 threshold is exceeded and log warning
+  # After flush, check if L0 threshold is exceeded and trigger compaction
   if result.isOk and result.value > 0:
     let l0Count = keyspace.l0TableCount()
     if l0Count >= 4: # L0_COMPACTION_TRIGGER
       logInfo("flushOldestSealed: L0 table count (" & $l0Count &
-              ") >= threshold (4) - consider triggering compaction")
+              ") >= threshold (4), triggering compaction")
+      # Trigger compaction synchronously
+      let gcWatermark = keyspace.inner.supervisor.inner.snapshotTracker.getSeqnoSafeToGc()
+      discard keyspace.inner.tree.majorCompact(0'u64, gcWatermark)
 
   return result
 
