@@ -26,3 +26,11 @@ task test_storage, "Run only storage engine unit tests":
     if name.startsWith("test_") and name.endswith(".nim"):
       echo "Running storage test: ", file
       exec "nim c -r --checks:on -p:src " & file
+
+task test_storage_integration, "Run storage integration tests including stress tests":
+  # Run storage integration tests from tests/integration/storage/
+  for file in walkDirRec("tests/integration/storage"):
+    let name = extractFilename(file)
+    if name.startsWith("test_") and name.endswith(".nim"):
+      echo "Running storage integration test: ", file
+      exec "nim c -r --checks:on -p:src " & file
