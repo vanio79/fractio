@@ -95,8 +95,9 @@ proc advanceSnapshotSeqno*(t: Tree): SeqNo =
 # Core Operations
 # ============================================================================
 
-proc insert*(t: Tree, key: types.Slice, value: types.Slice, seqno: SeqNo): (
+proc insert*(t: Tree, key: string, value: string, seqno: SeqNo): (
     uint64, uint64) =
+  ## Optimized insert that accepts strings directly to avoid Slice allocations
   let internalValue = newInternalValue(key, value, seqno, vtValue)
   let (itemSize, sizeAfter) = t.superVersion.activeMemtable.insert(internalValue)
 
@@ -111,7 +112,24 @@ proc insert*(t: Tree, key: types.Slice, value: types.Slice, seqno: SeqNo): (
 
   (itemSize, sizeAfter)
 
-proc remove*(t: Tree, key: types.Slice, seqno: SeqNo): (uint64, uint64) =
+proc insertSlice*(t: Tree, key: types.Slice, value: types.Slice,
+    seqno: SeqNo): (uint64, uint64) =
+  ## Insert with Slice arguments (for compatibility)
+  let internalValue = newInternalValue(key, value, seqno, vtValue)
+  let (itemSize, sizeAfter) = t.superVersion.activeMemtable.insert(internalValue)
+
+  # Check if we need to rotate the memtable
+  if t.superVersion.activeMemtable.size() >= t.config.maxMemtableSize:
+    t.superVersion.activeMemtable.flagRotated()
+
+    # Create new memtable
+    let newMemtable = newMemtable(t.nextMemtableId())
+    t.superVersion.sealedMemtables.add(t.superVersion.activeMemtable)
+    t.superVersion.activeMemtable = newMemtable
+
+  (itemSize, sizeAfter)
+
+proc remove*(t: Tree, key: string, seqno: SeqNo): (uint64, uint64) =
   let tombstone = newTombstone(key, seqno)
   t.superVersion.activeMemtable.insert(tombstone)
 
@@ -141,8 +159,26 @@ proc get*(t: Tree, key: types.Slice, seqno: Option[SeqNo] = none(
         return none(types.Slice)
       return some(value.value)
 
-  # TODO: Check SSTables
-  # This would involve reading from disk
+  # Check SSTables
+  let keyStr = key.data
+  for table in t.superVersion.tables:
+    # Skip if table is not open
+    if not table.fileOpened:
+      continue
+
+    # Check if key is in range
+    if table.meta.minKey.len > 0 and keyStr < table.meta.minKey:
+      continue
+    if table.meta.maxKey.len > 0 and keyStr > table.meta.maxKey:
+      continue
+
+    # Look up in SSTable
+    let tableResult = table.lookup(keyStr, snapshotSeqno)
+    if tableResult.isSome:
+      let entry = tableResult.get
+      if entry.key.isTombstone():
+        return none(types.Slice)
+      return some(entry.value)
 
   none(types.Slice)
 
@@ -182,7 +218,16 @@ proc flushMemtable*(t: Tree, memtable: Memtable): LsmResult[SsTable] =
   if tableResult.isErr:
     return err[SsTable](tableResult.error)
 
-  ok(tableResult.value)
+  # Open the table for reading
+  let openResult = openSsTable(tablePath)
+  if openResult.isErr:
+    return err[SsTable](openResult.error)
+
+  # Copy metadata from the created table
+  let openedTable = openResult.value
+  openedTable.meta = tableResult.value.meta
+
+  ok(openedTable)
 
 proc rotateMemtable*(t: Tree): Option[Memtable]
 
@@ -198,7 +243,11 @@ proc flushActiveMemtable*(t: Tree): LsmResult[Option[SsTable]] =
   if flushResult.isErr:
     return err[Option[SsTable]](flushResult.error)
 
-  ok(some(flushResult.value))
+  # Add the flushed table to tables
+  let flushedTable = flushResult.value
+  t.superVersion.tables.add(flushedTable)
+
+  ok(some(flushedTable))
 
 proc rotateMemtable*(t: Tree): Option[Memtable] =
   if t.superVersion.activeMemtable.isEmpty():
@@ -251,7 +300,30 @@ proc getInternalEntry*(t: Tree, key: types.Slice, seqno: Option[SeqNo] = none(
     if result.isSome:
       return result
 
-  # TODO: Check SSTables
+  # Check SSTables - iterate from newest to oldest (L0 to higher levels)
+  # Convert key to string for SSTable lookup
+  let keyStr = key.data
+
+  for table in t.superVersion.tables:
+    # Skip if table is not open
+    if not table.fileOpened:
+      continue
+
+    # Check if key is in range
+    if table.meta.minKey.len > 0 and keyStr < table.meta.minKey:
+      continue
+    if table.meta.maxKey.len > 0 and keyStr > table.meta.maxKey:
+      continue
+
+    # Look up in SSTable
+    let tableResult = table.lookup(keyStr, snapshotSeqno)
+    if tableResult.isSome:
+      let entry = tableResult.get
+      # Check if this is a tombstone
+      if entry.key.valueType.isTombstone:
+        # Return tombstone to indicate deletion
+        return some(entry)
+      return some(entry)
 
   none(InternalValue)
 

@@ -12,15 +12,38 @@ import types
 import error
 
 # ============================================================================
+# Memtable Entry - sorted by seqno (descending) for fast MVCC lookup
+# ============================================================================
+
+type
+  MemtableEntry* = object
+    ## Single version of a key-value pair
+    seqno*: SeqNo
+    valueType*: ValueType
+    value*: types.Slice
+
+  MemtableKeyVersions* = ref object
+    ## All versions of a single user key, sorted by seqno descending
+    versions*: seq[MemtableEntry]
+
+# Compare for binary search - by seqno descending
+proc cmpSeqnoDesc(a, b: MemtableEntry): int =
+  # Descending order (higher seqno first)
+  if a.seqno < b.seqno: 1
+  elif a.seqno > b.seqno: -1
+  else: 0
+
+# ============================================================================
 # Memtable
 # ============================================================================
 
 type
   Memtable* = ref object
     ## In-memory write buffer for the LSM tree
-    ## Uses a table for simple key-value storage (would be skip list in production)
+    ## Uses a table indexed by user key for O(log n) lookups
     id*: MemtableId
-    items*: Table[InternalKey, types.Slice] # InternalKey -> value
+    ## Main storage: userKey -> all versions of that key, sorted by seqno desc
+    items*: Table[string, MemtableKeyVersions]
     approximateSize*: Atomic[uint64]
     highestSeqno*: Atomic[SeqNo]
     requestedRotation*: Atomic[bool]
@@ -32,7 +55,7 @@ proc newMemtable*(id: MemtableId): Memtable =
 
   Memtable(
     id: id,
-    items: initTable[InternalKey, types.Slice](),
+    items: initTable[string, MemtableKeyVersions](),
     approximateSize: approxSize,
     highestSeqno: highSeqno,
     requestedRotation: reqRotation
@@ -69,13 +92,23 @@ proc getHighestSeqno*(m: Memtable): Option[SeqNo] =
 proc insert*(m: Memtable, item: InternalValue): (uint64, uint64) =
   ## Insert an item into the memtable
   ## Returns (item_size, total_size_after)
-  let itemSize = uint64(item.key.userKey.len + item.value.len + sizeof(
-      InternalKey) + sizeof(types.Slice))
+  let userKeyStr = item.key.userKey # Already a string now
+  let itemSize = uint64(userKeyStr.len + item.value.len + 16) # Approximate
 
   let sizeBefore = fetchAdd(m.approximateSize, itemSize, moRelaxed)
 
-  # Insert into table
-  m.items[item.key] = item.value
+  # Check if key exists and get or create
+  let isNew = not m.items.hasKey(userKeyStr)
+  if isNew:
+    m.items[userKeyStr] = MemtableKeyVersions(versions: @[])
+
+  # Add new version at end - seqnos are increasing so entries are naturally sorted (ascending)
+  let entry = MemtableEntry(
+    seqno: item.key.seqno,
+    valueType: item.key.valueType,
+    value: item.value
+  )
+  m.items[userKeyStr].versions.add(entry)
 
   # Update highest seqno using compareExchange
   var currentSeqno = load(m.highestSeqno, moRelaxed)
@@ -87,7 +120,7 @@ proc insert*(m: Memtable, item: InternalValue): (uint64, uint64) =
   (itemSize, sizeBefore + itemSize)
 
 # ============================================================================
-# Point Lookup with MVCC
+# Point Lookup with MVCC - O(log n)
 # ============================================================================
 
 proc get*(m: Memtable, key: types.Slice, seqno: SeqNo): Option[InternalValue] =
@@ -96,35 +129,83 @@ proc get*(m: Memtable, key: types.Slice, seqno: SeqNo): Option[InternalValue] =
   if seqno == 0:
     return none(InternalValue)
 
-  var bestMatch: Option[InternalValue] = none(InternalValue)
+  let userKey = key.data # Get string data from Slice directly
+  if not m.items.hasKey(userKey):
+    return none(InternalValue)
 
-  for internalKey, value in m.items:
-    if internalKey.userKey == key and internalKey.seqno <= seqno:
-      if bestMatch.isNone or internalKey.seqno > bestMatch.get.key.seqno:
-        bestMatch = some(InternalValue(key: internalKey, value: value))
+  let keyVersions = m.items[userKey]
 
-  bestMatch
+  # Binary search for highest seqno <= target seqno
+  # Versions are sorted by seqno ascending
+  var lo = 0
+  var hi = keyVersions.versions.len - 1
+  var bestIdx = -1
+
+  while lo <= hi:
+    let mid = (lo + hi) div 2
+    let midSeqno = keyVersions.versions[mid].seqno
+    if midSeqno <= seqno:
+      bestIdx = mid
+      lo = mid + 1
+    else:
+      hi = mid - 1
+
+  if bestIdx < 0:
+    return none(InternalValue)
+
+  let entry = keyVersions.versions[bestIdx]
+
+  # Check if it's a value or tombstone
+  case entry.valueType
+  of vtValue:
+    let internalKey = newInternalKey(
+      userKey, # Already a string
+      entry.seqno,
+      entry.valueType
+    )
+    return some(InternalValue(key: internalKey, value: entry.value))
+  of vtTombstone, vtWeakTombstone:
+    return none(InternalValue)
+  of vtIndirection:
+    # TODO: Handle blob indirection
+    return none(InternalValue)
 
 # ============================================================================
 # Iteration
 # ============================================================================
 
 proc iter*(m: Memtable): seq[InternalValue] =
-  ## Full range iterator
+  ## Full range iterator - returns latest version of each key
   result = newSeq[InternalValue]()
-  for key, value in m.items:
-    result.add(InternalValue(key: key, value: value))
-  # Sort by key (user key ascending, seqno descending)
-  result.sort(proc(a, b: InternalValue): int = cmpInternalKey(a.key, b.key))
+  for userKey, keyVersions in m.items:
+    if keyVersions.versions.len > 0:
+      let entry = keyVersions.versions[0] # Highest seqno
+      if entry.valueType == vtValue:
+        let internalKey = newInternalKey(
+          userKey, # Already a string
+          entry.seqno,
+          entry.valueType
+        )
+        result.add(InternalValue(key: internalKey, value: entry.value))
 
 proc range*(m: Memtable, startKey: InternalKey, endKey: InternalKey): seq[
     InternalValue] =
   ## Range iterator
   result = newSeq[InternalValue]()
-  for key, value in m.items:
-    if key >= startKey and key < endKey:
-      result.add(InternalValue(key: key, value: value))
-  result.sort(proc(a, b: InternalValue): int = cmpInternalKey(a.key, b.key))
+  let startStr = startKey.userKey # Already a string
+  let endStr = endKey.userKey # Already a string
+
+  for userKey, keyVersions in m.items:
+    if userKey >= startStr and userKey < endStr:
+      if keyVersions.versions.len > 0:
+        let entry = keyVersions.versions[0]
+        if entry.valueType == vtValue:
+          let internalKey = newInternalKey(
+            userKey, # Already a string
+            entry.seqno,
+            entry.valueType
+          )
+          result.add(InternalValue(key: internalKey, value: entry.value))
 
 # ============================================================================
 # Tests

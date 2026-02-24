@@ -125,21 +125,29 @@ proc `[]`*(s: Slice, r: HSlice[int, int]): string {.inline.} =
 type
   InternalKey* = ref object
     ## Internal key structure with user key, sequence number, and value type
-    userKey*: Slice
+    ## Stores userKey as string directly for efficient Table lookups
+    userKey*: string
     seqno*: SeqNo
     valueType*: ValueType
 
-proc newInternalKey*(userKey: Slice, seqno: SeqNo,
+proc newInternalKey*(userKey: string, seqno: SeqNo,
     valueType: ValueType): InternalKey =
   assert(userKey.len <= 65535, "keys can be 65535 bytes in length")
   InternalKey(userKey: userKey, seqno: seqno, valueType: valueType)
 
+proc newInternalKeyFromSlice*(userKey: Slice, seqno: SeqNo,
+    valueType: ValueType): InternalKey =
+  ## Create InternalKey from Slice - converts Slice to string
+  assert(userKey.len <= 65535, "keys can be 65535 bytes in length")
+  InternalKey(userKey: userKey.data, seqno: seqno, valueType: valueType)
+
+# Generic overloads for backward compatibility
 proc newInternalKey*[K: Slice|string](userKey: K, seqno: SeqNo,
     valueType: ValueType): InternalKey =
   when K is string:
-    newInternalKey(newSlice(userKey), seqno, valueType)
-  else:
     newInternalKey(userKey, seqno, valueType)
+  else:
+    newInternalKeyFromSlice(userKey, seqno, valueType)
 
 proc isTombstone*(key: InternalKey): bool {.inline.} =
   key.valueType.isTombstone()
@@ -177,7 +185,7 @@ proc `$`*(key: InternalKey): string =
   of vtTombstone: "T"
   of vtWeakTombstone: "W"
   of vtIndirection: "Vb"
-  key.userKey.data & ":" & $key.seqno & ":" & vtStr
+  key.userKey & ":" & $key.seqno & ":" & vtStr
 
 # ============================================================================
 # Internal Value
