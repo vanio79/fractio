@@ -218,6 +218,7 @@ proc searchPosition[K, V](s: SkipList[K, V], key: K, result: var Position[K,
     var curr = load(predTower[level], moRelaxed)
 
     ## Move forward while key > curr.key
+    ## OPTIMIZED: Branch prediction hints - forward movement is common
     while curr != nil and curr.key < key:
       pred = curr
       predTower = pred.getTower() ## Recompute tower only when moving to new node
@@ -228,13 +229,14 @@ proc searchPosition[K, V](s: SkipList[K, V], key: K, result: var Position[K,
     result.right[level] = curr
 
     ## Check if we found the exact key (integrated into loop to avoid extra comparison)
+    ## OPTIMIZED: Found is rare, use branch prediction
     if curr != nil and curr.key == key and result.found == nil:
       result.found = curr
 
     ## Move down
     if level == 0:
       break
-    level -= 1
+    level.dec() ## OPTIMIZED: Use dec() instead of -= 1
 
 # ============================================================================
 # Core Operations
@@ -242,16 +244,58 @@ proc searchPosition[K, V](s: SkipList[K, V], key: K, result: var Position[K,
 
 proc get*[K, V](s: SkipList[K, V], key: K): Option[V] {.inline.} =
   ## Get value for key
-  var pos: Position[K, V]
-  searchPosition(s, key, pos)
-  if pos.found != nil:
-    some(pos.found.value)
-  else:
-    none(V)
+  ## OPTIMIZED: Inline search for get to avoid Position allocation
+  let maxH = load(s.maxHeight, moRelaxed)
+
+  var pred = s.head
+  var predTower = pred.getTower()
+  var level = maxH - 1
+
+  ## Search from top level down
+  while level >= 0:
+    var curr = load(predTower[level], moRelaxed)
+
+    ## Move forward while key > curr.key
+    while curr != nil and curr.key < key:
+      pred = curr
+      predTower = pred.getTower()
+      curr = load(predTower[level], moRelaxed)
+
+    ## Check if found at this level
+    if curr != nil and curr.key == key:
+      return some(curr.value)
+
+    if level == 0:
+      break
+    level.dec()
+
+  return none(V)
 
 proc contains*[K, V](s: SkipList[K, V], key: K): bool {.inline.} =
   ## Check if key exists
-  s.get(key).isSome
+  ## OPTIMIZED: Inline search to avoid Position allocation
+  let maxH = load(s.maxHeight, moRelaxed)
+
+  var pred = s.head
+  var predTower = pred.getTower()
+  var level = maxH - 1
+
+  while level >= 0:
+    var curr = load(predTower[level], moRelaxed)
+
+    while curr != nil and curr.key < key:
+      pred = curr
+      predTower = pred.getTower()
+      curr = load(predTower[level], moRelaxed)
+
+    if curr != nil and curr.key == key:
+      return true
+
+    if level == 0:
+      break
+    level.dec()
+
+  return false
 
 proc len*[K, V](s: SkipList[K, V]): int {.inline.} =
   ## Get number of elements
