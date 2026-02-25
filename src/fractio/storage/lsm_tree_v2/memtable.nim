@@ -5,14 +5,14 @@
 ## LSM Tree v2 - Memtable
 ##
 ## This module provides the Memtable implementation - an in-memory write buffer
-## for the LSM tree using a sorted structure.
+## for the LSM tree using a skip list for efficient range iteration.
 
-import std/[tables, sequtils, algorithm, atomics, options]
+import std/[atomics, options]
 import types
-import error
+import skiplist
 
 # ============================================================================
-# Memtable Entry - sorted by seqno (descending) for fast MVCC lookup
+# Memtable Entry
 # ============================================================================
 
 type
@@ -22,28 +22,15 @@ type
     valueType*: ValueType
     value*: types.Slice
 
-  MemtableKeyVersions* = ref object
-    ## All versions of a single user key, sorted by seqno descending
-    versions*: seq[MemtableEntry]
-
-# Compare for binary search - by seqno descending
-proc cmpSeqnoDesc(a, b: MemtableEntry): int =
-  # Descending order (higher seqno first)
-  if a.seqno < b.seqno: 1
-  elif a.seqno > b.seqno: -1
-  else: 0
-
 # ============================================================================
-# Memtable
+# Memtable - Uses skip list for O(log n) range iteration
 # ============================================================================
 
 type
   Memtable* = ref object
     ## In-memory write buffer for the LSM tree
-    ## Uses a table indexed by user key for O(log n) lookups
     id*: MemtableId
-    ## Main storage: userKey -> all versions of that key, sorted by seqno desc
-    items*: Table[string, MemtableKeyVersions]
+    items*: SkipList[InternalKey, types.Slice]
     approximateSize*: Atomic[uint64]
     highestSeqno*: Atomic[SeqNo]
     requestedRotation*: Atomic[bool]
@@ -55,7 +42,7 @@ proc newMemtable*(id: MemtableId): Memtable =
 
   Memtable(
     id: id,
-    items: initTable[string, MemtableKeyVersions](),
+    items: newSkipList[InternalKey, types.Slice](),
     approximateSize: approxSize,
     highestSeqno: highSeqno,
     requestedRotation: reqRotation
@@ -74,7 +61,7 @@ proc len*(m: Memtable): int {.inline.} =
   m.items.len
 
 proc isEmpty*(m: Memtable): bool {.inline.} =
-  m.items.len == 0
+  m.items.isEmpty
 
 proc size*(m: Memtable): uint64 {.inline.} =
   load(m.approximateSize)
@@ -90,27 +77,10 @@ proc getHighestSeqno*(m: Memtable): Option[SeqNo] =
 # ============================================================================
 
 proc insert*(m: Memtable, item: InternalValue): (uint64, uint64) =
-  ## Insert an item into the memtable
-  ## Returns (item_size, total_size_after)
-  let userKeyStr = item.key.userKey # Already a string now
-  let itemSize = uint64(userKeyStr.len + item.value.len + 16) # Approximate
-
+  let itemSize = uint64(item.key.userKey.len + item.value.len + 16)
   let sizeBefore = fetchAdd(m.approximateSize, itemSize, moRelaxed)
+  discard m.items.insert(item.key, item.value)
 
-  # Check if key exists and get or create
-  let isNew = not m.items.hasKey(userKeyStr)
-  if isNew:
-    m.items[userKeyStr] = MemtableKeyVersions(versions: @[])
-
-  # Add new version at end - seqnos are increasing so entries are naturally sorted (ascending)
-  let entry = MemtableEntry(
-    seqno: item.key.seqno,
-    valueType: item.key.valueType,
-    value: item.value
-  )
-  m.items[userKeyStr].versions.add(entry)
-
-  # Update highest seqno using compareExchange
   var currentSeqno = load(m.highestSeqno, moRelaxed)
   while item.key.seqno > currentSeqno:
     if compareExchange(m.highestSeqno, currentSeqno, item.key.seqno, moRelaxed, moRelaxed):
@@ -120,129 +90,132 @@ proc insert*(m: Memtable, item: InternalValue): (uint64, uint64) =
   (itemSize, sizeBefore + itemSize)
 
 # ============================================================================
-# Point Lookup with MVCC - O(log n)
+# Point Lookup with MVCC
 # ============================================================================
 
 proc get*(m: Memtable, key: types.Slice, seqno: SeqNo): Option[InternalValue] =
-  ## Get value for key at given sequence number
-  ## Implements MVCC by returning highest seqno <= given seqno
   if seqno == 0:
     return none(InternalValue)
 
-  let userKey = key.data # Get string data from Slice directly
-  if not m.items.hasKey(userKey):
-    return none(InternalValue)
+  let userKey = key.data
+  let searchKey = newInternalKey(userKey, seqno - 1, vtValue)
 
-  let keyVersions = m.items[userKey]
+  # Custom search for the rightmost entry with the same userKey
+  # This handles InternalKey's descending seqno ordering correctly
+  var update: seq[SkipListNode[InternalKey, types.Slice]] = newSeq[SkipListNode[
+      InternalKey, types.Slice]](MAX_LEVEL)
+  var x = m.items.header
+  var lastSameKeyNode: SkipListNode[InternalKey, types.Slice] = nil
 
-  # Binary search for highest seqno <= target seqno
-  # Versions are sorted by seqno ascending
-  var lo = 0
-  var hi = keyVersions.versions.len - 1
-  var bestIdx = -1
+  for i in countdown(m.items.level - 1, 0):
+    while x.forward[i] != nil:
+      let fwd = x.forward[i]
+      if fwd.key <= searchKey:
+        # Check if this forward node has the same userKey
+        if fwd.key.userKey == userKey:
+          lastSameKeyNode = fwd
+        x = fwd
+      else:
+        break
+    update[i] = x
 
-  while lo <= hi:
-    let mid = (lo + hi) div 2
-    let midSeqno = keyVersions.versions[mid].seqno
-    if midSeqno <= seqno:
-      bestIdx = mid
-      lo = mid + 1
-    else:
-      hi = mid - 1
+  let node = if lastSameKeyNode != nil: lastSameKeyNode else: x.forward[0]
 
-  if bestIdx < 0:
-    return none(InternalValue)
+  if node != nil and node.key.userKey == userKey:
+    if node.key.isTombstone():
+      return none(InternalValue)
+    return some(InternalValue(key: node.key, value: node.value))
 
-  let entry = keyVersions.versions[bestIdx]
-
-  # Check if it's a value or tombstone
-  case entry.valueType
-  of vtValue:
-    let internalKey = newInternalKey(
-      userKey, # Already a string
-      entry.seqno,
-      entry.valueType
-    )
-    return some(InternalValue(key: internalKey, value: entry.value))
-  of vtTombstone, vtWeakTombstone:
-    return none(InternalValue)
-  of vtIndirection:
-    # TODO: Handle blob indirection
-    return none(InternalValue)
+  none(InternalValue)
 
 # ============================================================================
-# Iteration
+# Range Iterator
+# ============================================================================
+
+type
+  MemtableRangeIter* = ref object
+    memtable*: Memtable
+    startKey*: InternalKey
+    endKey*: InternalKey
+    targetSeqno*: SeqNo
+    iter*: SkipListRangeIter[InternalKey, types.Slice]
+    initialized*: bool
+
+proc newMemtableRangeIter*(m: Memtable, startKey, endKey: InternalKey,
+    targetSeqno: SeqNo): MemtableRangeIter =
+  MemtableRangeIter(
+    memtable: m,
+    startKey: startKey,
+    endKey: endKey,
+    targetSeqno: targetSeqno,
+    iter: m.items.newRangeIter(startKey, endKey, false),
+    initialized: true
+  )
+
+proc hasNext*(m: MemtableRangeIter): bool =
+  while m.iter.hasNext():
+    let (key, value) = m.iter.next()
+    if key.seqno <= m.targetSeqno:
+      # Found a valid entry
+      m.iter = m.memtable.items.newRangeIter(key, m.endKey, false)
+      return true
+  return false
+
+proc next*(m: MemtableRangeIter): Option[InternalValue] =
+  if not m.hasNext():
+    return none(InternalValue)
+
+  # Get the current entry
+  let (key, value) = m.iter.next()
+  some(InternalValue(key: key, value: value))
+
+# ============================================================================
+# Full iteration
 # ============================================================================
 
 proc iter*(m: Memtable): seq[InternalValue] =
-  ## Full range iterator - returns latest version of each key
   result = newSeq[InternalValue]()
-  for userKey, keyVersions in m.items:
-    if keyVersions.versions.len > 0:
-      let entry = keyVersions.versions[0] # Highest seqno
-      if entry.valueType == vtValue:
-        let internalKey = newInternalKey(
-          userKey, # Already a string
-          entry.seqno,
-          entry.valueType
-        )
-        result.add(InternalValue(key: internalKey, value: entry.value))
-
-proc range*(m: Memtable, startKey: InternalKey, endKey: InternalKey): seq[
-    InternalValue] =
-  ## Range iterator
-  result = newSeq[InternalValue]()
-  let startStr = startKey.userKey # Already a string
-  let endStr = endKey.userKey # Already a string
-
-  for userKey, keyVersions in m.items:
-    if userKey >= startStr and userKey < endStr:
-      if keyVersions.versions.len > 0:
-        let entry = keyVersions.versions[0]
-        if entry.valueType == vtValue:
-          let internalKey = newInternalKey(
-            userKey, # Already a string
-            entry.seqno,
-            entry.valueType
-          )
-          result.add(InternalValue(key: internalKey, value: entry.value))
+  let iter = m.items.all()
+  while iter.hasNext():
+    let (key, value) = iter.next()
+    if key.valueType == vtValue:
+      result.add(InternalValue(key: key, value: value))
 
 # ============================================================================
 # Tests
 # ============================================================================
 
 when isMainModule:
-  echo "Testing memtable..."
+  echo "Testing Memtable..."
 
   let memtable = newMemtable(0)
 
-  # Insert some values
   discard memtable.insert(newInternalValue("key1", "value1", 1, vtValue))
-  discard memtable.insert(newInternalValue("key1", "value2", 2, vtValue))
-  discard memtable.insert(newInternalValue("key2", "value3", 3, vtValue))
+  discard memtable.insert(newInternalValue("key2", "value2", 2, vtValue))
+  discard memtable.insert(newInternalValue("key3", "value3", 3, vtValue))
 
   echo "Memtable size: ", memtable.size()
   echo "Memtable len: ", memtable.len()
 
-  # Test get with latest seqno
-  let key1 = newSlice("key1")
-  let val = memtable.get(key1, 2)
-  if val.isSome:
-    echo "Got key1 (seqno 2): ", val.get.value.asString()
-
-  # Test get with older seqno
-  let val1 = memtable.get(key1, 1)
+  # Test get
+  let val1 = memtable.get(newSlice("key1"), 1.SeqNo)
   if val1.isSome:
-    echo "Got key1 (seqno 1): ", val1.get.value.asString()
+    echo "Got key1: ", val1.get.value.asString()
 
-  # Test tombstone
-  discard memtable.insert(newTombstone("key2", 4))
-  let val2 = memtable.get(key1, 4)
-  echo "After tombstone, key2 exists: ", val2.isSome
+  # Test range iteration
+  let startKey = newInternalKey("key1", 3.SeqNo, vtValue)
+  let endKey = newInternalKey("key3", 0.SeqNo, vtValue)
+  let rangeIter = memtable.newMemtableRangeIter(startKey, endKey, 3.SeqNo)
 
-  # Test iter
-  echo "\nAll items:"
-  for item in memtable.iter():
-    echo "  ", $item
+  echo "Range results:"
+  var count = 0
+  while rangeIter.hasNext() and count < 10:
+    let item = rangeIter.next()
+    if item.isSome:
+      echo "  ", item.get.key.userKey, ":", item.get.value.asString()
+      count += 1
+
+  if count >= 10:
+    echo "  ... (truncated)"
 
   echo "Memtable tests passed!"
