@@ -70,13 +70,25 @@ type
 # Node Operations
 # ============================================================================
 
+proc getTower[K, V](node: SkipListNode[K, V]): ptr UncheckedArray[Atomic[
+    SkipListNode[K, V]]] {.inline.} =
+  ## Get pointer to tower array
+  cast[ptr UncheckedArray[Atomic[SkipListNode[K, V]]]](
+    cast[uint](node) + uint(sizeof(SkipListNodeObj[K, V]))
+  )
+
 proc allocNode[K, V](h: int): SkipListNode[K, V] {.inline.} =
   ## Allocate node with embedded atomic tower
+  ## OPTIMIZED: Use alloc instead of alloc0, only zero tower pointers
   ## Total size = object size + h * sizeof(Atomic[pointer])
   let size = sizeof(SkipListNodeObj[K, V]) + h * sizeof(Atomic[pointer])
-  result = cast[SkipListNode[K, V]](alloc0(size))
+  result = cast[SkipListNode[K, V]](alloc(size))
   ## Initialize refsAndHeight: height-1 in lower bits, ref count = 2 (1 for entry + 1 for level 0 link)
   store(result.refsAndHeight, uint(h - 1) or (2u shl HEIGHT_BITS), moRelaxed)
+  ## Zero only tower pointers (key/value will be written immediately)
+  let tower = result.getTower()
+  for i in 0 ..< h:
+    store(tower[i], nil, moRelaxed)
 
 proc deallocNode[K, V](node: SkipListNode[K, V]) {.inline.} =
   ## Free a node and its key/value
@@ -98,13 +110,6 @@ proc decRef[K, V](node: SkipListNode[K, V]) {.inline.} =
     ## Last reference dropped
     fence(moAcquire)
     deallocNode(node)
-
-proc getTower[K, V](node: SkipListNode[K, V]): ptr UncheckedArray[Atomic[
-    SkipListNode[K, V]]] {.inline.} =
-  ## Get pointer to tower array
-  cast[ptr UncheckedArray[Atomic[SkipListNode[K, V]]]](
-    cast[uint](node) + uint(sizeof(SkipListNodeObj[K, V]))
-  )
 
 proc loadNext[K, V](node: SkipListNode[K, V], level: int): SkipListNode[K,
     V] {.inline.} =
@@ -185,10 +190,13 @@ proc randomHeight[K, V](s: SkipList[K, V]): int {.inline.} =
 # Search with Position Tracking
 # ============================================================================
 
-proc searchPosition[K, V](s: SkipList[K, V], key: K): Position[K,
-    V] {.inline.} =
+proc searchPosition[K, V](s: SkipList[K, V], key: K, result: var Position[K,
+    V]) {.inline.} =
   ## Search for key and return position (predecessors and successors at each level)
   ## This is the core search algorithm used by insert, remove, and get
+  ## OPTIMIZED: Cache tower base to avoid recomputing on every load
+  ## OPTIMIZED: Use moRelaxed for traversal loads (validated by CAS later)
+  ## OPTIMIZED: Pass result as var parameter to avoid large struct copy
 
   let maxH = load(s.maxHeight, moRelaxed)
 
@@ -200,23 +208,26 @@ proc searchPosition[K, V](s: SkipList[K, V], key: K): Position[K,
   result.found = nil
 
   var pred = s.head
+  var predTower = pred.getTower() ## Cache tower base for current predecessor
   var level = maxH - 1
 
   ## Search from top level down
   while level >= 0:
-    ## Get successor at this level
-    var curr = loadNext(pred, level)
+    ## Get successor at this level (using cached tower)
+    ## Use moRelaxed for traversal - CAS in insert/remove provides synchronization
+    var curr = load(predTower[level], moRelaxed)
 
     ## Move forward while key > curr.key
     while curr != nil and curr.key < key:
       pred = curr
-      curr = loadNext(pred, level)
+      predTower = pred.getTower() ## Recompute tower only when moving to new node
+      curr = load(predTower[level], moRelaxed)
 
     ## Record position at this level
     result.left[level] = pred
     result.right[level] = curr
 
-    ## Check if we found the exact key
+    ## Check if we found the exact key (integrated into loop to avoid extra comparison)
     if curr != nil and curr.key == key and result.found == nil:
       result.found = curr
 
@@ -231,7 +242,8 @@ proc searchPosition[K, V](s: SkipList[K, V], key: K): Position[K,
 
 proc get*[K, V](s: SkipList[K, V], key: K): Option[V] {.inline.} =
   ## Get value for key
-  let pos = searchPosition(s, key)
+  var pos: Position[K, V]
+  searchPosition(s, key, pos)
   if pos.found != nil:
     some(pos.found.value)
   else:
@@ -258,7 +270,8 @@ proc insert*[K, V](s: SkipList[K, V], key: K, value: V): Entry[K, V] =
   ## Uses CAS retry loops for thread safety
 
   ## First, search for the key
-  var pos = searchPosition(s, key)
+  var pos: Position[K, V]
+  searchPosition(s, key, pos)
 
   ## If key exists, update value and return
   if pos.found != nil:
@@ -269,13 +282,10 @@ proc insert*[K, V](s: SkipList[K, V], key: K, value: V): Entry[K, V] =
   let height = s.randomHeight()
 
   ## Allocate and initialize new node
+  ## Tower is already zeroed in allocNode
   let newNode = allocNode[K, V](height)
   newNode.key = key
   newNode.value = value
-
-  ## Initialize tower to nil
-  for i in 0 ..< height:
-    store(newNode.getTower()[i], nil, moRelaxed)
 
   ## Optimistically increment length
   discard fetchAdd(s.len, 1, moRelaxed)
@@ -304,10 +314,10 @@ proc insert*[K, V](s: SkipList[K, V], key: K, value: V): Entry[K, V] =
         useFastPath = false
         break
 
-    if useFastPath:
-      ## Fast path completed successfully
-      return Entry[K, V](list: s, node: newNode)
-
+  if useFastPath:
+    ## Fast path completed successfully
+    return Entry[K, V](list: s, node: newNode)
+  else:
     ## Fast path failed partway - need to continue with slow path
     ## Find which level we need to resume from
     var resumeLevel = 1
@@ -333,53 +343,53 @@ proc insert*[K, V](s: SkipList[K, V], key: K, value: V): Entry[K, V] =
           incRef(newNode)
           break
 
-        let newPos = searchPosition(s, key)
+        var newPos: Position[K, V]
+        searchPosition(s, key, newPos)
         pos.left[level] = newPos.left[level]
         pos.right[level] = newPos.right[level]
 
         if loadNext(newNode, 0) == nil or loadNext(newNode, level) != nil:
           break
 
-    return Entry[K, V](list: s, node: newNode)
-
-  ## SLOW PATH: CAS loop for level 0 insertion
-  while true:
-    storeNext(newNode, 0, pos.right[0])
-
-    if casNext(pos.left[0], 0, pos.right[0], newNode):
-      break
-
-    pos = searchPosition(s, key)
-
-    if pos.found != nil:
-      deallocNode(newNode)
-      discard fetchSub(s.len, 1, moRelaxed)
-      pos.found.value = value
-      return Entry[K, V](list: s, node: pos.found)
-
-  ## Build upper levels (1 to height-1) with CAS
-  for level in 1 ..< height:
+    ## SLOW PATH: CAS loop for level 0 insertion
     while true:
-      let pred = pos.left[level]
-      let succ = pos.right[level]
+      storeNext(newNode, 0, pos.right[0])
 
-      if loadNext(newNode, level) != nil:
+      if casNext(pos.left[0], 0, pos.right[0], newNode):
         break
 
-      storeNext(newNode, level, succ)
+      searchPosition(s, key, pos)
 
-      if casNext(pred, level, succ, newNode):
-        incRef(newNode)
-        break
+      if pos.found != nil:
+        deallocNode(newNode)
+        discard fetchSub(s.len, 1, moRelaxed)
+        pos.found.value = value
+        return Entry[K, V](list: s, node: pos.found)
 
-      let newPos = searchPosition(s, key)
-      pos.left[level] = newPos.left[level]
-      pos.right[level] = newPos.right[level]
+    ## Build upper levels (1 to height-1) with CAS
+    for level in 1 ..< height:
+      while true:
+        let pred = pos.left[level]
+        let succ = pos.right[level]
 
-      if loadNext(newNode, 0) == nil or loadNext(newNode, level) != nil:
-        break
+        if loadNext(newNode, level) != nil:
+          break
 
-  Entry[K, V](list: s, node: newNode)
+        storeNext(newNode, level, succ)
+
+        if casNext(pred, level, succ, newNode):
+          incRef(newNode)
+          break
+
+        var newPos: Position[K, V]
+        searchPosition(s, key, newPos)
+        pos.left[level] = newPos.left[level]
+        pos.right[level] = newPos.right[level]
+
+        if loadNext(newNode, 0) == nil or loadNext(newNode, level) != nil:
+          break
+
+  return Entry[K, V](list: s, node: newNode)
 
 # ============================================================================
 # Lock-Free Removal with Logical Deletion
@@ -401,7 +411,8 @@ proc remove*[K, V](s: SkipList[K, V], key: K): bool =
   ## Remove key using lock-free algorithm
   ## Uses logical deletion (marking) followed by physical unlinking
 
-  var pos = searchPosition(s, key)
+  var pos: Position[K, V]
+  searchPosition(s, key, pos)
 
   if pos.found == nil:
     return false
@@ -434,9 +445,10 @@ proc remove*[K, V](s: SkipList[K, V], key: K): bool =
         decRef(node)
         break
 
-      ## CAS failed - re-search
-      let newPos = searchPosition(s, key)
-      pos.left[level] = newPos.left[level]
+    ## CAS failed - re-search
+    var newPos: Position[K, V]
+    searchPosition(s, key, newPos)
+    pos.left[level] = newPos.left[level]
 
   ## Decrement reference count for the entry
   decRef(node)
@@ -466,9 +478,10 @@ proc next*[K, V](it: Iter[K, V]): tuple[key: K, value: V] {.inline.} =
 # ============================================================================
 
 proc range*[K, V](s: SkipList[K, V], startKey: K, endKey: K,
-                  endInclusive: bool = false): RangeIter[K, V] =
+    endInclusive: bool = false): RangeIter[K, V] =
   ## Create iterator over key range [startKey, endKey)
-  let pos = searchPosition(s, startKey)
+  var pos: Position[K, V]
+  searchPosition(s, startKey, pos)
   var start = pos.found
 
   ## If startKey not found, use the next node
