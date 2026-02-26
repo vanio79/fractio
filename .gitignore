@@ -63,4 +63,6 @@ config.local.nim
 Thumbs.db
 # Benchmark binaries
 benchmarks/fractio_bench
-benchmarks/fjall_bench/target/
+
+# Rust build artifacts (target directories)
+benchmarks/**/target/
