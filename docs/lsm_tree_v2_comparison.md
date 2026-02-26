@@ -103,11 +103,11 @@ This document compares the Nim `lsm_tree_v2` implementation with the Rust `lsm-t
 
 | Feature | Rust | Nim | Status |
 |---------|------|-----|--------|
-| hash64 | xxhash64 | FNV-1a | ⚠️ Simplified |
-| hash128 | ✓ | ✓ (simplified) | ⚠️ Simplified |
-| MurmurHash3 | Used in bloom | Not implemented | ❌ Missing |
+| hash64 | xxhash3 | xxhash64 | ✅ Complete |
+| hash128 | xxhash3 | xxhash128 | ✅ Complete |
+| Used by | Bloom filter, checksums | Same | ✅ Complete |
 
-**Status:** ⚠️ Simplified (would benefit from better hash functions)
+**Status:** ✅ Complete (matching algorithm, uses xxhash)
 
 ---
 
@@ -183,9 +183,11 @@ This document compares the Nim `lsm_tree_v2` implementation with the Rust `lsm-t
 | BlockEncoder | ✓ | ✓ | ✅ Complete |
 | BlockTrailer | ✓ | ✓ | ✅ Complete |
 | BinaryIndex | ✓ | ✓ | ✅ Complete |
-| HashIndex | ✓ | stub | ⚠️ Partial |
+| HashIndex Builder | ✓ | ✅ Added | ✅ Complete |
+| HashIndex Reader | ✓ | ✅ Added | ✅ Complete |
+| Compression | LZ4 | ctNone only | ⚠️ Partial |
 
-**Status:** ⚠️ Partial (hash index is stub)
+**Status:** ✅ Complete (hash index added)
 
 ---
 
@@ -387,8 +389,8 @@ But for scan operations, Nim's custom skiplist outperforms Rust's!
 
 | File | Coverage | Impact |
 |------|----------|--------|
-| hash.nim | ~30% | Low (bloom filters affected) |
-| block.nim | ~70% | Low |
+| hash.nim | ~90% | xxhash implemented |
+| block.nim | ~90% | Hash index added |
 | version.nim | ~20% | Low (not used in benchmark) |
 
 ### ❌ Stubs (Not Used in Benchmark)
