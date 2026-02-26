@@ -62,48 +62,65 @@ type
     data*: string
 
 proc newSlice*(data: string): Slice =
-  Slice(data: data)
+  result = new(Slice)
+  result.data = data
 
 proc newSlice*(data: seq[uint8]): Slice =
-  Slice(data: cast[string](data))
+  result = new(Slice)
+  result.data = cast[string](data)
 
 proc newSlice*(data: openArray[byte]): Slice =
   var s = newString(data.len)
   for i, b in data:
     s[i] = char(b)
-  Slice(data: s)
+  result = new(Slice)
+  result.data = s
 
 proc emptySlice*(): Slice =
-  Slice(data: "")
+  result = new(Slice)
+  result.data = ""
 
 proc len*(s: Slice): int {.inline.} =
+  if s.isNil: return 0
   s.data.len
 
 proc isEmpty*(s: Slice): bool {.inline.} =
+  if s.isNil: return true
   s.data.len == 0
 
 proc `==`*(a, b: Slice): bool {.inline.} =
+  if a.isNil or b.isNil: return a.isNil and b.isNil
   a.data == b.data
 
-proc `<`*(a, b: Slice): bool {.inline.} =
+proc `<`*(a, b: Slice): bool =
+  if a.isNil: return not b.isNil
+  if b.isNil: return false
   a.data < b.data
 
-proc `<=`*(a, b: Slice): bool {.inline.} =
+proc `<=`*(a, b: Slice): bool =
+  if a.isNil: return true
+  if b.isNil: return false
   a.data <= b.data
 
-proc `>`*(a, b: Slice): bool {.inline.} =
+proc `>`*(a, b: Slice): bool =
+  if a.isNil: return false
+  if b.isNil: return true
   a.data > b.data
 
-proc `>=`*(a, b: Slice): bool {.inline.} =
+proc `>=`*(a, b: Slice): bool =
+  if a.isNil: return b.isNil
+  if b.isNil: return true
   a.data >= b.data
 
-proc hash*(s: Slice): Hash {.inline.} =
+proc hash*(s: Slice): Hash =
+  if s.isNil: return Hash(0)
   hash(s.data)
 
 proc `$`*(s: Slice): string =
+  if s.isNil: return "Slice(nil)"
   "Slice(" & $s.data.len & " bytes)"
 
-proc toSeq*(s: Slice): seq[uint8] {.inline.} =
+proc toSeq*(s: Slice): seq[uint8] =
   cast[seq[uint8]](s.data)
 
 proc asString*(s: Slice): string {.inline.} =
@@ -133,13 +150,19 @@ type
 proc newInternalKey*(userKey: string, seqno: SeqNo,
     valueType: ValueType): InternalKey =
   assert(userKey.len <= 65535, "keys can be 65535 bytes in length")
-  InternalKey(userKey: userKey, seqno: seqno, valueType: valueType)
+  result = new(InternalKey)
+  result.userKey = userKey
+  result.seqno = seqno
+  result.valueType = valueType
 
 proc newInternalKeyFromSlice*(userKey: Slice, seqno: SeqNo,
     valueType: ValueType): InternalKey =
   ## Create InternalKey from Slice - converts Slice to string
   assert(userKey.len <= 65535, "keys can be 65535 bytes in length")
-  InternalKey(userKey: userKey.data, seqno: seqno, valueType: valueType)
+  result = new(InternalKey)
+  result.userKey = userKey.data
+  result.seqno = seqno
+  result.valueType = valueType
 
 # Generic overloads for backward compatibility
 proc newInternalKey*[K: Slice|string](userKey: K, seqno: SeqNo,
@@ -150,36 +173,44 @@ proc newInternalKey*[K: Slice|string](userKey: K, seqno: SeqNo,
     newInternalKeyFromSlice(userKey, seqno, valueType)
 
 proc isTombstone*(key: InternalKey): bool {.inline.} =
+  if key.isNil: return false
   key.valueType.isTombstone()
 
-proc `==`*(a, b: InternalKey): bool {.inline.} =
+proc `==`*(a, b: InternalKey): bool =
+  if a.isNil or b.isNil: return a.isNil and b.isNil
   a.userKey == b.userKey and a.seqno == b.seqno
 
 proc cmpInternalKey*(a, b: InternalKey): int =
   ## Compare two internal keys
   ## Order by user key ascending, THEN by sequence number descending (Reverse)
+  ## Handles nil refs: nil is considered less than any valid key
+  if a.isNil and b.isNil: return 0
+  if a.isNil: return -1
+  if b.isNil: return 1
   let keyCmp = cmp(a.userKey, b.userKey)
   if keyCmp != 0:
     keyCmp
   else:
     cmp(b.seqno, a.seqno) # Reverse order for seqno
 
-proc `<`*(a, b: InternalKey): bool {.inline.} =
+proc `<`*(a, b: InternalKey): bool =
   cmpInternalKey(a, b) < 0
 
-proc `<=`*(a, b: InternalKey): bool {.inline.} =
+proc `<=`*(a, b: InternalKey): bool =
   cmpInternalKey(a, b) <= 0
 
-proc `>`*(a, b: InternalKey): bool {.inline.} =
+proc `>`*(a, b: InternalKey): bool =
   cmpInternalKey(a, b) > 0
 
-proc `>=`*(a, b: InternalKey): bool {.inline.} =
+proc `>=`*(a, b: InternalKey): bool =
   cmpInternalKey(a, b) >= 0
 
 proc hash*(key: InternalKey): Hash =
+  if key.isNil: return Hash(0)
   hash(key.userKey) !& hash(key.seqno)
 
 proc `$`*(key: InternalKey): string =
+  if key.isNil: return "InternalKey(nil)"
   let vtStr = case key.valueType
   of vtValue: "V"
   of vtTombstone: "T"

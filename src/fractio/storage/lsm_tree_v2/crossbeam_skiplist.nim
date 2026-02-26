@@ -18,6 +18,7 @@
 ## 4. Handle concurrent modifications gracefully
 
 import std/[atomics, options, bitops]
+import types
 
 const
   HEIGHT_BITS = 5
@@ -79,16 +80,12 @@ proc getTower[K, V](node: SkipListNode[K, V]): ptr UncheckedArray[Atomic[
 
 proc allocNode[K, V](h: int): SkipListNode[K, V] {.inline.} =
   ## Allocate node with embedded atomic tower
-  ## OPTIMIZED: Use alloc instead of alloc0, only zero tower pointers
+  ## Use alloc0 to zero-initialize everything for safety
   ## Total size = object size + h * sizeof(Atomic[pointer])
   let size = sizeof(SkipListNodeObj[K, V]) + h * sizeof(Atomic[pointer])
-  result = cast[SkipListNode[K, V]](alloc(size))
+  result = cast[SkipListNode[K, V]](alloc0(size))
   ## Initialize refsAndHeight: height-1 in lower bits, ref count = 2 (1 for entry + 1 for level 0 link)
   store(result.refsAndHeight, uint(h - 1) or (2u shl HEIGHT_BITS), moRelaxed)
-  ## Zero only tower pointers (key/value will be written immediately)
-  let tower = result.getTower()
-  for i in 0 ..< h:
-    store(tower[i], nil, moRelaxed)
 
 proc deallocNode[K, V](node: SkipListNode[K, V]) {.inline.} =
   ## Free a node and its key/value
@@ -138,6 +135,23 @@ proc newSkipList*[K, V](): SkipList[K, V] =
 
   ## Allocate head with full MAX_HEIGHT tower
   result.head = allocNode[K, V](MAX_HEIGHT)
+
+  ## Initialize head node's key/value with sentinel values
+  ## This is critical - the head acts as a sentinel with the lowest possible key
+  ## We use newInternalKey with empty string and seqno 0 as the minimum possible key
+  when K is types.InternalKey:
+    result.head.key = types.newInternalKey("", 0.SeqNo, vtValue)
+  elif K is string:
+    result.head.key = ""
+  else:
+    result.head.key = default(K)
+
+  when V is types.Slice:
+    result.head.value = types.newSlice("")
+  elif V is string:
+    result.head.value = ""
+  else:
+    result.head.value = default(V)
 
   ## Initialize all tower slots to nil
   for i in 0 ..< MAX_HEIGHT:
