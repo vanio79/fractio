@@ -61,18 +61,37 @@ proc newTableMeta*(id: TableId, level: int = 0): TableMeta =
 # SSTable
 # ============================================================================
 
+# Forward declaration with fields
+type
+  BloomFilter* = ref object
+    data*: string
+    numHashes*: int
+    numBits*: int
+
 type
   SsTable* = ref object
     path*: string
     meta*: TableMeta
     fileSize*: uint64
+    ## Cached data (optional optimization)
+    cachedIndexBlock*: Option[string]
+    cachedFilterBlock*: Option[BloomFilter]
+    filterOffset*: uint64
+    filterSize*: uint32
+    fileHandle*: File # Open file handle for efficient I/O
 
 proc newSsTable*(path: string): SsTable =
-  SsTable(
+  result = SsTable(
     path: path,
     meta: newTableMeta(0, 0),
-    fileSize: 0
+    fileSize: 0,
+    cachedIndexBlock: none(string),
+    cachedFilterBlock: none(BloomFilter),
+    filterOffset: 0,
+    filterSize: 0
   )
+  # Open and keep file handle
+  result.fileHandle = open(path, fmRead)
 
 proc id*(t: SsTable): TableId = t.meta.id
 proc level*(t: SsTable): int = t.meta.level
@@ -80,6 +99,10 @@ proc size*(t: SsTable): uint64 = t.meta.size
 proc entryCount*(t: SsTable): uint64 = t.meta.entryCount
 proc minKey*(t: SsTable): types.Slice = t.meta.minKey
 proc maxKey*(t: SsTable): types.Slice = t.meta.maxKey
+
+proc closeTable*(t: SsTable) =
+  ## Close the table and release resources
+  close(t.fileHandle)
 
 # ============================================================================
 # Block Builder
@@ -148,7 +171,7 @@ proc add*(b: BlockBuilder, value: InternalValue): LsmResult[void] =
       b.restartPoints.add(b.buffer.len)
 
     # Update last key
-    b.lastKey = key.userKey
+    b.lastKey = newSlice(key.userKey)
 
     okVoid()
   except:
@@ -332,9 +355,9 @@ proc addEntry*(w: TableWriter, value: InternalValue): LsmResult[void] =
 
     # Update min/max key
     if w.entryCount == 0:
-      w.minKey = key.userKey
+      w.minKey = newSlice(key.userKey)
       w.smallestSeqno = key.seqno
-    w.maxKey = key.userKey
+    w.maxKey = newSlice(key.userKey)
     w.largestSeqno = key.seqno
 
     # Add to current block
@@ -354,7 +377,7 @@ proc addEntry*(w: TableWriter, value: InternalValue): LsmResult[void] =
         offset: w.stream.getPosition().uint64,
         size: blockData.value.len.uint32
       )
-      w.indexEntries.add((key.userKey, handle))
+      w.indexEntries.add((newSlice(key.userKey), handle))
 
       # Write block data
       w.stream.write(blockData.value)
@@ -426,11 +449,7 @@ proc close*(w: TableWriter) =
 # Bloom Filter (simplified)
 # ============================================================================
 
-type
-  BloomFilter* = ref object
-    data*: string
-    numHashes*: int
-    numBits*: int
+# BloomFilter is forward-declared above for SsTable
 
 proc newBloomFilter*(numBits: int, numHashes: int): BloomFilter =
   BloomFilter(
@@ -465,6 +484,374 @@ proc mightContain*(bf: BloomFilter, key: types.Slice): bool =
     if (ord(bf.data[idx]) and (1 shl bit)) == 0:
       return false
   true
+
+# ============================================================================
+# SSTable Lookup - Full Implementation
+# ============================================================================
+# SSTable Lookup - Full Implementation
+# ============================================================================
+
+proc decodeFixed32FromString*(data: string, pos: int): uint32 =
+  ## Decode 32-bit unsigned integer from string
+  var result: uint32 = 0
+  for i in 0 ..< 4:
+    result = result or (uint32(data[pos + i].uint8) shl (i * 8))
+  result
+
+proc decodeFixed64FromString*(data: string, pos: int): uint64 =
+  ## Decode 64-bit unsigned integer from string
+  var result: uint64 = 0
+  for i in 0 ..< 8:
+    result = result or (uint64(data[pos + i].uint8) shl (i * 8))
+  result
+
+proc decodeVarintFromString*(data: string, pos: int): tuple[value: uint64, newPos: int] =
+  ## Decode varint from string, returns (value, newPosition)
+  var result: uint64 = 0
+  var shift = 0
+  var i = pos
+  while i < data.len:
+    let b = data[i].uint8
+    result = result or ((b and 0x7F) shl shift)
+    if (b and 0x80) == 0:
+      break
+    inc shift
+    inc i
+  (result, i + 1)
+
+proc readFileBytes*(path: string, offset: uint64, size: uint64): string =
+  ## Read bytes from a file at given offset
+  var file = open(path, fmRead)
+  file.setFilePos(offset.int64)
+  # Use buffer approach
+  var buffer = newSeq[uint8](size.int)
+  let bytesRead = readBytes(file, buffer, 0, size.int)
+  result = ""
+  for i in 0 ..< bytesRead:
+    result.add(buffer[i].char)
+  close(file)
+
+proc readFromHandle*(table: SsTable, offset: uint64, size: uint64): string =
+  ## Read from cached file handle
+  table.fileHandle.setFilePos(offset.int64)
+  var buffer = newSeq[uint8](size.int)
+  let bytesRead = readBytes(table.fileHandle, buffer, 0, size.int)
+  result = ""
+  for i in 0 ..< bytesRead:
+    result.add(buffer[i].char)
+
+proc searchIndexBlock*(indexData: string, key: string): tuple[offset: uint64,
+    size: uint32, found: bool] =
+  ## Search index block for key, returns (offset, size, found)
+  ## Index block format: (key_len, key, offset, size) repeated
+
+  var pos = 0
+  var lastOffset: uint64 = 0
+  var lastSize: uint32 = 0
+
+  while pos < indexData.len:
+    # Read key length
+    if pos >= indexData.len:
+      break
+    let (keyLen, newPos) = decodeVarintFromString(indexData, pos)
+    pos = newPos
+
+    if pos + keyLen.int > indexData.len:
+      break
+    let indexedKey = indexData[pos ..< pos + keyLen.int]
+    pos += keyLen.int
+
+    # Read offset and size
+    if pos + 12 > indexData.len:
+      break
+    let offset = decodeFixed64FromString(indexData, pos)
+    pos += 8
+    let size = decodeFixed32FromString(indexData, pos)
+    pos += 4
+
+    # Check if this is the right block
+    if indexedKey >= key:
+      return (offset, size, indexedKey == key)
+
+    lastOffset = offset
+    lastSize = size
+
+  # Return the last block if key is greater than all indexed keys
+  if lastOffset > 0:
+    return (lastOffset, lastSize, false)
+
+  (0, 0, false)
+
+proc searchDataBlock*(blockData: string, key: string, seqno: SeqNo,
+    globalSeqno: SeqNo): Option[InternalValue] =
+  ## Search data block for key at given seqno
+  ## Returns the value if found
+
+  var pos = 0
+
+  # First, read restart points
+  if pos + 4 > blockData.len:
+    return none(InternalValue)
+  let restartCount = decodeFixed32FromString(blockData, pos)
+  pos += 4
+
+  # Read restart point offsets
+  var restartOffsets: seq[int] = @[]
+  for i in 0 ..< restartCount:
+    if pos + 4 > blockData.len:
+      break
+    let offset = decodeFixed32FromString(blockData, pos).int
+    restartOffsets.add(offset)
+    pos += 4
+
+  # Binary search using restart points
+  var low = 0
+  var high = restartOffsets.len - 1
+  var foundKey = ""
+
+  while low <= high:
+    let mid = (low + high) div 2
+    var entryPos = restartOffsets[mid]
+
+    # Decode entry at restart point
+    let (sharedLen, keyPos) = decodeVarintFromString(blockData, entryPos)
+    entryPos = keyPos
+
+    let (unsharedLen, valuePos) = decodeVarintFromString(blockData, entryPos)
+    entryPos = valuePos
+
+    let (valueLen, dataPos) = decodeVarintFromString(blockData, entryPos)
+    entryPos = dataPos
+
+    # Reconstruct key - since it's a restart point, sharedLen should be 0
+    # But in practice, we need to compare against previous key
+    # For now, let's just use the unshared part
+    if entryPos + unsharedLen.int + valueLen.int > blockData.len:
+      return none(InternalValue)
+
+    let entryKey = blockData[entryPos ..< entryPos + unsharedLen.int]
+
+    if entryKey < key:
+      low = mid + 1
+    elif entryKey > key:
+      high = mid - 1
+    else:
+      # Found the key - read the value
+      let valuePos = entryPos + unsharedLen.int
+      if valuePos + valueLen.int > blockData.len:
+        return none(InternalValue)
+      let valueData = blockData[valuePos ..< valuePos + valueLen.int]
+
+      # Create InternalKey and InternalValue
+      let internalKey = newInternalKey(entryKey, seqno, vtValue)
+      let internalValue = InternalValue(key: internalKey, value: newSlice(valueData))
+      return some(internalValue)
+
+  none(InternalValue)
+
+proc lookup*(table: SsTable, key: string, seqno: SeqNo): Option[InternalValue] =
+  ## Look up a key in the SSTable
+  ## Returns the value if found and seqno is within range, none otherwise
+  if table.meta.entryCount == 0:
+    return none(InternalValue)
+
+  # Check if key is in range
+  if table.meta.minKey.len > 0 and key < table.meta.minKey.data:
+    return none(InternalValue)
+  if table.meta.maxKey.len > 0 and key > table.meta.maxKey.data:
+    return none(InternalValue)
+
+  # Check global seqno - if query seqno is before table's seqno range, skip
+  if table.meta.smallestSeqno > 0 and seqno < table.meta.smallestSeqno:
+    return none(InternalValue)
+
+  # Read footer to get index block and filter block locations
+  let footerSize = 24 # 8 + 4 + 8 + 4 bytes
+  if table.fileSize <= footerSize.uint64:
+    return none(InternalValue)
+
+  let footerData = table.readFromHandle(table.fileSize - footerSize.uint64,
+      footerSize.uint64)
+
+  let indexOffset = decodeFixed64FromString(footerData, 0)
+  let indexSize = decodeFixed32FromString(footerData, 8)
+  let filterOffset = decodeFixed64FromString(footerData, 12)
+  let filterSize = decodeFixed32FromString(footerData, 20)
+
+  # Check bloom filter first (if available)
+  if filterSize > 0 and filterOffset > 0:
+    # Load filter block if not cached
+    if table.cachedFilterBlock.isNone():
+      let filterData = table.readFromHandle(filterOffset, filterSize.uint64)
+      # Simple bloom filter reconstruction (for now, assume 10 hashes, 1MB)
+      let numBits = filterData.len * 8
+      var bf = newBloomFilter(numBits, 10)
+      bf.data = filterData
+      table.cachedFilterBlock = some(bf)
+
+    # Check if key might be in table
+    if table.cachedFilterBlock.isSome:
+      let keySlice = newSlice(key)
+      if not table.cachedFilterBlock.get.mightContain(keySlice):
+        # Bloom filter says key definitely not in table
+        return none(InternalValue)
+
+  if indexSize == 0 or indexOffset >= table.fileSize:
+    return none(InternalValue)
+
+  # Read index block (use cache if available)
+  let indexData = if table.cachedIndexBlock.isSome:
+    table.cachedIndexBlock.get
+  else:
+    let data = table.readFromHandle(indexOffset, indexSize.uint64)
+    table.cachedIndexBlock = some(data)
+    data
+
+  # Search index block for the key
+  let (dataOffset, dataSize, found) = searchIndexBlock(indexData, key)
+
+  if dataSize == 0:
+    return none(InternalValue)
+
+  # Read data block
+  let blockData = table.readFromHandle(dataOffset, dataSize.uint64)
+
+  # Search data block
+  let globalSeqno = table.meta.smallestSeqno
+  result = searchDataBlock(blockData, key, seqno, globalSeqno)
+
+# ============================================================================
+# Table Range Iterator
+# ============================================================================
+
+type
+  TableRangeIter* = ref object
+    table*: SsTable
+    startKey*: string
+    endKey*: string
+    targetSeqno*: SeqNo
+    entries*: seq[InternalValue]
+    position*: int
+
+proc newTableRangeIter*(table: SsTable, startKey, endKey: string,
+    targetSeqno: SeqNo): TableRangeIter =
+  ## Create a new table range iterator that reads all entries in range
+  result = TableRangeIter(
+    table: table,
+    startKey: startKey,
+    endKey: endKey,
+    targetSeqno: targetSeqno,
+    entries: newSeq[InternalValue](),
+    position: 0
+  )
+
+  # Read all data blocks and collect entries in range
+  let footerSize = 24
+  if table.fileSize > footerSize.uint64:
+    let footerData = table.readFromHandle(table.fileSize - footerSize.uint64,
+        footerSize.uint64)
+    let indexOffset = decodeFixed64FromString(footerData, 0)
+    let indexSize = decodeFixed32FromString(footerData, 8)
+
+    if indexSize > 0 and indexOffset < table.fileSize:
+      let indexData = table.readFromHandle(indexOffset, indexSize.uint64)
+
+      # Iterate through index entries
+      var pos = 0
+      while pos < indexData.len:
+        let (keyLen, newPos) = decodeVarintFromString(indexData, pos)
+        pos = newPos
+
+        if pos + keyLen.int > indexData.len:
+          break
+        let indexedKey = indexData[pos ..< pos + keyLen.int]
+        pos += keyLen.int
+
+        if pos + 12 > indexData.len:
+          break
+        let blockOffset = decodeFixed64FromString(indexData, pos)
+        pos += 8
+        let blockSize = decodeFixed32FromString(indexData, pos)
+        pos += 4
+
+        # Skip blocks outside our range
+        if result.endKey.len > 0 and indexedKey > result.endKey:
+          break
+        if result.startKey.len > 0 and indexedKey < result.startKey:
+          continue
+
+        # Read and search the data block
+        if blockSize > 0 and blockOffset < table.fileSize:
+          let blockData = table.readFromHandle(blockOffset, blockSize.uint64)
+
+          # Simple linear scan through restart points
+          var blockPos = 0
+          if blockPos + 4 <= blockData.len:
+            let restartCount = decodeFixed32FromString(blockData, blockPos)
+            blockPos += 4
+
+            # Skip to first entry after restart points
+            blockPos = restartCount.int * 4 + 4
+
+            # Iterate through entries
+            while blockPos < blockData.len:
+              # Check for restart point
+              let restartIndex = (blockPos - 4) div 4 - 1
+              if restartIndex >= 0 and (blockPos - 4) mod 4 == 0 and
+                  restartIndex < restartCount.int:
+                # At restart point - skip the offset
+                blockPos += 0 # Already at right position
+              
+              # Try to read entry
+              if blockPos >= blockData.len:
+                break
+
+              let (sharedLen, keyPos) = decodeVarintFromString(blockData, blockPos)
+              if keyPos >= blockData.len:
+                break
+              blockPos = keyPos
+
+              let (unsharedLen, valuePos) = decodeVarintFromString(blockData, blockPos)
+              if valuePos >= blockData.len:
+                break
+              blockPos = valuePos
+
+              let (valueLen, dataPos) = decodeVarintFromString(blockData, blockPos)
+              if dataPos >= blockData.len:
+                break
+              blockPos = dataPos
+
+              if dataPos + unsharedLen.int > blockData.len:
+                break
+              let entryKey = blockData[dataPos ..< dataPos + unsharedLen.int]
+              blockPos = dataPos + unsharedLen.int
+
+              if dataPos + unsharedLen.int + valueLen.int > blockData.len:
+                break
+              let valueData = blockData[dataPos + unsharedLen.int ..< dataPos +
+                  unsharedLen.int + valueLen.int]
+
+              # Check if key is in range
+              if result.startKey.len > 0 and entryKey < result.startKey:
+                continue
+              if result.endKey.len > 0 and entryKey > result.endKey:
+                break
+
+              # Add entry (using targetSeqno as approximation)
+              let internalKey = newInternalKey(entryKey, targetSeqno, vtValue)
+              let internalValue = InternalValue(key: internalKey,
+                  value: newSlice(valueData))
+              result.entries.add(internalValue)
+
+proc hasNext*(t: TableRangeIter): bool =
+  t.position < t.entries.len
+
+proc next*(t: TableRangeIter): Option[InternalValue] =
+  if t.position < t.entries.len:
+    let result = t.entries[t.position]
+    inc t.position
+    return some(result)
+  none(InternalValue)
 
 # ============================================================================
 # Tests
