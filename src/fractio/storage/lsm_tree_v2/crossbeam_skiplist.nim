@@ -197,6 +197,7 @@ proc searchPosition[K, V](s: SkipList[K, V], key: K, result: var Position[K,
   ## OPTIMIZED: Cache tower base to avoid recomputing on every load
   ## OPTIMIZED: Use moRelaxed for traversal loads (validated by CAS later)
   ## OPTIMIZED: Pass result as var parameter to avoid large struct copy
+  ## NOTE: Using inline because this is called from multiple places
 
   let maxH = load(s.maxHeight, moRelaxed)
 
@@ -334,72 +335,52 @@ proc insert*[K, V](s: SkipList[K, V], key: K, value: V): Entry[K, V] =
   ## Optimistically increment length
   discard fetchAdd(s.len, 1, moRelaxed)
 
+  ## OPTIMIZED: Cache newNode tower once for both fast and slow paths
+  let newNodeTower = newNode.getTower()
+
   ## Try fast path: check if predecessor's next is unchanged (uncontended)
+  ## OPTIMIZED: Use relaxed loads for fast path check (we'll use proper ordering for stores)
   let leftNode = pos.left[0]
   let rightNode = pos.right[0]
-  var useFastPath = loadNext(leftNode, 0) == rightNode
+  let leftNodeTower = leftNode.getTower()
+  var useFastPath = load(leftNodeTower[0], moRelaxed) == rightNode
 
   if useFastPath:
     ## Fast path: simple stores for level 0
-    storeNext(newNode, 0, rightNode)
-    storeNext(leftNode, 0, newNode)
+    store(newNodeTower[0], rightNode, moRelease)
+    store(leftNodeTower[0], newNode, moRelease)
 
     ## Fast path: build upper levels with simple stores
+    ## OPTIMIZED: Cache tower pointers to avoid repeated getTower calls
+    var fastPathComplete = true
     for level in 1 ..< height:
       let pred = pos.left[level]
       let succ = pos.right[level]
+      let predTower = pred.getTower()
       ## Only use fast path if predecessor's next is unchanged
-      if loadNext(pred, level) == succ:
-        storeNext(newNode, level, succ)
-        storeNext(pred, level, newNode)
+      if load(predTower[level], moRelaxed) == succ:
+        store(newNodeTower[level], succ, moRelease)
+        store(predTower[level], newNode, moRelease)
         incRef(newNode)
       else:
-        ## Contention detected - fall back to slow path for remaining levels
-        useFastPath = false
+        ## Contention detected - fall back to slow path
+        fastPathComplete = false
         break
 
-  if useFastPath:
-    ## Fast path completed successfully
-    return Entry[K, V](list: s, node: newNode)
-  else:
-    ## Fast path failed partway - need to continue with slow path
-    ## Find which level we need to resume from
-    var resumeLevel = 1
-    while resumeLevel < height:
-      if loadNext(newNode, resumeLevel) != nil:
-        incRef(newNode)
-        resumeLevel += 1
-      else:
-        break
+    if fastPathComplete:
+      return Entry[K, V](list: s, node: newNode)
 
-    ## Continue with slow path from resumeLevel
-    for level in resumeLevel ..< height:
-      while true:
-        let pred = pos.left[level]
-        let succ = pos.right[level]
-
-        if loadNext(newNode, level) != nil:
-          break
-
-        storeNext(newNode, level, succ)
-
-        if casNext(pred, level, succ, newNode):
-          incRef(newNode)
-          break
-
-        var newPos: Position[K, V]
-        searchPosition(s, key, newPos)
-        pos.left[level] = newPos.left[level]
-        pos.right[level] = newPos.right[level]
-
-        if loadNext(newNode, 0) == nil or loadNext(newNode, level) != nil:
-          break
-
-    ## SLOW PATH: CAS loop for level 0 insertion
+  ## SLOW PATH: Use CAS for all levels (newNodeTower already cached above)
+  ## First check if level 0 needs linking (may have been linked in fast path attempt)
+  if load(newNodeTower[0], moRelaxed) == nil:
+    let leftNode0 = pos.left[0]
+    let leftNode0Tower = leftNode0.getTower()
     while true:
-      storeNext(newNode, 0, pos.right[0])
+      store(newNodeTower[0], pos.right[0], moRelease)
 
-      if casNext(pos.left[0], 0, pos.right[0], newNode):
+      var expected = pos.right[0]
+      if compareExchange(leftNode0Tower[0], expected, newNode,
+                         moSequentiallyConsistent, moRelaxed):
         break
 
       searchPosition(s, key, pos)
@@ -410,28 +391,34 @@ proc insert*[K, V](s: SkipList[K, V], key: K, value: V): Entry[K, V] =
         pos.found.value = value
         return Entry[K, V](list: s, node: pos.found)
 
-    ## Build upper levels (1 to height-1) with CAS
-    for level in 1 ..< height:
-      while true:
-        let pred = pos.left[level]
-        let succ = pos.right[level]
+  ## SLOW PATH: Build upper levels with CAS
+  ## OPTIMIZED: Cache predecessor tower for direct CAS access
+  for level in 1 ..< height:
+    while true:
+      let pred = pos.left[level]
+      let succ = pos.right[level]
+      let predTower = pred.getTower()
 
-        if loadNext(newNode, level) != nil:
-          break
+      ## OPTIMIZED: Use cached tower for newNode
+      if load(newNodeTower[level], moRelaxed) != nil:
+        break
 
-        storeNext(newNode, level, succ)
+      store(newNodeTower[level], succ, moRelease)
 
-        if casNext(pred, level, succ, newNode):
-          incRef(newNode)
-          break
+      var expected = succ
+      if compareExchange(predTower[level], expected, newNode,
+                         moSequentiallyConsistent, moRelaxed):
+        incRef(newNode)
+        break
 
-        var newPos: Position[K, V]
-        searchPosition(s, key, newPos)
-        pos.left[level] = newPos.left[level]
-        pos.right[level] = newPos.right[level]
+      var newPos: Position[K, V]
+      searchPosition(s, key, newPos)
+      pos.left[level] = newPos.left[level]
+      pos.right[level] = newPos.right[level]
 
-        if loadNext(newNode, 0) == nil or loadNext(newNode, level) != nil:
-          break
+      if load(newNodeTower[0], moRelaxed) == nil or load(newNodeTower[level],
+          moRelaxed) != nil:
+        break
 
   return Entry[K, V](list: s, node: newNode)
 
