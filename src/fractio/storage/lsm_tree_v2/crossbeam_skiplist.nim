@@ -156,11 +156,11 @@ proc randomHeight[K, V](s: SkipList[K, V]): int {.inline.} =
   ## Uses countTrailingZeroBits for O(1) height calculation
 
   ## Xorshift RNG from "Xorshift RNGs" by George Marsaglia
-  var num = load(s.seed, moRelaxed)
+  var num = cast[uint64](load(s.seed, moRelaxed))
   num = num xor (num shl 13)
   num = num xor (num shr 17)
   num = num xor (num shl 5)
-  store(s.seed, num, moRelaxed)
+  store(s.seed, cast[uint](num), moRelaxed)
 
   ## Use trailing zeros to determine height
   var height = min(MAX_HEIGHT, countTrailingZeroBits(num) + 1)

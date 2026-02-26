@@ -5,7 +5,10 @@
 //! - Lookup throughput
 //! - Iteration throughput
 //! - Combined insert/remove throughput
+//! - Concurrent mixed workload
 
+use std::sync::Arc;
+use std::thread;
 use std::time::Instant;
 
 use crossbeam_epoch as epoch;
@@ -13,9 +16,67 @@ use crossbeam_skiplist::SkipList;
 use rand::Rng;
 
 const NUM_ELEMENTS: usize = 100_000;
+const NUM_WORKERS: usize = 50;
+const OPS_PER_WORKER: usize = 1000;
+const CONCURRENT_INITIAL_KEYS: usize = 10_000;
 
 fn make_key(i: usize) -> u64 {
     (i as u64).wrapping_mul(17).wrapping_add(255)
+}
+
+fn make_value(key: u64) -> u64 {
+    // Simply use key + 1 to avoid overflow issues
+    key.wrapping_add(1)
+}
+
+struct WorkerResult {
+    reads: usize,
+    writes: usize,
+    verified: usize,
+}
+
+fn concurrent_worker(
+    list: Arc<SkipList<u64, u64>>,
+    keys: Vec<u64>,
+    worker_id: usize,
+    guard: &epoch::Guard,
+) -> WorkerResult {
+    let mut rng = worker_id + 1;
+    let mut local_reads = 0;
+    let mut local_writes = 0;
+    let mut local_verified = 0;
+    let num_keys = keys.len();
+
+    for _ in 0..OPS_PER_WORKER {
+        let op = rng % 10;
+        let key_idx = rng % num_keys;
+        let key = keys[key_idx];
+
+        if op < 7 {
+            // 70% reads
+            if let Some(val) = list.get(&key, guard) {
+                local_reads += 1;
+                if *val.value() == make_value(key) {
+                    local_verified += 1;
+                }
+            } else {
+                local_reads += 1;
+            }
+        } else {
+            // 30% writes
+            list.insert(key, make_value(key), guard);
+            local_writes += 1;
+        }
+
+        // Simple RNG update
+        rng = ((rng as u64).wrapping_mul(1103515245).wrapping_add(12345) >> 16) as usize;
+    }
+
+    WorkerResult {
+        reads: local_reads,
+        writes: local_writes,
+        verified: local_verified,
+    }
 }
 
 fn main() {
@@ -146,6 +207,58 @@ fn main() {
         NUM_ELEMENTS * 2,
         duration,
         ops_per_sec
+    );
+
+    // =========================================================================
+    // Benchmark 7: Concurrent Mixed Workload
+    // =========================================================================
+    println!(
+        "Running concurrent mixed benchmark ({} workers)...",
+        NUM_WORKERS
+    );
+
+    // Pre-populate list
+    let list = Arc::new(SkipList::new(epoch::default_collector().clone()));
+    let mut init_keys = Vec::with_capacity(CONCURRENT_INITIAL_KEYS);
+    let guard = &epoch::pin();
+    for i in 0..CONCURRENT_INITIAL_KEYS {
+        let key = make_key(i);
+        init_keys.push(key);
+        list.insert(key, make_value(key), guard);
+    }
+
+    let start = Instant::now();
+
+    // Spawn workers
+    let mut handles = Vec::new();
+    for i in 0..NUM_WORKERS {
+        let list = Arc::clone(&list);
+        let keys = init_keys.clone();
+        let handle = thread::spawn(move || {
+            let guard = epoch::pin();
+            concurrent_worker(list, keys, i, &guard)
+        });
+        handles.push(handle);
+    }
+
+    // Wait for completion
+    let mut total_reads = 0;
+    let mut total_writes = 0;
+    let mut total_verified = 0;
+
+    for handle in handles {
+        let result = handle.join().unwrap();
+        total_reads += result.reads;
+        total_writes += result.writes;
+        total_verified += result.verified;
+    }
+
+    let duration = start.elapsed();
+    let total_ops = total_reads + total_writes;
+    let ops_per_sec = total_ops as f64 / duration.as_secs_f64();
+    println!(
+        "  concurrent_mixed: {} ops in {:?} | {:.0} ops/s ({} reads, {} writes, {} verified)",
+        total_ops, duration, ops_per_sec, total_reads, total_writes, total_verified
     );
 
     println!();

@@ -5,10 +5,14 @@
 # - Lookup throughput
 # - Iteration throughput
 # - Combined insert/remove throughput
+# - Concurrent mixed workload
 
-import std/[times, random, atomics, options]
+import std/[times, random, atomics, options, threadpool]
 
 const NUM_ELEMENTS = 100_000
+const NUM_WORKERS = 50
+const OPS_PER_WORKER = 1000
+const CONCURRENT_INITIAL_KEYS = 10_000
 
 # Helper to convert Duration to seconds as float
 proc toSeconds(d: Duration): float =
@@ -18,7 +22,85 @@ proc toSeconds(d: Duration): float =
 import fractio/storage/lsm_tree_v2/crossbeam_skiplist
 
 proc makeKey(i: int): uint64 =
-  (uint64(i) * 17) + 255
+  uint64(i) * 17 + 255
+
+proc makeValue(key: uint64): uint64 =
+  # Simply use key + 1 to avoid any overflow issues
+  key + 1
+
+# =========================================================================
+# Concurrent Mixed Workload Benchmark
+# =========================================================================
+
+type
+  WorkerResult = object
+    reads: int
+    writes: int
+    verified: int
+
+proc concurrentWorker(list: SkipList[uint64, uint64],
+                     keys: seq[uint64],
+                     workerId: int): WorkerResult {.thread, gcsafe.} =
+  var rng = workerId + 1
+  var localReads = 0
+  var localWrites = 0
+  var localVerified = 0
+  let numKeys = keys.len
+
+  # Do mixed read/write workload
+  for i in 0 ..< OPS_PER_WORKER:
+    let op = rng mod 10
+    let keyIdx = rng mod numKeys
+    let key = keys[keyIdx]
+
+    if op < 7: # 70% reads
+      let val = list.get(key)
+      localReads += 1
+      if val.isSome():
+        if val.get() == makeValue(key):
+          localVerified += 1
+    else: # 30% writes
+      discard list.insert(key, makeValue(key))
+      localWrites += 1
+
+    # Simple RNG update - avoid overflow
+    rng = cast[int]((cast[uint](rng) * 1103515245'u + 1235'u) shr 16)
+
+  result.reads = localReads
+  result.writes = localWrites
+  result.verified = localVerified
+
+proc runConcurrentBenchmark(): tuple[reads, writes, verified: int] =
+  var list = newSkipList[uint64, uint64]()
+
+  # Pre-populate with some data
+  var initKeys: seq[uint64] = newSeq[uint64](CONCURRENT_INITIAL_KEYS)
+  for i in 0 ..< initKeys.len:
+    initKeys[i] = makeKey(i)
+    discard list.insert(initKeys[i], makeValue(initKeys[i]))
+
+  # Spawn workers - only do reads first
+  var workers: seq[FlowVar[WorkerResult]] = newSeq[FlowVar[WorkerResult]](NUM_WORKERS)
+
+  for i in 0 ..< NUM_WORKERS:
+    workers[i] = spawn concurrentWorker(list, initKeys, i)
+
+  # Wait for completion
+  var totalReads = 0
+  var totalWrites = 0
+  var totalVerified = 0
+
+  for i in 0 ..< NUM_WORKERS:
+    let result = ^workers[i]
+    totalReads += result.reads
+    totalWrites += result.writes
+    totalVerified += result.verified
+
+  result = (totalReads, totalWrites, totalVerified)
+
+# =========================================================================
+# Main Benchmark
+# =========================================================================
 
 proc main() =
   echo "=== crossbeam-skiplist (Nim) Benchmark ==="
@@ -35,7 +117,7 @@ proc main() =
   var list = newSkipList[uint64, uint64]()
   for i in 0 ..< NUM_ELEMENTS:
     let key = makeKey(i)
-    discard list.insert(key, not key)
+    discard list.insert(key, makeValue(key))
 
   var duration = getTime() - start
   var opsPerSec = float64(NUM_ELEMENTS) / duration.toSeconds()
@@ -54,8 +136,8 @@ proc main() =
     let val = list.get(key)
     if val.isSome():
       found += 1
-      # Verify value is correct (should be not key)
-      if val.get() == (not key):
+      # Verify value is correct
+      if val.get() == makeValue(key):
         verified += 1
   duration = getTime() - start
   opsPerSec = float64(NUM_ELEMENTS) / duration.toSeconds()
@@ -78,8 +160,8 @@ proc main() =
     let val = list.get(key)
     if val.isSome():
       found += 1
-      # Verify value is correct (should be not key)
-      if val.get() == (not key):
+      # Verify value is correct
+      if val.get() == makeValue(key):
         verified += 1
   duration = getTime() - start
   opsPerSec = float64(NUM_ELEMENTS) / duration.toSeconds()
@@ -107,7 +189,7 @@ proc main() =
   start = getTime()
   for i in 0 ..< NUM_ELEMENTS:
     let key = makeKey(i)
-    discard list.insert(key, not key)
+    discard list.insert(key, makeValue(key))
   for i in 0 ..< NUM_ELEMENTS:
     let key = makeKey(i)
     discard list.remove(key)
@@ -115,6 +197,19 @@ proc main() =
   opsPerSec = float64(NUM_ELEMENTS * 2) / duration.toSeconds()
   echo " insert_remove: ", NUM_ELEMENTS * 2, " ops in ", duration, " | ",
     opsPerSec, " ops/s"
+
+  # =========================================================================
+  # Benchmark 6: Concurrent Mixed Workload
+  # =========================================================================
+  echo "Running concurrent mixed benchmark (", NUM_WORKERS, " workers)..."
+  start = getTime()
+  let concurrentResult = runConcurrentBenchmark()
+  duration = getTime() - start
+  let totalOps = concurrentResult.reads + concurrentResult.writes
+  opsPerSec = float64(totalOps) / duration.toSeconds()
+  echo " concurrent_mixed: ", totalOps, " ops in ", duration, " | ",
+    opsPerSec, " ops/s (", concurrentResult.reads, " reads, ",
+    concurrentResult.writes, " writes, ", concurrentResult.verified, " verified)"
 
   echo ""
   echo "=== JSON Output ==="
@@ -128,7 +223,7 @@ proc main() =
   var startSeq = getTime()
   for i in 0 ..< NUM_ELEMENTS:
     let key = makeKey(i)
-    discard list2.insert(key, not key)
+    discard list2.insert(key, makeValue(key))
   var seqInsert = getTime() - startSeq
 
   var startLookup = getTime()
