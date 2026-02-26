@@ -95,11 +95,11 @@ proc deallocNode[K, V](node: SkipListNode[K, V]) {.inline.} =
   ## In a full implementation, this would use epoch-based reclamation
   dealloc(cast[pointer](node))
 
-proc height(node: SkipListNode[auto, auto]): int {.inline.} =
+proc height[K, V](node: SkipListNode[K, V]): int {.inline.} =
   ## Extract height from refsAndHeight
   int(load(node.refsAndHeight, moRelaxed) and HEIGHT_MASK) + 1
 
-proc incRef(node: SkipListNode[auto, auto]) {.inline.} =
+proc incRef[K, V](node: SkipListNode[K, V]) {.inline.} =
   ## Increment reference count
   discard fetchAdd(node.refsAndHeight, 1u shl HEIGHT_BITS, moRelaxed)
 

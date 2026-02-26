@@ -9,7 +9,7 @@
 
 import std/[atomics, options]
 import types
-import skiplist
+import crossbeam_skiplist
 
 # ============================================================================
 # Memtable Entry
@@ -98,33 +98,31 @@ proc get*(m: Memtable, key: types.Slice, seqno: SeqNo): Option[InternalValue] =
     return none(InternalValue)
 
   let userKey = key.data
-  let searchKey = newInternalKey(userKey, seqno - 1, vtValue)
 
-  # Custom search for the rightmost entry with the same userKey
-  # This handles InternalKey's descending seqno ordering correctly
-  var update: seq[SkipListNode[InternalKey, types.Slice]] = newSeq[SkipListNode[
-      InternalKey, types.Slice]](MAX_LEVEL)
-  var x = m.items.header
-  var lastSameKeyNode: SkipListNode[InternalKey, types.Slice] = nil
+  # Find the rightmost entry with the same userKey and seqno <= target
+  # Range query: entries with same userKey, ordered by seqno DESC
+  let startKey = newInternalKey(userKey, seqno, vtValue)
+  let endKey = newInternalKey(userKey, 0.SeqNo, vtValue)
 
-  for i in countdown(m.items.level - 1, 0):
-    while x.forward[i] != nil:
-      let fwd = x.forward[i]
-      if fwd.key <= searchKey:
-        # Check if this forward node has the same userKey
-        if fwd.key.userKey == userKey:
-          lastSameKeyNode = fwd
-        x = fwd
-      else:
-        break
-    update[i] = x
+  var rightmost: tuple[key: InternalKey, value: types.Slice]
 
-  let node = if lastSameKeyNode != nil: lastSameKeyNode else: x.forward[0]
+  let rangeIter = m.items.range(startKey, endKey, false)
+  while rangeIter.hasNext():
+    let (k, v) = rangeIter.next()
 
-  if node != nil and node.key.userKey == userKey:
-    if node.key.isTombstone():
-      return none(InternalValue)
-    return some(InternalValue(key: node.key, value: node.value))
+    # Stop when key changes (shouldn't happen within range, but safety check)
+    if k.userKey != userKey:
+      break
+
+    # Find rightmost entry with seqno <= target
+    if k.seqno <= seqno:
+      if k.isTombstone():
+        # Tombstone - continue searching for older entry
+        continue
+      rightmost = (k, v)
+
+  if rightmost.key.userKey == userKey:
+    return some(InternalValue(key: rightmost.key, value: rightmost.value))
 
   none(InternalValue)
 
@@ -138,7 +136,7 @@ type
     startKey*: InternalKey
     endKey*: InternalKey
     targetSeqno*: SeqNo
-    iter*: SkipListRangeIter[InternalKey, types.Slice]
+    iter*: RangeIter[InternalKey, types.Slice]
     initialized*: bool
 
 proc newMemtableRangeIter*(m: Memtable, startKey, endKey: InternalKey,
@@ -148,7 +146,7 @@ proc newMemtableRangeIter*(m: Memtable, startKey, endKey: InternalKey,
     startKey: startKey,
     endKey: endKey,
     targetSeqno: targetSeqno,
-    iter: m.items.newRangeIter(startKey, endKey, false),
+    iter: m.items.range(startKey, endKey, false),
     initialized: true
   )
 
@@ -157,7 +155,7 @@ proc hasNext*(m: MemtableRangeIter): bool =
     let (key, value) = m.iter.next()
     if key.seqno <= m.targetSeqno:
       # Found a valid entry
-      m.iter = m.memtable.items.newRangeIter(key, m.endKey, false)
+      m.iter = m.memtable.items.range(key, m.endKey, false)
       return true
   return false
 
@@ -175,7 +173,7 @@ proc next*(m: MemtableRangeIter): Option[InternalValue] =
 
 proc iter*(m: Memtable): seq[InternalValue] =
   result = newSeq[InternalValue]()
-  let iter = m.items.all()
+  let iter = m.items.iter()
   while iter.hasNext():
     let (key, value) = iter.next()
     if key.valueType == vtValue:
