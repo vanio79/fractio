@@ -123,9 +123,18 @@ This document compares the Nim `lsm_tree_v2` implementation with the Rust `lsm-t
 | SSTable format | Same footer/header | Same | ✅ Match |
 | Data blocks | Restart interval compression | Same | ✅ Match |
 | Index block | Partitioned support | ⚠️ Partial | 
-| Bloom filter | Full + partitioned | ⚠️ Partial | 
+| Bloom filter | Full + partitioned | ✅ Infrastructure added | 
 | Lookup | Binary search in index | Same | ✅ Match |
 | Range iteration | Block-by-block | Same | ✅ Match |
+| File handle caching | Uses file_accessor | ✅ Now implemented | 
+| Block caching | Cache integration | ⚠️ Partial (index cached) |
+| Global seqno skip | Skips tables by seqno | ✅ Now implemented |
+
+**Updates (2026-02-26):**
+- Added cached file handle to `SsTable` for efficient I/O
+- Added index block caching
+- Added bloom filter check in lookup (skips when filter says no)
+- Added global seqno optimization to skip tables
 
 **Algorithm Match:** ✅
 - Point lookup: Index block search → data block search
@@ -198,13 +207,29 @@ This document compares the Nim `lsm_tree_v2` implementation with the Rust `lsm-t
 
 ### Analysis
 
-The 5-10x performance gap is **algorithmic** (same algorithms) not **implementation**:
-- Nim uses ARC/ORC garbage collector
-- Rust has zero-cost abstractions
-- Memory allocation patterns differ
+The 5-10x performance gap is primarily due to:
+
+1. **Garbage Collection**: Nim's ARC/ORC GC vs Rust's manual memory management
+   - Every insertion allocates new memory for keys/values
+   - GC pause overhead during allocations
+   - Rust's ownership model eliminates most allocations
+
+2. **Memory Allocation Patterns**:
+   - Nim strings are copied by default
+   - Rust borrows/references where possible
+   - Nim's Slice type wraps strings but copies on assignment
+
+3. **Benchmark Behavior**:
+   - Current benchmark stays in memtable only (no SSTable I/O)
+   - Both implementations hit the skiplist path
+   - Gap is in the memtable/skiplist performance, not SSTable
+
+**Key Finding**: The benchmark doesn't flush to SSTables, so SSTable optimizations 
+(file handle caching, bloom filter) won't improve these numbers. The gap is in the 
+memtable/skiplist layer which is where both implementations spend 100% of their time.
 
 Both implementations use:
-- Same skiplist data structure
+- Same skiplist data structure (lock-free)
 - Same MVCC semantics (seqno-based filtering)
 - Same merge iterator algorithm
 - Same SSTable format
