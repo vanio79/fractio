@@ -507,7 +507,8 @@ when defined(nimV2):
     let startKey = newSlice("scan_00000000")
     let endKey = newSlice("scan_00009999")
     let rangeResult = tree.range(startKey, endKey)
-    scanned = rangeResult.len
+    let collected = rangeResult.collect()
+    scanned = collected.len
     let t1 = getTime()
     latency.trackLatency((t1 - t0).inNanoseconds)
 
@@ -542,16 +543,11 @@ when defined(nimV2):
 
     scanned = 0
     let t2 = getTime()
-    # Use range with prefix - scan_ is the prefix
-    let prefixStart = newSlice("scan_")
-    let prefixEnd = newSlice("scan_") # This will get items starting with "scan_"
-                                      # Since we don't have prefix scan, we iterate through all scan keys
-    for i in 0 ..< scanCount:
-      let padded = $i
-      let key = "scan_" & "00000000"[padded.len .. ^1] & padded
-      let k = newSlice(key)
-      let getRes = tree.get(k, some(seqno))
-      if getRes.isSome:
+    # Use proper prefix iterator (like Rust's tree.prefix())
+    let prefixIt = tree.prefixScan(newSlice("scan_"), some(seqno))
+    while prefixIt.hasNext():
+      let item = prefixIt.next()
+      if item.isSome:
         scanned += 1
     let t3 = getTime()
     latency.trackLatency((t3 - t2).inNanoseconds)

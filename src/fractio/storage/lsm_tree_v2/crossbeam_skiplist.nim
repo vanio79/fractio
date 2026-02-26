@@ -536,10 +536,37 @@ proc range*[K, V](s: SkipList[K, V], startKey: K, endKey: K,
   RangeIter[K, V](list: s, current: start, endKey: endKey,
                   endInclusive: endInclusive)
 
+proc rangeFrom*[K, V](s: SkipList[K, V], startKey: K): RangeIter[K, V] =
+  ## Create iterator over key range [startKey, +infinity)
+  ## This is useful for searching for a key prefix where we want all keys >= startKey
+  var pos: Position[K, V]
+  searchPosition(s, startKey, pos)
+  var start = pos.found
+
+  ## If startKey not found, use the next node
+  if start == nil or start.key < startKey:
+    start = pos.right[0]
+
+  # Use a nil endKey - hasNext will just check current != nil
+  RangeIter[K, V](list: s, current: start, endKey: default(K),
+                  endInclusive: false)
+
 proc hasNext*[K, V](r: RangeIter[K, V]): bool {.inline.} =
   ## Check if more elements in range
   if r.current == nil:
     return false
+
+  # If endKey is default (nil for ref types, 0 for primitives), allow all
+  # This supports unbounded range iteration
+  when K is (ref object):
+    # For ref types, check if endKey is nil
+    if r.endKey.isNil:
+      return true
+  else:
+    # For value types, use a sentinel value
+    when K is string:
+      if r.endKey.len == 0:
+        return true
 
   let cmp = r.current.key
   if r.endInclusive:

@@ -99,30 +99,44 @@ proc get*(m: Memtable, key: types.Slice, seqno: SeqNo): Option[InternalValue] =
 
   let userKey = key.data
 
-  # Find the rightmost entry with the same userKey and seqno <= target
-  # Range query: entries with same userKey, ordered by seqno DESC
-  let startKey = newInternalKey(userKey, seqno, vtValue)
-  let endKey = newInternalKey(userKey, 0.SeqNo, vtValue)
+  # Rust's approach: Search from (seqno - 1) downward and take the FIRST match.
+  # Since InternalKey stores seqno in reverse order, the first entry with the
+  # matching userKey will have the highest seqno <= target.
+  #
+  # We search starting at (seqno - 1) because the skiplist orders by:
+  # 1. user_key (ascending)
+  # 2. seqno (descending, via Reverse)
+  # 3. valueType
+  #
+  # So searching from seqno-1 gives us the highest seqno <= target as the first result.
+  let searchSeqno = if seqno > 0: seqno - 1 else: 0.SeqNo
+  let startKey = newInternalKey(userKey, searchSeqno, vtValue)
 
-  var rightmost: tuple[key: InternalKey, value: types.Slice]
+  # Range from startKey to infinity - first match will have highest seqno
+  let rangeIter = m.items.rangeFrom(startKey)
 
-  let rangeIter = m.items.range(startKey, endKey, false)
-  while rangeIter.hasNext():
+  # Get the first entry - that's the one with highest seqno <= target
+  if rangeIter.hasNext():
     let (k, v) = rangeIter.next()
-
-    # Stop when key changes (shouldn't happen within range, but safety check)
-    if k.userKey != userKey:
-      break
-
-    # Find rightmost entry with seqno <= target
-    if k.seqno <= seqno:
+    # Verify the key matches
+    if k.userKey == userKey:
+      # Check if it's a tombstone - if so, we need to find older version
       if k.isTombstone():
-        # Tombstone - continue searching for older entry
-        continue
-      rightmost = (k, v)
-
-  if rightmost.key.userKey == userKey:
-    return some(InternalValue(key: rightmost.key, value: rightmost.value))
+        # Tombstone found - need to continue searching for older version
+        # Keep iterating until we find a non-tombstone or key changes
+        var iter = m.items.rangeFrom(startKey)
+        var result: Option[InternalValue] = none(InternalValue)
+        while iter.hasNext():
+          let (tk, tv) = iter.next()
+          if tk.userKey != userKey:
+            break
+          if not tk.isTombstone():
+            # Found a valid value
+            result = some(InternalValue(key: tk, value: tv))
+        return result
+      else:
+        # Found a valid value
+        return some(InternalValue(key: k, value: v))
 
   none(InternalValue)
 
@@ -138,6 +152,8 @@ type
     targetSeqno*: SeqNo
     iter*: RangeIter[InternalKey, types.Slice]
     initialized*: bool
+    currentKey*: InternalKey
+    currentValue*: types.Slice
 
 proc newMemtableRangeIter*(m: Memtable, startKey, endKey: InternalKey,
     targetSeqno: SeqNo): MemtableRangeIter =
@@ -147,25 +163,29 @@ proc newMemtableRangeIter*(m: Memtable, startKey, endKey: InternalKey,
     endKey: endKey,
     targetSeqno: targetSeqno,
     iter: m.items.range(startKey, endKey, false),
-    initialized: true
+    initialized: false,
+    currentKey: nil,
+    currentValue: nil
   )
 
 proc hasNext*(m: MemtableRangeIter): bool =
   while m.iter.hasNext():
     let (key, value) = m.iter.next()
     if key.seqno <= m.targetSeqno:
-      # Found a valid entry
-      m.iter = m.memtable.items.range(key, m.endKey, false)
+      # Found a valid entry - store it and return true
+      m.currentKey = key
+      m.currentValue = value
       return true
+    # Skip entries with seqno > targetSeqno (they're newer)
   return false
 
 proc next*(m: MemtableRangeIter): Option[InternalValue] =
-  if not m.hasNext():
+  if m.currentKey.isNil:
     return none(InternalValue)
-
-  # Get the current entry
-  let (key, value) = m.iter.next()
-  some(InternalValue(key: key, value: value))
+  let result = some(InternalValue(key: m.currentKey, value: m.currentValue))
+  m.currentKey = nil
+  m.currentValue = nil
+  return result
 
 # ============================================================================
 # Full iteration
