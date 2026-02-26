@@ -16,9 +16,9 @@ use crossbeam_skiplist::SkipList;
 use rand::Rng;
 
 const NUM_ELEMENTS: usize = 100_000;
-const NUM_WORKERS: usize = 50;
-const OPS_PER_WORKER: usize = 1000;
-const CONCURRENT_INITIAL_KEYS: usize = 10_000;
+const NUM_WORKERS: usize = 200;
+const OPS_PER_WORKER: usize = 10_000;
+const CONCURRENT_INITIAL_KEYS: usize = 20_000;
 
 fn make_key(i: usize) -> u64 {
     (i as u64).wrapping_mul(17).wrapping_add(255)

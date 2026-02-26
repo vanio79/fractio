@@ -10,9 +10,9 @@
 import std/[times, random, atomics, options, threadpool]
 
 const NUM_ELEMENTS = 100_000
-const NUM_WORKERS = 50
-const OPS_PER_WORKER = 1000
-const CONCURRENT_INITIAL_KEYS = 10_000
+const NUM_WORKERS = 200
+const OPS_PER_WORKER = 10000
+const CONCURRENT_INITIAL_KEYS = 20_000
 
 # Helper to convert Duration to seconds as float
 proc toSeconds(d: Duration): float =
