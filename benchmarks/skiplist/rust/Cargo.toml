@@ -1,0 +1,13 @@
+[package]
+name = "skiplist_bench"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+crossbeam-skiplist = { path = "../../../thirdparty/crossbeam/crossbeam-skiplist" }
+crossbeam-epoch = { path = "../../../thirdparty/crossbeam/crossbeam-epoch" }
+rand = "0.9"
+
+[[bin]]
+name = "skiplist_bench"
+path = "src/main.rs"
