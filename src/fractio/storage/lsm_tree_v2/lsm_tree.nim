@@ -13,7 +13,7 @@ import memtable
 import table
 import merge
 import config
-import range_iter
+import cache
 
 # ============================================================================
 # Super Version
@@ -60,19 +60,26 @@ type
     memtableIdCounter*: Atomic[int64]
     snapshotSeqnoCounter*: Atomic[uint64]
     superVersion*: SuperVersion
+    blockCache*: Cache ## LRU cache for blocks
 
 proc newTree*(config: Config, id: TreeId = 0): Tree =
   var tableIdCounter: Atomic[uint64]
   var memtableIdCounter: Atomic[int64]
   var snapshotSeqnoCounter: Atomic[uint64]
 
-  Tree(
+  # Initialize block cache if configured
+  let cacheSize = if config.cacheSize > 0: uint64(config.cacheSize) else: 64 *
+      1024 * 1024 # Default 64MB
+  var blockCache = newCache(cacheSize)
+
+  result = Tree(
     config: config,
     id: id,
     tableIdCounter: tableIdCounter,
     memtableIdCounter: memtableIdCounter,
     snapshotSeqnoCounter: snapshotSeqnoCounter,
-    superVersion: newSuperVersion()
+    superVersion: newSuperVersion(),
+    blockCache: blockCache
   )
 
 # ============================================================================
@@ -86,6 +93,8 @@ proc nextMemtableId*(t: Tree): MemtableId =
   MemtableId(fetchAdd(t.memtableIdCounter, 1, moRelaxed))
 
 proc currentSnapshotSeqno*(t: Tree): SeqNo =
+  # Return the highest seqno used so far, or 0 if no inserts yet
+  # This ensures reads can see recently inserted data
   load(t.snapshotSeqnoCounter)
 
 proc advanceSnapshotSeqno*(t: Tree): SeqNo =
@@ -99,13 +108,27 @@ proc advanceSnapshotSeqno*(t: Tree): SeqNo =
 proc insert*(t: Tree, key: string, value: string, seqno: SeqNo): (
     uint64, uint64) =
   let internalKey = newInternalKey(key, seqno, vtValue)
-  let internalValue = InternalValue(key: internalKey, value: newSlice(value))
-  t.superVersion.activeMemtable.insert(internalValue)
+  let internalValue = newInternalValue(internalKey, newSlice(value))
+  let (size, totalSize) = t.superVersion.activeMemtable.insert(internalValue)
+  # Update snapshot counter if this seqno is higher
+  var current = load(t.snapshotSeqnoCounter)
+  while seqno > current:
+    if compareExchange(t.snapshotSeqnoCounter, current, seqno, moRelaxed, moRelaxed):
+      break
+    current = load(t.snapshotSeqnoCounter)
+  return (size, totalSize)
 
 proc remove*(t: Tree, key: string, seqno: SeqNo): (uint64, uint64) =
   let internalKey = newInternalKey(key, seqno, vtTombstone)
-  let internalValue = InternalValue(key: internalKey, value: newSlice(""))
-  t.superVersion.activeMemtable.insert(internalValue)
+  let internalValue = newInternalValue(internalKey, newSlice(""))
+  let (size, totalSize) = t.superVersion.activeMemtable.insert(internalValue)
+  # Update snapshot counter if this seqno is higher
+  var current = load(t.snapshotSeqnoCounter)
+  while seqno > current:
+    if compareExchange(t.snapshotSeqnoCounter, current, seqno, moRelaxed, moRelaxed):
+      break
+    current = load(t.snapshotSeqnoCounter)
+  return (size, totalSize)
 
 proc flushMemtable*(t: Tree, memtable: Memtable): LsmResult[SsTable] =
   let tableId = t.nextTableId()
@@ -131,16 +154,7 @@ proc flushMemtable*(t: Tree, memtable: Memtable): LsmResult[SsTable] =
   if tableResult.isErr:
     return err[SsTable](tableResult.error)
 
-  # Open the table for reading
-  let openResult = openSsTable(tablePath)
-  if openResult.isErr:
-    return err[SsTable](openResult.error)
-
-  # Copy metadata from the created table
-  let openedTable = openResult.value
-  openedTable.meta = tableResult.value.meta
-
-  ok(openedTable)
+  ok(tableResult.value)
 
 proc rotateMemtable*(t: Tree): Option[Memtable]
 
@@ -158,6 +172,8 @@ proc flushActiveMemtable*(t: Tree): LsmResult[Option[SsTable]] =
 
   # Add the flushed table to tables
   let flushedTable = flushResult.value
+  # Set the block cache on the table
+  flushedTable.setBlockCache(addr t.blockCache)
   t.superVersion.tables.add(flushedTable)
 
   ok(some(flushedTable))
@@ -208,24 +224,21 @@ proc getInternalEntry*(t: Tree, key: types.Slice, seqno: Option[SeqNo] = none(
     return activeResult
 
   # Check sealed memtables
-  for i in countdown(t.superVersion.sealedMemtables.len - 1, 0):
-    let result = t.superVersion.sealedMemtables[i].get(key, snapshotSeqno)
-    if result.isSome:
-      return result
+  if t.superVersion.sealedMemtables.len > 0:
+    for i in countdown(t.superVersion.sealedMemtables.len - 1, 0):
+      let result = t.superVersion.sealedMemtables[i].get(key, snapshotSeqno)
+      if result.isSome:
+        return result
 
   # Check SSTables - iterate from newest to oldest (L0 to higher levels)
   # Convert key to string for SSTable lookup
   let keyStr = key.data
 
   for table in t.superVersion.tables:
-    # Skip if table is not open
-    if not table.fileOpened:
-      continue
-
     # Check if key is in range
-    if table.meta.minKey.len > 0 and keyStr < table.meta.minKey:
+    if table.meta.minKey.len > 0 and keyStr < table.meta.minKey.data:
       continue
-    if table.meta.maxKey.len > 0 and keyStr > table.meta.maxKey:
+    if table.meta.maxKey.len > 0 and keyStr > table.meta.maxKey.data:
       continue
 
     # Look up in SSTable
@@ -253,26 +266,23 @@ proc lookup*(t: Tree, key: types.Slice, seqno: Option[SeqNo] = none(
     return some(value.value)
 
   # Check sealed memtables (newest first)
-  for i in countdown(t.superVersion.sealedMemtables.len - 1, 0):
-    let memtable = t.superVersion.sealedMemtables[i]
-    let result = memtable.get(key, snapshotSeqno)
-    if result.isSome:
-      let value = result.get
-      if value.key.isTombstone():
-        return none(types.Slice)
-      return some(value.value)
+  if t.superVersion.sealedMemtables.len > 0:
+    for i in countdown(t.superVersion.sealedMemtables.len - 1, 0):
+      let memtable = t.superVersion.sealedMemtables[i]
+      let result = memtable.get(key, snapshotSeqno)
+      if result.isSome:
+        let value = result.get
+        if value.key.isTombstone():
+          return none(types.Slice)
+        return some(value.value)
 
   # Check SSTables
   let keyStr = key.data
   for table in t.superVersion.tables:
-    # Skip if table is not open
-    if not table.fileOpened:
-      continue
-
     # Check if key is in range
-    if table.meta.minKey.len > 0 and keyStr < table.meta.minKey:
+    if table.meta.minKey.len > 0 and keyStr < table.meta.minKey.data:
       continue
-    if table.meta.maxKey.len > 0 and keyStr > table.meta.maxKey:
+    if table.meta.maxKey.len > 0 and keyStr > table.meta.maxKey.data:
       continue
 
     # Look up in SSTable
@@ -346,12 +356,12 @@ proc initRangeIterator*(r: RangeIterator) =
   # Helper to get next from table range
   proc makeTableIterator(table: SsTable, startKey, endKey: string,
       targetSeqno: SeqNo): proc(): Option[InternalValue] =
-    var scanner = newTableRangeIterator(table, startKey, endKey, targetSeqno)
+    var tableIter = newTableRangeIter(table, startKey, endKey, targetSeqno)
 
     result = proc(): Option[InternalValue] =
-      if scanner.isNil:
-        return none(InternalValue)
-      scanner.next()
+      if tableIter.hasNext():
+        return tableIter.next()
+      none(InternalValue)
 
   # Add active memtable
   r.iterators.add(makeMemtableIterator(r.tree.superVersion.activeMemtable,
@@ -363,10 +373,9 @@ proc initRangeIterator*(r: RangeIterator) =
 
   # Add SSTables
   for table in r.tree.superVersion.tables:
-    if table.fileOpened:
-      if not (table.meta.maxKey.len > 0 and startKeyStr > table.meta.maxKey):
-        if not (table.meta.minKey.len > 0 and endKeyStr < table.meta.minKey):
-          r.iterators.add(makeTableIterator(table, startKeyStr, endKeyStr, targetSeqno))
+    if not (table.meta.maxKey.len > 0 and startKeyStr > table.meta.maxKey.data):
+      if not (table.meta.minKey.len > 0 and endKeyStr < table.meta.minKey.data):
+        r.iterators.add(makeTableIterator(table, startKeyStr, endKeyStr, targetSeqno))
 
   r.initialized = true
 
@@ -501,21 +510,14 @@ proc initPrefixIterator*(p: PrefixIterator) =
         return memtableIter.next()
       none(InternalValue)
 
-  # Helper for table prefix
+  # Helper for table prefix - uses table range iterator
   proc makeTablePrefixIterator(table: SsTable, prefix, endPrefix: string,
       targetSeqno: SeqNo): proc(): Option[InternalValue] =
-    var scanner = newTablePrefixScannerForIter(table, prefix, targetSeqno)
+    var tableIter = newTableRangeIter(table, prefix, endPrefix, targetSeqno)
 
     result = proc(): Option[InternalValue] =
-      if scanner.isNil:
-        return none(InternalValue)
-      let entryOpt = scanner.nextPrefix()
-      if entryOpt.isSome:
-        let entry = entryOpt.get
-        if endPrefix.len > 0 and entry.key.userKey >= endPrefix:
-          return none(InternalValue)
-        if entry.key.seqno <= targetSeqno:
-          return some(entry)
+      if tableIter.hasNext():
+        return tableIter.next()
       none(InternalValue)
 
   # Add active memtable
@@ -528,9 +530,8 @@ proc initPrefixIterator*(p: PrefixIterator) =
 
   # Add SSTables
   for table in p.tree.superVersion.tables:
-    if table.fileOpened:
-      if not (table.meta.maxKey.len > 0 and prefix > table.meta.maxKey):
-        p.iterators.add(makeTablePrefixIterator(table, prefix, endPrefix, targetSeqno))
+    if not (table.meta.maxKey.len > 0 and prefix > table.meta.maxKey.data):
+      p.iterators.add(makeTablePrefixIterator(table, prefix, endPrefix, targetSeqno))
 
   p.initialized = true
 

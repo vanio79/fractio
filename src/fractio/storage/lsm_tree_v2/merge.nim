@@ -209,8 +209,9 @@ proc next*(m: var StreamingMergeIterator): Option[InternalValue] =
     let idx = top.idx
 
     # Check if this is a new key
-    if entry.key.userKey != m.lastKey:
-      m.lastKey = entry.key.userKey
+    let entryKeySlice = newSlice(entry.key.userKey)
+    if entryKeySlice != m.lastKey:
+      m.lastKey = entryKeySlice
       m.lastAdded = false
 
       # Decide whether to include this entry

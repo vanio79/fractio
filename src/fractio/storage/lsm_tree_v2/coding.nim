@@ -88,6 +88,13 @@ proc decodeFixed32*(stream: Stream): uint32 =
     result = result or (uint32(stream.readChar().uint8) shl (i * 8))
   result
 
+proc decodeFixed32*(data: string, pos: int): uint32 =
+  ## Decode 32-bit unsigned integer from string at position
+  var result: uint32 = 0
+  for i in 0 ..< 4:
+    result = result or (uint32(data[pos + i].uint8) shl (i * 8))
+  result
+
 proc encodeFixed64*(stream: Stream, value: uint64) =
   ## Encode 64-bit unsigned integer as 8 bytes
   for i in 0 ..< 8:
@@ -106,6 +113,57 @@ proc decodeFixed64*(stream: Stream): uint64 =
   for i in 0 ..< 8:
     result = result or (uint64(stream.readChar().uint8) shl (i * 8))
   result
+
+proc decodeFixed64*(data: string, pos: int): uint64 =
+  ## Decode 64-bit unsigned integer from string at position
+  var result: uint64 = 0
+  for i in 0 ..< 8:
+    result = result or (uint64(data[pos + i].uint8) shl (i * 8))
+  result
+
+# ============================================================================
+# Varint Size Calculation
+# ============================================================================
+
+proc varintSize*(value: uint64 | uint32 | int): int =
+  ## Calculate the number of bytes needed to encode a value as varint
+  var v = uint64(value)
+  if v < 0x80'u64:
+    return 1
+  elif v < 0x4000'u64:
+    return 2
+  elif v < 0x200000'u64:
+    return 3
+  elif v < 0x10000000'u64:
+    return 4
+  elif v < 0x80000000'u64:
+    return 5
+  elif v < 0x400000000'u64:
+    return 6
+  elif v < 0x2000000000'u64:
+    return 7
+  elif v < 0x10000000000'u64:
+    return 8
+  elif v < 0x80000000000'u64:
+    return 9
+  elif v < 0x400000000000'u64:
+    return 10
+  else:
+    return 11
+
+proc decodeVarintFromString*(data: string, pos: int): tuple[value: uint64, newPos: int] =
+  ## Decode varint from string at given position
+  var result: uint64 = 0
+  var shift = 0
+  var i = pos
+  while i < data.len:
+    let b = data[i].uint8
+    result = result or ((b and 0x7F) shl shift)
+    if (b and 0x80) == 0:
+      break
+    inc shift
+    inc i
+  return (result, i + 1)
 
 # ============================================================================
 # Tests

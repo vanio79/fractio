@@ -53,31 +53,31 @@ proc newCache*(capacity: uint64): Cache =
 proc size*(c: Cache): uint64 = c.currentSize
 proc capacity*(c: Cache): uint64 = c.capacity
 
-proc getBlock*(c: Cache, treeId, tableId: int64, offset: uint64): Option[string] =
+proc getBlock*(c: ptr Cache, treeId, tableId: int64, offset: uint64): Option[string] =
   let key = CacheKey(tag: TAG_BLOCK, treeId: treeId, tableId: tableId,
       offset: offset)
-  if c.data.hasKey(key):
-    return some(c.data[key].blockData)
+  if c[].data.hasKey(key):
+    return some(c[].data[key].blockData)
   none(string)
 
-proc insertBlock*(c: var Cache, treeId, tableId: int64, offset: uint64,
+proc insertBlock*(c: ptr Cache, treeId, tableId: int64, offset: uint64,
     data: string) =
   let key = CacheKey(tag: TAG_BLOCK, treeId: treeId, tableId: tableId,
       offset: offset)
   let item = CacheItem(isBlock: true, blockData: data)
 
   # Evict if necessary
-  while c.currentSize + uint64(data.len) > c.capacity and c.order.len > 0:
-    let oldKey = c.order.pop()
-    if c.data.hasKey(oldKey):
-      let oldItem = c.data[oldKey]
+  while c[].currentSize + uint64(data.len) > c[].capacity and c[].order.len > 0:
+    let oldKey = c[].order.pop()
+    if c[].data.hasKey(oldKey):
+      let oldItem = c[].data[oldKey]
       if oldItem.isBlock:
-        c.currentSize -= uint64(oldItem.blockData.len)
-      c.data.del(oldKey)
+        c[].currentSize -= uint64(oldItem.blockData.len)
+      c[].data.del(oldKey)
 
-  c.data[key] = item
-  c.currentSize += uint64(data.len)
-  c.order.insert(key, 0)
+  c[].data[key] = item
+  c[].currentSize += uint64(data.len)
+  c[].order.insert(key, 0)
 
 proc getBlob*(c: Cache, vlogId: int64, blobFileId: int64,
     offset: uint64): Option[types.Slice] =
