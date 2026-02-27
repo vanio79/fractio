@@ -21,22 +21,20 @@ when defined(nimV2):
 # ============================================================================
 
 type
-  Config = object
+  Config* = object
     numOps*: uint64
     keySize*: int
     valueSize*: int
-    batchSize*: int
     warmupOps*: uint64
     dbPath*: string
 
 proc defaultConfig*(): Config =
-  Config(
-    numOps: 100_000,
+  result = Config(
+    numOps: 1_000_000,
     keySize: 16,
     valueSize: 100,
-    batchSize: 100,
     warmupOps: 1000,
-    dbPath: "/tmp/bench_lsm_v2"
+    dbPath: "/tmp/bench_lsm_tree_nim"
   )
 
 proc parseArgs*(): Config =
@@ -169,12 +167,32 @@ type
     latencyMax*: float64
     cpuMs*: uint64
     memoryMb*: float64
+    diskReadBytes*: uint64
+    diskWriteBytes*: uint64
+    diskReadIops*: uint64
+    diskWriteIops*: uint64
+    diskReadMB*: float64
+    diskWriteMB*: float64
 
 proc printBenchResult*(r: BenchResult) =
   echo fmt"  {r.name:<20} {r.ops:>8} ops in {r.durationMs:>6}ms | {r.opsPerSec:>10.0f} ops/s"
   echo fmt"    Lat: avg={r.latencyAvg:>7.1f}us p50={r.latencyP50:>7.1f}us p95={r.latencyP95:>7.1f}us p99={r.latencyP99:>7.1f}us"
   echo fmt"    CPU: {r.cpuMs:>6}ms"
   echo fmt"    Mem: {r.memoryMb:>6.1f}MB"
+  echo fmt"    Disk: read={r.diskReadMB:>6.2f}MB({r.diskReadIops:>6} IOPS) write={r.diskWriteMB:>6.2f}MB({r.diskWriteIops:>6} IOPS)"
+
+proc calcDiskMetrics*(diffRes: ResourceMetrics, durationMs: uint64): tuple[
+    readIops, writeIops: uint64, readMB, writeMB: float64] =
+  let blockSize = 4096.0
+  let durationSec = float64(durationMs) / 1000.0
+  if durationSec > 0:
+    result.readIops = uint64(float64(diffRes.diskReadBytes) / blockSize / durationSec)
+    result.writeIops = uint64(float64(diffRes.diskWriteBytes) / blockSize / durationSec)
+  else:
+    result.readIops = 0
+    result.writeIops = 0
+  result.readMB = float64(diffRes.diskReadBytes) / (1024.0 * 1024.0)
+  result.writeMB = float64(diffRes.diskWriteBytes) / (1024.0 * 1024.0)
 
 # ============================================================================
 # Helper Functions
@@ -299,6 +317,8 @@ when defined(nimV2):
     var verifyOk = tree.verifyData("seq", seqIndices, seqno - 1, config.keySize,
         config.valueSize)
 
+    let diskMetrics = calcDiskMetrics(diffRes, durationMs)
+
     results.add(BenchResult(
       name: "seq_writes",
       ops: config.numOps,
@@ -311,7 +331,13 @@ when defined(nimV2):
       latencyMin: stats.min,
       latencyMax: stats.max,
       cpuMs: diffRes.cpuUserMs + diffRes.cpuSystemMs,
-      memoryMb: float64(endRes.memoryRssKb) / 1024.0
+      memoryMb: float64(endRes.memoryRssKb) / 1024.0,
+      diskReadBytes: diffRes.diskReadBytes,
+      diskWriteBytes: diffRes.diskWriteBytes,
+      diskReadIops: diskMetrics.readIops,
+      diskWriteIops: diskMetrics.writeIops,
+      diskReadMB: diskMetrics.readMB,
+      diskWriteMB: diskMetrics.writeMB
     ))
 
     if not verifyOk:
@@ -353,6 +379,8 @@ when defined(nimV2):
     verifyOk = tree.verifyData("rand", indices, seqno - 1, config.keySize,
         config.valueSize)
 
+    let diskMetrics2 = calcDiskMetrics(diffRes2, durationMs2)
+
     results.add(BenchResult(
       name: "rand_writes",
       ops: config.numOps,
@@ -365,7 +393,13 @@ when defined(nimV2):
       latencyMin: stats2.min,
       latencyMax: stats2.max,
       cpuMs: diffRes2.cpuUserMs + diffRes2.cpuSystemMs,
-      memoryMb: float64(endRes2.memoryRssKb) / 1024.0
+      memoryMb: float64(endRes2.memoryRssKb) / 1024.0,
+      diskReadBytes: diffRes2.diskReadBytes,
+      diskWriteBytes: diffRes2.diskWriteBytes,
+      diskReadIops: diskMetrics2.readIops,
+      diskWriteIops: diskMetrics2.writeIops,
+      diskReadMB: diskMetrics2.readMB,
+      diskWriteMB: diskMetrics2.writeMB
     ))
 
     if not verifyOk:
@@ -383,19 +417,45 @@ when defined(nimV2):
     latency = LatencyTracker(samples: @[])
     let startRes3 = readResourceMetrics()
     let startTime3 = getTime()
+    let expectedValue = makeValueStr(config.valueSize)
 
+    var seqReadVerified = 0
+    var seqReadFailed = 0
     for i in 0'u64 ..< config.numOps:
       let t0 = getTime()
       let key = makeKeyStr("seq", i, config.keySize)
-      discard tree.get(newSlice(key), some(seqno))
+      let getResult = tree.get(newSlice(key), some(seqno))
       let t1 = getTime()
       latency.trackLatency((t1 - t0).inNanoseconds)
+
+      # Verify the result
+      if getResult.isSome:
+        let storedValue = getResult.get.data
+        if storedValue == expectedValue:
+          seqReadVerified += 1
+        else:
+          if seqReadFailed < 5:
+            echo "  SEQ_READ FAILED: Key ", i, " value mismatch (got ",
+                storedValue.len, " bytes, expected ", expectedValue.len, ")"
+          seqReadFailed += 1
+      else:
+        if seqReadFailed < 5:
+          echo "  SEQ_READ FAILED: Key ", i, " not found"
+        seqReadFailed += 1
 
     let endTime3 = getTime()
     let endRes3 = readResourceMetrics()
     let diffRes3 = endRes3.diffResources(startRes3)
     let stats3 = latency.getLatencyStats()
     let durationMs3 = (endTime3 - startTime3).inMilliseconds.uint64
+
+    # Verify results
+    if seqReadFailed > 0:
+      echo "  SEQ_READ VERIFICATION FAILED: ", seqReadFailed, " keys incorrect"
+    else:
+      echo "  SEQ_READ VERIFIED: All ", seqReadVerified, " keys correct"
+
+    let diskMetrics3 = calcDiskMetrics(diffRes3, durationMs3)
 
     results.add(BenchResult(
       name: "seq_reads",
@@ -409,7 +469,13 @@ when defined(nimV2):
       latencyMin: stats3.min,
       latencyMax: stats3.max,
       cpuMs: diffRes3.cpuUserMs + diffRes3.cpuSystemMs,
-      memoryMb: float64(endRes3.memoryRssKb) / 1024.0
+      memoryMb: float64(endRes3.memoryRssKb) / 1024.0,
+      diskReadBytes: diffRes3.diskReadBytes,
+      diskWriteBytes: diffRes3.diskWriteBytes,
+      diskReadIops: diskMetrics3.readIops,
+      diskWriteIops: diskMetrics3.writeIops,
+      diskReadMB: diskMetrics3.readMB,
+      diskWriteMB: diskMetrics3.writeMB
     ))
 
     # =========================================================================
@@ -420,18 +486,43 @@ when defined(nimV2):
     let startRes4 = readResourceMetrics()
     let startTime4 = getTime()
 
+    var randReadVerified = 0
+    var randReadFailed = 0
     for i in indices:
       let t0 = getTime()
       let key = makeKeyStr("rand", i, config.keySize)
-      discard tree.get(newSlice(key), some(seqno))
+      let getResult = tree.get(newSlice(key), some(seqno))
       let t1 = getTime()
       latency.trackLatency((t1 - t0).inNanoseconds)
+
+      # Verify the result
+      if getResult.isSome:
+        let storedValue = getResult.get.data
+        if storedValue == expectedValue:
+          randReadVerified += 1
+        else:
+          if randReadFailed < 5:
+            echo "  RAND_READ FAILED: Key ", i, " value mismatch (got ",
+                storedValue.len, " bytes, expected ", expectedValue.len, ")"
+          randReadFailed += 1
+      else:
+        if randReadFailed < 5:
+          echo "  RAND_READ FAILED: Key ", i, " not found"
+        randReadFailed += 1
 
     let endTime4 = getTime()
     let endRes4 = readResourceMetrics()
     let diffRes4 = endRes4.diffResources(startRes4)
     let stats4 = latency.getLatencyStats()
     let durationMs4 = (endTime4 - startTime4).inMilliseconds.uint64
+
+    # Verify results
+    if randReadFailed > 0:
+      echo "  RAND_READ VERIFICATION FAILED: ", randReadFailed, " keys incorrect"
+    else:
+      echo "  RAND_READ VERIFIED: All ", randReadVerified, " keys correct"
+
+    let diskMetrics4 = calcDiskMetrics(diffRes4, durationMs4)
 
     results.add(BenchResult(
       name: "rand_reads",
@@ -445,7 +536,13 @@ when defined(nimV2):
       latencyMin: stats4.min,
       latencyMax: stats4.max,
       cpuMs: diffRes4.cpuUserMs + diffRes4.cpuSystemMs,
-      memoryMb: float64(endRes4.memoryRssKb) / 1024.0
+      memoryMb: float64(endRes4.memoryRssKb) / 1024.0,
+      diskReadBytes: diffRes4.diskReadBytes,
+      diskWriteBytes: diffRes4.diskWriteBytes,
+      diskReadIops: diskMetrics4.readIops,
+      diskWriteIops: diskMetrics4.writeIops,
+      diskReadMB: diskMetrics4.readMB,
+      diskWriteMB: diskMetrics4.writeMB
     ))
 
     # =========================================================================
@@ -456,18 +553,36 @@ when defined(nimV2):
     let startRes5 = readResourceMetrics()
     let startTime5 = getTime()
 
+    var containsVerified = 0
+    var containsFailed = 0
     for i in indices:
       let t0 = getTime()
       let key = makeKeyStr("rand", i, config.keySize)
-      discard tree.contains(newSlice(key), some(seqno))
+      let containsResult = tree.contains(newSlice(key), some(seqno))
       let t1 = getTime()
       latency.trackLatency((t1 - t0).inNanoseconds)
+
+      # Verify: all rand keys should exist
+      if containsResult:
+        containsVerified += 1
+      else:
+        if containsFailed < 5:
+          echo "  CONTAINS FAILED: Key ", i, " not found but should exist"
+        containsFailed += 1
 
     let endTime5 = getTime()
     let endRes5 = readResourceMetrics()
     let diffRes5 = endRes5.diffResources(startRes5)
     let stats5 = latency.getLatencyStats()
     let durationMs5 = (endTime5 - startTime5).inMilliseconds.uint64
+
+    # Verify results
+    if containsFailed > 0:
+      echo "  CONTAINS VERIFICATION FAILED: ", containsFailed, " keys incorrect"
+    else:
+      echo "  CONTAINS VERIFIED: All ", containsVerified, " keys correct"
+
+    let diskMetrics5 = calcDiskMetrics(diffRes5, durationMs5)
 
     results.add(BenchResult(
       name: "contains_key",
@@ -481,7 +596,13 @@ when defined(nimV2):
       latencyMin: stats5.min,
       latencyMax: stats5.max,
       cpuMs: diffRes5.cpuUserMs + diffRes5.cpuSystemMs,
-      memoryMb: float64(endRes5.memoryRssKb) / 1024.0
+      memoryMb: float64(endRes5.memoryRssKb) / 1024.0,
+      diskReadBytes: diffRes5.diskReadBytes,
+      diskWriteBytes: diffRes5.diskWriteBytes,
+      diskReadIops: diskMetrics5.readIops,
+      diskWriteIops: diskMetrics5.writeIops,
+      diskReadMB: diskMetrics5.readMB,
+      diskWriteMB: diskMetrics5.writeMB
     ))
 
     # =========================================================================
@@ -489,6 +610,7 @@ when defined(nimV2):
     # =========================================================================
     echo "Range scan..."
     let scanCount = min(10000, int(config.numOps))
+    let scanValue = makeValueStr(config.valueSize)
 
     # Insert scan data
     for i in 0 ..< scanCount:
@@ -503,12 +625,24 @@ when defined(nimV2):
     let startTime6 = getTime()
 
     var scanned = 0
+    var rangeVerified = 0
+    var rangeFailed = 0
     let t0 = getTime()
     let startKey = newSlice("scan_00000000")
     let endKey = newSlice("scan_00009999")
     let rangeResult = tree.range(startKey, endKey)
     let collected = rangeResult.collect()
     scanned = collected.len
+
+    # Verify all scanned items have correct value
+    for item in collected:
+      if item.value.data == scanValue:
+        rangeVerified += 1
+      else:
+        if rangeFailed < 5:
+          echo "  RANGE_SCAN FAILED: key ", item.key.userKey, " has incorrect value"
+        rangeFailed += 1
+
     let t1 = getTime()
     latency.trackLatency((t1 - t0).inNanoseconds)
 
@@ -517,6 +651,17 @@ when defined(nimV2):
     let diffRes6 = endRes6.diffResources(startRes6)
     let stats6 = latency.getLatencyStats()
     let durationMs6 = (endTime6 - startTime6).inMilliseconds.uint64
+
+    # Verify results
+    if rangeFailed > 0:
+      echo "  RANGE_SCAN VERIFICATION FAILED: ", rangeFailed, " values incorrect"
+    elif scanned != scanCount:
+      echo "  RANGE_SCAN VERIFICATION FAILED: scanned ", scanned,
+          " != expected ", scanCount
+    else:
+      echo "  RANGE_SCAN VERIFIED: All ", rangeVerified, " items correct"
+
+    let diskMetrics6 = calcDiskMetrics(diffRes6, durationMs6)
 
     results.add(BenchResult(
       name: "range_scan",
@@ -530,7 +675,13 @@ when defined(nimV2):
       latencyMin: stats6.min,
       latencyMax: stats6.max,
       cpuMs: diffRes6.cpuUserMs + diffRes6.cpuSystemMs,
-      memoryMb: float64(endRes6.memoryRssKb) / 1024.0
+      memoryMb: float64(endRes6.memoryRssKb) / 1024.0,
+      diskReadBytes: diffRes6.diskReadBytes,
+      diskWriteBytes: diffRes6.diskWriteBytes,
+      diskReadIops: diskMetrics6.readIops,
+      diskWriteIops: diskMetrics6.writeIops,
+      diskReadMB: diskMetrics6.readMB,
+      diskWriteMB: diskMetrics6.writeMB
     ))
 
     # =========================================================================
@@ -542,6 +693,8 @@ when defined(nimV2):
     let startTime7 = getTime()
 
     scanned = 0
+    var prefixVerified = 0
+    var prefixFailed = 0
     let t2 = getTime()
     # Use proper prefix iterator (like Rust's tree.prefix())
     let prefixIt = tree.prefixScan(newSlice("scan_"), some(seqno))
@@ -549,6 +702,13 @@ when defined(nimV2):
       let item = prefixIt.next()
       if item.isSome:
         scanned += 1
+        # Verify value
+        if item.get.value.data == scanValue:
+          prefixVerified += 1
+        else:
+          if prefixFailed < 5:
+            echo "  PREFIX_SCAN FAILED: key ", item.get.key.userKey, " has incorrect value"
+          prefixFailed += 1
     let t3 = getTime()
     latency.trackLatency((t3 - t2).inNanoseconds)
 
@@ -557,6 +717,17 @@ when defined(nimV2):
     let diffRes7 = endRes7.diffResources(startRes7)
     let stats7 = latency.getLatencyStats()
     let durationMs7 = (endTime7 - startTime7).inMilliseconds.uint64
+
+    # Verify results
+    if prefixFailed > 0:
+      echo "  PREFIX_SCAN VERIFICATION FAILED: ", prefixFailed, " values incorrect"
+    elif scanned != scanCount:
+      echo "  PREFIX_SCAN VERIFICATION FAILED: scanned ", scanned,
+          " != expected ", scanCount
+    else:
+      echo "  PREFIX_SCAN VERIFIED: All ", prefixVerified, " items correct"
+
+    let diskMetrics7 = calcDiskMetrics(diffRes7, durationMs7)
 
     results.add(BenchResult(
       name: "prefix_scan",
@@ -570,7 +741,13 @@ when defined(nimV2):
       latencyMin: stats7.min,
       latencyMax: stats7.max,
       cpuMs: diffRes7.cpuUserMs + diffRes7.cpuSystemMs,
-      memoryMb: float64(endRes7.memoryRssKb) / 1024.0
+      memoryMb: float64(endRes7.memoryRssKb) / 1024.0,
+      diskReadBytes: diffRes7.diskReadBytes,
+      diskWriteBytes: diffRes7.diskWriteBytes,
+      diskReadIops: diskMetrics7.readIops,
+      diskWriteIops: diskMetrics7.writeIops,
+      diskReadMB: diskMetrics7.readMB,
+      diskWriteMB: diskMetrics7.writeMB
     ))
 
     # =========================================================================
@@ -597,6 +774,8 @@ when defined(nimV2):
     let stats8 = latency.getLatencyStats()
     let durationMs8 = (endTime8 - startTime8).inMilliseconds.uint64
 
+    let diskMetrics8 = calcDiskMetrics(diffRes8, durationMs8)
+
     results.add(BenchResult(
       name: "deletions",
       ops: uint64(deleteCount),
@@ -609,7 +788,13 @@ when defined(nimV2):
       latencyMin: stats8.min,
       latencyMax: stats8.max,
       cpuMs: diffRes8.cpuUserMs + diffRes8.cpuSystemMs,
-      memoryMb: float64(endRes8.memoryRssKb) / 1024.0
+      memoryMb: float64(endRes8.memoryRssKb) / 1024.0,
+      diskReadBytes: diffRes8.diskReadBytes,
+      diskWriteBytes: diffRes8.diskWriteBytes,
+      diskReadIops: diskMetrics8.readIops,
+      diskWriteIops: diskMetrics8.writeIops,
+      diskReadMB: diskMetrics8.readMB,
+      diskWriteMB: diskMetrics8.writeMB
     ))
 
     # Cleanup
