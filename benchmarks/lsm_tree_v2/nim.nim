@@ -585,7 +585,8 @@ when defined(nimV2):
 
     var containsVerified = 0
     var containsFailed = 0
-    for i in indices:
+    # Match Rust: use sequential indices (not shuffled) for contains_key
+    for i in 0'u64 ..< config.numOps:
       let t0 = getTime()
       let key = makeKeyStr("rand", i, config.keySize)
       let containsResult = tree.contains(key, some(SeqNo(seqno.int64)))

@@ -148,6 +148,7 @@ proc currentSnapshotSeqno*(t: Tree): SeqNo =
 
 proc insert*(t: Tree, key: string, value: string, seqno: SeqNo): (uint64, uint64) =
   ## Insert a key-value pair into the tree
+  ## Matches Rust's append_entry which just reads version and inserts
 
   # Write to WAL first for durability (if enabled)
   if t.inner.config.walEnabled and t.inner.walManager.isSome:
@@ -155,20 +156,14 @@ proc insert*(t: Tree, key: string, value: string, seqno: SeqNo): (uint64, uint64
     if walResult.isErr:
       discard # WAL write failed, continue anyway
 
-  # Get current version from history (thread-safe read)
+  # Get current version and insert - matches Rust's append_entry
+  # Note: acquireRead/releaseRead are just atomic inc/dec, not actual locks
   t.inner.versionHistory.acquireRead()
   let currentVersion = t.inner.versionHistory.value.latestVersion()
   t.inner.versionHistory.releaseRead()
 
-  # Use insertFromString which stores a copy of the key
-  let (size, totalSize) = currentVersion.activeMemtable.insertFromString(key,
-      value, seqno)
-
-  # OPTIMIZED: Use atomic fetch_max instead of write lock to update latestSeqno
-  # This is lock-free and much faster than acquiring a write lock
-  discard atomicMaxSeqNo(t.inner.versionHistory.value.latestSeqno, seqno)
-
-  return (size, totalSize)
+  # Insert into memtable - Rust doesn't update a separate latestSeqno
+  result = currentVersion.activeMemtable.insertFromString(key, value, seqno)
 
 proc remove*(t: Tree, key: string, seqno: SeqNo): (uint64, uint64) =
   ## Remove a key from the tree (insert tombstone)
@@ -179,23 +174,19 @@ proc remove*(t: Tree, key: string, seqno: SeqNo): (uint64, uint64) =
     if walResult.isErr:
       discard # WAL write failed, continue anyway
 
-  # Get current version from history (thread-safe read)
+  # Get current version and insert tombstone
   t.inner.versionHistory.acquireRead()
   let currentVersion = t.inner.versionHistory.value.latestVersion()
   t.inner.versionHistory.releaseRead()
 
-  # Insert tombstone
-  let (size, totalSize) = currentVersion.activeMemtable.insertFromString(key,
-      "", seqno)
-  return (size, totalSize)
+  result = currentVersion.activeMemtable.insertFromString(key, "", seqno)
 
 proc getInternalEntry*(t: Tree, key: string, seqno: Option[SeqNo] = none(
     SeqNo)): Option[string] =
   ## Get value for key with snapshot isolation
-  ## Simplified to just return the value (key is known by caller)
   let snapshotSeqno = if seqno.isSome: seqno.get else: t.currentSnapshotSeqno()
 
-  # Get appropriate version for this snapshot (thread-safe)
+  # Get version for snapshot
   t.inner.versionHistory.acquireRead()
   let version = t.inner.versionHistory.value.getVersionForSnapshot(snapshotSeqno)
   t.inner.versionHistory.releaseRead()
@@ -208,9 +199,9 @@ proc getInternalEntry*(t: Tree, key: string, seqno: Option[SeqNo] = none(
   # Check sealed memtables
   if version.sealedMemtables.len > 0:
     for i in countdown(version.sealedMemtables.len - 1, 0):
-      let result = version.sealedMemtables[i].get(key, snapshotSeqno)
-      if result.isSome:
-        return result
+      let res = version.sealedMemtables[i].get(key, snapshotSeqno)
+      if res.isSome:
+        return res
 
   # Check SSTables
   for table in version.tables:
@@ -231,7 +222,7 @@ proc lookup*(t: Tree, key: string, seqno: Option[SeqNo] = none(SeqNo)): Option[s
   ## Lookup with snapshot isolation
   let snapshotSeqno = if seqno.isSome: seqno.get else: t.currentSnapshotSeqno()
 
-  # Get appropriate version for this snapshot (thread-safe)
+  # Get version for snapshot
   t.inner.versionHistory.acquireRead()
   let version = t.inner.versionHistory.value.getVersionForSnapshot(snapshotSeqno)
   t.inner.versionHistory.releaseRead()
@@ -244,9 +235,9 @@ proc lookup*(t: Tree, key: string, seqno: Option[SeqNo] = none(SeqNo)): Option[s
   # Check sealed memtables
   if version.sealedMemtables.len > 0:
     for i in countdown(version.sealedMemtables.len - 1, 0):
-      let result = version.sealedMemtables[i].get(key, snapshotSeqno)
-      if result.isSome:
-        return result
+      let res = version.sealedMemtables[i].get(key, snapshotSeqno)
+      if res.isSome:
+        return res
 
   # Check SSTables
   for table in version.tables:
@@ -381,5 +372,24 @@ proc createNewTree*(config: Config, id: TreeId = TreeId(0'u64)): LsmResult[Tree]
 
 proc contains*(t: Tree, key: string, seqno: Option[SeqNo] = none(SeqNo)): bool =
   ## Check if key exists in tree
-  let result = t.lookup(key, seqno)
-  result.isSome()
+  ## OPTIMIZED: Inline the lookup to avoid extra function call overhead
+  let snapshotSeqno = if seqno.isSome: seqno.get else: t.currentSnapshotSeqno()
+
+  # Get version for snapshot
+  t.inner.versionHistory.acquireRead()
+  let version = t.inner.versionHistory.value.getVersionForSnapshot(snapshotSeqno)
+  t.inner.versionHistory.releaseRead()
+
+  # Check active memtable - return as soon as we find it
+  let activeResult = version.activeMemtable.get(key, snapshotSeqno)
+  if activeResult.isSome:
+    return true
+
+  # Check sealed memtables
+  if version.sealedMemtables.len > 0:
+    for i in countdown(version.sealedMemtables.len - 1, 0):
+      let res = version.sealedMemtables[i].get(key, snapshotSeqno)
+      if res.isSome:
+        return true
+
+  false
