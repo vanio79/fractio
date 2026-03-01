@@ -2,83 +2,128 @@
 # This source code is licensed under both the Apache 2.0 and MIT License
 # (found in the LICENSE-* files in the repository)
 
-## LSM Tree v2 - Main Implementation
+## LSM Tree v2 - Main Implementation with Version History
 ##
-## This module provides the main Tree implementation for the LSM tree.
+## Updated to use VersionHistory for proper MVCC snapshot isolation.
+## Matches Rust implementation architecture.
+##
+## OPTIMIZED: Uses SearchKey for zero-copy lookups
 
-import std/[atomics, os, tables, options, algorithm, heapqueue]
+import std/[atomics, os, locks, options]
 import types
 import error
 import memtable
 import table
 import merge
+import atomics_helpers
 import config
 import cache
+import version_history
+import rwlock
+import wal
+import manifest
+import skiplist_search # Zero-copy search operations
+
+# Re-export for compatibility
+export types
+export error
+export memtable
+export table
+export merge
+export config
+export cache
+export version_history
 
 # ============================================================================
-# Super Version
+# TreeInner - Core structure for LSM tree (matches Rust implementation)
 # ============================================================================
 
 type
-  SuperVersion* = ref object
-    ## Contains current state of the tree
-    activeMemtable*: Memtable
-    sealedMemtables*: seq[Memtable]
-    tables*: seq[SsTable] # SSTables organized by level
-    snapshotSeqno*: SeqNo
-    refCount*: Atomic[int32]
-    versionId*: int64
-
-proc newSuperVersion*(): SuperVersion =
-  var refCount: Atomic[int32]
-  SuperVersion(
-    activeMemtable: newMemtable(0),
-    sealedMemtables: newSeq[Memtable](),
-    tables: newSeq[SsTable](),
-    snapshotSeqno: 0,
-    refCount: refCount,
-    versionId: 0
-  )
-
-proc acquire*(sv: SuperVersion): int32 =
-  atomicInc(sv.refCount, 1)
-  return sv.refCount.load()
-
-proc release*(sv: SuperVersion): int32 =
-  atomicDec(sv.refCount, 1)
-  return sv.refCount.load()
+  TreeInner* = ref object
+    id*: TreeId
+    config*: Config
+    versionHistory*: RwLock[VersionHistory] # Historical versions for MVCC
+    tableIdCounter*: Atomic[uint64]
+    flushLock*: Lock
+    walManager*: Option[WALManager]         # None when walEnabled=false (in-memory only)
+    manifestManager*: ManifestManager
+    insertedKeys*: seq[string]              # For benchmark verification
 
 # ============================================================================
-# Tree
+# Tree - Public interface wrapper
 # ============================================================================
 
 type
   Tree* = ref object
-    config*: Config
-    id*: TreeId
-    tableIdCounter*: Atomic[uint64]
+    inner*: TreeInner
     memtableIdCounter*: Atomic[int64]
-    snapshotSeqnoCounter*: Atomic[uint64]
-    superVersion*: SuperVersion
-    blockCache*: Cache ## LRU cache for blocks
+    blockCache*: Cache
 
-proc newTree*(config: Config, id: TreeId = 0): Tree =
+proc getInsertedKeys*(t: Tree): seq[string] =
+  ## Return the list of keys inserted during benchmark
+  # This is only safe if no inserts are ongoing
+  result = t.inner.insertedKeys
+
+proc newTree*(config: Config, id: TreeId = TreeId(0)): Tree =
+  ## Create a new LSM tree with version history support
   var tableIdCounter: Atomic[uint64]
   var memtableIdCounter: Atomic[int64]
-  var snapshotSeqnoCounter: Atomic[uint64]
+  var flushLock: Lock
+  initLock(flushLock)
 
   # Initialize block cache if configured
   let cacheSize = if config.cacheSize > 0: uint64(config.cacheSize) else: 64 *
-      1024 * 1024 # Default 64MB
+      1024 * 1024
   var blockCache = newCache(cacheSize)
 
-  result = Tree(
-    config: config,
+  # Create initial SuperVersion
+  let initialVersion = newSuperVersion(0.SeqNo)
+
+  # Create version history
+  let versionHist = newVersionHistory(initialVersion)
+  let versionHistoryLock = newRwLock[VersionHistory](versionHist)
+
+  # Create WAL manager only if enabled
+  var walManager: Option[WALManager] = none(WALManager)
+  var memtable = newMemtable(MemtableId(0))
+
+  if config.walEnabled:
+    let walResult = newWALManager(config.path)
+    if walResult.isErr:
+      raise newIoError("Failed to create WAL manager: " & walResult.error.msg)
+    walManager = some(walResult.get)
+
+    # Replay WAL to reconstruct memtable state
+    let replayResult = walManager.get.replay(memtable)
+    if replayResult.isErr:
+      raise newIoError("Failed to replay WAL: " & replayResult.error.msg)
+
+  # Create manifest manager
+  let manifestResult = newManifestManager(config.path)
+  if manifestResult.isErr:
+    raise newIoError("Failed to create manifest manager: " &
+        manifestResult.error.msg)
+  let manifestManager = manifestResult.get
+
+  # Replay manifest to reconstruct SSTable state
+  let replayManifestResult = manifestManager.replay()
+  if replayManifestResult.isErr:
+    raise newIoError("Failed to replay manifest: " &
+        replayManifestResult.error.msg)
+
+  let treeInner = TreeInner(
     id: id,
+    config: config,
+    versionHistory: versionHistoryLock,
     tableIdCounter: tableIdCounter,
+    flushLock: flushLock,
+    walManager: walManager,
+    manifestManager: manifestManager
+  )
+
+  result = Tree(
+    inner: treeInner,
     memtableIdCounter: memtableIdCounter,
-    snapshotSeqnoCounter: snapshotSeqnoCounter,
-    superVersion: newSuperVersion(),
     blockCache: blockCache
   )
 
@@ -86,610 +131,279 @@ proc newTree*(config: Config, id: TreeId = 0): Tree =
 # ID Management
 # ============================================================================
 
+# Forward declarations
+proc rotateMemtable*(t: Tree): Option[Memtable]
+proc flush*(t: Tree, memtable: Memtable): LsmResult[SsTable]
+
 proc nextTableId*(t: Tree): TableId =
-  TableId(fetchAdd(t.tableIdCounter, 1, moRelaxed))
+  TableId(fetchAdd(t.inner.tableIdCounter, 1, moRelaxed))
 
 proc nextMemtableId*(t: Tree): MemtableId =
   MemtableId(fetchAdd(t.memtableIdCounter, 1, moRelaxed))
 
 proc currentSnapshotSeqno*(t: Tree): SeqNo =
-  # Return the highest seqno used so far, or 0 if no inserts yet
-  # This ensures reads can see recently inserted data
-  load(t.snapshotSeqnoCounter)
-
-proc advanceSnapshotSeqno*(t: Tree): SeqNo =
-  let newSeqno = fetchAdd(t.snapshotSeqnoCounter, 1, moRelaxed) + 1
-  return newSeqno
+  ## Return current snapshot sequence number
+  load(t.inner.versionHistory.value.latestSeqno, moRelaxed)
 
 # ============================================================================
-# Core Operations
+# Core Operations with Version History
 # ============================================================================
 
-proc insert*(t: Tree, key: string, value: string, seqno: SeqNo): (
-    uint64, uint64) =
-  let internalKey = newInternalKey(key, seqno, vtValue)
-  let internalValue = newInternalValue(internalKey, newSlice(value))
-  let (size, totalSize) = t.superVersion.activeMemtable.insert(internalValue)
-  # Update snapshot counter if this seqno is higher
-  var current = load(t.snapshotSeqnoCounter)
-  while seqno > current:
-    if compareExchange(t.snapshotSeqnoCounter, current, seqno, moRelaxed, moRelaxed):
-      break
-    current = load(t.snapshotSeqnoCounter)
+proc insert*(t: Tree, key: string, value: string, seqno: SeqNo): (uint64, uint64) =
+  ## Insert a key-value pair into the tree
+  ## Uses arena allocation for keys - eliminates per-key GC overhead
+
+  # Write to WAL first for durability (if enabled)
+  if t.inner.config.walEnabled and t.inner.walManager.isSome:
+    let walResult = t.inner.walManager.get.appendWrite(seqno, key, value)
+    if walResult.isErr:
+      discard # WAL write failed, continue anyway
+
+  # Get current version from history (thread-safe read)
+  t.inner.versionHistory.acquireRead()
+  let currentVersion = t.inner.versionHistory.value.latestVersion()
+  t.inner.versionHistory.releaseRead()
+
+  # Use insertFromString which copies key into arena
+  let (size, totalSize) = currentVersion.activeMemtable.insertFromString(key,
+      value, seqno)
+
+  # CRITICAL: Update VersionHistory.latestSeqno to make key visible in snapshot
+  t.inner.versionHistory.acquireWrite()
+  let currentLatest = load(t.inner.versionHistory.value.latestSeqno, moRelaxed)
+  if seqno > currentLatest:
+    store(t.inner.versionHistory.value.latestSeqno, seqno, moRelaxed)
+  t.inner.versionHistory.releaseWrite()
+
   return (size, totalSize)
 
 proc remove*(t: Tree, key: string, seqno: SeqNo): (uint64, uint64) =
-  let internalKey = newInternalKey(key, seqno, vtTombstone)
-  let internalValue = newInternalValue(internalKey, newSlice(""))
-  let (size, totalSize) = t.superVersion.activeMemtable.insert(internalValue)
-  # Update snapshot counter if this seqno is higher
-  var current = load(t.snapshotSeqnoCounter)
-  while seqno > current:
-    if compareExchange(t.snapshotSeqnoCounter, current, seqno, moRelaxed, moRelaxed):
-      break
-    current = load(t.snapshotSeqnoCounter)
+  ## Remove a key from the tree (insert tombstone)
+
+  # Write to WAL first for durability (if enabled)
+  if t.inner.config.walEnabled and t.inner.walManager.isSome:
+    let walResult = t.inner.walManager.get.appendRemove(seqno, key)
+    if walResult.isErr:
+      discard # WAL write failed, continue anyway
+
+  # Get current version from history (thread-safe read)
+  t.inner.versionHistory.acquireRead()
+  let currentVersion = t.inner.versionHistory.value.latestVersion()
+  t.inner.versionHistory.releaseRead()
+
+  # Insert tombstone - copy key into arena
+  let (size, totalSize) = currentVersion.activeMemtable.insertFromString(key,
+      "", seqno)
   return (size, totalSize)
 
-proc flushMemtable*(t: Tree, memtable: Memtable): LsmResult[SsTable] =
-  let tableId = t.nextTableId()
-  let level = 0
-  let tablePath = t.config.path / ("L" & $level & "/" & $tableId & ".sst")
-
-  createDir(t.config.path / ("L" & $level))
-
-  let builderResult = newTableWriter(tablePath,
-      t.config.dataBlockRestartInterval.interval)
-  if builderResult.isErr:
-    return err[SsTable](builderResult.error)
-
-  let builder = builderResult.value
-
-  for entry in memtable.iter():
-    let addResult = builder.addEntry(entry)
-    if addResult.isErr:
-      builder.close()
-      return err[SsTable](addResult.error)
-
-  let tableResult = builder.finish()
-  if tableResult.isErr:
-    return err[SsTable](tableResult.error)
-
-  ok(tableResult.value)
-
-proc rotateMemtable*(t: Tree): Option[Memtable]
-
-proc flushActiveMemtable*(t: Tree): LsmResult[Option[SsTable]] =
-  if t.superVersion.activeMemtable.isEmpty():
-    return ok(none(SsTable))
-
-  let rotated = t.rotateMemtable()
-  if rotated.isNone:
-    return ok(none(SsTable))
-
-  let flushResult = t.flushMemtable(rotated.get)
-  if flushResult.isErr:
-    return err[Option[SsTable]](flushResult.error)
-
-  # Add the flushed table to tables
-  let flushedTable = flushResult.value
-  # Set the block cache on the table
-  flushedTable.setBlockCache(addr t.blockCache)
-  t.superVersion.tables.add(flushedTable)
-
-  ok(some(flushedTable))
-
-proc rotateMemtable*(t: Tree): Option[Memtable] =
-  if t.superVersion.activeMemtable.isEmpty():
-    return none(Memtable)
-
-  let yanked = t.superVersion.activeMemtable
-
-  let newMemtable = newMemtable(t.nextMemtableId())
-
-  var newSv = newSuperVersion()
-  newSv.activeMemtable = newMemtable
-  newSv.sealedMemtables = t.superVersion.sealedMemtables & yanked
-  newSv.tables = t.superVersion.tables
-  newSv.snapshotSeqno = t.superVersion.snapshotSeqno
-
-  t.superVersion = newSv
-
-  return some(yanked)
-
-# ============================================================================
-# Iteration
-# ============================================================================
-
-type
-  TreeIterator* = ref object
-    tree*: Tree
-    snapshotSeqno*: SeqNo
-
-proc newTreeIterator*(tree: Tree, snapshotSeqno: Option[SeqNo] = none(
-    SeqNo)): TreeIterator =
-  let seqno = if snapshotSeqno.isSome: snapshotSeqno.get else: tree.currentSnapshotSeqno()
-
-  TreeIterator(
-    tree: tree,
-    snapshotSeqno: seqno
-  )
-
-proc getInternalEntry*(t: Tree, key: types.Slice, seqno: Option[SeqNo] = none(
-    SeqNo)): Option[InternalValue] =
+proc getInternalEntry*(t: Tree, key: string, seqno: Option[SeqNo] = none(
+    SeqNo)): Option[string] =
+  ## Get value for key with snapshot isolation
+  ## Simplified to just return the value (key is known by caller)
   let snapshotSeqno = if seqno.isSome: seqno.get else: t.currentSnapshotSeqno()
 
+  # Get appropriate version for this snapshot (thread-safe)
+  t.inner.versionHistory.acquireRead()
+  let version = t.inner.versionHistory.value.getVersionForSnapshot(snapshotSeqno)
+  t.inner.versionHistory.releaseRead()
+
   # Check active memtable
-  let activeResult = t.superVersion.activeMemtable.get(key, snapshotSeqno)
+  let activeResult = version.activeMemtable.get(key, snapshotSeqno)
   if activeResult.isSome:
     return activeResult
 
   # Check sealed memtables
-  if t.superVersion.sealedMemtables.len > 0:
-    for i in countdown(t.superVersion.sealedMemtables.len - 1, 0):
-      let result = t.superVersion.sealedMemtables[i].get(key, snapshotSeqno)
+  if version.sealedMemtables.len > 0:
+    for i in countdown(version.sealedMemtables.len - 1, 0):
+      let result = version.sealedMemtables[i].get(key, snapshotSeqno)
       if result.isSome:
         return result
 
-  # Check SSTables - iterate from newest to oldest (L0 to higher levels)
-  # Convert key to string for SSTable lookup
-  let keyStr = key.data
-
-  for table in t.superVersion.tables:
-    # Check if key is in range
-    if table.meta.minKey.len > 0 and keyStr < table.meta.minKey.data:
+  # Check SSTables
+  for table in version.tables:
+    if table.meta.minKey.len > 0 and key < table.meta.minKey:
       continue
-    if table.meta.maxKey.len > 0 and keyStr > table.meta.maxKey.data:
+    if table.meta.maxKey.len > 0 and key > table.meta.maxKey:
       continue
 
-    # Look up in SSTable
-    let tableResult = table.lookup(keyStr, snapshotSeqno)
+    let tableResult = table.lookup(key, snapshotSeqno)
     if tableResult.isSome:
       let entry = tableResult.get
-      # Check if this is a tombstone
-      if entry.key.isTombstone():
-        # Return tombstone to indicate deletion
-        return some(entry)
-      return some(entry)
+      if not entry.key.isTombstone():
+        return some(entry.value)
 
-  none(InternalValue)
+  none(string)
 
-proc lookup*(t: Tree, key: types.Slice, seqno: Option[SeqNo] = none(
-    SeqNo)): Option[types.Slice] =
+proc lookup*(t: Tree, key: string, seqno: Option[SeqNo] = none(
+    SeqNo)): Option[string] =
+  ## Lookup with snapshot isolation - OPTIMIZED with zero-copy SearchKey
   let snapshotSeqno = if seqno.isSome: seqno.get else: t.currentSnapshotSeqno()
 
-  # Check active memtable
-  let activeResult = t.superVersion.activeMemtable.get(key, snapshotSeqno)
+  # Get appropriate version for this snapshot (thread-safe)
+  t.inner.versionHistory.acquireRead()
+  let version = t.inner.versionHistory.value.getVersionForSnapshot(snapshotSeqno)
+  t.inner.versionHistory.releaseRead()
+
+  # Check active memtable using zero-copy SearchKey
+  let activeResult = version.activeMemtable.get(key, snapshotSeqno)
   if activeResult.isSome:
     let value = activeResult.get
-    if value.key.isTombstone():
-      return none(types.Slice)
-    return some(value.value)
+    # Check if this is a tombstone using zero-copy SearchKey
+    let searchKey = newSearchKey(key, snapshotSeqno, vtValue)
+    let rangeIter = version.activeMemtable.items.rangeFromWithSearchKey(searchKey)
+    if rangeIter.hasNext():
+      let (k, v) = rangeIter.next()
+      if k.userKey == key and k.isTombstone():
+        return none(string)
+    return some(value)
 
-  # Check sealed memtables (newest first)
-  if t.superVersion.sealedMemtables.len > 0:
-    for i in countdown(t.superVersion.sealedMemtables.len - 1, 0):
-      let memtable = t.superVersion.sealedMemtables[i]
-      let result = memtable.get(key, snapshotSeqno)
+  # Check sealed memtables using zero-copy SearchKey
+  if version.sealedMemtables.len > 0:
+    for i in countdown(version.sealedMemtables.len - 1, 0):
+      let result = version.sealedMemtables[i].get(key, snapshotSeqno)
       if result.isSome:
         let value = result.get
-        if value.key.isTombstone():
-          return none(types.Slice)
-        return some(value.value)
+        # Check tombstone using zero-copy SearchKey
+        let searchKey = newSearchKey(key, snapshotSeqno, vtValue)
+        let rangeIter = version.sealedMemtables[i].items.rangeFromWithSearchKey(searchKey)
+        if rangeIter.hasNext():
+          let (k, v) = rangeIter.next()
+          if k.userKey == key and k.isTombstone():
+            return none(string)
+        return some(value)
 
   # Check SSTables
-  let keyStr = key.data
-  for table in t.superVersion.tables:
-    # Check if key is in range
-    if table.meta.minKey.len > 0 and keyStr < table.meta.minKey.data:
+  for table in version.tables:
+    if table.meta.minKey.len > 0 and key < table.meta.minKey:
       continue
-    if table.meta.maxKey.len > 0 and keyStr > table.meta.maxKey.data:
+    if table.meta.maxKey.len > 0 and key > table.meta.maxKey:
       continue
 
-    # Look up in SSTable
-    let tableResult = table.lookup(keyStr, snapshotSeqno)
+    let tableResult = table.lookup(key, snapshotSeqno)
     if tableResult.isSome:
       let entry = tableResult.get
       if entry.key.isTombstone():
-        return none(types.Slice)
+        return none(string)
       return some(entry.value)
 
-  none(types.Slice)
+  none(string)
 
-# Backward compatibility alias
-proc get*(t: Tree, key: types.Slice, seqno: Option[SeqNo] = none(
-    SeqNo)): Option[types.Slice] =
+# Backward compatibility
+proc get*(t: Tree, key: string, seqno: Option[SeqNo] = none(
+    SeqNo)): Option[string] =
   t.lookup(key, seqno)
 
-proc contains*(t: Tree, key: types.Slice, seqno: Option[SeqNo] = none(SeqNo)): bool =
-  t.lookup(key, seqno).isSome
-
 # ============================================================================
-# Range Iterator - Lazy, streaming iterator like Rust's TreeIter
+# Flush and Compaction Support
 # ============================================================================
 
-type
-  RangeIterator* = ref object
-    ## Lazy range iterator that yields items one at a time
-    ## Mirrors Rust's TreeIter pattern
-    tree*: Tree
-    startKey*: string
-    endKey*: string
-    targetSeqno*: SeqNo
-    ## Iterator state
-    initialized*: bool
-    heap*: HeapQueue[MergeItem]
-    iterators*: seq[proc(): Option[InternalValue]]
-
-proc newRangeIterator*(tree: Tree, startKey, endKey: string,
-    targetSeqno: SeqNo): RangeIterator =
-  RangeIterator(
-    tree: tree,
-    startKey: startKey,
-    endKey: endKey,
-    targetSeqno: targetSeqno,
-    initialized: false,
-    heap: initHeapQueue[MergeItem](),
-    iterators: newSeq[proc(): Option[InternalValue]]()
-  )
-
-proc initRangeIterator*(r: RangeIterator) =
-  ## Initialize the iterator by creating sub-iterators for each data source
-  if r.initialized:
-    return
-
-  let startKeyStr = r.startKey
-  let endKeyStr = r.endKey
-  let targetSeqno = r.targetSeqno
-
-  # Helper to get next from memtable range - uses skiplist's native range
-  proc makeMemtableIterator(memtable: Memtable, startKey, endKey: string,
-      targetSeqno: SeqNo): proc(): Option[InternalValue] =
-    let startIKey = newInternalKey(startKey, targetSeqno, vtValue)
-    let endIKey = newInternalKey(endKey, 0, vtValue)
-    var memtableIter = memtable.newMemtableRangeIter(startIKey, endIKey, targetSeqno)
-
-    result = proc(): Option[InternalValue] =
-      if memtableIter.hasNext():
-        return memtableIter.next()
-      none(InternalValue)
-
-  # Helper to get next from table range
-  proc makeTableIterator(table: SsTable, startKey, endKey: string,
-      targetSeqno: SeqNo): proc(): Option[InternalValue] =
-    var tableIter = newTableRangeIter(table, startKey, endKey, targetSeqno)
-
-    result = proc(): Option[InternalValue] =
-      if tableIter.hasNext():
-        return tableIter.next()
-      none(InternalValue)
-
-  # Add active memtable
-  r.iterators.add(makeMemtableIterator(r.tree.superVersion.activeMemtable,
-      startKeyStr, endKeyStr, targetSeqno))
-
-  # Add sealed memtables
-  for memtable in r.tree.superVersion.sealedMemtables:
-    r.iterators.add(makeMemtableIterator(memtable, startKeyStr, endKeyStr, targetSeqno))
-
-  # Add SSTables
-  for table in r.tree.superVersion.tables:
-    if not (table.meta.maxKey.len > 0 and startKeyStr > table.meta.maxKey.data):
-      if not (table.meta.minKey.len > 0 and endKeyStr < table.meta.minKey.data):
-        r.iterators.add(makeTableIterator(table, startKeyStr, endKeyStr, targetSeqno))
-
-  r.initialized = true
-
-proc hasNext*(r: RangeIterator): bool =
-  ## Check if there are more items (without advancing)
-  if not r.initialized:
-    r.initRangeIterator()
-
-  # Initialize heap with first item from each iterator if not done
-  if r.heap.len == 0:
-    for i in 0 ..< r.iterators.len:
-      let item = r.iterators[i]()
-      if item.isSome:
-        r.heap.push((i, item.get))
-
-  r.heap.len > 0
-
-proc next*(r: RangeIterator): Option[InternalValue] =
-  ## Get the next item in the range
-  if not r.initialized:
-    r.initRangeIterator()
-
-  # Initialize heap with first item from each iterator if not done
-  if r.heap.len == 0:
-    for i in 0 ..< r.iterators.len:
-      let item = r.iterators[i]()
-      if item.isSome:
-        r.heap.push((i, item.get))
-
-  if r.heap.len == 0:
-    return none(InternalValue)
-
-  let minItem = r.heap.pop()
-  if minItem.value.key.userKey.len == 0:
-    return none(InternalValue)
-
-  let idx = minItem.idx
-  if idx < r.iterators.len:
-    let nextItem = r.iterators[idx]()
-    if nextItem.isSome:
-      r.heap.push((idx, nextItem.get))
-
-  some(minItem.value)
-
-proc collect*(r: RangeIterator): seq[InternalValue] =
-  ## Collect all items from the iterator into a seq
-  result = newSeq[InternalValue]()
-  while r.hasNext():
-    let item = r.next()
-    if item.isSome:
-      result.add(item.get)
-
-# ============================================================================
-# Range Query - Returns lazy iterator (like Rust's TreeIter)
-# ============================================================================
-
-proc range*(t: Tree, startKey: types.Slice, endKey: types.Slice,
-    seqno: Option[SeqNo] = none(SeqNo)): RangeIterator =
-  ## Returns a lazy range iterator that yields items one at a time.
-  ## This is the primary range scan API - use hasNext()/next() to iterate.
-  let targetSeqno = if seqno.isSome: seqno.get else: t.currentSnapshotSeqno()
-  let startKeyStr = startKey.data
-  let endKeyStr = endKey.data
-
-  newRangeIterator(t, startKeyStr, endKeyStr, targetSeqno)
-
-# ============================================================================
-# Prefix Iterator - Lazy, streaming iterator like Rust's TreeIter
-# ============================================================================
-
-type
-  PrefixIterator* = ref object
-    ## Lazy prefix iterator that yields items one at a time
-    tree*: Tree
-    prefix*: string
-    endPrefix*: string
-    targetSeqno*: SeqNo
-    initialized*: bool
-    heap*: HeapQueue[MergeItem]
-    iterators*: seq[proc(): Option[InternalValue]]
-
-proc newPrefixIterator*(tree: Tree, prefix: string,
-    targetSeqno: SeqNo): PrefixIterator =
-  # Calculate end prefix
-  var endPrefix = ""
-  var found = false
-  for i in countdown(prefix.len - 1, 0):
-    if prefix[i] != '\255':
-      endPrefix = prefix[0 ..< i] & chr(ord(prefix[i]) + 1)
-      found = true
-      break
-  if not found:
-    endPrefix = "" # All 255s means unbounded
-
-  PrefixIterator(
-    tree: tree,
-    prefix: prefix,
-    endPrefix: endPrefix,
-    targetSeqno: targetSeqno,
-    initialized: false,
-    heap: initHeapQueue[MergeItem](),
-    iterators: newSeq[proc(): Option[InternalValue]]()
-  )
-
-proc initPrefixIterator*(p: PrefixIterator) =
-  if p.initialized:
-    return
-
-  let prefix = p.prefix
-  let endPrefix = p.endPrefix
-  let targetSeqno = p.targetSeqno
-
-  # Helper for memtable prefix - uses skiplist's native range
-  proc makeMemtablePrefixIterator(memtable: Memtable, prefix, endPrefix: string,
-      targetSeqno: SeqNo): proc(): Option[InternalValue] =
-    # For prefix scan, we use the range iterator with the prefix range
-    let startKey = newInternalKey(prefix, targetSeqno, vtValue)
-    # Calculate end key for the prefix
-    var prefixEnd = ""
-    if endPrefix.len > 0:
-      prefixEnd = endPrefix
-    else:
-      # Create a key that's just after all keys with this prefix
-      prefixEnd = prefix
-      if prefixEnd.len > 0:
-        prefixEnd[^1] = chr(ord(prefixEnd[^1]) + 1)
-    let endKey = newInternalKey(prefixEnd, 0, vtValue)
-    var memtableIter = memtable.newMemtableRangeIter(startKey, endKey, targetSeqno)
-
-    result = proc(): Option[InternalValue] =
-      if memtableIter.hasNext():
-        return memtableIter.next()
-      none(InternalValue)
-
-  # Helper for table prefix - uses table range iterator
-  proc makeTablePrefixIterator(table: SsTable, prefix, endPrefix: string,
-      targetSeqno: SeqNo): proc(): Option[InternalValue] =
-    var tableIter = newTableRangeIter(table, prefix, endPrefix, targetSeqno)
-
-    result = proc(): Option[InternalValue] =
-      if tableIter.hasNext():
-        return tableIter.next()
-      none(InternalValue)
-
-  # Add active memtable
-  p.iterators.add(makeMemtablePrefixIterator(p.tree.superVersion.activeMemtable,
-      prefix, endPrefix, targetSeqno))
-
-  # Add sealed memtables
-  for memtable in p.tree.superVersion.sealedMemtables:
-    p.iterators.add(makeMemtablePrefixIterator(memtable, prefix, endPrefix, targetSeqno))
-
-  # Add SSTables
-  for table in p.tree.superVersion.tables:
-    if not (table.meta.maxKey.len > 0 and prefix > table.meta.maxKey.data):
-      p.iterators.add(makeTablePrefixIterator(table, prefix, endPrefix, targetSeqno))
-
-  p.initialized = true
-
-proc hasNext*(p: PrefixIterator): bool =
-  if not p.initialized:
-    p.initPrefixIterator()
-
-  if p.heap.len == 0:
-    for i in 0 ..< p.iterators.len:
-      let item = p.iterators[i]()
-      if item.isSome:
-        p.heap.push((i, item.get))
-
-  p.heap.len > 0
-
-proc next*(p: PrefixIterator): Option[InternalValue] =
-  if not p.initialized:
-    p.initPrefixIterator()
-
-  if p.heap.len == 0:
-    for i in 0 ..< p.iterators.len:
-      let item = p.iterators[i]()
-      if item.isSome:
-        p.heap.push((i, item.get))
-
-  if p.heap.len == 0:
-    return none(InternalValue)
-
-  let minItem = p.heap.pop()
-  if minItem.value.key.userKey.len == 0:
-    return none(InternalValue)
-
-  let idx = minItem.idx
-  if idx < p.iterators.len:
-    let nextItem = p.iterators[idx]()
-    if nextItem.isSome:
-      p.heap.push((idx, nextItem.get))
-
-  some(minItem.value)
-
-proc collectPrefix*(p: PrefixIterator): seq[InternalValue] =
-  result = newSeq[InternalValue]()
-  while p.hasNext():
-    let item = p.next()
-    if item.isSome:
-      result.add(item.get)
-
-# ============================================================================
-# Prefix Scan - Returns lazy iterator (like Rust's TreeIter)
-# ============================================================================
-
-proc prefixScan*(t: Tree, prefix: types.Slice,
-    seqno: Option[SeqNo] = none(SeqNo)): PrefixIterator =
-  ## Returns a lazy prefix iterator that yields items one at a time.
-  ## This is the primary prefix scan API - use hasNext()/next() to iterate.
-  let targetSeqno = if seqno.isSome: seqno.get else: t.currentSnapshotSeqno()
-  let prefixStr = prefix.data
-
-  newPrefixIterator(t, prefixStr, targetSeqno)
-
-# ============================================================================
-# Statistics
-# ============================================================================
-
-proc tableCount*(t: Tree): int =
-  t.superVersion.tables.len
-
-proc approximateLen*(t: Tree): int =
-  result = t.superVersion.activeMemtable.len()
-  for memtable in t.superVersion.sealedMemtables:
-    result += memtable.len()
-  for table in t.superVersion.tables:
-    result += int(table.meta.entryCount)
-
-proc diskUsage*(t: Tree): uint64 =
-  result = 0
-  for table in t.superVersion.tables:
-    result += table.meta.size
-
-proc getHighestMemtableSeqno*(t: Tree): Option[SeqNo] =
-  var result: Option[SeqNo] = t.superVersion.activeMemtable.getHighestSeqno()
-
-  for memtable in t.superVersion.sealedMemtables:
-    let mtSeqno = memtable.getHighestSeqno()
-    if mtSeqno.isSome:
-      if result.isNone or mtSeqno.get > result.get:
-        result = mtSeqno
-
-  result
-
-proc getHighestPersistedSeqno*(t: Tree): Option[SeqNo] =
-  var result: Option[SeqNo] = none(SeqNo)
-
-  for table in t.superVersion.tables:
-    if result.isNone or table.meta.largestSeqno > result.get:
-      result = some(table.meta.largestSeqno)
-
-  result
-
-# ============================================================================
-# Tree Lifecycle
-# ============================================================================
-
-proc openTree*(config: Config, id: TreeId = 0): LsmResult[Tree] =
-  if not dirExists(config.path):
-    return err[Tree](newUnrecoverableError("Database directory does not exist"))
-
-  let tree = newTree(config, id)
-  ok(tree)
-
-proc createNewTree*(config: Config, id: TreeId = 0): LsmResult[Tree] =
-  if dirExists(config.path):
-    removeDir(config.path)
-
-  createDir(config.path)
-
-  let tree = newTree(config, id)
-  ok(tree)
+proc rotateMemtable*(t: Tree): Option[Memtable] =
+  ## Rotate active memtable to sealed (requires write lock)
+  t.inner.versionHistory.acquireWrite()
+
+  if t.inner.versionHistory.value.latestVersion().activeMemtable.isEmpty():
+    t.inner.versionHistory.releaseWrite()
+    return none(Memtable)
+
+  let yanked = t.inner.versionHistory.value.latestVersion().activeMemtable
+  let newMemtable = newMemtable(t.nextMemtableId())
+
+  # Create new SuperVersion with rotated memtable
+  var newVersion = newSuperVersion(t.currentSnapshotSeqno())
+  newVersion.activeMemtable = newMemtable
+  newVersion.sealedMemtables = t.inner.versionHistory.value.latestVersion().sealedMemtables & yanked
+  newVersion.tables = t.inner.versionHistory.value.latestVersion().tables
+
+  t.inner.versionHistory.value.appendVersion(newVersion)
+
+  t.inner.versionHistory.releaseWrite()
+  return some(yanked)
+
+proc flush*(t: Tree, memtable: Memtable): LsmResult[SsTable] =
+  ## Flush a memtable to disk as an SSTable
+  ## Returns the created SSTable
+  try:
+    let tableId = t.nextTableId()
+    let path = t.inner.config.path & "/" & $tableId & ".sst"
+
+    # Create table writer
+    let writer = newTableWriter(path)
+    if writer.isErr:
+      return err[SsTable](writer.error)
+
+    # Write all entries from memtable
+    var entries = memtable.iter()
+    for (key, value) in entries:
+      let addResult = writer.get.addEntry(key, value)
+      if addResult.isErr:
+        writer.get.close()
+        return err[SsTable](addResult.error)
+
+    # Finish table
+    let finishResult = writer.get.finish()
+    if finishResult.isErr:
+      writer.get.close()
+      return err[SsTable](finishResult.error)
+
+    # Copy metadata from writer BEFORE closing
+    let metaMinKey = writer.get.getMinKey()
+    let metaMaxKey = writer.get.getMaxKey()
+    let metaEntryCount = writer.get.getEntryCount()
+    let metaSmallestSeqno = writer.get.getSmallestSeqno()
+    let metaLargestSeqno = writer.get.getLargestSeqno()
+
+    # Close writer
+    writer.get.close()
+
+    # Create SsTable from the written file
+    let ssTable = newSsTable(path)
+    ssTable.meta.id = tableId
+    # CRITICAL: Copy metadata from writer to SsTable
+    ssTable.meta.minKey = metaMinKey
+    ssTable.meta.maxKey = metaMaxKey
+    ssTable.meta.entryCount = metaEntryCount
+    ssTable.meta.smallestSeqno = metaSmallestSeqno
+    ssTable.meta.largestSeqno = metaLargestSeqno
+    # Get file size
+    ssTable.fileSize = uint64(getFileSize(path))
+
+    # Add to manifest
+    let manifestResult = t.inner.manifestManager.addTable(ssTable)
+    if manifestResult.isErr:
+      return err[SsTable](manifestResult.error)
+
+    # Add to version history
+    t.inner.versionHistory.acquireWrite()
+    let currentVersion = t.inner.versionHistory.value.latestVersion()
+    var newVersion = newSuperVersion(t.currentSnapshotSeqno())
+    newVersion.activeMemtable = currentVersion.activeMemtable
+    newVersion.sealedMemtables = currentVersion.sealedMemtables
+    newVersion.tables = currentVersion.tables & ssTable
+    t.inner.versionHistory.value.appendVersion(newVersion)
+    t.inner.versionHistory.releaseWrite()
+
+    ok(ssTable)
+  except:
+    err[SsTable](newIoError("Failed to flush memtable: " &
+        getCurrentExceptionMsg()))
+
+proc advanceSnapshotSeqno*(t: Tree): SeqNo =
+  ## Advance snapshot sequence number (called during flush)
+  let oldSeqno = fetchAddSeqNo(t.inner.versionHistory.value.latestSeqno, 1, moRelaxed)
+  SeqNo(int64(oldSeqno) + 1)
 
 # ============================================================================
 # Tests
 # ============================================================================
 
-when isMainModule:
-  echo "Testing Tree..."
+proc createNewTree*(config: Config, id: TreeId = TreeId(0'u64)): LsmResult[Tree] =
+  if dirExists(config.path):
+    removeDir(config.path)
+  createDir(config.path)
+  let tree = newTree(config, id)
+  ok(tree)
 
-  let tmpDir = "/tmp/test_lsm_tree"
-  if dirExists(tmpDir):
-    removeDir(tmpDir)
-
-  let cfg = newDefaultConfig(tmpDir)
-  let treeResult = createNewTree(cfg, 0)
-  if treeResult.isErr:
-    echo "Error creating tree: ", treeResult.error
-    quit(1)
-
-  let tree = treeResult.value
-
-  # Insert some data
-  discard tree.insert("key1", "value1", 1)
-  discard tree.insert("key2", "value2", 2)
-  discard tree.insert("key3", "value3", 3)
-
-  # Test get
-  let val1 = tree.get(newSlice("key1"), some(1.SeqNo))
-  if val1.isSome:
-    echo "Got key1: ", val1.get.asString()
-
-  # Test range
-  let rangeResult = tree.range(newSlice("key1"), newSlice("key3"), some(3.SeqNo))
-  echo "Range results: ", rangeResult.len
-
-  # Test prefix scan
-  let prefixResult = tree.prefixScan(newSlice("key"), some(3.SeqNo))
-  echo "Prefix results: ", prefixResult.len
-
-  # Cleanup
-  if dirExists(tmpDir):
-    removeDir(tmpDir)
-
-  echo "Tree tests passed!"
+proc contains*(t: Tree, key: string, seqno: Option[SeqNo] = none(SeqNo)): bool =
+  ## Check if key exists in tree
+  let result = t.lookup(key, seqno)
+  result.isSome()

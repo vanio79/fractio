@@ -7,7 +7,8 @@
 ## This module provides the SSTable (Sorted String Table) implementation
 ## for on-disk storage of sorted key-value pairs.
 
-import std/[sequtils, streams, endians, strformat, tables, options, hashes, algorithm]
+import std/[sequtils, posix, endians, strformat, tables,
+    options, hashes, algorithm, os]
 import types
 import error
 import coding
@@ -37,8 +38,8 @@ type
     globalId*: GlobalTableId
     level*: int
     size*: uint64
-    minKey*: types.Slice
-    maxKey*: types.Slice
+    minKey*: string
+    maxKey*: string
     entryCount*: uint64
     compression*: sstable_block.CompressionType
     smallestSeqno*: SeqNo
@@ -48,15 +49,15 @@ type
 proc newTableMeta*(id: TableId, level: int = 0): TableMeta =
   TableMeta(
     id: id,
-    globalId: id,
+    globalId: GlobalTableId(id),
     level: level,
     size: 0,
-    minKey: emptySlice(),
-    maxKey: emptySlice(),
+    minKey: "",
+    maxKey: "",
     entryCount: 0,
     compression: ctNone,
-    smallestSeqno: 0,
-    largestSeqno: 0,
+    smallestSeqno: 0.SeqNo,
+    largestSeqno: 0.SeqNo,
     checksum: 0
   )
 
@@ -81,13 +82,13 @@ type
     cachedFilterBlock*: Option[BloomFilter]
     filterOffset*: uint64
     filterSize*: uint32
-    fileHandle*: File    # Open file handle for efficient I/O
+    fileHandle*: cint    # File descriptor for efficient I/O
     blockCache*: pointer # Pointer to shared block cache (Cache object)
 
 proc newSsTable*(path: string): SsTable =
   result = SsTable(
     path: path,
-    meta: newTableMeta(0, 0),
+    meta: newTableMeta(TableId(0), 0),
     fileSize: 0,
     cachedIndexBlock: none(string),
     cachedFilterBlock: none(BloomFilter),
@@ -96,7 +97,7 @@ proc newSsTable*(path: string): SsTable =
     blockCache: nil
   )
   # Open and keep file handle
-  result.fileHandle = open(path, fmRead)
+  result.fileHandle = posix.open(path, cint(FileFlags.frRead), 0)
 
 proc id*(t: SsTable): TableId = t.meta.id
 proc level*(t: SsTable): int = t.meta.level
@@ -121,12 +122,12 @@ proc putCachedBlock*(table: SsTable, offset: uint64, data: string) =
   cachePtr.insertBlock(0, int64(table.meta.id), offset, data)
 
 proc entryCount*(t: SsTable): uint64 = t.meta.entryCount
-proc minKey*(t: SsTable): types.Slice = t.meta.minKey
-proc maxKey*(t: SsTable): types.Slice = t.meta.maxKey
+proc minKey*(t: SsTable): string = t.meta.minKey
+proc maxKey*(t: SsTable): string = t.meta.maxKey
 
 proc closeTable*(t: SsTable) =
   ## Close the table and release resources
-  close(t.fileHandle)
+  discard posix.close(t.fileHandle)
 
 # ============================================================================
 # Block Builder
@@ -142,7 +143,7 @@ type
     restartPoints*: seq[int]
     entryCount*: int
     restartInterval*: int
-    lastKey*: types.Slice
+    lastKey*: string
     hashIndexBuilder*: HashIndexBuilder ## Hash index for fast lookups
 
 proc newBlockBuilder*(restartInterval: int = DefaultRestartInterval,
@@ -156,21 +157,18 @@ proc newBlockBuilder*(restartInterval: int = DefaultRestartInterval,
     restartPoints: @[0],
     entryCount: 0,
     restartInterval: restartInterval,
-    lastKey: emptySlice(),
+    lastKey: "",
     hashIndexBuilder: hashIdx
   )
 
 proc estimatedSize*(b: BlockBuilder): int = b.buffer.len
 
-proc add*(b: BlockBuilder, value: InternalValue): LsmResult[void] =
+proc add*(b: BlockBuilder, key: InternalKey, value: string): LsmResult[void] =
   try:
-    let key = value.key
-    let val = value.value
-
     # Calculate shared prefix length
     var sharedLen = 0
     let minLen = min(b.lastKey.len, key.userKey.len)
-    while sharedLen < minLen and b.lastKey[sharedLen] == key.userKey[sharedLen]:
+    while sharedLen < minLen and b.lastKey[sharedLen] == key.userKey.charAt(sharedLen):
       inc sharedLen
 
     let unsharedLen = key.userKey.len - sharedLen
@@ -184,30 +182,31 @@ proc add*(b: BlockBuilder, value: InternalValue): LsmResult[void] =
     # Unshared key length
     entry.add(encodeVarint(unsharedLen.uint64))
     # Value length
-    entry.add(encodeVarint(val.len.uint64))
+    entry.add(encodeVarint(value.len.uint64))
 
     # Unshared key bytes
     if unsharedLen > 0:
-      entry.add(key.userKey[sharedLen ..< key.userKey.len])
+      let unsharedKey = key.userKey.sliceToString(sharedLen, key.userKey.len)
+      entry.add(unsharedKey)
 
     # Value bytes
-    entry.add(val.data)
+    entry.add(value)
 
     # Add to buffer
     b.buffer.add(entry)
 
+    # Update last key
+    b.lastKey = key.userKey.toString()
+
     # Update hash index - map key to binary index position (restart point index)
     let restartIdx = b.restartPoints.len - 1 # Current restart point index
     if restartIdx < 255: # Max value for uint8
-      discard b.hashIndexBuilder.set(key.userKey, uint8(restartIdx))
+      discard b.hashIndexBuilder.set(key.userKey.toString(), uint8(restartIdx))
 
     # Update restart points
     b.entryCount += 1
     if b.entryCount mod b.restartInterval == 0:
       b.restartPoints.add(b.buffer.len)
-
-    # Update last key
-    b.lastKey = newSlice(key.userKey)
 
     okVoid()
   except:
@@ -237,7 +236,7 @@ proc reset*(b: BlockBuilder) =
   b.buffer = ""
   b.restartPoints = @[0]
   b.entryCount = 0
-  b.lastKey = emptySlice()
+  b.lastKey = ""
   # Recreate hash index with same bucket count
   let bucketCount = max(uint32(1), uint32(float(b.restartInterval) * 1.33))
   b.hashIndexBuilder = sstable_block.newHashIndexBuilder(bucketCount)
@@ -314,9 +313,9 @@ proc newBlockReader*(data: string, restartInterval: int = DefaultRestartInterval
     currentIndex: -1
   )
 
-proc next*(r: BlockReader): Option[InternalValue] =
+proc next*(r: BlockReader): Option[tuple[key: InternalKey, value: string]] =
   if r.currentIndex >= r.restartPoints.len - 1:
-    return none(InternalValue)
+    return none(tuple[key: InternalKey, value: string])
 
   # Find restart point for current index
   let restartIdx = (r.currentIndex + 1) div r.restartInterval
@@ -348,9 +347,9 @@ proc next*(r: BlockReader): Option[InternalValue] =
 
   r.currentIndex += 1
 
-  some(InternalValue(
-    key: newInternalKey(newSlice(keyData), 0, vtValue),
-    value: newSlice(valueData)
+  some((
+    key: newInternalKey(toKeySlice(keyData), 0.SeqNo, vtValue),
+    value: valueData
   ))
 
 proc hasNext*(r: BlockReader): bool =
@@ -363,19 +362,20 @@ proc hasNext*(r: BlockReader): bool =
 type
   TableWriter* = ref object
     path*: string
-    stream*: Stream
+    stream*: cint
     currentBlock*: BlockBuilder
-    indexEntries*: seq[tuple[key: types.Slice, handle: TableBlockHandle]]
-    minKey*: types.Slice
-    maxKey*: types.Slice
+    indexEntries*: seq[tuple[key: string, handle: TableBlockHandle]]
+    minKey*: string
+    maxKey*: string
     entryCount*: uint64
     blockRestartInterval*: int
     smallestSeqno*: SeqNo
     largestSeqno*: SeqNo
 
 proc newTableWriter*(path: string, restartInterval: int = DefaultRestartInterval): LsmResult[TableWriter] =
-  let stream = newFileStream(path, fmWrite)
-  if stream.isNil:
+  let stream = posix.open(path, cint(FileFlags.frWrite) or cint(
+      FileFlags.frCreate), 0o644)
+  if stream == -1:
     return err[TableWriter](newIoError("Failed to create table file: " & path))
 
   let writer = TableWriter(
@@ -383,28 +383,29 @@ proc newTableWriter*(path: string, restartInterval: int = DefaultRestartInterval
     stream: stream,
     currentBlock: newBlockBuilder(restartInterval),
     indexEntries: @[],
-    minKey: emptySlice(),
-    maxKey: emptySlice(),
+    minKey: "",
+    maxKey: "",
     entryCount: 0,
     blockRestartInterval: restartInterval,
     smallestSeqno: MAX_VALID_SEQNO,
-    largestSeqno: 0
+    largestSeqno: 0.SeqNo
   )
+
   ok(writer)
 
-proc addEntry*(w: TableWriter, value: InternalValue): LsmResult[void] =
+proc addEntry*(w: TableWriter, key: InternalKey, value: string): LsmResult[void] =
   try:
-    let key = value.key
-
-    # Update min/max key
+    # Update min/max key and seqno
+    # NOTE: InternalKey ordering has DESCENDING seqno, so first entry has HIGHEST seqno
     if w.entryCount == 0:
-      w.minKey = newSlice(key.userKey)
-      w.smallestSeqno = key.seqno
-    w.maxKey = newSlice(key.userKey)
-    w.largestSeqno = key.seqno
+      w.minKey = key.userKey.toString()
+      w.largestSeqno = key.seqno # First entry has highest seqno
+    w.maxKey = key.userKey.toString()
+    w.smallestSeqno = key.seqno # Will end up with lowest seqno after iteration
+    inc(w.entryCount) # CRITICAL FIX: Increment entry count!
 
     # Add to current block
-    let addResult = w.currentBlock.add(value)
+    let addResult = w.currentBlock.add(key, value)
     if addResult.isErr:
       return errVoid(addResult.error)
 
@@ -415,51 +416,48 @@ proc addEntry*(w: TableWriter, value: InternalValue): LsmResult[void] =
       if blockData.isErr:
         return errVoid(blockData.error)
 
-      # Add index entry
       let handle = TableBlockHandle(
-        offset: w.stream.getPosition().uint64,
-        size: blockData.value.len.uint32
-      )
-      w.indexEntries.add((newSlice(key.userKey), handle))
-
-      # Write block data
-      w.stream.write(blockData.value)
-
-      # Reset for next block
-      w.currentBlock.reset()
-
-    w.entryCount += 1
-    okVoid()
-  except:
-    errVoid(newIoError("Failed to add entry to table: " &
-        getCurrentExceptionMsg()))
-
-proc finish*(w: TableWriter): LsmResult[SsTable] =
-  try:
-    # Flush remaining block
-    if w.currentBlock.estimatedSize() > 0:
-      let blockData = w.currentBlock.finish()
-      if blockData.isErr:
-        return err[SsTable](blockData.error)
-
-      let handle = TableBlockHandle(
-        offset: w.stream.getPosition().uint64,
+        offset: posix.lseek(w.stream, 0, SEEK_CUR).uint64,
         size: blockData.value.len.uint32
       )
       w.indexEntries.add((w.maxKey, handle))
-      w.stream.write(blockData.value)
+      discard posix.write(w.stream, cast[pointer](addr(blockData.value[0])),
+          blockData.value.len)
+
+      # CRITICAL: Reset the block builder for next block
+      w.currentBlock.reset()
+
+  except:
+    return errVoid(newIoError("Failed to add entry: " & getCurrentExceptionMsg()))
+
+  okVoid()
+
+proc finish*(w: TableWriter): LsmResult[void] =
+  try:
+    # Write the final block (which may not be full)
+    let blockData = w.currentBlock.finish()
+    if blockData.isErr:
+      return errVoid(blockData.error)
+
+    let handle = TableBlockHandle(
+      offset: posix.lseek(w.stream, 0, SEEK_CUR).uint64,
+      size: blockData.value.len.uint32
+    )
+    w.indexEntries.add((w.maxKey, handle))
+    discard posix.write(w.stream, cast[pointer](addr(blockData.value[0])),
+        blockData.value.len)
 
     # Write index block
     var indexData = ""
     for entry in w.indexEntries:
       indexData.add(encodeVarint(entry.key.len))
-      indexData.add(entry.key.data)
+      indexData.add(entry.key)
       indexData.add(encodeVarint(int(entry.handle.offset)))
       indexData.add(encodeVarint(int(entry.handle.size)))
 
-    let indexOffset = w.stream.getPosition().uint64
+    let indexOffset = posix.lseek(w.stream, 0, SEEK_CUR).uint64
     let indexSize = indexData.len.uint32
-    w.stream.write(indexData)
+    discard posix.write(w.stream, cast[pointer](addr(indexData[0])), indexData.len)
 
     # Write footer
     var footer = ""
@@ -467,26 +465,25 @@ proc finish*(w: TableWriter): LsmResult[SsTable] =
     footer.add(encodeUint32(indexSize))
     footer.add(encodeUint64(0)) # No meta block
     footer.add(encodeUint32(0))
-    w.stream.write(footer)
+    discard posix.write(w.stream, cast[pointer](addr(footer[0])), footer.len)
 
-    close(w.stream)
+    discard posix.fsync(w.stream)
+    discard posix.close(w.stream)
 
-    # Create table
-    let table = newSsTable(w.path)
-    table.meta.minKey = w.minKey
-    table.meta.maxKey = w.maxKey
-    table.meta.entryCount = w.entryCount
-    table.meta.smallestSeqno = w.smallestSeqno
-    table.meta.largestSeqno = w.largestSeqno
-    table.fileSize = w.stream.getPosition().uint64
-    table.meta.size = table.fileSize
-
-    ok(table)
+    okVoid()
   except:
-    err[SsTable](newIoError("Failed to finish table: " & getCurrentExceptionMsg()))
+    return errVoid(newIoError("Failed to finish table: " &
+        getCurrentExceptionMsg()))
 
 proc close*(w: TableWriter) =
-  close(w.stream)
+  discard posix.close(cint(w.stream))
+
+# Metadata accessors for TableWriter
+proc getMinKey*(w: TableWriter): string = w.minKey
+proc getMaxKey*(w: TableWriter): string = w.maxKey
+proc getEntryCount*(w: TableWriter): uint64 = w.entryCount
+proc getSmallestSeqno*(w: TableWriter): SeqNo = w.smallestSeqno
+proc getLargestSeqno*(w: TableWriter): SeqNo = w.largestSeqno
 
 # ============================================================================
 # Bloom Filter (simplified)
@@ -501,11 +498,11 @@ proc newBloomFilter*(numBits: int, numHashes: int): BloomFilter =
     numBits: numBits
   )
 
-proc hash*(s: types.Slice): int =
+proc hash*(s: string): int =
   ## Use xxhash64 for fast hashing - matches Rust implementation
-  int(xxhash64(s.data))
+  int(xxhash64(s))
 
-proc addKey*(bf: BloomFilter, key: types.Slice) =
+proc addKey*(bf: BloomFilter, key: string) =
   let h1 = key.hash()
   let h2 = h1 shr 16
 
@@ -514,7 +511,7 @@ proc addKey*(bf: BloomFilter, key: types.Slice) =
     let bit = ((h1 + i * h2) mod bf.numBits) mod 8
     bf.data[idx] = chr(ord(bf.data[idx]) or (1 shl bit))
 
-proc mightContain*(bf: BloomFilter, key: types.Slice): bool =
+proc mightContain*(bf: BloomFilter, key: string): bool =
   let h1 = key.hash()
   let h2 = h1 shr 16
 
@@ -561,15 +558,21 @@ proc decodeVarintFromString*(data: string, pos: int): tuple[value: uint64, newPo
 
 proc readFileBytes*(path: string, offset: uint64, size: uint64): string =
   ## Read bytes from a file at given offset
-  var file = open(path, fmRead)
-  file.setFilePos(offset.int64)
-  # Use buffer approach
+  var fd = posix.open(path, cint(FileFlags.frRead))
+  if fd == -1:
+    raise newException(IOError, "Failed to open file: " & path)
+  discard posix.lseek(fd, offset.int64, SEEK_SET)
   var buffer = newSeq[uint8](size.int)
-  let bytesRead = readBytes(file, buffer, 0, size.int)
-  result = ""
-  for i in 0 ..< bytesRead:
-    result.add(buffer[i].char)
-  close(file)
+  var totalRead = 0
+  while totalRead < size.int:
+    let bytesRead = posix.read(fd, addr(buffer[totalRead]), size.int - totalRead)
+    if bytesRead == 0:
+      break
+    inc totalRead, bytesRead
+  result = cast[string](buffer)
+  if totalRead < size.int:
+    result = result[0 ..< totalRead]
+  discard posix.close(fd)
 
 proc readFromHandle*(table: SsTable, offset: uint64, size: uint64): string =
   ## Read from cached file handle or block cache
@@ -579,14 +582,20 @@ proc readFromHandle*(table: SsTable, offset: uint64, size: uint64): string =
     return cached.get
 
   # Read from file
-  table.fileHandle.setFilePos(offset.int64)
+  discard posix.lseek(table.fileHandle, offset.int64, SEEK_SET)
   var buffer = newSeq[uint8](size.int)
-  let bytesRead = readBytes(table.fileHandle, buffer, 0, size.int)
+  var totalRead = 0
+  while totalRead < size.int:
+    let bytesRead = posix.read(table.fileHandle, cast[pointer](addr(buffer[
+        totalRead])), size.int - totalRead)
+    if bytesRead == 0:
+      break
+    inc totalRead, bytesRead
   # Fast string conversion using move
   result = cast[string](buffer)
   # Trim to actual bytes read
-  if bytesRead < size.int:
-    result = result[0 ..< bytesRead]
+  if totalRead < size.int:
+    result = result[0 ..< totalRead]
 
   # Insert into cache
   table.putCachedBlock(offset, result)
@@ -634,7 +643,7 @@ proc searchIndexBlock*(indexData: string, key: string): tuple[offset: uint64,
   (0, 0, false)
 
 proc searchDataBlockWithHashIndex*(blockData: string, key: string, seqno: SeqNo,
-    globalSeqno: SeqNo): Option[InternalValue] =
+    globalSeqno: SeqNo): Option[tuple[key: InternalKey, value: string]] =
   ## Search data block for key using hash index (fast path)
   ## Returns the value if found
 
@@ -642,7 +651,7 @@ proc searchDataBlockWithHashIndex*(blockData: string, key: string, seqno: SeqNo,
 
   # First, read restart points
   if pos + 4 > blockData.len:
-    return none(InternalValue)
+    return none(tuple[key: InternalKey, value: string])
   let restartCount = decodeFixed32FromString(blockData, pos)
   pos += 4
 
@@ -667,7 +676,7 @@ proc searchDataBlockWithHashIndex*(blockData: string, key: string, seqno: SeqNo,
 
     if bucketPos == sstable_block.HashIndexMarkerFree:
       # Key definitely not in block
-      return none(InternalValue)
+      return none(tuple[key: InternalKey, value: string])
 
     if bucketPos != sstable_block.HashIndexMarkerConflict and bucketPos <
         restartOffsets.len.uint8:
@@ -687,19 +696,31 @@ proc searchDataBlockWithHashIndex*(blockData: string, key: string, seqno: SeqNo,
         entryPos = dataPos
 
         if entryPos + unsharedLen.int + valueLen.int > blockData.len:
-          return none(InternalValue)
+          return none(tuple[key: InternalKey, value: string])
 
         let entryKey = blockData[entryPos ..< entryPos + unsharedLen.int]
 
         # Check if this is the key we want
         if entryKey == key:
           let valuePos = entryPos + unsharedLen.int
-          if valuePos + valueLen.int > blockData.len:
-            return none(InternalValue)
+          if valuePos + valueLen.int + 9 > blockData.len:
+            return none(tuple[key: InternalKey, value: string])
           let valueData = blockData[valuePos ..< valuePos + valueLen.int]
-          let internalKey = newInternalKey(entryKey, seqno, vtValue)
-          let internalValue = InternalValue(key: internalKey, value: newSlice(valueData))
-          return some(internalValue)
+
+          # Decode full InternalKey: user key + 8-byte seqno + 1-byte type
+          let seqnoBytes = blockData[valuePos + valueLen.int ..< valuePos +
+              valueLen.int + 8]
+          let typeByte = blockData[valuePos + valueLen.int + 8]
+          let storedSeqno = decodeFixed64FromString(seqnoBytes, 0)
+          let storedType = ValueType(ord(typeByte))
+
+          # Only accept if stored seqno <= snapshot seqno
+          if storedSeqno > uint64(seqno):
+            return none(tuple[key: InternalKey, value: string])
+
+          let internalKey = newInternalKey(toKeySlice(entryKey),
+              storedSeqno.SeqNo, storedType)
+          return some((key: internalKey, value: valueData))
         # If key doesn't match, fall through to linear scan
 
       # Fallback to binary search
@@ -722,62 +743,40 @@ proc searchDataBlockWithHashIndex*(blockData: string, key: string, seqno: SeqNo,
     entryPos = dataPos
 
     if entryPos + unsharedLen.int + valueLen.int > blockData.len:
-      return none(InternalValue)
+      return none(tuple[key: InternalKey, value: string])
 
-    # Reconstruct full key
-    var entryKey: string
-    if sharedLen > 0:
-      entryKey = lastKey[0 ..< min(int(sharedLen), lastKey.len)] & blockData[
-          entryPos ..< entryPos + unsharedLen.int]
-    else:
-      entryKey = blockData[entryPos ..< entryPos + unsharedLen.int]
-    lastKey = entryKey
 
-    if entryKey < key:
-      low = mid + 1
-    elif entryKey > key:
-      high = mid - 1
-    else:
-      # Found the key - read the value
-      let valuePos = entryPos + unsharedLen.int
-      if valuePos + valueLen.int > blockData.len:
-        return none(InternalValue)
-      let valueData = blockData[valuePos ..< valuePos + valueLen.int]
 
-      # Create InternalKey and InternalValue
-      let internalKey = newInternalKey(entryKey, seqno, vtValue)
-      let internalValue = InternalValue(key: internalKey, value: newSlice(valueData))
-      return some(internalValue)
-
-  none(InternalValue)
+  none(tuple[key: InternalKey, value: string])
 
 # Keep the old binary search version for compatibility
 proc searchDataBlock*(blockData: string, key: string, seqno: SeqNo,
-    globalSeqno: SeqNo): Option[InternalValue] =
+    globalSeqno: SeqNo): Option[tuple[key: InternalKey, value: string]] =
   ## Search data block for key at given seqno
   ## Returns the value if found - uses hash index when available
   searchDataBlockWithHashIndex(blockData, key, seqno, globalSeqno)
 
-proc lookup*(table: SsTable, key: string, seqno: SeqNo): Option[InternalValue] =
+proc lookup*(table: SsTable, key: string, seqno: SeqNo): Option[tuple[
+    key: InternalKey, value: string]] =
   ## Look up a key in the SSTable
   ## Returns the value if found and seqno is within range, none otherwise
   if table.meta.entryCount == 0:
-    return none(InternalValue)
+    return none(tuple[key: InternalKey, value: string])
 
   # Check if key is in range
-  if table.meta.minKey.len > 0 and key < table.meta.minKey.data:
-    return none(InternalValue)
-  if table.meta.maxKey.len > 0 and key > table.meta.maxKey.data:
-    return none(InternalValue)
+  if table.meta.minKey.len > 0 and key < table.meta.minKey:
+    return none(tuple[key: InternalKey, value: string])
+  if table.meta.maxKey.len > 0 and key > table.meta.maxKey:
+    return none(tuple[key: InternalKey, value: string])
 
   # Check global seqno - if query seqno is before table's seqno range, skip
-  if table.meta.smallestSeqno > 0 and seqno < table.meta.smallestSeqno:
-    return none(InternalValue)
+  if table.meta.smallestSeqno > 0.SeqNo and seqno < table.meta.smallestSeqno:
+    return none(tuple[key: InternalKey, value: string])
 
   # Read footer to get index block and filter block locations
   let footerSize = 24 # 8 + 4 + 8 + 4 bytes
   if table.fileSize <= footerSize.uint64:
-    return none(InternalValue)
+    return none(tuple[key: InternalKey, value: string])
 
   let footerData = table.readFromHandle(table.fileSize - footerSize.uint64,
       footerSize.uint64)
@@ -800,13 +799,12 @@ proc lookup*(table: SsTable, key: string, seqno: SeqNo): Option[InternalValue] =
 
     # Check if key might be in table
     if table.cachedFilterBlock.isSome:
-      let keySlice = newSlice(key)
-      if not table.cachedFilterBlock.get.mightContain(keySlice):
+      if not table.cachedFilterBlock.get.mightContain(key):
         # Bloom filter says key definitely not in table
-        return none(InternalValue)
+        return none(tuple[key: InternalKey, value: string])
 
   if indexSize == 0 or indexOffset >= table.fileSize:
-    return none(InternalValue)
+    return none(tuple[key: InternalKey, value: string])
 
   # Read index block (use cache if available)
   let indexData = if table.cachedIndexBlock.isSome:
@@ -820,13 +818,13 @@ proc lookup*(table: SsTable, key: string, seqno: SeqNo): Option[InternalValue] =
   let (dataOffset, dataSize, found) = searchIndexBlock(indexData, key)
 
   if dataSize == 0:
-    return none(InternalValue)
+    return none(tuple[key: InternalKey, value: string])
 
   # Read data block
   let blockData = table.readFromHandle(dataOffset, dataSize.uint64)
 
   # Search data block
-  let globalSeqno = table.meta.smallestSeqno
+  let globalSeqno = seqno # Use snapshot seqno, not table.minSeqno
   result = searchDataBlock(blockData, key, seqno, globalSeqno)
 
 # ============================================================================
@@ -839,8 +837,9 @@ type
     startKey*: string
     endKey*: string
     targetSeqno*: SeqNo
-    entries*: seq[InternalValue]
+    entries*: seq[tuple[key: InternalKey, value: string]]
     position*: int
+    ## IMPORTANT: Caller must call close() to unregister from IteratorGuard and prevent memory leaks
 
 proc newTableRangeIter*(table: SsTable, startKey, endKey: string,
     targetSeqno: SeqNo): TableRangeIter =
@@ -850,9 +849,12 @@ proc newTableRangeIter*(table: SsTable, startKey, endKey: string,
     startKey: startKey,
     endKey: endKey,
     targetSeqno: targetSeqno,
-    entries: newSeq[InternalValue](),
+    entries: newSeq[tuple[key: InternalKey, value: string]](),
     position: 0
   )
+
+  # Register this iterator with the guard
+
 
   # Read all data blocks and collect entries in range
   let footerSize = 24
@@ -947,20 +949,29 @@ proc newTableRangeIter*(table: SsTable, startKey, endKey: string,
                 break
 
               # Add entry (using targetSeqno as approximation)
-              let internalKey = newInternalKey(entryKey, targetSeqno, vtValue)
-              let internalValue = InternalValue(key: internalKey,
-                  value: newSlice(valueData))
-              result.entries.add(internalValue)
+              let internalKey = newInternalKey(toKeySlice(entryKey),
+                  targetSeqno, vtValue)
+              result.entries.add((key: internalKey, value: valueData))
+
+  # Close the iterator immediately after building entries
+  # We don't need the iterator anymore — only the entries are used
+
+
+proc close*(iter: var TableRangeIter) =
+  ## Close the iterator and unregister it from the guard
+
+  iter.entries = @[]
+  iter.position = 0
 
 proc hasNext*(t: TableRangeIter): bool =
   t.position < t.entries.len
 
-proc next*(t: TableRangeIter): Option[InternalValue] =
+proc next*(t: TableRangeIter): Option[tuple[key: InternalKey, value: string]] =
   if t.position < t.entries.len:
     let result = t.entries[t.position]
     inc t.position
     return some(result)
-  none(InternalValue)
+  none(tuple[key: InternalKey, value: string])
 
 # ============================================================================
 # Tests
@@ -975,8 +986,8 @@ when isMainModule:
 
   # Test block builder
   let builder = newBlockBuilder()
-  discard builder.add(newInternalValue("key1", "value1", 1, vtValue))
-  discard builder.add(newInternalValue("key2", "value2", 2, vtValue))
+  discard builder.add(newInternalKey(toKeySlice("key1"), 1.SeqNo, vtValue), "value1")
+  discard builder.add(newInternalKey(toKeySlice("key2"), 2.SeqNo, vtValue), "value2")
 
   let blockData = builder.finish()
   if blockData.isOk:
@@ -984,8 +995,8 @@ when isMainModule:
 
   # Test bloom filter
   let bf = newBloomFilter(1024, 3)
-  bf.addKey(newSlice("test_key"))
-  echo "Bloom might contain test_key: ", bf.mightContain(newSlice("test_key"))
-  echo "Bloom might contain other: ", bf.mightContain(newSlice("other"))
+  bf.addKey("test_key")
+  echo "Bloom might contain test_key: ", bf.mightContain("test_key")
+  echo "Bloom might contain other: ", bf.mightContain("other")
 
   echo "Table tests passed!"

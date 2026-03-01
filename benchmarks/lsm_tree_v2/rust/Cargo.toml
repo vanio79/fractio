@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 lsm-tree = { path = "../../../thirdparty/lsm-tree" }
 rand = "0.9"
+tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms"] }
 
 [profile.release]
 opt-level = 3

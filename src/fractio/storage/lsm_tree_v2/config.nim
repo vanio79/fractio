@@ -135,6 +135,9 @@ type
     # KV separation
     kvSeparation*: Option[KvSeparationOptions]
 
+    # WAL - set to false for in-memory only (matches Rust lsm-tree behavior)
+    walEnabled*: bool
+
 proc newDefaultConfig*(path: string): Config =
   Config(
     path: path,
@@ -156,7 +159,8 @@ proc newDefaultConfig*(path: string): Config =
     targetTableSize: 64 * 1024 * 1024, # 64 MiB
     maxConcurrentCompactions: 4,
     cacheSize: 16 * 1024 * 1024, # 16 MiB
-    kvSeparation: none(KvSeparationOptions)
+    kvSeparation: none(KvSeparationOptions),
+    walEnabled: true # WAL enabled by default for durability
   )
 
 # ============================================================================
@@ -202,6 +206,10 @@ proc withLevels*(b: ConfigBuilder, count: int): ConfigBuilder =
 proc withKvSeparation*(b: ConfigBuilder,
     opts: KvSeparationOptions): ConfigBuilder =
   b.config.kvSeparation = some(opts)
+  b
+
+proc withWalEnabled*(b: ConfigBuilder, enabled: bool): ConfigBuilder =
+  b.config.walEnabled = enabled
   b
 
 proc build*(b: ConfigBuilder): Config =

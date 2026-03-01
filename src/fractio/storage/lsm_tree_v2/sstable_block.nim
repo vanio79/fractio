@@ -89,7 +89,7 @@ const
 
 type
   BinaryIndex* = ref object
-    entries*: seq[tuple[key: types.Slice, offset: uint32]]
+    entries*: seq[tuple[key: string, offset: uint32]]
 
 # ============================================================================
 # Hash Index - matches Rust lsm-tree implementation
@@ -196,11 +196,11 @@ proc newBlockHandle*(offset: BlockOffset, size: uint32): BlockHandle =
 
 type
   KeyedBlockHandle* = ref object
-    endKey*: types.Slice ## Last key in the block
-    seqno*: SeqNo        ## Sequence number
+    endKey*: string ## Last key in the block
+    seqno*: SeqNo   ## Sequence number
     blockHandle*: BlockHandle
 
-proc newKeyedBlockHandle*(endKey: types.Slice, seqno: SeqNo,
+proc newKeyedBlockHandle*(endKey: string, seqno: SeqNo,
                           offset: BlockOffset, size: uint32): KeyedBlockHandle =
   KeyedBlockHandle(
     endKey: endKey,
@@ -227,9 +227,9 @@ proc encodeIndexBlock*(handles: seq[KeyedBlockHandle]): string =
     result.add(encodeVarint(uint64(h.endKey.len)))
     # Encode key data
     if h.endKey.len > 0:
-      result.add(h.endKey.data)
+      result.add(h.endKey)
     # Encode seqno (varint)
-    result.add(encodeVarint(h.seqno))
+    result.add(encodeVarint(uint64(h.seqno)))
     # Encode offset (varint)
     result.add(encodeVarint(h.blockHandle.offset))
     # Encode size (varint)
@@ -274,8 +274,7 @@ proc decodeIndexBlock*(data: string): seq[KeyedBlockHandle] =
     pos = sizePos
 
     # Create handle
-    let keySlice = newSlice(keyData)
-    result.add(newKeyedBlockHandle(keySlice, seqno, BlockOffset(offset), size.uint32))
+    result.add(newKeyedBlockHandle(keyData, SeqNo(seqno), BlockOffset(offset), size.uint32))
 
 # ============================================================================
 # Partitioned Index Writer
@@ -362,7 +361,7 @@ proc cutIndexBlock*(w: PartitionedIndexWriter): LsmResult[void] =
     errVoid(newIoError("Failed to cut index block: " & getCurrentExceptionMsg()))
 
 proc registerDataBlock*(w: PartitionedIndexWriter,
-                        endKey: types.Slice, seqno: SeqNo,
+                        endKey: string, seqno: SeqNo,
                         offset: BlockOffset, size: uint32): LsmResult[void] =
   ## Register a data block with the index writer
   try:
@@ -371,7 +370,7 @@ proc registerDataBlock*(w: PartitionedIndexWriter,
     # Calculate size contribution
     # key_len + key + seqno + offset + size (all varints)
     let keyLenSize = varintSize(endKey.len)
-    let seqnoSize = varintSize(seqno)
+    let seqnoSize = varintSize(uint64(seqno))
     let offsetSize = varintSize(offset)
     let sizeSize = varintSize(size)
     let handleSize = keyLenSize + endKey.len + seqnoSize + offsetSize + sizeSize
@@ -443,7 +442,7 @@ proc findBlock*(r: IndexBlockReader, key: string): tuple[offset: BlockOffset,
 
   while low <= high:
     let mid = (low + high) div 2
-    let entryKey = r.entries[mid].endKey.data
+    let entryKey = r.entries[mid].endKey
 
     if entryKey >= key:
       resultOffset = r.entries[mid].offset
@@ -485,7 +484,7 @@ proc findPartition*(t: TopLevelIndex, key: string): tuple[
 
   while low <= high:
     let mid = (low + high) div 2
-    let entryKey = t.entries[mid].endKey.data
+    let entryKey = t.entries[mid].endKey
 
     if entryKey >= key:
       resultHandle = t.entries[mid]

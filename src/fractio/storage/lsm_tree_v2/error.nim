@@ -50,32 +50,42 @@ type
 # ============================================================================
 
 proc newIoError*(msg: string): LsmTreeError =
-  LsmTreeError(kind: lsmIo, ioError: msg)
+  result = LsmTreeError(kind: lsmIo, ioError: msg)
+  result.msg = "LsmTreeError(Io): " & msg
 
 proc newDecompressError*(compressType: CompressionType): LsmTreeError =
-  LsmTreeError(kind: lsmDecompress, decompressType: compressType)
+  result = LsmTreeError(kind: lsmDecompress, decompressType: compressType)
+  result.msg = "LsmTreeError(Decompress): " & $compressType
 
 proc newInvalidVersionError*(version: uint8): LsmTreeError =
-  LsmTreeError(kind: lsmInvalidVersion, invalidVersion: version)
+  result = LsmTreeError(kind: lsmInvalidVersion, invalidVersion: version)
+  result.msg = "LsmTreeError(InvalidVersion): " & $version
 
 proc newUnrecoverableError*(msg: string): LsmTreeError =
-  LsmTreeError(kind: lsmUnrecoverable, message: msg)
+  result = LsmTreeError(kind: lsmUnrecoverable, message: msg)
+  result.msg = "LsmTreeError(Unrecoverable): " & msg
 
 proc newChecksumMismatchError*(got, expected: uint64): LsmTreeError =
-  LsmTreeError(kind: lsmChecksumMismatch, gotChecksum: got,
+  result = LsmTreeError(kind: lsmChecksumMismatch, gotChecksum: got,
                expectedChecksum: expected)
+  result.msg = "LsmTreeError(ChecksumMismatch): got=" & $got & ", expected=" & $expected
 
 proc newInvalidTagError*(tagName: string, tagValue: uint8): LsmTreeError =
-  LsmTreeError(kind: lsmInvalidTag, tagName: tagName, tagValue: tagValue)
+  result = LsmTreeError(kind: lsmInvalidTag, tagName: tagName,
+      tagValue: tagValue)
+  result.msg = "LsmTreeError(InvalidTag): " & tagName & "=" & $tagValue
 
 proc newInvalidTrailerError*(msg: string): LsmTreeError =
-  LsmTreeError(kind: lsmInvalidTrailer, message: msg)
+  result = LsmTreeError(kind: lsmInvalidTrailer, message: msg)
+  result.msg = "LsmTreeError(InvalidTrailer): " & msg
 
 proc newInvalidHeaderError*(msg: string): LsmTreeError =
-  LsmTreeError(kind: lsmInvalidHeader, message: msg)
+  result = LsmTreeError(kind: lsmInvalidHeader, message: msg)
+  result.msg = "LsmTreeError(InvalidHeader): " & msg
 
 proc newUtf8Error*(msg: string): LsmTreeError =
-  LsmTreeError(kind: lsmUtf8, message: msg)
+  result = LsmTreeError(kind: lsmUtf8, message: msg)
+  result.msg = "LsmTreeError(Utf8): " & msg
 
 # ============================================================================
 # Error Display
@@ -134,6 +144,11 @@ proc isErr*[T](r: LsmResult[T]): bool {.inline.} =
   not r.isOk
 
 proc value*[T](r: LsmResult[T]): T =
+  assert(r.isOk, "Cannot get value from error result")
+  r.value
+
+proc get*[T](r: LsmResult[T]): T =
+  ## Alias for value - unwrap result
   assert(r.isOk, "Cannot get value from error result")
   r.value
 

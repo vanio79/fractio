@@ -17,6 +17,9 @@ use lsm_tree::{AbstractTree, Config};
 use rand::rngs::StdRng;
 use rand::{seq::SliceRandom, SeedableRng};
 
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 /// System resource metrics
 #[derive(Debug, Clone, Default)]
 struct ResourceMetrics {

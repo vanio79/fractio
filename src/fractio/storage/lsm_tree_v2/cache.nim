@@ -23,7 +23,7 @@ type
     of true:
       blockData*: string
     of false:
-      blobData*: types.Slice
+      blobData*: string
 
   Cache* = object
     ## LRU cache for blocks and blobs
@@ -80,15 +80,15 @@ proc insertBlock*(c: ptr Cache, treeId, tableId: int64, offset: uint64,
   c[].order.insert(key, 0)
 
 proc getBlob*(c: Cache, vlogId: int64, blobFileId: int64,
-    offset: uint64): Option[types.Slice] =
+    offset: uint64): Option[string] =
   let key = CacheKey(tag: TAG_BLOB, treeId: vlogId, tableId: blobFileId,
       offset: offset)
   if c.data.hasKey(key):
     return some(c.data[key].blobData)
-  none(types.Slice)
+  none(string)
 
 proc insertBlob*(c: var Cache, vlogId: int64, blobFileId: int64, offset: uint64,
-    data: types.Slice) =
+    data: string) =
   let key = CacheKey(tag: TAG_BLOB, treeId: vlogId, tableId: blobFileId,
       offset: offset)
   let item = CacheItem(isBlock: false, blobData: data)

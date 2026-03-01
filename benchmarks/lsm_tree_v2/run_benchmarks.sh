@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 # Benchmark script for LSM Tree v2 - compares Nim and Rust implementations
 # Uses native CPU optimization for both
 #
@@ -8,9 +8,11 @@
 
 set -e
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$SCRIPT_DIR/.."
-NIM_BIN="$SCRIPT_DIR/nim_bench"
+# Get script directory using POSIX-compliant method
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$SCRIPT_DIR/../.."
+NIM_BIN="$SCRIPT_DIR/nim"
+NIM_SRC="$SCRIPT_DIR/nim.nim"
 RUST_BIN="$SCRIPT_DIR/rust/target/release/lsm_tree_bench"
 
 # Number of operations (default 1M)
@@ -22,32 +24,30 @@ echo "LSM Tree v2 Benchmark ($NUM_OPS ops)"
 echo "=========================================="
 echo ""
 
-# Check if Nim binary exists, compile if not
-if [ ! -f "$NIM_BIN" ] || [ "$REBUILD" == "--rebuild" ]; then
-    echo "Compiling Nim benchmark..."
-    cd "$PROJECT_DIR"
-    nim c -d:nimV2 -d:release -d:useMalloc \
-        --passC:"-march=native" \
-        --passL:"-ljemalloc -lrt" \
-        -p:src \
-        -o:"$NIM_BIN" \
-        "$SCRIPT_DIR/nim.nim"
-    echo ""
-fi
+# Clean up any existing benchmark data
+rm -rf /tmp/bench_lsm_tree_nim /tmp/bench_lsm_tree 2>/dev/null || true
 
-# Check if Rust binary exists, compile if not
-if [ ! -f "$RUST_BIN" ] || [ "$REBUILD" == "--rebuild" ]; then
-    echo "Compiling Rust benchmark..."
-    cd "$SCRIPT_DIR/rust"
-    RUSTFLAGS="-C target-cpu=native" cargo build --release
-    echo ""
-fi
+# Always compile Nim benchmark
+echo "Compiling Nim benchmark..."
+cd "$PROJECT_DIR" \
+&& nim c -d:nimV2 -d:release -d:useMalloc \
+    --path:src \
+    --passC:"-march=native" \
+    --passL:"-ljemalloc -lrt" \
+    -o:"$NIM_BIN" \
+    "$NIM_SRC"
+echo ""
+
+# Always compile Rust benchmark
+echo "Compiling Rust benchmark..."
+cd "$SCRIPT_DIR/rust"
+RUSTFLAGS="-C target-cpu=native" cargo build --release
+echo ""
 
 echo "=========================================="
 echo "Running Nim Benchmark ($NUM_OPS ops)"
-echo "=========================================="
 echo ""
-"$NIM_BIN"
+"$NIM_BIN" --ops $NUM_OPS --warmup 100
 
 echo ""
 echo "=========================================="
@@ -56,4 +56,4 @@ echo "=========================================="
 echo ""
 
 # Run Rust with native CPU optimization
-RUSTFLAGS="-C target-cpu=native" "$RUST_BIN" --ops "$NUM_OPS"
+RUSTFLAGS="-C target-cpu=native" "$RUST_BIN" --ops $NUM_OPS

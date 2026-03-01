@@ -16,8 +16,8 @@ import error
 # ============================================================================
 
 type
-  MergeItem* = tuple[idx: int, value: InternalValue]
-  MergeResult* = LsmResult[InternalValue]
+  MergeItem* = tuple[idx: int, key: InternalKey, value: string]
+  MergeResult* = LsmResult[tuple[key: InternalKey, value: string]]
 
 # ============================================================================
 # Generic Merge Iterator
@@ -26,13 +26,13 @@ type
 # Iterator concept (simplified - actual iterators must provide these)
 type
   KvIterator* = concept it
-    it.next() is Option[InternalValue]
+    it.next() is Option[tuple[key: InternalKey, value: string]]
     it.hasNext() is bool
 
 proc cmpMergeItem*(a, b: MergeItem): int =
   ## Compare merge items for heap ordering
   ## Uses InternalKey comparison (user_key ASC, seqno DESC)
-  cmpInternalKey(a.value.key, b.value.key)
+  cmpInternalKey(a.key, b.key)
 
 proc `<`*(a, b: MergeItem): bool =
   cmpMergeItem(a, b) < 0
@@ -91,10 +91,10 @@ proc next*[I](m: var Merger[I]): MergeResult =
   if not m.initializedLo:
     let initResult = m.initializeLo()
     if initResult.isErr:
-      return err[InternalValue](initResult.error)
+      return err[tuple[key: InternalKey, value: string]](initResult.error)
 
   if m.heap.len == 0:
-    return err[InternalValue](newIoError("Iterator is exhausted"))
+    return err[tuple[key: InternalKey, value: string]](newIoError("Iterator is exhausted"))
 
   let minItem = m.heap.pop()
   let idx = minItem.idx
@@ -102,9 +102,9 @@ proc next*[I](m: var Merger[I]): MergeResult =
   # Get next item from the same iterator
   let nextItem = m.iterators[idx].next()
   if nextItem.isSome:
-    m.heap.push((idx, nextItem.get))
+    m.heap.push((idx, nextItem.get.key, nextItem.get.value))
 
-  ok[InternalValue](minItem.value)
+  ok[tuple[key: InternalKey, value: string]]((minItem.key, minItem.value))
 
 proc hasNext*[I](m: var Merger[I]): bool =
   if not m.initializedLo:
@@ -120,12 +120,13 @@ proc hasNext*[I](m: var Merger[I]): bool =
 
 type
   SeqMergeIterator* = ref object
-    sources*: seq[seq[InternalValue]]
+    sources*: seq[seq[tuple[key: InternalKey, value: string]]]
     indices*: seq[int]
     heap*: HeapQueue[MergeItem]
     initialized*: bool
 
-proc newSeqMergeIterator*(sources: seq[seq[InternalValue]]): SeqMergeIterator =
+proc newSeqMergeIterator*(sources: seq[seq[tuple[key: InternalKey,
+    value: string]]]): SeqMergeIterator =
   SeqMergeIterator(
     sources: sources,
     indices: newSeq[int](sources.len),
@@ -136,25 +137,26 @@ proc newSeqMergeIterator*(sources: seq[seq[InternalValue]]): SeqMergeIterator =
 proc initialize*(m: var SeqMergeIterator) =
   for i, source in m.sources:
     if source.len > 0:
-      m.heap.push((i, source[0]))
+      m.heap.push((i, source[0].key, source[0].value))
       m.indices[i] = 1
   m.initialized = true
 
-proc next*(m: var SeqMergeIterator): Option[InternalValue] =
+proc next*(m: var SeqMergeIterator): Option[tuple[key: InternalKey,
+    value: string]] =
   if not m.initialized:
     m.initialize()
 
   if m.heap.len == 0:
-    return none(InternalValue)
+    return none(tuple[key: InternalKey, value: string])
 
   let minItem = m.heap.pop()
   let idx = minItem.idx
-  let result = minItem.value
+  let result = (minItem.key, minItem.value)
 
   # Get next item from the same source
   if m.indices[idx] < m.sources[idx].len:
     let nextValue = m.sources[idx][m.indices[idx]]
-    m.heap.push((idx, nextValue))
+    m.heap.push((idx, nextValue.key, nextValue.value))
     m.indices[idx] += 1
 
   return some(result)
@@ -170,21 +172,21 @@ proc hasNext*(m: var SeqMergeIterator): bool =
 
 type
   StreamingMergeIterator* = ref object
-    sources*: seq[seq[InternalValue]]
+    sources*: seq[seq[tuple[key: InternalKey, value: string]]]
     indices*: seq[int]
     heap*: HeapQueue[MergeItem]
-    lastKey*: types.Slice
+    lastKey*: string
     lastAdded*: bool
     gcWatermark*: SeqNo
     initialized*: bool
 
-proc newStreamingMergeIterator*(sources: seq[seq[InternalValue]],
-    gcWatermark: SeqNo): StreamingMergeIterator =
+proc newStreamingMergeIterator*(sources: seq[seq[tuple[key: InternalKey,
+    value: string]]], gcWatermark: SeqNo): StreamingMergeIterator =
   StreamingMergeIterator(
     sources: sources,
     indices: newSeq[int](sources.len),
     heap: initHeapQueue[MergeItem](),
-    lastKey: emptySlice(),
+    lastKey: "",
     lastAdded: false,
     gcWatermark: gcWatermark,
     initialized: false
@@ -193,65 +195,66 @@ proc newStreamingMergeIterator*(sources: seq[seq[InternalValue]],
 proc initialize*(m: var StreamingMergeIterator) =
   for i, source in m.sources:
     if source.len > 0:
-      m.heap.push((i, source[0]))
+      m.heap.push((i, source[0].key, source[0].value))
       m.indices[i] = 1
-  m.lastKey = emptySlice()
+  m.lastKey = ""
   m.lastAdded = false
 
-proc next*(m: var StreamingMergeIterator): Option[InternalValue] =
+proc next*(m: var StreamingMergeIterator): Option[tuple[key: InternalKey,
+    value: string]] =
   if not m.initialized:
     m.initialize()
     m.initialized = true
 
   while m.heap.len > 0:
     let top = m.heap.pop()
-    let entry = top.value
+    let key = top.key
+    let value = top.value
     let idx = top.idx
 
     # Check if this is a new key
-    let entryKeySlice = newSlice(entry.key.userKey)
-    if entryKeySlice != m.lastKey:
-      m.lastKey = entryKeySlice
+    if key.userKey != m.lastKey:
+      m.lastKey = key.userKey.toString()
       m.lastAdded = false
 
       # Decide whether to include this entry
       # Skip tombstones that are old enough to GC
-      if entry.key.valueType.isTombstone():
-        if entry.key.seqno >= m.gcWatermark:
+      if key.valueType.isTombstone():
+        if key.seqno >= m.gcWatermark:
           # Keep recent tombstone
           m.lastAdded = true
           if m.indices[idx] < m.sources[idx].len:
             let nextEntry = m.sources[idx][m.indices[idx]]
-            m.heap.push((idx, nextEntry))
+            m.heap.push((idx, nextEntry.key, nextEntry.value))
             m.indices[idx] += 1
-          return some(entry)
+          return some((key, value))
         # Otherwise discard (GC'd)
       else:
         # Regular value
         m.lastAdded = true
         if m.indices[idx] < m.sources[idx].len:
           let nextEntry = m.sources[idx][m.indices[idx]]
-          m.heap.push((idx, nextEntry))
+          m.heap.push((idx, nextEntry.key, nextEntry.value))
           m.indices[idx] += 1
-        return some(entry)
+        return some((key, value))
     else:
       # Same key - only add if we haven't added anything for this key
-      if not m.lastAdded and entry.key.seqno >= m.gcWatermark:
-        if not entry.key.valueType.isTombstone():
+      if not m.lastAdded and key.seqno >= m.gcWatermark:
+        if not key.valueType.isTombstone():
           m.lastAdded = true
           if m.indices[idx] < m.sources[idx].len:
             let nextEntry = m.sources[idx][m.indices[idx]]
-            m.heap.push((idx, nextEntry))
+            m.heap.push((idx, nextEntry.key, nextEntry.value))
             m.indices[idx] += 1
-          return some(entry)
+          return some((key, value))
 
       # Get next entry from same source
       if m.indices[idx] < m.sources[idx].len:
         let nextEntry = m.sources[idx][m.indices[idx]]
-        m.heap.push((idx, nextEntry))
+        m.heap.push((idx, nextEntry.key, nextEntry.value))
         m.indices[idx] += 1
 
-  return none(InternalValue)
+  return none(tuple[key: InternalKey, value: string])
 
 proc hasNext*(m: var StreamingMergeIterator): bool =
   if not m.initialized:
@@ -263,9 +266,10 @@ proc hasNext*(m: var StreamingMergeIterator): bool =
 # Utility Functions
 # ============================================================================
 
-proc mergeSequences*(sources: seq[seq[InternalValue]]): seq[InternalValue] =
+proc mergeSequences*(sources: seq[seq[tuple[key: InternalKey,
+    value: string]]]): seq[tuple[key: InternalKey, value: string]] =
   var merger = newSeqMergeIterator(sources)
-  result = newSeq[InternalValue]()
+  result = newSeq[tuple[key: InternalKey, value: string]]()
 
   while merger.hasNext():
     let item = merger.next()
@@ -281,33 +285,39 @@ when isMainModule:
 
   # Test sequence merge
   let source1 = @[
-    newInternalValue("a", "value1", 1, vtValue),
-    newInternalValue("c", "value3", 3, vtValue)
+    (key: InternalKey(userKey: "a", seqno: 1, valueType: vtValue),
+        value: "value1"),
+    (key: InternalKey(userKey: "c", seqno: 3, valueType: vtValue),
+        value: "value3")
   ]
   let source2 = @[
-    newInternalValue("b", "value2", 2, vtValue),
-    newInternalValue("d", "value4", 4, vtValue)
+    (key: InternalKey(userKey: "b", seqno: 2, valueType: vtValue),
+        value: "value2"),
+    (key: InternalKey(userKey: "d", seqno: 4, valueType: vtValue),
+        value: "value4")
   ]
 
   let merged = mergeSequences(@[source1, source2])
   echo "Merged count: ", merged.len
   for item in merged:
-    echo "  ", item.key.userKey.asString(), " => ", item.value.asString()
+    echo "  ", item.key.userKey, " => ", item.value
 
   # Test with tombstones and GC
   let source3 = @[
-    newInternalValue("a", "v1", 1, vtValue),
-    newInternalValue("a", "v2", 5, vtTombstone), # Old tombstone - should be GC'd
+    (key: InternalKey(userKey: "a", seqno: 1, valueType: vtValue), value: "v1"),
+    (key: InternalKey(userKey: "a", seqno: 5, valueType: vtTombstone),
+        value: "v2"), # Old tombstone - should be GC'd
   ]
   let source4 = @[
-    newInternalValue("a", "v3", 10, vtValue),         # New value
+    (key: InternalKey(userKey: "a", seqno: 10, valueType: vtValue),
+        value: "v3"), # New value
   ]
 
   let mergedWithGc = mergeSequences(@[source3, source4])
   echo "\nMerged with GC watermark=8:"
   for item in mergedWithGc:
     let shouldInclude = item.key.seqno >= 8
-    echo "  ", item.key.userKey.asString(), " seqno=", item.key.seqno,
-         " tombstone=", item.key.isTombstone(), " include=", shouldInclude
+    echo "  ", item.key.userKey, " seqno=", item.key.seqno,
+         " tombstone=", item.key.valueType.isTombstone(), " include=", shouldInclude
 
   echo "Merge tests passed!"

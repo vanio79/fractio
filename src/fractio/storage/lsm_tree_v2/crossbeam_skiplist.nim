@@ -18,7 +18,13 @@
 ## 4. Handle concurrent modifications gracefully
 
 import std/[atomics, options, bitops]
-import types
+
+# Helper procs to ensure proper key comparison with InternalKey
+proc keyEqual[K](a, b: K): bool =
+  a == b
+
+proc keyLess[K](a, b: K): bool =
+  a < b
 
 const
   HEIGHT_BITS = 5
@@ -32,40 +38,40 @@ const
 type
   ## Node with embedded tower of atomic pointers
   ## Tower is stored inline after the fixed fields
-  SkipListNodeObj[K, V] = object
-    key: K
-    value: V
+  SkipListNodeObj*[K, V] = object
+    key*: K
+    value*: V
     ## refsAndHeight: bits 0-4 = height-1, bits 5+ = reference count
-    refsAndHeight: Atomic[uint]
+    refsAndHeight*: Atomic[uint]
     ## Tower follows - array of Atomic[ptr SkipListNodeObj[K, V]]
 
-  SkipListNode[K, V] = ptr SkipListNodeObj[K, V]
+  SkipListNode*[K, V] = ptr SkipListNodeObj[K, V]
 
   ## Position tracks predecessors and successors during search
-  Position[K, V] = object
-    found: SkipListNode[K, V] ## Node with matching key (if any)
-    left: array[MAX_HEIGHT, SkipListNode[K, V]]                  ## Predecessors
-    right: array[MAX_HEIGHT, SkipListNode[K, V]]                 ## Successors
+  Position*[K, V] = object
+    found*: SkipListNode[K, V] ## Node with matching key (if any)
+    left*: array[MAX_HEIGHT, SkipListNode[K, V]]                  ## Predecessors
+    right*: array[MAX_HEIGHT, SkipListNode[K, V]]                 ## Successors
 
   SkipList*[K, V] = ref object
-    head: SkipListNode[K, V] ## Head node with MAX_HEIGHT tower
-    len: Atomic[int]
-    maxHeight: Atomic[int]
-    seed: Atomic[uint]
+    head*: SkipListNode[K, V] ## Head node with MAX_HEIGHT tower
+    len*: Atomic[int]
+    maxHeight*: Atomic[int]
+    seed*: Atomic[uint]
 
   Entry*[K, V] = ref object
-    list: SkipList[K, V]
-    node: SkipListNode[K, V]
+    list*: SkipList[K, V]
+    node*: SkipListNode[K, V]
 
   Iter*[K, V] = ref object
-    list: SkipList[K, V]
-    current: SkipListNode[K, V]
+    list*: SkipList[K, V]
+    current*: SkipListNode[K, V]
 
   RangeIter*[K, V] = ref object
-    list: SkipList[K, V]
-    current: SkipListNode[K, V]
-    endKey: K
-    endInclusive: bool
+    list*: SkipList[K, V]
+    current*: SkipListNode[K, V]
+    endKey*: K
+    endInclusive*: bool
 
 # ============================================================================
 # Node Operations
@@ -138,20 +144,8 @@ proc newSkipList*[K, V](): SkipList[K, V] =
 
   ## Initialize head node's key/value with sentinel values
   ## This is critical - the head acts as a sentinel with the lowest possible key
-  ## We use newInternalKey with empty string and seqno 0 as the minimum possible key
-  when K is types.InternalKey:
-    result.head.key = types.newInternalKey("", 0.SeqNo, vtValue)
-  elif K is string:
-    result.head.key = ""
-  else:
-    result.head.key = default(K)
-
-  when V is types.Slice:
-    result.head.value = types.newSlice("")
-  elif V is string:
-    result.head.value = ""
-  else:
-    result.head.value = default(V)
+  result.head.key = default(K)
+  result.head.value = default(V)
 
   ## Initialize all tower slots to nil
   for i in 0 ..< MAX_HEIGHT:
@@ -234,7 +228,7 @@ proc searchPosition[K, V](s: SkipList[K, V], key: K, result: var Position[K,
 
     ## Move forward while key > curr.key
     ## OPTIMIZED: Branch prediction hints - forward movement is common
-    while curr != nil and curr.key < key:
+    while curr != nil and keyLess(curr.key, key):
       pred = curr
       predTower = pred.getTower() ## Recompute tower only when moving to new node
       curr = load(predTower[level], moRelaxed)
@@ -245,7 +239,7 @@ proc searchPosition[K, V](s: SkipList[K, V], key: K, result: var Position[K,
 
     ## Check if we found the exact key (integrated into loop to avoid extra comparison)
     ## OPTIMIZED: Found is rare, use branch prediction
-    if curr != nil and curr.key == key and result.found == nil:
+    if curr != nil and keyEqual(curr.key, key) and result.found == nil:
       result.found = curr
 
     ## Move down
@@ -271,13 +265,13 @@ proc get*[K, V](s: SkipList[K, V], key: K): Option[V] {.inline.} =
     var curr = load(predTower[level], moRelaxed)
 
     ## Move forward while key > curr.key
-    while curr != nil and curr.key < key:
+    while curr != nil and keyLess(curr.key, key):
       pred = curr
       predTower = pred.getTower()
       curr = load(predTower[level], moRelaxed)
 
     ## Check if found at this level
-    if curr != nil and curr.key == key:
+    if curr != nil and keyEqual(curr.key, key):
       return some(curr.value)
 
     if level == 0:
@@ -298,12 +292,12 @@ proc contains*[K, V](s: SkipList[K, V], key: K): bool {.inline.} =
   while level >= 0:
     var curr = load(predTower[level], moRelaxed)
 
-    while curr != nil and curr.key < key:
+    while curr != nil and keyLess(curr.key, key):
       pred = curr
       predTower = pred.getTower()
       curr = load(predTower[level], moRelaxed)
 
-    if curr != nil and curr.key == key:
+    if curr != nil and keyEqual(curr.key, key):
       return true
 
     if level == 0:
@@ -518,6 +512,11 @@ proc next*[K, V](it: Iter[K, V]): tuple[key: K, value: V] {.inline.} =
   result = (node.key, node.value)
   it.current = loadNext(node, 0)
 
+iterator items*[K, V](it: var Iter[K, V]): tuple[key: K, value: V] =
+  ## Iterate over all entries
+  while it.hasNext():
+    yield it.next()
+
 # ============================================================================
 # Range Iteration
 # ============================================================================
@@ -556,23 +555,37 @@ proc hasNext*[K, V](r: RangeIter[K, V]): bool {.inline.} =
   if r.current == nil:
     return false
 
-  # If endKey is default (nil for ref types, 0 for primitives), allow all
-  # This supports unbounded range iteration
+  # Check if endKey is default (unbounded range)
   when K is (ref object):
     # For ref types, check if endKey is nil
     if r.endKey.isNil:
       return true
+  elif K is string:
+    # For strings, empty string means unbounded
+    if r.endKey.len == 0:
+      return true
+  elif K is (object or tuple):
+    # For objects/tuples, check if all fields are default
+    # For now, we'll just assume unbounded if we have a current node
+    # since default object comparison is complex
+    when compiles(r.endKey == default(K)):
+      if r.endKey == default(K):
+        return true
+    else:
+      # Fallback: if we can't compare, assume unbounded
+      return true
   else:
-    # For value types, use a sentinel value
-    when K is string:
-      if r.endKey.len == 0:
+    # For primitives, check for zero value
+    when compises(r.endKey == default(K)):
+      if r.endKey == default(K):
         return true
 
+  # Bounded range - compare with endKey
   let cmp = r.current.key
   if r.endInclusive:
-    cmp <= r.endKey
+    keyEqual(cmp, r.endKey) or keyLess(cmp, r.endKey)
   else:
-    cmp < r.endKey
+    keyLess(cmp, r.endKey)
 
 proc next*[K, V](r: RangeIter[K, V]): tuple[key: K, value: V] {.inline.} =
   ## Get next element in range

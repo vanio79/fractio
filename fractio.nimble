@@ -7,8 +7,22 @@ license       = "MIT"
 # Dependencies
 requires "nim >= 1.6.0"
 
+# Source directory
+srcDir = "src"
+
 # Build targets
-skipDirs = @["docs", "tests", "benchmarks", "simulations", "tmp"]
+skipDirs = @[
+  "docs",
+  "tests",
+  "benchmarks",
+  "simulations",
+  "tmp"
+]
+
+bin = @[]
+
+import os
+
 
 import os
 
