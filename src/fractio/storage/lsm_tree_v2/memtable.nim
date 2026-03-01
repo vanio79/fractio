@@ -40,9 +40,10 @@ proc newMemtable*(id: MemtableId): Memtable =
 # OPTIMIZED: Template for true inlining
 template insert*(m: Memtable, key: InternalKey, value: string): (uint64, uint64) =
   let itemSize = uint64(key.userKey.len + value.len + 16)
-  let sizeBefore = fetchAdd(m.approximateSize, itemSize, moRelaxed)
+  # Use Acquire ordering like Rust for proper memory visibility
+  let sizeBefore = fetchAdd(m.approximateSize, itemSize, moAcquire)
   discard m.items.insert(key, value)
-  discard atomicMaxSeqNo(m.highestSeqno, key.seqno)
+  discard atomicMaxSeqNoAcqRel(m.highestSeqno, key.seqno)
   (itemSize, sizeBefore + itemSize)
 
 # OPTIMIZED: Template for true inlining

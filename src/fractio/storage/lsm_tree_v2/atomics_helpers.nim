@@ -26,6 +26,23 @@ template atomicMaxSeqNo*(a: var Atomic[SeqNo], val: SeqNo): bool =
       current = load(a, moRelaxed)
     result
 
+template atomicMaxSeqNoAcqRel*(a: var Atomic[SeqNo], val: SeqNo): bool =
+  ## Atomic max for SeqNo with Acquire ordering - matches Rust's fetch_max
+  ## Returns true if updated
+  block:
+    var current = load(a, moAcquire)
+    var result = false
+    while true:
+      if val <= current:
+        break
+      # Try to update if current hasn't changed
+      if compareExchange(a, current, val, moAcquire, moAcquire):
+        result = true
+        break
+      # CAS failed, current was updated, retry
+      current = load(a, moAcquire)
+    result
+
 template fetchAddSeqNo*(a: var Atomic[SeqNo], val: int64,
     order: MemoryOrder = moSequentiallyConsistent): SeqNo =
   ## Atomic fetch-add for SeqNo using CAS loop
