@@ -322,7 +322,8 @@ template isEmpty*[K, V](s: SkipList[K, V]): bool =
 # Lock-Free Insertion with CAS Retry Loops
 # ============================================================================
 
-proc insert*[K, V](s: SkipList[K, V], key: K, value: V): Entry[K, V] =
+proc insert*[K, V](s: SkipList[K, V], key: K, value: V): Entry[K,
+    V] {.inline.} =
   ## Insert key-value pair using lock-free algorithm
   ## Uses CAS retry loops for thread safety
 
