@@ -780,6 +780,119 @@ when defined(nimV2):
     ))
 
     # =========================================================================
+    # Concurrent Mixed Workload
+  #    # =========================================================================
+  #    echo "Concurrent mixed workload (20 workers)..."
+  #    const NUM_WORKERS = 20
+  #    const OPS_PER_WORKER = 1000
+  #    const CONCURRENT_INITIAL_KEYS = 2000
+  #
+  #    type
+  #      WorkerResult = object
+  #        reads: int
+  #        writes: int
+  #        verified: int
+  #
+  #    proc concurrentWorker(tree: ptr Tree, keys: seq[string], workerId: int,
+  #        seqno: ptr uint64, valueSize: int): WorkerResult {.thread, gcsafe.} =
+  #      var rng = workerId + 1
+  #      var localReads = 0
+  #      var localWrites = 0
+  #      var localVerified = 0
+  #      let numKeys = keys.len
+  #      let value = makeValueStr(valueSize)
+  #
+  #      # Do mixed read/write workload
+  #      for i in 0 ..< OPS_PER_WORKER:
+  #        let op = rng mod 10
+  #        let keyIdx = rng mod numKeys
+  #        let key = keys[keyIdx]
+  #
+  #        if op < 7: # 70% reads
+  #          let val = tree[].get(key, some(SeqNo(seqno[].int64)))
+  #          localReads += 1
+  #          if val.isSome():
+  #            if val.get == value:
+  #              localVerified += 1
+  #        else: # 30% writes
+  #          discard tree[].insert(key, value, SeqNo(seqno[].int64))
+  #          seqno[] += 1
+  #          localWrites += 1
+  #
+  #        # Simple RNG update - avoid overflow
+  #        rng = cast[int]((cast[uint](rng) * 1103515245'u + 1235'u) shr 16)
+  #
+  #      result.reads = localReads
+  #      result.writes = localWrites
+  #      result.verified = localVerified
+  #
+  #    # Pre-populate with some data
+  #    var initKeys: seq[string] = newSeq[string](CONCURRENT_INITIAL_KEYS)
+  #    for i in 0 ..< initKeys.len:
+  #      initKeys[i] = makeKeyStr("concurrent", uint64(i), config.keySize)
+  #      let value = makeValueStr(config.valueSize)
+  #      discard tree.insert(initKeys[i], value, SeqNo(seqno.int64))
+  #      seqno += 1
+  #
+  #    latency = LatencyTracker(samples: @[])
+  #    let startRes9 = readResourceMetrics()
+  #    let startTime9 = getTime()
+  #
+  #    # Spawn workers
+  #    var workers: seq[FlowVar[WorkerResult]] = newSeq[FlowVar[WorkerResult]](NUM_WORKERS)
+  #    var sharedSeqno = seqno
+  #
+  #    for i in 0 ..< NUM_WORKERS:
+  #      workers[i] = spawn concurrentWorker(addr(tree), initKeys, i, addr(
+  #          sharedSeqno), config.valueSize)
+  #
+  #    # Wait for completion
+  #    var totalReads = 0
+  #    var totalWrites = 0
+  #    var totalVerified = 0
+  #
+  #    for i in 0 ..< NUM_WORKERS:
+  #      let result = ^workers[i]
+  #      totalReads += result.reads
+  #      totalWrites += result.writes
+  #      totalVerified += result.verified
+  #
+  #    seqno = sharedSeqno
+  #
+  #    let endTime9 = getTime()
+  #    let endRes9 = readResourceMetrics()
+  #    let diffRes9 = endRes9.diffResources(startRes9)
+  #    let stats9 = latency.getLatencyStats()
+  #    let durationMs9 = (endTime9 - startTime9).inMilliseconds.uint64
+  #    let totalOps = totalReads + totalWrites
+  #
+  #    echo "  CONCURRENT_MIXED VERIFIED: ", totalVerified, " of ", totalReads,
+  #        " reads verified"
+  #
+  #    let diskMetrics9 = calcDiskMetrics(diffRes9, durationMs9)
+  #
+  #    results.add(BenchResult(
+  #      name: "concurrent_mixed",
+  #      ops: uint64(totalOps),
+  #      durationMs: durationMs9,
+  #      opsPerSec: float64(totalOps) * 1000.0 / float64(durationMs9),
+  #      latencyAvg: stats9.avg,
+  #      latencyP50: stats9.p50,
+  #      latencyP95: stats9.p95,
+  #      latencyP99: stats9.p99,
+  #      latencyMin: stats9.min,
+  #      latencyMax: stats9.max,
+  #      cpuMs: diffRes9.cpuUserMs + diffRes9.cpuSystemMs,
+  #      memoryMb: float64(endRes9.memoryRssKb) / 1024.0,
+  #      diskReadBytes: diffRes9.diskReadBytes,
+  #      diskWriteBytes: diffRes9.diskWriteBytes,
+  #      diskReadIops: diskMetrics9.readIops,
+  #      diskWriteIops: diskMetrics9.writeIops,
+  #      diskReadMB: diskMetrics9.readMB,
+  #      diskWriteMB: diskMetrics9.writeMB
+  #    ))
+
+    # =========================================================================
     # Deletions
     # =========================================================================
     echo "Deletions..."

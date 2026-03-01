@@ -11,6 +11,7 @@
 use std::env;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lsm_tree::{AbstractTree, Config};
@@ -748,6 +749,141 @@ fn main() -> lsm_tree::Result<()> {
         latency,
         start_res,
     );
+    result.print();
+    results.push(result);
+
+    // =========================================================================
+    // Benchmark 9: Concurrent Mixed Workload
+    // =========================================================================
+    println!("Running concurrent mixed benchmark (200 workers)...");
+    const NUM_WORKERS: usize = 200;
+    const OPS_PER_WORKER: usize = 10000;
+    const CONCURRENT_INITIAL_KEYS: usize = 20000;
+
+    struct WorkerResult {
+        reads: usize,
+        writes: usize,
+        verified: usize,
+    }
+
+    fn concurrent_worker(
+        tree: &lsm_tree::AnyTree,
+        keys: Vec<Vec<u8>>,
+        worker_id: usize,
+        seqno: &Arc<std::sync::atomic::AtomicU64>,
+        value: &[u8],
+    ) -> WorkerResult {
+        let mut rng = worker_id + 1;
+        let mut local_reads = 0;
+        let mut local_writes = 0;
+        let mut local_verified = 0;
+        let num_keys = keys.len();
+
+        for _ in 0..OPS_PER_WORKER {
+            let op = rng % 10;
+            let key_idx = rng % num_keys;
+            let key = &keys[key_idx];
+
+            if op < 7 {
+                // 70% reads
+                let current_seqno = seqno.load(std::sync::atomic::Ordering::Acquire);
+                if let Ok(Some(val)) = tree.get(key, current_seqno) {
+                    local_reads += 1;
+                    if val.as_ref() == value {
+                        local_verified += 1;
+                    }
+                } else {
+                    local_reads += 1;
+                }
+            } else {
+                // 30% writes
+                let current_seqno = seqno.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                tree.insert(key, value, current_seqno);
+                local_writes += 1;
+            }
+
+            // Simple RNG update
+            rng = ((rng as u64).wrapping_mul(1103515245).wrapping_add(12345) >> 16) as usize;
+        }
+
+        WorkerResult {
+            reads: local_reads,
+            writes: local_writes,
+            verified: local_verified,
+        }
+    }
+
+    // Pre-populate with some data
+    let mut init_keys = Vec::with_capacity(CONCURRENT_INITIAL_KEYS);
+    let value = make_value(config.value_size);
+    for i in 0..CONCURRENT_INITIAL_KEYS {
+        let key = make_key("concurrent", i as u64, config.key_size);
+        init_keys.push(key.clone());
+        tree.insert(&key, &value, seqno);
+        seqno += 1;
+    }
+
+    let shared_seqno = Arc::new(std::sync::atomic::AtomicU64::new(seqno));
+
+    let start = Instant::now();
+
+    // Spawn workers
+    let mut handles = Vec::new();
+    for i in 0..NUM_WORKERS {
+        let tree = tree.clone();
+        let keys = init_keys.clone();
+        let seqno = Arc::clone(&shared_seqno);
+        let value = value.clone();
+        let handle = std::thread::spawn(move || concurrent_worker(&tree, keys, i, &seqno, &value));
+        handles.push(handle);
+    }
+
+    // Wait for completion
+    let mut total_reads = 0;
+    let mut total_writes = 0;
+    let mut total_verified = 0;
+
+    for handle in handles {
+        let result = handle.join().unwrap();
+        total_reads += result.reads;
+        total_writes += result.writes;
+        total_verified += result.verified;
+    }
+
+    let duration = start.elapsed();
+    let total_ops = total_reads + total_writes;
+    let ops_per_sec = total_ops as f64 / duration.as_secs_f64();
+    println!(
+        "  concurrent_mixed: {} ops in {:?} | {:.0} ops/s ({} reads, {} writes, {} verified)",
+        total_ops, duration, ops_per_sec, total_reads, total_writes, total_verified
+    );
+
+    let result = BenchResult {
+        name: "concurrent_mixed".to_string(),
+        total_ops: total_ops as u64,
+        duration_ms: duration.as_millis() as u64,
+        ops_per_sec,
+        latency_avg_us: 0.0,
+        latency_p50_us: 0,
+        latency_p95_us: 0,
+        latency_p99_us: 0,
+        latency_min_us: 0,
+        latency_max_us: 0,
+        cpu_user_ms: 0,
+        cpu_system_ms: 0,
+        cpu_total_ms: 0,
+        cpu_percent: 0.0,
+        memory_rss_mb: 0.0,
+        memory_peak_mb: 0.0,
+        disk_read_mb: 0.0,
+        disk_write_mb: 0.0,
+        disk_read_ops: 0,
+        disk_write_ops: 0,
+        iops: 0.0,
+        throughput_mb_per_sec: 0.0,
+        disk_read_bytes: 0,
+        disk_write_bytes: 0,
+    };
     result.print();
     results.push(result);
 
