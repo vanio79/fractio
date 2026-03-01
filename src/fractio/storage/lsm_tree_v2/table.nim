@@ -99,9 +99,9 @@ proc newSsTable*(path: string): SsTable =
   # Open and keep file handle
   result.fileHandle = posix.open(path, cint(FileFlags.frRead), 0)
 
-proc id*(t: SsTable): TableId = t.meta.id
-proc level*(t: SsTable): int = t.meta.level
-proc size*(t: SsTable): uint64 = t.meta.size
+template id*(t: SsTable): TableId = t.meta.id
+template level*(t: SsTable): int = t.meta.level
+template size*(t: SsTable): uint64 = t.meta.size
 
 proc setBlockCache*(t: SsTable, cache: ptr Cache) =
   ## Set the shared block cache for this table
@@ -121,9 +121,9 @@ proc putCachedBlock*(table: SsTable, offset: uint64, data: string) =
   let cachePtr = cast[ptr Cache](table.blockCache)
   cachePtr.insertBlock(0, int64(table.meta.id), offset, data)
 
-proc entryCount*(t: SsTable): uint64 = t.meta.entryCount
-proc minKey*(t: SsTable): string = t.meta.minKey
-proc maxKey*(t: SsTable): string = t.meta.maxKey
+template entryCount*(t: SsTable): uint64 = t.meta.entryCount
+template minKey*(t: SsTable): string = t.meta.minKey
+template maxKey*(t: SsTable): string = t.meta.maxKey
 
 proc closeTable*(t: SsTable) =
   ## Close the table and release resources

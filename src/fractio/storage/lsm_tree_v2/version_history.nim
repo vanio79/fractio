@@ -42,7 +42,7 @@ proc acquire*(sv: SuperVersion): int32 =
   atomicInc(sv.refCount, 1)
   load(sv.refCount, moRelaxed)
 
-proc release*(sv: SuperVersion): int32 =
+template release*(sv: SuperVersion): int32 =
   ## Release reference to SuperVersion
   atomicDec(sv.refCount, 1)
   load(sv.refCount, moRelaxed)
@@ -77,7 +77,7 @@ proc freeListLen*(vh: VersionHistory): int {.inline.} =
   ## Number of versions that can be GC'd (all except latest)
   max(0, vh.versions.len - 1)
 
-proc latestVersion*(vh: VersionHistory): SuperVersion =
+template latestVersion*(vh: VersionHistory): SuperVersion =
   ## Get the latest version (most recent snapshot)
   if vh.versions.len > 0:
     vh.versions[^1]

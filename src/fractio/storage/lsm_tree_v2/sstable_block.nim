@@ -109,6 +109,12 @@ type
     offset*: uint32
     len*: uint32
 
+# Template for hash position - must be defined before use
+template calculateBucketPosition*(key: string, bucketCount: uint32): int =
+  ## Calculate bucket position for a key using hash
+  let h = xxhash64(key)
+  int(h mod uint64(bucketCount))
+
 proc newHashIndexBuilder*(bucketCount: uint32): HashIndexBuilder =
   var buckets = newSeq[uint8](bucketCount.int)
   for i in 0 ..< buckets.len:
@@ -117,11 +123,6 @@ proc newHashIndexBuilder*(bucketCount: uint32): HashIndexBuilder =
     buckets: buckets,
     bucketCount: bucketCount
   )
-
-proc calculateBucketPosition*(key: string, bucketCount: uint32): int =
-  ## Calculate bucket position for a key using hash
-  let h = xxhash64(key)
-  int(h mod uint64(bucketCount))
 
 proc set*(b: HashIndexBuilder, key: string, binaryIndexPos: uint8): bool =
   ## Map a key to binary index position. Returns true if set successfully.
@@ -151,17 +152,20 @@ proc intoInner*(b: HashIndexBuilder): string =
 proc newHashIndexReader*(data: string, offset, len: uint32): HashIndexReader =
   HashIndexReader(data: data, offset: offset, len: len)
 
-proc bucketCount*(r: HashIndexReader): int = int(r.len)
+template bucketCount*(r: HashIndexReader): int =
+  ## Get bucket count
+  int(r.len)
 
-proc get*(r: HashIndexReader, key: string): uint8 =
+template get*(r: HashIndexReader, key: string): uint8 =
   ## Get binary index position for key, or marker if not found/conflicted
   if r.len == 0:
-    return HashIndexMarkerFree
-
-  let pos = calculateBucketPosition(key, r.len)
-  if pos < r.data.len:
-    return uint8(r.data[r.offset.int + pos])
-  return HashIndexMarkerFree
+    HashIndexMarkerFree
+  else:
+    let pos = calculateBucketPosition(key, r.len)
+    if pos < r.data.len:
+      uint8(r.data[r.offset.int + pos])
+    else:
+      HashIndexMarkerFree
 
 proc conflictCount*(r: HashIndexReader): int =
   ## Count number of conflicts in hash index

@@ -122,34 +122,34 @@ proc decodeFixed64*(data: string, pos: int): uint64 =
   result
 
 # ============================================================================
-# Varint Size Calculation
+# Varint Size Calculation - TEMPLATE for true inlining
 # ============================================================================
 
-proc varintSize*(value: uint64 | uint32 | int): int =
+template varintSize*(value: uint64 | uint32 | int): int =
   ## Calculate the number of bytes needed to encode a value as varint
-  var v = uint64(value)
+  let v = uint64(value)
   if v < 0x80'u64:
-    return 1
+    1
   elif v < 0x4000'u64:
-    return 2
+    2
   elif v < 0x200000'u64:
-    return 3
+    3
   elif v < 0x10000000'u64:
-    return 4
+    4
   elif v < 0x80000000'u64:
-    return 5
+    5
   elif v < 0x400000000'u64:
-    return 6
+    6
   elif v < 0x2000000000'u64:
-    return 7
+    7
   elif v < 0x10000000000'u64:
-    return 8
+    8
   elif v < 0x80000000000'u64:
-    return 9
+    9
   elif v < 0x400000000000'u64:
-    return 10
+    10
   else:
-    return 11
+    11
 
 proc decodeVarintFromString*(data: string, pos: int): tuple[value: uint64, newPos: int] =
   ## Decode varint from string at given position

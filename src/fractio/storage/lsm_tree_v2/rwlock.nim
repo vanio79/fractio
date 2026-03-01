@@ -27,20 +27,20 @@ proc newRwLockBase*(): RwLockBase =
   store(result.readerCount, 0.int32)
   store(result.writerCount, 0.int32)
 
-proc acquireRead*(r: RwLockBase) =
+template acquireRead*(r: RwLockBase) =
   ## Acquire read lock (multiple readers allowed)
   atomicInc(r.readerCount, 1.int32)
 
-proc releaseRead*(r: RwLockBase) =
+template releaseRead*(r: RwLockBase) =
   ## Release read lock
   atomicDec(r.readerCount, 1.int32)
 
-proc acquireWrite*(r: RwLockBase) =
+template acquireWrite*(r: RwLockBase) =
   ## Acquire write lock (exclusive)
   atomicInc(r.writerCount, 1.int32)
   r.lock.acquire()
 
-proc releaseWrite*(r: RwLockBase) =
+template releaseWrite*(r: RwLockBase) =
   ## Release write lock
   r.lock.release()
   atomicDec(r.writerCount, 1.int32)
@@ -61,19 +61,19 @@ proc newRwLock*[T](value: T): RwLock[T] =
     value: value
   )
 
-proc acquireRead*[T](r: RwLock[T]) =
+template acquireRead*[T](r: RwLock[T]) =
   ## Acquire read lock (multiple readers allowed)
   r.base.acquireRead()
 
-proc releaseRead*[T](r: RwLock[T]) =
+template releaseRead*[T](r: RwLock[T]) =
   ## Release read lock
   r.base.releaseRead()
 
-proc acquireWrite*[T](r: RwLock[T]) =
+template acquireWrite*[T](r: RwLock[T]) =
   ## Acquire write lock (exclusive)
   r.base.acquireWrite()
 
-proc releaseWrite*[T](r: RwLock[T]) =
+template releaseWrite*[T](r: RwLock[T]) =
   ## Release write lock
   r.base.releaseWrite()
 

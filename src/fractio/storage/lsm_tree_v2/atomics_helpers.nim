@@ -9,26 +9,34 @@
 import std/atomics
 import types
 
-proc atomicMaxSeqNo*(a: var Atomic[SeqNo], val: SeqNo): bool =
+template atomicMaxSeqNo*(a: var Atomic[SeqNo], val: SeqNo): bool =
   ## Atomic max for SeqNo - returns true if updated
   ## Uses CAS loop which is the standard pattern in Nim
-  var current = load(a, moRelaxed)
-  while true:
-    if val <= current:
-      return false
-    # Try to update if current hasn't changed
-    if compareExchange(a, current, val, moRelaxed, moRelaxed):
-      return true
-    # CAS failed, current was updated, retry
-    current = load(a, moRelaxed)
+  block:
+    var current = load(a, moRelaxed)
+    var result = false
+    while true:
+      if val <= current:
+        break
+      # Try to update if current hasn't changed
+      if compareExchange(a, current, val, moRelaxed, moRelaxed):
+        result = true
+        break
+      # CAS failed, current was updated, retry
+      current = load(a, moRelaxed)
+    result
 
-proc fetchAddSeqNo*(a: var Atomic[SeqNo], val: int64,
+template fetchAddSeqNo*(a: var Atomic[SeqNo], val: int64,
     order: MemoryOrder = moSequentiallyConsistent): SeqNo =
   ## Atomic fetch-add for SeqNo using CAS loop
   ## Returns the old value
-  var current = load(a, order)
-  while true:
-    let newVal = SeqNo(int64(current) + val)
-    if compareExchange(a, current, newVal, order, order):
-      return current
-    # CAS failed, retry with updated current
+  block:
+    var current = load(a, order)
+    var result: SeqNo
+    while true:
+      let newVal = SeqNo(int64(current) + val)
+      if compareExchange(a, current, newVal, order, order):
+        result = current
+        break
+      # CAS failed, retry with updated current
+    result
