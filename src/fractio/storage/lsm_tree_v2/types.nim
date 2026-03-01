@@ -3,7 +3,7 @@
 
 ## LSM Tree v2 - Core Types
 ##
-## Simple string-based keys for clarity and maintainability
+## OPTIMIZED: Hot path comparisons use templates for true inlining
 
 import std/hashes
 
@@ -24,7 +24,8 @@ type
     vtWeakTombstone = 2'u8
     vtIndirection = 4'u8
 
-func isTombstone*(vt: ValueType): bool {.inline.} =
+# OPTIMIZED: Template for true inlining
+template isTombstone*(vt: ValueType): bool =
   vt == vtTombstone or vt == vtWeakTombstone
 
 func toByte*(vt: ValueType): uint8 =
@@ -33,6 +34,17 @@ func toByte*(vt: ValueType): uint8 =
   of vtTombstone: 1'u8
   of vtWeakTombstone: 2'u8
   of vtIndirection: 4'u8
+
+# ============================================================================
+# SeqNo comparisons - OPTIMIZED: Templates for true inlining
+# ============================================================================
+
+template `==`*(a, b: SeqNo): bool = int(a) == int(b)
+template `<`*(a, b: SeqNo): bool = int(a) < int(b)
+template `<=`*(a, b: SeqNo): bool = int(a) <= int(b)
+template `>`*(a, b: SeqNo): bool = int(a) > int(b)
+template `>=`*(a, b: SeqNo): bool = int(a) >= int(b)
+proc `$`*(s: SeqNo): string = $int(s)
 
 # ============================================================================
 # InternalKey - Simple string-based key
@@ -45,16 +57,14 @@ type
     seqno*: SeqNo
     valueType*: ValueType
 
-proc newInternalKey*(userKey: string, seqno: SeqNo,
-    valueType: ValueType): InternalKey {.inline.} =
-  result = InternalKey(
-    userKey: userKey,
-    seqno: seqno,
-    valueType: valueType
-  )
+# OPTIMIZED: Template for true inlining
+template newInternalKey*(userKey: string, seqno: SeqNo,
+    valueType: ValueType): InternalKey =
+  InternalKey(userKey: userKey, seqno: seqno, valueType: valueType)
 
-proc isTombstone*(key: InternalKey): bool {.inline.} =
-  key.valueType.isTombstone()
+# OPTIMIZED: Template for true inlining
+template isTombstone*(key: InternalKey): bool =
+  key.valueType == vtTombstone or key.valueType == vtWeakTombstone
 
 # Hash support for InternalKey
 proc hash*(k: InternalKey): Hash =
@@ -63,44 +73,50 @@ proc hash*(k: InternalKey): Hash =
   let h3 = int(hash(k.valueType))
   result = Hash(h1 xor h2 xor h3)
 
-# Compare two InternalKeys for ordering
-proc `==`*(a, b: InternalKey): bool =
+# ============================================================================
+# InternalKey comparisons - OPTIMIZED: Templates for true inlining
+# ============================================================================
+
+# OPTIMIZED: Template for true inlining - called on every skip list comparison
+template `==`*(a, b: InternalKey): bool =
   a.userKey == b.userKey and int(a.seqno) == int(b.seqno) and a.valueType == b.valueType
 
-proc `<`*(a, b: InternalKey): bool =
-  if a.userKey != b.userKey: return a.userKey < b.userKey
-  if int(a.seqno) != int(b.seqno): return int(a.seqno) > int(b.seqno) # Descending seqno
-  return a.valueType < b.valueType
+# OPTIMIZED: Template for true inlining - called on every skip list traversal
+# Ordering: userKey ASC, seqno DESC, valueType ASC
+template `<`*(a, b: InternalKey): bool =
+  if a.userKey != b.userKey:
+    a.userKey < b.userKey
+  elif int(a.seqno) != int(b.seqno):
+    int(a.seqno) > int(b.seqno) # Descending seqno
+  else:
+    a.valueType < b.valueType
 
 # ============================================================================
 # Comparison: InternalKey for heap ordering
 # ============================================================================
 
-proc cmpInternalKey*(a, b: InternalKey): int =
-  let cmpKey = cmp(a.userKey, b.userKey)
-  if cmpKey != 0: return cmpKey
-  let cmpSeq = cmp(int(b.seqno), int(a.seqno)) # Descending seqno
-  if cmpSeq != 0: return cmpSeq
-  return cmp(int(a.valueType), int(b.valueType))
+template cmpInternalKey*(a, b: InternalKey): int =
+  if a.userKey < b.userKey: -1
+  elif a.userKey > b.userKey: 1
+  elif int(b.seqno) < int(a.seqno): -1
+  elif int(b.seqno) > int(a.seqno): 1
+  elif int(a.valueType) < int(b.valueType): -1
+  elif int(a.valueType) > int(b.valueType): 1
+  else: 0
 
+# ============================================================================
 # String comparison helper
-proc cmp*(a, b: string): int =
-  if a < b: return -1
-  if a > b: return 1
-  return 0
-
-# ============================================================================
-# SeqNo comparisons
 # ============================================================================
 
-proc `==`*(a, b: SeqNo): bool = int(a) == int(b)
-proc `<`*(a, b: SeqNo): bool = int(a) < int(b)
-proc `<=`*(a, b: SeqNo): bool = int(a) <= int(b)
-proc `>`*(a, b: SeqNo): bool = int(a) > int(b)
-proc `>=`*(a, b: SeqNo): bool = int(a) >= int(b)
-proc `$`*(s: SeqNo): string = $int(s)
+template cmp*(a, b: string): int =
+  if a < b: -1
+  elif a > b: 1
+  else: 0
 
-# Define `$` for TableId
+# ============================================================================
+# Other
+# ============================================================================
+
 proc `$`*(t: TableId): string = $uint64(t)
 
 const

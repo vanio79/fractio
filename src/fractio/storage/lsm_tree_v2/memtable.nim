@@ -3,12 +3,14 @@
 # (found in the LICENSE-* files in the repository)
 
 ## LSM Tree v2 - Memtable (string-based implementation)
+##
+## OPTIMIZED: Hot paths use templates for true inlining
 
 import std/[atomics, options]
-import fractio/storage/lsm_tree_v2/types
+import types
 import crossbeam_skiplist
 export crossbeam_skiplist
-import fractio/storage/lsm_tree_v2/atomics_helpers
+import atomics_helpers
 
 type
   Memtable* = ref object
@@ -35,62 +37,60 @@ proc newMemtable*(id: MemtableId): Memtable =
     requestedRotation: requestedRotation
   )
 
-proc insert*(m: Memtable, key: InternalKey, value: string): (uint64, uint64) =
+# OPTIMIZED: Template for true inlining
+template insert*(m: Memtable, key: InternalKey, value: string): (uint64, uint64) =
   let itemSize = uint64(key.userKey.len + value.len + 16)
   let sizeBefore = fetchAdd(m.approximateSize, itemSize, moRelaxed)
   discard m.items.insert(key, value)
   discard atomicMaxSeqNo(m.highestSeqno, key.seqno)
   (itemSize, sizeBefore + itemSize)
 
-proc insertFromString*(m: Memtable, key: string, value: string, seqno: SeqNo): (
-    uint64, uint64) =
-  ## Insert from string key - stores a copy of the key
-  let internalKey = newInternalKey(key, seqno, vtValue)
-  result = m.insert(internalKey, value)
+# OPTIMIZED: Template for true inlining
+template insertFromString*(m: Memtable, key: string, value: string,
+    seqno: SeqNo): (uint64, uint64) =
+  let internalKey = InternalKey(userKey: key, seqno: seqno, valueType: vtValue)
+  m.insert(internalKey, value)
 
-proc insertTombstone*(m: Memtable, key: string, seqno: SeqNo): (uint64, uint64) =
-  ## Insert a tombstone (deletion marker)
-  let internalKey = newInternalKey(key, seqno, vtTombstone)
-  result = m.insert(internalKey, "")
+# OPTIMIZED: Template for true inlining
+template insertTombstone*(m: Memtable, key: string, seqno: SeqNo): (uint64, uint64) =
+  let internalKey = InternalKey(userKey: key, seqno: seqno,
+      valueType: vtTombstone)
+  m.insert(internalKey, "")
 
-proc isEmpty*(m: Memtable): bool =
+template isEmpty*(m: Memtable): bool =
   m.items.isEmpty()
 
-proc iter*(m: Memtable): auto =
+template iter*(m: Memtable): auto =
   m.items.iter()
 
-proc get*(m: Memtable, key: string, seqno: SeqNo): Option[string] =
-  ## Get value for key at given snapshot
+# OPTIMIZED: Direct lookup - use proc with inline pragma
+proc getImpl*(m: Memtable, key: string, seqno: SeqNo): Option[
+    string] {.inline.} =
   if seqno == 0.SeqNo:
     return none(string)
-
-  # Create a search key with max seqno to find all versions of this key
-  let searchKey = newInternalKey(key, SeqNo(high(int64)), vtValue)
+  let searchKey = InternalKey(userKey: key, seqno: SeqNo(high(int64)),
+      valueType: vtValue)
   var rangeIter = m.items.rangeFrom(searchKey)
-
-  # Look for a matching entry visible to our snapshot
   while rangeIter.hasNext():
     let (k, v) = rangeIter.next()
-    # Check if we've moved past the target key
     if k.userKey > key:
       break
-    # Check if this is our key
     if k.userKey == key:
-      # Check if this version is visible to our snapshot
       if int(k.seqno) <= int(seqno):
-        if not k.isTombstone():
+        if not (k.valueType == vtTombstone or k.valueType == vtWeakTombstone):
           return some(v)
-        else:
-          return none(string) # Tombstone
+        break
+  none(string)
 
-  result = none(string)
+template get*(m: Memtable, key: string, seqno: SeqNo): Option[string] =
+  getImpl(m, key, seqno)
 
 # ===========================================================================
 # MVCC Snapshot Support
 # ===========================================================================
 
-proc getAt*(m: Memtable, key: string, seqno: SeqNo): Option[string] =
-  get(m, key, seqno)
+template getAt*(m: Memtable, key: string, seqno: SeqNo): Option[string] =
+  m.get(key, seqno)
 
 # ===========================================================================
 # Iteration
@@ -106,7 +106,6 @@ type
 proc newIter*(m: Memtable, startKey: string): MemtableIter =
   result.iter = m.items.iter()
   result.hasNext = result.iter.hasNext()
-  # Skip to startKey
   while result.hasNext:
     let (k, v) = result.iter.next()
     if k.userKey >= startKey:
@@ -115,8 +114,8 @@ proc newIter*(m: Memtable, startKey: string): MemtableIter =
       return
   result.hasNext = false
 
-proc hasNext*(iter: var MemtableIter): bool =
-  result = iter.hasNext
+template hasNext*(iter: var MemtableIter): bool =
+  iter.hasNext
 
 proc next*(iter: var MemtableIter): tuple[key: string, value: string] =
   if not iter.hasNext:

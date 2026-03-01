@@ -19,21 +19,23 @@
 
 import std/[atomics, options, bitops]
 
-# Helper procs to ensure proper key comparison with InternalKey
-proc keyEqual[K](a, b: K): bool =
+# ============================================================================
+# Types
+# ============================================================================
+
+# OPTIMIZED: Key comparison inlined directly at call sites for maximum performance
+# The generic keyEqual/keyLess wrappers were causing overhead
+
+template keyEqualImpl[K](a, b: K): bool =
   a == b
 
-proc keyLess[K](a, b: K): bool =
+template keyLessImpl[K](a, b: K): bool =
   a < b
 
 const
   HEIGHT_BITS = 5
   MAX_HEIGHT = 1 shl HEIGHT_BITS ## 32 levels max
   HEIGHT_MASK = MAX_HEIGHT - 1
-
-# ============================================================================
-# Types
-# ============================================================================
 
 type
   ## Node with embedded tower of atomic pointers
@@ -228,7 +230,7 @@ proc searchPosition[K, V](s: SkipList[K, V], key: K, result: var Position[K,
 
     ## Move forward while key > curr.key
     ## OPTIMIZED: Branch prediction hints - forward movement is common
-    while curr != nil and keyLess(curr.key, key):
+    while curr != nil and keyLessImpl(curr.key, key):
       pred = curr
       predTower = pred.getTower() ## Recompute tower only when moving to new node
       curr = load(predTower[level], moRelaxed)
@@ -239,7 +241,7 @@ proc searchPosition[K, V](s: SkipList[K, V], key: K, result: var Position[K,
 
     ## Check if we found the exact key (integrated into loop to avoid extra comparison)
     ## OPTIMIZED: Found is rare, use branch prediction
-    if curr != nil and keyEqual(curr.key, key) and result.found == nil:
+    if curr != nil and keyEqualImpl(curr.key, key) and result.found == nil:
       result.found = curr
 
     ## Move down
@@ -265,13 +267,13 @@ proc get*[K, V](s: SkipList[K, V], key: K): Option[V] {.inline.} =
     var curr = load(predTower[level], moRelaxed)
 
     ## Move forward while key > curr.key
-    while curr != nil and keyLess(curr.key, key):
+    while curr != nil and keyLessImpl(curr.key, key):
       pred = curr
       predTower = pred.getTower()
       curr = load(predTower[level], moRelaxed)
 
     ## Check if found at this level
-    if curr != nil and keyEqual(curr.key, key):
+    if curr != nil and keyEqualImpl(curr.key, key):
       return some(curr.value)
 
     if level == 0:
@@ -292,12 +294,12 @@ proc contains*[K, V](s: SkipList[K, V], key: K): bool {.inline.} =
   while level >= 0:
     var curr = load(predTower[level], moRelaxed)
 
-    while curr != nil and keyLess(curr.key, key):
+    while curr != nil and keyLessImpl(curr.key, key):
       pred = curr
       predTower = pred.getTower()
       curr = load(predTower[level], moRelaxed)
 
-    if curr != nil and keyEqual(curr.key, key):
+    if curr != nil and keyEqualImpl(curr.key, key):
       return true
 
     if level == 0:
@@ -583,9 +585,9 @@ proc hasNext*[K, V](r: RangeIter[K, V]): bool {.inline.} =
   # Bounded range - compare with endKey
   let cmp = r.current.key
   if r.endInclusive:
-    keyEqual(cmp, r.endKey) or keyLess(cmp, r.endKey)
+    keyEqualImpl(cmp, r.endKey) or keyLessImpl(cmp, r.endKey)
   else:
-    keyLess(cmp, r.endKey)
+    keyLessImpl(cmp, r.endKey)
 
 proc next*[K, V](r: RangeIter[K, V]): tuple[key: K, value: V] {.inline.} =
   ## Get next element in range

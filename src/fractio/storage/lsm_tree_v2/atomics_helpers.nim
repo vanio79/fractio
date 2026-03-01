@@ -7,7 +7,7 @@
 ## Provides atomic operations that match Rust's atomics behavior
 
 import std/atomics
-import fractio/storage/lsm_tree_v2/types
+import types
 
 proc atomicMaxSeqNo*(a: var Atomic[SeqNo], val: SeqNo): bool =
   ## Atomic max for SeqNo - returns true if updated

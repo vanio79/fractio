@@ -9,9 +9,9 @@ import std/posix
 import std/locks
 import std/atomics
 import std/strutils
-import fractio/storage/lsm_tree_v2/types
-import fractio/storage/lsm_tree_v2/error
-import fractio/storage/lsm_tree_v2/memtable
+import types
+import error
+import memtable
 
 # ============================================================================
 # WAL Record Types

@@ -5,10 +5,10 @@
 ## Tracks SSTable metadata for crash recovery and version reconstruction
 
 import std/[os, options, hashes, locks, posix]
-import fractio/storage/lsm_tree_v2/types
-import fractio/storage/lsm_tree_v2/error
-import fractio/storage/lsm_tree_v2/table
-import fractio/storage/lsm_tree_v2/coding
+import types
+import error
+import table
+import coding
 
 # Helper: Decode 64-bit int from bytes
 proc decodeFixed64*(data: string): int64 =
