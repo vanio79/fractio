@@ -164,12 +164,9 @@ proc insert*(t: Tree, key: string, value: string, seqno: SeqNo): (uint64, uint64
   let (size, totalSize) = currentVersion.activeMemtable.insertFromString(key,
       value, seqno)
 
-  # CRITICAL: Update VersionHistory.latestSeqno to make key visible in snapshot
-  t.inner.versionHistory.acquireWrite()
-  let currentLatest = load(t.inner.versionHistory.value.latestSeqno, moRelaxed)
-  if seqno > currentLatest:
-    store(t.inner.versionHistory.value.latestSeqno, seqno, moRelaxed)
-  t.inner.versionHistory.releaseWrite()
+  # OPTIMIZED: Use atomic fetch_max instead of write lock to update latestSeqno
+  # This is lock-free and much faster than acquiring a write lock
+  discard atomicMaxSeqNo(t.inner.versionHistory.value.latestSeqno, seqno)
 
   return (size, totalSize)
 
