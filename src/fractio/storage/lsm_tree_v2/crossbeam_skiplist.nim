@@ -76,62 +76,65 @@ type
     endInclusive*: bool
 
 # ============================================================================
-# Node Operations
+# Node Operations - TEMPLATES for true inlining
 # ============================================================================
 
-proc getTower[K, V](node: SkipListNode[K, V]): ptr UncheckedArray[Atomic[
-    SkipListNode[K, V]]] {.inline.} =
+template getTower*[K, V](node: SkipListNode[K, V]): ptr UncheckedArray[
+    Atomic[SkipListNode[K, V]]] =
   ## Get pointer to tower array
   cast[ptr UncheckedArray[Atomic[SkipListNode[K, V]]]](
     cast[uint](node) + uint(sizeof(SkipListNodeObj[K, V]))
   )
 
-proc allocNode[K, V](h: int): SkipListNode[K, V] {.inline.} =
+template allocNode*[K, V](h: int): SkipListNode[K, V] =
   ## Allocate node with embedded atomic tower
   ## Use alloc0 to zero-initialize everything for safety
   ## Total size = object size + h * sizeof(Atomic[pointer])
-  let size = sizeof(SkipListNodeObj[K, V]) + h * sizeof(Atomic[pointer])
-  result = cast[SkipListNode[K, V]](alloc0(size))
-  ## Initialize refsAndHeight: height-1 in lower bits, ref count = 2 (1 for entry + 1 for level 0 link)
-  store(result.refsAndHeight, uint(h - 1) or (2u shl HEIGHT_BITS), moRelaxed)
+  block:
+    let size = sizeof(SkipListNodeObj[K, V]) + h * sizeof(Atomic[pointer])
+    var result = cast[SkipListNode[K, V]](alloc0(size))
+    ## Initialize refsAndHeight: height-1 in lower bits, ref count = 2 (1 for entry + 1 for level 0 link)
+    store(result.refsAndHeight, uint(h - 1) or (2u shl HEIGHT_BITS), moRelaxed)
+    result
 
-proc deallocNode[K, V](node: SkipListNode[K, V]) {.inline.} =
+template deallocNode*[K, V](node: SkipListNode[K, V]) =
   ## Free a node and its key/value
   ## In a full implementation, this would use epoch-based reclamation
   dealloc(cast[pointer](node))
 
-proc height[K, V](node: SkipListNode[K, V]): int {.inline.} =
+template height*[K, V](node: SkipListNode[K, V]): int =
   ## Extract height from refsAndHeight
   int(load(node.refsAndHeight, moRelaxed) and HEIGHT_MASK) + 1
 
-proc incRef[K, V](node: SkipListNode[K, V]) {.inline.} =
+template incRef*[K, V](node: SkipListNode[K, V]) =
   ## Increment reference count
   discard fetchAdd(node.refsAndHeight, 1u shl HEIGHT_BITS, moRelaxed)
 
-proc decRef[K, V](node: SkipListNode[K, V]) {.inline.} =
+template decRef*[K, V](node: SkipListNode[K, V]) =
   ## Decrement reference count, free if zero
-  let old = fetchSub(node.refsAndHeight, 1u shl HEIGHT_BITS, moRelease)
-  if (old shr HEIGHT_BITS) == 1:
-    ## Last reference dropped
-    fence(moAcquire)
-    deallocNode(node)
+  block:
+    let old = fetchSub(node.refsAndHeight, 1u shl HEIGHT_BITS, moRelease)
+    if (old shr HEIGHT_BITS) == 1:
+      ## Last reference dropped
+      fence(moAcquire)
+      deallocNode(node)
 
-proc loadNext[K, V](node: SkipListNode[K, V], level: int): SkipListNode[K,
-    V] {.inline.} =
+template loadNext*[K, V](node: SkipListNode[K, V], level: int): SkipListNode[K, V] =
   ## Load next pointer at level (acquire for synchronization)
   load(node.getTower()[level], moAcquire)
 
-proc storeNext[K, V](node: SkipListNode[K, V], level: int, next: SkipListNode[K,
-    V]) {.inline.} =
+template storeNext*[K, V](node: SkipListNode[K, V], level: int,
+    next: SkipListNode[K, V]) =
   ## Store next pointer at level (release for synchronization)
   store(node.getTower()[level], next, moRelease)
 
-proc casNext[K, V](node: SkipListNode[K, V], level: int,
-                   expected, desired: SkipListNode[K, V]): bool {.inline.} =
+template casNext*[K, V](node: SkipListNode[K, V], level: int,
+                         expected, desired: SkipListNode[K, V]): bool =
   ## Compare-and-swap next pointer at level
-  var exp = expected
-  compareExchange(node.getTower()[level], exp, desired,
-      moSequentiallyConsistent, moRelaxed)
+  block:
+    var exp = expected
+    compareExchange(node.getTower()[level], exp, desired,
+        moSequentiallyConsistent, moRelaxed)
 
 # ============================================================================
 # SkipList Creation
@@ -158,10 +161,10 @@ proc newSkipList*[K, V](): SkipList[K, V] =
   store(result.len, 0, moRelaxed)
 
 # ============================================================================
-# Random Height Generation (Xorshift + countTrailingZeroBits)
+# Random Height Generation - INLINE PROC (complex control flow)
 # ============================================================================
 
-proc randomHeight[K, V](s: SkipList[K, V]): int {.inline.} =
+proc randomHeight*[K, V](s: SkipList[K, V]): int {.inline.} =
   ## Generate random height using Xorshift RNG
   ## Uses countTrailingZeroBits for O(1) height calculation
 
@@ -197,17 +200,16 @@ proc randomHeight[K, V](s: SkipList[K, V]): int {.inline.} =
   height
 
 # ============================================================================
-# Search with Position Tracking
+# Search with Position Tracking - INLINE PROC (complex control flow)
 # ============================================================================
 
-proc searchPosition[K, V](s: SkipList[K, V], key: K, result: var Position[K,
+proc searchPosition*[K, V](s: SkipList[K, V], key: K, result: var Position[K,
     V]) {.inline.} =
   ## Search for key and return position (predecessors and successors at each level)
   ## This is the core search algorithm used by insert, remove, and get
   ## OPTIMIZED: Cache tower base to avoid recomputing on every load
   ## OPTIMIZED: Use moRelaxed for traversal loads (validated by CAS later)
   ## OPTIMIZED: Pass result as var parameter to avoid large struct copy
-  ## NOTE: Using inline because this is called from multiple places
 
   let maxH = load(s.maxHeight, moRelaxed)
 
@@ -247,10 +249,10 @@ proc searchPosition[K, V](s: SkipList[K, V], key: K, result: var Position[K,
     ## Move down
     if level == 0:
       break
-    level.dec() ## OPTIMIZED: Use dec() instead of -= 1
+    dec(level) ## OPTIMIZED: Use dec() instead of -= 1
 
 # ============================================================================
-# Core Operations
+# Core Operations - MIXED: simple ops as templates, complex as inline procs
 # ============================================================================
 
 proc get*[K, V](s: SkipList[K, V], key: K): Option[V] {.inline.} =
@@ -278,7 +280,7 @@ proc get*[K, V](s: SkipList[K, V], key: K): Option[V] {.inline.} =
 
     if level == 0:
       break
-    level.dec()
+    dec(level)
 
   return none(V)
 
@@ -304,15 +306,15 @@ proc contains*[K, V](s: SkipList[K, V], key: K): bool {.inline.} =
 
     if level == 0:
       break
-    level.dec()
+    dec(level)
 
   return false
 
-proc len*[K, V](s: SkipList[K, V]): int {.inline.} =
+template len*[K, V](s: SkipList[K, V]): int =
   ## Get number of elements
   load(s.len, moRelaxed)
 
-proc isEmpty*[K, V](s: SkipList[K, V]): bool {.inline.} =
+template isEmpty*[K, V](s: SkipList[K, V]): bool =
   ## Check if empty
   s.len() == 0
 
@@ -497,7 +499,7 @@ proc remove*[K, V](s: SkipList[K, V], key: K): bool =
   true
 
 # ============================================================================
-# Iteration
+# Iteration - INLINE PROCS (complex control flow, templates hurt branch prediction)
 # ============================================================================
 
 proc iter*[K, V](s: SkipList[K, V]): Iter[K, V] {.inline.} =
@@ -511,8 +513,8 @@ proc hasNext*[K, V](it: Iter[K, V]): bool {.inline.} =
 proc next*[K, V](it: Iter[K, V]): tuple[key: K, value: V] {.inline.} =
   ## Get next element
   let node = it.current
-  result = (node.key, node.value)
   it.current = loadNext(node, 0)
+  result = (node.key, node.value)
 
 iterator items*[K, V](it: var Iter[K, V]): tuple[key: K, value: V] =
   ## Iterate over all entries
@@ -552,55 +554,81 @@ proc rangeFrom*[K, V](s: SkipList[K, V], startKey: K): RangeIter[K, V] =
   RangeIter[K, V](list: s, current: start, endKey: default(K),
                   endInclusive: false)
 
-proc hasNext*[K, V](r: RangeIter[K, V]): bool {.inline.} =
+template hasNext*[K, V](r: RangeIter[K, V]): bool =
   ## Check if more elements in range
-  if r.current == nil:
-    return false
-
-  # Check if endKey is default (unbounded range)
-  when K is (ref object):
-    # For ref types, check if endKey is nil
-    if r.endKey.isNil:
-      return true
-  elif K is string:
-    # For strings, empty string means unbounded
-    if r.endKey.len == 0:
-      return true
-  elif K is (object or tuple):
-    # For objects/tuples, check if all fields are default
-    # For now, we'll just assume unbounded if we have a current node
-    # since default object comparison is complex
-    when compiles(r.endKey == default(K)):
-      if r.endKey == default(K):
-        return true
+  block:
+    if r.current == nil:
+      false
     else:
-      # Fallback: if we can't compare, assume unbounded
-      return true
-  else:
-    # For primitives, check for zero value
-    when compises(r.endKey == default(K)):
-      if r.endKey == default(K):
-        return true
+      # Check if endKey is default (unbounded range)
+      when K is (ref object):
+        # For ref types, check if endKey is nil
+        if r.endKey.isNil:
+          true
+        else:
+          # Bounded range - compare with endKey
+          let cmp = r.current.key
+          if r.endInclusive:
+            keyEqualImpl(cmp, r.endKey) or keyLessImpl(cmp, r.endKey)
+          else:
+            keyLessImpl(cmp, r.endKey)
+      elif K is string:
+        # For strings, empty string means unbounded
+        if r.endKey.len == 0:
+          true
+        else:
+          let cmp = r.current.key
+          if r.endInclusive:
+            keyEqualImpl(cmp, r.endKey) or keyLessImpl(cmp, r.endKey)
+          else:
+            keyLessImpl(cmp, r.endKey)
+      elif K is (object or tuple):
+        # For objects/tuples, check if all fields are default
+        when compiles(r.endKey == default(K)):
+          if r.endKey == default(K):
+            true
+          else:
+            let cmp = r.current.key
+            if r.endInclusive:
+              keyEqualImpl(cmp, r.endKey) or keyLessImpl(cmp, r.endKey)
+            else:
+              keyLessImpl(cmp, r.endKey)
+        else:
+          # Fallback: if we can't compare, assume unbounded
+          true
+      else:
+        # For primitives, check for zero value
+        when compiles(r.endKey == default(K)):
+          if r.endKey == default(K):
+            true
+          else:
+            let cmp = r.current.key
+            if r.endInclusive:
+              keyEqualImpl(cmp, r.endKey) or keyLessImpl(cmp, r.endKey)
+            else:
+              keyLessImpl(cmp, r.endKey)
+        else:
+          # Fallback: assume bounded
+          let cmp = r.current.key
+          if r.endInclusive:
+            keyEqualImpl(cmp, r.endKey) or keyLessImpl(cmp, r.endKey)
+          else:
+            keyLessImpl(cmp, r.endKey)
 
-  # Bounded range - compare with endKey
-  let cmp = r.current.key
-  if r.endInclusive:
-    keyEqualImpl(cmp, r.endKey) or keyLessImpl(cmp, r.endKey)
-  else:
-    keyLessImpl(cmp, r.endKey)
-
-proc next*[K, V](r: RangeIter[K, V]): tuple[key: K, value: V] {.inline.} =
+template next*[K, V](r: RangeIter[K, V]): tuple[key: K, value: V] =
   ## Get next element in range
-  let node = r.current
-  result = (node.key, node.value)
-  r.current = loadNext(node, 0)
+  block:
+    let node = r.current
+    var result = (node.key, node.value)
+    r.current = loadNext(node, 0)
+    result
 
 # ============================================================================
-# Entry Accessors
+# Entry Accessors - TEMPLATES for true inlining
 # ============================================================================
 
-proc key*[K, V](e: Entry[K, V]): K {.inline.} = e.node.key
-proc value*[K, V](e: Entry[K, V]): V {.inline.} = e.node.value
+template key*[K, V](e: Entry[K, V]): K = e.node.key
+template value*[K, V](e: Entry[K, V]): V = e.node.value
 
 # ============================================================================
 # Tests
