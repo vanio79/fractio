@@ -214,7 +214,7 @@ proc next*(m: var StreamingMergeIterator): Option[tuple[key: InternalKey,
 
     # Check if this is a new key
     if key.userKey != m.lastKey:
-      m.lastKey = key.userKey.toString()
+      m.lastKey = key.userKey
       m.lastAdded = false
 
       # Decide whether to include this entry

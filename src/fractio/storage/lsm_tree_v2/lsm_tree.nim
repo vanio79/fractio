@@ -6,8 +6,6 @@
 ##
 ## Updated to use VersionHistory for proper MVCC snapshot isolation.
 ## Matches Rust implementation architecture.
-##
-## OPTIMIZED: Uses SearchKey for zero-copy lookups
 
 import std/[atomics, os, locks, options]
 import types
@@ -22,7 +20,6 @@ import version_history
 import rwlock
 import wal
 import manifest
-import skiplist_search # Zero-copy search operations
 
 # Re-export for compatibility
 export types
@@ -151,7 +148,6 @@ proc currentSnapshotSeqno*(t: Tree): SeqNo =
 
 proc insert*(t: Tree, key: string, value: string, seqno: SeqNo): (uint64, uint64) =
   ## Insert a key-value pair into the tree
-  ## Uses arena allocation for keys - eliminates per-key GC overhead
 
   # Write to WAL first for durability (if enabled)
   if t.inner.config.walEnabled and t.inner.walManager.isSome:
@@ -164,7 +160,7 @@ proc insert*(t: Tree, key: string, value: string, seqno: SeqNo): (uint64, uint64
   let currentVersion = t.inner.versionHistory.value.latestVersion()
   t.inner.versionHistory.releaseRead()
 
-  # Use insertFromString which copies key into arena
+  # Use insertFromString which stores a copy of the key
   let (size, totalSize) = currentVersion.activeMemtable.insertFromString(key,
       value, seqno)
 
@@ -191,7 +187,7 @@ proc remove*(t: Tree, key: string, seqno: SeqNo): (uint64, uint64) =
   let currentVersion = t.inner.versionHistory.value.latestVersion()
   t.inner.versionHistory.releaseRead()
 
-  # Insert tombstone - copy key into arena
+  # Insert tombstone
   let (size, totalSize) = currentVersion.activeMemtable.insertFromString(key,
       "", seqno)
   return (size, totalSize)
@@ -234,9 +230,8 @@ proc getInternalEntry*(t: Tree, key: string, seqno: Option[SeqNo] = none(
 
   none(string)
 
-proc lookup*(t: Tree, key: string, seqno: Option[SeqNo] = none(
-    SeqNo)): Option[string] =
-  ## Lookup with snapshot isolation - OPTIMIZED with zero-copy SearchKey
+proc lookup*(t: Tree, key: string, seqno: Option[SeqNo] = none(SeqNo)): Option[string] =
+  ## Lookup with snapshot isolation
   let snapshotSeqno = if seqno.isSome: seqno.get else: t.currentSnapshotSeqno()
 
   # Get appropriate version for this snapshot (thread-safe)
@@ -244,33 +239,17 @@ proc lookup*(t: Tree, key: string, seqno: Option[SeqNo] = none(
   let version = t.inner.versionHistory.value.getVersionForSnapshot(snapshotSeqno)
   t.inner.versionHistory.releaseRead()
 
-  # Check active memtable using zero-copy SearchKey
+  # Check active memtable
   let activeResult = version.activeMemtable.get(key, snapshotSeqno)
   if activeResult.isSome:
-    let value = activeResult.get
-    # Check if this is a tombstone using zero-copy SearchKey
-    let searchKey = newSearchKey(key, snapshotSeqno, vtValue)
-    let rangeIter = version.activeMemtable.items.rangeFromWithSearchKey(searchKey)
-    if rangeIter.hasNext():
-      let (k, v) = rangeIter.next()
-      if k.userKey == key and k.isTombstone():
-        return none(string)
-    return some(value)
+    return activeResult
 
-  # Check sealed memtables using zero-copy SearchKey
+  # Check sealed memtables
   if version.sealedMemtables.len > 0:
     for i in countdown(version.sealedMemtables.len - 1, 0):
       let result = version.sealedMemtables[i].get(key, snapshotSeqno)
       if result.isSome:
-        let value = result.get
-        # Check tombstone using zero-copy SearchKey
-        let searchKey = newSearchKey(key, snapshotSeqno, vtValue)
-        let rangeIter = version.sealedMemtables[i].items.rangeFromWithSearchKey(searchKey)
-        if rangeIter.hasNext():
-          let (k, v) = rangeIter.next()
-          if k.userKey == key and k.isTombstone():
-            return none(string)
-        return some(value)
+        return result
 
   # Check SSTables
   for table in version.tables:
@@ -282,9 +261,8 @@ proc lookup*(t: Tree, key: string, seqno: Option[SeqNo] = none(
     let tableResult = table.lookup(key, snapshotSeqno)
     if tableResult.isSome:
       let entry = tableResult.get
-      if entry.key.isTombstone():
-        return none(string)
-      return some(entry.value)
+      if not entry.key.isTombstone():
+        return some(entry.value)
 
   none(string)
 
@@ -334,7 +312,8 @@ proc flush*(t: Tree, memtable: Memtable): LsmResult[SsTable] =
     # Write all entries from memtable
     var entries = memtable.iter()
     for (key, value) in entries:
-      let addResult = writer.get.addEntry(key, value)
+      let addResult = writer.get.addEntrySimple(key.userKey, key.seqno,
+          key.valueType, value)
       if addResult.isErr:
         writer.get.close()
         return err[SsTable](addResult.error)

@@ -168,7 +168,7 @@ proc add*(b: BlockBuilder, key: InternalKey, value: string): LsmResult[void] =
     # Calculate shared prefix length
     var sharedLen = 0
     let minLen = min(b.lastKey.len, key.userKey.len)
-    while sharedLen < minLen and b.lastKey[sharedLen] == key.userKey.charAt(sharedLen):
+    while sharedLen < minLen and b.lastKey[sharedLen] == key.userKey[sharedLen]:
       inc sharedLen
 
     let unsharedLen = key.userKey.len - sharedLen
@@ -186,7 +186,7 @@ proc add*(b: BlockBuilder, key: InternalKey, value: string): LsmResult[void] =
 
     # Unshared key bytes
     if unsharedLen > 0:
-      let unsharedKey = key.userKey.sliceToString(sharedLen, key.userKey.len)
+      let unsharedKey = key.userKey[sharedLen..<key.userKey.len]
       entry.add(unsharedKey)
 
     # Value bytes
@@ -196,12 +196,12 @@ proc add*(b: BlockBuilder, key: InternalKey, value: string): LsmResult[void] =
     b.buffer.add(entry)
 
     # Update last key
-    b.lastKey = key.userKey.toString()
+    b.lastKey = key.userKey
 
     # Update hash index - map key to binary index position (restart point index)
     let restartIdx = b.restartPoints.len - 1 # Current restart point index
     if restartIdx < 255: # Max value for uint8
-      discard b.hashIndexBuilder.set(key.userKey.toString(), uint8(restartIdx))
+      discard b.hashIndexBuilder.set(key.userKey, uint8(restartIdx))
 
     # Update restart points
     b.entryCount += 1
@@ -348,7 +348,7 @@ proc next*(r: BlockReader): Option[tuple[key: InternalKey, value: string]] =
   r.currentIndex += 1
 
   some((
-    key: newInternalKey(toKeySlice(keyData), 0.SeqNo, vtValue),
+    key: newInternalKey(keyData, 0.SeqNo, vtValue),
     value: valueData
   ))
 
@@ -398,9 +398,9 @@ proc addEntry*(w: TableWriter, key: InternalKey, value: string): LsmResult[void]
     # Update min/max key and seqno
     # NOTE: InternalKey ordering has DESCENDING seqno, so first entry has HIGHEST seqno
     if w.entryCount == 0:
-      w.minKey = key.userKey.toString()
+      w.minKey = key.userKey
       w.largestSeqno = key.seqno # First entry has highest seqno
-    w.maxKey = key.userKey.toString()
+    w.maxKey = key.userKey
     w.smallestSeqno = key.seqno # Will end up with lowest seqno after iteration
     inc(w.entryCount) # CRITICAL FIX: Increment entry count!
 
@@ -431,6 +431,12 @@ proc addEntry*(w: TableWriter, key: InternalKey, value: string): LsmResult[void]
     return errVoid(newIoError("Failed to add entry: " & getCurrentExceptionMsg()))
 
   okVoid()
+
+proc addEntrySimple*(w: TableWriter, userKey: string, seqno: SeqNo,
+                     valueType: ValueType, value: string): LsmResult[void] =
+  ## Add entry with simple string key (from memtable)
+  let internalKey = newInternalKey(userKey, seqno, valueType)
+  addEntry(w, internalKey, value)
 
 proc finish*(w: TableWriter): LsmResult[void] =
   try:
@@ -718,7 +724,7 @@ proc searchDataBlockWithHashIndex*(blockData: string, key: string, seqno: SeqNo,
           if storedSeqno > uint64(seqno):
             return none(tuple[key: InternalKey, value: string])
 
-          let internalKey = newInternalKey(toKeySlice(entryKey),
+          let internalKey = newInternalKey(entryKey,
               storedSeqno.SeqNo, storedType)
           return some((key: internalKey, value: valueData))
         # If key doesn't match, fall through to linear scan
@@ -949,7 +955,7 @@ proc newTableRangeIter*(table: SsTable, startKey, endKey: string,
                 break
 
               # Add entry (using targetSeqno as approximation)
-              let internalKey = newInternalKey(toKeySlice(entryKey),
+              let internalKey = newInternalKey(entryKey,
                   targetSeqno, vtValue)
               result.entries.add((key: internalKey, value: valueData))
 
@@ -986,8 +992,8 @@ when isMainModule:
 
   # Test block builder
   let builder = newBlockBuilder()
-  discard builder.add(newInternalKey(toKeySlice("key1"), 1.SeqNo, vtValue), "value1")
-  discard builder.add(newInternalKey(toKeySlice("key2"), 2.SeqNo, vtValue), "value2")
+  discard builder.add(newInternalKey("key1", 1.SeqNo, vtValue), "value1")
+  discard builder.add(newInternalKey("key2", 2.SeqNo, vtValue), "value2")
 
   let blockData = builder.finish()
   if blockData.isOk:

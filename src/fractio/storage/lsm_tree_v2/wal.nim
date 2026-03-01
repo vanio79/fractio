@@ -234,7 +234,7 @@ proc replay*(w: WALManager, memtable: var Memtable): LsmResult[void] =
         value = valBuf
         pos += valLen
 
-      # Apply to memtable - use insertFromString which copies into arena
+      # Apply to memtable
       if typeByte == WAL_TYPE_INSERT:
         discard memtable.insertFromString(keyBuf, value, seqno)
       else:

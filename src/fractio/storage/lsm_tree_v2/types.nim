@@ -1,14 +1,11 @@
 # Copyright (c) 2024-present, fractio-rs
 # This source code is licensed under both the Apache 2.0 and MIT License
 
-## LSM Tree v2 - Core Types with Arena-allocated keys
+## LSM Tree v2 - Core Types
 ##
-## Uses KeySlice for keys - borrowed from a shared arena
-## This eliminates per-key GC tracking overhead
+## Simple string-based keys for clarity and maintainability
 
 import std/hashes
-import arena
-export arena
 
 # ============================================================================
 # Domain Types
@@ -38,19 +35,18 @@ func toByte*(vt: ValueType): uint8 =
   of vtIndirection: 4'u8
 
 # ============================================================================
-# InternalKey - Uses KeySlice (borrowed from arena)
+# InternalKey - Simple string-based key
 # ============================================================================
 
 type
   InternalKey* = object
-    ## Key stored in skip list nodes - borrows data from arena
-    userKey*: KeySlice
+    ## Key stored in skip list nodes - owns its string data
+    userKey*: string
     seqno*: SeqNo
     valueType*: ValueType
 
-proc newInternalKey*(userKey: KeySlice, seqno: SeqNo,
+proc newInternalKey*(userKey: string, seqno: SeqNo,
     valueType: ValueType): InternalKey {.inline.} =
-  ## Create an InternalKey with a KeySlice (already in arena)
   result = InternalKey(
     userKey: userKey,
     seqno: seqno,
@@ -77,51 +73,6 @@ proc `<`*(a, b: InternalKey): bool =
   return a.valueType < b.valueType
 
 # ============================================================================
-# SearchKey - Borrows from caller's string (temporary, for lookup)
-# ============================================================================
-
-type
-  SearchKey* = object
-    ## Temporary search key - borrows from caller's string
-    userKey*: KeySlice
-    seqno*: SeqNo
-    valueType*: ValueType
-
-proc newSearchKey*(userKey: string, seqno: SeqNo,
-    valueType: ValueType): SearchKey {.inline.} =
-  ## Create a SearchKey that borrows from a string (zero-copy, temporary!)
-  ## WARNING: The string must outlive the SearchKey
-  result = SearchKey(
-    userKey: KeySlice(
-      data: if userKey.len > 0: cast[ptr UncheckedArray[byte]](userKey[
-          0].unsafeAddr) else: nil,
-      len: userKey.len
-    ),
-    seqno: seqno,
-    valueType: valueType
-  )
-
-proc isTombstone*(key: SearchKey): bool {.inline.} =
-  key.valueType.isTombstone()
-
-# ============================================================================
-# Comparison: SearchKey vs InternalKey
-# ============================================================================
-
-proc `==`*(a: SearchKey, b: InternalKey): bool {.inline.} =
-  a.userKey == b.userKey and int(a.seqno) == int(b.seqno) and a.valueType == b.valueType
-
-proc `<`*(a: SearchKey, b: InternalKey): bool {.inline.} =
-  if a.userKey != b.userKey:
-    return a.userKey < b.userKey
-  if int(a.seqno) != int(b.seqno):
-    return int(a.seqno) > int(b.seqno)
-  result = a.valueType < b.valueType
-
-proc `<`*(a: InternalKey, b: SearchKey): bool {.inline.} =
-  not (b == a) and not (b < a)
-
-# ============================================================================
 # Comparison: InternalKey for heap ordering
 # ============================================================================
 
@@ -131,6 +82,12 @@ proc cmpInternalKey*(a, b: InternalKey): int =
   let cmpSeq = cmp(int(b.seqno), int(a.seqno)) # Descending seqno
   if cmpSeq != 0: return cmpSeq
   return cmp(int(a.valueType), int(b.valueType))
+
+# String comparison helper
+proc cmp*(a, b: string): int =
+  if a < b: return -1
+  if a > b: return 1
+  return 0
 
 # ============================================================================
 # SeqNo comparisons
