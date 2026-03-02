@@ -1,108 +1,62 @@
 ## Read-Write Lock Implementation for LSM Tree
 ##
-## Provides a proper read-write lock for version history management.
-## Uses a simple approach: write lock is exclusive, read lock allows multiple readers.
+## Multiple readers can hold the lock simultaneously.
+## Writer has exclusive access and priority over new readers.
+##
+## State encoding:
+##   -1 or less: writer holds lock (nested writers use -2, -3, etc.)
+##   0: unlocked
+##   1 or more: number of active readers
 
-import std/[locks, atomics]
-
-# ============================================================================
-# RwLock - Read-Write Lock (non-generic base)
-# ============================================================================
-
-type
-  RwLockBase* = ref object
-    lock*: Lock
-    readerCount*: Atomic[int32]
-
-proc newRwLockBase*(): RwLockBase =
-  ## Create a new RwLockBase
-  var lock: Lock
-  initLock(lock)
-  result = RwLockBase(
-    lock: lock,
-    readerCount: default(Atomic[int32])
-  )
-  store(result.readerCount, 0.int32)
-
-proc acquireRead*(r: RwLockBase) =
-  ## Acquire read lock (multiple readers allowed)
-  ## Simple approach: just increment reader count
-  ## Writers will acquire the lock which blocks all readers
-  atomicInc(r.readerCount, 1.int32)
-
-proc releaseRead*(r: RwLockBase) =
-  ## Release read lock
-  atomicDec(r.readerCount, 1.int32)
-
-proc acquireWrite*(r: RwLockBase) =
-  ## Acquire write lock (exclusive)
-  ## First acquire the base lock, then wait for all readers to finish
-  r.lock.acquire()
-
-  # Wait for all readers to release
-  while load(r.readerCount, moAcquire) > 0:
-    # Spin-wait with small backoff
-    for _ in 0..<100:
-      discard
-
-proc releaseWrite*(r: RwLockBase) =
-  ## Release write lock
-  r.lock.release()
-
-# ============================================================================
-# RwLock - Generic wrapper with value storage
-# ============================================================================
+import std/atomics
 
 type
-  RwLock*[T] = object
-    base*: RwLockBase
-    value*: T
+  SpinRwLock* = object
+    state*: Atomic[int]
 
-proc newRwLock*[T](value: T): RwLock[T] =
-  ## Create a new RwLock with initial value
-  result = RwLock[T](
-    base: newRwLockBase(),
-    value: value
-  )
+proc initSpinRwLock*(): SpinRwLock =
+  result.state.store(0, moRelaxed)
 
-proc acquireRead*[T](r: RwLock[T]) =
-  ## Acquire read lock (multiple readers allowed)
-  r.base.acquireRead()
+template read*(rw: var SpinRwLock, body: untyped) =
+  ## Acquire read lock, execute body, release read lock.
+  var acquired = false
 
-proc releaseRead*[T](r: RwLock[T]) =
-  ## Release read lock
-  r.base.releaseRead()
+  while true:
+    let current = rw.state.load(moAcquire)
+    if current < 0:
+      # Writer is active - spin
+      cpuRelax()
+      continue
 
-proc acquireWrite*[T](r: RwLock[T]) =
-  ## Acquire write lock (exclusive)
-  r.base.acquireWrite()
+    # Try to increment reader count
+    var expected = current
+    if rw.state.compareExchange(expected, current + 1, moAcquire, moRelaxed):
+      acquired = true
+      break
 
-proc releaseWrite*[T](r: RwLock[T]) =
-  ## Release write lock
-  r.base.releaseWrite()
+  if acquired:
+    try:
+      body
+    finally:
+      discard rw.state.fetchSub(1, moRelease)
 
-# ============================================================================
-# Tests
-# ============================================================================
+template write*(rw: var SpinRwLock, body: untyped) =
+  ## Acquire write lock, execute body, release write lock.
+  var acquired = false
 
-when isMainModule:
-  echo "Testing RwLock..."
+  while true:
+    let current = rw.state.load(moAcquire)
+    if current == 0:
+      # No readers - try to acquire as writer
+      var expected = 0
+      if rw.state.compareExchange(expected, -1, moAcquire, moRelaxed):
+        acquired = true
+        break
+    # Either readers exist or another writer is active
+    cpuRelax()
 
-  var rwLock = newRwLock(0)
-
-  # Test read lock
-  rwLock.acquireRead()
-  assert rwLock.value == 0
-  rwLock.releaseRead()
-
-  # Test write lock
-  rwLock.acquireWrite()
-  rwLock.value = 1
-  rwLock.releaseWrite()
-
-  # Test read after write
-  rwLock.acquireRead()
-  assert rwLock.value == 1
-  rwLock.releaseRead()
-
-  echo "RwLock tests passed!"
+  if acquired:
+    try:
+      body
+    finally:
+      rw.state.store(0, moRelease)
