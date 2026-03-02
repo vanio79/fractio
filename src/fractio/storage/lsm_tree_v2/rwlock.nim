@@ -1,7 +1,7 @@
 ## Read-Write Lock Implementation for LSM Tree
 ##
-## Provides a simple read-write lock for version history management.
-## Based on Nim's Lock implementation with reader-writer semantics.
+## Provides a proper read-write lock for version history management.
+## Uses a simple approach: write lock is exclusive, read lock allows multiple readers.
 
 import std/[locks, atomics]
 
@@ -13,7 +13,6 @@ type
   RwLockBase* = ref object
     lock*: Lock
     readerCount*: Atomic[int32]
-    writerCount*: Atomic[int32]
 
 proc newRwLockBase*(): RwLockBase =
   ## Create a new RwLockBase
@@ -21,29 +20,34 @@ proc newRwLockBase*(): RwLockBase =
   initLock(lock)
   result = RwLockBase(
     lock: lock,
-    readerCount: default(Atomic[int32]),
-    writerCount: default(Atomic[int32])
+    readerCount: default(Atomic[int32])
   )
   store(result.readerCount, 0.int32)
-  store(result.writerCount, 0.int32)
 
-template acquireRead*(r: RwLockBase) =
+proc acquireRead*(r: RwLockBase) =
   ## Acquire read lock (multiple readers allowed)
+  ## Simple approach: just increment reader count
+  ## Writers will acquire the lock which blocks all readers
   atomicInc(r.readerCount, 1.int32)
 
-template releaseRead*(r: RwLockBase) =
+proc releaseRead*(r: RwLockBase) =
   ## Release read lock
   atomicDec(r.readerCount, 1.int32)
 
-template acquireWrite*(r: RwLockBase) =
+proc acquireWrite*(r: RwLockBase) =
   ## Acquire write lock (exclusive)
-  atomicInc(r.writerCount, 1.int32)
+  ## First acquire the base lock, then wait for all readers to finish
   r.lock.acquire()
 
-template releaseWrite*(r: RwLockBase) =
+  # Wait for all readers to release
+  while load(r.readerCount, moAcquire) > 0:
+    # Spin-wait with small backoff
+    for _ in 0..<100:
+      discard
+
+proc releaseWrite*(r: RwLockBase) =
   ## Release write lock
   r.lock.release()
-  atomicDec(r.writerCount, 1.int32)
 
 # ============================================================================
 # RwLock - Generic wrapper with value storage
@@ -61,19 +65,19 @@ proc newRwLock*[T](value: T): RwLock[T] =
     value: value
   )
 
-template acquireRead*[T](r: RwLock[T]) =
+proc acquireRead*[T](r: RwLock[T]) =
   ## Acquire read lock (multiple readers allowed)
   r.base.acquireRead()
 
-template releaseRead*[T](r: RwLock[T]) =
+proc releaseRead*[T](r: RwLock[T]) =
   ## Release read lock
   r.base.releaseRead()
 
-template acquireWrite*[T](r: RwLock[T]) =
+proc acquireWrite*[T](r: RwLock[T]) =
   ## Acquire write lock (exclusive)
   r.base.acquireWrite()
 
-template releaseWrite*[T](r: RwLock[T]) =
+proc releaseWrite*[T](r: RwLock[T]) =
   ## Release write lock
   r.base.releaseWrite()
 

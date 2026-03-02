@@ -17,7 +17,6 @@ import atomics_helpers
 import config
 import cache
 import version_history
-import rwlock
 import wal
 import manifest
 
@@ -39,12 +38,12 @@ type
   TreeInner* = ref object
     id*: TreeId
     config*: Config
-    versionHistory*: RwLock[VersionHistory] # Historical versions for MVCC
+    versionHistory*: VersionHistory # Lock-free reads, write lock inside
     tableIdCounter*: Atomic[uint64]
     flushLock*: Lock
-    walManager*: Option[WALManager]         # None when walEnabled=false (in-memory only)
+    walManager*: Option[WALManager] # None when walEnabled=false (in-memory only)
     manifestManager*: ManifestManager
-    insertedKeys*: seq[string]              # For benchmark verification
+    insertedKeys*: seq[string]      # For benchmark verification
 
 # ============================================================================
 # Tree - Public interface wrapper
@@ -76,9 +75,8 @@ proc newTree*(config: Config, id: TreeId = TreeId(0)): Tree =
   # Create initial SuperVersion
   let initialVersion = newSuperVersion(0.SeqNo)
 
-  # Create version history
+  # Create version history (lock-free reads now)
   let versionHist = newVersionHistory(initialVersion)
-  let versionHistoryLock = newRwLock[VersionHistory](versionHist)
 
   # Create WAL manager only if enabled
   var walManager: Option[WALManager] = none(WALManager)
@@ -111,7 +109,7 @@ proc newTree*(config: Config, id: TreeId = TreeId(0)): Tree =
   let treeInner = TreeInner(
     id: id,
     config: config,
-    versionHistory: versionHistoryLock,
+    versionHistory: versionHist,
     tableIdCounter: tableIdCounter,
     flushLock: flushLock,
     walManager: walManager,
@@ -140,7 +138,7 @@ proc nextMemtableId*(t: Tree): MemtableId =
 
 proc currentSnapshotSeqno*(t: Tree): SeqNo =
   ## Return current snapshot sequence number
-  load(t.inner.versionHistory.value.latestSeqno, moRelaxed)
+  load(t.inner.versionHistory.latestSeqno, moRelaxed)
 
 # ============================================================================
 # Core Operations with Version History
@@ -148,7 +146,7 @@ proc currentSnapshotSeqno*(t: Tree): SeqNo =
 
 proc insert*(t: Tree, key: string, value: string, seqno: SeqNo): (uint64, uint64) =
   ## Insert a key-value pair into the tree
-  ## Matches Rust's append_entry which just reads version and inserts
+  ## Uses lock-free read of current version
 
   # Write to WAL first for durability (if enabled)
   if t.inner.config.walEnabled and t.inner.walManager.isSome:
@@ -156,17 +154,15 @@ proc insert*(t: Tree, key: string, value: string, seqno: SeqNo): (uint64, uint64
     if walResult.isErr:
       discard # WAL write failed, continue anyway
 
-  # Get current version and insert - matches Rust's append_entry
-  # Note: acquireRead/releaseRead are just atomic inc/dec, not actual locks
-  t.inner.versionHistory.acquireRead()
-  let currentVersion = t.inner.versionHistory.value.latestVersion()
-  t.inner.versionHistory.releaseRead()
+  # Get current version using lock-free read
+  let currentVersion = t.inner.versionHistory.latestVersionNoLock()
 
-  # Insert into memtable - Rust doesn't update a separate latestSeqno
+  # Insert into memtable
   result = currentVersion.activeMemtable.insertFromString(key, value, seqno)
 
 proc remove*(t: Tree, key: string, seqno: SeqNo): (uint64, uint64) =
   ## Remove a key from the tree (insert tombstone)
+  ## Uses lock-free read of current version
 
   # Write to WAL first for durability (if enabled)
   if t.inner.config.walEnabled and t.inner.walManager.isSome:
@@ -174,22 +170,19 @@ proc remove*(t: Tree, key: string, seqno: SeqNo): (uint64, uint64) =
     if walResult.isErr:
       discard # WAL write failed, continue anyway
 
-  # Get current version and insert tombstone
-  t.inner.versionHistory.acquireRead()
-  let currentVersion = t.inner.versionHistory.value.latestVersion()
-  t.inner.versionHistory.releaseRead()
+  # Get current version using lock-free read
+  let currentVersion = t.inner.versionHistory.latestVersionNoLock()
 
   result = currentVersion.activeMemtable.insertFromString(key, "", seqno)
 
 proc getInternalEntry*(t: Tree, key: string, seqno: Option[SeqNo] = none(
     SeqNo)): Option[string] =
   ## Get value for key with snapshot isolation
+  ## Uses lock-free read of current version
   let snapshotSeqno = if seqno.isSome: seqno.get else: t.currentSnapshotSeqno()
 
-  # Get version for snapshot
-  t.inner.versionHistory.acquireRead()
-  let version = t.inner.versionHistory.value.getVersionForSnapshot(snapshotSeqno)
-  t.inner.versionHistory.releaseRead()
+  # Get version using lock-free read
+  let version = t.inner.versionHistory.getVersionForSnapshot(snapshotSeqno)
 
   # Check active memtable
   let activeResult = version.activeMemtable.get(key, snapshotSeqno)
@@ -220,12 +213,11 @@ proc getInternalEntry*(t: Tree, key: string, seqno: Option[SeqNo] = none(
 
 proc lookup*(t: Tree, key: string, seqno: Option[SeqNo] = none(SeqNo)): Option[string] =
   ## Lookup with snapshot isolation
+  ## Uses lock-free read of current version
   let snapshotSeqno = if seqno.isSome: seqno.get else: t.currentSnapshotSeqno()
 
-  # Get version for snapshot
-  t.inner.versionHistory.acquireRead()
-  let version = t.inner.versionHistory.value.getVersionForSnapshot(snapshotSeqno)
-  t.inner.versionHistory.releaseRead()
+  # Get version using lock-free read
+  let version = t.inner.versionHistory.getVersionForSnapshot(snapshotSeqno)
 
   # Check active memtable
   let activeResult = version.activeMemtable.get(key, snapshotSeqno)
@@ -267,20 +259,20 @@ proc rotateMemtable*(t: Tree): Option[Memtable] =
   ## Rotate active memtable to sealed (requires write lock)
   t.inner.versionHistory.acquireWrite()
 
-  if t.inner.versionHistory.value.latestVersion().activeMemtable.isEmpty():
+  if t.inner.versionHistory.latestVersion().activeMemtable.isEmpty():
     t.inner.versionHistory.releaseWrite()
     return none(Memtable)
 
-  let yanked = t.inner.versionHistory.value.latestVersion().activeMemtable
+  let yanked = t.inner.versionHistory.latestVersion().activeMemtable
   let newMemtable = newMemtable(t.nextMemtableId())
 
   # Create new SuperVersion with rotated memtable
   var newVersion = newSuperVersion(t.currentSnapshotSeqno())
   newVersion.activeMemtable = newMemtable
-  newVersion.sealedMemtables = t.inner.versionHistory.value.latestVersion().sealedMemtables & yanked
-  newVersion.tables = t.inner.versionHistory.value.latestVersion().tables
+  newVersion.sealedMemtables = t.inner.versionHistory.latestVersion().sealedMemtables & yanked
+  newVersion.tables = t.inner.versionHistory.latestVersion().tables
 
-  t.inner.versionHistory.value.appendVersion(newVersion)
+  t.inner.versionHistory.appendVersion(newVersion)
 
   t.inner.versionHistory.releaseWrite()
   return some(yanked)
@@ -341,12 +333,12 @@ proc flush*(t: Tree, memtable: Memtable): LsmResult[SsTable] =
 
     # Add to version history
     t.inner.versionHistory.acquireWrite()
-    let currentVersion = t.inner.versionHistory.value.latestVersion()
+    let currentVersion = t.inner.versionHistory.latestVersion()
     var newVersion = newSuperVersion(t.currentSnapshotSeqno())
     newVersion.activeMemtable = currentVersion.activeMemtable
     newVersion.sealedMemtables = currentVersion.sealedMemtables
     newVersion.tables = currentVersion.tables & ssTable
-    t.inner.versionHistory.value.appendVersion(newVersion)
+    t.inner.versionHistory.appendVersion(newVersion)
     t.inner.versionHistory.releaseWrite()
 
     ok(ssTable)
@@ -356,7 +348,7 @@ proc flush*(t: Tree, memtable: Memtable): LsmResult[SsTable] =
 
 proc advanceSnapshotSeqno*(t: Tree): SeqNo =
   ## Advance snapshot sequence number (called during flush)
-  let oldSeqno = fetchAddSeqNo(t.inner.versionHistory.value.latestSeqno, 1, moRelaxed)
+  let oldSeqno = fetchAddSeqNo(t.inner.versionHistory.latestSeqno, 1, moRelaxed)
   SeqNo(int64(oldSeqno) + 1)
 
 # ============================================================================
@@ -372,13 +364,11 @@ proc createNewTree*(config: Config, id: TreeId = TreeId(0'u64)): LsmResult[Tree]
 
 proc contains*(t: Tree, key: string, seqno: Option[SeqNo] = none(SeqNo)): bool =
   ## Check if key exists in tree
-  ## OPTIMIZED: Inline the lookup to avoid extra function call overhead
+  ## Uses lock-free read of current version
   let snapshotSeqno = if seqno.isSome: seqno.get else: t.currentSnapshotSeqno()
 
-  # Get version for snapshot
-  t.inner.versionHistory.acquireRead()
-  let version = t.inner.versionHistory.value.getVersionForSnapshot(snapshotSeqno)
-  t.inner.versionHistory.releaseRead()
+  # Get version using lock-free read
+  let version = t.inner.versionHistory.getVersionForSnapshot(snapshotSeqno)
 
   # Check active memtable - return as soon as we find it
   let activeResult = version.activeMemtable.get(key, snapshotSeqno)
