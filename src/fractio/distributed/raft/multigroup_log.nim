@@ -8,6 +8,7 @@ import std/options
 import std/json
 import std/strutils
 import std/sequtils
+import std/tables
 
 import fractio/distributed/range/types
 import fractio/distributed/raft/multigroup_types
@@ -78,8 +79,8 @@ proc decodeEntry*(data: string): LogEntry =
   let json = parseJson(data)
 
   new(result)
-  result.term = json["term"].getUInt()
-  result.index = json["index"].getUInt()
+  result.term = uint64(json["term"].getInt())
+  result.index = uint64(json["index"].getInt())
 
   let cmdKind = CommandKind(json["commandKind"].getInt())
 
@@ -109,12 +110,12 @@ proc decodeEntry*(data: string): LogEntry =
     result.command = RaftCommand(
       kind: ckSplit,
       splitKey: splitKey,
-      newRangeId: RangeID(json["newRangeId"].getUInt())
+      newRangeId: RangeID(uint64(json["newRangeId"].getInt()))
     )
   of ckMerge:
     result.command = RaftCommand(
       kind: ckMerge,
-      otherRangeId: RangeID(json["otherRangeId"].getUInt())
+      otherRangeId: RangeID(uint64(json["otherRangeId"].getInt()))
     )
   of ckChangeReplicas:
     let repJson = json["replica"]
@@ -210,11 +211,11 @@ proc truncate*(log: RaftLog, fromIndex: uint64) =
     let key = encodeLogKey(log.rangeId, idx)
     if not log.store.exists(key):
       break
-    log.store.delete(key)
+    discard log.store.delete(key)
     inc idx
 
   # Update last index
-  var current = log.lastIndex.load
+  var current = log.lastIndex.load()
   while fromIndex - 1 < current:
     if log.lastIndex.compareExchange(current, fromIndex - 1):
       break
@@ -222,12 +223,11 @@ proc truncate*(log: RaftLog, fromIndex: uint64) =
 proc compact*(log: RaftLog, toIndex: uint64) =
   ## Compact log entries up to index (exclusive)
   ## Called after snapshot
-  var idx = log.firstIndex.load
+  var idx = log.firstIndex.load()
   while idx < toIndex:
     let key = encodeLogKey(log.rangeId, idx)
-    log.store.delete(key)
+    discard log.store.delete(key)
     inc idx
-
   log.firstIndex.store(toIndex)
 
 # ============================================================================
@@ -292,10 +292,10 @@ proc loadState*(log: RaftLog): Option[RaftPersistentState] =
   if value.isSome:
     let json = parseJson(value.get)
     result = some(RaftPersistentState(
-      currentTerm: json["currentTerm"].getUInt(),
+      currentTerm: uint64(json["currentTerm"].getInt()),
       votedFor: ReplicaID(json["votedFor"].getInt()),
-      commitIndex: json["commitIndex"].getUInt(),
-      lastApplied: json["lastApplied"].getUInt()
+      commitIndex: uint64(json["commitIndex"].getInt()),
+      lastApplied: uint64(json["lastApplied"].getInt())
     ))
 
 # ============================================================================
@@ -332,10 +332,10 @@ proc loadSnapshot*(log: RaftLog): Option[Snapshot] =
       stateMachineSnap.add(byte(b.getInt()))
 
     result = some(Snapshot(
-      rangeId: RangeID(json["rangeId"].getUInt()),
+      rangeId: RangeID(uint64(json["rangeId"].getInt())),
       raftSnap: RaftSnapshotMeta(
-        lastIncludedIndex: json["lastIncludedIndex"].getUInt(),
-        lastIncludedTerm: json["lastIncludedTerm"].getUInt(),
+        lastIncludedIndex: uint64(json["lastIncludedIndex"].getInt()),
+        lastIncludedTerm: uint64(json["lastIncludedTerm"].getInt()),
         configuration: config
       ),
       stateMachineSnap: stateMachineSnap
