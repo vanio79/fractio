@@ -21,22 +21,21 @@ Fractio's multi-group Raft follows CockroachDB's model where:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                      SQL Layer                               │
-│  (Parser, Planner, Executor - translates SQL to KV ops)     │
+│ SQL Layer                                                   │
+│ (Parser, Planner, Executor - translates SQL to KV ops)      │
 ├─────────────────────────────────────────────────────────────┤
-│                   Transaction Layer                          │
-│  (MVCC, 2PC for cross-range transactions, Timestamp Oracle) │
+│ Distribution Layer                                          │
+│ (Range routing, DistSender, Meta ranges, gRPC)              │
 ├─────────────────────────────────────────────────────────────┤
-│                   Distribution Layer                         │
-│  (Range routing, DistSender, Meta ranges, gRPC)             │
+│ Replication Layer                                           │
+│ (Multi-Group Raft, Leader Leases, Snapshots)                │
 ├─────────────────────────────────────────────────────────────┤
-│                   Replication Layer                          │
-│  (Multi-Group Raft, Leader Leases, Snapshots)               │
-├─────────────────────────────────────────────────────────────┤
-│                     Storage Layer                            │
-│  (WiscKey backend, MVCC storage, SSTables)                  │
+│ Storage Layer                                               │
+│ (WiscKey backend, MVCC storage, SSTables)                   │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+**Note**: Transaction support (MVCC, 2PC) will be implemented as a separate work item.
 
 ### 1.3 Data Flow
 
@@ -47,12 +46,6 @@ Client Request
 ┌─────────────┐
 │  SQL Layer  │ ─── Parse SQL, generate KV operations
 └─────────────┘
-      │
-      ▼
-┌─────────────────┐
-│ Transaction     │ ─── Begin transaction, assign timestamp
-│ Layer           │
-└─────────────────┘
       │
       ▼
 ┌─────────────────┐
@@ -450,48 +443,7 @@ type
 
 ---
 
-## 7. Transaction Layer Integration
-
-### 7.1 Single-Range Transactions
-
-For operations within a single range:
-1. Route to leaseholder
-2. Propose through Raft
-3. Wait for commit
-4. Return result
-
-### 7.2 Cross-Range Transactions (2PC)
-
-For operations spanning multiple ranges:
-
-```nim
-type
-  TransactionCoordinator* = ref object
-    ## Coordinates distributed transactions
-    txnId*: TransactionID
-    timestamp*: Timestamp
-    participants*: seq[RangeID]
-    state*: TxnState
-    
-  TxnState* = enum
-    tsPending
-    tsPrepared
-    tsCommitted
-    tsAborted
-```
-
-**Protocol**:
-1. **Prepare Phase**: Coordinator sends Prepare to all participants
-   - Each participant writes Prepare record to its Raft log
-   - Returns vote (yes/no) based on conflict detection
-2. **Commit Phase**: If all votes yes, coordinator sends Commit
-   - Each participant writes Commit record
-   - Transaction is durable
-3. **Abort**: If any vote no, coordinator sends Abort
-
----
-
-## 8. Rebalancing and Load Distribution
+## 7. Rebalancing and Load Distribution
 
 ### 8.1 Replica Rebalancing
 
@@ -528,7 +480,7 @@ Leases move to optimize latency:
 
 ---
 
-## 9. Configuration Changes
+## 8. Configuration Changes
 
 ### 9.1 Joint Consensus
 
@@ -560,7 +512,7 @@ type
 
 ---
 
-## 10. Error Handling
+## 9. Error Handling
 
 ### 10.1 Error Types
 
@@ -594,7 +546,7 @@ Per-replica circuit breakers prevent cascading failures:
 
 ---
 
-## 11. Thread Safety Model
+## 10. Thread Safety Model
 
 ### 11.1 Concurrency Design
 
@@ -630,7 +582,7 @@ Per-replica circuit breakers prevent cascading failures:
 
 ---
 
-## 12. Metrics and Monitoring
+## 11. Metrics and Monitoring
 
 ### 12.1 Key Metrics
 
@@ -663,7 +615,7 @@ type
 
 ---
 
-## 13. Implementation Priorities
+## 12. Implementation Priorities
 
 ### Phase 1: Core Multi-Group Infrastructure
 1. RangeDescriptor and RangeID types
@@ -681,20 +633,15 @@ type
 2. DistSender
 3. Range cache
 
-### Phase 4: Transactions
-1. Single-range transactions
-2. Cross-range 2PC
-
-### Phase 5: Rebalancing
+### Phase 4: Rebalancing
 1. Replica rebalancing
 2. Lease rebalancing
 3. Range splits/merges
 
 ---
 
-## 14. References
+## 13. References
 
 - CockroachDB Architecture Documentation
 - Raft Paper: "In Search of an Understandable Consensus Algorithm"
 - CockroachDB Leader Leases RFC
-- TiKV Transaction Model

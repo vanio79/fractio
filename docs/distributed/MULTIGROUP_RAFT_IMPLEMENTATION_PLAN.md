@@ -327,81 +327,11 @@ proc sendToNode*(ds: DistSender, nodeId: NodeID,
 
 ---
 
-## Phase 4: Transactions (Weeks 8-10)
+## Phase 4: Rebalancing (Weeks 8-9)
 
-### 4.1 Single-Range Transactions
+**Note**: Transaction support (MVCC, 2PC) will be implemented as a separate work item.
 
-**Files to Create/Modify:**
-- `src/fractio/distributed/txn/coordinator.nim`
-- `src/fractio/distributed/txn/record.nim`
-
-**Tasks:**
-1. Implement transaction record
-2. Create timestamp oracle integration
-3. Implement MVCC read snapshot
-4. Add write intent handling
-5. Unit tests for single-range transactions
-
-### 4.2 Cross-Range 2PC
-
-**Files to Create/Modify:**
-- `src/fractio/distributed/txn/2pc.nim`
-- `src/fractio/distributed/txn/participant.nim`
-
-**Tasks:**
-1. Implement 2PC coordinator
-2. Create participant state machine
-3. Implement prepare/commit/abort protocol
-4. Add transaction recovery
-5. Handle coordinator failure
-6. Integration tests for cross-range transactions
-
-**Key Implementation:**
-
-```nim
-# src/fractio/distributed/txn/2pc.nim
-
-type
-  TwoPhaseCommit* = ref object
-    txnId*: TransactionID
-    participants*: seq[RangeID]
-    state*: Atomic[TwoPCState]
-    votes*: Table[RangeID, bool]
-    lock*: Lock
-
-proc execute*(tpc: TwoPhaseCommit): Future[bool] =
-  ## Execute 2PC protocol
-  # Phase 1: Prepare
-  tpc.state.store(tpsPreparing)
-  var prepareFutures: seq[Future[PrepareResponse]]
-  for rangeId in tpc.participants:
-    prepareFutures.add(tpc.sendPrepare(rangeId))
-  
-  let prepareResults = await all(prepareFutures)
-  
-  # Check if all voted yes
-  var allYes = true
-  for result in prepareResults:
-    if not result.voteYes:
-      allYes = false
-      break
-  
-  # Phase 2: Commit or Abort
-  if allYes:
-    tpc.state.store(tpsCommitting)
-    await tpc.sendCommitAll()
-    return true
-  else:
-    tpc.state.store(tpsAborting)
-    await tpc.sendAbortAll()
-    return false
-```
-
----
-
-## Phase 5: Rebalancing (Weeks 11-12)
-
-### 5.1 Replica Rebalancing
+### 4.1 Replica Rebalancing
 
 **Files to Create/Modify:**
 - `src/fractio/distributed/rebalance/allocator.nim`
@@ -414,7 +344,7 @@ proc execute*(tpc: TwoPhaseCommit): Future[bool] =
 4. Add load-based rebalancing
 5. Integration tests for rebalancing
 
-### 5.2 Range Splits and Merges
+### 4.2 Range Splits and Merges
 
 **Files to Create/Modify:**
 - `src/fractio/distributed/range/split.nim`
@@ -429,9 +359,9 @@ proc execute*(tpc: TwoPhaseCommit): Future[bool] =
 
 ---
 
-## Phase 6: Testing and Hardening (Weeks 13-14)
+## Phase 5: Testing and Hardening (Weeks 10-11)
 
-### 6.1 Concurrency Tests
+### 5.1 Concurrency Tests
 
 **Files to Create:**
 - `tests/concurrency/distributed/raft/test_multigroup_stress.nim`
@@ -445,7 +375,7 @@ proc execute*(tpc: TwoPhaseCommit): Future[bool] =
 4. Network partition simulation
 5. Chaos testing framework
 
-### 6.2 Recovery Tests
+### 5.2 Recovery Tests
 
 **Files to Create:**
 - `tests/integration/distributed/raft/test_node_recovery.nim`
@@ -515,11 +445,6 @@ src/fractio/distributed/
 │   ├── types.nim          # Meta range types
 │   ├── range_cache.nim    # Range cache
 │   └── lookup.nim         # Range lookup
-├── txn/
-│   ├── coordinator.nim    # Transaction coordinator
-│   ├── record.nim         # Transaction record
-│   ├── 2pc.nim            # Two-phase commit
-│   └── participant.nim    # 2PC participant
 ├── rebalance/
 │   ├── allocator.nim      # Allocation decisions
 │   └── scheduler.nim      # Rebalance scheduling
@@ -538,12 +463,10 @@ tests/
 │   └── meta/
 │       └── test_lookup.nim
 ├── integration/distributed/
-│   ├── raft/
-│   │   ├── test_multigroup.nim
-│   │   ├── test_election.nim
-│   │   └── test_recovery.nim
-│   └── txn/
-│       └── test_2pc.nim
+│   └── raft/
+│       ├── test_multigroup.nim
+│       ├── test_election.nim
+│       └── test_recovery.nim
 └── concurrency/distributed/
     └── raft/
         ├── test_stress.nim
@@ -595,11 +518,10 @@ tests/
 | Phase 1: Core Infrastructure | 3 weeks | Week 1 | Week 3 |
 | Phase 2: Leader Leases | 2 weeks | Week 4 | Week 5 |
 | Phase 3: Distribution Layer | 2 weeks | Week 6 | Week 7 |
-| Phase 4: Transactions | 3 weeks | Week 8 | Week 10 |
-| Phase 5: Rebalancing | 2 weeks | Week 11 | Week 12 |
-| Phase 6: Testing | 2 weeks | Week 13 | Week 14 |
+| Phase 4: Rebalancing | 2 weeks | Week 8 | Week 9 |
+| Phase 5: Testing | 2 weeks | Week 10 | Week 11 |
 
-**Total Duration**: 14 weeks
+**Total Duration**: 11 weeks
 
 ---
 
