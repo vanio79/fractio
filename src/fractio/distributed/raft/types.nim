@@ -1,116 +1,79 @@
-## Raft consensus types for Fractio
-## This module defines the core types used by the Raft consensus algorithm,
-## including commands, log entries, and snapshots.
+# Raft Types and Core Definitions
 
-import ../../core/errors
+import std/options
+import std/sets
+import std/sequtils
+import std/tables
 
+# Raft Server Roles
 type
-  NodeId* = uint64
-    ## Unique identifier for a Raft node in the cluster
+  ServerRole* = enum
+    SR_LEADER
+    SR_CANDIDATE
+    SR_FOLLOWER
 
-  RaftCommandKind* = enum
-    ## Command types understood by the Raft state machine
-    rckNoop,         ## No-op (used for heartbeats)
-    rckAddNode,      ## Add a new node to the cluster configuration
-    rckRemoveNode,   ## Remove a node from the cluster
-    rckReconfigure,  ## Change cluster configuration (joint consensus)
-    rckClientCommand ## Direct client command (e.g., SQL statement)
+# Raft Node State
+type
+  RaftNodeState* = object
+    role*: ServerRole
+    currentTerm*: int64
+    votedFor*: int32
+    leaderId*: int32
+    commitIndex*: int64
+    lastApplied*: int64
 
-  RaftCommand* = ref object
-    ## A command to be replicated via Raft and applied to the state machine
-    kind*: RaftCommandKind
-      ## The kind of command
-    data*: seq[byte]
-      ## Opaque serialized command data. Interpretation depends on `kind`.
+# Raft Configuration
+type
+  RaftConfig* = object
+    ## Configuration for Raft node
+    serverId*: int32
+    endpoint*: string
+    electionTimeout*: int   # ms
+    heartbeatInterval*: int # ms
+    logStoragePath*: string # WiscKey path
+    snapshotEnabled*: bool
+    snapshotDistance*: int  # Log distance between snapshots
+    maxAppendSize*: int     # Max entries per append RPC
 
-  RaftEntry* = ref object
-    ## An entry in the Raft log
-    term*: uint64
-      ## Term when this entry was created (by leader)
-    index*: uint64
-      ## Log position (1-indexed). Monotonically increasing.
-    command*: RaftCommand
-      ## The command to apply
-    checksum*: uint32
-      ## CRC32 checksum of `command.data` for integrity verification
+# Raft Log Entry
+type
+  LogEntryType* = enum
+    LET_NORMAL
+    LET_CONFIG_CHANGE
+    LET_NO_OP
 
-  Snapshot* = ref object
-    ## A point-in-time snapshot of the state machine
-    lastIndex*: uint64
-      ## Log index of the last entry applied to create this snapshot
-    lastTerm*: uint64
-      ## Term of the last applied entry
-    data*: seq[byte]
-      ## Serialized state machine state (opaque)
+  LogEntry* = object
+    term*: int64
+    entryType*: LogEntryType
+    data*: string
 
-  # RPC message types
-  RaftMessageKind* = enum
-    rmRequestVote, rmRequestVoteReply, rmAppendEntries,
-    rmAppendEntriesReply, rmInstallSnapshot
+# Raft Log Store Interface
+type
+  RaftLogStore* = ref object of RootObj
+    ## Abstract log store for Raft
 
-  RequestVoteArgs* = object
-    term*: uint64
-    candidateId*: NodeId
-    lastLogIndex*: uint64
-    lastLogTerm*: uint64
+  RaftError* = object of CatchableError
+    ## Raft-specific errors
 
-  RequestVoteReply* = object
-    term*: uint64
-    voteGranted*: bool
+# Raft State Machine Interface
+type
+  StateMachine* = ref object of RootObj
+    ## Base class for user-defined state machines
 
-  AppendEntriesArgs* = object
-    term*: uint64
-    leaderId*: NodeId
-    prevLogIndex*: uint64
-    prevLogTerm*: uint64
-    entries*: seq[RaftEntry]
-    leaderCommit*: uint64
+  RaftNode* = ref object of RootObj
+    ## High-level Raft node for managing consensus
+    serverId*: int32
+    endpoint*: string
+    config*: RaftConfig
+    nodeState*: RaftNodeState
+    logStore*: RaftLogStore
+    stateMachine*: StateMachine
+    initialized*: bool
+    isLeader*: bool
+    leaderId*: int32
+    commitIndex*: int64
+    lastApplied*: int64
 
-  AppendEntriesReply* = object
-    term*: uint64
-    success*: bool
-    conflictTerm*: uint64  ## Optional: used for optimization
-    conflictIndex*: uint64 ## Optional: used for optimization
-
-  InstallSnapshotArgs* = object
-    term*: uint64
-    leaderId*: NodeId
-    lastIncludedIndex*: uint64
-    lastIncludedTerm*: uint64
-    data*: seq[byte]
-
-  RaftMessage* = ref object
-    case kind*: RaftMessageKind
-    of rmRequestVote:
-      requestVote*: RequestVoteArgs
-    of rmRequestVoteReply:
-      requestVoteReply*: RequestVoteReply
-    of rmAppendEntries:
-      appendEntries*: AppendEntriesArgs
-    of rmAppendEntriesReply:
-      appendEntriesReply*: AppendEntriesReply
-    of rmInstallSnapshot:
-      installSnapshot*: InstallSnapshotArgs
-
-  # Transport interface for sending RPCs and managing lifecycle.
-  RaftTransport* {.inheritable.} = ref object of RootObj
-    ## Abstract base class for Raft network transport implementations.
-
-  # Network address of a Raft node (used by transport)
-  NodeAddress* = object
-    host*: string
-    port*: uint16
-
-# Abstract methods for RaftTransport
-method send*(self: RaftTransport, dest: NodeId, msg: RaftMessage) {.raises: [
-    FractioError], gcsafe, base.} =
-  ## Send a Raft message to the specified destination node.
-  raise notImplementedError("RaftTransport.send must be overridden by concrete transport", "")
-
-method start*(self: RaftTransport) {.base.} =
-  ## Start the transport (bind sockets, launch threads, etc.).
-  raise notImplementedError("RaftTransport.start must be overridden by concrete transport", "")
-
-method close*(self: RaftTransport) {.base.} =
-  ## Stop the transport and release resources.
-  raise notImplementedError("RaftTransport.close must be overridden by concrete transport", "")
+method close*(store: RaftLogStore) {.base.} =
+  ## Close the log store (base implementation does nothing)
+  discard

@@ -1,0 +1,61 @@
+# Recovery Test 1 - Step 2: Parent verifies empty log recovery
+# Run after 01_empty_child.nim
+
+import std/os
+import std/options
+import fractio/distributed/raft/types
+import fractio/distributed/raft/node
+import fractio/distributed/raft/state_machine
+
+type TestStateMachine = ref object of StateMachine
+  commits: seq[(int64, string)]
+  rollbacks: seq[(int64, string)]
+  lastAppliedIndex: int64
+
+method commit(sm: TestStateMachine, logIdx: int64, data: string): string =
+  sm.commits.add((logIdx, data))
+  sm.lastAppliedIndex = logIdx
+  return "OK"
+
+method rollback(sm: TestStateMachine, logIdx: int64, data: string) =
+  sm.rollbacks.add((logIdx, data))
+
+method getLastAppliedIndex(sm: TestStateMachine): int64 =
+  result = sm.lastAppliedIndex
+
+let testPath = "tmp/raft_recovery_empty/"
+
+let config = RaftConfig(
+  serverId: 1,
+  endpoint: "127.0.0.1:9000",
+  electionTimeout: 1000,
+  heartbeatInterval: 100,
+  logStoragePath: testPath,
+  snapshotEnabled: false,
+  snapshotDistance: 1000,
+  maxAppendSize: 100
+)
+
+var sm = TestStateMachine(commits: @[], rollbacks: @[], lastAppliedIndex: 0)
+var raftNode = RaftNodeImpl(
+  serverId: config.serverId,
+  endpoint: config.endpoint,
+  config: config,
+  nodeState: RaftNodeState(role: SR_FOLLOWER, currentTerm: 0, votedFor: -1,
+      leaderId: -1, commitIndex: 0, lastApplied: 0),
+  logStore: nil, stateMachine: sm, initialized: false, isLeader: false,
+      leaderId: -1, commitIndex: 0, lastApplied: 0
+)
+
+let success = raftNode.init(config, sm)
+if not success:
+  echo "FAIL: Failed to recover log store"
+  quit(1)
+
+if raftNode.wsLogStore.nextIndex != 1:
+  echo "FAIL: Expected nextIndex=1, got ", raftNode.wsLogStore.nextIndex
+  quit(1)
+
+raftNode.shutdown()
+removeDir(testPath)
+echo "OK: Recovery with empty log verified"

@@ -22,6 +22,9 @@ proc newLogger*(name: string = "", minLevel: LogLevel = llInfo): Logger =
     echo msg
   )
 
+# Global logger instance
+var globalLogger* = newLogger("fractio", llDebug)
+
 proc setMinLevel*(self: Logger, level: LogLevel) =
   self.minLevel = level
 
@@ -39,7 +42,7 @@ proc formatMessage*(self: Logger, level: LogLevel, msg: string, fields: Table[
     result = fmt"[{self.name}] {msg}"
 
 proc log*(self: Logger, level: LogLevel, msg: string,
-         fields: Table[string, string] = initTable[string, string]()) {.gcsafe.} =
+    fields: Table[string, string] = initTable[string, string]()) {.gcsafe.} =
   if not self.shouldLog(level):
     return
   let formatted = self.formatMessage(level, msg, fields)
@@ -47,21 +50,38 @@ proc log*(self: Logger, level: LogLevel, msg: string,
     handler(level, formatted, fields)
 
 proc debug*(self: Logger, msg: string,
-            fields: Table[string, string] = initTable[string, string]()) {.gcsafe.} =
+    fields: Table[string, string] = initTable[string, string]()) {.gcsafe.} =
   self.log(llDebug, msg, fields)
 
 proc info*(self: Logger, msg: string,
-           fields: Table[string, string] = initTable[string, string]()) {.gcsafe.} =
+    fields: Table[string, string] = initTable[string, string]()) {.gcsafe.} =
   self.log(llInfo, msg, fields)
 
 proc warn*(self: Logger, msg: string,
-           fields: Table[string, string] = initTable[string, string]()) {.gcsafe.} =
+    fields: Table[string, string] = initTable[string, string]()) {.gcsafe.} =
   self.log(llWarn, msg, fields)
 
 proc error*(self: Logger, msg: string,
-            fields: Table[string, string] = initTable[string, string]()) {.gcsafe.} =
+    fields: Table[string, string] = initTable[string, string]()) {.gcsafe.} =
   self.log(llError, msg, fields)
 
 proc addHandler*(self: Logger, handler: proc(level: LogLevel, msg: string,
     fields: Table[string, string]) {.gcsafe.}) =
   self.handlers.add(handler)
+
+# Convenience procs that use the global logger
+proc debug*(msg: string, fields: Table[string, string] = initTable[string,
+    string]()) =
+  globalLogger.debug(msg, fields)
+
+proc info*(msg: string, fields: Table[string, string] = initTable[string,
+    string]()) =
+  globalLogger.info(msg, fields)
+
+proc warn*(msg: string, fields: Table[string, string] = initTable[string,
+    string]()) =
+  globalLogger.warn(msg, fields)
+
+proc error*(msg: string, fields: Table[string, string] = initTable[string,
+    string]()) =
+  globalLogger.error(msg, fields)

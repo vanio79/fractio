@@ -1,584 +1,476 @@
-## RaftNode state machine for Fractio
-## Implements leader election, log replication, commitment, and application.
-## Thread-safe with lock protection. Designed for unit testing with mock transports.
+# Raft Node Implementation
 
-import system
-import locks
-import tables
-import std/random
-import ../../core/errors
-import ../../utils/logging
-import ./types
-import ./log
-import ./states
+import std/json
+import std/strutils
+import std/streams
+import std/sets
+import std/sequtils
+import std/tables
+import std/times
+import std/options
+import std/os
+import std/locks
+
+import fractio/utils/logging
+import fractio/distributed/raft/types
+import fractio/storage/backend
+import fractio/storage/wisckey_backend
 
 type
-  RaftState* = enum
-    rsFollower, rsCandidate, rsLeader
+  WiscKeyLogStore* = ref object of RaftLogStore
+    ## WiscKey-based log store for Raft
+    backend*: WiscKeyBackend
+    path*: string # Store path for lock file cleanup
+    startIndex*: int64
+    nextIndex*: int64
+    lock*: Lock   # Lock for thread-safe index assignment
 
-  RaftConfig* = object
-    electionTimeoutMin*: uint64 ## Minimum election timeout in nanoseconds
-    electionTimeoutMax*: uint64 ## Maximum election timeout in nanoseconds
-    heartbeatInterval*: uint64  ## Leader heartbeat interval in nanoseconds
-    clusterSize*: int           ## Total number of nodes in the cluster
-    peerIds*: seq[NodeId]       ## IDs of all peers (excluding self)
+  RaftRPC* = object
+    ## Raft RPC message
+    rpcType*: RPCType
+    term*: int64
+    leaderId*: int32
+    prevLogIndex*: int64
+    prevLogTerm*: int64
+    entries*: seq[LogEntry]
+    leaderCommit*: int64
+    success*: bool
+    data*: string
 
-  RaftNode* = ref object
-    nodeId*: NodeId
-    state*: RaftState
-    term*: uint64
-    votedFor*: uint64
-    log*: RaftLog
-    commitIndex*: uint64
-    lastApplied*: uint64
-    leaderId*: uint64
-    transport*: RaftTransport
-    logger*: Logger
-    lock*: Lock
+  RPCType* = enum
+    RPC_APPEND_ENTRIES
+    RPC_REQUEST_VOTE
+    RPC_CLIENT_REQUEST
 
-    electionTimeoutMin*: uint64
-    electionTimeoutMax*: uint64
-    heartbeatInterval*: uint64
-    clusterSize*: int
-    peerIds*: seq[NodeId]
+  RaftNodeImpl* = ref object of RaftNode
+    ## Internal Raft node implementation
+    lastHeartbeat*: int64
+    lastVoteTerm*: int64
+    voteCount*: int
+    logEntries*: seq[LogEntry]
+    pendingEntries*: seq[LogEntry]
+    wsLogStore*: WiscKeyLogStore # Concrete log store type
 
-    electionDeadline*: uint64
-    heartbeatDeadline*: uint64
+  RaftError* = object of CatchableError
+    ## Raft-specific errors
 
-    nextIndex*: Table[NodeId, uint64]
-    matchIndex*: Table[NodeId, uint64]
-    lastSentIndex*: Table[NodeId, uint64] ## Tracks in-flight batch highest index (0 if none)
+# Forward declarations
+proc handleRPCAsFollower*(node: RaftNodeImpl, rpc: RaftRPC): RaftRPC
+proc handleRPCAsCandidate*(node: RaftNodeImpl, rpc: RaftRPC): RaftRPC
+proc handleRPCAsLeader*(node: RaftNodeImpl, rpc: RaftRPC): RaftRPC
 
-    votesGranted*: int
-    votesFrom*: Table[NodeId, bool]
+proc newWiscKeyLogStore*(path: string): WiscKeyLogStore =
+  ## Create a new WiscKey-based log store
+  new(result)
+  result.path = path
+  result.backend = newWiscKeyBackend(StorageConfig(
+    path: path,
+    createIfMissing: true,
+    syncWrites: true
+  ))
 
-    stateMachine*: RaftStateMachine ## Applied to committed entries
+  if not result.backend.open(StorageConfig(
+    path: path,
+    createIfMissing: true,
+    syncWrites: true
+  )):
+    raise newException(RaftError, "Failed to open WiscKey backend")
 
-# Helper: majority threshold
-proc majority(self: RaftNode): int {.gcsafe.} =
-  result = self.clusterSize div 2 + 1
-
-proc acquire(self: RaftNode) = self.lock.acquire()
-proc release(self: RaftNode) = self.lock.release()
-
-# Forward declarations for procs used in tick (defined later)
-proc becomeCandidate(self: RaftNode, now: uint64) {.gcsafe, raises: [FractioError].}
-proc sendHeartbeats(self: RaftNode) {.gcsafe, raises: [FractioError].}
-
-# Forward declarations for RPC handlers used in receiveMessage (defined later)
-proc handleRequestVote(self: RaftNode, sender: NodeId, args: RequestVoteArgs,
-    now: uint64) {.gcsafe, raises: [FractioError].}
-proc handleRequestVoteReply(self: RaftNode, sender: NodeId,
-    reply: RequestVoteReply, now: uint64) {.gcsafe, raises: [FractioError].}
-proc handleAppendEntries(self: RaftNode, sender: NodeId,
-    args: AppendEntriesArgs, now: uint64) {.gcsafe, raises: [FractioError].}
-proc handleAppendEntriesReply(self: RaftNode, sender: NodeId,
-    reply: AppendEntriesReply, now: uint64) {.gcsafe, raises: [FractioError].}
-proc handleInstallSnapshot(self: RaftNode, sender: NodeId,
-    args: InstallSnapshotArgs, now: uint64) {.gcsafe, raises: [FractioError].}
-
-# Forward declarations for other procs used before definition
-proc maybeCommit(self: RaftNode) {.gcsafe, raises: [FractioError].}
-  ## Applies all committed but not yet applied entries to the state machine.
-  ## Calls `stateMachine.applyImpl` for each new entry. Idempotent: already applied entries are skipped.
-  ## Errors from `applyImpl` are caught and logged but do not stop processing.
-proc applyEntries*(self: RaftNode) {.gcsafe, raises: [FractioError].}
-
-# Helper to safely log errors without raising exceptions
-proc safeLogError(logger: Logger, msg: string) {.gcsafe, raises: [].} =
-  try:
-    logger.error(msg)
-  except Exception:
-    discard
-
-proc newRaftNode*(nodeId: NodeId, log: RaftLog, transport: RaftTransport,
-    logger: Logger, config: RaftConfig, stateMachine: RaftStateMachine,
-        now: uint64): RaftNode =
-  ## Create a new RaftNode. It starts as a follower with an election timer set.
-  ##
-  ## - stateMachine: Implementation that applies committed entries to the state machine.
-  ##   Must be thread-safe and idempotent. Errors are logged but do not destabilize the node.
-  result = RaftNode(
-    nodeId: nodeId,
-    state: rsFollower,
-    term: log.getCurrentTerm(),
-    votedFor: log.getVotedFor(),
-    log: log,
-    commitIndex: log.getCommitIndex(),
-    lastApplied: log.getLastApplied(),
-    leaderId: 0,
-    transport: transport,
-    logger: logger,
-    stateMachine: stateMachine,
-    electionTimeoutMin: config.electionTimeoutMin,
-    electionTimeoutMax: config.electionTimeoutMax,
-    heartbeatInterval: config.heartbeatInterval,
-    clusterSize: config.clusterSize,
-    peerIds: config.peerIds,
-  )
+  # Initialize start index (this would need to be persisted)
+  result.startIndex = 1
+  result.nextIndex = 1
   initLock(result.lock)
-  result.nextIndex = initTable[NodeId, uint64]()
-  result.matchIndex = initTable[NodeId, uint64]()
-  result.lastSentIndex = initTable[NodeId, uint64]()
-  result.votesFrom = initTable[NodeId, bool]()
-  # Random election timeout
-  result.electionDeadline = now + rand(config.electionTimeoutMin.int ..
-      config.electionTimeoutMax.int).uint64
-  result.heartbeatDeadline = 0
 
-proc tick*(self: RaftNode, now: uint64) {.gcsafe, raises: [FractioError].} =
-  ## Called periodically to advance the state machine. Handles election timeouts and heartbeats.
-  self.acquire()
-  try:
-    if now >= self.electionDeadline:
-      case self.state
-      of rsFollower:
-        self.becomeCandidate(now)
-      of rsCandidate:
-        self.becomeCandidate(now) # new election
-      of rsLeader:
-        # Leader should not have election deadline; ignore
-        discard
-    if self.state == rsLeader and now >= self.heartbeatDeadline:
-      self.sendHeartbeats()
-      self.heartbeatDeadline = now + self.heartbeatInterval
-  finally:
-    self.release()
+proc loadWiscKeyLogStore*(path: string): WiscKeyLogStore =
+  ## Load an existing WiscKey-based log store and recover the next index
+  new(result)
+  result.path = path
 
-proc becomeFollower(self: RaftNode, term: uint64, now: uint64) {.gcsafe,
-    raises: [FractioError].} =
-  ## Transition to follower state with given term, reset election timer, and persist.
-  if term < self.term: return
-  self.term = term
-  self.state = rsFollower
-  self.leaderId = 0
-  self.votedFor = 0
-  # Update log's term and clear votedFor, then persist
-  self.log.setCurrentTerm(term)
-  self.log.setVotedFor(0)
-  self.log.persistMeta()
-  # Reset election timer
-  self.electionDeadline = now + rand(self.electionTimeoutMin.int ..
-      self.electionTimeoutMax.int).uint64
-  # Clear candidate-specific state
-  self.votesGranted = 0
-  self.votesFrom.clear()
-
-proc becomeCandidate(self: RaftNode, now: uint64) {.gcsafe, raises: [
-    FractioError].} =
-  ## Transition to candidate, increment term, vote for self, and request votes.
-  self.term += 1
-  self.state = rsCandidate
-  self.votedFor = self.nodeId
-  self.log.setCurrentTerm(self.term)
-  self.log.setVotedFor(self.nodeId)
-  self.log.persistMeta()
-  # Reset election timer
-  self.electionDeadline = now + rand(self.electionTimeoutMin.int ..
-      self.electionTimeoutMax.int).uint64
-  # Initialize vote count (self vote)
-  self.votesGranted = 1
-  self.votesFrom = initTable[NodeId, bool]()
-  self.votesFrom[self.nodeId] = true
-  # Send RequestVote RPCs
-  let lastIdx = self.log.getLastLogIndex()
-  let lastTerm = self.log.getLastLogTerm()
-  for peer in self.peerIds:
-    let args = RequestVoteArgs(term: self.term, candidateId: self.nodeId,
-        lastLogIndex: lastIdx, lastLogTerm: lastTerm)
-    let msg = RaftMessage(kind: rmRequestVote, requestVote: args)
+  # On Linux, LevelDB uses flock which is process-wide. If the database
+  # was closed properly, the lock file should be removable.
+  # Try removing the lock file before opening.
+  let lockFile = path & "/LOCK"
+  if fileExists(lockFile):
     try:
-      self.transport.send(peer, msg)
-    except FractioError as e:
-      safeLogError(self.logger, "Failed to send RequestVote to " & $peer &
-          ": " & e.msg)
+      removeFile(lockFile)
+    except:
+      discard
 
-proc becomeLeader(self: RaftNode, now: uint64) {.gcsafe, raises: [
-    FractioError].} =
-  ## Transition to leader, initialize replication state, and send initial heartbeats.
-  self.state = rsLeader
-  self.leaderId = self.nodeId
-  self.electionDeadline = 0 # no election timer
-  # Initialize nextIndex and matchIndex for all peers
-  let lastLogIndex = self.log.getLastLogIndex()
-  for peer in self.peerIds:
-    self.nextIndex[peer] = lastLogIndex + 1
-    self.matchIndex[peer] = 0
-  # For self, matchIndex is lastLogIndex
-  self.matchIndex[self.nodeId] = lastLogIndex
-  # Reset lastSentIndex (no pending batches)
-  self.lastSentIndex.clear()
-  # Set immediate heartbeat
-  self.heartbeatDeadline = now
-  # Send initial AppendEntries (may contain new entries)
-  self.sendHeartbeats()
+  result.backend = newWiscKeyBackend(StorageConfig(
+    path: path,
+    createIfMissing: false,
+    syncWrites: true
+  ))
 
-proc sendHeartbeats(self: RaftNode) {.gcsafe, raises: [FractioError].} =
-  ## Send AppendEntries RPC to all followers. Sends full batch from nextIndex to lastLogIndex, or empty heartbeat if up-to-date.
-  let lastLogIndex = self.log.getLastLogIndex()
-  let lastLogTerm = self.log.getLastLogTerm()
-  let leaderCommit = self.commitIndex
-  for peer in self.peerIds:
-    # Skip if there is a pending batch for this peer (avoid pipelining)
-    if self.lastSentIndex.getOrDefault(peer, 0'u64) > 0:
-      continue
-    let nextIdx = self.nextIndex.getOrDefault(peer, 0'u64)
-    if nextIdx > lastLogIndex:
-      # Heartbeat (no entries)
-      let args = AppendEntriesArgs(
-        term: self.term,
-        leaderId: self.nodeId,
-        prevLogIndex: lastLogIndex,
-        prevLogTerm: lastLogTerm,
-        entries: @[],
-        leaderCommit: leaderCommit
+  if not result.backend.open(StorageConfig(
+    path: path,
+    createIfMissing: false,
+    syncWrites: true
+  )):
+    raise newException(RaftError, "Failed to open WiscKey backend")
+
+  # Recover next index by finding the last entry
+  result.startIndex = 1
+  result.nextIndex = 1
+
+  # Scan to find the highest index
+  var highestIdx: int64 = 0
+  let iter = result.backend.newIterator()
+  if iter != nil:
+    var currentIter = WiscKeyIterator(iter)
+    if seekToFirstWiscKey(currentIter):
+      while validWiscKey(currentIter):
+        let key = keyWiscKey(currentIter)
+        try:
+          let idx = parseInt(key)
+          if idx > highestIdx:
+            highestIdx = idx
+        except:
+          discard
+        discard nextWiscKey(currentIter)
+    destroyIter(iter)
+
+  if highestIdx > 0:
+    result.nextIndex = highestIdx + 1
+
+  initLock(result.lock)
+
+proc init*(node: RaftNodeImpl, config: RaftConfig,
+    stateMachine: StateMachine): bool =
+  ## Initialize the Raft node
+  # If already initialized with the same config, return success (idempotent)
+  if node.initialized and node.wsLogStore != nil:
+    return true
+
+  node.serverId = config.serverId
+  node.endpoint = config.endpoint
+  node.config = config
+  node.nodeState = RaftNodeState(
+    role: SR_FOLLOWER,
+    currentTerm: 0,
+    votedFor: -1,
+    leaderId: -1,
+    commitIndex: 0,
+    lastApplied: 0
+  )
+
+  # Create or load log store depending on whether path exists
+  if dirExists(config.logStoragePath):
+    node.wsLogStore = loadWiscKeyLogStore(config.logStoragePath)
+  else:
+    # Create parent directory if needed
+    let parentDir = parentDir(config.logStoragePath)
+    if parentDir.len > 0 and not dirExists(parentDir):
+      createDir(parentDir)
+    node.wsLogStore = newWiscKeyLogStore(config.logStoragePath)
+  node.logStore = node.wsLogStore # Also set base type
+  node.stateMachine = stateMachine
+  node.initialized = true
+  node.isLeader = false
+  node.leaderId = -1
+
+  var fields = initTable[string, string]()
+  fields["serverId"] = $config.serverId
+  fields["endpoint"] = config.endpoint
+  debug("Raft node initialized", fields)
+  return true
+
+proc shutdown*(node: RaftNodeImpl) =
+  ## Shutdown the Raft node
+  if node.wsLogStore != nil:
+    node.wsLogStore.close()
+  node.initialized = false
+  var fields = initTable[string, string]()
+  fields["serverId"] = $node.serverId
+  debug("Raft node shutdown", fields)
+
+proc appendEntry*(store: WiscKeyLogStore, entry: LogEntry): int64 =
+  ## Append a log entry to the store (thread-safe)
+  if store.backend == nil:
+    raise newException(RaftError, "Log store not initialized")
+
+  # Thread-safe index assignment
+  withLock store.lock:
+    result = store.nextIndex
+    inc store.nextIndex
+
+  # Serialize entry
+  let data = entry.data
+  let serialized = """{"term": """ & $entry.term &
+    ", \"type\": \"" & $entry.entryType &
+    "\", \"data\": \"" & data.replace("\"", "\\\"") & "\"}"
+
+  # Write to WiscKey - use index as key
+  let key = $result
+  if not store.backend.put(key, serialized):
+    raise newException(RaftError, "Failed to write log entry")
+
+proc getEntry*(store: WiscKeyLogStore, index: int64): Option[LogEntry] =
+  ## Get a log entry by index
+  if store.backend == nil:
+    raise newException(RaftError, "Log store not initialized")
+
+  let key = $index
+  if not store.backend.exists(key):
+    return none(LogEntry)
+
+  let value = store.backend.get(key)
+  if value.isNone:
+    return none(LogEntry)
+
+  # Deserialize entry
+  try:
+    let jsonNode = parseJson(value.get)
+    result = some(LogEntry(
+      term: jsonNode["term"].getInt(),
+      entryType: parseEnum[LogEntryType](jsonNode["type"].getStr()),
+      data: jsonNode["data"].getStr()
+    ))
+  except JsonParsingError:
+    var fields = initTable[string, string]()
+    fields["index"] = $index
+    warn("Failed to parse log entry", fields)
+    return none(LogEntry)
+
+proc getEntries*(store: WiscKeyLogStore, start: int64, endIndex: int64): seq[LogEntry] =
+  ## Get a range of log entries
+  if store.backend == nil:
+    raise newException(RaftError, "Log store not initialized")
+
+  for i in start..endIndex:
+    let entry = store.getEntry(i)
+    if entry.isSome:
+      result.add(entry.get)
+
+proc getLastEntry*(store: WiscKeyLogStore): Option[LogEntry] =
+  ## Get the last log entry
+  if store.nextIndex == 1:
+    return none(LogEntry)
+
+  return store.getEntry(store.nextIndex - 1)
+
+method close*(store: WiscKeyLogStore) =
+  ## Close the log store and release the lock file
+  if store.backend != nil:
+    store.backend.close()
+    store.backend = nil
+  # Remove the lock file to allow reopening
+  let lockFile = store.path & "/LOCK"
+  if fileExists(lockFile):
+    try:
+      removeFile(lockFile)
+    except:
+      discard
+  deinitLock(store.lock)
+
+proc handleRPC*(node: RaftNodeImpl, rpc: RaftRPC): RaftRPC =
+  ## Handle an incoming RPC
+  var fields = initTable[string, string]()
+  fields["rpcType"] = $rpc.rpcType
+  fields["term"] = $rpc.term
+  fields["serverId"] = $node.serverId
+  debug("Handling RPC", fields)
+
+  case node.nodeState.role
+  of SR_FOLLOWER:
+    return handleRPCAsFollower(node, rpc)
+  of SR_CANDIDATE:
+    return handleRPCAsCandidate(node, rpc)
+  of SR_LEADER:
+    return handleRPCAsLeader(node, rpc)
+
+proc handleRPCAsFollower*(node: RaftNodeImpl, rpc: RaftRPC): RaftRPC =
+  ## Handle RPC when in follower role
+  case rpc.rpcType
+  of RPC_APPEND_ENTRIES:
+    # Handle heartbeat or append entries
+    if rpc.term >= node.nodeState.currentTerm:
+      node.nodeState.currentTerm = rpc.term
+      node.nodeState.leaderId = rpc.leaderId
+      node.lastHeartbeat = getTime().toUnix
+
+      # Apply entries if any
+      if rpc.entries.len > 0:
+        for entry in rpc.entries:
+          let idx = node.wsLogStore.appendEntry(entry)
+          # Update commit index if needed
+          if rpc.leaderCommit > node.nodeState.commitIndex:
+            node.nodeState.commitIndex = min(rpc.leaderCommit, idx)
+
+      return RaftRPC(
+        rpcType: RPC_APPEND_ENTRIES,
+        term: node.nodeState.currentTerm,
+        leaderId: node.serverId,
+        success: true
       )
-      try:
-        self.transport.send(peer, RaftMessage(kind: rmAppendEntries,
-            appendEntries: args))
-      except FractioError as e:
-        safeLogError(self.logger, "Failed to send heartbeat to " & $peer &
-            ": " & e.msg)
-    else:
-      # Collect entries from nextIdx to lastLogIndex
-      var entries: seq[RaftEntry] = @[]
-      var i = nextIdx
-      while i <= lastLogIndex:
-        try:
-          let entry = self.log.getEntry(i)
-          entries.add(entry)
-        except FractioError:
-          # Should not happen; skip peer
-          break
-        inc i
-      if entries.len == 0:
-        continue
-      let prevLogIndex = nextIdx - 1
-      var prevLogTerm: uint64 = 0
-      if prevLogIndex > 0:
-        try:
-          let prevEntry = self.log.getEntry(prevLogIndex)
-          prevLogTerm = prevEntry.term
-        except FractioError:
-          prevLogTerm = 0
-      let args = AppendEntriesArgs(
-        term: self.term,
-        leaderId: self.nodeId,
-        prevLogIndex: prevLogIndex,
-        prevLogTerm: prevLogTerm,
-        entries: entries,
-        leaderCommit: leaderCommit
+  of RPC_REQUEST_VOTE:
+    # Handle vote request
+    if rpc.term > node.nodeState.currentTerm or
+        (rpc.term == node.nodeState.currentTerm and node.nodeState.votedFor == -1):
+      node.nodeState.currentTerm = rpc.term
+      node.nodeState.votedFor = rpc.leaderId
+      node.lastHeartbeat = getTime().toUnix
+
+      return RaftRPC(
+        rpcType: RPC_REQUEST_VOTE,
+        term: node.nodeState.currentTerm,
+        leaderId: node.serverId,
+        success: true
       )
-      # Record in-flight batch
-      self.lastSentIndex[peer] = lastLogIndex
-      try:
-        self.transport.send(peer, RaftMessage(kind: rmAppendEntries,
-            appendEntries: args))
-      except FractioError as e:
-        safeLogError(self.logger, "Failed to send AppendEntries to " & $peer &
-            ": " & e.msg)
-        self.lastSentIndex.del(peer) # clear so we can retry
+  of RPC_CLIENT_REQUEST:
+    # Forward to leader
+    return RaftRPC(
+      rpcType: RPC_CLIENT_REQUEST,
+      term: node.nodeState.currentTerm,
+      leaderId: node.nodeState.leaderId,
+      success: false
+    )
 
-proc receiveMessage*(self: RaftNode, sender: NodeId, msg: RaftMessage,
-    now: uint64) {.gcsafe, raises: [FractioError].} =
-  ## Called by transport when a message arrives. Processes RPC under lock.
-  self.acquire()
-  try:
-    case msg.kind
-    of rmRequestVote:
-      self.handleRequestVote(sender, msg.requestVote, now)
-    of rmRequestVoteReply:
-      self.handleRequestVoteReply(sender, msg.requestVoteReply, now)
-    of rmAppendEntries:
-      self.handleAppendEntries(sender, msg.appendEntries, now)
-    of rmAppendEntriesReply:
-      self.handleAppendEntriesReply(sender, msg.appendEntriesReply, now)
-    of rmInstallSnapshot:
-      self.handleInstallSnapshot(sender, msg.installSnapshot, now)
-  finally:
-    self.release()
+proc handleRPCAsLeader*(node: RaftNodeImpl, rpc: RaftRPC): RaftRPC =
+  ## Handle RPC when in leader role
+  if rpc.term > node.nodeState.currentTerm:
+    # Step down if we see a higher term
+    node.nodeState.role = SR_FOLLOWER
+    node.nodeState.currentTerm = rpc.term
+    node.nodeState.votedFor = -1
+    node.isLeader = false
+    return handleRPCAsFollower(node, rpc)
 
-proc handleRequestVote(self: RaftNode, sender: NodeId, args: RequestVoteArgs,
-    now: uint64) {.gcsafe, raises: [FractioError].} =
-  if args.term > self.term:
-    self.becomeFollower(args.term, now)
-  if args.term < self.term:
-    let reply = RequestVoteReply(term: self.term, voteGranted: false)
-    try:
-      self.transport.send(sender, RaftMessage(kind: rmRequestVoteReply,
-          requestVoteReply: reply))
-    except FractioError as e:
-      safeLogError(self.logger, "Failed to send RequestVoteReply: " & e.msg)
-    return
-  # Now args.term == self.term
-  if self.votedFor != 0 and self.votedFor != args.candidateId:
-    # Reset election timer (we saw a candidate)
-    self.electionDeadline = now + rand(self.electionTimeoutMin.int ..
-        self.electionTimeoutMax.int).uint64
-    let reply = RequestVoteReply(term: self.term, voteGranted: false)
-    try:
-      self.transport.send(sender, RaftMessage(kind: rmRequestVoteReply,
-          requestVoteReply: reply))
-    except FractioError as e:
-      safeLogError(self.logger, "Failed to send RequestVoteReply: " & e.msg)
-    return
-  # Check log up-to-date
-  let myLastIdx = self.log.getLastLogIndex()
-  let myLastTerm = self.log.getLastLogTerm()
-  var logOk = false
-  if args.lastLogTerm > myLastTerm:
-    logOk = true
-  elif args.lastLogTerm == myLastTerm and args.lastLogIndex >= myLastIdx:
-    logOk = true
-  else:
-    logOk = false
-  if logOk:
-    self.votedFor = args.candidateId
-    self.log.setVotedFor(args.candidateId)
-    self.log.persistMeta()
-    # Reset election timer (we voted for a candidate)
-    self.electionDeadline = now + rand(self.electionTimeoutMin.int ..
-        self.electionTimeoutMax.int).uint64
-    let reply = RequestVoteReply(term: self.term, voteGranted: true)
-    try:
-      self.transport.send(sender, RaftMessage(kind: rmRequestVoteReply,
-          requestVoteReply: reply))
-    except FractioError as e:
-      safeLogError(self.logger, "Failed to send RequestVoteReply: " & e.msg)
-  else:
-    # Reset election timer (we saw a candidate even though we rejected)
-    self.electionDeadline = now + rand(self.electionTimeoutMin.int ..
-        self.electionTimeoutMax.int).uint64
-    let reply = RequestVoteReply(term: self.term, voteGranted: false)
-    try:
-      self.transport.send(sender, RaftMessage(kind: rmRequestVoteReply,
-          requestVoteReply: reply))
-    except FractioError as e:
-      safeLogError(self.logger, "Failed to send RequestVoteReply: " & e.msg)
+  # Handle specific RPC types
+  case rpc.rpcType
+  of RPC_APPEND_ENTRIES:
+    # This should be a heartbeat from another leader (we should have stepped down)
+    return handleRPCAsFollower(node, rpc)
+  of RPC_REQUEST_VOTE:
+    # Another candidate is requesting votes - deny
+    return RaftRPC(
+      rpcType: RPC_REQUEST_VOTE,
+      term: node.nodeState.currentTerm,
+      leaderId: node.serverId,
+      success: false
+    )
+  of RPC_CLIENT_REQUEST:
+    # Handle client request - we're the leader
+    if node.stateMachine != nil:
+      let idx = node.wsLogStore.appendEntry(LogEntry(
+        term: node.nodeState.currentTerm,
+        entryType: LET_NORMAL,
+        data: rpc.data
+      ))
 
-proc handleRequestVoteReply(self: RaftNode, sender: NodeId,
-    reply: RequestVoteReply, now: uint64) {.gcsafe, raises: [FractioError].} =
-  if reply.term > self.term:
-    self.becomeFollower(reply.term, now)
-    return
-  if self.state != rsCandidate or self.term != reply.term:
-    return
-  if reply.voteGranted:
-    if not (sender in self.votesFrom):
-      self.votesFrom[sender] = true
-      inc(self.votesGranted)
-      if self.votesGranted >= self.majority():
-        self.becomeLeader(now)
+      # Update commit index if we have a majority (simplified)
+      node.nodeState.commitIndex = idx
 
-proc handleAppendEntries(self: RaftNode, sender: NodeId,
-    args: AppendEntriesArgs, now: uint64) {.gcsafe, raises: [FractioError].} =
-  if args.term > self.term:
-    self.becomeFollower(args.term, now)
-  if args.term < self.term:
-    let reply = AppendEntriesReply(term: self.term, success: false)
-    try:
-      self.transport.send(sender, RaftMessage(kind: rmAppendEntriesReply,
-          appendEntriesReply: reply))
-    except FractioError as e:
-      safeLogError(self.logger, "Failed to send AppendEntriesReply: " & e.msg)
-    return
-  # At this point, args.term == self.term
-  if self.state == rsCandidate:
-    self.state = rsFollower
-  # Reset election timer (heartbeat from leader)
-  self.electionDeadline = now + rand(self.electionTimeoutMin.int ..
-      self.electionTimeoutMax.int).uint64
-  self.leaderId = args.leaderId
-  # Consistency check on prevLogIndex
-  if args.prevLogIndex > 0:
-    let snapIdx = self.log.getSnapshotIndex()
-    if args.prevLogIndex < snapIdx:
-      # Leader is behind; follower needs snapshot
-      let reply = AppendEntriesReply(term: self.term, success: false)
-      try:
-        self.transport.send(sender, RaftMessage(kind: rmAppendEntriesReply,
-            appendEntriesReply: reply))
-      except FractioError as e:
-        safeLogError(self.logger, "Failed to send AppendEntriesReply: " & e.msg)
-      return
-    elif args.prevLogIndex == snapIdx:
-      # Check against snapshot term
-      if args.prevLogTerm != self.log.getSnapshotTerm():
-        let reply = AppendEntriesReply(term: self.term, success: false)
-        try:
-          self.transport.send(sender, RaftMessage(kind: rmAppendEntriesReply,
-              appendEntriesReply: reply))
-        except FractioError as e:
-          safeLogError(self.logger, "Failed to send AppendEntriesReply: " & e.msg)
-        return
-      # else: prevLog matches snapshot, continue without fetching entry
-    else: # args.prevLogIndex > snapIdx
-      try:
-        let prevEntry = self.log.getEntry(args.prevLogIndex)
-        if prevEntry.term != args.prevLogTerm:
-          let reply = AppendEntriesReply(term: self.term, success: false)
-          try:
-            self.transport.send(sender, RaftMessage(kind: rmAppendEntriesReply,
-                appendEntriesReply: reply))
-          except FractioError as e:
-            safeLogError(self.logger, "Failed to send AppendEntriesReply: " & e.msg)
-          return
-      except FractioError:
-        let reply = AppendEntriesReply(term: self.term, success: false)
-        try:
-          self.transport.send(sender, RaftMessage(kind: rmAppendEntriesReply,
-              appendEntriesReply: reply))
-        except FractioError as e:
-          safeLogError(self.logger, "Failed to send AppendEntriesReply: " & e.msg)
-        return
-  # Process entries
-  if args.entries.len > 0:
-    var startIdx: uint64 = 0
-    # Find first index that needs to be appended (missing or term conflict)
-    for entry in args.entries:
-      if entry.index <= self.log.getSnapshotIndex():
-        continue
-      try:
-        let existing = self.log.getEntry(entry.index)
-        if existing.term == entry.term:
-          # Already present, skip
-          continue
-        else:
-          # Conflict: need to truncate from here
-          startIdx = entry.index
-          break
-      except FractioError:
-        # Missing entry: need to append from here
-        startIdx = entry.index
-        break
-    if startIdx > 0:
-      # Truncate from startIdx
-      self.log.truncateFrom(startIdx)
-      # Append all entries starting from startIdx (must be consecutive)
-      for entry in args.entries:
-        if entry.index < startIdx:
-          continue
-        # Append will validate consecutive index
-        discard self.log.append(entry)
-  # Update commit index based on leaderCommit
-  if args.leaderCommit > self.commitIndex:
-    let newCommit = min(args.leaderCommit, self.log.getLastLogIndex())
-    if newCommit > self.commitIndex:
-      self.commitIndex = newCommit
-      self.log.setCommitIndex(newCommit)
-      self.applyEntries()
-  # Reply success
-  let reply = AppendEntriesReply(term: self.term, success: true)
-  try:
-    self.transport.send(sender, RaftMessage(kind: rmAppendEntriesReply,
-        appendEntriesReply: reply))
-  except FractioError as e:
-    safeLogError(self.logger, "Failed to send AppendEntriesReply: " & e.msg)
-
-proc handleAppendEntriesReply(self: RaftNode, sender: NodeId,
-    reply: AppendEntriesReply, now: uint64) {.gcsafe, raises: [FractioError].} =
-  if reply.term > self.term:
-    self.becomeFollower(reply.term, now)
-    return
-  if self.state != rsLeader or self.term != reply.term:
-    return
-  # Check if we have a pending batch for this follower
-  let lastSentVal = self.lastSentIndex.getOrDefault(sender, 0'u64)
-  if lastSentVal == 0:
-    return
-  let sentIdx = lastSentVal
-  if reply.success:
-    self.matchIndex[sender] = sentIdx
-    self.nextIndex[sender] = sentIdx + 1
-    self.lastSentIndex.del(sender)
-    self.maybeCommit()
-  else:
-    # Decrement nextIndex to retry
-    let current = self.nextIndex.getOrDefault(sender, 0'u64)
-    if current > 1:
-      self.nextIndex[sender] = current - 1
+      return RaftRPC(
+        rpcType: RPC_CLIENT_REQUEST,
+        term: node.nodeState.currentTerm,
+        leaderId: node.serverId,
+        success: true,
+        data: "Request processed at index " & $idx
+      )
     else:
-      self.nextIndex[sender] = 1
-    self.lastSentIndex.del(sender)
+      return RaftRPC(
+        rpcType: RPC_CLIENT_REQUEST,
+        term: node.nodeState.currentTerm,
+        leaderId: node.serverId,
+        success: false,
+        data: "No state machine configured"
+      )
 
-proc maybeCommit(self: RaftNode) {.gcsafe, raises: [FractioError].} =
-  if self.state != rsLeader: return
-  let lastIdx = self.log.getLastLogIndex()
-  var i = lastIdx
-  while i > self.commitIndex:
-    var count = 0
-    for peer in self.peerIds:
-      if self.matchIndex.getOrDefault(peer, 0'u64) >= i:
-        inc count
-    if self.matchIndex.getOrDefault(self.nodeId, 0'u64) >= i:
-      inc count
-    if count >= self.majority():
-      # Check term of entry i
-      let entry = self.log.getEntry(i)
-      if entry.term == self.term:
-        self.commitIndex = i
-        self.log.setCommitIndex(i)
-        self.applyEntries()
-        break
-    dec i
+proc handleRPCAsCandidate*(node: RaftNodeImpl, rpc: RaftRPC): RaftRPC =
+  ## Handle RPC when in candidate role
+  case rpc.rpcType
+  of RPC_APPEND_ENTRIES:
+    # If we get an append entries from a valid leader, step down
+    if rpc.term >= node.nodeState.currentTerm:
+      node.nodeState.role = SR_FOLLOWER
+      node.nodeState.currentTerm = rpc.term
+      node.nodeState.votedFor = -1
+      node.isLeader = false
+      return handleRPCAsFollower(node, rpc)
+  of RPC_REQUEST_VOTE:
+    # Deny votes to other candidates
+    return RaftRPC(
+      rpcType: RPC_REQUEST_VOTE,
+      term: node.nodeState.currentTerm,
+      leaderId: node.serverId,
+      success: false
+    )
+  of RPC_CLIENT_REQUEST:
+    # Forward to leader if we know who it is
+    if node.nodeState.leaderId != -1:
+      return RaftRPC(
+        rpcType: RPC_CLIENT_REQUEST,
+        term: node.nodeState.currentTerm,
+        leaderId: node.nodeState.leaderId,
+        success: false
+      )
 
-proc applyEntries*(self: RaftNode) {.gcsafe, raises: [FractioError].} =
-  while self.lastApplied < self.commitIndex:
-    inc self.lastApplied
-    let entry = self.log.getEntry(self.lastApplied)
-    let res = self.stateMachine.applyImpl(entry)
-    if res.isErr:
-      safeLogError(self.logger, "apply failed at index " & $self.lastApplied &
-          ": " & res.error.msg)
-    self.log.setLastApplied(self.lastApplied)
-  self.log.persistMeta()
-
-proc handleInstallSnapshot(self: RaftNode, sender: NodeId,
-    args: InstallSnapshotArgs, now: uint64) {.gcsafe, raises: [FractioError].} =
-  if args.term > self.term:
-    self.becomeFollower(args.term, now)
+proc becomeLeader*(node: RaftNodeImpl) =
+  ## Transition to leader state
+  if node.nodeState.role != SR_CANDIDATE:
     return
-  if args.term < self.term:
-    return
-  if self.state == rsCandidate or self.state == rsLeader:
-    self.state = rsFollower
-  self.leaderId = args.leaderId
-  self.electionDeadline = now + rand(self.electionTimeoutMin.int ..
-      self.electionTimeoutMax.int).uint64
-  let mySnapshotIdx = self.log.getSnapshotIndex()
-  if args.lastIncludedIndex > mySnapshotIdx:
-    let snap = Snapshot(lastIndex: args.lastIncludedIndex,
-        lastTerm: args.lastIncludedTerm, data: args.data)
-    self.log.installSnapshot(snap)
-    # Snapshot represents all work up to lastIncludedIndex; mark as applied and committed.
-    self.lastApplied = args.lastIncludedIndex
-    self.commitIndex = args.lastIncludedIndex
-    self.log.setLastApplied(args.lastIncludedIndex)
-    self.log.setCommitIndex(args.lastIncludedIndex)
-    # After installing snapshot, our state should be follower with updated log
-    # Update matchIndex and nextIndex for the leader (if needed)
-    self.matchIndex[sender] = args.lastIncludedIndex
-    self.nextIndex[sender] = args.lastIncludedIndex + 1
 
-proc submitCommand*(self: RaftNode, cmd: RaftCommand): uint64 {.raises: [
-    FractioError].} =
-  ## Submit a client command to the Raft cluster. Only the leader can accept commands.
-  self.acquire()
-  try:
-    if self.state != rsLeader:
-      raise storageError("Cannot submit command: not leader", "")
-    # Determine next index
-    let lastLogIndex = self.log.getLastLogIndex()
-    let nextIdx = if lastLogIndex > 0: lastLogIndex +
-        1 else: self.log.getSnapshotIndex() + 1
-    let entry = RaftEntry(term: self.term, index: nextIdx, command: cmd,
-        checksum: 0'u32)
-    # Append will compute checksum and set index
-    let idx = self.log.append(entry)
-    # Update matchIndex for self
-    self.matchIndex[self.nodeId] = idx
-    # Replicate to followers immediately
-    self.sendHeartbeats()
-    return idx
-  finally:
-    self.release()
+  node.nodeState.role = SR_LEADER
+  node.isLeader = true
+  node.nodeState.leaderId = node.serverId
+  var fields = initTable[string, string]()
+  fields["serverId"] = $node.serverId
+  fields["term"] = $node.nodeState.currentTerm
+  debug("Became leader", fields)
+
+proc becomeCandidate*(node: RaftNodeImpl) =
+  ## Transition to candidate state
+  node.nodeState.role = SR_CANDIDATE
+  node.nodeState.currentTerm += 1
+  node.nodeState.votedFor = node.serverId
+  node.lastVoteTerm = node.nodeState.currentTerm
+  var fields = initTable[string, string]()
+  fields["serverId"] = $node.serverId
+  fields["term"] = $node.nodeState.currentTerm
+  debug("Became candidate", fields)
+
+proc startElection*(node: RaftNodeImpl) =
+  ## Start a new election
+  if node.nodeState.role == SR_LEADER:
+    return
+
+  becomeCandidate(node)
+
+  # In a real implementation, we would send RequestVote RPCs to all other nodes
+  var fields = initTable[string, string]()
+  fields["serverId"] = $node.serverId
+  fields["term"] = $node.nodeState.currentTerm
+  debug("Started election", fields)
+
+proc stepDown*(node: RaftNodeImpl, term: int64) =
+  ## Step down to follower if we see a higher term
+  if term > node.nodeState.currentTerm:
+    node.nodeState.role = SR_FOLLOWER
+    node.nodeState.currentTerm = term
+    node.nodeState.votedFor = -1
+    node.isLeader = false
+    var fields = initTable[string, string]()
+    fields["serverId"] = $node.serverId
+    fields["term"] = $term
+    debug("Stepped down to follower", fields)
+
+proc appendEntries*(node: RaftNodeImpl, entries: seq[LogEntry]): int64 =
+  ## Append entries to log and return the index of the last entry
+  for entry in entries:
+    result = node.wsLogStore.appendEntry(entry)
+
+  return result
+
+proc commit*(node: RaftNodeImpl, data: string): int64 =
+  ## Commit data to the Raft log
+  if not node.isLeader:
+    raise newException(RaftError, "Only leader can commit")
+
+  let entry = LogEntry(
+    term: node.nodeState.currentTerm,
+    entryType: LET_NORMAL,
+    data: data
+  )
+
+  return node.appendEntries(@[entry])

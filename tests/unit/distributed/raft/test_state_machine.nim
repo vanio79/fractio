@@ -1,400 +1,156 @@
-## Unit tests for Raft state machine abstraction and InMemoryStateMachine.
-## 100% coverage target for states.nim and inmemory_states.nim.
+# Unit Tests for State Machine Interface
 
 import unittest
-import std/strutils
-import std/tables
-import std/typedthreads
-import fractio/distributed/raft/states
-import fractio/distributed/raft/inmemory_states
+
 import fractio/distributed/raft/types
-import fractio/core/errors
 
-suite "RaftStateMachine abstraction":
-  test "applyImpl base returns notImplementedError":
-    let base = RaftStateMachine()
-    let entry = RaftEntry(term: 1, index: 1, command: RaftCommand(
-        kind: rckNoop), checksum: 0)
-    let res = base.applyImpl(entry)
-    check res.isErr
-    check res.error.msg.contains("not implemented")
+# Test State Machine
+type
+  TestStateMachine* = ref object of StateMachine
+    ## Test state machine for unit testing
+    commits*: seq[(int64, string)]
+    rollbacks*: seq[(int64, string)]
+    lastAppliedIndex*: int64
 
-suite "ClientCommand serialization/deserialization":
-  var sm: InMemoryStateMachine
+  TestStateMachineError* = object of CatchableError
 
-  setup:
-    sm = newInMemoryStateMachine()
+method commit*(sm: TestStateMachine, logIdx: int64, data: string): string =
+  ## Test commit implementation
+  sm.commits.add((logIdx, data))
+  sm.lastAppliedIndex = logIdx
+  return "OK"
 
-  test "round-trip SET command":
-    let cmd = ClientCommand(op: cckSet, key: "foo", value: "bar")
-    let data = serialize(cmd)
-    let res = deserialize(data)
-    check res.isOk
-    let decoded = res.get()
-    check decoded.op == cckSet
-    check decoded.key == "foo"
-    check decoded.value == "bar"
+method rollback*(sm: TestStateMachine, logIdx: int64, data: string) =
+  ## Test rollback implementation
+  sm.rollbacks.add((logIdx, data))
 
-  test "round-trip DELETE command":
-    let cmd = ClientCommand(op: cckDelete, key: "deleteMe", value: "ignored")
-    let data = serialize(cmd)
-    let res = deserialize(data)
-    check res.isOk
-    let decoded = res.get()
-    check decoded.op == cckDelete
-    check decoded.key == "deleteMe"
-    check decoded.value == "ignored"
+method getLastAppliedIndex*(sm: TestStateMachine): int64 =
+  ## Get last applied log index
+  result = sm.lastAppliedIndex
 
-  test "empty key and value":
-    let cmd = ClientCommand(op: cckSet, key: "", value: "")
-    let data = serialize(cmd)
-    let res = deserialize(data)
-    check res.isOk
-    let decoded = res.get()
-    check decoded.key == ""
-    check decoded.value == ""
 
-  test "unicode keys and values":
-    let cmd = ClientCommand(op: cckSet, key: "日本語", value: "🚀")
-    let data = serialize(cmd)
-    let res = deserialize(data)
-    check res.isOk
-    let decoded = res.get()
-    check decoded.key == "日本語"
-    check decoded.value == "🚀"
+# Test Fixtures
+type
+  TestSetup* = object
+    stateMachine*: TestStateMachine
 
-  test "deserialize empty data returns error":
-    let res = deserialize(@[])
-    check res.isErr
-    check res.error.msg.contains("too short")
+proc setupTest*(): TestSetup =
+  ## Setup test environment
+  result.stateMachine = TestStateMachine(
+    commits: @[],
+    rollbacks: @[],
+    lastAppliedIndex: 0
+  )
 
-  test "deserialize truncated op only":
-    let data = [byte(cckSet.uint8)]
-    let res = deserialize(data)
-    check res.isErr
+proc teardownTest*(setup: var TestSetup) =
+  ## Teardown test environment (nothing to cleanup for state machine)
+  discard
 
-  test "deserialize truncated after op":
-    let data = [byte(cckSet.uint8), 0'u8]
-    let res = deserialize(data)
-    check res.isErr
 
-  test "deserialize invalid op":
-    let data = [byte(2'u8), 0'u8, 1'u8, 0'u8, 0'u8, 1'u8, 0'u8]
-    let res = deserialize(data)
-    check res.isErr or (let dec = res.get(); dec.op notin [cckSet, cckDelete])
-
-  test "deserialize key overflow":
-    var keyLen: uint16 = 100
-    var valLen: uint16 = 0
-    var data = newSeq[byte](1 + 2 + 5 + 2)
-    data[0] = byte(cckSet.uint8)
-    copyMem(data[1].addr, addr keyLen, 2)
-    let keyBytes = stringToBytes("abcde")
-    for i in 0..<keyBytes.len:
-      data[3 + i] = keyBytes[i]
-    copyMem(data[8].addr, addr valLen, 2)
-    let res = deserialize(data)
-    check res.isErr
-    check res.error.msg.contains("overflow")
-
-  test "deserialize value overflow":
-    let key = "ok"
-    let keyBytes = stringToBytes(key)
-    var valLen: uint16 = 100
-    var data = newSeq[byte](1 + 2 + keyBytes.len + 2)
-    data[0] = byte(cckSet.uint8)
-    var beKeyLen = keyBytes.len.uint16
-    copyMem(data[1].addr, addr beKeyLen, 2)
-    copyMem(data[3].addr, keyBytes[0].addr, keyBytes.len)
-    copyMem(data[3 + keyBytes.len].addr, addr valLen, 2)
-    let res = deserialize(data)
-    check res.isErr
-    check res.error.msg.contains("overflow")
-
-suite "InMemoryStateMachine":
-  var sm: InMemoryStateMachine
+# Test Suite
+suite "StateMachine Interface Tests":
 
   setup:
-    sm = newInMemoryStateMachine()
+    var testSetup = setupTest()
 
-  test "constructor initializes empty data and config":
-    check len(sm.data) == 0
-    check sm.config.len == 0
-    check sm.applyCount == 0
+  teardown:
+    teardownTest(testSetup)
 
-  test "constructor with initial peers":
-    let sm2 = newInMemoryStateMachine(@[1'u64, 2'u64, 3'u64])
-    check sm2.config.len == 3
-    check 1'u64 in sm2.config
-    check 2'u64 in sm2.config
-    check 3'u64 in sm2.config
+  test "Initialization and basic state":
+    check testSetup.stateMachine.commits.len == 0
+    check testSetup.stateMachine.rollbacks.len == 0
+    check testSetup.stateMachine.lastAppliedIndex == 0
 
-  test "applyImpl Noop does nothing":
-    let entry = RaftEntry(term: 1, index: 1, command: RaftCommand(
-        kind: rckNoop), checksum: 0)
-    let res = sm.applyImpl(entry)
-    check res.isOk
-    check len(sm.data) == 0
-    check sm.config.len == 0
-    check sm.applyCount == 1
+  test "Commit operation":
+    let result = testSetup.stateMachine.commit(1, "test data")
+    check result == "OK"
+    check testSetup.stateMachine.commits.len == 1
+    check testSetup.stateMachine.commits[0][0] == 1
+    check testSetup.stateMachine.commits[0][1] == "test data"
+    check testSetup.stateMachine.lastAppliedIndex == 1
 
-  test "applyImpl ClientCommand Set":
-    var cmd = ClientCommand(op: cckSet, key: "a", value: "1")
-    let data = serialize(cmd)
-    let entry = RaftEntry(term: 1, index: 1, command: RaftCommand(
-        kind: rckClientCommand, data: data), checksum: 0)
-    let res = sm.applyImpl(entry)
-    check res.isOk
-    check sm.data["a"] == "1"
-    check sm.applyCount == 1
+  test "Multiple commits":
+    discard testSetup.stateMachine.commit(1, "data1")
+    discard testSetup.stateMachine.commit(2, "data2")
+    discard testSetup.stateMachine.commit(3, "data3")
 
-  test "applyImpl ClientCommand Delete":
-    sm.data["toDelete"] = "value"
-    sm.applyCount = 0
-    var cmd = ClientCommand(op: cckDelete, key: "toDelete", value: "")
-    let data = serialize(cmd)
-    let entry = RaftEntry(term: 1, index: 2, command: RaftCommand(
-        kind: rckClientCommand, data: data), checksum: 0)
-    let res = sm.applyImpl(entry)
-    check res.isOk
-    check "toDelete" notin sm.data
-    check sm.applyCount == 1
+    check testSetup.stateMachine.commits.len == 3
+    check testSetup.stateMachine.commits[0][0] == 1
+    check testSetup.stateMachine.commits[1][0] == 2
+    check testSetup.stateMachine.commits[2][0] == 3
+    check testSetup.stateMachine.lastAppliedIndex == 3
 
-  test "applyImpl ClientCommand overwrites existing key":
-    sm.data["x"] = "old"
-    var cmd = ClientCommand(op: cckSet, key: "x", value: "new")
-    let data = serialize(cmd)
-    let entry = RaftEntry(term: 1, index: 1, command: RaftCommand(
-        kind: rckClientCommand, data: data), checksum: 0)
-    let res = sm.applyImpl(entry)
-    check res.isOk
-    check sm.data["x"] == "new"
+  test "Rollback operation":
+    discard testSetup.stateMachine.commit(1, "data1")
+    discard testSetup.stateMachine.commit(2, "data2")
 
-  test "applyImpl AddNode":
-    let nid: uint64 = 42
-    var data = newSeq[byte](8)
-    copyMem(data[0].addr, addr nid, 8)
-    let entry = RaftEntry(term: 1, index: 1, command: RaftCommand(
-        kind: rckAddNode, data: data), checksum: 0)
-    let res = sm.applyImpl(entry)
-    check res.isOk
-    check nid in sm.config
-    check sm.applyCount == 1
+    testSetup.stateMachine.rollback(2, "data2")
 
-  test "applyImpl AddNode ignores duplicate":
-    let nid: uint64 = 7
-    var data = newSeq[byte](8)
-    copyMem(data[0].addr, addr nid, 8)
-    let entry1 = RaftEntry(term: 1, index: 1, command: RaftCommand(
-        kind: rckAddNode, data: data), checksum: 0)
-    let entry2 = RaftEntry(term: 1, index: 2, command: RaftCommand(
-        kind: rckAddNode, data: data), checksum: 0)
-    check sm.applyImpl(entry1).isOk
-    check sm.applyImpl(entry2).isOk
-    var count = 0
-    for n in sm.config:
-      if n == nid: inc count
-    check count == 1
+    check testSetup.stateMachine.rollbacks.len == 1
+    check testSetup.stateMachine.rollbacks[0][0] == 2
+    check testSetup.stateMachine.rollbacks[0][1] == "data2"
+    check testSetup.stateMachine.commits.len == 2 # Commits not removed
 
-  test "applyImpl RemoveNode":
-    sm.config = @[10'u64, 20'u64, 30'u64]
-    let nid: uint64 = 20
-    var data = newSeq[byte](8)
-    copyMem(data[0].addr, addr nid, 8)
-    let entry = RaftEntry(term: 1, index: 1, command: RaftCommand(
-        kind: rckRemoveNode, data: data), checksum: 0)
-    let res = sm.applyImpl(entry)
-    check res.isOk
-    check nid notin sm.config
-    check 10'u64 in sm.config
-    check 30'u64 in sm.config
+  test "Rollback without commits":
+    testSetup.stateMachine.rollback(1, "data1")
+    check testSetup.stateMachine.rollbacks.len == 1
+    check testSetup.stateMachine.rollbacks[0][0] == 1
+    check testSetup.stateMachine.rollbacks[0][1] == "data1"
 
-  test "applyImpl RemoveNode no-op if missing":
-    sm.config = @[1'u64]
-    let nid: uint64 = 99
-    var data = newSeq[byte](8)
-    copyMem(data[0].addr, addr nid, 8)
-    let entry = RaftEntry(term: 1, index: 1, command: RaftCommand(
-        kind: rckRemoveNode, data: data), checksum: 0)
-    let res = sm.applyImpl(entry)
-    check res.isOk
-    check sm.config.len == 1
+  test "Get last applied index":
+    discard testSetup.stateMachine.commit(1, "data1")
+    discard testSetup.stateMachine.commit(2, "data2")
 
-  test "applyImpl Reconfigure":
-    var newConfig = @[100'u64, 200'u64]
-    var data = newSeq[byte](4 + 2*8)
-    var count: uint32 = 2
-    copyMem(data[0].addr, addr count, 4)
-    copyMem(data[4].addr, addr newConfig[0], 8)
-    copyMem(data[12].addr, addr newConfig[1], 8)
-    let entry = RaftEntry(term: 1, index: 1, command: RaftCommand(
-        kind: rckReconfigure, data: data), checksum: 0)
-    let res = sm.applyImpl(entry)
-    check res.isOk
-    check sm.config.len == 2
-    check 100'u64 in sm.config
-    check 200'u64 in sm.config
+    let lastIndex = testSetup.stateMachine.getLastAppliedIndex()
+    check lastIndex == 2
 
-  test "applyImpl Reconfigure error on short data":
-    var data = newSeq[byte](2)
-    var count: uint32 = 1
-    copyMem(data[0].addr, addr count, 2)
-    let entry = RaftEntry(term: 1, index: 1, command: RaftCommand(
-        kind: rckReconfigure, data: data), checksum: 0)
-    let res = sm.applyImpl(entry)
-    check res.isErr
+  test "Last applied index without commits":
+    let lastIndex = testSetup.stateMachine.getLastAppliedIndex()
+    check lastIndex == 0
 
-  test "applyImpl ClientCommand malformed data returns error":
-    let badData = @[byte(cckSet.uint8), 0'u8, 255'u8]
-    let entry = RaftEntry(term: 1, index: 1, command: RaftCommand(
-        kind: rckClientCommand, data: badData), checksum: 0)
-    let res = sm.applyImpl(entry)
-    check res.isErr
+  test "Mixed commits and rollbacks":
+    discard testSetup.stateMachine.commit(1, "data1")
+    discard testSetup.stateMachine.commit(2, "data2")
+    testSetup.stateMachine.rollback(2, "data2")
+    discard testSetup.stateMachine.commit(3, "data3")
 
-  test "applyImpl is idempotent - SET applied twice":
-    var cmd = ClientCommand(op: cckSet, key: "k", value: "v")
-    let data = serialize(cmd)
-    let entry = RaftEntry(term: 1, index: 1, command: RaftCommand(
-        kind: rckClientCommand, data: data), checksum: 0)
-    check sm.applyImpl(entry).isOk
-    check sm.applyCount == 1
-    check sm.applyImpl(entry).isOk
-    check sm.applyCount == 2
-    check sm.data["k"] == "v"
+    check testSetup.stateMachine.commits.len == 3
+    check testSetup.stateMachine.rollbacks.len == 1
+    check testSetup.stateMachine.lastAppliedIndex == 3
 
-  test "applyImpl is idempotent - DELETE applied twice":
-    sm.data["k"] = "v"
-    var cmd = ClientCommand(op: cckDelete, key: "k", value: "")
-    let data = serialize(cmd)
-    let entry = RaftEntry(term: 1, index: 1, command: RaftCommand(
-        kind: rckClientCommand, data: data), checksum: 0)
-    check sm.applyImpl(entry).isOk
-    check sm.applyCount == 1
-    check "k" notin sm.data
-    check sm.applyImpl(entry).isOk
-    check sm.applyCount == 2
-    check "k" notin sm.data
+  test "Commit with empty data":
+    let result = testSetup.stateMachine.commit(1, "")
+    check result == "OK"
+    check testSetup.stateMachine.commits.len == 1
+    check testSetup.stateMachine.commits[0][1] == ""
 
-  test "applyImpl increments applyCount for each call":
-    sm.applyCount = 0
-    let entryNoop = RaftEntry(term: 1, index: 1, command: RaftCommand(
-        kind: rckNoop), checksum: 0)
-    discard sm.applyImpl(entryNoop)
-    discard sm.applyImpl(entryNoop)
-    discard sm.applyImpl(entryNoop)
-    check sm.applyCount == 3
+  test "Rollback with empty data":
+    discard testSetup.stateMachine.commit(1, "data1")
+    testSetup.stateMachine.rollback(1, "")
+    check testSetup.stateMachine.rollbacks.len == 1
+    check testSetup.stateMachine.rollbacks[0][1] == ""
 
-  test "resetApplyCount resets counter":
-    discard sm.applyImpl(RaftEntry(term: 1, index: 1, command: RaftCommand(
-        kind: rckNoop), checksum: 0))
-    discard sm.applyImpl(RaftEntry(term: 1, index: 2, command: RaftCommand(
-        kind: rckNoop), checksum: 0))
-    discard sm.applyImpl(RaftEntry(term: 1, index: 3, command: RaftCommand(
-        kind: rckNoop), checksum: 0))
-    sm.resetApplyCount()
-    check sm.applyCount == 0
+  test "Rollback non-existent log":
+    # Should not crash or raise exceptions
+    testSetup.stateMachine.rollback(999, "non-existent")
+    check testSetup.stateMachine.rollbacks.len == 1
+    check testSetup.stateMachine.rollbacks[0][0] == 999
 
-suite "InMemoryStateMachine thread-safety":
-  test "concurrent SET operations produce correct final state":
-    var sm = newInMemoryStateMachine()
-    # Worker proc for SET
-    proc worker(args: tuple[idx: int, sm: InMemoryStateMachine]) {.thread.} =
-      let idx = args.idx
-      let stateMachine = args.sm
-      let key = "key"
-      let val = $idx
-      let cmd = ClientCommand(op: cckSet, key: key, value: val)
-      let data = serialize(cmd)
-      let entry = RaftEntry(term: 1, index: uint64(idx+1),
-          command: RaftCommand(kind: rckClientCommand, data: data), checksum: 0)
-      discard stateMachine.applyImpl(entry)
+  test "Rollback multiple times":
+    discard testSetup.stateMachine.commit(1, "data1")
+    testSetup.stateMachine.rollback(1, "data1")
+    testSetup.stateMachine.rollback(1, "data1") # Second rollback
 
-    const n = 100
-    var threads: array[n, Thread[tuple[idx: int, sm: InMemoryStateMachine]]]
-    for i in 0..<n:
-      createThread(threads[i], worker, (i, sm))
-    for i in 0..<n: joinThread(threads[i])
-    let finalVal = sm.getValue("key")
-    var validVals = newSeq[string]()
-    for i in 0..<n:
-      validVals.add $i
-    check finalVal in validVals
-    check sm.applyCount == n
+    check testSetup.stateMachine.rollbacks.len == 2
+    check testSetup.stateMachine.rollbacks[0][0] == 1
+    check testSetup.stateMachine.rollbacks[1][0] == 1
 
-  test "concurrent mix of operations maintains integrity":
-    var sm = newInMemoryStateMachine()
-    type OpKind = enum
-      opSet, opDelete, opAdd, opRemove
+  test "State machine persistence":
+    # Verify state machine maintains state across operations
+    discard testSetup.stateMachine.commit(1, "persist")
+    check testSetup.stateMachine.lastAppliedIndex == 1
 
-    proc mixWorker(args: tuple[op: OpKind, idx: int,
-         sm: InMemoryStateMachine]) {.thread.} =
-      let capturedOp = args.op
-      let capturedIdx = args.idx
-      let stateMachine = args.sm
-      case capturedOp
-      of opSet:
-        let cmd = ClientCommand(op: cckSet, key: "k", value: "v")
-        let data = serialize(cmd)
-        let entry = RaftEntry(term: 1, index: 1, command: RaftCommand(
-            kind: rckClientCommand, data: data), checksum: 0)
-        discard stateMachine.applyImpl(entry)
-      of opDelete:
-        let cmd = ClientCommand(op: cckDelete, key: "k", value: "")
-        let data = serialize(cmd)
-        let entry = RaftEntry(term: 1, index: 1, command: RaftCommand(
-            kind: rckClientCommand, data: data), checksum: 0)
-        discard stateMachine.applyImpl(entry)
-      of opAdd:
-        let nid = uint64(capturedIdx)
-        var d = newSeq[byte](8)
-        copyMem(d[0].addr, addr nid, 8)
-        let entry = RaftEntry(term: 1, index: 1, command: RaftCommand(
-            kind: rckAddNode, data: d), checksum: 0)
-        discard stateMachine.applyImpl(entry)
-      of opRemove:
-        let nid = uint64(capturedIdx)
-        var d = newSeq[byte](8)
-        copyMem(d[0].addr, addr nid, 8)
-        let entry = RaftEntry(term: 1, index: 1, command: RaftCommand(
-            kind: rckRemoveNode, data: d), checksum: 0)
-        discard stateMachine.applyImpl(entry)
+    discard testSetup.stateMachine.commit(2, "persist2")
+    check testSetup.stateMachine.lastAppliedIndex == 2
 
-    var ops: array[50, OpKind]
-    sm.config = @[]
-    const n = 50
-    var threads: array[n, Thread[tuple[op: OpKind, idx: int,
-        sm: InMemoryStateMachine]]]
-    for i in 0..<n:
-      ops[i] = OpKind(i mod 4)
-      createThread(threads[i], mixWorker, (ops[i], i, sm))
-    for i in 0..<n: joinThread(threads[i])
-    check sm.applyCount == n
-
-suite "Accessors":
-  var sm: InMemoryStateMachine
-
-  setup:
-    sm = newInMemoryStateMachine()
-
-  test "getValue returns empty for missing key":
-    check sm.getValue("missing") == ""
-
-  test "getValue returns set value":
-    sm.data["x"] = "42"
-    check sm.getValue("x") == "42"
-
-  test "hasKey false for missing":
-    check sm.hasKey("nope") == false
-
-  test "hasKey true for existing":
-    sm.data["present"] = "yes"
-    check sm.hasKey("present") == true
-
-  test "getConfig returns copy of config":
-    sm.config = @[1'u64, 2'u64]
-    var cfg = sm.getConfig()
-    check cfg.len == 2
-    check 1'u64 in cfg
-    check 2'u64 in cfg
-    cfg.add(3'u64)
-    check sm.getConfig().len == 2
+    check testSetup.stateMachine.commits.len == 2
