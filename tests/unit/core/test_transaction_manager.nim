@@ -10,6 +10,7 @@ import fractio/core/types
 import fractio/storage/mvcc/engine
 import fractio/storage/mvcc/types
 import fractio/storage/backend
+import fractio/distributed/sharedtimer/mock
 
 # Mock StorageBackend for testing
 type
@@ -46,8 +47,9 @@ method newIterator*(backend: MockStorageBackend): StorageIterator =
 suite "TransactionManager":
   setup:
     let mockBackend = newMockStorageBackend()
+    let mockTimer = MockTimeProvider(currentTime: 1000_000_000) # 1 second in ns
     let tsProvider = TimestampProvider(
-      timer: nil, # Would use real timer in production
+      timer: mockTimer,
       lastTimestamp: 1000,
       lastCounter: 0,
       maxOffset: DEFAULT_MAX_OFFSET_NS,
@@ -169,8 +171,9 @@ suite "TransactionManager":
 suite "Transaction Lifecycle":
   setup:
     let mockBackend = newMockStorageBackend()
+    let mockTimer = MockTimeProvider(currentTime: 1000_000_000)
     let tsProvider = TimestampProvider(
-      timer: nil,
+      timer: mockTimer,
       lastTimestamp: 1000,
       lastCounter: 0,
       maxOffset: DEFAULT_MAX_OFFSET_NS,
@@ -225,7 +228,7 @@ suite "Transaction Lifecycle":
     check txn.epoch == 1
 
     txn.resetForRetry(Timestamp(2000))
-    check txn.epoch == 1 # Incremented again in resetForRetry
+    check txn.epoch == 2 # Incremented again in resetForRetry
     check txn.status == TXN_PENDING
 
     tm.endTransaction(txn)
@@ -233,8 +236,9 @@ suite "Transaction Lifecycle":
 suite "Error Handling":
   setup:
     let mockBackend = newMockStorageBackend()
+    let mockTimer = MockTimeProvider(currentTime: 1000_000_000)
     let tsProvider = TimestampProvider(
-      timer: nil,
+      timer: mockTimer,
       lastTimestamp: 1000,
       lastCounter: 0,
       maxOffset: DEFAULT_MAX_OFFSET_NS,

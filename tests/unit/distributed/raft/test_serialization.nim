@@ -140,7 +140,7 @@ suite "Cluster Configuration Serialization Tests":
 
     let serialized = cluster.serializeCluster()
     check "\"servers\"" in serialized
-    check "\"self_id\": 1" in serialized
+    check "\"self_id\":1" in serialized
 
   test "Deserialize cluster configuration":
     let cluster = newRaftCluster(RaftConfig(

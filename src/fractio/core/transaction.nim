@@ -260,7 +260,7 @@ proc checkDeadline*(txn: MVCCTransaction, currentTime: Timestamp): bool =
   ## Check if transaction has exceeded its deadline
   if txn.deadline == MAX_TIMESTAMP:
     return false # No deadline set
-  result = currentTime >= txn.deadline
+  result = currentTime > txn.deadline
 
 proc isExpired*(txn: MVCCTransaction, currentTime: Timestamp): bool =
   ## Alias for checkDeadline

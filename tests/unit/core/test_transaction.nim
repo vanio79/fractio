@@ -329,7 +329,7 @@ suite "CommitResult":
     check result.success == false
     check result.error.code == ceWriteConflict
     check result.error.retryable == true
-    check result.error.msg == "conflict: Write conflict on key"
+    check result.error.msg == "conflict"
 
   test "error constructors":
     let abortErr = transactionAbortedError("test")

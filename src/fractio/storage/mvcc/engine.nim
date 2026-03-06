@@ -2,10 +2,12 @@
 # Wraps StorageBackend to provide MVCC semantics
 
 import std/[options, sets, sequtils, algorithm, strutils]
-import ../../core/types
+import ../../core/types as core_types
 import ../../core/timestamp_provider
+import ../../core/transaction
 import ../../storage/backend
 import ./types
+export types.MAX_TIMESTAMP
 
 type
   MVCCEngine* = ref object
@@ -67,7 +69,7 @@ proc mvccGet*(engine: MVCCEngine, key: string, timestamp: Timestamp,
 
   # Check for any intent from another transaction
   # Iterate through possible intents (we need a better approach for production)
-  let latestKey = makeVersionKey(key, MAX_TIMESTAMP)
+  let latestKey = makeVersionKey(key, types.MAX_TIMESTAMP)
   let iter = engine.backend.newIterator()
   discard iter.seek(key) # Seek to the key
 
@@ -92,12 +94,12 @@ proc mvccGet*(engine: MVCCEngine, key: string, timestamp: Timestamp,
   # No version found
   return ok(none(MVCCValue))
 
-proc mvccPut*(engine: MVCCEngine, key: string, value: string,
-    txn: Transaction): MVCCResult =
+proc mvccPut*(engine: MVCCEngine, txn: MVCCTransaction, key: string,
+    value: string): MVCCResult =
   ## Put a value as an intent (provisional write)
   ## The transaction provides the timestamp and txnId
 
-  if txn.status != tsActive:
+  if txn.status != TXN_PENDING:
     return err(mvccInvalidTransaction, "Transaction not pending")
 
   # Check if there's already an intent
@@ -107,13 +109,7 @@ proc mvccPut*(engine: MVCCEngine, key: string, value: string,
     return err(mvccIntentConflict, "Intent already exists for key: " & key)
 
   # Encode the intent value
-  let mvccValue = MVCCValue(
-    data: value,
-    timestamp: Timestamp(txn.timestamp),
-    isDeleted: false,
-    txnId: txn.id
-  )
-  let encodedValue = encodeMVCCValue(value, Timestamp(txn.timestamp), false, txn.id)
+  let encodedValue = encodeMVCCValue(value, txn.startTimestamp, false, txn.id)
 
   # Write the intent
   let intentKey = makeIntentKey(key, txn.id)
@@ -122,21 +118,15 @@ proc mvccPut*(engine: MVCCEngine, key: string, value: string,
 
   return ok(none(MVCCValue))
 
-proc mvccDelete*(engine: MVCCEngine, key: string,
-    txn: Transaction): MVCCResult =
+proc mvccDelete*(engine: MVCCEngine, txn: MVCCTransaction,
+    key: string): MVCCResult =
   ## Delete a key by writing a delete intent
 
-  if txn.status != tsActive:
+  if txn.status != TXN_PENDING:
     return err(mvccInvalidTransaction, "Transaction not pending")
 
   # Encode delete intent
-  let mvccValue = MVCCValue(
-    data: "",
-    timestamp: Timestamp(txn.timestamp),
-    isDeleted: true,
-    txnId: txn.id
-  )
-  let encodedValue = encodeMVCCValue("", Timestamp(txn.timestamp), true, txn.id)
+  let encodedValue = encodeMVCCValue("", txn.startTimestamp, true, txn.id)
 
   # Write the delete intent
   let intentKey = makeIntentKey(key, txn.id)

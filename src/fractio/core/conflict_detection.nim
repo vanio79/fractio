@@ -355,6 +355,10 @@ proc shouldAbortTransaction*(txn: MVCCTransaction,
   ## Determine if transaction should abort due to conflict
   ## Uses wait-die policy
 
+  # If this transaction is committed, it won't be aborted
+  if txn.isCommitted():
+    return false
+
   # If conflicting transaction is committed, we can retry
   if conflictingTxn.isCommitted():
     return false
