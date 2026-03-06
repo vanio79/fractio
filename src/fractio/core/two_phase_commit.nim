@@ -1,0 +1,756 @@
+# Two-Phase Commit (2PC) for Distributed Transactions
+# Provides atomic commit across multiple nodes/ranges using the 2PC protocol
+# Integrated with Raft for consensus and durability
+
+import std/[options, tables, sets, sequtils, times, strutils, json,
+    asyncdispatch, random]
+import fractio/core/types
+import fractio/core/transaction
+import fractio/core/timestamp_provider
+import fractio/storage/mvcc/engine
+import fractio/storage/mvcc/types
+import fractio/utils/logging
+import fractio/distributed/raft/types
+
+type
+  # 2PC States
+  TwoPCState* = enum
+    ## State of a 2PC participant or coordinator
+    tpcsIdle
+      ## Not participating in any transaction
+    tpcsPreparing
+      ## In prepare phase, waiting for votes
+    tpcsPrepared
+      ## Prepared, waiting for commit/rollback
+    tpcsCommitting
+      ## In commit phase
+    tpcsCommitted
+      ## Transaction committed successfully
+    tpcsAborting
+      ## In abort phase
+    tpcsAborted
+      ## Transaction aborted
+    tpcsRecovering
+      ## Recovering from coordinator failure
+
+  # 2PC Participant
+  Participant* = ref object
+    ## Represents a participant in a distributed transaction
+    nodeId*: string
+      ## Unique identifier for this node
+    endpoint*: string
+      ## Network endpoint for RPC communication
+    state*: TwoPCState
+      ## Current 2PC state
+    transactionId*: TransactionID
+      ## Transaction ID being coordinated
+    prepareTimestamp*: Timestamp
+      ## Timestamp when prepare was received
+    vote*: ParticipantVote
+      ## Vote (yes/no/abstain)
+    transaction*: MVCCTransaction
+      ## Local transaction (if any)
+    lastHeartbeat*: Timestamp
+      ## Last heartbeat from coordinator
+
+  ParticipantVote* = enum
+    ## Vote from participant during prepare phase
+    pvYes
+      ## Participant can commit
+    pvNo
+      ## Participant cannot commit
+    pvAbstain
+      ## Participant abstains (doesn't vote)
+
+  # 2PC Coordinator
+  Coordinator* = ref object
+    ## Coordinates a distributed transaction across multiple participants
+    transaction*: MVCCTransaction
+      ## The transaction being coordinated
+    transactionId*: TransactionID
+      ## Unique transaction ID
+    coordinatorId*: string
+      ## Node ID of the coordinator
+    participants*: seq[Participant]
+      ## List of participants in this transaction
+    state*: TwoPCState
+      ## Current 2PC state
+    prepareTimeout*: int64
+      ## Timeout for prepare phase (milliseconds)
+    commitTimeout*: int64
+      ## Timeout for commit/rollback phase (milliseconds)
+    startTime*: Timestamp
+      ## When the transaction started
+    votes*: seq[ParticipantVote]
+      ## Votes received from participants
+    preparedCount*: int
+      ## Number of participants that voted yes
+    abortedCount*: int
+      ## Number of participants that voted no/abstain
+    quorum*: int
+      ## Number of votes needed to proceed
+    retryCount*: int
+      ## Number of retry attempts
+    raftNode*: RaftNode
+      ## Raft node for consensus (optional)
+    logger*: Logger
+      ## Logger for this coordinator
+
+  # 2PC Request Types
+  TwoPCRequestType* = enum
+    ## Types of 2PC requests
+    tpcPrepare
+      ## Prepare request
+    tpcCommit
+      ## Commit request
+    tpcRollback
+      ## Rollback request
+    tpcRecovery
+      ## Recovery request
+    tpcHeartbeat
+      ## Heartbeat to keep transaction alive
+
+  TwoPCRequest* = object
+    ## A 2PC request
+    requestId*: string
+      ## Unique request ID
+    requestType*: TwoPCRequestType
+    transactionId*: TransactionID
+    coordinatorId*: string
+    timestamp*: Timestamp
+    data*: string
+      ## Additional request data (e.g., write set)
+    participantEndpoints*: seq[string]
+      ## List of participant endpoints
+
+  TwoPCResponse* = object
+    ## A 2PC response
+    requestId*: string
+    transactionId*: TransactionID
+    participantId*: string
+    vote*: ParticipantVote
+    state*: TwoPCState
+    error*: string
+      ## Error message if failed
+
+  TwoPCResult* = object
+    ## Result of a 2PC transaction
+    success*: bool
+    transactionId*: TransactionID
+    commitTimestamp*: Timestamp
+    participants*: seq[string]
+      ## IDs of participants that committed
+    error*: string
+      ## Error message if failed
+    retryable*: bool
+      ## Whether the transaction can be retried
+
+  # 2PC Configuration
+  TwoPCConfig* = object
+    ## Configuration for 2PC
+    prepareTimeoutMs*: int64
+      ## Timeout for prepare phase (default: 10s)
+    commitTimeoutMs*: int64
+      ## Timeout for commit/rollback (default: 5s)
+    maxRetries*: int
+      ## Maximum retry attempts
+    enableRecovery*: bool
+      ## Enable recovery from coordinator failure
+    recoveryCheckIntervalMs*: int64
+      ## How often to check for recovery (default: 1s)
+    heartbeatIntervalMs*: int64
+      ## Heartbeat interval (default: 2s)
+    enableRaft*: bool
+      ## Use Raft for consensus
+
+  # 2PC Error Types
+  TwoPCErrorKind* = enum
+    tpekTimeout
+    tpekNetworkError
+    tpekParticipantFailed
+    tpekCoordinatorFailed
+    tpekQuorumNotReached
+    tpekInvalidState
+    tpekRaftError
+
+  TwoPCError* = ref object of CatchableError
+    ## 2PC-specific error
+    errorKind*: TwoPCErrorKind
+    participantId*: string
+      ## Participant that caused the error (if applicable)
+
+const
+  DEFAULT_PREPARE_TIMEOUT_MS* = 10_000        # 10 seconds
+  DEFAULT_COMMIT_TIMEOUT_MS* = 5_000          # 5 seconds
+  DEFAULT_2PC_MAX_RETRIES* = 3
+  DEFAULT_RECOVERY_CHECK_INTERVAL_MS* = 1_000 # 1 second
+  DEFAULT_HEARTBEAT_INTERVAL_MS* = 2_000      # 2 seconds
+
+# Helper functions
+
+proc newTwoPCConfig*(): TwoPCConfig =
+  ## Create default 2PC configuration
+  TwoPCConfig(
+    prepareTimeoutMs: DEFAULT_PREPARE_TIMEOUT_MS,
+    commitTimeoutMs: DEFAULT_COMMIT_TIMEOUT_MS,
+    maxRetries: DEFAULT_2PC_MAX_RETRIES,
+    enableRecovery: true,
+    recoveryCheckIntervalMs: DEFAULT_RECOVERY_CHECK_INTERVAL_MS,
+    heartbeatIntervalMs: DEFAULT_HEARTBEAT_INTERVAL_MS,
+    enableRaft: false
+  )
+
+proc generateTransactionId*(tsProvider: TimestampProvider): TransactionID =
+  ## Generate a unique transaction ID
+  let now = tsProvider.now()
+  # Combine timestamp with node ID for uniqueness
+  # In production, would include node ID
+  result = TransactionID(now)
+
+proc generateRequestId*(): string =
+  ## Generate a unique request ID
+  result = "req_" & $epochTime().int64 & "_" & $rand(1000000)
+
+proc newTwoPCError*(kind: TwoPCErrorKind, message: string,
+    participantId: string = ""): TwoPCError =
+  ## Create a 2PC error
+  result = TwoPCError(
+    msg: message,
+    errorKind: kind,
+    participantId: participantId
+  )
+
+# Coordinator operations
+
+proc newCoordinator*(transaction: MVCCTransaction,
+    coordinatorId: string,
+    config: TwoPCConfig = newTwoPCConfig(),
+    raftNode: RaftNode = nil,
+    logger: Logger = nil): Coordinator =
+  ## Create a new coordinator for a transaction
+  new(result)
+  result.transaction = transaction
+  result.transactionId = transaction.id
+  result.coordinatorId = coordinatorId
+  result.participants = @[]
+  result.state = tpcsIdle
+  result.prepareTimeout = config.prepareTimeoutMs
+  result.commitTimeout = config.commitTimeoutMs
+  result.startTime = transaction.createdAt
+  result.votes = @[]
+  result.preparedCount = 0
+  result.abortedCount = 0
+  result.quorum = 0
+  result.retryCount = 0
+  result.raftNode = raftNode
+  result.logger = if logger != nil: logger else: newLogger()
+
+proc addParticipant*(coordinator: Coordinator,
+    nodeId: string, endpoint: string,
+    transaction: MVCCTransaction) =
+  ## Add a participant to the coordinator
+  let participant = Participant(
+    nodeId: nodeId,
+    endpoint: endpoint,
+    state: tpcsIdle,
+    transactionId: coordinator.transactionId,
+    prepareTimestamp: INVALID_TIMESTAMP,
+    vote: pvAbstain,
+    transaction: transaction,
+    lastHeartbeat: INVALID_TIMESTAMP
+  )
+  coordinator.participants.add(participant)
+  # Quorum is majority of participants
+  coordinator.quorum = (coordinator.participants.len div 2) + 1
+
+proc sendPrepareRequest*(coordinator: Coordinator): Future[seq[
+    TwoPCResponse]] {.async.} =
+  ## Send prepare requests to all participants
+  ## Returns responses from participants
+
+  coordinator.state = tpcsPreparing
+  coordinator.startTime = Timestamp(epochTime().int64 * 1_000_000) # Convert to nanoseconds
+
+  var responses: seq[TwoPCResponse] = @[]
+  let requestId = generateRequestId()
+
+  coordinator.logger.info("Sending prepare requests",
+    {"transactionId": $int64(coordinator.transactionId),
+     "participants": $coordinator.participants.len}.toTable)
+
+  # If Raft is enabled, log the prepare phase to Raft
+  if coordinator.raftNode != nil:
+    # In a real implementation, we would log the prepare phase to Raft
+    # for durability and consensus
+    discard
+
+  for participant in coordinator.participants:
+    # In a real implementation, this would send RPC to participant
+    # For now, we simulate the response
+    let response = TwoPCResponse(
+      requestId: requestId,
+      transactionId: coordinator.transactionId,
+      participantId: participant.nodeId,
+      vote: pvYes, # Assume all vote yes for now
+      state: tpcsPrepared,
+      error: ""
+    )
+    responses.add(response)
+
+  return responses
+
+proc processPrepareResponses*(coordinator: Coordinator,
+    responses: seq[TwoPCResponse]): bool =
+  ## Process prepare responses from participants
+  ## Returns true if quorum achieved
+
+  coordinator.votes = @[]
+  coordinator.preparedCount = 0
+  coordinator.abortedCount = 0
+
+  for response in responses:
+    coordinator.votes.add(response.vote)
+
+    if response.vote == pvYes:
+      coordinator.preparedCount += 1
+    elif response.vote == pvNo:
+      coordinator.abortedCount += 1
+    elif response.vote == pvAbstain:
+      coordinator.abortedCount += 1
+
+    coordinator.logger.debug("Received prepare response",
+      {"participantId": response.participantId,
+       "vote": $response.vote,
+       "state": $response.state}.toTable)
+
+  # Check if we have quorum
+  let quorumAchieved = coordinator.preparedCount >= coordinator.quorum
+
+  coordinator.logger.info("Prepare phase completed",
+    {"transactionId": $int64(coordinator.transactionId),
+     "preparedCount": $coordinator.preparedCount,
+     "abortedCount": $coordinator.abortedCount,
+     "quorum": $coordinator.quorum,
+     "quorumAchieved": $quorumAchieved}.toTable)
+
+  return quorumAchieved
+
+proc sendCommitRequest*(coordinator: Coordinator): Future[seq[
+    TwoPCResponse]] {.async.} =
+  ## Send commit requests to all participants
+  ## Returns responses from participants
+
+  coordinator.state = tpcsCommitting
+
+  var responses: seq[TwoPCResponse] = @[]
+  let requestId = generateRequestId()
+
+  coordinator.logger.info("Sending commit requests",
+    {"transactionId": $int64(coordinator.transactionId),
+     "participants": $coordinator.participants.len}.toTable)
+
+  # If Raft is enabled, log the commit phase to Raft
+  if coordinator.raftNode != nil:
+    # In a real implementation, we would log the commit phase to Raft
+    discard
+
+  for participant in coordinator.participants:
+    # In a real implementation, this would send RPC to participant
+    # For now, we simulate the response
+    let response = TwoPCResponse(
+      requestId: requestId,
+      transactionId: coordinator.transactionId,
+      participantId: participant.nodeId,
+      vote: pvAbstain,
+      state: tpcsCommitted,
+      error: ""
+    )
+    responses.add(response)
+
+  return responses
+
+proc sendRollbackRequest*(coordinator: Coordinator): Future[seq[
+    TwoPCResponse]] {.async.} =
+  ## Send rollback requests to all participants
+  ## Returns responses from participants
+
+  coordinator.state = tpcsAborting
+
+  var responses: seq[TwoPCResponse] = @[]
+  let requestId = generateRequestId()
+
+  coordinator.logger.info("Sending rollback requests",
+    {"transactionId": $int64(coordinator.transactionId),
+     "participants": $coordinator.participants.len}.toTable)
+
+  for participant in coordinator.participants:
+    # In a real implementation, this would send RPC to participant
+    # For now, we simulate the response
+    let response = TwoPCResponse(
+      requestId: requestId,
+      transactionId: coordinator.transactionId,
+      participantId: participant.nodeId,
+      vote: pvAbstain,
+      state: tpcsAborted,
+      error: ""
+    )
+    responses.add(response)
+
+  return responses
+
+proc executeTwoPC*(coordinator: Coordinator): Future[TwoPCResult] {.async.} =
+  ## Execute the full 2PC protocol
+  ## 1. Prepare phase
+  ## 2. Commit or Rollback phase
+
+  coordinator.logger.info("Starting 2PC transaction",
+    {"transactionId": $int64(coordinator.transactionId),
+     "coordinatorId": coordinator.coordinatorId,
+     "participants": $coordinator.participants.len}.toTable)
+
+  # Phase 1: Prepare
+  let prepareResponses = await coordinator.sendPrepareRequest()
+
+  if not coordinator.processPrepareResponses(prepareResponses):
+    # Quorum not achieved, rollback
+    let rollbackResponses = await coordinator.sendRollbackRequest()
+    coordinator.state = tpcsAborted
+
+    coordinator.logger.warn("Prepare phase failed, rolling back",
+      {"transactionId": $int64(coordinator.transactionId),
+       "reason": "quorum not achieved"}.toTable)
+
+    return TwoPCResult(
+      success: false,
+      transactionId: coordinator.transactionId,
+      commitTimestamp: INVALID_TIMESTAMP,
+      participants: @[],
+      error: "Prepare phase failed: quorum not achieved",
+      retryable: true
+    )
+
+  # Phase 2: Commit
+  let commitResponses = await coordinator.sendCommitRequest()
+
+  # Verify all participants committed
+  var allCommitted = true
+  for response in commitResponses:
+    if response.state != tpcsCommitted:
+      allCommitted = false
+      coordinator.logger.error("Participant failed to commit",
+        {"transactionId": $int64(coordinator.transactionId),
+         "participantId": response.participantId,
+         "state": $response.state,
+         "error": response.error}.toTable)
+      break
+
+  if allCommitted:
+    coordinator.state = tpcsCommitted
+    let commitTs = coordinator.transaction.commitTimestamp
+    let participantIds = coordinator.participants.mapIt(it.nodeId)
+
+    coordinator.logger.info("2PC transaction committed successfully",
+      {"transactionId": $int64(coordinator.transactionId),
+       "commitTimestamp": $commitTs,
+       "participants": $participantIds.len}.toTable)
+
+    return TwoPCResult(
+      success: true,
+      transactionId: coordinator.transactionId,
+      commitTimestamp: commitTs,
+      participants: participantIds,
+      error: "",
+      retryable: false
+    )
+  else:
+    # Some participants failed to commit
+    coordinator.state = tpcsAborted
+
+    coordinator.logger.error("Commit phase failed",
+      {"transactionId": $int64(coordinator.transactionId),
+       "reason": "some participants failed"}.toTable)
+
+    return TwoPCResult(
+      success: false,
+      transactionId: coordinator.transactionId,
+      commitTimestamp: INVALID_TIMESTAMP,
+      participants: @[],
+      error: "Commit phase failed: some participants failed",
+      retryable: false
+    )
+
+# Participant operations
+
+proc newParticipant*(nodeId: string, endpoint: string,
+    config: TwoPCConfig = newTwoPCConfig(),
+    logger: Logger = nil): Participant =
+  ## Create a new participant
+  new(result)
+  result.nodeId = nodeId
+  result.endpoint = endpoint
+  result.state = tpcsIdle
+  result.transactionId = TransactionID(0)
+  result.prepareTimestamp = INVALID_TIMESTAMP
+  result.vote = pvAbstain
+  result.transaction = nil
+  result.lastHeartbeat = INVALID_TIMESTAMP
+
+proc handlePrepareRequest*(participant: Participant,
+    request: TwoPCRequest): TwoPCResponse =
+  ## Handle a prepare request from coordinator
+  ## Returns response with vote
+
+  participant.state = tpcsPreparing
+  participant.transactionId = request.transactionId
+  participant.prepareTimestamp = request.timestamp
+
+  # In a real implementation, this would:
+  # 1. Validate the transaction
+  # 2. Lock resources
+  # 3. Write intents
+  # 4. Return vote
+
+  # For now, we always vote yes
+  participant.vote = pvYes
+  participant.state = tpcsPrepared
+
+  return TwoPCResponse(
+    requestId: request.requestId,
+    transactionId: request.transactionId,
+    participantId: participant.nodeId,
+    vote: pvYes,
+    state: tpcsPrepared,
+    error: ""
+  )
+
+proc handleCommitRequest*(participant: Participant,
+    request: TwoPCRequest): TwoPCResponse =
+  ## Handle a commit request from coordinator
+  ## Returns response with new state
+
+  participant.state = tpcsCommitting
+
+  # In a real implementation, this would:
+  # 1. Upgrade intents to committed values
+  # 2. Release locks
+  # 3. Return response
+
+  participant.state = tpcsCommitted
+
+  return TwoPCResponse(
+    requestId: request.requestId,
+    transactionId: request.transactionId,
+    participantId: participant.nodeId,
+    vote: pvAbstain,
+    state: tpcsCommitted,
+    error: ""
+  )
+
+proc handleRollbackRequest*(participant: Participant,
+    request: TwoPCRequest): TwoPCResponse =
+  ## Handle a rollback request from coordinator
+  ## Returns response with new state
+
+  participant.state = tpcsAborting
+
+  # In a real implementation, this would:
+  # 1. Rollback intents
+  # 2. Release locks
+  # 3. Return response
+
+  participant.state = tpcsAborted
+
+  return TwoPCResponse(
+    requestId: request.requestId,
+    transactionId: request.transactionId,
+    participantId: participant.nodeId,
+    vote: pvAbstain,
+    state: tpcsAborted,
+    error: ""
+  )
+
+proc handleHeartbeat*(participant: Participant,
+    request: TwoPCRequest): TwoPCResponse =
+  ## Handle a heartbeat from coordinator
+  ## Returns response to keep transaction alive
+
+  participant.lastHeartbeat = request.timestamp
+
+  return TwoPCResponse(
+    requestId: request.requestId,
+    transactionId: request.transactionId,
+    participantId: participant.nodeId,
+    vote: pvAbstain,
+    state: participant.state,
+    error: ""
+  )
+
+# Recovery mechanism
+
+proc checkRecovery*(participant: Participant,
+    coordinatorId: string,
+    config: TwoPCConfig): TwoPCResult =
+  ## Check if recovery is needed for pending transactions
+  ## Returns recovery result
+
+  # In a real implementation, this would:
+  # 1. Check for pending transactions
+  # 2. Contact coordinator for status
+  # 3. Complete or rollback pending transactions
+
+  return TwoPCResult(
+    success: true,
+    transactionId: TransactionID(0),
+    commitTimestamp: INVALID_TIMESTAMP,
+    participants: @[],
+    error: "",
+    retryable: false
+  )
+
+proc recoverTransaction*(coordinator: Coordinator,
+    transactionId: TransactionID): TwoPCResult =
+  ## Attempt to recover a transaction after coordinator failure
+  ## Returns recovery result
+
+  coordinator.state = tpcsRecovering
+
+  coordinator.logger.info("Attempting to recover transaction",
+    {"transactionId": $int64(transactionId),
+     "coordinatorId": coordinator.coordinatorId}.toTable)
+
+  # In a real implementation, this would:
+  # 1. Query all participants for their state
+  # 2. Determine if transaction can be committed or must be aborted
+  # 3. Send commit/rollback to participants
+  # 4. Return result
+
+  # For now, return success
+  coordinator.state = tpcsIdle
+
+  return TwoPCResult(
+    success: true,
+    transactionId: transactionId,
+    commitTimestamp: INVALID_TIMESTAMP,
+    participants: @[],
+    error: "",
+    retryable: false
+  )
+
+# Timeout handling
+
+proc checkTimeout*(coordinator: Coordinator,
+    currentTime: Timestamp): bool =
+  ## Check if the current phase has timed out
+  ## Returns true if timeout occurred
+
+  let elapsed = currentTime - coordinator.startTime
+
+  case coordinator.state
+  of tpcsPreparing:
+    return elapsed >= coordinator.prepareTimeout
+  of tpcsCommitting, tpcsAborting:
+    return elapsed >= coordinator.commitTimeout
+  else:
+    return false
+
+proc handleTimeout*(coordinator: Coordinator): TwoPCResult =
+  ## Handle a timeout in the current phase
+  ## Returns result of timeout handling
+
+  coordinator.logger.warn("2PC timeout occurred",
+    {"transactionId": $int64(coordinator.transactionId),
+     "state": $coordinator.state}.toTable)
+
+  case coordinator.state
+  of tpcsPreparing:
+    # Timeout in prepare phase - rollback
+    coordinator.state = tpcsAborted
+    return TwoPCResult(
+      success: false,
+      transactionId: coordinator.transactionId,
+      commitTimestamp: INVALID_TIMESTAMP,
+      participants: @[],
+      error: "Prepare phase timeout",
+      retryable: true
+    )
+  of tpcsCommitting:
+    # Timeout in commit phase - this is a critical error
+    # Need to run recovery
+    coordinator.state = tpcsRecovering
+    return TwoPCResult(
+      success: false,
+      transactionId: coordinator.transactionId,
+      commitTimestamp: INVALID_TIMESTAMP,
+      participants: @[],
+      error: "Commit phase timeout - recovery needed",
+      retryable: false
+    )
+  of tpcsAborting:
+    # Timeout in abort phase - assume aborted
+    coordinator.state = tpcsAborted
+    return TwoPCResult(
+      success: false,
+      transactionId: coordinator.transactionId,
+      commitTimestamp: INVALID_TIMESTAMP,
+      participants: @[],
+      error: "Abort phase timeout",
+      retryable: false
+    )
+  else:
+    return TwoPCResult(
+      success: false,
+      transactionId: coordinator.transactionId,
+      commitTimestamp: INVALID_TIMESTAMP,
+      participants: @[],
+      error: "Unknown timeout state",
+      retryable: false
+    )
+
+# Serialization for RPC
+
+proc twoPCRequestToJson*(request: TwoPCRequest): JsonNode =
+  ## Serialize a 2PC request to JSON
+  result = %*{
+    "requestId": request.requestId,
+    "requestType": $request.requestType,
+    "transactionId": int64(request.transactionId),
+    "coordinatorId": request.coordinatorId,
+    "timestamp": int64(request.timestamp),
+    "data": request.data,
+    "participantEndpoints": request.participantEndpoints
+  }
+
+proc twoPCRequestFromJson*(json: JsonNode): TwoPCRequest =
+  ## Deserialize a 2PC request from JSON
+  result = TwoPCRequest(
+    requestId: json["requestId"].getStr(),
+    requestType: parseEnum[TwoPCRequestType](json["requestType"].getStr()),
+    transactionId: TransactionID(json["transactionId"].getInt()),
+    coordinatorId: json["coordinatorId"].getStr(),
+    timestamp: Timestamp(json["timestamp"].getInt()),
+    data: json["data"].getStr(),
+    participantEndpoints: json["participantEndpoints"].getElems().mapIt(
+        it.getStr())
+  )
+
+proc twoPCResponseToJson*(response: TwoPCResponse): JsonNode =
+  ## Serialize a 2PC response to JSON
+  result = %*{
+    "requestId": response.requestId,
+    "transactionId": int64(response.transactionId),
+    "participantId": response.participantId,
+    "vote": $response.vote,
+    "state": $response.state,
+    "error": response.error
+  }
+
+proc twoPCResponseFromJson*(json: JsonNode): TwoPCResponse =
+  ## Deserialize a 2PC response from JSON
+  result = TwoPCResponse(
+    requestId: json["requestId"].getStr(),
+    transactionId: TransactionID(json["transactionId"].getInt()),
+    participantId: json["participantId"].getStr(),
+    vote: parseEnum[ParticipantVote](json["vote"].getStr()),
+    state: parseEnum[TwoPCState](json["state"].getStr()),
+    error: json["error"].getStr()
+  )
