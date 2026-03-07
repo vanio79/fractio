@@ -1,4 +1,4 @@
-# Fractio protocol client — Phase 1 + Phase 2: Core Protocol + KV Operations.
+# Fractio protocol client — Phase 1 + Phase 2 + Phase 3: Core, KV, Transactions.
 #
 # Manages a single TCP connection, performs the handshake, and provides
 # send/receive with automatic Request ID assignment.
@@ -18,6 +18,7 @@ import ./frame
 import ./handshake
 import ./messages/core
 import ./messages/kv
+import ./messages/txn as txnMsgs
 
 # ---------------------------------------------------------------------------
 # Safe logging helper (no Logger dep in client to keep it lightweight)
@@ -373,3 +374,43 @@ proc kvScan*(client: ProtocolClient, startKey: string = "",
   let r = client.send(encodeScanRequest(req))
   if r.isErr: return peErr(r.error)
   decodeScanResponseFrame(r.value.payload, flags)
+
+# ---------------------------------------------------------------------------
+# Transaction convenience procs (Phase 3)
+# ---------------------------------------------------------------------------
+
+proc beginTxn*(client: ProtocolClient, flags: uint8 = 0,
+    timeoutMs: uint32 = 0): Result[txnMsgs.BeginTxnResponse,
+    ProtocolError] {.gcsafe, raises: [].} =
+  ## Begin a new transaction. Returns (txnId, readTimestamp).
+  let req = txnMsgs.BeginTxnRequest(flags: flags, timeoutMs: timeoutMs)
+  let r = client.send(txnMsgs.encodeBeginTxnRequest(req))
+  if r.isErr: return peErr(r.error)
+  txnMsgs.decodeBeginTxnResponse(r.value.payload)
+
+proc commitTxn*(client: ProtocolClient,
+    txnId: uint64): Result[txnMsgs.CommitTxnResponse,
+    ProtocolError] {.gcsafe, raises: [].} =
+  ## Commit txnId. Check .status for TxnCommitOK / conflict / timeout.
+  let req = txnMsgs.CommitTxnRequest(txnId: txnId)
+  let r = client.send(txnMsgs.encodeCommitTxnRequest(req))
+  if r.isErr: return peErr(r.error)
+  txnMsgs.decodeCommitTxnResponse(r.value.payload)
+
+proc rollbackTxn*(client: ProtocolClient,
+    txnId: uint64): Result[txnMsgs.RollbackTxnResponse,
+    ProtocolError] {.gcsafe, raises: [].} =
+  ## Roll back txnId.
+  let req = txnMsgs.RollbackTxnRequest(txnId: txnId)
+  let r = client.send(txnMsgs.encodeRollbackTxnRequest(req))
+  if r.isErr: return peErr(r.error)
+  txnMsgs.decodeRollbackTxnResponse(r.value.payload)
+
+proc txnStatus*(client: ProtocolClient,
+    txnId: uint64): Result[txnMsgs.TxnStatusResponse,
+    ProtocolError] {.gcsafe, raises: [].} =
+  ## Query the status of txnId.
+  let req = txnMsgs.TxnStatusRequest(txnId: txnId)
+  let r = client.send(txnMsgs.encodeTxnStatusRequest(req))
+  if r.isErr: return peErr(r.error)
+  txnMsgs.decodeTxnStatusResponse(r.value.payload)

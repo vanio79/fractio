@@ -1,4 +1,4 @@
-# Fractio protocol server — Phase 1 + Phase 2: Core Protocol + KV Operations.
+# Fractio protocol server — Phase 1 + Phase 2 + Phase 3: Core, KV, Transactions.
 #
 # Thread model:
 #   - One acceptor thread (server.start spawns acceptLoop)
@@ -15,6 +15,8 @@ import ./frame
 import ./handshake
 import ./messages/core
 import ./messages/kv
+import ./messages/txn as txnMsgs
+import ./txn_manager
 import ../utils/logging
 
 # ---------------------------------------------------------------------------
@@ -190,7 +192,8 @@ type
     handlersMu*: Lock
     nextClientId*: Atomic[uint32]
     serverFeatures*: uint32
-    kvStore*: KVStore ## Phase 2: in-memory store
+    kvStore*: KVStore           ## Phase 2: in-memory store
+    txnMgr*: TransactionManager ## Phase 3: transaction manager
 
 # ---------------------------------------------------------------------------
 # Thread argument types — defined after ProtocolServer to avoid forward refs
@@ -216,6 +219,7 @@ proc newProtocolServer*(config: ServerConfig): ProtocolServer =
     clients: initTable[uint32, ClientConnection](),
     handlers: initTable[int, MessageHandler](),
     kvStore: newKVStore(),
+    txnMgr: newTransactionManager(),
   )
   initLock(result.clientsMu)
   initLock(result.handlersMu)
@@ -439,6 +443,13 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
     if req.key.len == 0 or req.key.len > int(server.config.maxKeyBytes):
       sendError(conn, requestId, ErrProtocol, ErrCatKV, "invalid key length")
       return
+    # Transactional read: register the key as read by the transaction
+    if req.txnId != 0:
+      let rr = server.txnMgr.recordRead(req.txnId, req.key)
+      if rr.isErr:
+        sendError(conn, requestId, ErrTxnAborted, ErrCatTransaction,
+          "txn expired or not found: " & rr.error.msg)
+        return
     let entryOpt = server.kvStore.kvGet(req.key)
     var resp: GetResponse
     if entryOpt.isSome:
@@ -467,6 +478,14 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
     if req.value.len > int(server.config.maxValueBytes):
       sendError(conn, requestId, ErrProtocol, ErrCatKV, "value too large")
       return
+    # Transactional write: register the key as written by the transaction
+    if req.txnId != 0:
+      let wr = server.txnMgr.recordWrite(req.txnId, req.key)
+      if wr.isErr:
+        let resp = PutResponse(status: PutStatusTxnAborted,
+                               timestamp: 0, version: 0)
+        sendFrame(conn, encodePutResponse(resp), requestId)
+        return
     # CAS check
     if (req.flags and PutFlagCAS) != 0:
       let existing = server.kvStore.kvGet(req.key)
@@ -500,6 +519,13 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
     if req.key.len == 0 or req.key.len > int(server.config.maxKeyBytes):
       sendError(conn, requestId, ErrProtocol, ErrCatKV, "invalid key length")
       return
+    # Transactional write: register the key as written by the transaction
+    if req.txnId != 0:
+      let wr = server.txnMgr.recordWrite(req.txnId, req.key)
+      if wr.isErr:
+        let resp = DeleteResponse(status: DelStatusTxnAborted)
+        sendFrame(conn, encodeDeleteResponse(resp), requestId)
+        return
     let deleted = server.kvStore.kvDelete(req.key)
     var resp: DeleteResponse
     if deleted.isNone:
@@ -608,6 +634,61 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
       &"unknown KV message type 0x{typeVal:04X}")
 
 # ---------------------------------------------------------------------------
+# Built-in Transaction handlers (BeginTxn, CommitTxn, RollbackTxn, TxnStatus)
+# ---------------------------------------------------------------------------
+
+proc handleBuiltinTxn(server: ProtocolServer, conn: ClientConnection,
+    requestId: uint32, flags: uint16,
+    payload: string) {.gcsafe, raises: [].} =
+  if payload.len < 2: return
+  let typeVal = (uint16(payload[0]) shl 8) or uint16(payload[1])
+
+  case typeVal
+
+  of uint16(mtBeginTxn):
+    let reqR = txnMsgs.decodeBeginTxnRequest(payload)
+    if reqR.isErr:
+      sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
+      return
+    let req = reqR.value
+    # Opportunistically expire timed-out transactions before starting new ones
+    server.txnMgr.expireTimedOutTxns()
+    let rec = server.txnMgr.beginTransaction(req.flags, req.timeoutMs)
+    let resp = txnMsgs.BeginTxnResponse(
+      txnId: rec.id,
+      readTimestamp: rec.readTimestamp,
+    )
+    sendFrame(conn, txnMsgs.encodeBeginTxnResponse(resp), requestId)
+
+  of uint16(mtCommitTxn):
+    let reqR = txnMsgs.decodeCommitTxnRequest(payload)
+    if reqR.isErr:
+      sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
+      return
+    let resp = server.txnMgr.commitTransaction(reqR.value.txnId)
+    sendFrame(conn, txnMsgs.encodeCommitTxnResponse(resp), requestId)
+
+  of uint16(mtRollbackTxn):
+    let reqR = txnMsgs.decodeRollbackTxnRequest(payload)
+    if reqR.isErr:
+      sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
+      return
+    let resp = server.txnMgr.rollbackTransaction(reqR.value.txnId)
+    sendFrame(conn, txnMsgs.encodeRollbackTxnResponse(resp), requestId)
+
+  of uint16(mtTxnStatus):
+    let reqR = txnMsgs.decodeTxnStatusRequest(payload)
+    if reqR.isErr:
+      sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
+      return
+    let resp = server.txnMgr.getTransactionStatus(reqR.value.txnId)
+    sendFrame(conn, txnMsgs.encodeTxnStatusResponse(resp), requestId)
+
+  else:
+    sendError(conn, requestId, ErrProtocol, ErrCatTransaction,
+      &"unknown txn message type 0x{typeVal:04X}")
+
+# ---------------------------------------------------------------------------
 # Per-connection loop
 # ---------------------------------------------------------------------------
 
@@ -659,6 +740,9 @@ proc clientLoop(server: ProtocolServer,
         f.payload)
     elif typeVal >= 0x0100 and typeVal <= 0x01FF:
       handleBuiltinKV(server, conn, f.header.requestId, f.header.flags,
+        f.payload)
+    elif typeVal >= 0x0200 and typeVal <= 0x02FF:
+      handleBuiltinTxn(server, conn, f.header.requestId, f.header.flags,
         f.payload)
     else:
       sendError(conn, f.header.requestId, ErrProtocol, ErrCatProtocol,
