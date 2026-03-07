@@ -37,6 +37,10 @@ import fractio/protocol/server
 import fractio/protocol/client
 import fractio/protocol/types
 import fractio/protocol/messages/txn as txnMsgs
+import fractio/protocol/raft_store
+import fractio/distributed/raft/multigroup_coordinator
+import fractio/distributed/raft/multigroup_types
+import fractio/distributed/range/types as rangeTypes
 
 # =============================================================================
 # Constants
@@ -45,7 +49,8 @@ import fractio/protocol/messages/txn as txnMsgs
 const
   BENCH_PORT = 29000
   BENCH_HOST = "127.0.0.1"
-  SERVER_WAIT_MS = 80 ## ms to sleep after server.start() before connecting
+  SERVER_WAIT_MS = 120 ## ms to sleep after server.start() before connecting
+  RAFT_STORAGE_PATH = "/tmp/fractio_bench_raft"
 
 # =============================================================================
 # Shared types (compatible with fractio_benchmarks.nim)
@@ -509,8 +514,47 @@ when isMainModule:
   echo ""
 
   # -------------------------------------------------------------------------
-  # Start server (single instance, shared across all benchmarks)
+  # Start server with Raft + WiscKey (syncWrites=true) backend
+  #
+  # Write path:
+  #   client kvPut → server handleBuiltinKV (raftStore branch)
+  #     → raftPut → proposeAndWait (Raft consensus, quorum=1)
+  #     → applyBatchToSM → WiscKey.put (fdatasync) + in-memory SM
+  #
+  # This puts real fsync I/O on every write, making the comparison with
+  # PostgreSQL/MySQL/SQLite apples-to-apples.
   # -------------------------------------------------------------------------
+
+  # Clean up any leftover storage from a previous run
+  try: removeDir(RAFT_STORAGE_PATH) except CatchableError: discard
+  try: createDir(RAFT_STORAGE_PATH) except CatchableError: discard
+
+  # Build coordinator (WiscKey opened with syncWrites=true inside newMultiRaftCoordinator)
+  let coordCfg = CoordinatorConfig(
+    nodeId: RangeNodeID(1),
+    numWorkers: 2,
+    electionTimeoutNs: DEFAULT_ELECTION_TIMEOUT_NS,
+    heartbeatIntervalNs: DEFAULT_HEARTBEAT_INTERVAL_NS,
+    storagePath: RAFT_STORAGE_PATH,
+    proposeTimeoutMs: 10_000,
+  )
+  let coord = newMultiRaftCoordinator(coordCfg)
+
+  # Bootstrap a single shard covering the full key-space
+  let rid = RangeID(1)
+  let desc = newRangeDescriptor(rid, @[], @[])
+  let rep = desc.addReplica(RangeNodeID(1))
+  let group = coord.createGroup(desc, rep.replicaId)
+  group.becomeLeader()
+
+  # Create RaftKVStoreExt and wire the apply callback BEFORE coord.start()
+  let raftSt = newRaftKVStoreExt(coord, proposeTimeoutMs = 10_000)
+  raftSt.wireApplyCallback()
+  raftSt.bootstrapSingleShardExt(rid)
+
+  coord.start()
+
+  # Protocol server
   var srvCfg = defaultServerConfig()
   srvCfg.host = BENCH_HOST
   srvCfg.port = BENCH_PORT
@@ -518,10 +562,12 @@ when isMainModule:
   srvCfg.serverName = "fractio-bench"
 
   let srv = newProtocolServer(srvCfg)
+  srv.raftStore = raftSt
   srv.start()
   sleep(SERVER_WAIT_MS)
 
   echo "Server started on " & BENCH_HOST & ":" & $BENCH_PORT
+  echo "Backend: Raft + WiscKey (LevelDB syncWrites=true / fdatasync per commit)"
   echo ""
 
   var allResults: seq[BenchmarkResult] = @[]
@@ -635,6 +681,8 @@ when isMainModule:
   # -------------------------------------------------------------------------
   srv.stop()
   sleep(50)
+  coord.stop()
+  try: removeDir(RAFT_STORAGE_PATH) except CatchableError: discard
   echo "Done!"
   # Exit explicitly to avoid ORC teardown crash on module-level thread globals
   # in server.nim (threadStore / acceptThreadStore seqs).

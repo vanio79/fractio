@@ -34,6 +34,7 @@ import fractio/distributed/raft/multigroup_coordinator
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/range/types as rangeTypes
 import fractio/distributed/raft/state_machine
+import fractio/storage/wisckey_backend
 import ../utils/logging
 
 # ---------------------------------------------------------------------------
@@ -278,6 +279,50 @@ proc fromBytes(b: seq[byte]): string {.inline.} =
   result = newString(b.len)
   for i in 0 ..< b.len:
     result[i] = char(b[i])
+
+# ---------------------------------------------------------------------------
+# Follower apply callback (called by coordinator on committed entries)
+# ---------------------------------------------------------------------------
+
+proc applyBatchToSM*(storePtr: pointer, rid: RangeID,
+    batch: WriteBatch) {.gcsafe, raises: [].} =
+  ## Callback registered with the coordinator so that follower nodes can apply
+  ## committed WriteBatch entries to their local KVStateMachine.
+  ## `storePtr` is a raw `pointer` cast from `RaftKVStoreExt` to break
+  ## the raft_store → coordinator → raft_store circular import.
+  ##
+  ## Write-through: every committed entry is also persisted to the WiscKey
+  ## backend (opened with syncWrites=true → fdatasync per batch) so that
+  ## committed data survives a crash.  This makes the hot path comparable to
+  ## PostgreSQL/MySQL/SQLite which all fsync on every commit.
+  if storePtr == nil: return
+  let store = cast[RaftKVStoreExt](storePtr)
+  let sm = store.getOrCreateSM(rid)
+
+  # --- Persist to WiscKey (fsync path) ---
+  let backend = store.coordinator.store
+  if backend != nil and backend.isOpen:
+    {.cast(raises: []).}:
+      for (k, v) in batch.puts:
+        discard backend.put(fromBytes(k), fromBytes(v))
+      for k in batch.deletes:
+        discard backend.delete(fromBytes(k))
+
+  # --- Update in-memory state machine (for fast reads) ---
+  acquire(store.smMu)
+  defer: release(store.smMu)
+  for (k, v) in batch.puts:
+    sm.kvStore[fromBytes(k)] = fromBytes(v)
+  for k in batch.deletes:
+    sm.kvStore.del(fromBytes(k))
+
+proc wireApplyCallback*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
+  ## Wire the applyBatchToSM callback into the coordinator so that committed
+  ## log entries are applied to the local KV state machine on followers.
+  ## Call this once after newRaftKVStoreExt() and before coordinator.start().
+  {.cast(gcsafe).}: {.cast(raises: []).}:
+    multigroup_coordinator.applyBatchCallback = applyBatchToSM
+  store.coordinator.kvStorePtr = cast[pointer](store)
 
 proc proposeWrite(store: RaftKVStoreExt, rangeId: RangeID,
     batch: WriteBatch): RSVoidResult {.gcsafe, raises: [].} =
