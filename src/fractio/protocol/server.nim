@@ -1,4 +1,5 @@
-# Fractio protocol server — Phase 1 + Phase 2 + Phase 3: Core, KV, Transactions.
+# Fractio protocol server — Phase 1 + Phase 2 + Phase 3 + Phase 4:
+#   Core, KV, Transactions, Admin/Metrics, Authentication.
 #
 # Thread model:
 #   - One acceptor thread (server.start spawns acceptLoop)
@@ -13,9 +14,11 @@ import ./types
 import ./codec as protoCodec
 import ./frame
 import ./handshake
+import ./auth
 import ./messages/core
 import ./messages/kv
 import ./messages/txn as txnMsgs
+import ./messages/admin as adminMsgs
 import ./txn_manager
 import ../utils/logging
 
@@ -51,6 +54,8 @@ type
     serverName*: string
     serverId*: uint16
     clusterId*: uint64
+    serverVersion*: string      ## reported in ServerInfo; default "1.0.0"
+    clusterName*: string        ## reported in Health; default "fractio"
 
 proc defaultServerConfig*(): ServerConfig =
   ServerConfig(
@@ -67,6 +72,8 @@ proc defaultServerConfig*(): ServerConfig =
     serverName: "fractio",
     serverId: 1,
     clusterId: 0,
+    serverVersion: "1.0.0",
+    clusterName: "fractio",
   )
 
 # ---------------------------------------------------------------------------
@@ -177,6 +184,69 @@ proc kvScan*(store: KVStore, startKey: string, endKey: string,
     pairs.setLen(int(limit))
   pairs
 
+proc kvLen*(store: KVStore): int {.gcsafe, raises: [].} =
+  acquire(store.mu)
+  defer: release(store.mu)
+  store.data.len
+
+# ---------------------------------------------------------------------------
+# Metrics counters (Phase 4)
+# ---------------------------------------------------------------------------
+
+type
+  ServerMetrics* = ref object
+    requestsTotal*: Atomic[uint64]
+    requestsOK*: Atomic[uint64]
+    requestsErr*: Atomic[uint64]
+    bytesIn*: Atomic[uint64]
+    bytesOut*: Atomic[uint64]
+    kvGets*: Atomic[uint64]
+    kvPuts*: Atomic[uint64]
+    kvDeletes*: Atomic[uint64]
+    committedTxns*: Atomic[uint64]
+    abortedTxns*: Atomic[uint64]
+
+proc newServerMetrics*(): ServerMetrics =
+  result = ServerMetrics()
+  result.requestsTotal.store(0)
+  result.requestsOK.store(0)
+  result.requestsErr.store(0)
+  result.bytesIn.store(0)
+  result.bytesOut.store(0)
+  result.kvGets.store(0)
+  result.kvPuts.store(0)
+  result.kvDeletes.store(0)
+  result.committedTxns.store(0)
+  result.abortedTxns.store(0)
+
+proc snapshot*(m: ServerMetrics): adminMsgs.MetricsResponse {.gcsafe,
+    raises: [].} =
+  adminMsgs.MetricsResponse(
+    requestsTotal: m.requestsTotal.load(),
+    requestsOK: m.requestsOK.load(),
+    requestsErr: m.requestsErr.load(),
+    bytesIn: m.bytesIn.load(),
+    bytesOut: m.bytesOut.load(),
+    kvGets: m.kvGets.load(),
+    kvPuts: m.kvPuts.load(),
+    kvDeletes: m.kvDeletes.load(),
+    activeTxns: 0'u32, # filled in from txnMgr at call site
+    committedTxns: m.committedTxns.load(),
+    abortedTxns: m.abortedTxns.load(),
+  )
+
+proc reset*(m: ServerMetrics) {.gcsafe, raises: [].} =
+  m.requestsTotal.store(0)
+  m.requestsOK.store(0)
+  m.requestsErr.store(0)
+  m.bytesIn.store(0)
+  m.bytesOut.store(0)
+  m.kvGets.store(0)
+  m.kvPuts.store(0)
+  m.kvDeletes.store(0)
+  m.committedTxns.store(0)
+  m.abortedTxns.store(0)
+
 # ---------------------------------------------------------------------------
 # Protocol server
 # ---------------------------------------------------------------------------
@@ -186,14 +256,17 @@ type
     config*: ServerConfig
     logger*: Logger
     running*: Atomic[bool]
+    startedAt*: int64             ## Unix seconds; set in start()
     clients*: Table[uint32, ClientConnection]
     clientsMu*: Lock
     handlers*: Table[int, MessageHandler]
     handlersMu*: Lock
     nextClientId*: Atomic[uint32]
     serverFeatures*: uint32
-    kvStore*: KVStore           ## Phase 2: in-memory store
-    txnMgr*: TransactionManager ## Phase 3: transaction manager
+    kvStore*: KVStore             ## Phase 2: in-memory store
+    txnMgr*: TransactionManager   ## Phase 3: transaction manager
+    metrics*: ServerMetrics       ## Phase 4: request counters
+    authenticator*: Authenticator ## Phase 4: auth validator
 
 # ---------------------------------------------------------------------------
 # Thread argument types — defined after ProtocolServer to avoid forward refs
@@ -220,6 +293,9 @@ proc newProtocolServer*(config: ServerConfig): ProtocolServer =
     handlers: initTable[int, MessageHandler](),
     kvStore: newKVStore(),
     txnMgr: newTransactionManager(),
+    metrics: newServerMetrics(),
+    authenticator: newAuthenticator(config.authMethod),
+    startedAt: getTime().toUnix(),
   )
   initLock(result.clientsMu)
   initLock(result.handlersMu)
@@ -281,7 +357,7 @@ proc sendError(conn: ClientConnection, requestId: uint32,
   sendRaw(conn, encodeErrorFrame(requestId, errCode, category, msg))
 
 # ---------------------------------------------------------------------------
-# Handshake
+# Handshake (Phase 4: auth wired in)
 # ---------------------------------------------------------------------------
 
 proc performHandshake(server: ProtocolServer,
@@ -339,10 +415,11 @@ proc performHandshake(server: ProtocolServer,
         errorMessage: &"unsupported protocol version {hs.version}")))
       return false
 
+    # Phase 4: authenticate when server requires it
     if server.config.authMethod != amNone:
-      if AuthMethod(hs.authType) != server.config.authMethod:
+      if not server.authenticator.authenticate(hs.authType, hsAuthData):
         conn.socket.send(encodeHandshakeResponse(HandshakeResponse(
-          status: HandshakeError, errorMessage: "authentication required")))
+          status: HandshakeError, errorMessage: "authentication failed")))
         return false
 
     let negotiated = negotiateFeatures(server.serverFeatures, hs.features)
@@ -435,6 +512,7 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
   case typeVal
 
   of uint16(mtGet):
+    discard server.metrics.kvGets.fetchAdd(1)
     let reqR = decodeGetRequest(payload)
     if reqR.isErr:
       sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
@@ -467,6 +545,7 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
     sendFrame(conn, encodeGetResponse(resp), requestId)
 
   of uint16(mtPut):
+    discard server.metrics.kvPuts.fetchAdd(1)
     let reqR = decodePutRequest(payload)
     if reqR.isErr:
       sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
@@ -511,6 +590,7 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
     sendFrame(conn, encodePutResponse(resp), requestId)
 
   of uint16(mtDelete):
+    discard server.metrics.kvDeletes.fetchAdd(1)
     let reqR = decodeDeleteRequest(payload)
     if reqR.isErr:
       sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
@@ -549,6 +629,7 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
     for i, op in req.operations:
       case op.kind
       of BatchOpGet:
+        discard server.metrics.kvGets.fetchAdd(1)
         # Decode key from op.data (uint32-prefixed)
         var dpos = 0
         let keyR = protoCodec.readBytes(op.data, dpos)
@@ -566,6 +647,7 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
             anyFailed = true
             results[i] = BatchOpResult(status: 0x01'u8, data: "")
       of BatchOpPut:
+        discard server.metrics.kvPuts.fetchAdd(1)
         var dpos = 0
         let keyR = protoCodec.readBytes(op.data, dpos)
         if keyR.isErr:
@@ -581,6 +663,7 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
         allFailed = false
         results[i] = BatchOpResult(status: 0x00'u8, data: "")
       of BatchOpDelete:
+        discard server.metrics.kvDeletes.fetchAdd(1)
         var dpos = 0
         let keyR = protoCodec.readBytes(op.data, dpos)
         if keyR.isErr:
@@ -666,6 +749,10 @@ proc handleBuiltinTxn(server: ProtocolServer, conn: ClientConnection,
       sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
       return
     let resp = server.txnMgr.commitTransaction(reqR.value.txnId)
+    if resp.status == txnMsgs.TxnCommitOK:
+      discard server.metrics.committedTxns.fetchAdd(1)
+    else:
+      discard server.metrics.abortedTxns.fetchAdd(1)
     sendFrame(conn, txnMsgs.encodeCommitTxnResponse(resp), requestId)
 
   of uint16(mtRollbackTxn):
@@ -674,6 +761,7 @@ proc handleBuiltinTxn(server: ProtocolServer, conn: ClientConnection,
       sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
       return
     let resp = server.txnMgr.rollbackTransaction(reqR.value.txnId)
+    discard server.metrics.abortedTxns.fetchAdd(1)
     sendFrame(conn, txnMsgs.encodeRollbackTxnResponse(resp), requestId)
 
   of uint16(mtTxnStatus):
@@ -687,6 +775,59 @@ proc handleBuiltinTxn(server: ProtocolServer, conn: ClientConnection,
   else:
     sendError(conn, requestId, ErrProtocol, ErrCatTransaction,
       &"unknown txn message type 0x{typeVal:04X}")
+
+# ---------------------------------------------------------------------------
+# Built-in Admin handlers (ServerInfo, Metrics, Health)
+# ---------------------------------------------------------------------------
+
+proc handleBuiltinAdmin(server: ProtocolServer, conn: ClientConnection,
+    requestId: uint32, flags: uint16,
+    payload: string) {.gcsafe, raises: [].} =
+  if payload.len < 2: return
+  let typeVal = (uint16(payload[0]) shl 8) or uint16(payload[1])
+
+  case typeVal
+
+  of uint16(mtServerInfo):
+    let nowSec = getTime().toUnix()
+    let uptime = uint64(if nowSec > server.startedAt: nowSec -
+        server.startedAt else: 0)
+    let resp = adminMsgs.ServerInfoResponse(
+      nodeId: server.config.serverId,
+      version: server.config.serverVersion,
+      uptimeSecs: uptime,
+      role: adminMsgs.RoleLeader, ## Phase 4: always leader (single-node)
+      shardCount: 1'u32,
+      clientCount: uint32(server.clientCount()),
+    )
+    sendFrame(conn, adminMsgs.encodeServerInfoResponse(resp), requestId)
+
+  of uint16(mtMetrics):
+    let reqR = adminMsgs.decodeMetricsRequest(payload)
+    if reqR.isErr:
+      sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
+      return
+    var snap = server.metrics.snapshot()
+    snap.activeTxns = uint32(server.txnMgr.activeTxnCount())
+    sendFrame(conn, adminMsgs.encodeMetricsResponse(snap), requestId)
+    # Reset counters if flag requested
+    if (reqR.value.flags and adminMsgs.MetricsFlagReset) != 0:
+      server.metrics.reset()
+
+  of uint16(mtHealth):
+    let status = adminMsgs.HealthOK
+    let resp = adminMsgs.HealthResponse(
+      status: status,
+      leaderOK: true,
+      replicaCount: 1,
+      healthyReplicas: 1,
+      clusterName: server.config.clusterName,
+    )
+    sendFrame(conn, adminMsgs.encodeHealthResponse(resp), requestId)
+
+  else:
+    sendError(conn, requestId, ErrProtocol, ErrCatSystem,
+      &"unknown admin message type 0x{typeVal:04X}")
 
 # ---------------------------------------------------------------------------
 # Per-connection loop
@@ -716,14 +857,20 @@ proc clientLoop(server: ProtocolServer,
       let e = frameR.error
       if e.kind != peInternal:
         sendError(conn, 0, ErrProtocol, ErrCatProtocol, $e)
+        discard server.metrics.requestsErr.fetchAdd(1)
       break
 
     let f = frameR.value
     conn.touchActivity()
 
+    discard server.metrics.requestsTotal.fetchAdd(1)
+    discard server.metrics.bytesIn.fetchAdd(uint64(FRAME_HEADER_SIZE +
+        f.payload.len))
+
     if f.payload.len < 2:
       sendError(conn, f.header.requestId, ErrProtocol, ErrCatProtocol,
         "payload too short")
+      discard server.metrics.requestsErr.fetchAdd(1)
       continue
 
     let typeVal = int((uint16(f.payload[0]) shl 8) or uint16(f.payload[1]))
@@ -735,18 +882,27 @@ proc clientLoop(server: ProtocolServer,
 
     if handler.isSome:
       handler.get()(conn, f.header.requestId, f.header.flags, f.payload)
+      discard server.metrics.requestsOK.fetchAdd(1)
     elif typeVal <= 0x00FF:
       handleBuiltinCore(server, conn, f.header.requestId, f.header.flags,
         f.payload)
+      discard server.metrics.requestsOK.fetchAdd(1)
     elif typeVal >= 0x0100 and typeVal <= 0x01FF:
       handleBuiltinKV(server, conn, f.header.requestId, f.header.flags,
         f.payload)
+      discard server.metrics.requestsOK.fetchAdd(1)
     elif typeVal >= 0x0200 and typeVal <= 0x02FF:
       handleBuiltinTxn(server, conn, f.header.requestId, f.header.flags,
         f.payload)
+      discard server.metrics.requestsOK.fetchAdd(1)
+    elif typeVal >= 0x0700 and typeVal <= 0x07FF:
+      handleBuiltinAdmin(server, conn, f.header.requestId, f.header.flags,
+        f.payload)
+      discard server.metrics.requestsOK.fetchAdd(1)
     else:
       sendError(conn, f.header.requestId, ErrProtocol, ErrCatProtocol,
         &"no handler for message type 0x{typeVal:04X}")
+      discard server.metrics.requestsErr.fetchAdd(1)
 
 # ---------------------------------------------------------------------------
 # Thread entry points
@@ -793,6 +949,7 @@ proc acceptLoop(args: AcceptLoopArgs) {.thread.} =
 
 proc start*(server: ProtocolServer) {.raises: [].} =
   server.running.store(true)
+  server.startedAt = getTime().toUnix()
   var sock: Socket
   try:
     sock = newSocket()

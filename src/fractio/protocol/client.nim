@@ -1,4 +1,4 @@
-# Fractio protocol client — Phase 1 + Phase 2 + Phase 3: Core, KV, Transactions.
+# Fractio protocol client — Phase 1 + Phase 2 + Phase 3 + Phase 4: Core, KV, Transactions, Admin.
 #
 # Manages a single TCP connection, performs the handshake, and provides
 # send/receive with automatic Request ID assignment.
@@ -19,6 +19,7 @@ import ./handshake
 import ./messages/core
 import ./messages/kv
 import ./messages/txn as txnMsgs
+import ./messages/admin as adminMsgs
 
 # ---------------------------------------------------------------------------
 # Safe logging helper (no Logger dep in client to keep it lightweight)
@@ -414,3 +415,33 @@ proc txnStatus*(client: ProtocolClient,
   let r = client.send(txnMsgs.encodeTxnStatusRequest(req))
   if r.isErr: return peErr(r.error)
   txnMsgs.decodeTxnStatusResponse(r.value.payload)
+
+# ---------------------------------------------------------------------------
+# Admin convenience procs (Phase 4)
+# ---------------------------------------------------------------------------
+
+proc serverInfo*(client: ProtocolClient): Result[adminMsgs.ServerInfoResponse,
+    ProtocolError] {.gcsafe, raises: [].} =
+  ## Request server identity, version, uptime, role, and connection counts.
+  let r = client.send(adminMsgs.encodeServerInfoRequest())
+  if r.isErr: return peErr(r.error)
+  adminMsgs.decodeServerInfoResponse(r.value.payload)
+
+proc metrics*(client: ProtocolClient,
+    flags: uint8 = 0): Result[adminMsgs.MetricsResponse,
+    ProtocolError] {.gcsafe, raises: [].} =
+  ## Request server metrics. Set flags = MetricsFlagReset to reset counters
+  ## after reading.
+  let req = adminMsgs.MetricsRequest(flags: flags)
+  let r = client.send(adminMsgs.encodeMetricsRequest(req))
+  if r.isErr: return peErr(r.error)
+  adminMsgs.decodeMetricsResponse(r.value.payload)
+
+proc health*(client: ProtocolClient): Result[adminMsgs.HealthResponse,
+    ProtocolError] {.gcsafe, raises: [].} =
+  ## Request cluster health status.
+  let r = client.send(adminMsgs.encodeHealthRequest())
+  if r.isErr: return peErr(r.error)
+  adminMsgs.decodeHealthResponse(r.value.payload)
+
+
