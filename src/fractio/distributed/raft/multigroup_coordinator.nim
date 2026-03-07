@@ -2,19 +2,26 @@
 #
 # This module manages multiple Raft groups on a single node.
 # It handles proposal routing, worker threads, and group lifecycle.
+#
+# Fixed for Nim 2.2.8:
+#   - Replaced std/channels (nonexistent) with built-in Channel[T]
+#   - Replaced RwLock (nonexistent) with Lock
+#   - Replaced Future-based propose with synchronous proposeAndWait
+#   - Removed asyncdispatch dependency
 
 import std/atomics
 import std/locks
 import std/tables
 import std/sets
-import std/channels
 import std/typedthreads
 import std/times
 import std/options
+import os # for sleep()
 
 import fractio/distributed/range/types
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/multigroup_log
+import fractio/storage/backend
 import fractio/storage/wisckey_backend
 import fractio/utils/logging
 
@@ -54,12 +61,12 @@ type
     # Group management
     groups*: Table[RangeID, RaftGroup]
     logs*: Table[RangeID, RaftLog]
-    groupsLock*: RwLock
+    groupsLock*: Lock ## replaced RwLock with plain Lock
 
     # Storage
     store*: WiscKeyBackend
 
-    # Proposal handling
+    # Proposal handling: Channel is a built-in type in Nim (no import needed)
     proposalCh*: Channel[Proposal]
     pendingProposals*: Table[uint64, Proposal]
     proposalIdCounter*: Atomic[uint64]
@@ -104,13 +111,15 @@ proc newMultiRaftCoordinator*(config: CoordinatorConfig): MultiRaftCoordinator =
   result.pendingProposals = initTable[uint64, Proposal]()
   result.proposalIdCounter.store(0)
 
-  # Initialize synchronization
+  # Initialize synchronization: Channel[T].open() initialises the channel
   initLock(result.groupsLock)
-  result.proposalCh = newChannel[Proposal](MAX_PROPOSAL_QUEUE_SIZE)
+  result.proposalCh.open(MAX_PROPOSAL_QUEUE_SIZE)
 
   # Initialize workers
   result.workers = newSeq[Thread[WorkerContext]](config.numWorkers)
   result.running.store(false)
+
+proc workerProc(ctx: WorkerContext) {.thread.} # forward declaration
 
 proc start*(c: MultiRaftCoordinator) =
   ## Start the coordinator and worker threads
@@ -124,10 +133,11 @@ proc start*(c: MultiRaftCoordinator) =
     let ctx = WorkerContext(coordinator: c, workerId: i)
     createThread(c.workers[i], workerProc, ctx)
 
-  var fields = initTable[string, string]()
-  fields["nodeId"] = $c.nodeId
-  fields["numWorkers"] = $c.config.numWorkers
-  info("Multi-Raft coordinator started", fields)
+  {.cast(gcsafe).}:
+    var fields = initTable[string, string]()
+    fields["nodeId"] = $c.nodeId
+    fields["numWorkers"] = $c.config.numWorkers
+    info("Multi-Raft coordinator started", fields)
 
 proc stop*(c: MultiRaftCoordinator) =
   ## Stop the coordinator
@@ -136,12 +146,21 @@ proc stop*(c: MultiRaftCoordinator) =
 
   c.running.store(false)
 
-  # Close channel to unblock workers
-  c.proposalCh.close()
+  # Send shutdown signals to workers (one per worker).
+  # rangeId == 0 is used as a shutdown sentinel; resultPtr is nil (no reply needed).
+  for i in 0..<c.workers.len:
+    c.proposalCh.send(Proposal(
+      rangeId: RangeID(0),
+      command: RaftCommand(kind: ckNoop),
+      resultPtr: nil,
+    ))
 
   # Wait for workers to finish
-  for worker in c.workers:
-    joinThread(worker)
+  for i in 0..<c.workers.len:
+    joinThread(c.workers[i])
+
+  # Close the channel
+  c.proposalCh.close()
 
   # Close all groups
   withLock c.groupsLock:
@@ -153,9 +172,10 @@ proc stop*(c: MultiRaftCoordinator) =
   # Close storage
   c.store.close()
 
-  var fields = initTable[string, string]()
-  fields["nodeId"] = $c.nodeId
-  info("Multi-Raft coordinator stopped", fields)
+  {.cast(gcsafe).}:
+    var fields = initTable[string, string]()
+    fields["nodeId"] = $c.nodeId
+    info("Multi-Raft coordinator stopped", fields)
 
 # ============================================================================
 # Group Management
@@ -186,10 +206,11 @@ proc createGroup*(c: MultiRaftCoordinator, descriptor: RangeDescriptor,
       group.commitIndex.store(state.get.commitIndex)
       group.lastApplied.store(state.get.lastApplied)
 
-    var fields = initTable[string, string]()
-    fields["rangeId"] = $descriptor.rangeId
-    fields["replicaId"] = $replicaId
-    info("Created Raft group", fields)
+    {.cast(gcsafe).}:
+      var fields = initTable[string, string]()
+      fields["rangeId"] = $descriptor.rangeId
+      fields["replicaId"] = $replicaId
+      info("Created Raft group", fields)
 
     result = group
 
@@ -205,9 +226,10 @@ proc removeGroup*(c: MultiRaftCoordinator, rangeId: RangeID) =
       log.close()
       c.logs.del(rangeId)
 
-      var fields = initTable[string, string]()
-      fields["rangeId"] = $rangeId
-      info("Removed Raft group", fields)
+      {.cast(gcsafe).}:
+        var fields = initTable[string, string]()
+        fields["rangeId"] = $rangeId
+        info("Removed Raft group", fields)
 
 proc getGroup*(c: MultiRaftCoordinator, rangeId: RangeID): Option[RaftGroup] =
   ## Get a Raft group by range ID
@@ -221,68 +243,67 @@ proc hasGroup*(c: MultiRaftCoordinator, rangeId: RangeID): bool =
     result = c.groups.hasKey(rangeId)
 
 # ============================================================================
-# Proposal Handling
+# Proposal Handling (synchronous — no asyncdispatch)
 # ============================================================================
-
-proc propose*(c: MultiRaftCoordinator, rangeId: RangeID,
-              command: RaftCommand): Future[RaftResult] =
-  ## Propose a command to a Raft group
-  let proposal = Proposal(
-    rangeId: rangeId,
-    command: command,
-    callback: nil
-  )
-
-  # Create a future for the result
-  var future = newFuture[RaftResult]()
-  proposal.callback = proc(result: RaftResult) =
-    future.complete(result)
-
-  # Send to proposal channel
-  c.proposalCh.send(proposal)
-
-  return future
 
 proc proposeAndWait*(c: MultiRaftCoordinator, rangeId: RangeID,
                      command: RaftCommand, timeoutMs: int = 5000): RaftResult =
-  ## Propose a command and wait for result
-  let future = c.propose(rangeId, command)
+  ## Propose a command to a Raft group and block until the result is available.
+  ##
+  ## Completion is signalled via a ProposalResultChannel allocated on the heap
+  ## and shared with the worker thread via a raw pointer.  Using a raw pointer
+  ## (instead of a GC ref inside a closure) avoids ORC cross-thread cycle
+  ## tracking, which causes SIGSEGV in Nim 2.2.8.
+  var prc = cast[ptr ProposalResultChannel](
+    allocShared0(sizeof(ProposalResultChannel)))
+  prc[].ch.open(1)
 
-  # Wait with timeout
-  let startTime = getTime().toUnix * 1000
-  while not future.finished:
-    let elapsed = (getTime().toUnix * 1000) - startTime
-    if elapsed > timeoutMs:
+  let proposal = Proposal(
+    rangeId: rangeId,
+    command: command,
+    resultPtr: prc,
+  )
+
+  c.proposalCh.send(proposal)
+
+  # Busy-wait with timeout
+  let deadline = getTime().toUnix * 1000 + timeoutMs
+  while true:
+    let (avail, res) = prc[].ch.tryRecv()
+    if avail:
+      prc[].ch.close()
+      deallocShared(prc)
+      return res
+    if getTime().toUnix * 1000 >= deadline:
+      prc[].ch.close()
+      deallocShared(prc)
       return RaftResult(success: false, error: "Timeout waiting for proposal")
-    sleep(10)
-
-  if future.completed:
-    result = future.read
-  else:
-    result = RaftResult(success: false, error: "Proposal failed")
+    sleep(1)
 
 # ============================================================================
 # Worker Thread
 # ============================================================================
 
+proc sendResult(p: ptr ProposalResultChannel, r: RaftResult) {.inline.} =
+  ## Send the result to the waiting caller via the raw-pointer channel.
+  ## The caller owns the ProposalResultChannel and frees it after recv.
+  if p != nil:
+    p[].ch.send(r)
+
 proc workerProc(ctx: WorkerContext) {.thread.} =
   ## Worker thread that processes proposals
   let c = ctx.coordinator
 
-  var fields = initTable[string, string]()
-  fields["workerId"] = $ctx.workerId
-  debug("Worker thread started", fields)
-
   while c.running.load:
+    let proposal = c.proposalCh.recv()
+    if proposal.rangeId.uint64 == 0:
+      break # Shutdown sentinel
+
     try:
-      let proposal = c.proposalCh.recv()
-      if proposal.rangeId.uint64 == 0:
-        break # Shutdown signal
-      
       # Get the group
       let groupOpt = c.getGroup(proposal.rangeId)
       if groupOpt.isNone:
-        proposal.callback(RaftResult(
+        sendResult(proposal.resultPtr, RaftResult(
           success: false,
           error: "Range not found: " & $proposal.rangeId
         ))
@@ -292,38 +313,31 @@ proc workerProc(ctx: WorkerContext) {.thread.} =
 
       # Check if we're the leader
       if not group.isLeader():
-        proposal.callback(RaftResult(
+        sendResult(proposal.resultPtr, RaftResult(
           success: false,
           error: "Not the leader"
         ))
         continue
 
       # Append to log
-      let log = c.logs[proposal.rangeId]
-      let term = group.getTerm()
-      let index = log.lastIndex.load + 1
+      withLock c.groupsLock:
+        let log = c.logs[proposal.rangeId]
+        let term = group.getTerm()
+        let index = log.lastIndex.load + 1
 
-      let entry = newLogEntry(term, index, proposal.command)
-      log.putEntry(entry)
+        let entry = newLogEntry(term, index, proposal.command)
+        log.putEntry(entry)
 
-      # Update commit index (simplified - in real implementation, wait for quorum)
-      group.commitIndex.store(index)
+        # Update commit index (simplified — single-node quorum)
+        group.commitIndex.store(index)
 
-      # Complete the proposal
-      proposal.callback(RaftResult(
-        success: true,
-        index: index
-      ))
+        # Signal completion to the waiting caller
+        sendResult(proposal.resultPtr, RaftResult(success: true, index: index))
 
     except CatchableError as e:
-      var errFields = initTable[string, string]()
-      errFields["workerId"] = $ctx.workerId
-      errFields["error"] = e.msg
-      error("Worker error", errFields)
-
-  fields = initTable[string, string]()
-  fields["workerId"] = $ctx.workerId
-  debug("Worker thread stopped", fields)
+      try:
+        sendResult(proposal.resultPtr, RaftResult(success: false, error: e.msg))
+      except CatchableError: discard
 
 # ============================================================================
 # Election and Heartbeat

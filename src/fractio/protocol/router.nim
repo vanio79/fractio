@@ -4,10 +4,18 @@
 # Thread-safe via a single Mutex; all public procs acquire the lock.
 #
 # In Phase 2 the router operates in "mock" mode: a single shard covers the
-# entire keyspace and is always routed to the local node.  Phase 5 replaces
-# this with real Raft group handles and consistent-hash ring placement.
+# entire keyspace and is always routed to the local node.
+#
+# Phase 5 additions:
+#   - onLeaderChange callback: invoked whenever a shard leader changes so the
+#     RaftKVStoreExt can adapt (e.g. redirect proposals to the new leader).
+#   - notLeaderRedirect: record NOT_LEADER hints from Raft and update the table.
+#   - syncFromRaftGroup: populate routing entries from a MultiRaftCoordinator's
+#     live group map (called at startup or after config changes).
+#   - staleness TTL: LeaderInfo.lastSeenMs checked against a configurable TTL;
+#     stale entries trigger re-routing.
 
-import std/[tables, locks, strformat, algorithm]
+import std/[tables, locks, strformat, algorithm, times]
 import ./types
 
 # ---------------------------------------------------------------------------
@@ -28,24 +36,41 @@ type
     nodeAddr*: string  ## "host:port" of the leader
     lastSeenMs*: int64 ## monotonic ms; updated on each successful contact
 
+  LeaderChangeCallback* = proc(shardId: uint32,
+      leader: LeaderInfo) {.gcsafe, raises: [].}
+    ## Called whenever the leader for a shard is updated in the routing table.
+
   RouterTable* = ref object
     ## Thread-safe mapping: shardId → (ShardRange, LeaderInfo).
-    shards*: seq[ShardRange]            ## sorted by startKey ascending
-    leaders*: Table[uint32, LeaderInfo] ## shardId → leader
+    shards*: seq[ShardRange]              ## sorted by startKey ascending
+    leaders*: Table[uint32, LeaderInfo]   ## shardId → leader
     localNodeId*: uint32
     mu*: Lock
+    ## Phase 5: optional callbacks for leader-change notifications
+    onLeaderChange*: LeaderChangeCallback ## nil when not configured
+    leaderTtlMs*: int64 ## entries older than this are treated as stale (0 = no TTL)
 
 # ---------------------------------------------------------------------------
 # Constructor
 # ---------------------------------------------------------------------------
 
-proc newRouterTable*(localNodeId: uint32 = 1): RouterTable =
+proc newRouterTable*(localNodeId: uint32 = 1,
+    leaderTtlMs: int64 = 0): RouterTable =
   result = RouterTable(
     shards: @[],
     leaders: initTable[uint32, LeaderInfo](),
     localNodeId: localNodeId,
+    leaderTtlMs: leaderTtlMs,
+    onLeaderChange: nil,
   )
   initLock(result.mu)
+
+proc setLeaderChangeCallback*(rt: RouterTable,
+    cb: LeaderChangeCallback) {.gcsafe, raises: [].} =
+  ## Register a callback invoked whenever a shard leader changes.
+  acquire(rt.mu)
+  rt.onLeaderChange = cb
+  release(rt.mu)
 
 # ---------------------------------------------------------------------------
 # Bootstrap: single-shard covering the whole keyspace
@@ -97,7 +122,7 @@ proc findShardForKey(rt: RouterTable, key: string): int =
 proc routeKey*(rt: RouterTable,
     key: string): Result[LeaderInfo, ProtocolError] =
   ## Return the LeaderInfo for the shard that owns `key`.
-  ## Returns peNotLeader when no leader is currently known for that shard.
+  ## Returns peNotLeader when no leader is currently known or the entry is stale.
   acquire(rt.mu)
   defer: release(rt.mu)
 
@@ -113,6 +138,13 @@ proc routeKey*(rt: RouterTable,
   if leader.nodeId == 0:
     return peErr(newProtocolError(peNotLeader,
       &"leader unknown for shard {shard.shardId} (election in progress?)"))
+
+  # Phase 5: check staleness TTL
+  if rt.leaderTtlMs > 0 and leader.lastSeenMs > 0:
+    let nowMs = (getTime().toUnixFloat() * 1000).int64
+    if (nowMs - leader.lastSeenMs) > rt.leaderTtlMs:
+      return peErr(newProtocolError(peNotLeader,
+        &"leader entry for shard {shard.shardId} is stale (ttl={rt.leaderTtlMs}ms)"))
 
   peOk(leader)
 
@@ -179,9 +211,30 @@ proc updateRoute*(rt: RouterTable, shard: ShardRange,
 proc updateLeader*(rt: RouterTable, shardId: uint32,
     leader: LeaderInfo) {.gcsafe, raises: [].} =
   ## Update only the leader for an existing shard (e.g. after election).
+  ## Fires the onLeaderChange callback if registered.
+  acquire(rt.mu)
+  rt.leaders[shardId] = leader
+  let cb = rt.onLeaderChange
+  release(rt.mu)
+  if cb != nil:
+    cb(shardId, leader)
+
+proc notLeaderRedirect*(rt: RouterTable, shardId: uint32,
+    newLeader: LeaderInfo) {.gcsafe, raises: [].} =
+  ## Called when a NOT_LEADER response carries a leader hint.
+  ## Updates the routing table and fires onLeaderChange.
+  rt.updateLeader(shardId, newLeader)
+
+proc touchLeader*(rt: RouterTable, shardId: uint32) {.gcsafe, raises: [].} =
+  ## Refresh the lastSeenMs timestamp for a shard's leader (call after a
+  ## successful operation to keep the TTL alive).
   acquire(rt.mu)
   defer: release(rt.mu)
-  rt.leaders[shardId] = leader
+  var entry = rt.leaders.getOrDefault(shardId,
+      LeaderInfo(nodeId: 0, nodeAddr: "", lastSeenMs: 0))
+  if entry.nodeId != 0:
+    entry.lastSeenMs = (getTime().toUnixFloat() * 1000).int64
+    rt.leaders[shardId] = entry
 
 # ---------------------------------------------------------------------------
 # Public: shardCount / isLocal

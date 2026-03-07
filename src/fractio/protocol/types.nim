@@ -110,6 +110,7 @@ const
   ErrNotLeader* = 0x07000001'u32
   ErrClusterDown* = 0x07000002'u32
   ErrOverloaded* = 0x07000003'u32
+  ErrInternal* = 0x07000004'u32 ## Phase 5: internal/unexpected server error
 
 # Wire-level error categories
 const

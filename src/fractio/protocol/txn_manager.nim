@@ -1,4 +1,4 @@
-# Transaction manager for the Fractio protocol layer — Phase 3.
+# Transaction manager for the Fractio protocol layer — Phase 3 + Phase 5.
 #
 # Provides an in-memory, thread-safe TransactionManager that handles:
 #   - beginTransaction: allocate a new txn with a monotonic read timestamp
@@ -13,12 +13,18 @@
 #   falls strictly after the committing txn's readTimestamp.  This prevents
 #   lost updates (write-write conflicts under SSI).
 #
-# In Phase 3 the manager is self-contained (no Raft integration).
-# Phase 5 replaces the in-memory store with real Raft group calls.
+# Phase 5 additions:
+#   - Optional `timeProvider`: when set, read timestamps are sourced from the
+#     P2P SharedTimer (fractio/distributed/sharedtimer) for cluster-wide
+#     monotonic ordering.  Falls back to wall clock when nil.
+#   - Optional `raftCoord`: when set, commitTransaction uses the Raft 2PC
+#     coordinator to durably commit / rollback write-intents through Raft
+#     consensus.  When nil (Phase 3 compat), pure in-memory behaviour is kept.
 
-import std/[tables, sets, locks, times, atomics, strformat]
+import std/[tables, sets, locks, times, atomics, strformat, options]
 import ./types
 import ./messages/txn as txnMsgs
+import fractio/distributed/sharedtimer/timeprovider as tp
 
 export txnMsgs # re-export status constants
 
@@ -44,9 +50,12 @@ type
     mu*: Lock
     nextTxnId*: Atomic[uint64]
     nextTimestamp*: Atomic[uint64]  ## monotonic counter (nanoseconds)
-                                   ## commitIndex: tracks (key → commitTs) for conflict detection.
-                                   ## Maps each key to the highest commit timestamp that wrote it.
+                                    ## commitIndex: tracks (key → commitTs) for conflict detection.
+                                    ## Maps each key to the highest commit timestamp that wrote it.
     commitIndex*: Table[string, uint64]
+    ## Phase 5 optional integrations:
+    timeProvider*: tp.TimeProvider  ## when non-nil, use cluster time for timestamps
+    raftCoordPtr*: pointer ## when non-nil, points to RaftTxnCoordinator (void ptr to avoid circular import)
 
 const
   DEFAULT_TXN_TIMEOUT_MS* = 30_000'u32 ## 30 seconds
@@ -59,12 +68,31 @@ proc newTransactionManager*(): TransactionManager =
   result = TransactionManager(
     txns: initTable[uint64, TxnRecord](),
     commitIndex: initTable[string, uint64](),
+    timeProvider: nil,
+    raftCoordPtr: nil,
   )
   initLock(result.mu)
   result.nextTxnId.store(1)
-  # Seed timestamp from wall clock (µs → ns)
+  # Seed timestamp from wall clock (ns)
   let nowNs = uint64(getTime().toUnixFloat() * 1_000_000_000)
   result.nextTimestamp.store(nowNs)
+
+proc setTimeProvider*(mgr: TransactionManager,
+    provider: tp.TimeProvider) {.gcsafe, raises: [].} =
+  ## Configure the cluster-wide TimeProvider for timestamp allocation.
+  ## Thread-safe: atomic assignment (pointer write is atomic on x86-64).
+  acquire(mgr.mu)
+  mgr.timeProvider = provider
+  release(mgr.mu)
+
+proc setRaftCoordPtr*(mgr: TransactionManager,
+    coordPtr: pointer) {.gcsafe, raises: [].} =
+  ## Store a void pointer to the RaftTxnCoordinator.
+  ## Avoids circular import between txn_manager ↔ raft_txn.
+  ## The server is responsible for casting this pointer back.
+  acquire(mgr.mu)
+  mgr.raftCoordPtr = coordPtr
+  release(mgr.mu)
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -72,8 +100,15 @@ proc newTransactionManager*(): TransactionManager =
 
 proc allocTimestamp(mgr: TransactionManager): uint64 {.gcsafe, raises: [].} =
   ## Monotonically-increasing nanosecond timestamp.
+  ## When a TimeProvider is configured (Phase 5), uses cluster time.
   ## Always advances by at least 1 tick to ensure strict ordering.
-  let wallNs = uint64(getTime().toUnixFloat() * 1_000_000_000)
+  let wallNs: uint64 =
+    if not mgr.timeProvider.isNil:
+      try: uint64(mgr.timeProvider.now())
+      except Exception: uint64(getTime().toUnixFloat() * 1_000_000_000)
+    else:
+      uint64(getTime().toUnixFloat() * 1_000_000_000)
+
   var cur = mgr.nextTimestamp.load()
   while true:
     let next = if wallNs > cur: wallNs else: cur + 1

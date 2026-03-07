@@ -1,10 +1,16 @@
-# Fractio protocol server — Phase 1 + Phase 2 + Phase 3 + Phase 4:
-#   Core, KV, Transactions, Admin/Metrics, Authentication.
+# Fractio protocol server — Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 5:
+#   Core, KV, Transactions, Admin/Metrics, Authentication, Raft Integration.
 #
 # Thread model:
 #   - One acceptor thread (server.start spawns acceptLoop)
 #   - One reader thread per client connection (clientLoop)
 #   - Handlers are called on the reader thread; they must be gcsafe.
+#
+# Phase 5 changes:
+#   - ProtocolServer.raftStore: optional RaftKVStoreExt field.
+#     When set, all KV reads/writes go through Raft consensus.
+#     When nil (default), the Phase 2 in-memory KVStore is used (backward compat).
+#   - NOT_LEADER responses surface as ErrNotLeader wire errors.
 #
 # All shared mutable state is protected by Locks.
 
@@ -20,6 +26,7 @@ import ./messages/kv
 import ./messages/txn as txnMsgs
 import ./messages/admin as adminMsgs
 import ./txn_manager
+import ./raft_store
 import ../utils/logging
 
 # ---------------------------------------------------------------------------
@@ -263,7 +270,8 @@ type
     handlersMu*: Lock
     nextClientId*: Atomic[uint32]
     serverFeatures*: uint32
-    kvStore*: KVStore             ## Phase 2: in-memory store
+    kvStore*: KVStore             ## Phase 2: in-memory store (fallback when raftStore is nil)
+    raftStore*: RaftKVStoreExt    ## Phase 5: Raft-backed KV store (nil = use kvStore)
     txnMgr*: TransactionManager   ## Phase 3: transaction manager
     metrics*: ServerMetrics       ## Phase 4: request counters
     authenticator*: Authenticator ## Phase 4: auth validator
@@ -528,20 +536,46 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
         sendError(conn, requestId, ErrTxnAborted, ErrCatTransaction,
           "txn expired or not found: " & rr.error.msg)
         return
-    let entryOpt = server.kvStore.kvGet(req.key)
+
     var resp: GetResponse
-    if entryOpt.isSome:
-      let entry = entryOpt.get()
-      resp = GetResponse(
-        found: true,
-        hasTimestamp: (req.flags and GetFlagIncludeTimestamp) != 0,
-        hasVersion: (req.flags and GetFlagIncludeVersion) != 0,
-        timestamp: entry.timestamp,
-        version: entry.version,
-        value: entry.value,
-      )
+    if not server.raftStore.isNil:
+      # Phase 5: Raft-backed read
+      let rr = server.raftStore.raftGet(req.key)
+      if not rr.isOk:
+        if rr.error.kind == rseNotLeader:
+          sendError(conn, requestId, ErrNotLeader, ErrCatKV,
+            "not the leader for key: " & req.key)
+        else:
+          sendError(conn, requestId, ErrInternal, ErrCatKV, rr.error.msg)
+        return
+      let entryOpt = rr.value
+      if entryOpt.isSome:
+        let entry = entryOpt.get()
+        resp = GetResponse(
+          found: true,
+          hasTimestamp: (req.flags and GetFlagIncludeTimestamp) != 0,
+          hasVersion: (req.flags and GetFlagIncludeVersion) != 0,
+          timestamp: entry.timestamp,
+          version: entry.version,
+          value: entry.value,
+        )
+      else:
+        resp = GetResponse(found: false)
     else:
-      resp = GetResponse(found: false)
+      # Phase 2 fallback: in-memory read
+      let entryOpt = server.kvStore.kvGet(req.key)
+      if entryOpt.isSome:
+        let entry = entryOpt.get()
+        resp = GetResponse(
+          found: true,
+          hasTimestamp: (req.flags and GetFlagIncludeTimestamp) != 0,
+          hasVersion: (req.flags and GetFlagIncludeVersion) != 0,
+          timestamp: entry.timestamp,
+          version: entry.version,
+          value: entry.value,
+        )
+      else:
+        resp = GetResponse(found: false)
     sendFrame(conn, encodeGetResponse(resp), requestId)
 
   of uint16(mtPut):
@@ -565,29 +599,65 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
                                timestamp: 0, version: 0)
         sendFrame(conn, encodePutResponse(resp), requestId)
         return
-    # CAS check
-    if (req.flags and PutFlagCAS) != 0:
-      let existing = server.kvStore.kvGet(req.key)
-      let currentVer: uint64 = if existing.isSome: existing.get().version else: 0
-      if currentVer != req.expectedVersion:
-        let resp = PutResponse(status: PutStatusCASFailed,
-          timestamp: 0, version: 0)
-        sendFrame(conn, encodePutResponse(resp), requestId)
+
+    if not server.raftStore.isNil:
+      # Phase 5: Raft-backed write
+      # CAS check via raftGet
+      if (req.flags and PutFlagCAS) != 0:
+        let existR = server.raftStore.raftGet(req.key)
+        let currentVer: uint64 = if existR.isOk and existR.value.isSome:
+                                    existR.value.get().version
+                                  else: 0'u64
+        if currentVer != req.expectedVersion:
+          sendFrame(conn, encodePutResponse(PutResponse(
+            status: PutStatusCASFailed,
+            timestamp: 0, version: 0)), requestId)
+          return
+      var prevEntry: Option[RaftKVEntry]
+      if (req.flags and PutFlagReturnPrev) != 0:
+        let pr = server.raftStore.raftGet(req.key)
+        if pr.isOk: prevEntry = pr.value
+      let wr = server.raftStore.raftPut(req.key, req.value)
+      if not wr.isOk:
+        if wr.error.kind == rseNotLeader:
+          sendError(conn, requestId, ErrNotLeader, ErrCatKV,
+            "not the leader for key: " & req.key)
+        else:
+          sendError(conn, requestId, ErrInternal, ErrCatKV, wr.error.msg)
         return
-    # Capture previous value if requested
-    var prevEntry: Option[KVEntry]
-    if (req.flags and PutFlagReturnPrev) != 0:
-      prevEntry = server.kvStore.kvGet(req.key)
-    let entry = server.kvStore.kvPut(req.key, req.value)
-    var resp = PutResponse(
-      status: PutStatusOK,
-      timestamp: entry.timestamp,
-      version: entry.version,
-    )
-    if (req.flags and PutFlagReturnPrev) != 0 and prevEntry.isSome:
-      resp.hasPreviousValue = true
-      resp.previousValue = prevEntry.get().value
-    sendFrame(conn, encodePutResponse(resp), requestId)
+      let entry = wr.value
+      var resp = PutResponse(
+        status: PutStatusOK,
+        timestamp: entry.timestamp,
+        version: entry.version,
+      )
+      if (req.flags and PutFlagReturnPrev) != 0 and prevEntry.isSome:
+        resp.hasPreviousValue = true
+        resp.previousValue = prevEntry.get().value
+      sendFrame(conn, encodePutResponse(resp), requestId)
+    else:
+      # Phase 2 fallback: in-memory write
+      if (req.flags and PutFlagCAS) != 0:
+        let existing = server.kvStore.kvGet(req.key)
+        let currentVer: uint64 = if existing.isSome: existing.get().version else: 0
+        if currentVer != req.expectedVersion:
+          let resp = PutResponse(status: PutStatusCASFailed,
+            timestamp: 0, version: 0)
+          sendFrame(conn, encodePutResponse(resp), requestId)
+          return
+      var prevEntry: Option[KVEntry]
+      if (req.flags and PutFlagReturnPrev) != 0:
+        prevEntry = server.kvStore.kvGet(req.key)
+      let entry = server.kvStore.kvPut(req.key, req.value)
+      var resp = PutResponse(
+        status: PutStatusOK,
+        timestamp: entry.timestamp,
+        version: entry.version,
+      )
+      if (req.flags and PutFlagReturnPrev) != 0 and prevEntry.isSome:
+        resp.hasPreviousValue = true
+        resp.previousValue = prevEntry.get().value
+      sendFrame(conn, encodePutResponse(resp), requestId)
 
   of uint16(mtDelete):
     discard server.metrics.kvDeletes.fetchAdd(1)
@@ -606,16 +676,38 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
         let resp = DeleteResponse(status: DelStatusTxnAborted)
         sendFrame(conn, encodeDeleteResponse(resp), requestId)
         return
-    let deleted = server.kvStore.kvDelete(req.key)
-    var resp: DeleteResponse
-    if deleted.isNone:
-      resp = DeleteResponse(status: DelStatusNotFound)
+
+    if not server.raftStore.isNil:
+      # Phase 5: Raft-backed delete
+      let dr = server.raftStore.raftDelete(req.key)
+      if not dr.isOk:
+        if dr.error.kind == rseNotLeader:
+          sendError(conn, requestId, ErrNotLeader, ErrCatKV,
+            "not the leader for key: " & req.key)
+        else:
+          sendError(conn, requestId, ErrInternal, ErrCatKV, dr.error.msg)
+        return
+      var resp: DeleteResponse
+      if dr.value.isNone:
+        resp = DeleteResponse(status: DelStatusNotFound)
+      else:
+        resp = DeleteResponse(status: DelStatusDeleted)
+        if (req.flags and DelFlagReturnPrev) != 0:
+          resp.hasPreviousValue = true
+          resp.previousValue = dr.value.get().value
+      sendFrame(conn, encodeDeleteResponse(resp), requestId)
     else:
-      resp = DeleteResponse(status: DelStatusDeleted)
-      if (req.flags and DelFlagReturnPrev) != 0:
-        resp.hasPreviousValue = true
-        resp.previousValue = deleted.get().value
-    sendFrame(conn, encodeDeleteResponse(resp), requestId)
+      # Phase 2 fallback
+      let deleted = server.kvStore.kvDelete(req.key)
+      var resp: DeleteResponse
+      if deleted.isNone:
+        resp = DeleteResponse(status: DelStatusNotFound)
+      else:
+        resp = DeleteResponse(status: DelStatusDeleted)
+        if (req.flags and DelFlagReturnPrev) != 0:
+          resp.hasPreviousValue = true
+          resp.previousValue = deleted.get().value
+      sendFrame(conn, encodeDeleteResponse(resp), requestId)
 
   of uint16(mtBatch):
     let reqR = decodeBatchRequest(payload)
@@ -694,23 +786,49 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
       sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
       return
     let req = reqR.value
-    let pairs = server.kvStore.kvScan(req.startKey, req.endKey, req.limit)
-    # Build scan pairs
-    var scanPairs = newSeq[ScanPair](pairs.len)
-    for i, p in pairs:
-      let (k, entry) = p
-      scanPairs[i] = ScanPair(
-        key: k,
-        value: entry.value,
-        timestamp: entry.timestamp,
-        version: entry.version,
+
+    if not server.raftStore.isNil:
+      # Phase 5: Raft-backed scan
+      let sr = server.raftStore.raftScan(req.startKey, req.endKey, req.limit)
+      if not sr.isOk:
+        if sr.error.kind == rseNotLeader:
+          sendError(conn, requestId, ErrNotLeader, ErrCatKV, "not the leader")
+        else:
+          sendError(conn, requestId, ErrInternal, ErrCatKV, sr.error.msg)
+        return
+      var scanPairs = newSeq[ScanPair](sr.value.len)
+      for i, p in sr.value:
+        let (k, entry) = p
+        scanPairs[i] = ScanPair(
+          key: k,
+          value: entry.value,
+          timestamp: entry.timestamp,
+          version: entry.version,
+        )
+      let rf = ScanResponseFrame(
+        respFlags: ScanRespFlagEndOfScan,
+        pairs: scanPairs,
+        reqFlags: req.flags,
       )
-    let rf = ScanResponseFrame(
-      respFlags: ScanRespFlagEndOfScan, # single-frame response in Phase 2
-      pairs: scanPairs,
-      reqFlags: req.flags,
-    )
-    sendFrame(conn, encodeScanResponseFrame(rf), requestId)
+      sendFrame(conn, encodeScanResponseFrame(rf), requestId)
+    else:
+      # Phase 2 fallback
+      let pairs = server.kvStore.kvScan(req.startKey, req.endKey, req.limit)
+      var scanPairs = newSeq[ScanPair](pairs.len)
+      for i, p in pairs:
+        let (k, entry) = p
+        scanPairs[i] = ScanPair(
+          key: k,
+          value: entry.value,
+          timestamp: entry.timestamp,
+          version: entry.version,
+        )
+      let rf = ScanResponseFrame(
+        respFlags: ScanRespFlagEndOfScan,
+        pairs: scanPairs,
+        reqFlags: req.flags,
+      )
+      sendFrame(conn, encodeScanResponseFrame(rf), requestId)
 
   else:
     sendError(conn, requestId, ErrProtocol, ErrCatProtocol,

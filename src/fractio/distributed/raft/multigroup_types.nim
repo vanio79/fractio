@@ -165,17 +165,26 @@ type
 # ============================================================================
 
 type
-  Proposal* = ref object
-    ## A pending proposal to a Raft group
-    rangeId*: RangeID
-    command*: RaftCommand
-    callback*: proc(result: RaftResult) {.closure, gcsafe.}
-
   RaftResult* = object
     ## Result of a Raft proposal
     success*: bool
     index*: uint64
     error*: string
+
+  ProposalResultChannel* = object
+    ## One-shot channel used to return a RaftResult to a waiting caller.
+    ## Allocated on the heap and accessed via raw pointer so ORC does not
+    ## attempt cross-thread cycle tracking (which causes SIGSEGV).
+    ch*: Channel[RaftResult]
+
+  Proposal* = ref object
+    ## A pending proposal to a Raft group.
+    rangeId*: RangeID
+    command*: RaftCommand
+    ## Raw pointer to the caller's heap-allocated ProposalResultChannel.
+    ## The worker sends into ch; the caller receives from ch.
+    ## Using a raw pointer sidesteps ORC's cross-thread ref counting.
+    resultPtr*: ptr ProposalResultChannel
 
 # ============================================================================
 # Errors
