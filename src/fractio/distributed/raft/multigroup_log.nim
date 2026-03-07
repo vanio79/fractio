@@ -13,6 +13,7 @@ import std/tables
 import fractio/distributed/range/types
 import fractio/distributed/raft/multigroup_types
 import fractio/storage/wisckey_backend
+import fractio/storage/backend
 import fractio/utils/logging
 
 # ============================================================================
@@ -164,6 +165,37 @@ proc putEntry*(log: RaftLog, entry: LogEntry) =
 
   if not log.store.put(key, value):
     raise newException(MultiRaftError, "Failed to write log entry")
+
+  # Update last index atomically
+  var current = log.lastIndex.load
+  while entry.index > current:
+    if log.lastIndex.compareExchange(current, entry.index):
+      break
+
+proc putEntryAndState*(log: RaftLog, entry: LogEntry,
+    state: RaftPersistentState) =
+  ## Store a log entry AND persist Raft state in a single LevelDB WriteBatch.
+  ## This reduces 2 fdatasyncs (one for the entry, one for the state) to just 1.
+  let logKey = encodeLogKey(log.rangeId, entry.index)
+  let logValue = encodeEntry(entry)
+
+  let stateKey = encodeStateKey(log.rangeId)
+  let stateJson = %*{
+    "currentTerm": state.currentTerm,
+    "votedFor": state.votedFor.uint32,
+    "commitIndex": state.commitIndex,
+    "lastApplied": state.lastApplied
+  }
+
+  let pairs: seq[KeyValuePair] = @[
+    (key: logKey, value: logValue),
+    (key: stateKey, value: $stateJson)
+  ]
+  let deletes: seq[string] = @[]
+
+  if not log.store.writeBatch(pairs, deletes):
+    raise newException(MultiRaftError,
+        "Failed to write log entry and state")
 
   # Update last index atomically
   var current = log.lastIndex.load

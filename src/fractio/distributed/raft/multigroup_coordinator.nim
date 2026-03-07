@@ -292,9 +292,15 @@ proc start*(c: MultiRaftCoordinator) =
         let idx = log.lastIndex.load + 1
         let cmd = RaftCommand(kind: ckWrite, writeBatch: batch)
         let e = newLogEntry(term, idx, cmd)
-        log.putEntry(e)
+        # Combined log entry + Raft state in a single fdatasync
+        let state = RaftPersistentState(
+          currentTerm: group.currentTerm.load(),
+          votedFor: group.votedFor.load(),
+          commitIndex: group.commitIndex.load(),
+          lastApplied: group.lastApplied.load(),
+        )
+        log.putEntryAndState(e, state)
         release(coord.groupsLock)
-        coord.saveGroupState(group, log)
         entry = e
         index = idx
       # Single-node: commit immediately.
@@ -575,9 +581,15 @@ proc workerProc(ctx: WorkerContext) {.thread.} =
         let term = group.getTerm()
         let idx = log.lastIndex.load + 1
         let e = newLogEntry(term, idx, proposal.command)
-        log.putEntry(e)
+        # Combined log entry + Raft state in a single fdatasync
+        let state = RaftPersistentState(
+          currentTerm: group.currentTerm.load(),
+          votedFor: group.votedFor.load(),
+          commitIndex: group.commitIndex.load(),
+          lastApplied: group.lastApplied.load(),
+        )
+        log.putEntryAndState(e, state)
         release(c.groupsLock)
-        c.saveGroupState(group, log)
         entry = e
         index = idx
 

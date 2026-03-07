@@ -35,6 +35,7 @@ import fractio/distributed/raft/multigroup_types
 import fractio/distributed/range/types as rangeTypes
 import fractio/distributed/raft/state_machine
 import fractio/storage/wisckey_backend
+import fractio/storage/backend
 import ../utils/logging
 
 # ---------------------------------------------------------------------------
@@ -299,14 +300,19 @@ proc applyBatchToSM*(storePtr: pointer, rid: RangeID,
   let store = cast[RaftKVStoreExt](storePtr)
   let sm = store.getOrCreateSM(rid)
 
-  # --- Persist to WiscKey (fsync path) ---
+  # --- Persist to WiscKey (single fdatasync for entire batch) ---
+  # Uses LevelDB's native WriteBatch API so all puts+deletes are flushed
+  # in one atomic fdatasync instead of one fdatasync per key.
   let backend = store.coordinator.store
   if backend != nil and backend.isOpen:
     {.cast(raises: []).}:
+      var pairs: seq[KeyValuePair] = @[]
+      var delKeys: seq[string] = @[]
       for (k, v) in batch.puts:
-        discard backend.put(fromBytes(k), fromBytes(v))
+        pairs.add((key: fromBytes(k), value: fromBytes(v)))
       for k in batch.deletes:
-        discard backend.delete(fromBytes(k))
+        delKeys.add(fromBytes(k))
+      discard backend.writeBatch(pairs, delKeys)
 
   # --- Update in-memory state machine (for fast reads) ---
   acquire(store.smMu)
