@@ -1,7 +1,7 @@
 # Fractio Benchmark Results — Cross-Database Comparison
 
 **Date:** 2026-03-08  
-**Machine:** Linux x86_64 (loopback, single node, debug build)
+**Machine:** Linux x86_64 (loopback, single node)
 
 ## Test Configuration
 
@@ -62,12 +62,12 @@ transaction with zero extra fsyncs and correct isolation from other transactions
 | MySQL | 5,723 | 174 | 135 | 412 |
 | PostgreSQL | 772 | 1,295 | 95 | 8,030 |
 | SQLite | 405 | 2,470 | 5 | 15,100 |
-| **Fractio (GC + fsync fix)** | **193** | **5,191** | **44** | **~100k** |
+| **Fractio (release, GC, Phase 12)** | **247** | **4,043** | **22** | **~20k** |
+| Fractio (debug, GC, Phase 10) | 193 | 5,191 | 44 | ~100k |
 | Fractio (GC, pre-fix) | 123 | 8,103 | 35 | 343,622 |
 | Fractio (no GC, pre-fix) | 86 | 11,608 | 35 | 306,307 |
 
-> Phase 10 fsync fix improves sequential mixed by **57%** over Phase 9 GC alone
-> (123 → 193 ops/sec) and **124%** over the original baseline (86 → 193).
+> Release build (+41% over debug Phase 12, +28% over debug Phase 10).
 
 ---
 
@@ -83,7 +83,8 @@ identical read:write ratio, identical thread counts, wall-clock throughput.
 | MySQL | 6,527 | 219 | 1,050 |
 | PostgreSQL | 901 | 2,195 | 7,244 |
 | SQLite | 375 | 5,227 | 124,852 |
-| **Fractio (GC + fsync fix)** | **146** | **13,662** | **~110k** |
+| **Fractio (release, GC, Phase 12)** | **136** | **14,617** | **~108k** |
+| Fractio (debug, GC, Phase 10) | 146 | 13,662 | ~110k |
 | Fractio (GC, pre-fix) | 91 | 21,904 | 103,772 |
 | Fractio (no GC, pre-fix) | 61 | 32,696 | 352,662 |
 
@@ -94,7 +95,8 @@ identical read:write ratio, identical thread counts, wall-clock throughput.
 | MySQL | 5,787 | 317 | 2,487 |
 | PostgreSQL | 1,658 | 2,341 | 11,914 |
 | SQLite | 412 | 8,010 | 476,065 |
-| **Fractio (GC + fsync fix)** | **293** | **13,558** | **~440k** |
+| **Fractio (release, GC, Phase 12)** | **262** | **15,204** | **~84k** |
+| Fractio (debug, GC, Phase 10) | 293 | 13,558 | ~440k |
 | Fractio (GC, pre-fix) | 126 | 31,792 | 730,056 |
 | Fractio (no GC, pre-fix) | 71 | 55,896 | 458,231 |
 
@@ -105,7 +107,8 @@ identical read:write ratio, identical thread counts, wall-clock throughput.
 | MySQL | 4,459 | 459 | 4,715 |
 | PostgreSQL | 2,884 | 2,559 | 13,318 |
 | SQLite | 401 | 17,819 | 572,515 |
-| **Fractio (GC + fsync fix)** | **310** | **23,330** | **~2M** |
+| **Fractio (release, GC, Phase 12)** | **560** | **13,714** | **~66k** |
+| Fractio (debug, GC, Phase 10) | 310 | 23,330 | ~2M |
 | Fractio (GC, pre-fix) | 125 | 62,881 | 445,488 |
 | Fractio (no GC, pre-fix) | 88 | 90,695 | 348,383 |
 
@@ -151,20 +154,53 @@ identical read:write ratio, identical thread counts, wall-clock throughput.
 
 ---
 
-## Fractio Full-Stack Numbers (all benchmarks — Phase 12, GC enabled)
+## Fractio Full-Stack Numbers — Release Build (`-d:release --checks:off`)
+
+> **Phase 12, GC enabled** — `-d:release --checks:off` (production build)
 
 | Benchmark | Ops/sec | Avg Lat (μs) | p99 Lat (μs) | Errors |
 |-----------|--------:|-------------:|-------------:|-------:|
-| Sequential Mixed (2:1 r/w) | 175 | 5,705 | 29,023 | 0 |
-| Write-Only | 41 | 24,502 | 170,292 | 0 |
-| Read-Only | 22,727 | 44 | 72 | 0 |
-| Scan (100-key range) | 6,250 | 159 | 225 | 0 |
-| Transactional (begin/put/commit) | 40 | 24,720 | 58,737 | 0 |
-| Concurrent Mixed 2t | 108 | 18,401 | 77,756 | 0 |
-| Concurrent Mixed 4t | 234 | 16,825 | 77,635 | 0 |
-| Concurrent Mixed 8t | **457** | 17,355 | 70,239 | 0 |
+| Sequential Mixed (2:1 r/w) | **247** | 4,043 | 14,319 | 0 |
+| Write-Only | **62** | 16,103 | 46,062 | 0 |
+| Read-Only | **38,462** | 27 | 50 | 0 |
+| Scan (100-key range) | **25,000** | 41 | 68 | 0 |
+| Transactional (begin/put/commit) | **40** | 25,298 | 60,760 | 0 |
+| Concurrent Mixed 2t | **136** | 14,617 | 74,452 | 0 |
+| Concurrent Mixed 4t | **262** | 15,204 | 73,288 | 0 |
+| Concurrent Mixed 8t | **560** | 13,714 | 63,793 | 0 |
 
-### Phase 10 (fsync fix) numbers — for comparison
+> **Phase 12, GC enabled** — without group commit (release build)
+
+| Benchmark | Ops/sec | Avg Lat (μs) | p99 Lat (μs) | Errors |
+|-----------|--------:|-------------:|-------------:|-------:|
+| Sequential Mixed (2:1 r/w) | 176 | 5,690 | 32,268 | 0 |
+| Write-Only | 59 | 16,890 | 39,214 | 0 |
+| Read-Only | 45,455 | 23 | 44 | 0 |
+| Scan (100-key range) | 22,727 | 44 | 82 | 0 |
+| Transactional (begin/put/commit) | 44 | 22,695 | 39,464 | 0 |
+| Concurrent Mixed 2t | 99 | 20,102 | 79,926 | 0 |
+| Concurrent Mixed 4t | 81 | 48,720 | 276,612 | 0 |
+| Concurrent Mixed 8t | 93 | 84,697 | 503,815 | 0 |
+
+### Debug vs Release comparison (GC enabled)
+
+| Benchmark | Debug (ops/sec) | Release (ops/sec) | Speedup |
+|-----------|----------------:|------------------:|--------:|
+| Sequential Mixed | 175 | **247** | **+41%** |
+| Write-Only | 41 | **62** | **+51%** |
+| Read-Only | 22,727 | **38,462** | **+69%** |
+| Scan | 6,250 | **25,000** | **+300%** |
+| Transactional | 40 | **40** | flat (fdatasync dominated) |
+| Concurrent 2t | 108 | **136** | **+26%** |
+| Concurrent 4t | 234 | **262** | **+12%** |
+| Concurrent 8t | 457 | **560** | **+23%** |
+
+> Read-heavy workloads see the largest gains (up to 4× for Scan) since those
+> paths are pure CPU — no disk I/O.  Write paths are dominated by `fdatasync`
+> latency (~16ms per call on this disk), so release-mode CPU savings are
+> smaller relative to total wall time.
+
+### Phase 10 debug numbers — for historical comparison
 
 | Benchmark | Ops/sec | Avg Lat (μs) | p99 Lat (μs) | Errors |
 |-----------|--------:|-------------:|-------------:|-------:|
@@ -210,31 +246,29 @@ now costs exactly **1 fdatasync** for the log/state combined write, plus
 With group commit merging N proposals, the per-proposal cost approaches
 **2/N fdatasyncs**, which is why concurrent throughput scales so much better.
 
-### Comparison with production databases (GC + fsync fix)
+### Comparison with production databases (release build, GC + Phase 12)
 
-| Workload | MySQL | PostgreSQL | SQLite | Fractio (GC+fix) | vs PostgreSQL |
-|----------|------:|-----------:|-------:|------------------:|:-------------|
-| Sequential Mixed | 5,723 | 772 | 405 | 193 | 25% of PG |
-| Concurrent 2t | 6,527 | 901 | 375 | 146 | 16% of PG |
-| Concurrent 4t | 5,787 | 1,658 | 412 | 293 | 18% of PG |
-| Concurrent 8t | 4,459 | 2,884 | 401 | 310 | 11% of PG |
+| Workload | MySQL | PostgreSQL | SQLite | Fractio (release, GC) | vs PostgreSQL |
+|----------|------:|-----------:|-------:|----------------------:|:-------------|
+| Sequential Mixed | 5,723 | 772 | 405 | **247** | 32% of PG |
+| Concurrent 2t | 6,527 | 901 | 375 | **136** | 15% of PG |
+| Concurrent 4t | 5,787 | 1,658 | 412 | **262** | 16% of PG |
+| Concurrent 8t | 4,459 | 2,884 | 401 | **560** | **19% of PG** |
 
 ### Read Throughput
-- Fractio read-only: **~22,700 ops/sec** — reads serve from the in-memory
-  Raft state machine (equivalent to a 100% buffer pool hit rate).
-- This is competitive with production databases for warm-cache reads.
+- Fractio read-only (release): **~38,500 ops/sec** — reads serve from the in-memory
+  Raft state machine. Faster than PostgreSQL's warm-cache read throughput.
+- Fractio scan (release): **~25,000 ops/sec** (100-key range scans).
 
-### Why not 500–5,000 ops/sec yet?
-1. **Debug build:** Compiled with `--checks:on`, no `-d:release`. Release
-   build typically yields 2–3× throughput improvement on all paths.
-2. **LevelDB fdatasync latency:** Each `fdatasync()` on this disk takes ~20ms.
-   With group commit + fsync fix, 2 fdatasyncs per batch → theoretical max
-   with 2ms batching window ≈ 500 ops/sec (if batches are large enough).
-3. **Single flush thread:** The batcher uses one flush thread. Under high
+### Why write throughput is still fdatasync-limited
+1. **LevelDB fdatasync latency:** Each `fdatasync()` on this disk takes ~16ms.
+   With group commit + fsync fix, 1 fdatasync per batch → theoretical max
+   ≈ 62 writes/sec single-threaded; group commit batches multiple callers per fsync.
+2. **Single flush thread:** The batcher uses one flush thread. Under high
    concurrency, the flush thread's fdatasync latency still serialises all writes.
-4. **TCP loopback overhead:** Each operation requires a full TCP round-trip,
-   adding ~40–45μs per op even for reads.
-5. **Channel contention:** The Nim `Channel[T]` used for proposal routing
+3. **TCP loopback overhead:** Each operation requires a full TCP round-trip,
+   adding ~22–27μs per op (release) even for reads.
+4. **Channel contention:** The Nim `Channel[T]` used for proposal routing
    has a mutex internally, which serialises under high contention.
 
 ---
@@ -260,7 +294,7 @@ They are **not** a fair comparison against any database that fsyncs.
 | Component | Version / Detail |
 |-----------|-----------------|
 | OS | Linux x86_64 Ubuntu 24.04 |
-| Nim | 2.2.8 (debug build, `--checks:on`) |
+| Nim | 2.2.8 (`-d:release --checks:off` for latest numbers; `--checks:on` for historical) |
 | Fractio build | debug (`-d:release` will be ~2–3× faster) |
 | Fractio backend | Raft consensus + WiscKey (LevelDB) `syncWrites=true` |
 | PostgreSQL | 16 (scram-sha-256 auth, TCP loopback) |
@@ -278,14 +312,17 @@ They are **not** a fair comparison against any database that fsyncs.
 # Run the Python comparison benchmark
 python3 benchmarks/db_benchmarks.py --keys 5000 --ops 1000 --threads 4
 
-# Compile the Fractio benchmark binary
+# Compile the Fractio benchmark binary — debug (for testing)
 nim c --checks:on -p:src -o:benchmarks/fractio_bench benchmarks/fractio_fullstack_benchmarks.nim
 
-# Run WITHOUT group commit (baseline)
-./benchmarks/fractio_bench --keys 5000 --ops 500 --warmup 50
+# Compile the Fractio benchmark binary — release (for performance numbers)
+nim c -d:release --checks:off -p:src -o:benchmarks/fractio_bench_release benchmarks/fractio_fullstack_benchmarks.nim
 
-# Run WITH group commit + fsync fix (Phase 10)
-./benchmarks/fractio_bench --keys 5000 --ops 500 --warmup 50 --group-commit
+# Run WITHOUT group commit (baseline)
+./benchmarks/fractio_bench_release --keys 5000 --ops 500 --warmup 50
+
+# Run WITH group commit (recommended — Phase 12 numbers)
+./benchmarks/fractio_bench_release --keys 5000 --ops 500 --warmup 50 --group-commit
 ```
 
 Both scripts use identical workload parameters. The Fractio binary requires
@@ -295,8 +332,6 @@ no other service listening on port 29000.
 
 ## Next Steps
 
-- **Release build:** Rerun with `-d:release` to establish production-grade
-  baseline (expected ~2–3× throughput improvement on all paths).
 - **Parallel flush threads:** Add multiple flush threads to the group commit
   batcher so concurrent fdatasyncs can overlap. Target: 1,000+ ops/sec.
 - **Async I/O:** Replace blocking `fdatasync` with `io_uring` for concurrent
