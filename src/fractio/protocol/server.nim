@@ -1,4 +1,4 @@
-# Fractio protocol server — Phase 1: Core Protocol.
+# Fractio protocol server — Phase 1 + Phase 2: Core Protocol + KV Operations.
 #
 # Thread model:
 #   - One acceptor thread (server.start spawns acceptLoop)
@@ -7,12 +7,14 @@
 #
 # All shared mutable state is protected by Locks.
 
-import std/[net, tables, strformat, times, atomics, locks, options]
+import std/[net, tables, strformat, times, atomics, locks, options, algorithm]
 import posix as posixSys
 import ./types
+import ./codec as protoCodec
 import ./frame
 import ./handshake
 import ./messages/core
+import ./messages/kv
 import ../utils/logging
 
 # ---------------------------------------------------------------------------
@@ -109,6 +111,71 @@ type
       flags: uint16, payload: string) {.gcsafe, raises: [].}
 
 # ---------------------------------------------------------------------------
+# In-memory KV store (Phase 2 — no persistence, no Raft integration yet)
+# ---------------------------------------------------------------------------
+
+type
+  KVEntry* = object
+    value*: string
+    version*: uint64
+    timestamp*: uint64
+
+  KVStore* = ref object
+    data*: Table[string, KVEntry]
+    mu*: Lock
+    nextVersion*: Atomic[uint64]
+
+proc newKVStore*(): KVStore =
+  result = KVStore(data: initTable[string, KVEntry]())
+  initLock(result.mu)
+  result.nextVersion.store(1)
+
+proc kvGet*(store: KVStore, key: string): Option[KVEntry] {.gcsafe, raises: [].} =
+  acquire(store.mu)
+  defer: release(store.mu)
+  let entry = store.data.getOrDefault(key)
+  if entry.version > 0:
+    some(entry)
+  else:
+    none(KVEntry)
+
+proc kvPut*(store: KVStore, key: string,
+    value: string): KVEntry {.gcsafe, raises: [].} =
+  let ver = store.nextVersion.fetchAdd(1)
+  let ts = uint64(getTime().toUnixFloat() * 1_000_000)
+  let entry = KVEntry(value: value, version: ver, timestamp: ts)
+  acquire(store.mu)
+  defer: release(store.mu)
+  store.data[key] = entry
+  entry
+
+proc kvDelete*(store: KVStore, key: string): Option[KVEntry] {.gcsafe, raises: [].} =
+  acquire(store.mu)
+  defer: release(store.mu)
+  let entry = store.data.getOrDefault(key)
+  if entry.version > 0:
+    store.data.del(key)
+    some(entry)
+  else:
+    none(KVEntry)
+
+proc kvScan*(store: KVStore, startKey: string, endKey: string,
+    limit: uint32): seq[(string, KVEntry)] {.gcsafe, raises: [].} =
+  acquire(store.mu)
+  defer: release(store.mu)
+  var pairs: seq[(string, KVEntry)] = @[]
+  for k, v in store.data:
+    let afterStart = startKey.len == 0 or k >= startKey
+    let beforeEnd = endKey.len == 0 or k < endKey
+    if afterStart and beforeEnd:
+      pairs.add((k, v))
+  # sort pairs by key for deterministic order
+  algorithm.sort(pairs, proc(a, b: (string, KVEntry)): int = cmp(a[0], b[0]))
+  if limit > 0 and pairs.len > int(limit):
+    pairs.setLen(int(limit))
+  pairs
+
+# ---------------------------------------------------------------------------
 # Protocol server
 # ---------------------------------------------------------------------------
 
@@ -123,6 +190,7 @@ type
     handlersMu*: Lock
     nextClientId*: Atomic[uint32]
     serverFeatures*: uint32
+    kvStore*: KVStore ## Phase 2: in-memory store
 
 # ---------------------------------------------------------------------------
 # Thread argument types — defined after ProtocolServer to avoid forward refs
@@ -147,6 +215,7 @@ proc newProtocolServer*(config: ServerConfig): ProtocolServer =
     logger: newLogger("protocol.server"),
     clients: initTable[uint32, ClientConnection](),
     handlers: initTable[int, MessageHandler](),
+    kvStore: newKVStore(),
   )
   initLock(result.clientsMu)
   initLock(result.handlersMu)
@@ -350,6 +419,195 @@ proc handleBuiltinCore(server: ProtocolServer, conn: ClientConnection,
       &"unknown core message type 0x{typeVal:04X}")
 
 # ---------------------------------------------------------------------------
+# Built-in KV message handlers (Get, Put, Delete, Batch, Scan)
+# ---------------------------------------------------------------------------
+
+proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
+    requestId: uint32, flags: uint16,
+    payload: string) {.gcsafe, raises: [].} =
+  if payload.len < 2: return
+  let typeVal = (uint16(payload[0]) shl 8) or uint16(payload[1])
+
+  case typeVal
+
+  of uint16(mtGet):
+    let reqR = decodeGetRequest(payload)
+    if reqR.isErr:
+      sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
+      return
+    let req = reqR.value
+    if req.key.len == 0 or req.key.len > int(server.config.maxKeyBytes):
+      sendError(conn, requestId, ErrProtocol, ErrCatKV, "invalid key length")
+      return
+    let entryOpt = server.kvStore.kvGet(req.key)
+    var resp: GetResponse
+    if entryOpt.isSome:
+      let entry = entryOpt.get()
+      resp = GetResponse(
+        found: true,
+        hasTimestamp: (req.flags and GetFlagIncludeTimestamp) != 0,
+        hasVersion: (req.flags and GetFlagIncludeVersion) != 0,
+        timestamp: entry.timestamp,
+        version: entry.version,
+        value: entry.value,
+      )
+    else:
+      resp = GetResponse(found: false)
+    sendFrame(conn, encodeGetResponse(resp), requestId)
+
+  of uint16(mtPut):
+    let reqR = decodePutRequest(payload)
+    if reqR.isErr:
+      sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
+      return
+    let req = reqR.value
+    if req.key.len == 0 or req.key.len > int(server.config.maxKeyBytes):
+      sendError(conn, requestId, ErrProtocol, ErrCatKV, "invalid key length")
+      return
+    if req.value.len > int(server.config.maxValueBytes):
+      sendError(conn, requestId, ErrProtocol, ErrCatKV, "value too large")
+      return
+    # CAS check
+    if (req.flags and PutFlagCAS) != 0:
+      let existing = server.kvStore.kvGet(req.key)
+      let currentVer: uint64 = if existing.isSome: existing.get().version else: 0
+      if currentVer != req.expectedVersion:
+        let resp = PutResponse(status: PutStatusCASFailed,
+          timestamp: 0, version: 0)
+        sendFrame(conn, encodePutResponse(resp), requestId)
+        return
+    # Capture previous value if requested
+    var prevEntry: Option[KVEntry]
+    if (req.flags and PutFlagReturnPrev) != 0:
+      prevEntry = server.kvStore.kvGet(req.key)
+    let entry = server.kvStore.kvPut(req.key, req.value)
+    var resp = PutResponse(
+      status: PutStatusOK,
+      timestamp: entry.timestamp,
+      version: entry.version,
+    )
+    if (req.flags and PutFlagReturnPrev) != 0 and prevEntry.isSome:
+      resp.hasPreviousValue = true
+      resp.previousValue = prevEntry.get().value
+    sendFrame(conn, encodePutResponse(resp), requestId)
+
+  of uint16(mtDelete):
+    let reqR = decodeDeleteRequest(payload)
+    if reqR.isErr:
+      sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
+      return
+    let req = reqR.value
+    if req.key.len == 0 or req.key.len > int(server.config.maxKeyBytes):
+      sendError(conn, requestId, ErrProtocol, ErrCatKV, "invalid key length")
+      return
+    let deleted = server.kvStore.kvDelete(req.key)
+    var resp: DeleteResponse
+    if deleted.isNone:
+      resp = DeleteResponse(status: DelStatusNotFound)
+    else:
+      resp = DeleteResponse(status: DelStatusDeleted)
+      if (req.flags and DelFlagReturnPrev) != 0:
+        resp.hasPreviousValue = true
+        resp.previousValue = deleted.get().value
+    sendFrame(conn, encodeDeleteResponse(resp), requestId)
+
+  of uint16(mtBatch):
+    let reqR = decodeBatchRequest(payload)
+    if reqR.isErr:
+      sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
+      return
+    let req = reqR.value
+    var results = newSeq[BatchOpResult](req.operations.len)
+    var anyFailed = false
+    var allFailed = req.operations.len > 0
+    for i, op in req.operations:
+      case op.kind
+      of BatchOpGet:
+        # Decode key from op.data (uint32-prefixed)
+        var dpos = 0
+        let keyR = protoCodec.readBytes(op.data, dpos)
+        if keyR.isErr:
+          results[i] = BatchOpResult(status: 0x01'u8, data: "")
+          anyFailed = true
+        else:
+          let entryOpt = server.kvStore.kvGet(keyR.value)
+          if entryOpt.isSome:
+            allFailed = false
+            var rdata = ""
+            rdata.writeBytes(entryOpt.get().value)
+            results[i] = BatchOpResult(status: 0x00'u8, data: rdata)
+          else:
+            anyFailed = true
+            results[i] = BatchOpResult(status: 0x01'u8, data: "")
+      of BatchOpPut:
+        var dpos = 0
+        let keyR = protoCodec.readBytes(op.data, dpos)
+        if keyR.isErr:
+          results[i] = BatchOpResult(status: 0x01'u8, data: "")
+          anyFailed = true
+          continue
+        let valR = protoCodec.readBytes(op.data, dpos)
+        if valR.isErr:
+          results[i] = BatchOpResult(status: 0x01'u8, data: "")
+          anyFailed = true
+          continue
+        discard server.kvStore.kvPut(keyR.value, valR.value)
+        allFailed = false
+        results[i] = BatchOpResult(status: 0x00'u8, data: "")
+      of BatchOpDelete:
+        var dpos = 0
+        let keyR = protoCodec.readBytes(op.data, dpos)
+        if keyR.isErr:
+          results[i] = BatchOpResult(status: 0x01'u8, data: "")
+          anyFailed = true
+          continue
+        let deleted = server.kvStore.kvDelete(keyR.value)
+        if deleted.isNone:
+          anyFailed = true
+          results[i] = BatchOpResult(status: 0x01'u8, data: "")
+        else:
+          allFailed = false
+          results[i] = BatchOpResult(status: 0x00'u8, data: "")
+      else:
+        results[i] = BatchOpResult(status: 0x01'u8, data: "")
+        anyFailed = true
+
+    let batchStatus: uint8 =
+      if not anyFailed: BatchStatusAllOK
+      elif allFailed: BatchStatusAllFailed
+      else: BatchStatusPartialFailure
+    let resp = BatchResponse(status: batchStatus, results: results)
+    sendFrame(conn, encodeBatchResponse(resp), requestId)
+
+  of uint16(mtScan):
+    let reqR = decodeScanRequest(payload)
+    if reqR.isErr:
+      sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
+      return
+    let req = reqR.value
+    let pairs = server.kvStore.kvScan(req.startKey, req.endKey, req.limit)
+    # Build scan pairs
+    var scanPairs = newSeq[ScanPair](pairs.len)
+    for i, p in pairs:
+      let (k, entry) = p
+      scanPairs[i] = ScanPair(
+        key: k,
+        value: entry.value,
+        timestamp: entry.timestamp,
+        version: entry.version,
+      )
+    let rf = ScanResponseFrame(
+      respFlags: ScanRespFlagEndOfScan, # single-frame response in Phase 2
+      pairs: scanPairs,
+      reqFlags: req.flags,
+    )
+    sendFrame(conn, encodeScanResponseFrame(rf), requestId)
+
+  else:
+    sendError(conn, requestId, ErrProtocol, ErrCatProtocol,
+      &"unknown KV message type 0x{typeVal:04X}")
+
+# ---------------------------------------------------------------------------
 # Per-connection loop
 # ---------------------------------------------------------------------------
 
@@ -398,6 +656,9 @@ proc clientLoop(server: ProtocolServer,
       handler.get()(conn, f.header.requestId, f.header.flags, f.payload)
     elif typeVal <= 0x00FF:
       handleBuiltinCore(server, conn, f.header.requestId, f.header.flags,
+        f.payload)
+    elif typeVal >= 0x0100 and typeVal <= 0x01FF:
+      handleBuiltinKV(server, conn, f.header.requestId, f.header.flags,
         f.payload)
     else:
       sendError(conn, f.header.requestId, ErrProtocol, ErrCatProtocol,

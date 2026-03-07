@@ -1,10 +1,10 @@
-# Fractio protocol client — Phase 1: Core Protocol.
+# Fractio protocol client — Phase 1 + Phase 2: Core Protocol + KV Operations.
 #
 # Manages a single TCP connection, performs the handshake, and provides
 # send/receive with automatic Request ID assignment.
 #
 # Thread safety: writes are serialised via writeMu. readOneFrame is called
-# synchronously from send() — only one caller at a time in Phase 1.
+# synchronously from send() — only one caller at a time in Phase 1/2.
 #
 # Receive I/O: uses posix.recv (truly blocking) with SO_RCVTIMEO set on the
 # socket.  Nim's net.recv(timeout=...) variant uses select() which does not
@@ -17,6 +17,7 @@ import ./codec
 import ./frame
 import ./handshake
 import ./messages/core
+import ./messages/kv
 
 # ---------------------------------------------------------------------------
 # Safe logging helper (no Logger dep in client to keep it lightweight)
@@ -289,7 +290,7 @@ proc send*(client: ProtocolClient,
   peOk(f)
 
 # ---------------------------------------------------------------------------
-# High-level convenience procs
+# Core convenience procs
 # ---------------------------------------------------------------------------
 
 proc ping*(client: ProtocolClient): Result[uint64, ProtocolError] {.gcsafe,
@@ -309,3 +310,66 @@ proc closeConn*(client: ProtocolClient, reason: string = "") {.gcsafe, raises: [
   let reqId = client.nextRequestId.fetchAdd(1)
   discard sendRaw(client, encodeFrame(encodeCloseRequest(reason), reqId))
   disconnect(client)
+
+# ---------------------------------------------------------------------------
+# KV convenience procs (Phase 2)
+# ---------------------------------------------------------------------------
+
+proc kvGet*(client: ProtocolClient, key: string,
+    flags: uint8 = 0, txnId: uint64 = 0,
+    readTimestamp: uint64 = 0): Result[GetResponse, ProtocolError] {.gcsafe,
+    raises: [].} =
+  ## Send a Get request and return the decoded response.
+  let req = GetRequest(flags: flags, txnId: txnId,
+                       readTimestamp: readTimestamp, key: key)
+  let r = client.send(encodeGetRequest(req))
+  if r.isErr: return peErr(r.error)
+  decodeGetResponse(r.value.payload)
+
+proc kvPut*(client: ProtocolClient, key: string, value: string,
+    flags: uint8 = 0, txnId: uint64 = 0,
+    expectedVersion: uint64 = 0): Result[PutResponse, ProtocolError] {.gcsafe,
+    raises: [].} =
+  ## Send a Put request and return the decoded response.
+  let req = PutRequest(flags: flags, txnId: txnId,
+                       expectedVersion: expectedVersion,
+                       key: key, value: value)
+  let r = client.send(encodePutRequest(req))
+  if r.isErr: return peErr(r.error)
+  decodePutResponse(r.value.payload)
+
+proc kvDelete*(client: ProtocolClient, key: string,
+    flags: uint8 = 0,
+    txnId: uint64 = 0): Result[DeleteResponse, ProtocolError] {.gcsafe,
+    raises: [].} =
+  ## Send a Delete request and return the decoded response.
+  let req = DeleteRequest(flags: flags, txnId: txnId, key: key)
+  let r = client.send(encodeDeleteRequest(req))
+  if r.isErr: return peErr(r.error)
+  decodeDeleteResponse(r.value.payload)
+
+proc kvBatch*(client: ProtocolClient,
+    req: BatchRequest): Result[BatchResponse, ProtocolError] {.gcsafe,
+    raises: [].} =
+  ## Send a Batch request and return the decoded response.
+  let r = client.send(encodeBatchRequest(req))
+  if r.isErr: return peErr(r.error)
+  decodeBatchResponse(r.value.payload)
+
+proc kvScan*(client: ProtocolClient, startKey: string = "",
+    endKey: string = "", limit: uint32 = 0,
+    flags: uint8 = 0, txnId: uint64 = 0,
+    readTimestamp: uint64 = 0): Result[ScanResponseFrame, ProtocolError] {.
+    gcsafe, raises: [].} =
+  ## Send a Scan request and return the first (and only, in Phase 2) response frame.
+  let req = ScanRequest(
+    flags: flags,
+    txnId: txnId,
+    readTimestamp: readTimestamp,
+    startKey: startKey,
+    endKey: endKey,
+    limit: limit,
+  )
+  let r = client.send(encodeScanRequest(req))
+  if r.isErr: return peErr(r.error)
+  decodeScanResponseFrame(r.value.payload, flags)
