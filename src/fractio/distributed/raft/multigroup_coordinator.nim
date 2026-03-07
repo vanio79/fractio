@@ -26,6 +26,7 @@ import os
 import fractio/distributed/range/types
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/multigroup_log
+import fractio/distributed/raft/group_commit
 import fractio/storage/backend
 import fractio/storage/wisckey_backend
 import fractio/utils/logging
@@ -86,9 +87,15 @@ type
     electionTimeoutNs*: int64
     heartbeatIntervalNs*: int64
     storagePath*: string
-    proposeTimeoutMs*: int ## default 5000
-                           ## Optional multi-node transport; nil = single-node mode (all existing tests)
+    proposeTimeoutMs*: int        ## default 5000
+                             ## Optional multi-node transport; nil = single-node mode (all existing tests)
     transport*: MultiRaftTransport
+    ## Group commit — coalesce concurrent writes into one fsync.
+    ## Disabled by default so all existing tests continue to use the
+    ## one-proposal-per-entry path unchanged.
+    groupCommitEnabled*: bool
+    groupCommitMaxBatch*: int ## 0 → use GC_DEFAULT_MAX_BATCH_SIZE (256)
+    groupCommitMaxDelayNs*: int64 ## 0 → use GC_DEFAULT_MAX_DELAY_NS  (2 ms)
 
   TimerContext = object
     coordinator: MultiRaftCoordinator
@@ -134,12 +141,20 @@ type
     # the circular import (raft_store → coordinator → raft_store).
     kvStorePtr*: pointer # *RaftKVStoreExt
 
+    # Group commit batcher (single-node path only).
+    # Heap-allocated so it can be passed as a raw pointer to the flush thread
+    # without ORC cross-thread cycle issues.
+    groupCommitEnabled*: bool
+    groupCommitBatcherPtr*: ptr GroupCommitBatcher
+
 # ============================================================================
 # Forward declarations
 # ============================================================================
 
 proc workerProc(ctx: WorkerContext) {.thread.}
 proc timerProc(ctx: TimerContext) {.thread.}
+proc getGroup*(c: MultiRaftCoordinator, rangeId: RangeID): Option[
+    RaftGroup] {.gcsafe.}
 
 # ============================================================================
 # Internal helpers
@@ -227,9 +242,71 @@ proc newMultiRaftCoordinator*(config: CoordinatorConfig): MultiRaftCoordinator =
   result.workers = newSeq[Thread[WorkerContext]](config.numWorkers)
   result.running.store(false)
 
+  # Group commit batcher — allocate on the heap when enabled.
+  result.groupCommitEnabled = config.groupCommitEnabled
+  result.groupCommitBatcherPtr = nil
+  if config.groupCommitEnabled:
+    result.groupCommitBatcherPtr = cast[ptr GroupCommitBatcher](
+      allocShared0(sizeof(GroupCommitBatcher)))
+    let maxBatch = if config.groupCommitMaxBatch > 0: config.groupCommitMaxBatch
+                   else: GC_DEFAULT_MAX_BATCH_SIZE
+    let maxDelay = if config.groupCommitMaxDelayNs >
+        0: config.groupCommitMaxDelayNs
+                   else: GC_DEFAULT_MAX_DELAY_NS
+    initGroupCommitBatcher(result.groupCommitBatcherPtr, maxBatch, maxDelay)
+
 proc start*(c: MultiRaftCoordinator) =
   if c.running.load: return
   c.running.store(true)
+
+  # Wire + start group commit batcher (single-node path only).
+  # The flushFn is injected here so it has access to `c` via a raw pointer,
+  # avoiding ORC cycles.  The batcher must be started BEFORE worker threads
+  # so callers that use proposeGroupCommit can enqueue immediately.
+  if c.groupCommitEnabled and c.groupCommitBatcherPtr != nil:
+    let cPtr = cast[pointer](c)
+    proc gcFlush(rangeId: RangeID, batch: WriteBatch,
+        resultPtrs: seq[ptr ProposalResultChannel]) {.gcsafe, raises: [].} =
+      let coord = cast[MultiRaftCoordinator](cPtr)
+      var groupOpt: Option[RaftGroup]
+      {.cast(raises: []).}: groupOpt = coord.getGroup(rangeId)
+      if groupOpt.isNone:
+        for rp in resultPtrs:
+          if rp != nil:
+            rp[].ch.send(RaftResult(success: false,
+                error: "Range not found: " & $rangeId))
+        return
+      let group = groupOpt.get
+      if not group.isLeader():
+        for rp in resultPtrs:
+          if rp != nil:
+            rp[].ch.send(RaftResult(success: false, error: "Not the leader"))
+        return
+      # Append ONE combined log entry for the entire batch.
+      var index: uint64
+      var entry: LogEntry
+      {.cast(raises: []).}:
+        acquire(coord.groupsLock)
+        let log = coord.logs.getOrDefault(rangeId)
+        let term = group.getTerm()
+        let idx = log.lastIndex.load + 1
+        let cmd = RaftCommand(kind: ckWrite, writeBatch: batch)
+        let e = newLogEntry(term, idx, cmd)
+        log.putEntry(e)
+        release(coord.groupsLock)
+        coord.saveGroupState(group, log)
+        entry = e
+        index = idx
+      # Single-node: commit immediately.
+      group.commitIndex.store(index)
+      {.cast(raises: []).}: coord.applyUpTo(rangeId, group, index)
+      # Signal all waiters with the same index.
+      let res = RaftResult(success: true, index: index)
+      for rp in resultPtrs:
+        if rp != nil:
+          rp[].ch.send(res)
+    c.groupCommitBatcherPtr[].flushFn = gcFlush
+    startBatcher(c.groupCommitBatcherPtr)
 
   # Start worker threads
   for i in 0..<c.config.numWorkers:
@@ -305,6 +382,13 @@ proc stop*(c: MultiRaftCoordinator) =
   if not c.running.load: return
   c.running.store(false)
 
+  # Stop group commit batcher first so no new flushes race with worker shutdown.
+  if c.groupCommitEnabled and c.groupCommitBatcherPtr != nil:
+    stopBatcher(c.groupCommitBatcherPtr)
+    deinitGroupCommitBatcher(c.groupCommitBatcherPtr)
+    deallocShared(c.groupCommitBatcherPtr)
+    c.groupCommitBatcherPtr = nil
+
   # Shutdown sentinel per worker (rangeId == 0)
   for _ in 0..<c.workers.len:
     c.proposalCh.send(Proposal(
@@ -377,7 +461,8 @@ proc removeGroup*(c: MultiRaftCoordinator, rangeId: RangeID) =
       c.logs[rangeId].close()
       c.logs.del(rangeId)
 
-proc getGroup*(c: MultiRaftCoordinator, rangeId: RangeID): Option[RaftGroup] =
+proc getGroup*(c: MultiRaftCoordinator, rangeId: RangeID): Option[
+    RaftGroup] {.gcsafe.} =
   withLock c.groupsLock:
     if c.groups.hasKey(rangeId):
       result = some(c.groups[rangeId])
@@ -393,16 +478,24 @@ proc hasGroup*(c: MultiRaftCoordinator, rangeId: RangeID): bool =
 proc proposeAndWait*(c: MultiRaftCoordinator, rangeId: RangeID,
     command: RaftCommand, timeoutMs: int = 5000): RaftResult =
   ## Propose a command and block until committed (or timeout).
-  ## Uses a raw-pointer heap channel to avoid ORC cross-thread SIGSEGV.
+  ## When group commit is enabled (single-node only), delegates to the
+  ## GroupCommitBatcher so many concurrent callers share one fsync.
+  ## Falls back to the classic one-entry-per-proposal path otherwise.
   var prc = cast[ptr ProposalResultChannel](
     allocShared0(sizeof(ProposalResultChannel)))
   prc[].ch.open(1)
 
-  c.proposalCh.send(Proposal(
-    rangeId: rangeId,
-    command: command,
-    resultPtr: prc,
-  ))
+  if c.groupCommitEnabled and c.groupCommitBatcherPtr != nil and
+      c.transport == nil and command.kind == ckWrite:
+    # Group commit path: enqueue and block on the result channel.
+    enqueue(c.groupCommitBatcherPtr, rangeId, command, prc)
+  else:
+    # Classic path: send to worker proposalCh.
+    c.proposalCh.send(Proposal(
+      rangeId: rangeId,
+      command: command,
+      resultPtr: prc,
+    ))
 
   let deadline = int64(getTime().toUnixFloat * 1000) + int64(timeoutMs)
   while true:

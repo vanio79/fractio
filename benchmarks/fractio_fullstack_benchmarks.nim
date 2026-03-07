@@ -458,6 +458,9 @@ when isMainModule:
   var numThreads = 4
   var skipSeq = false
   var skipConc = false
+  var useGroupCommit = false
+  var gcMaxBatch = 0 ## 0 → use library default (256)
+  var gcMaxDelayNs: int64 = 0 ## 0 → use library default (2 ms)
 
   let args = commandLineParams()
   var i = 0
@@ -477,15 +480,24 @@ when isMainModule:
       skipSeq = true
     of "--skip-concurrent":
       skipConc = true
+    of "--group-commit":
+      useGroupCommit = true
+    of "--gc-max-batch":
+      inc i; gcMaxBatch = parseInt(args[i])
+    of "--gc-max-delay-us":
+      inc i; gcMaxDelayNs = parseInt(args[i]) * 1000
     of "--help", "-h":
       echo "Usage: fractio_fullstack_benchmarks [options]"
-      echo "  --keys N          number of distinct keys (default 5000)"
-      echo "  --ops N           total ops per benchmark (default 1000)"
-      echo "  --threads N       threads for concurrent run (default 4)"
-      echo "  --value-size N    value size in bytes (default 100)"
-      echo "  --warmup N        warmup ops (default 100)"
-      echo "  --skip-sequential skip benchmarks 1-5"
-      echo "  --skip-concurrent skip benchmark 6 (concurrent mixed)"
+      echo "  --keys N            number of distinct keys (default 5000)"
+      echo "  --ops N             total ops per benchmark (default 1000)"
+      echo "  --threads N         threads for concurrent run (default 4)"
+      echo "  --value-size N      value size in bytes (default 100)"
+      echo "  --warmup N          warmup ops (default 100)"
+      echo "  --skip-sequential   skip benchmarks 1-5"
+      echo "  --skip-concurrent   skip benchmark 6 (concurrent mixed)"
+      echo "  --group-commit      enable group commit batching (target 500-5000 writes/sec)"
+      echo "  --gc-max-batch N    max proposals per group-commit batch (default 256)"
+      echo "  --gc-max-delay-us N max delay before flush in microseconds (default 2000)"
       quit(0)
     else:
       echo "Unknown flag: " & args[i]
@@ -505,12 +517,13 @@ when isMainModule:
   echo "=".repeat(SUMMARY_WIDTH)
   echo ""
   echo "Configuration:"
-  echo "  Server:     " & BENCH_HOST & ":" & $BENCH_PORT
-  echo "  Keys:       " & $numKeys
-  echo "  Ops/bench:  " & $numOps
-  echo "  Value size: " & $valueSize & " bytes"
-  echo "  Warmup:     " & $warmupOps & " ops"
-  echo "  Threads:    " & $numThreads & " (concurrent benchmark also runs 2 and 8)"
+  echo "  Server:       " & BENCH_HOST & ":" & $BENCH_PORT
+  echo "  Keys:         " & $numKeys
+  echo "  Ops/bench:    " & $numOps
+  echo "  Value size:   " & $valueSize & " bytes"
+  echo "  Warmup:       " & $warmupOps & " ops"
+  echo "  Threads:      " & $numThreads & " (concurrent benchmark also runs 2 and 8)"
+  echo "  Group commit: " & $useGroupCommit
   echo ""
 
   # -------------------------------------------------------------------------
@@ -537,6 +550,9 @@ when isMainModule:
     heartbeatIntervalNs: DEFAULT_HEARTBEAT_INTERVAL_NS,
     storagePath: RAFT_STORAGE_PATH,
     proposeTimeoutMs: 10_000,
+    groupCommitEnabled: useGroupCommit,
+    groupCommitMaxBatch: gcMaxBatch,
+    groupCommitMaxDelayNs: gcMaxDelayNs,
   )
   let coord = newMultiRaftCoordinator(coordCfg)
 
@@ -567,7 +583,11 @@ when isMainModule:
   sleep(SERVER_WAIT_MS)
 
   echo "Server started on " & BENCH_HOST & ":" & $BENCH_PORT
-  echo "Backend: Raft + WiscKey (LevelDB syncWrites=true / fdatasync per commit)"
+  if useGroupCommit:
+    echo "Backend: Raft + WiscKey + Group Commit (batch up to " &
+      $gcMaxBatch & " writes per fsync, delay " & $(gcMaxDelayNs div 1000) & " us)"
+  else:
+    echo "Backend: Raft + WiscKey (LevelDB syncWrites=true / fdatasync per commit)"
   echo ""
 
   var allResults: seq[BenchmarkResult] = @[]
