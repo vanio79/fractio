@@ -484,27 +484,101 @@ proc raftLen*(store: RaftKVStoreExt): int {.gcsafe, raises: [].} =
 # Transactional intent API
 # ---------------------------------------------------------------------------
 
-proc raftPutIntent*(store: RaftKVStoreExt, txnId: uint64, key,
+proc raftBufferIntent*(store: RaftKVStoreExt, txnId: uint64, key,
     value: string): RSVoidResult {.gcsafe, raises: [].} =
-  ## Write a transactional intent for `key` under `txnId`.
+  ## Stage a transactional write intent directly into WiscKey WITHOUT fsync
+  ## and WITHOUT going through the Raft log.
+  ##
+  ## Rationale: an intent is not a committed value.  If the server crashes
+  ## before the transaction commits the intent is lost — which is exactly
+  ## correct MVCC behaviour (the txn is treated as aborted).  We therefore
+  ## only need the intent to be visible in LevelDB's memtable (for reads
+  ## within the same transaction) and do not need durability until commit.
+  ##
+  ## The commit path (raftResolveIntent) writes the real key through Raft
+  ## with fdatasync, which is the only fsync this transaction requires.
   let intentKey = encodeIntentKey(txnId, key)
   let ridOpt = store.findRangeId(key)
   if ridOpt.isNone:
     return rsVErr(newRSE(rseRangeNotFound, &"no shard for key '{key}'"))
-  let batch = newWriteBatch()
-  batch.put(toBytes(intentKey), toBytes(value))
-  proposeWrite(store, ridOpt.get(), batch)
+
+  let backend = store.coordinator.store
+  if backend != nil and backend.isOpen:
+    {.cast(raises: []).}:
+      let pairs: seq[KeyValuePair] = @[(key: intentKey, value: value)]
+      discard backend.writeBatchNoSync(pairs, @[])
+
+  # Also update the in-memory state machine so reads-your-own-writes work
+  let sm = store.getOrCreateSM(ridOpt.get())
+  acquire(store.smMu)
+  sm.kvStore[intentKey] = value
+  release(store.smMu)
+
+  rsVOk()
 
 proc raftDeleteIntent*(store: RaftKVStoreExt, txnId: uint64,
     key: string): RSVoidResult {.gcsafe, raises: [].} =
-  ## Remove the intent (used during rollback or abort).
+  ## Remove the intent (used during rollback or abort) — also no fsync needed.
   let intentKey = encodeIntentKey(txnId, key)
   let ridOpt = store.findRangeId(key)
   if ridOpt.isNone:
     return rsVErr(newRSE(rseRangeNotFound, &"no shard for key '{key}'"))
+
+  let backend = store.coordinator.store
+  if backend != nil and backend.isOpen:
+    {.cast(raises: []).}:
+      discard backend.writeBatchNoSync(@[], @[intentKey])
+
+  let sm = store.getOrCreateSM(ridOpt.get())
+  acquire(store.smMu)
+  sm.kvStore.del(intentKey)
+  release(store.smMu)
+
+  rsVOk()
+
+proc raftPutIntent*(store: RaftKVStoreExt, txnId: uint64, key,
+    value: string): RSVoidResult {.gcsafe, raises: [].} =
+  ## Alias kept for raft_txn.nim compatibility; routes to raftBufferIntent.
+  raftBufferIntent(store, txnId, key, value)
+
+proc raftCommitTxn*(store: RaftKVStoreExt, txnId: uint64,
+    writeSet: seq[string]): RSVoidResult {.gcsafe, raises: [].} =
+  ## Commit a transaction by resolving all intents in a single Raft WriteBatch.
+  ## For each key in writeSet:
+  ##   - reads intent value from the in-memory state machine
+  ##   - adds (realKey → value) to the batch
+  ##   - adds (intentKey) to the delete list
+  ## Then proposes the whole batch through Raft → ONE fdatasync total.
+  ## If no intents are found (e.g. read-only txn) succeeds immediately.
+  if writeSet.len == 0:
+    return rsVOk()
+
+  # All keys must belong to the same shard (single-shard assumption for now).
+  # Use the first key to determine the rangeId.
+  let ridOpt = store.findRangeId(writeSet[0])
+  if ridOpt.isNone:
+    return rsVErr(newRSE(rseRangeNotFound,
+        &"no shard for key '{writeSet[0]}'"))
+  let rid = ridOpt.get()
+  let sm = store.getOrCreateSM(rid)
+
   let batch = newWriteBatch()
-  batch.delete(toBytes(intentKey))
-  proposeWrite(store, ridOpt.get(), batch)
+
+  acquire(store.smMu)
+  for key in writeSet:
+    let intentKey = encodeIntentKey(txnId, key)
+    if sm.kvStore.hasKey(intentKey):
+      let val = sm.kvStore.getOrDefault(intentKey)
+      batch.put(toBytes(key), toBytes(val))
+      batch.delete(toBytes(intentKey))
+    # If intent not found (key was never actually written), skip silently.
+  release(store.smMu)
+
+  if batch.isEmpty:
+    # Nothing to persist — transaction had no actual writes that left intents
+    return rsVOk()
+
+  proposeWrite(store, rid, batch)
 
 proc raftResolveIntent*(store: RaftKVStoreExt, txnId: uint64,
     key: string, commit: bool,

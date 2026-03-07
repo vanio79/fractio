@@ -288,6 +288,19 @@ proc expireTimedOutTxns*(mgr: TransactionManager) {.gcsafe, raises: [].} =
     if rec.state == TxnStatusActive and isExpired(rec):
       rec.state = TxnStatusAborted
 
+proc getWriteSet*(mgr: TransactionManager,
+    txnId: uint64): seq[string] {.gcsafe, raises: [].} =
+  ## Return a snapshot of the write-set for txnId.
+  ## Returns an empty seq when the transaction is not found.
+  acquire(mgr.mu)
+  defer: release(mgr.mu)
+  let rec = mgr.txns.getOrDefault(txnId)
+  if rec.id == 0:
+    return @[]
+  result = @[]
+  for k in rec.writeSet:
+    result.add(k)
+
 proc activeTxnCount*(mgr: TransactionManager): int {.gcsafe, raises: [].} =
   acquire(mgr.mu)
   defer: release(mgr.mu)

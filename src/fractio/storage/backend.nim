@@ -102,7 +102,14 @@ method exists*(backend: StorageBackend, key: string): bool {.base, gcsafe.} =
 
 method writeBatch*(backend: StorageBackend, pairs: seq[KeyValuePair],
                    deletes: seq[string]): bool {.base, gcsafe.} =
-  ## Write multiple key-value pairs and deletions atomically
+  ## Write multiple key-value pairs and deletions atomically with sync.
+  discard false
+
+method writeBatchNoSync*(backend: StorageBackend, pairs: seq[KeyValuePair],
+                         deletes: seq[string]): bool {.base, gcsafe.} =
+  ## Write multiple key-value pairs and deletions atomically WITHOUT fsync.
+  ## Use for staging data (e.g. transactional intents) where durability is
+  ## not required until an explicit sync write (commit) follows.
   discard false
 
 method newIterator*(backend: StorageBackend): StorageIterator {.base.} =

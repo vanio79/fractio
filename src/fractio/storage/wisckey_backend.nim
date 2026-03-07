@@ -11,13 +11,14 @@ import backend
 type
   WiscKeyBackend* = ref object of StorageBackend
     ## WiscKey storage backend
-    db*: pointer           # leveldb_t*
-    options*: pointer      # leveldb_options_t*
-    readOptions*: pointer  # leveldb_readoptions_t*
-    writeOptions*: pointer # leveldb_writeoptions_t*
+    db*: pointer                 # leveldb_t*
+    options*: pointer            # leveldb_options_t*
+    readOptions*: pointer        # leveldb_readoptions_t*
+    writeOptions*: pointer       # leveldb_writeoptions_t* (sync=configured)
+    noSyncWriteOptions*: pointer # leveldb_writeoptions_t* (sync=false, always)
     path*: string
     isOpen*: bool
-    syncWrites*: bool      # Whether to sync writes to disk
+    syncWrites*: bool            # Whether to sync writes to disk
 
   WiscKeyIterator* = ref object of StorageIterator
     ## WiscKey iterator
@@ -131,6 +132,8 @@ proc openWiscKey*(backend: WiscKeyBackend, config: StorageConfig): bool =
     c_leveldb_readoptions_destroy(backend.readOptions)
   if backend.writeOptions != nil:
     c_leveldb_writeoptions_destroy(backend.writeOptions)
+  if backend.noSyncWriteOptions != nil:
+    c_leveldb_writeoptions_destroy(backend.noSyncWriteOptions)
 
   # Create options
   backend.options = c_leveldb_options_create()
@@ -159,6 +162,10 @@ proc openWiscKey*(backend: WiscKeyBackend, config: StorageConfig): bool =
   # Set sync mode if configured
   if config.syncWrites:
     c_leveldb_writeoptions_set_sync(backend.writeOptions, 1.uint8)
+
+  # Always-async write options (sync=false) used for non-durable staging writes
+  backend.noSyncWriteOptions = c_leveldb_writeoptions_create()
+  c_leveldb_writeoptions_set_sync(backend.noSyncWriteOptions, 0.uint8)
 
   # Open database
   var errPtr: cstring
@@ -256,16 +263,38 @@ method writeBatch*(backend: WiscKeyBackend, pairs: seq[KeyValuePair],
   var errPtr: cstring
   let batch = c_leveldb_writebatch_create()
 
-  # Add puts
   for pair in pairs:
     c_leveldb_writebatch_put(batch, pair.key.cstring, pair.key.len.csize_t,
                              pair.value.cstring, pair.value.len.csize_t)
 
-  # Add deletes
   for key in deletes:
     c_leveldb_writebatch_delete(batch, key.cstring, key.len.csize_t)
 
   c_leveldb_write(backend.db, backend.writeOptions, batch, addr errPtr)
+  c_leveldb_writebatch_destroy(batch)
+
+  return not checkError(backend, errPtr)
+
+method writeBatchNoSync*(backend: WiscKeyBackend, pairs: seq[KeyValuePair],
+                         deletes: seq[string]): bool =
+  ## Atomically write pairs/deletes WITHOUT fdatasync.
+  ## Safe for transactional intents: data lands in LevelDB's memtable
+  ## immediately (readable via get()) but is not fdatasync'd until the
+  ## subsequent commit write (which goes through writeBatch with sync=true).
+  if not backend.isOpen:
+    return false
+
+  var errPtr: cstring
+  let batch = c_leveldb_writebatch_create()
+
+  for pair in pairs:
+    c_leveldb_writebatch_put(batch, pair.key.cstring, pair.key.len.csize_t,
+                             pair.value.cstring, pair.value.len.csize_t)
+
+  for key in deletes:
+    c_leveldb_writebatch_delete(batch, key.cstring, key.len.csize_t)
+
+  c_leveldb_write(backend.db, backend.noSyncWriteOptions, batch, addr errPtr)
   c_leveldb_writebatch_destroy(batch)
 
   return not checkError(backend, errPtr)

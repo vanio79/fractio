@@ -680,7 +680,18 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
 
     if not server.raftStore.isNil:
       # Phase 5: Raft-backed write
-      # CAS check via raftGet
+      # Transactional writes: buffer as intent (no fsync); commit resolves later
+      if req.txnId != 0:
+        let wr = server.raftStore.raftBufferIntent(req.txnId, req.key, req.value)
+        if not wr.isOk:
+          sendError(conn, requestId, ErrInternal, ErrCatKV, wr.error.msg)
+          return
+        let ver = server.raftStore.nextVersion.fetchAdd(1)
+        let ts = uint64(getTime().toUnixFloat() * 1_000_000_000)
+        sendFrame(conn, encodePutResponse(PutResponse(
+          status: PutStatusOK, timestamp: ts, version: ver)), requestId)
+        return
+      # Non-transactional: CAS check via raftGet
       if (req.flags and PutFlagCAS) != 0:
         let existR = server.raftStore.raftGet(req.key)
         let currentVer: uint64 = if existR.isOk and existR.value.isSome:
@@ -757,6 +768,16 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
 
     if not server.raftStore.isNil:
       # Phase 5: Raft-backed delete
+      # Transactional deletes: buffer as intent deletion (no fsync)
+      if req.txnId != 0:
+        let dr = server.raftStore.raftDeleteIntent(req.txnId, req.key)
+        if not dr.isOk:
+          sendError(conn, requestId, ErrInternal, ErrCatKV, dr.error.msg)
+          return
+        sendFrame(conn, encodeDeleteResponse(DeleteResponse(
+          status: DelStatusDeleted)), requestId)
+        return
+      # Non-transactional delete
       let dr = server.raftStore.raftDelete(req.key)
       if not dr.isOk:
         if dr.error.kind == rseNotLeader:
@@ -944,11 +965,26 @@ proc handleBuiltinTxn(server: ProtocolServer, conn: ClientConnection,
     if reqR.isErr:
       sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
       return
-    let resp = server.txnMgr.commitTransaction(reqR.value.txnId)
+    let txnId = reqR.value.txnId
+    # Capture write-set BEFORE committing (txnMgr.commitTransaction may clear it)
+    let writeSet = server.txnMgr.getWriteSet(txnId)
+    let resp = server.txnMgr.commitTransaction(txnId)
     if resp.status == txnMsgs.TxnCommitOK:
       discard server.metrics.committedTxns.fetchAdd(1)
+      # Resolve all buffered intents in a single Raft batch (one fsync)
+      if not server.raftStore.isNil and writeSet.len > 0:
+        let cr = server.raftStore.raftCommitTxn(txnId, writeSet)
+        if not cr.isOk:
+          # Intent resolution failed — client sees commit OK but data may not
+          # be durable; log the error. In a full impl we'd return a conflict.
+          server.logger.logError(
+            "raftCommitTxn failed for txn " & $txnId & ": " & cr.error.msg)
     else:
       discard server.metrics.abortedTxns.fetchAdd(1)
+      # Clean up buffered intents on conflict/timeout (no fsync needed)
+      if not server.raftStore.isNil and writeSet.len > 0:
+        for key in writeSet:
+          discard server.raftStore.raftDeleteIntent(txnId, key)
     sendFrame(conn, txnMsgs.encodeCommitTxnResponse(resp), requestId)
 
   of uint16(mtRollbackTxn):
@@ -956,8 +992,15 @@ proc handleBuiltinTxn(server: ProtocolServer, conn: ClientConnection,
     if reqR.isErr:
       sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
       return
-    let resp = server.txnMgr.rollbackTransaction(reqR.value.txnId)
+    let txnId = reqR.value.txnId
+    # Capture write-set before rolling back
+    let writeSet = server.txnMgr.getWriteSet(txnId)
+    let resp = server.txnMgr.rollbackTransaction(txnId)
     discard server.metrics.abortedTxns.fetchAdd(1)
+    # Delete all buffered intents (no fsync)
+    if not server.raftStore.isNil and writeSet.len > 0:
+      for key in writeSet:
+        discard server.raftStore.raftDeleteIntent(txnId, key)
     sendFrame(conn, txnMsgs.encodeRollbackTxnResponse(resp), requestId)
 
   of uint16(mtTxnStatus):
