@@ -11,8 +11,10 @@ import ./monotonic
 import ../../core/types
 import ../../utils/logging
 import ./udptransport
-import std/[times, math, algorithm, sequtils, tables]
+import std/[times, math, algorithm, sequtils, tables, atomics]
 import locks
+import std/os
+import std/typedthreads
 
 const
   DEFAULT_SYNC_INTERVAL* = 1_000_000_000'i64 # 1 second in nanoseconds
@@ -62,6 +64,10 @@ type
       ## Transaction ID counter (protected by mutex).
     onStateChange*: proc(state: TimeSyncState)
       ## Optional callback for state transitions.
+    running*: Atomic[bool]
+      ## Set to true while the background sync thread is active.
+    bgThread*: Thread[SharedTimer]
+      ## Background synchronization thread (value field — stays alive with the object).
 
 # Helper functions (algorithm internals)
 
@@ -198,7 +204,7 @@ proc getState*(self: SharedTimer): TimeSyncState {.gcsafe.} =
   withLock(self.mutex):
     result = self.state
 
-proc setState*(self: SharedTimer, state: TimeSyncState) =
+proc setState*(self: SharedTimer, state: TimeSyncState) {.gcsafe.} =
   ## Set synchronization state (internal). Triggers onStateChange callback if state changes.
   let oldState = self.state
   withLock(self.mutex):
@@ -206,7 +212,8 @@ proc setState*(self: SharedTimer, state: TimeSyncState) =
     self.lastSyncTime = self.localClock.now()
   if oldState != state and self.onStateChange != nil:
     try:
-      self.onStateChange(state)
+      {.cast(gcsafe).}:
+        self.onStateChange(state)
     except:
       discard
 
@@ -286,12 +293,32 @@ proc tick*(self: SharedTimer) =
       self.logger.error("TimeSync: Tick error", fields)
     self.setState(tssFailed)
 
+proc syncWorker(timer: SharedTimer) {.thread, gcsafe.} =
+  ## Background thread: calls tick() every syncInterval until running is false.
+  ## Polls the running flag every 50ms so stop() returns promptly.
+  let intervalMs = max(1, int(timer.syncInterval.inMilliseconds))
+  const POLL_INTERVAL_MS = 50
+  var elapsed = 0
+  while timer.running.load():
+    if elapsed >= intervalMs:
+      elapsed = 0
+      timer.tick()
+    sleep(POLL_INTERVAL_MS)
+    elapsed += POLL_INTERVAL_MS
+
 proc start*(self: SharedTimer) =
-  ## Start periodic synchronization (currently no-op, future: spawn background task).
-  discard
+  ## Spawn the background synchronization thread.
+  ## Idempotent — calling start() a second time while already running is a no-op.
+  if self.running.load():
+    return
+  self.running.store(true)
+  createThread(self.bgThread, syncWorker, self)
 
 proc stop*(self: SharedTimer) =
-  ## Stop synchronization and close network transport.
+  ## Signal the background thread to stop, join it, then close network transport.
+  if self.running.load():
+    self.running.store(false)
+    joinThread(self.bgThread)
   self.network.close()
 
 proc isSynchronized*(self: SharedTimer): bool =

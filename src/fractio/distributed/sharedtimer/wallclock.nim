@@ -8,6 +8,6 @@ type
   WallClockTimeProvider* = ref object of TimeProvider
     ## Time provider based on wall-clock time (may jump forwards/backwards).
 
-method now*(self: WallClockTimeProvider): Timestamp =
+method now*(self: WallClockTimeProvider): Timestamp {.gcsafe.} =
   let t = getTime()
   result = toUnix(t) * 1_000_000_000 + nanosecond(t).int64

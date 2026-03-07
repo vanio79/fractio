@@ -16,7 +16,7 @@ type
       ## Time (nanoseconds) peer takes to process request.
 
 method syncRound*(self: SimulatedNetworkTransport, localSend: Timestamp,
-    peers: seq[PeerConfig]): seq[ClockOffset] =
+    peers: seq[PeerConfig]): seq[ClockOffset] {.gcsafe.} =
   result = @[]
   for peer in peers:
     # Simulate network delay with random variation
@@ -45,5 +45,5 @@ method syncRound*(self: SimulatedNetworkTransport, localSend: Timestamp,
       lastUpdate: localSend
     ))
 
-method close*(self: SimulatedNetworkTransport) =
+method close*(self: SimulatedNetworkTransport) {.gcsafe.} =
   discard

@@ -119,7 +119,7 @@ proc serverMain*(transport: UDPTransport) {.thread, gcsafe.} =
 
   transport.logger.debug("UDPTransport server thread exiting")
 
-method start*(self: UDPTransport) =
+method start*(self: UDPTransport) {.gcsafe.} =
   ## Start the UDP server.
   if load(self.serverRunning, moRelaxed):
     raise newException(ValueError, "Transport already started")
@@ -144,7 +144,7 @@ method start*(self: UDPTransport) =
   self.logger.info("UDPTransport started", fields)
 
 method syncRound*(self: UDPTransport, localSend: Timestamp, peers: seq[
-    PeerConfig]): seq[ClockOffset] =
+    PeerConfig]): seq[ClockOffset] {.gcsafe.} =
   ## Perform one synchronization round with the given peers.
   ## Sends a sync request to each peer and collects offsets.
   ## Thread-safe: multiple calls are serialized by internal mutex.
@@ -241,7 +241,7 @@ method syncRound*(self: UDPTransport, localSend: Timestamp, peers: seq[
       raise SyncTimeout(msg: "No peers responded in sync round")
 
 method getStats*(self: UDPTransport): tuple[sent: int, received: int,
-    errors: int] {.base.} =
+    errors: int] {.base, gcsafe.} =
   ## Get current statistics (snapshot).
   result = (
     sent: load(self.stats.sent, moRelaxed),
@@ -249,7 +249,7 @@ method getStats*(self: UDPTransport): tuple[sent: int, received: int,
     errors: load(self.stats.errors, moRelaxed)
   )
 
-method close*(self: UDPTransport) =
+method close*(self: UDPTransport) {.gcsafe.} =
   ## Stop the server and close all resources.
   if not load(self.serverRunning, moRelaxed):
     return # Already closed

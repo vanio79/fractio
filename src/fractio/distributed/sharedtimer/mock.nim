@@ -8,7 +8,7 @@ type
     currentTime*: Timestamp
       ## The time to return on each call to now().
 
-method now*(self: MockTimeProvider): Timestamp =
+method now*(self: MockTimeProvider): Timestamp {.gcsafe.} =
   result = self.currentTime
 
 proc setTime*(self: MockTimeProvider, t: Timestamp) =

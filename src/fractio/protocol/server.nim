@@ -28,6 +28,7 @@ import ./messages/admin as adminMsgs
 import ./txn_manager
 import ./raft_store
 import ../utils/logging
+import ../distributed/sharedtimer
 
 # ---------------------------------------------------------------------------
 # Safe logging helper — swallows any logger exception so callers can be raises:[]
@@ -63,6 +64,11 @@ type
     clusterId*: uint64
     serverVersion*: string      ## reported in ServerInfo; default "1.0.0"
     clusterName*: string        ## reported in Health; default "fractio"
+                                ## SharedTimer (P2P time synchronization) config:
+    sharedTimerEnabled*: bool ## when true, create SharedTimer and wire into TransactionManager
+    sharedTimerNodeId*: string  ## human-readable node ID for SharedTimer (default: serverName)
+    sharedTimerNumericNodeId*: uint16 ## 10-bit numeric node ID for Snowflake transaction IDs (default: serverId)
+    sharedTimerPeers*: seq[PeerConfig] ## peer nodes for NTP-style clock sync (empty = single-node mode)
 
 proc defaultServerConfig*(): ServerConfig =
   ServerConfig(
@@ -81,6 +87,10 @@ proc defaultServerConfig*(): ServerConfig =
     clusterId: 0,
     serverVersion: "1.0.0",
     clusterName: "fractio",
+    sharedTimerEnabled: false,
+    sharedTimerNodeId: "",
+    sharedTimerNumericNodeId: 0,
+    sharedTimerPeers: @[],
   )
 
 # ---------------------------------------------------------------------------
@@ -275,6 +285,7 @@ type
     txnMgr*: TransactionManager   ## Phase 3: transaction manager
     metrics*: ServerMetrics       ## Phase 4: request counters
     authenticator*: Authenticator ## Phase 4: auth validator
+    sharedTimer*: SharedTimer     ## Phase 7: P2P clock sync (nil when disabled)
 
 # ---------------------------------------------------------------------------
 # Thread argument types — defined after ProtocolServer to avoid forward refs
@@ -312,6 +323,22 @@ proc newProtocolServer*(config: ServerConfig): ProtocolServer =
   result.serverFeatures = FeatPipelining or FeatTransactions or FeatAsync
   if config.tlsEnabled:
     result.serverFeatures = result.serverFeatures or FeatTLS
+
+  # Phase 7: wire SharedTimer into TransactionManager when enabled
+  if config.sharedTimerEnabled:
+    let nodeId = if config.sharedTimerNodeId.len > 0: config.sharedTimerNodeId
+                 else: config.serverName
+    let numericId = if config.sharedTimerNumericNodeId >
+        0: config.sharedTimerNumericNodeId
+                    else: config.serverId
+    let timer = newSharedTimer(
+      nodeId = nodeId,
+      numericNodeId = numericId,
+      peers = config.sharedTimerPeers,
+      logger = result.logger,
+    )
+    result.sharedTimer = timer
+    result.txnMgr.setTimeProvider(timer)
 
 proc registerHandler*(server: ProtocolServer, msgType: MessageType,
     handler: MessageHandler) =
@@ -1068,6 +1095,10 @@ proc acceptLoop(args: AcceptLoopArgs) {.thread.} =
 proc start*(server: ProtocolServer) {.raises: [].} =
   server.running.store(true)
   server.startedAt = getTime().toUnix()
+  # Start background SharedTimer sync thread if configured
+  if not server.sharedTimer.isNil:
+    try: server.sharedTimer.start()
+    except Exception as e: server.logger.logError("SharedTimer start failed: " & e.msg)
   var sock: Socket
   try:
     sock = newSocket()
@@ -1093,3 +1124,7 @@ proc start*(server: ProtocolServer) {.raises: [].} =
 proc stop*(server: ProtocolServer) {.raises: [].} =
   server.running.store(false)
   server.logger.logInfo("server stopping")
+  # Stop SharedTimer background sync thread and close network transport
+  if not server.sharedTimer.isNil:
+    try: server.sharedTimer.stop()
+    except Exception as e: server.logger.logError("SharedTimer stop failed: " & e.msg)
