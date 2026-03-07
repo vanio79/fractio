@@ -33,7 +33,7 @@ const
 type
   LivenessState* = object
     ## State of a single store's liveness
-    nodeId*: NodeID
+    nodeId*: RangeNodeID
     lastHeartbeat*: int64  # Nanoseconds since epoch
     supportedUntil*: int64 # Nanoseconds since epoch
     epoch*: uint64         # Incremented on restart
@@ -60,15 +60,15 @@ type
     ## Each node tracks liveness of other stores and provides
     ## "support" to stores that are alive.
 
-    nodeId*: NodeID
+    nodeId*: RangeNodeID
     epoch*: Atomic[uint64]
 
     # Liveness state of all known stores
-    stores*: Table[NodeID, LivenessState]
+    stores*: Table[RangeNodeID, LivenessState]
     storesLock*: Lock
 
     # Support state - which stores we are supporting
-    supporting*: HashSet[NodeID]
+    supporting*: HashSet[RangeNodeID]
     supportingLock*: Lock
 
     # Configuration
@@ -81,7 +81,7 @@ type
 
   LivenessMessage* = object
     ## Message exchanged between stores for liveness
-    nodeId*: NodeID
+    nodeId*: RangeNodeID
     epoch*: uint64
     timestamp*: int64
     messageType*: LivenessMessageType
@@ -97,7 +97,7 @@ type
                          # Store Liveness Operations
            # ============================================================================
 
-proc newStoreLiveness*(nodeId: NodeID,
+proc newStoreLiveness*(nodeId: RangeNodeID,
                         heartbeatIntervalNs = DEFAULT_HEARTBEAT_INTERVAL_NS,
                         supportExpirationNs = DEFAULT_SUPPORT_EXPIRATION_NS): StoreLiveness =
   ## Create a new store liveness manager
@@ -106,8 +106,8 @@ proc newStoreLiveness*(nodeId: NodeID,
   result.epoch.store(1) # Start with epoch 1
   result.heartbeatIntervalNs = heartbeatIntervalNs
   result.supportExpirationNs = supportExpirationNs
-  result.stores = initTable[NodeID, LivenessState]()
-  result.supporting = initHashSet[NodeID]()
+  result.stores = initTable[RangeNodeID, LivenessState]()
+  result.supporting = initHashSet[RangeNodeID]()
   initLock(result.storesLock)
   initLock(result.supportingLock)
   result.running.store(false)
@@ -152,7 +152,7 @@ proc processHeartbeat*(sl: StoreLiveness,
     messageType: lmtHeartbeatResponse
   )
 
-proc recordHeartbeat*(sl: StoreLiveness, nodeId: NodeID, epoch: uint64) =
+proc recordHeartbeat*(sl: StoreLiveness, nodeId: RangeNodeID, epoch: uint64) =
   ## Record a heartbeat from another store
   let now = getTime().toUnix * 1_000_000_000
 
@@ -168,7 +168,7 @@ proc recordHeartbeat*(sl: StoreLiveness, nodeId: NodeID, epoch: uint64) =
 # Support Management
 # ============================================================================
 
-proc grantSupport*(sl: StoreLiveness, nodeId: NodeID) =
+proc grantSupport*(sl: StoreLiveness, nodeId: RangeNodeID) =
   ## Grant support to a store
   withLock sl.supportingLock:
     sl.supporting.incl(nodeId)
@@ -177,7 +177,7 @@ proc grantSupport*(sl: StoreLiveness, nodeId: NodeID) =
   fields["nodeId"] = $nodeId
   debug("Granted support", fields)
 
-proc withdrawSupport*(sl: StoreLiveness, nodeId: NodeID) =
+proc withdrawSupport*(sl: StoreLiveness, nodeId: RangeNodeID) =
   ## Withdraw support from a store
   withLock sl.supportingLock:
     sl.supporting.excl(nodeId)
@@ -186,12 +186,12 @@ proc withdrawSupport*(sl: StoreLiveness, nodeId: NodeID) =
   fields["nodeId"] = $nodeId
   debug("Withdrawn support", fields)
 
-proc isSupporting*(sl: StoreLiveness, nodeId: NodeID): bool =
+proc isSupporting*(sl: StoreLiveness, nodeId: RangeNodeID): bool =
   ## Check if we are supporting a store
   withLock sl.supportingLock:
     result = nodeId in sl.supporting
 
-proc getSupportedStores*(sl: StoreLiveness): HashSet[NodeID] =
+proc getSupportedStores*(sl: StoreLiveness): HashSet[RangeNodeID] =
   ## Get all stores we are supporting
   withLock sl.supportingLock:
     result = sl.supporting
@@ -200,7 +200,7 @@ proc getSupportedStores*(sl: StoreLiveness): HashSet[NodeID] =
 # Liveness Queries
 # ============================================================================
 
-proc isAlive*(sl: StoreLiveness, nodeId: NodeID): bool =
+proc isAlive*(sl: StoreLiveness, nodeId: RangeNodeID): bool =
   ## Check if a store is considered alive
   let now = getTime().toUnix * 1_000_000_000
 
@@ -210,14 +210,14 @@ proc isAlive*(sl: StoreLiveness, nodeId: NodeID): bool =
       return now < state.supportedUntil
   return false
 
-proc getLivenessState*(sl: StoreLiveness, nodeId: NodeID): Option[
+proc getLivenessState*(sl: StoreLiveness, nodeId: RangeNodeID): Option[
     LivenessState] =
   ## Get the liveness state for a store
   withLock sl.storesLock:
     if sl.stores.hasKey(nodeId):
       result = some(sl.stores[nodeId])
 
-proc getSupportState*(sl: StoreLiveness, nodeId: NodeID): SupportState =
+proc getSupportState*(sl: StoreLiveness, nodeId: RangeNodeID): SupportState =
   ## Get the support state for a store
   let now = getTime().toUnix * 1_000_000_000
 
@@ -230,7 +230,7 @@ proc getSupportState*(sl: StoreLiveness, nodeId: NodeID): SupportState =
       return ssExpired
     return ssSupported
 
-proc timeUntilExpiration*(sl: StoreLiveness, nodeId: NodeID): int64 =
+proc timeUntilExpiration*(sl: StoreLiveness, nodeId: RangeNodeID): int64 =
   ## Get time until liveness expires for a store (nanoseconds)
   let now = getTime().toUnix * 1_000_000_000
 
@@ -247,13 +247,13 @@ proc timeUntilExpiration*(sl: StoreLiveness, nodeId: NodeID): int64 =
 # Quorum Support
 # ============================================================================
 
-proc countSupported*(sl: StoreLiveness, nodes: seq[NodeID]): int =
+proc countSupported*(sl: StoreLiveness, nodes: seq[RangeNodeID]): int =
   ## Count how many nodes in the list are supported (alive)
   for nodeId in nodes:
     if sl.isAlive(nodeId):
       inc result
 
-proc hasQuorumSupport*(sl: StoreLiveness, nodes: seq[NodeID]): bool =
+proc hasQuorumSupport*(sl: StoreLiveness, nodes: seq[RangeNodeID]): bool =
   ## Check if a quorum of nodes are supported (alive)
   let quorumSize = (nodes.len div 2) + 1
   let supported = sl.countSupported(nodes)
@@ -262,7 +262,7 @@ proc hasQuorumSupport*(sl: StoreLiveness, nodes: seq[NodeID]): bool =
 proc canAcquireLease*(sl: StoreLiveness, voters: seq[ReplicaDescriptor]): bool =
   ## Check if we can acquire a lease for a range.
   ## We need support from a quorum of voters.
-  var voterNodes: seq[NodeID]
+  var voterNodes: seq[RangeNodeID]
   for rep in voters:
     if rep.replicaType == rtVoter:
       voterNodes.add(rep.nodeId)
@@ -310,7 +310,7 @@ proc getEpoch*(sl: StoreLiveness): uint64 =
 # Store Registration
 # ============================================================================
 
-proc registerStore*(sl: StoreLiveness, nodeId: NodeID, epoch: uint64 = 0) =
+proc registerStore*(sl: StoreLiveness, nodeId: RangeNodeID, epoch: uint64 = 0) =
   ## Register a new store
   let now = getTime().toUnix * 1_000_000_000
 
@@ -327,7 +327,7 @@ proc registerStore*(sl: StoreLiveness, nodeId: NodeID, epoch: uint64 = 0) =
   fields["nodeId"] = $nodeId
   debug("Registered store", fields)
 
-proc unregisterStore*(sl: StoreLiveness, nodeId: NodeID) =
+proc unregisterStore*(sl: StoreLiveness, nodeId: RangeNodeID) =
   ## Unregister a store
   withLock sl.storesLock:
     sl.stores.del(nodeId)
@@ -343,7 +343,7 @@ proc unregisterStore*(sl: StoreLiveness, nodeId: NodeID) =
 # Diagnostics
 # ============================================================================
 
-proc getAliveStores*(sl: StoreLiveness): seq[NodeID] =
+proc getAliveStores*(sl: StoreLiveness): seq[RangeNodeID] =
   ## Get all stores that are currently alive
   withLock sl.storesLock:
     let now = getTime().toUnix * 1_000_000_000

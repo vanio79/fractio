@@ -336,7 +336,7 @@ proc processBatch*(scheduler: RebalanceScheduler, nowNs: int64): int =
 proc checkRangeForRebalance*(scheduler: RebalanceScheduler,
                               rangeId: RangeID,
                               replicas: seq[ReplicaDescriptor],
-                              leaseholder: NodeID,
+                              leaseholder: RangeNodeID,
                               nowNs: int64): seq[RebalanceOp] =
   ## Check a range for rebalancing and add decisions to queue
 

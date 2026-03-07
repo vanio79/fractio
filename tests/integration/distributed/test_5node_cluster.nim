@@ -10,8 +10,12 @@ import fractio/distributed/network/network_raft_node
 import fractio/distributed/raft/types as raft_types
 
 proc uniqueBasePort(): int =
-  ## Generate a unique base port based on current time
-  result = int(getTime().toUnix() mod 10000) * 10 + 10000
+  ## Generate a unique base port in the range 24000–25900, spaced 100 apart.
+  ## Avoids ports used by MySQL (3306/33060), protocol tests (19700–20099),
+  ## and cluster_bootstrap default (33060).
+  ## The formula yields 19 distinct values cycling every 19 seconds.
+  let bucket = int(getTime().toUnix() mod 19)
+  result = 24000 + bucket * 100
 
 suite "5-Node Cluster Integration Tests":
 

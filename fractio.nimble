@@ -19,7 +19,7 @@ skipDirs = @[
   "tmp"
 ]
 
-bin = @[]
+bin = @["fractio/cli/main"]
 
 import os
 

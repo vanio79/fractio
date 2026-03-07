@@ -123,7 +123,7 @@ proc decodeEntry*(data: string): LogEntry =
       kind: ckChangeReplicas,
       changeType: ReplicaChangeType(json["changeType"].getInt()),
       replica: ReplicaDescriptor(
-        nodeId: NodeID(repJson["nodeId"].getInt()),
+        nodeId: RangeNodeID(repJson["nodeId"].getInt()),
         replicaId: ReplicaID(repJson["replicaId"].getInt()),
         replicaType: ReplicaType(repJson["replicaType"].getInt())
       )
@@ -131,7 +131,7 @@ proc decodeEntry*(data: string): LogEntry =
   of ckTransferLease:
     result.command = RaftCommand(
       kind: ckTransferLease,
-      targetNode: NodeID(json["targetNode"].getInt())
+      targetNode: RangeNodeID(json["targetNode"].getInt())
     )
   of ckAcquireLease:
     result.command = RaftCommand(

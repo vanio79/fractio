@@ -29,7 +29,7 @@ proc makeStore(storagePath: string): tuple[
     coord: MultiRaftCoordinator, store: RaftKVStoreExt, rid: RangeID] =
   cleanDir(storagePath)
   let cfg = CoordinatorConfig(
-    nodeId: NodeID(1),
+    nodeId: RangeNodeID(1),
     numWorkers: 1,
     electionTimeoutNs: DEFAULT_ELECTION_TIMEOUT_NS,
     heartbeatIntervalNs: DEFAULT_HEARTBEAT_INTERVAL_NS,
@@ -38,7 +38,7 @@ proc makeStore(storagePath: string): tuple[
   let coord = newMultiRaftCoordinator(cfg)
   let rid = RangeID(1)
   let desc = newRangeDescriptor(rid, @[], @[])
-  let rep = desc.addReplica(NodeID(1))
+  let rep = desc.addReplica(RangeNodeID(1))
   let group = coord.createGroup(desc, rep.replicaId)
   group.becomeLeader()
   coord.start()

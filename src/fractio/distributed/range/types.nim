@@ -41,7 +41,7 @@ proc `>`*(a, b: seq[byte]): bool =
   not (a <= b)
 
 type
-  NodeID* = distinct uint32
+  RangeNodeID* = distinct uint32
     ## Unique identifier for a node in the cluster.
     ## Valid range: 1..uint32.high (0 is reserved for invalid/unknown)
 
@@ -61,7 +61,7 @@ type
 
   ReplicaDescriptor* = object
     ## Describes a single replica of a range
-    nodeId*: NodeID           ## Which node hosts this replica
+    nodeId*: RangeNodeID           ## Which node hosts this replica
     replicaId*: ReplicaID     ## Unique ID within the range
     replicaType*: ReplicaType ## Voter or non-voter
 
@@ -76,41 +76,41 @@ type
     generation*: uint64 ## Incremented on every change
 
 # ============================================================================
-# NodeID operations
+# RangeNodeID operations
 # ============================================================================
 
-proc `$`*(id: NodeID): string =
-  ## String representation of NodeID
+proc `$`*(id: RangeNodeID): string =
+  ## String representation of RangeNodeID
   result = "n" & $id.uint32
 
-proc parseNodeID*(s: string): NodeID =
-  ## Parse NodeID from string format "n<number>"
+proc parseNodeID*(s: string): RangeNodeID =
+  ## Parse RangeNodeID from string format "n<number>"
   if s.len < 2 or s[0] != 'n':
-    raise newException(ValueError, "Invalid NodeID format: " & s)
-  result = NodeID(parseInt(s[1..^1]))
+    raise newException(ValueError, "Invalid RangeNodeID format: " & s)
+  result = RangeNodeID(parseInt(s[1..^1]))
 
-proc hash*(id: NodeID): Hash =
+proc hash*(id: RangeNodeID): Hash =
   ## Hash for use in tables
   result = hash(id.uint32)
 
-proc `==`*(a, b: NodeID): bool =
+proc `==`*(a, b: RangeNodeID): bool =
   ## Equality comparison
   a.uint32 == b.uint32
 
-proc `<`*(a, b: NodeID): bool =
+proc `<`*(a, b: RangeNodeID): bool =
   ## Less than comparison
   a.uint32 < b.uint32
 
-proc `<=`*(a, b: NodeID): bool =
+proc `<=`*(a, b: RangeNodeID): bool =
   ## Less than or equal comparison
   a.uint32 <= b.uint32
 
-proc invalidNodeID*: NodeID =
-  ## Returns an invalid/unknown NodeID (0)
-  NodeID(0)
+proc invalidNodeID*: RangeNodeID =
+  ## Returns an invalid/unknown RangeNodeID (0)
+  RangeNodeID(0)
 
-proc isValid*(id: NodeID): bool =
-  ## Check if NodeID is valid (non-zero)
+proc isValid*(id: RangeNodeID): bool =
+  ## Check if RangeNodeID is valid (non-zero)
   id.uint32 > 0
 
 # ============================================================================
@@ -186,7 +186,7 @@ proc next*(id: var ReplicaID): ReplicaID =
 # ReplicaDescriptor operations
 # ============================================================================
 
-proc newReplicaDescriptor*(nodeId: NodeID, replicaId: ReplicaID,
+proc newReplicaDescriptor*(nodeId: RangeNodeID, replicaId: ReplicaID,
                            replicaType: ReplicaType = rtVoter): ReplicaDescriptor =
   ## Create a new ReplicaDescriptor
   result = ReplicaDescriptor(
@@ -221,7 +221,7 @@ proc toJson*(rep: ReplicaDescriptor): JsonNode =
 proc parseReplicaDescriptor*(json: JsonNode): ReplicaDescriptor =
   ## Parse ReplicaDescriptor from JSON
   result = ReplicaDescriptor(
-    nodeId: NodeID(json["nodeId"].getInt()),
+    nodeId: RangeNodeID(json["nodeId"].getInt()),
     replicaId: ReplicaID(json["replicaId"].getInt()),
     replicaType: ReplicaType(json["replicaType"].getInt())
   )
@@ -241,7 +241,7 @@ proc newRangeDescriptor*(rangeId: RangeID, startKey, endKey: seq[byte],
   result.nextReplicaId = firstReplicaID()
   result.generation = 1
 
-proc addReplica*(desc: RangeDescriptor, nodeId: NodeID,
+proc addReplica*(desc: RangeDescriptor, nodeId: RangeNodeID,
                   replicaType: ReplicaType = rtVoter): ReplicaDescriptor =
   ## Add a new replica to the range. Returns the new replica descriptor.
   result = ReplicaDescriptor(
@@ -262,7 +262,7 @@ proc removeReplica*(desc: RangeDescriptor, replicaId: ReplicaID): bool =
       return true
   return false
 
-proc getReplica*(desc: RangeDescriptor, nodeId: NodeID): Option[
+proc getReplica*(desc: RangeDescriptor, nodeId: RangeNodeID): Option[
     ReplicaDescriptor] =
   ## Get replica by node ID
   for rep in desc.replicas:

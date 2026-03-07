@@ -1,7 +1,8 @@
 # TCP Transport - TCP-based network transport for distributed Fractio
 # Provides both server and client functionality for TCP communication
 
-import std/[net, nativesockets, tables, locks, times, options]
+import std/[net, nativesockets, tables, locks, times, options, atomics,
+    typedthreads, endians]
 import ./types
 import ./serialization
 import ./config
@@ -26,13 +27,23 @@ type
     state*: ConnectionState
     remoteAddr*: string
 
+  ConnHandlerCtx* = object
+    ## Context passed to per-connection handler threads.
+    ## transportPtr is a raw pointer (not a traced ref) to break the
+    ## TCPTransport → connThreads → ConnHandlerCtx → TCPTransport cycle
+    ## that causes ORC's Bacon-Rajan collector to crash (SIGSEGV in rawDealloc).
+    ## TCPTransport.stopServer() joins all threads before clearing connThreads,
+    ## so the raw pointer is always valid while any handler thread is running.
+    transportPtr*: pointer # untraced; cast to TCPTransport before use
+    conn*: Connection
+
   TCPTransport* = ref object
     ## TCP transport for a specific protocol (Raft, Client, Admin)
     config*: NetworkConfig
     port*: int
     role*: string
     serverSocket*: Socket
-    running*: bool
+    running*: Atomic[bool]
     runningLock*: Lock
     connections*: tables.Table[string, Connection] # Key is string(NodeID)
     connectionsLock*: Lock
@@ -40,6 +51,9 @@ type
     messageIdLock*: Lock
     handlers*: tables.Table[uint16, proc(msg: string): string {.gcsafe.}]
     handlersLock*: Lock
+    acceptThread*: Thread[TCPTransport]
+    connThreads*: seq[ptr Thread[ConnHandlerCtx]] # raw ptr: Thread on shared heap, no ORC tracking
+    connThreadsLock*: Lock
 
 # =============================================================================
 # Connection Management
@@ -77,7 +91,7 @@ proc newTCPTransport*(config: NetworkConfig, port: int,
     config: config,
     port: port,
     role: role,
-    running: false,
+    running: Atomic[bool](),
     connections: tables.initTable[string, Connection](),
     nextMessageId: 1,
     handlers: tables.initTable[uint16, proc(msg: string): string {.gcsafe.}]()
@@ -86,6 +100,7 @@ proc newTCPTransport*(config: NetworkConfig, port: int,
   initLock(result.connectionsLock)
   initLock(result.messageIdLock)
   initLock(result.handlersLock)
+  initLock(result.connThreadsLock)
 
 proc nextMessageId*(t: TCPTransport): uint64 =
   withLock t.messageIdLock:
@@ -93,8 +108,7 @@ proc nextMessageId*(t: TCPTransport): uint64 =
     t.nextMessageId += 1
 
 proc isRunning*(t: TCPTransport): bool =
-  withLock t.runningLock:
-    result = t.running
+  result = t.running.load(moRelaxed)
 
 proc registerHandler*(t: TCPTransport, msgType: uint16,
                       handler: proc(msg: string): string {.gcsafe.}) =
@@ -111,6 +125,41 @@ proc getHandler*(t: TCPTransport, msgType: uint16): Option[proc(
 # =============================================================================
 # Low-level Socket Operations
 # =============================================================================
+
+proc readFrameNoLog(socket: Socket, timeoutMs: int,
+    connClosed: var bool): Option[string] =
+  ## GC-safe version of readFrame without logging.
+  ## Sets connClosed=true when the remote end closes the connection (recv=0),
+  ## as distinct from a plain timeout which leaves connClosed=false.
+  connClosed = false
+  try:
+    var headerBuf = newString(FRAME_HEADER_SIZE)
+    let n = socket.recv(headerBuf, FRAME_HEADER_SIZE, timeoutMs)
+    if n == 0:
+      connClosed = true
+      return none(string)
+    if n < FRAME_HEADER_SIZE:
+      return none(string)
+
+    let (header, _) = decodeFrameHeader(headerBuf)
+
+    if header.payloadLen.int > MAX_MESSAGE_SIZE:
+      return none(string)
+
+    var payload = newString(header.payloadLen.int)
+    if header.payloadLen > 0:
+      let n2 = socket.recv(payload, header.payloadLen.int)
+      if n2 == 0 or n2 < header.payloadLen.int:
+        return none(string)
+
+    let computedChecksum = computeCRC32(payload)
+    if computedChecksum != header.checksum:
+      return none(string)
+
+    return some(payload)
+
+  except CatchableError:
+    return none(string)
 
 proc readFrame*(socket: Socket, timeoutMs: int = 30000): Option[string] =
   try:
@@ -175,8 +224,12 @@ proc connectToNode*(t: TCPTransport, nodeId: NodeID, host: string,
     port: int): Option[Connection] =
   try:
     let socket = newSocket()
+    # NOTE: OptNoDelay (TCP_NODELAY) must NOT be set before connect() on Linux.
+    # Setting TCP_NODELAY on a non-blocking socket before connect() causes the
+    # kernel to return EPERM ("Permission denied") via select() instead of the
+    # expected ECONNREFUSED when the remote port is closed.
+    # We set it AFTER a successful connect() instead.
     socket.setSockOpt(OptReuseAddr, true)
-    socket.setSockOpt(OptNoDelay, t.config.tcpNoDelay)
     socket.setSockOpt(OptKeepAlive, t.config.tcpKeepAlive)
 
     let remoteAddr = host & ":" & $port
@@ -186,6 +239,10 @@ proc connectToNode*(t: TCPTransport, nodeId: NodeID, host: string,
     info("Connecting to node", fields)
 
     socket.connect(host, Port(port), timeout = t.config.tcpConnectTimeoutMs)
+
+    # Set TCP_NODELAY after connect; must pass IPPROTO_TCP level (default SOL_SOCKET
+    # would set SO_DEBUG=1 which requires root and returns EACCES on Linux).
+    socket.setSockOpt(OptNoDelay, t.config.tcpNoDelay, level = IPPROTO_TCP.cint)
 
     let conn = newConnection(nodeId, socket, remoteAddr)
 
@@ -269,18 +326,96 @@ proc handleIncomingMessage*(t: TCPTransport, payload: string): string =
 # Server Operations
 # =============================================================================
 
-proc acceptLoop*(t: TCPTransport) =
-  while t.isRunning():
+proc connHandlerProc(ctx: ConnHandlerCtx) {.thread.} =
+  ## Per-connection handler thread.  Reads messages from the connection,
+  ## dispatches to registered handlers, sends responses, and cleans up
+  ## when the connection closes or the transport stops.
+  let t = cast[TCPTransport](ctx.transportPtr)
+  let conn = ctx.conn
+
+  while t.running.load(moRelaxed) and conn.state == csConnected:
     try:
+      var remoteClosed = false
+      let payloadOpt = readFrameNoLog(conn.socket, 200, remoteClosed)
+      if payloadOpt.isNone:
+        if remoteClosed or not t.running.load(moRelaxed):
+          break
+        continue
+
+      let payload = payloadOpt.get()
+
+      if payload.len < 6:
+        continue
+
+      var headerLen: uint32
+      bigEndian32(addr headerLen, payload[0].unsafeAddr)
+
+      if payload.len < 4 + int(headerLen) or headerLen < 2:
+        continue
+
+      var msgType: uint16
+      bigEndian16(addr msgType, payload[4].unsafeAddr)
+
+      var response: string
+      withLock t.handlersLock:
+        if msgType in t.handlers:
+          response = t.handlers[msgType](payload)
+        else:
+          response = ""
+
+      if response.len > 0 and conn.state == csConnected:
+        try:
+          let frame = encodeFrame(response)
+          conn.socket.send(frame)
+        except Exception:
+          break # socket closed or error; exit handler loop
+
+    except Exception:
+      break
+
+  conn.state = csClosed
+  conn.close()
+
+  withLock t.connectionsLock:
+    t.connections.del(string(conn.nodeId))
+
+proc selectReadable(fd: SocketHandle, timeoutMs: int): bool =
+  ## Poll a single file descriptor for readability using select() with timeout.
+  ## Returns true if the fd is readable (i.e. accept() will not block).
+  when defined(posix):
+    var readSet: posix.TFdSet
+    FD_ZERO(readSet)
+    FD_SET(fd, readSet)
+    var tv: Timeval
+    tv.tv_sec = posix.Time(timeoutMs div 1000)
+    tv.tv_usec = Suseconds((timeoutMs mod 1000) * 1000)
+    let n = posix.select(fd.cint + 1, addr readSet, nil, nil, addr tv)
+    result = n > 0
+  else:
+    # Fallback: always return true (will block on accept)
+    result = true
+
+proc acceptLoopWrapper(t: TCPTransport) {.thread.} =
+  ## Accept loop — accepts incoming TCP connections and spawns a handler
+  ## thread for each one so multiple peers can be served concurrently.
+  ## Uses select() with a 200ms timeout before each accept() so the loop
+  ## can check `running` periodically and exit promptly during shutdown
+  ## (closing a socket from another thread does not reliably unblock a
+  ## blocking accept() on Linux).
+  while t.running.load(moRelaxed):
+    try:
+      # Poll the server socket for 200ms; if nothing arrives, loop back
+      # and re-check the running flag. This avoids blocking indefinitely
+      # in accept() which would prevent clean shutdown.
+      if not selectReadable(t.serverSocket.getFd(), 200):
+        continue
+
       var client: Socket
       var clientAddr: string
       t.serverSocket.acceptAddr(client, clientAddr)
 
-      var fields = tables.initTable[string, string]()
-      fields["addr"] = clientAddr
-      info("Accepted connection from", fields)
-
-      client.setSockOpt(OptNoDelay, t.config.tcpNoDelay)
+      client.setSockOpt(OptNoDelay, t.config.tcpNoDelay,
+          level = IPPROTO_TCP.cint)
       client.setSockOpt(OptKeepAlive, t.config.tcpKeepAlive)
 
       let tempId = NodeID("unknown_" & clientAddr)
@@ -289,11 +424,20 @@ proc acceptLoop*(t: TCPTransport) =
       withLock t.connectionsLock:
         t.connections[string(tempId)] = conn
 
-    except CatchableError as e:
-      if t.isRunning():
-        var fields = tables.initTable[string, string]()
-        fields["error"] = e.msg
-        error("Error accepting connection", fields)
+      # Spawn a handler thread for this connection.
+      # Allocate Thread on the shared heap (ptr, not ref) so ORC does not
+      # track it and cannot corrupt the shared-heap free list.
+      let thr = cast[ptr Thread[ConnHandlerCtx]](allocShared0(sizeof(Thread[
+          ConnHandlerCtx])))
+      let ctx = ConnHandlerCtx(transportPtr: cast[pointer](t), conn: conn)
+      createThread(thr[], connHandlerProc, ctx)
+
+      withLock t.connThreadsLock:
+        t.connThreads.add(thr)
+
+    except CatchableError:
+      if not t.running.load(moRelaxed):
+        return
 
 proc startServer*(t: TCPTransport): bool =
   try:
@@ -302,13 +446,16 @@ proc startServer*(t: TCPTransport): bool =
     t.serverSocket.bindAddr(Port(t.port), t.config.bindAddress)
     t.serverSocket.listen()
 
-    withLock t.runningLock:
-      t.running = true
+    t.running.store(true)
 
     var fields = tables.initTable[string, string]()
     fields["role"] = t.role
     fields["port"] = $t.port
     info("TCP server started", fields)
+
+    # Start accept thread
+    createThread(t.acceptThread, acceptLoopWrapper, t)
+
     return true
 
   except CatchableError as e:
@@ -318,22 +465,42 @@ proc startServer*(t: TCPTransport): bool =
     return false
 
 proc stopServer*(t: TCPTransport) =
-  withLock t.runningLock:
-    t.running = false
+  t.running.store(false)
 
-  withLock t.connectionsLock:
-    for nodeId, conn in t.connections:
-      conn.close()
-    t.connections.clear()
-
+  # Shutdown and close server socket to unblock accept.
+  # shutdown(SHUT_RDWR) reliably wakes a blocking accept/select on Linux,
+  # whereas close() alone may not unblock another thread.
   if t.serverSocket != nil:
     try:
+      when defined(posix):
+        discard posix.shutdown(t.serverSocket.getFd(), posix.SHUT_RDWR)
       t.serverSocket.close()
     except:
       discard
 
+  # Wait for accept thread to finish (at most ~200ms for select timeout)
+  if t.acceptThread.running:
+    t.acceptThread.joinThread()
+
+  # Close all active connections so handler threads unblock on recv
+  withLock t.connectionsLock:
+    for nodeId, conn in t.connections:
+      conn.close()
+
+  # Join all per-connection handler threads and free their shared-heap memory
+  withLock t.connThreadsLock:
+    for thr in t.connThreads:
+      if thr[].running:
+        joinThread(thr[])
+      deallocShared(thr)
+    t.connThreads.setLen(0)
+
+  withLock t.connectionsLock:
+    t.connections.clear()
+
   var fields = tables.initTable[string, string]()
   fields["role"] = t.role
+  fields["port"] = $t.port
   info("TCP server stopped", fields)
 
 # =============================================================================
@@ -347,3 +514,4 @@ proc close*(t: TCPTransport) =
   deinitLock(t.connectionsLock)
   deinitLock(t.messageIdLock)
   deinitLock(t.handlersLock)
+  deinitLock(t.connThreadsLock)

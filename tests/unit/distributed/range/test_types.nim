@@ -8,36 +8,36 @@ import std/options
 
 import fractio/distributed/range/types
 
-suite "NodeID":
+suite "RangeNodeID":
   test "string representation":
-    let id = NodeID(42)
+    let id = RangeNodeID(42)
     check $id == "n42"
 
   test "parse from string":
     let id = parseNodeID("n42")
-    check id == NodeID(42)
+    check id == RangeNodeID(42)
 
-  test "invalid NodeID is zero":
+  test "invalid RangeNodeID is zero":
     let invalid = invalidNodeID()
     check invalid.uint32 == 0
     check not isValid(invalid)
 
-  test "valid NodeID is non-zero":
-    let valid = NodeID(1)
+  test "valid RangeNodeID is non-zero":
+    let valid = RangeNodeID(1)
     check isValid(valid)
 
   test "equality comparison":
-    check NodeID(1) == NodeID(1)
-    check NodeID(1) != NodeID(2)
+    check RangeNodeID(1) == RangeNodeID(1)
+    check RangeNodeID(1) != RangeNodeID(2)
 
   test "ordering":
-    check NodeID(1) < NodeID(2)
-    check NodeID(1) <= NodeID(2)
-    check NodeID(2) <= NodeID(2)
+    check RangeNodeID(1) < RangeNodeID(2)
+    check RangeNodeID(1) <= RangeNodeID(2)
+    check RangeNodeID(2) <= RangeNodeID(2)
 
   test "hash for tables":
-    var table = {NodeID(1): "one", NodeID(2): "two"}.toTable
-    check table[NodeID(1)] == "one"
+    var table = {RangeNodeID(1): "one", RangeNodeID(2): "two"}.toTable
+    check table[RangeNodeID(1)] == "one"
 
 suite "RangeID":
   test "string representation":
@@ -81,26 +81,26 @@ suite "ReplicaID":
 
 suite "ReplicaDescriptor":
   test "create voter":
-    let rep = newReplicaDescriptor(NodeID(1), ReplicaID(1))
-    check rep.nodeId == NodeID(1)
+    let rep = newReplicaDescriptor(RangeNodeID(1), ReplicaID(1))
+    check rep.nodeId == RangeNodeID(1)
     check rep.replicaId == ReplicaID(1)
     check rep.isVoter()
     check rep.replicaType == rtVoter
 
   test "create non-voter":
-    let rep = newReplicaDescriptor(NodeID(1), ReplicaID(1), rtNonVoter)
+    let rep = newReplicaDescriptor(RangeNodeID(1), ReplicaID(1), rtNonVoter)
     check not rep.isVoter()
     check rep.replicaType == rtNonVoter
 
   test "equality":
-    let rep1 = newReplicaDescriptor(NodeID(1), ReplicaID(1))
-    let rep2 = newReplicaDescriptor(NodeID(1), ReplicaID(1))
-    let rep3 = newReplicaDescriptor(NodeID(2), ReplicaID(1))
+    let rep1 = newReplicaDescriptor(RangeNodeID(1), ReplicaID(1))
+    let rep2 = newReplicaDescriptor(RangeNodeID(1), ReplicaID(1))
+    let rep3 = newReplicaDescriptor(RangeNodeID(2), ReplicaID(1))
     check rep1 == rep2
     check rep1 != rep3
 
   test "JSON serialization":
-    let rep = newReplicaDescriptor(NodeID(42), ReplicaID(7), rtNonVoter)
+    let rep = newReplicaDescriptor(RangeNodeID(42), ReplicaID(7), rtNonVoter)
     let json = rep.toJson()
     check json["nodeId"].getInt() == 42
     check json["replicaId"].getInt() == 7
@@ -109,7 +109,7 @@ suite "ReplicaDescriptor":
   test "JSON deserialization":
     let json = %*{"nodeId": 42, "replicaId": 7, "replicaType": 1}
     let rep = parseReplicaDescriptor(json)
-    check rep.nodeId == NodeID(42)
+    check rep.nodeId == RangeNodeID(42)
     check rep.replicaId == ReplicaID(7)
     check rep.replicaType == rtNonVoter
 
@@ -124,27 +124,27 @@ suite "RangeDescriptor":
 
   test "add replica":
     let desc = newRangeDescriptor(RangeID(1), @[byte 0x00], @[byte 0xFF])
-    let rep1 = desc.addReplica(NodeID(1))
+    let rep1 = desc.addReplica(RangeNodeID(1))
     check desc.replicas.len == 1
-    check rep1.nodeId == NodeID(1)
+    check rep1.nodeId == RangeNodeID(1)
     check rep1.replicaId == ReplicaID(1)
     check desc.generation == 2
 
-    let rep2 = desc.addReplica(NodeID(2))
+    let rep2 = desc.addReplica(RangeNodeID(2))
     check desc.replicas.len == 2
     check rep2.replicaId == ReplicaID(2)
     check desc.generation == 3
 
   test "add non-voter replica":
     let desc = newRangeDescriptor(RangeID(1), @[byte 0x00], @[byte 0xFF])
-    discard desc.addReplica(NodeID(1))
-    let rep2 = desc.addReplica(NodeID(2), rtNonVoter)
+    discard desc.addReplica(RangeNodeID(1))
+    let rep2 = desc.addReplica(RangeNodeID(2), rtNonVoter)
     check rep2.replicaType == rtNonVoter
 
   test "remove replica":
     let desc = newRangeDescriptor(RangeID(1), @[byte 0x00], @[byte 0xFF])
-    discard desc.addReplica(NodeID(1))
-    discard desc.addReplica(NodeID(2))
+    discard desc.addReplica(RangeNodeID(1))
+    discard desc.addReplica(RangeNodeID(2))
     check desc.replicas.len == 2
     check desc.generation == 3 # gen starts at 1, +1 for each add
 
@@ -155,21 +155,21 @@ suite "RangeDescriptor":
 
   test "get replica by node":
     let desc = newRangeDescriptor(RangeID(1), @[byte 0x00], @[byte 0xFF])
-    discard desc.addReplica(NodeID(1))
-    discard desc.addReplica(NodeID(2))
+    discard desc.addReplica(RangeNodeID(1))
+    discard desc.addReplica(RangeNodeID(2))
 
-    let rep = desc.getReplica(NodeID(1))
+    let rep = desc.getReplica(RangeNodeID(1))
     check rep.isSome()
-    check rep.get().nodeId == NodeID(1)
+    check rep.get().nodeId == RangeNodeID(1)
 
-    let missing = desc.getReplica(NodeID(99))
+    let missing = desc.getReplica(RangeNodeID(99))
     check missing.isNone()
 
   test "get voters and non-voters":
     let desc = newRangeDescriptor(RangeID(1), @[byte 0x00], @[byte 0xFF])
-    discard desc.addReplica(NodeID(1)) # voter
-    discard desc.addReplica(NodeID(2)) # voter
-    discard desc.addReplica(NodeID(3), rtNonVoter) # non-voter
+    discard desc.addReplica(RangeNodeID(1)) # voter
+    discard desc.addReplica(RangeNodeID(2)) # voter
+    discard desc.addReplica(RangeNodeID(3), rtNonVoter) # non-voter
 
     let voters = desc.getVoters()
     check voters.len == 2
@@ -186,9 +186,9 @@ suite "RangeDescriptor":
 
   test "quorum size":
     let desc = newRangeDescriptor(RangeID(1), @[byte 0x00], @[byte 0xFF])
-    discard desc.addReplica(NodeID(1))
-    discard desc.addReplica(NodeID(2))
-    discard desc.addReplica(NodeID(3))
+    discard desc.addReplica(RangeNodeID(1))
+    discard desc.addReplica(RangeNodeID(2))
+    discard desc.addReplica(RangeNodeID(3))
     check desc.quorumSize() == 2 # majority of 3
 
   test "is initialized":
@@ -196,14 +196,14 @@ suite "RangeDescriptor":
     check not desc.isInitialized()
 
     desc = newRangeDescriptor(RangeID(1), @[byte 0x00], @[byte 0xFF])
-    discard desc.addReplica(NodeID(1))
+    discard desc.addReplica(RangeNodeID(1))
     check desc.isInitialized()
 
   test "JSON round-trip":
     let desc = newRangeDescriptor(RangeID(42), @[byte 0x00], @[byte 0xFF])
-    discard desc.addReplica(NodeID(1))
-    discard desc.addReplica(NodeID(2))
-    discard desc.addReplica(NodeID(3))
+    discard desc.addReplica(RangeNodeID(1))
+    discard desc.addReplica(RangeNodeID(2))
+    discard desc.addReplica(RangeNodeID(3))
 
     let json = desc.toJson()
     let parsed = parseRangeDescriptor(json)

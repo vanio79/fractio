@@ -29,7 +29,7 @@ import fractio/distributed/range/types as rangeTypes
 proc makeRaftServer(port: int, storagePath: string): ProtocolServer =
   ## Spin up a ProtocolServer with Raft-backed KV store.
   let coordCfg = CoordinatorConfig(
-    nodeId: NodeID(1),
+    nodeId: RangeNodeID(1),
     numWorkers: 1,
     electionTimeoutNs: DEFAULT_ELECTION_TIMEOUT_NS,
     heartbeatIntervalNs: DEFAULT_HEARTBEAT_INTERVAL_NS,
@@ -38,7 +38,7 @@ proc makeRaftServer(port: int, storagePath: string): ProtocolServer =
   let coord = newMultiRaftCoordinator(coordCfg)
   let rid = RangeID(1)
   let desc = newRangeDescriptor(rid, @[], @[])
-  let rep = desc.addReplica(NodeID(1))
+  let rep = desc.addReplica(RangeNodeID(1))
   let group = coord.createGroup(desc, rep.replicaId)
   group.becomeLeader()
   coord.start()

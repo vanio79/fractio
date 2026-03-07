@@ -25,6 +25,7 @@ import ./messages/core
 import ./messages/kv
 import ./messages/txn as txnMsgs
 import ./messages/admin as adminMsgs
+import ./messages/cluster as clusterMsgs
 import ./txn_manager
 import ./raft_store
 import ../utils/logging
@@ -207,6 +208,54 @@ proc kvLen*(store: KVStore): int {.gcsafe, raises: [].} =
   store.data.len
 
 # ---------------------------------------------------------------------------
+# Cluster node registry (Phase 8 — in-memory, protected by a Lock)
+# ---------------------------------------------------------------------------
+
+type
+  ClusterNodeEntry* = object
+    nodeId*: uint16
+    host*: string
+    raftPort*: uint16
+    clientPort*: uint16
+    status*: uint8 ## clusterMsgs.NodeStatus* constant
+
+  NodeRegistry* = ref object
+    nodes*: Table[uint16, ClusterNodeEntry]
+    mu*: Lock
+    ## Rebalance operation counters (atomic for lock-free reads)
+    rebalancePending*: Atomic[uint32]
+    rebalanceInProgress*: Atomic[uint32]
+    rebalanceCompleted*: Atomic[uint32]
+    rebalanceFailed*: Atomic[uint32]
+
+proc newNodeRegistry*(): NodeRegistry =
+  result = NodeRegistry(nodes: initTable[uint16, ClusterNodeEntry]())
+  initLock(result.mu)
+  result.rebalancePending.store(0)
+  result.rebalanceInProgress.store(0)
+  result.rebalanceCompleted.store(0)
+  result.rebalanceFailed.store(0)
+
+proc addNode*(reg: NodeRegistry, entry: ClusterNodeEntry) {.gcsafe, raises: [].} =
+  acquire(reg.mu)
+  defer: release(reg.mu)
+  reg.nodes[entry.nodeId] = entry
+
+proc removeNode*(reg: NodeRegistry, nodeId: uint16): bool {.gcsafe, raises: [].} =
+  acquire(reg.mu)
+  defer: release(reg.mu)
+  if reg.nodes.hasKey(nodeId):
+    reg.nodes.del(nodeId)
+    return true
+  false
+
+proc listNodes*(reg: NodeRegistry): seq[ClusterNodeEntry] {.gcsafe, raises: [].} =
+  acquire(reg.mu)
+  defer: release(reg.mu)
+  for _, v in reg.nodes:
+    result.add(v)
+
+# ---------------------------------------------------------------------------
 # Metrics counters (Phase 4)
 # ---------------------------------------------------------------------------
 
@@ -286,6 +335,7 @@ type
     metrics*: ServerMetrics       ## Phase 4: request counters
     authenticator*: Authenticator ## Phase 4: auth validator
     sharedTimer*: SharedTimer     ## Phase 7: P2P clock sync (nil when disabled)
+    nodeRegistry*: NodeRegistry   ## Phase 8: in-memory cluster node registry
 
 # ---------------------------------------------------------------------------
 # Thread argument types — defined after ProtocolServer to avoid forward refs
@@ -314,6 +364,7 @@ proc newProtocolServer*(config: ServerConfig): ProtocolServer =
     txnMgr: newTransactionManager(),
     metrics: newServerMetrics(),
     authenticator: newAuthenticator(config.authMethod),
+    nodeRegistry: newNodeRegistry(),
     startedAt: getTime().toUnix(),
   )
   initLock(result.clientsMu)
@@ -975,6 +1026,87 @@ proc handleBuiltinAdmin(server: ProtocolServer, conn: ClientConnection,
       &"unknown admin message type 0x{typeVal:04X}")
 
 # ---------------------------------------------------------------------------
+# Built-in Cluster Admin handlers (JoinNode, RemoveNode, ListNodes, RebalanceStatus)
+# ---------------------------------------------------------------------------
+
+proc handleBuiltinCluster(server: ProtocolServer, conn: ClientConnection,
+    requestId: uint32, flags: uint16,
+    payload: string) {.gcsafe, raises: [].} =
+  if payload.len < 2: return
+  let typeVal = (uint16(payload[0]) shl 8) or uint16(payload[1])
+
+  case typeVal
+
+  of uint16(mtJoinNode):
+    let reqR = clusterMsgs.decodeJoinNodeRequest(payload)
+    if reqR.isErr:
+      sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
+      return
+    let req = reqR.value
+    if req.nodeId == 0:
+      let resp = clusterMsgs.JoinNodeResponse(success: false,
+        message: "nodeId 0 is reserved")
+      sendFrame(conn, clusterMsgs.encodeJoinNodeResponse(resp), requestId)
+      return
+    if req.host.len == 0:
+      let resp = clusterMsgs.JoinNodeResponse(success: false,
+        message: "host must not be empty")
+      sendFrame(conn, clusterMsgs.encodeJoinNodeResponse(resp), requestId)
+      return
+    let entry = ClusterNodeEntry(
+      nodeId: req.nodeId,
+      host: req.host,
+      raftPort: req.raftPort,
+      clientPort: req.clientPort,
+      status: clusterMsgs.NodeStatusActive,
+    )
+    server.nodeRegistry.addNode(entry)
+    let resp = clusterMsgs.JoinNodeResponse(success: true,
+      message: "node " & $req.nodeId & " joined")
+    sendFrame(conn, clusterMsgs.encodeJoinNodeResponse(resp), requestId)
+
+  of uint16(mtRemoveNode):
+    let reqR = clusterMsgs.decodeRemoveNodeRequest(payload)
+    if reqR.isErr:
+      sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
+      return
+    let req = reqR.value
+    let removed = server.nodeRegistry.removeNode(req.nodeId)
+    let resp = clusterMsgs.RemoveNodeResponse(
+      success: removed,
+      message: if removed: "node " & $req.nodeId & " removed"
+               else: "node " & $req.nodeId & " not found",
+    )
+    sendFrame(conn, clusterMsgs.encodeRemoveNodeResponse(resp), requestId)
+
+  of uint16(mtListNodes):
+    let entries = server.nodeRegistry.listNodes()
+    var nodes = newSeq[clusterMsgs.NodeInfo](entries.len)
+    for i, e in entries:
+      nodes[i] = clusterMsgs.NodeInfo(
+        nodeId: e.nodeId,
+        host: e.host,
+        raftPort: e.raftPort,
+        clientPort: e.clientPort,
+        status: e.status,
+      )
+    let resp = clusterMsgs.ListNodesResponse(nodes: nodes)
+    sendFrame(conn, clusterMsgs.encodeListNodesResponse(resp), requestId)
+
+  of uint16(mtRebalanceStatus):
+    let resp = clusterMsgs.RebalanceStatusResponse(
+      pending: server.nodeRegistry.rebalancePending.load(),
+      inProgress: server.nodeRegistry.rebalanceInProgress.load(),
+      completed: server.nodeRegistry.rebalanceCompleted.load(),
+      failed: server.nodeRegistry.rebalanceFailed.load(),
+    )
+    sendFrame(conn, clusterMsgs.encodeRebalanceStatusResponse(resp), requestId)
+
+  else:
+    sendError(conn, requestId, ErrProtocol, ErrCatSystem,
+      &"unknown cluster message type 0x{typeVal:04X}")
+
+# ---------------------------------------------------------------------------
 # Per-connection loop
 # ---------------------------------------------------------------------------
 
@@ -1040,8 +1172,12 @@ proc clientLoop(server: ProtocolServer,
       handleBuiltinTxn(server, conn, f.header.requestId, f.header.flags,
         f.payload)
       discard server.metrics.requestsOK.fetchAdd(1)
-    elif typeVal >= 0x0700 and typeVal <= 0x07FF:
+    elif typeVal >= 0x0700 and typeVal <= 0x0702:
       handleBuiltinAdmin(server, conn, f.header.requestId, f.header.flags,
+        f.payload)
+      discard server.metrics.requestsOK.fetchAdd(1)
+    elif typeVal >= 0x0703 and typeVal <= 0x07FF:
+      handleBuiltinCluster(server, conn, f.header.requestId, f.header.flags,
         f.payload)
       discard server.metrics.requestsOK.fetchAdd(1)
     else:

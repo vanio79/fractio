@@ -20,6 +20,7 @@ import ./messages/core
 import ./messages/kv
 import ./messages/txn as txnMsgs
 import ./messages/admin as adminMsgs
+import ./messages/cluster as clusterMsgs
 
 # ---------------------------------------------------------------------------
 # Safe logging helper (no Logger dep in client to keep it lightweight)
@@ -444,4 +445,43 @@ proc health*(client: ProtocolClient): Result[adminMsgs.HealthResponse,
   if r.isErr: return peErr(r.error)
   adminMsgs.decodeHealthResponse(r.value.payload)
 
+# ---------------------------------------------------------------------------
+# Cluster admin convenience procs (Phase 8)
+# ---------------------------------------------------------------------------
 
+proc joinNode*(client: ProtocolClient, nodeId: uint16, host: string,
+    raftPort: uint16, clientPort: uint16): Result[clusterMsgs.JoinNodeResponse,
+    ProtocolError] {.gcsafe, raises: [].} =
+  ## Request that the server register a new cluster node.
+  let req = clusterMsgs.JoinNodeRequest(
+    nodeId: nodeId,
+    host: host,
+    raftPort: raftPort,
+    clientPort: clientPort,
+  )
+  let r = client.send(clusterMsgs.encodeJoinNodeRequest(req))
+  if r.isErr: return peErr(r.error)
+  clusterMsgs.decodeJoinNodeResponse(r.value.payload)
+
+proc removeNode*(client: ProtocolClient,
+    nodeId: uint16): Result[clusterMsgs.RemoveNodeResponse,
+    ProtocolError] {.gcsafe, raises: [].} =
+  ## Request that the server deregister a cluster node.
+  let req = clusterMsgs.RemoveNodeRequest(nodeId: nodeId)
+  let r = client.send(clusterMsgs.encodeRemoveNodeRequest(req))
+  if r.isErr: return peErr(r.error)
+  clusterMsgs.decodeRemoveNodeResponse(r.value.payload)
+
+proc listNodes*(client: ProtocolClient): Result[clusterMsgs.ListNodesResponse,
+    ProtocolError] {.gcsafe, raises: [].} =
+  ## Request the full list of cluster nodes known to the server.
+  let r = client.send(clusterMsgs.encodeListNodesRequest())
+  if r.isErr: return peErr(r.error)
+  clusterMsgs.decodeListNodesResponse(r.value.payload)
+
+proc rebalanceStatus*(client: ProtocolClient): Result[
+    clusterMsgs.RebalanceStatusResponse, ProtocolError] {.gcsafe, raises: [].} =
+  ## Query the server's rebalance operation counters.
+  let r = client.send(clusterMsgs.encodeRebalanceStatusRequest())
+  if r.isErr: return peErr(r.error)
+  clusterMsgs.decodeRebalanceStatusResponse(r.value.payload)

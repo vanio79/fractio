@@ -62,7 +62,7 @@ suite "Cache Entry":
       RangeID(1),
       @[byte(0)],
       @[byte(100)],
-      @[newReplicaDescriptor(NodeID(1), ReplicaID(1))]
+      @[newReplicaDescriptor(RangeNodeID(1), ReplicaID(1))]
     )
     let entry = newCacheEntry(desc, 1000'i64, 60000'i64)
     check entry.descriptor.rangeId == RangeID(1)
@@ -75,7 +75,7 @@ suite "Cache Entry":
       RangeID(1),
       @[byte(0)],
       @[byte(100)],
-      @[newReplicaDescriptor(NodeID(1), ReplicaID(1))]
+      @[newReplicaDescriptor(RangeNodeID(1), ReplicaID(1))]
     )
     let entry = newCacheEntry(desc, 1000'i64, 60000'i64)
     check not entry.isExpired(50000) # Not expired
@@ -86,7 +86,7 @@ suite "Cache Entry":
       RangeID(1),
       @[byte(0)],
       @[byte(100)],
-      @[newReplicaDescriptor(NodeID(1), ReplicaID(1))]
+      @[newReplicaDescriptor(RangeNodeID(1), ReplicaID(1))]
     )
     let entry = newCacheEntry(desc, 1000'i64, 60000'i64)
     entry.touch(5000)
@@ -101,7 +101,7 @@ suite "Cache Entry":
       RangeID(1),
       @[byte(0)],
       @[byte(100)],
-      @[newReplicaDescriptor(NodeID(1), ReplicaID(1))]
+      @[newReplicaDescriptor(RangeNodeID(1), ReplicaID(1))]
     )
     let entry = newCacheEntry(desc, 1000'i64, 60000'i64)
     check entry.ageNs(5000) == 4000
@@ -111,7 +111,7 @@ suite "Cache Entry":
       RangeID(1),
       @[byte(0)],
       @[byte(100)],
-      @[newReplicaDescriptor(NodeID(1), ReplicaID(1))]
+      @[newReplicaDescriptor(RangeNodeID(1), ReplicaID(1))]
     )
     let entry = newCacheEntry(desc, 1000'i64, 60000'i64)
     check entry.timeUntilExpiryNs(5000) == 56000
@@ -138,7 +138,7 @@ suite "Range Cache":
       RangeID(1),
       @[byte(0)],
       @[byte(100)],
-      @[newReplicaDescriptor(NodeID(1), ReplicaID(1))]
+      @[newReplicaDescriptor(RangeNodeID(1), ReplicaID(1))]
     )
     cache.put(desc, 1000)
 
@@ -166,7 +166,7 @@ suite "Range Cache":
       RangeID(1),
       @[byte(0)],
       @[byte(100)],
-      @[newReplicaDescriptor(NodeID(1), ReplicaID(1))]
+      @[newReplicaDescriptor(RangeNodeID(1), ReplicaID(1))]
     )
     cache.put(desc, 0)
 
@@ -184,7 +184,7 @@ suite "Range Cache":
       RangeID(1),
       @[byte(0)],
       @[byte(100)],
-      @[newReplicaDescriptor(NodeID(1), ReplicaID(1))]
+      @[newReplicaDescriptor(RangeNodeID(1), ReplicaID(1))]
     )
     cache.put(desc, 1000)
 
@@ -201,7 +201,7 @@ suite "Range Cache":
       RangeID(1),
       @[byte(0)],
       @[byte(100)],
-      @[newReplicaDescriptor(NodeID(1), ReplicaID(1))]
+      @[newReplicaDescriptor(RangeNodeID(1), ReplicaID(1))]
     )
     cache.put(desc, 1000)
 
@@ -217,7 +217,7 @@ suite "Range Cache":
       RangeID(1),
       @[byte(0)],
       @[byte(100)],
-      @[newReplicaDescriptor(NodeID(1), ReplicaID(1))]
+      @[newReplicaDescriptor(RangeNodeID(1), ReplicaID(1))]
     )
     cache.put(desc, 1000)
 
@@ -234,7 +234,7 @@ suite "Range Cache":
         RangeID(i),
         @[byte(i * 10)],
         @[byte((i + 1) * 10)],
-        @[newReplicaDescriptor(NodeID(1), ReplicaID(i))]
+        @[newReplicaDescriptor(RangeNodeID(1), ReplicaID(i))]
       )
       cache.put(desc, 1000)
 
@@ -251,7 +251,7 @@ suite "Range Cache":
       RangeID(1),
       @[byte(0)],
       @[byte(100)],
-      @[newReplicaDescriptor(NodeID(1), ReplicaID(1))]
+      @[newReplicaDescriptor(RangeNodeID(1), ReplicaID(1))]
     )
     cache.put(desc, 1000)
 
@@ -274,7 +274,7 @@ suite "Meta2 Cache":
       RangeID(1),
       @[byte(0)],
       @[byte(100)],
-      @[newReplicaDescriptor(NodeID(1), ReplicaID(1))]
+      @[newReplicaDescriptor(RangeNodeID(1), ReplicaID(1))]
     )
 
     let key = @[byte(50)]
@@ -294,14 +294,14 @@ suite "Meta2 Cache":
 
 suite "Node Descriptor":
   test "create node descriptor":
-    let desc = newNodeDescriptor(NodeID(1), "localhost:8080")
-    check desc.nodeId == NodeID(1)
+    let desc = newNodeDescriptor(RangeNodeID(1), "localhost:8080")
+    check desc.nodeId == RangeNodeID(1)
     check desc.address == "localhost:8080"
     check desc.isAlive
     check desc.locality.len == 0
 
   test "serialize to JSON":
-    var desc = newNodeDescriptor(NodeID(1), "localhost:8080")
+    var desc = newNodeDescriptor(RangeNodeID(1), "localhost:8080")
     desc.locality.add(("region", "us-west"))
     desc.locality.add(("zone", "a"))
 
@@ -321,7 +321,7 @@ suite "Node Descriptor":
     }
 
     let desc = parseNodeDescriptor(json)
-    check desc.nodeId == NodeID(1)
+    check desc.nodeId == RangeNodeID(1)
     check desc.address == "localhost:8080"
     check desc.locality.len == 1
     check desc.locality[0] == ("region", "us-west")
@@ -329,29 +329,29 @@ suite "Node Descriptor":
     check desc.lastHeartbeatNs == 12345
 
   test "string representation":
-    let desc = newNodeDescriptor(NodeID(1), "localhost:8080")
+    let desc = newNodeDescriptor(RangeNodeID(1), "localhost:8080")
     check $desc == "NodeDescriptor(n1, localhost:8080)"
 
 suite "Leaseholder Info":
   test "create leaseholder info":
-    let info = newLeaseholderInfo(RangeID(1), NodeID(1), 100000'i64)
+    let info = newLeaseholderInfo(RangeID(1), RangeNodeID(1), 100000'i64)
     check info.rangeId == RangeID(1)
-    check info.leaseholder == NodeID(1)
+    check info.leaseholder == RangeNodeID(1)
     check info.leaseExpirationNs == 100000
     check info.epoch == 0
 
   test "create with epoch":
-    let info = newLeaseholderInfo(RangeID(1), NodeID(1), 100000'i64, 5)
+    let info = newLeaseholderInfo(RangeID(1), RangeNodeID(1), 100000'i64, 5)
     check info.epoch == 5
 
   test "is valid":
-    let info = newLeaseholderInfo(RangeID(1), NodeID(1), 100000'i64)
+    let info = newLeaseholderInfo(RangeID(1), RangeNodeID(1), 100000'i64)
     check info.isValid(50000) # Not expired
     check not info.isValid(100000) # Expired
     check not info.isValid(150000) # Expired
 
   test "serialize to JSON":
-    let info = newLeaseholderInfo(RangeID(1), NodeID(1), 100000'i64, 5)
+    let info = newLeaseholderInfo(RangeID(1), RangeNodeID(1), 100000'i64, 5)
     let json = info.toJson()
     check json["rangeId"].getInt() == 1
     check json["leaseholder"].getInt() == 1
@@ -368,7 +368,7 @@ suite "Leaseholder Info":
 
     let info = parseLeaseholderInfo(json)
     check info.rangeId == RangeID(1)
-    check info.leaseholder == NodeID(1)
+    check info.leaseholder == RangeNodeID(1)
     check info.leaseExpirationNs == 100000
     check info.epoch == 5
 

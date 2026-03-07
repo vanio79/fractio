@@ -62,7 +62,7 @@ type
     ## Response from a range lookup
     descriptor*: RangeDescriptor
       ## The range descriptor
-    leaseholder*: NodeID
+    leaseholder*: RangeNodeID
       ## Current leaseholder (if known)
     found*: bool
       ## Whether the range was found
@@ -77,7 +77,7 @@ proc newLookupRequest*(key: seq[byte], readAtNs: int64,
   )
 
 proc newLookupResponse*(desc: RangeDescriptor,
-                        leaseholder: NodeID = NodeID(0)): LookupResponse =
+                        leaseholder: RangeNodeID = RangeNodeID(0)): LookupResponse =
   ## Create a successful lookup response
   result = LookupResponse(
     descriptor: desc,
@@ -89,7 +89,7 @@ proc notFoundResponse*(): LookupResponse =
   ## Create a not-found response
   result = LookupResponse(
     descriptor: nil,
-    leaseholder: NodeID(0),
+    leaseholder: RangeNodeID(0),
     found: false
   )
 
@@ -216,7 +216,7 @@ proc fullLookup*(lookup: RangeLookup, key: seq[byte],
   return newLookupResponse(data)
 
 proc getLeaseholder*(lookup: RangeLookup, rangeId: RangeID,
-                     nowNs: int64): Option[NodeID] =
+                     nowNs: int64): Option[RangeNodeID] =
   ## Get the current leaseholder for a range
   ## Returns the first voter replica (simplified)
 
@@ -227,7 +227,7 @@ proc getLeaseholder*(lookup: RangeLookup, rangeId: RangeID,
     if voters.len > 0:
       return some(voters[0].nodeId)
 
-  return none(NodeID)
+  return none(RangeNodeID)
 
 proc updateDescriptor*(lookup: RangeLookup, desc: RangeDescriptor,
                        nowNs: int64) =

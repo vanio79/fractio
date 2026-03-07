@@ -1,22 +1,27 @@
 # Multi-Raft Coordinator
 #
-# This module manages multiple Raft groups on a single node.
-# It handles proposal routing, worker threads, and group lifecycle.
+# Manages multiple Raft groups on a single node.
+# Handles proposal routing, log replication, worker threads, and group lifecycle.
 #
-# Fixed for Nim 2.2.8:
-#   - Replaced std/channels (nonexistent) with built-in Channel[T]
-#   - Replaced RwLock (nonexistent) with Lock
-#   - Replaced Future-based propose with synchronous proposeAndWait
-#   - Removed asyncdispatch dependency
+# Multi-node wiring (Phase 6):
+#   - CoordinatorConfig.transport: optional RaftGroupTransport; nil = single-node mode
+#   - workerProc calls replicateAndWait (quorum replication) when transport != nil,
+#     falls back to single-node commit when voters.len == 1 or transport == nil
+#   - Timer thread calls startElection / sendHeartbeats via transport
+#   - Incoming RPCs are dispatched via CoordAccessors callbacks set in start()
+#
+# Nim 2.2.8 constraints:
+#   - No std/channels; use built-in Channel[T] (.open/.close/.send/.tryRecv)
+#   - No RwLock; use plain Lock
+#   - Cross-thread completion uses raw ptr ProposalResultChannel (avoids ORC SIGSEGV)
 
 import std/atomics
 import std/locks
 import std/tables
-import std/sets
 import std/typedthreads
 import std/times
 import std/options
-import os # for sleep()
+import os
 
 import fractio/distributed/range/types
 import fractio/distributed/raft/multigroup_types
@@ -31,42 +36,80 @@ import fractio/utils/logging
 
 const
   DEFAULT_NUM_WORKERS* = 4
-  DEFAULT_ELECTION_TIMEOUT_NS* = 1_500_000_000'i64 # 1.5 seconds
-  DEFAULT_HEARTBEAT_INTERVAL_NS* = 500_000_000'i64 # 500ms
+  DEFAULT_ELECTION_TIMEOUT_NS* = 1_500_000_000'i64 # 1.5 s
+  DEFAULT_HEARTBEAT_INTERVAL_NS* = 500_000_000'i64 # 500 ms
   MAX_PROPOSAL_QUEUE_SIZE* = 10000
+  LOG_COMPACTION_THRESHOLD* = 10_000               # entries before snapshot
 
 # ============================================================================
 # Coordinator Types
 # ============================================================================
 
 type
+  # -------------------------------------------------------------------------
+  # MultiRaftTransport — vtable interface (no concrete type imported here).
+  # multigroup_transport.nim implements this and injects via attachTransport().
+  # This decouples coordinator.nim from network/types.nim, preventing the
+  # Nim 2.2.8 C-codegen RangeNodeID distinct-type collision.
+  # -------------------------------------------------------------------------
+
+  ## Callbacks handed to the transport so it can read coordinator state
+  ## without a circular import (mirrors CoordAccessors in multigroup_transport).
+  TransportCoordAccessors* = object
+    getGroup*: proc(rid: RangeID): Option[RaftGroup] {.gcsafe, raises: [].}
+    getLog*: proc(rid: RangeID): Option[RaftLog] {.gcsafe, raises: [].}
+    applyUpTo*: proc(rid: RangeID, g: RaftGroup,
+        idx: uint64) {.gcsafe, raises: [].}
+    saveState*: proc(rid: RangeID, g: RaftGroup,
+        log: RaftLog) {.gcsafe, raises: [].}
+
+  ## Abstract transport vtable — filled in by multigroup_transport after create.
+  MultiRaftTransport* = ref object
+    ## Called once in start() to register incoming-RPC handlers and begin
+    ## listening for connections.
+    startFn*: proc(acc: TransportCoordAccessors) {.gcsafe, raises: [].}
+    ## Called in stop() to shut down the listener and all connections.
+    stopFn*: proc() {.gcsafe, raises: [].}
+    ## Fan-out AppendEntries to peers, wait for quorum. Returns true on quorum.
+    replicateFn*: proc(group: RaftGroup, log: RaftLog,
+        entry: LogEntry, timeoutMs: int): bool {.gcsafe, raises: [].}
+    ## Broadcast RequestVote, become leader if quorum. Returns true if won.
+    electionFn*: proc(group: RaftGroup,
+        log: RaftLog): bool {.gcsafe, raises: [].}
+    ## Send empty AppendEntries (heartbeat) to all followers of leader groups.
+    heartbeatFn*: proc(groups: Table[RangeID, RaftGroup],
+        logs: Table[RangeID, RaftLog]) {.gcsafe, raises: [].}
+
   CoordinatorConfig* = object
-    ## Configuration for the coordinator
-    nodeId*: NodeID
+    nodeId*: RangeNodeID
     numWorkers*: int
     electionTimeoutNs*: int64
     heartbeatIntervalNs*: int64
     storagePath*: string
+    proposeTimeoutMs*: int ## default 5000
+                           ## Optional multi-node transport; nil = single-node mode (all existing tests)
+    transport*: MultiRaftTransport
+
+  TimerContext = object
+    coordinator: MultiRaftCoordinator
 
   WorkerContext = object
-    ## Context passed to worker threads
     coordinator: MultiRaftCoordinator
     workerId: int
 
   MultiRaftCoordinator* = ref object
-    ## Manages all Raft groups on a single node
-    nodeId*: NodeID
+    nodeId*: RangeNodeID
     config*: CoordinatorConfig
 
     # Group management
     groups*: Table[RangeID, RaftGroup]
     logs*: Table[RangeID, RaftLog]
-    groupsLock*: Lock ## replaced RwLock with plain Lock
+    groupsLock*: Lock
 
     # Storage
     store*: WiscKeyBackend
 
-    # Proposal handling: Channel is a built-in type in Nim (no import needed)
+    # Proposal queue
     proposalCh*: Channel[Proposal]
     pendingProposals*: Table[uint64, Proposal]
     proposalIdCounter*: Atomic[uint64]
@@ -75,63 +118,182 @@ type
     workers*: seq[Thread[WorkerContext]]
     running*: Atomic[bool]
 
+    # Timer thread (election + heartbeat) — only active when transport != nil
+    timerThread*: Thread[TimerContext]
+    timerRunning*: bool
+
     # Timing
     electionTimeoutNs*: int64
     heartbeatIntervalNs*: int64
+
+    # Multi-node transport vtable (nil = single-node)
+    transport*: MultiRaftTransport
+
+    # Back-reference set by raft_store so the coordinator can apply committed
+    # entries to the KVStateMachine on followers. Stored as pointer to break
+    # the circular import (raft_store → coordinator → raft_store).
+    kvStorePtr*: pointer # *RaftKVStoreExt
+
+# ============================================================================
+# Forward declarations
+# ============================================================================
+
+proc workerProc(ctx: WorkerContext) {.thread.}
+proc timerProc(ctx: TimerContext) {.thread.}
+
+# ============================================================================
+# Internal helpers
+# ============================================================================
+
+proc getLog*(c: MultiRaftCoordinator, rangeId: RangeID): Option[RaftLog] =
+  withLock c.groupsLock:
+    if c.logs.hasKey(rangeId):
+      result = some(c.logs[rangeId])
+
+proc saveGroupState(c: MultiRaftCoordinator, group: RaftGroup,
+    log: RaftLog) {.gcsafe.} =
+  ## Persist Raft state (term, vote, commitIndex) to the log's WiscKey store.
+  try:
+    log.saveState(RaftPersistentState(
+      currentTerm: group.currentTerm.load(),
+      votedFor: group.votedFor.load(),
+      commitIndex: group.commitIndex.load(),
+      lastApplied: group.lastApplied.load(),
+    ))
+  except CatchableError: discard
+
+# Module-level callback set once by raft_store after bootstrapping.
+# Breaks the coordinator → raft_store → coordinator circular import.
+var applyBatchCallback*: proc(storePtr: pointer, rid: RangeID,
+    batch: WriteBatch) {.gcsafe, raises: [].} = nil
+
+proc applyUpTo*(c: MultiRaftCoordinator, rangeId: RangeID,
+    group: RaftGroup, upToIndex: uint64) {.gcsafe.} =
+  ## Apply all log entries from lastApplied+1 through upToIndex to the KV SM.
+  ## Calls back into raft_store via the kvStorePtr function pointer to avoid
+  ## a circular import. Safe to call with group.lock held.
+  let startIdx = group.lastApplied.load() + 1
+  if startIdx > upToIndex: return
+
+  let logOpt = c.getLog(rangeId)
+  if logOpt.isNone: return
+  let log = logOpt.get
+
+  for idx in startIdx..upToIndex:
+    let entryOpt = try: log.getEntry(idx) except CatchableError: none(LogEntry)
+    if entryOpt.isNone: break
+    let entry = entryOpt.get
+
+    # Apply write batches to the KV state machine via the back-pointer.
+    # The function signature is:  applyBatchCallback(kvStorePtr, rangeId, batch)
+    # We cast and call it only when the pointer is set.
+    if c.kvStorePtr != nil and entry.command.kind == ckWrite:
+      {.cast(gcsafe).}:
+        applyBatchCallback(c.kvStorePtr, rangeId, entry.command.writeBatch)
+
+    group.lastApplied.store(idx)
+
+
 
 # ============================================================================
 # Coordinator Lifecycle
 # ============================================================================
 
 proc newMultiRaftCoordinator*(config: CoordinatorConfig): MultiRaftCoordinator =
-  ## Create a new multi-raft coordinator
   new(result)
   result.nodeId = config.nodeId
   result.config = config
   result.electionTimeoutNs = config.electionTimeoutNs
   result.heartbeatIntervalNs = config.heartbeatIntervalNs
+  result.transport = config.transport
+  result.kvStorePtr = nil
+  result.timerRunning = false
 
-  # Initialize storage
   result.store = newWiscKeyBackend(StorageConfig(
-    path: config.storagePath,
-    createIfMissing: true,
-    syncWrites: true
-  ))
+    path: config.storagePath, createIfMissing: true, syncWrites: true))
 
   if not result.store.open(StorageConfig(
-    path: config.storagePath,
-    createIfMissing: true,
-    syncWrites: true
-  )):
+      path: config.storagePath, createIfMissing: true, syncWrites: true)):
     raise newException(MultiRaftError, "Failed to open storage backend")
 
-  # Initialize data structures
   result.groups = initTable[RangeID, RaftGroup]()
   result.logs = initTable[RangeID, RaftLog]()
   result.pendingProposals = initTable[uint64, Proposal]()
   result.proposalIdCounter.store(0)
 
-  # Initialize synchronization: Channel[T].open() initialises the channel
   initLock(result.groupsLock)
   result.proposalCh.open(MAX_PROPOSAL_QUEUE_SIZE)
 
-  # Initialize workers
   result.workers = newSeq[Thread[WorkerContext]](config.numWorkers)
   result.running.store(false)
 
-proc workerProc(ctx: WorkerContext) {.thread.} # forward declaration
-
 proc start*(c: MultiRaftCoordinator) =
-  ## Start the coordinator and worker threads
-  if c.running.load:
-    return
-
+  if c.running.load: return
   c.running.store(true)
 
   # Start worker threads
   for i in 0..<c.config.numWorkers:
-    let ctx = WorkerContext(coordinator: c, workerId: i)
-    createThread(c.workers[i], workerProc, ctx)
+    createThread(c.workers[i], workerProc, WorkerContext(
+        coordinator: c, workerId: i))
+
+  # Wire transport incoming handlers and start the transport TCP listener
+  if c.transport != nil:
+    # Use a raw pointer to `c` inside the closures to break the ORC cycle:
+    #   MultiRaftCoordinator(c) → transport → RaftGroupTransport → NetworkRaftNode
+    #     → ConnectionManager → TCPTransport.handlers → closure env → c  (cycle!)
+    # With a raw pointer the closure environment holds no traced ref, so ORC
+    # does not detect a cycle and does not crash during collectCycles.
+    # Safety: the transport is stopped (handlers cleared) before `c` is freed.
+    let cPtr = cast[pointer](c)
+
+    proc coordGetGroup(rid: RangeID): Option[RaftGroup] {.gcsafe, raises: [].} =
+      let coord = cast[MultiRaftCoordinator](cPtr)
+      acquire(coord.groupsLock)
+      defer: release(coord.groupsLock)
+      let g = coord.groups.getOrDefault(rid)
+      if g != nil: result = some(g)
+      else: result = none(RaftGroup)
+
+    proc coordGetLog(rid: RangeID): Option[RaftLog] {.gcsafe, raises: [].} =
+      let coord = cast[MultiRaftCoordinator](cPtr)
+      acquire(coord.groupsLock)
+      defer: release(coord.groupsLock)
+      let l = coord.logs.getOrDefault(rid)
+      if l != nil: result = some(l)
+      else: result = none(RaftLog)
+
+    proc coordApplyUpTo(rid: RangeID, g: RaftGroup,
+        idx: uint64) {.gcsafe, raises: [].} =
+      {.cast(raises: []).}:
+        cast[MultiRaftCoordinator](cPtr).applyUpTo(rid, g, idx)
+
+    proc coordSaveState(rid: RangeID, g: RaftGroup,
+        log: RaftLog) {.gcsafe, raises: [].} =
+      {.cast(raises: []).}:
+        cast[MultiRaftCoordinator](cPtr).saveGroupState(g, log)
+
+    let acc = TransportCoordAccessors(
+      getGroup: coordGetGroup,
+      getLog: coordGetLog,
+      applyUpTo: coordApplyUpTo,
+      saveState: coordSaveState,
+    )
+    c.transport.startFn(acc)
+
+    # Reset election clocks BEFORE spawning the timer thread so the timeout is
+    # measured from when the coordinator actually starts, not from when the
+    # groups were created.  Without this, time spent in LevelDB/storage
+    # initialization (which can be hundreds of ms) counts against the election
+    # timeout and causes spurious elections on the very first timer tick.
+    # NOTE: must happen before createThread so there is no race with timerProc.
+    acquire(c.groupsLock)
+    for group in c.groups.values:
+      group.updateHeartbeat()
+    release(c.groupsLock)
+
+    # Timer thread for elections and heartbeats
+    createThread(c.timerThread, timerProc, TimerContext(coordinator: c))
+    c.timerRunning = true
 
   {.cast(gcsafe).}:
     var fields = initTable[string, string]()
@@ -140,36 +302,33 @@ proc start*(c: MultiRaftCoordinator) =
     info("Multi-Raft coordinator started", fields)
 
 proc stop*(c: MultiRaftCoordinator) =
-  ## Stop the coordinator
-  if not c.running.load:
-    return
-
+  if not c.running.load: return
   c.running.store(false)
 
-  # Send shutdown signals to workers (one per worker).
-  # rangeId == 0 is used as a shutdown sentinel; resultPtr is nil (no reply needed).
-  for i in 0..<c.workers.len:
+  # Shutdown sentinel per worker (rangeId == 0)
+  for _ in 0..<c.workers.len:
     c.proposalCh.send(Proposal(
       rangeId: RangeID(0),
       command: RaftCommand(kind: ckNoop),
       resultPtr: nil,
     ))
 
-  # Wait for workers to finish
   for i in 0..<c.workers.len:
     joinThread(c.workers[i])
 
-  # Close the channel
   c.proposalCh.close()
 
-  # Close all groups
-  withLock c.groupsLock:
-    for group in c.groups.values:
-      group.close()
-    for log in c.logs.values:
-      log.close()
+  if c.transport != nil:
+    # Join timer thread BEFORE stopping transports so the timer thread can
+    # finish its current election/heartbeat cycle without hitting closed sockets.
+    if c.timerRunning:
+      joinThread(c.timerThread)
+    c.transport.stopFn()
 
-  # Close storage
+  withLock c.groupsLock:
+    for group in c.groups.values: group.close()
+    for log in c.logs.values: log.close()
+
   c.store.close()
 
   {.cast(gcsafe).}:
@@ -182,23 +341,19 @@ proc stop*(c: MultiRaftCoordinator) =
 # ============================================================================
 
 proc createGroup*(c: MultiRaftCoordinator, descriptor: RangeDescriptor,
-                   replicaId: ReplicaID): RaftGroup =
-  ## Create a new Raft group for a range
+    replicaId: ReplicaID): RaftGroup =
   withLock c.groupsLock:
     if c.groups.hasKey(descriptor.rangeId):
-      raise newException(MultiRaftError, "Group already exists: " &
-          $descriptor.rangeId)
+      raise newException(MultiRaftError,
+          "Group already exists: " & $descriptor.rangeId)
 
-    # Create log storage
     let log = newRaftLog(descriptor.rangeId, c.store)
     log.recoverLog()
     c.logs[descriptor.rangeId] = log
 
-    # Create group
     let group = newRaftGroup(descriptor.rangeId, c.nodeId, replicaId, descriptor)
     c.groups[descriptor.rangeId] = group
 
-    # Load persistent state
     let state = log.loadState()
     if state.isSome:
       group.currentTerm.store(state.get.currentTerm)
@@ -215,66 +370,48 @@ proc createGroup*(c: MultiRaftCoordinator, descriptor: RangeDescriptor,
     result = group
 
 proc removeGroup*(c: MultiRaftCoordinator, rangeId: RangeID) =
-  ## Remove a Raft group
   withLock c.groupsLock:
     if c.groups.hasKey(rangeId):
-      let group = c.groups[rangeId]
-      group.close()
+      c.groups[rangeId].close()
       c.groups.del(rangeId)
-
-      let log = c.logs[rangeId]
-      log.close()
+      c.logs[rangeId].close()
       c.logs.del(rangeId)
 
-      {.cast(gcsafe).}:
-        var fields = initTable[string, string]()
-        fields["rangeId"] = $rangeId
-        info("Removed Raft group", fields)
-
 proc getGroup*(c: MultiRaftCoordinator, rangeId: RangeID): Option[RaftGroup] =
-  ## Get a Raft group by range ID
   withLock c.groupsLock:
     if c.groups.hasKey(rangeId):
       result = some(c.groups[rangeId])
 
 proc hasGroup*(c: MultiRaftCoordinator, rangeId: RangeID): bool =
-  ## Check if a group exists
   withLock c.groupsLock:
     result = c.groups.hasKey(rangeId)
 
 # ============================================================================
-# Proposal Handling (synchronous — no asyncdispatch)
+# Proposal Handling
 # ============================================================================
 
 proc proposeAndWait*(c: MultiRaftCoordinator, rangeId: RangeID,
-                     command: RaftCommand, timeoutMs: int = 5000): RaftResult =
-  ## Propose a command to a Raft group and block until the result is available.
-  ##
-  ## Completion is signalled via a ProposalResultChannel allocated on the heap
-  ## and shared with the worker thread via a raw pointer.  Using a raw pointer
-  ## (instead of a GC ref inside a closure) avoids ORC cross-thread cycle
-  ## tracking, which causes SIGSEGV in Nim 2.2.8.
+    command: RaftCommand, timeoutMs: int = 5000): RaftResult =
+  ## Propose a command and block until committed (or timeout).
+  ## Uses a raw-pointer heap channel to avoid ORC cross-thread SIGSEGV.
   var prc = cast[ptr ProposalResultChannel](
     allocShared0(sizeof(ProposalResultChannel)))
   prc[].ch.open(1)
 
-  let proposal = Proposal(
+  c.proposalCh.send(Proposal(
     rangeId: rangeId,
     command: command,
     resultPtr: prc,
-  )
+  ))
 
-  c.proposalCh.send(proposal)
-
-  # Busy-wait with timeout
-  let deadline = getTime().toUnix * 1000 + timeoutMs
+  let deadline = int64(getTime().toUnixFloat * 1000) + int64(timeoutMs)
   while true:
     let (avail, res) = prc[].ch.tryRecv()
     if avail:
       prc[].ch.close()
       deallocShared(prc)
       return res
-    if getTime().toUnix * 1000 >= deadline:
+    if int64(getTime().toUnixFloat * 1000) >= deadline:
       prc[].ch.close()
       deallocShared(prc)
       return RaftResult(success: false, error: "Timeout waiting for proposal")
@@ -285,13 +422,36 @@ proc proposeAndWait*(c: MultiRaftCoordinator, rangeId: RangeID,
 # ============================================================================
 
 proc sendResult(p: ptr ProposalResultChannel, r: RaftResult) {.inline.} =
-  ## Send the result to the waiting caller via the raw-pointer channel.
-  ## The caller owns the ProposalResultChannel and frees it after recv.
-  if p != nil:
-    p[].ch.send(r)
+  if p != nil: p[].ch.send(r)
+
+proc computeNewCommitIndex(group: RaftGroup, proposed: uint64): uint64 =
+  ## Return the highest index that a quorum of voters have acknowledged,
+  ## considering that this leader's own local append counts as 1.
+  ## matchIndex values updated by replicateEntry; local replica is at proposed.
+  let currentCommit = group.commitIndex.load()
+  let voters = group.descriptor.getVoters()
+  let quorum = group.quorum()
+
+  # Collect acknowledged indices (self = proposed, peers = matchIndex)
+  var indices = newSeq[uint64](voters.len)
+  var i = 0
+  for rep in voters:
+    if rep.nodeId == group.nodeId:
+      indices[i] = proposed
+    else:
+      indices[i] = group.matchIndex.getOrDefault(rep.replicaId, 0'u64)
+    inc i
+
+  # Sort descending to find the quorum-th highest
+  for a in 0..<indices.len:
+    for b in a+1..<indices.len:
+      if indices[b] > indices[a]:
+        let tmp = indices[a]; indices[a] = indices[b]; indices[b] = tmp
+
+  let candidate = indices[quorum - 1]
+  if candidate > currentCommit: candidate else: currentCommit
 
 proc workerProc(ctx: WorkerContext) {.thread.} =
-  ## Worker thread that processes proposals
   let c = ctx.coordinator
 
   while c.running.load:
@@ -300,89 +460,183 @@ proc workerProc(ctx: WorkerContext) {.thread.} =
       break # Shutdown sentinel
 
     try:
-      # Get the group
       let groupOpt = c.getGroup(proposal.rangeId)
       if groupOpt.isNone:
         sendResult(proposal.resultPtr, RaftResult(
-          success: false,
-          error: "Range not found: " & $proposal.rangeId
-        ))
+          success: false, error: "Range not found: " & $proposal.rangeId))
         continue
 
       let group = groupOpt.get
 
-      # Check if we're the leader
       if not group.isLeader():
         sendResult(proposal.resultPtr, RaftResult(
-          success: false,
-          error: "Not the leader"
-        ))
+          success: false, error: "Not the leader"))
         continue
 
-      # Append to log
-      withLock c.groupsLock:
-        let log = c.logs[proposal.rangeId]
+      # --- Append to local log ---
+      var entry: LogEntry
+      var index: uint64
+      block appendBlock:
+        acquire(c.groupsLock)
+        let log = c.logs.getOrDefault(proposal.rangeId)
         let term = group.getTerm()
-        let index = log.lastIndex.load + 1
+        let idx = log.lastIndex.load + 1
+        let e = newLogEntry(term, idx, proposal.command)
+        log.putEntry(e)
+        release(c.groupsLock)
+        c.saveGroupState(group, log)
+        entry = e
+        index = idx
 
-        let entry = newLogEntry(term, index, proposal.command)
-        log.putEntry(entry)
+      # --- Determine replication path ---
+      let voters = group.descriptor.getVoters()
+      let useTransport = c.transport != nil and voters.len > 1
 
-        # Update commit index (simplified — single-node quorum)
+      if useTransport:
+        # Multi-node: fan-out AppendEntries and wait for quorum
+        let logOpt = c.getLog(proposal.rangeId)
+        if logOpt.isNone:
+          sendResult(proposal.resultPtr, RaftResult(
+            success: false, error: "Log not found"))
+          continue
+
+        let timeoutMs = if c.config.proposeTimeoutMs > 0:
+                          c.config.proposeTimeoutMs else: 5000
+        let ok = c.transport.replicateFn(group, logOpt.get, entry, timeoutMs)
+
+        if not ok:
+          sendResult(proposal.resultPtr, RaftResult(
+            success: false, error: "Failed to reach quorum"))
+          continue
+
+        let newCommit = computeNewCommitIndex(group, index)
+        if newCommit > group.commitIndex.load():
+          group.commitIndex.store(newCommit)
+          c.applyUpTo(proposal.rangeId, group, newCommit)
+          # getLog acquires groupsLock — call it without holding the lock
+          let logOpt2 = c.getLog(proposal.rangeId)
+          if logOpt2.isSome:
+            c.saveGroupState(group, logOpt2.get)
+
+        sendResult(proposal.resultPtr, RaftResult(
+          success: true, index: index))
+
+      else:
+        # Single-node (existing behaviour): commit immediately
         group.commitIndex.store(index)
-
-        # Signal completion to the waiting caller
-        sendResult(proposal.resultPtr, RaftResult(success: true, index: index))
+        c.applyUpTo(proposal.rangeId, group, index)
+        sendResult(proposal.resultPtr, RaftResult(
+          success: true, index: index))
 
     except CatchableError as e:
       try:
-        sendResult(proposal.resultPtr, RaftResult(success: false, error: e.msg))
+        sendResult(proposal.resultPtr, RaftResult(
+          success: false, error: e.msg))
       except CatchableError: discard
 
 # ============================================================================
-# Election and Heartbeat
+# Timer Thread (election + heartbeat)
+# ============================================================================
+
+proc timerProc(ctx: TimerContext) {.thread.} =
+  ## Runs every 10 ms. Checks each group independently:
+  ##   Leader   → send heartbeats when heartbeatInterval elapsed
+  ##   Follower/Candidate → start election when electionTimeout elapsed
+  let c = ctx.coordinator
+
+  while c.running.load:
+    sleep(10)
+
+    # Snapshot group/log tables under the lock, then iterate without it
+    var groupSnap: seq[(RangeID, RaftGroup)]
+    withLock c.groupsLock:
+      for rid, g in c.groups:
+        groupSnap.add((rid, g))
+
+    for (rid, group) in groupSnap:
+      let logOpt = c.getLog(rid)
+      if logOpt.isNone: continue
+      let log = logOpt.get
+
+      case group.state.load()
+      of rsLeader:
+        if group.timeSinceHeartbeat() >= c.heartbeatIntervalNs:
+          var groupsCopy: Table[RangeID, RaftGroup]
+          var logsCopy: Table[RangeID, RaftLog]
+          withLock c.groupsLock:
+            groupsCopy = c.groups
+            logsCopy = c.logs
+          c.transport.heartbeatFn(groupsCopy, logsCopy)
+
+      of rsFollower, rsCandidate:
+        let elapsed = group.timeSinceHeartbeat()
+        # Deterministic jitter to spread election timeouts and avoid split votes.
+        # Uses a multiplicative hash of nodeId and rangeId to produce a value in
+        # [0, electionTimeoutNs).  For nodes 1..5 with rangeId 1 this gives
+        # spreads of hundreds of milliseconds, unlike the previous XOR approach
+        # which gave 0-3 nanoseconds for small IDs.
+        let hashVal = (group.nodeId.uint64 * 2654435761'u64 +
+                       group.rangeId.uint64 * 2246822519'u64) and 0xFFFF_FFFF'u64
+        let jitterNs = int64(hashVal mod uint64(c.electionTimeoutNs))
+        let effectiveTimeout = c.electionTimeoutNs + jitterNs
+
+        if elapsed >= effectiveTimeout:
+          {.cast(gcsafe).}:
+            var fields = initTable[string, string]()
+            fields["rangeId"] = $rid
+            fields["term"] = $group.getTerm()
+            info("Starting election", fields)
+
+          let won = c.transport.electionFn(group, log)
+          if won:
+            {.cast(gcsafe).}:
+              var fields = initTable[string, string]()
+              fields["rangeId"] = $rid
+              fields["term"] = $group.getTerm()
+              info("Won election, became leader", fields)
+            c.saveGroupState(group, log)
+            # Send immediate no-op heartbeat to establish leadership
+            var groupsCopy: Table[RangeID, RaftGroup]
+            var logsCopy: Table[RangeID, RaftLog]
+            withLock c.groupsLock:
+              groupsCopy = c.groups
+              logsCopy = c.logs
+            c.transport.heartbeatFn(groupsCopy, logsCopy)
+          else:
+            # Lost election — reset heartbeat so we don't immediately retry.
+            # This gives other candidates time to win before we try again.
+            group.updateHeartbeat()
+
+# ============================================================================
+# Election and Heartbeat (legacy stubs — kept for backward compatibility)
 # ============================================================================
 
 proc checkElectionTimeout*(c: MultiRaftCoordinator) =
-  ## Check all groups for election timeout
+  ## Legacy stub — election is now driven by timerProc when transport != nil.
+  if c.transport != nil: return
+  withLock c.groupsLock:
+    for group in c.groups.values:
+      if group.state.load == rsLeader: continue
+      if group.timeSinceHeartbeat() > c.electionTimeoutNs:
+        group.becomeCandidate()
+
+proc sendHeartbeats*(c: MultiRaftCoordinator) =
+  ## Legacy stub — heartbeats are now sent by timerProc when transport != nil.
+  if c.transport != nil: return
   withLock c.groupsLock:
     for group in c.groups.values:
       if group.state.load == rsLeader:
-        continue
-
-      let timeSince = group.timeSinceHeartbeat()
-      if timeSince > c.electionTimeoutNs:
-        # Start election
-        group.becomeCandidate()
-
-        var fields = initTable[string, string]()
-        fields["rangeId"] = $group.rangeId
-        fields["term"] = $group.getTerm()
-        debug("Starting election", fields)
-
-proc sendHeartbeats*(c: MultiRaftCoordinator) =
-  ## Send heartbeats for all leader groups
-  withLock c.groupsLock:
-    for group in c.groups.values:
-      if group.state.load != rsLeader:
-        continue
-
-      # In a real implementation, send AppendEntries RPCs
-      # For now, just update the heartbeat time
-      group.updateHeartbeat()
+        group.updateHeartbeat()
 
 # ============================================================================
 # Utility
 # ============================================================================
 
 proc getLeaderCount*(c: MultiRaftCoordinator): int =
-  ## Count groups where this node is leader
   withLock c.groupsLock:
     for group in c.groups.values:
-      if group.isLeader():
-        inc result
+      if group.isLeader(): inc result
 
 proc getGroupCount*(c: MultiRaftCoordinator): int =
-  ## Get total number of groups
   withLock c.groupsLock:
     result = c.groups.len

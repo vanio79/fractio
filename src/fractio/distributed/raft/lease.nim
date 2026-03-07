@@ -38,7 +38,7 @@ type
     ## Manages leases for a single Raft group
 
     rangeId*: RangeID
-    nodeId*: NodeID
+    nodeId*: RangeNodeID
 
     # Current lease state
     lease*: Atomic[Lease]
@@ -54,7 +54,7 @@ type
     lock*: Lock
 
     # Pending lease operations
-    pendingTransfer*: Option[NodeID]
+    pendingTransfer*: Option[RangeNodeID]
     transferComplete*: bool
 
   LeaseAcquisitionResult* = object
@@ -72,7 +72,7 @@ type
 # Lease Manager Operations
 # ============================================================================
 
-proc newLeaseManager*(rangeId: RangeID, nodeId: NodeID,
+proc newLeaseManager*(rangeId: RangeID, nodeId: RangeNodeID,
                        storeLiveness: StoreLiveness,
                        leaseDurationNs = DEFAULT_LEASE_DURATION_NS): LeaseManager =
   ## Create a new lease manager
@@ -273,7 +273,7 @@ proc renewLease*(lm: LeaseManager, group: RaftGroup): LeaseAcquisitionResult =
 # Lease Transfer
 # ============================================================================
 
-proc proposeLeaseTransfer*(lm: LeaseManager, target: NodeID): bool =
+proc proposeLeaseTransfer*(lm: LeaseManager, target: RangeNodeID): bool =
   ## Propose transferring lease to another node.
   ## The transfer happens through Raft.
 
@@ -295,7 +295,7 @@ proc proposeLeaseTransfer*(lm: LeaseManager, target: NodeID): bool =
 
   return true
 
-proc completeLeaseTransfer*(lm: LeaseManager, target: NodeID): bool =
+proc completeLeaseTransfer*(lm: LeaseManager, target: RangeNodeID): bool =
   ## Complete a lease transfer to the target node.
   ## Called when the transfer command is applied.
 
@@ -303,14 +303,14 @@ proc completeLeaseTransfer*(lm: LeaseManager, target: NodeID): bool =
     if lm.pendingTransfer.isSome() and lm.pendingTransfer.get() == target:
       lm.transferComplete = true
       lm.leaseState.store(lsNone)
-      lm.pendingTransfer = none(NodeID)
+      lm.pendingTransfer = none(RangeNodeID)
       return true
   return false
 
 proc cancelLeaseTransfer*(lm: LeaseManager) =
   ## Cancel a pending lease transfer
   withLock lm.lock:
-    lm.pendingTransfer = none(NodeID)
+    lm.pendingTransfer = none(RangeNodeID)
     lm.transferComplete = false
     lm.leaseState.store(lsHeld)
 
@@ -357,12 +357,12 @@ proc isLeaseholder*(lm: LeaseManager): bool =
   let state = lm.leaseState.load()
   result = state == lsHeld or state == lsTransferring
 
-proc getLeaseholder*(lm: LeaseManager): Option[NodeID] =
+proc getLeaseholder*(lm: LeaseManager): Option[RangeNodeID] =
   ## Get the current leaseholder
   if lm.leaseState.load() == lsHeld:
     result = some(lm.lease.load().leaseholder)
   else:
-    result = none(NodeID)
+    result = none(RangeNodeID)
 
 # ============================================================================
 # Lease Serialization
@@ -380,7 +380,7 @@ proc leaseToJson*(lease: Lease): JsonNode =
 proc parseLease*(json: JsonNode): Lease =
   ## Parse lease from JSON
   Lease(
-    leaseholder: NodeID(json["leaseholder"].getInt()),
+    leaseholder: RangeNodeID(json["leaseholder"].getInt()),
     startTs: json["startTs"].getInt(),
     expirationTs: json["expirationTs"].getInt(),
     epoch: uint64(json["epoch"].getInt())

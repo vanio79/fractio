@@ -346,7 +346,7 @@ proc hitRate*(cache: RangeCache): float64 =
 type
   NodeDescriptor* = ref object
     ## Describes a node in the cluster
-    nodeId*: NodeID
+    nodeId*: RangeNodeID
     address*: string
       ## Network address (host:port)
     locality*: seq[tuple[key, value: string]]
@@ -356,7 +356,7 @@ type
     lastHeartbeatNs*: int64
       ## Last heartbeat received
 
-proc newNodeDescriptor*(nodeId: NodeID, address: string): NodeDescriptor =
+proc newNodeDescriptor*(nodeId: RangeNodeID, address: string): NodeDescriptor =
   ## Create a new node descriptor
   new(result)
   result.nodeId = nodeId
@@ -381,7 +381,7 @@ proc toJson*(desc: NodeDescriptor): JsonNode =
 proc parseNodeDescriptor*(json: JsonNode): NodeDescriptor =
   ## Parse NodeDescriptor from JSON
   new(result)
-  result.nodeId = NodeID(json["nodeId"].getInt())
+  result.nodeId = RangeNodeID(json["nodeId"].getInt())
   result.address = json["address"].getStr()
 
   for locJson in json["locality"]:
@@ -402,11 +402,11 @@ type
   LeaseholderInfo* = object
     ## Information about the current leaseholder for a range
     rangeId*: RangeID
-    leaseholder*: NodeID
+    leaseholder*: RangeNodeID
     leaseExpirationNs*: int64
     epoch*: uint64
 
-proc newLeaseholderInfo*(rangeId: RangeID, leaseholder: NodeID,
+proc newLeaseholderInfo*(rangeId: RangeID, leaseholder: RangeNodeID,
                          expirationNs: int64,
                              epoch: uint64 = 0): LeaseholderInfo =
   ## Create new leaseholder info
@@ -434,7 +434,7 @@ proc parseLeaseholderInfo*(json: JsonNode): LeaseholderInfo =
   ## Parse from JSON
   result = LeaseholderInfo(
     rangeId: RangeID(json["rangeId"].getInt()),
-    leaseholder: NodeID(json["leaseholder"].getInt()),
+    leaseholder: RangeNodeID(json["leaseholder"].getInt()),
     leaseExpirationNs: json["leaseExpirationNs"].getInt(),
     epoch: uint64(json["epoch"].getInt())
   )

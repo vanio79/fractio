@@ -43,7 +43,7 @@ type
 
   NotLeaderError* = object of SendError
     ## Current node is not the leader
-    leaderHint*: NodeID
+    leaderHint*: RangeNodeID
       ## Hint about who the actual leader is
     rangeId*: RangeID
       ## The range that has a different leader
@@ -57,7 +57,7 @@ type
     rangeId*: RangeID
 
 proc newNotLeaderError*(rangeId: RangeID,
-    leaderHint: NodeID): ref NotLeaderError =
+    leaderHint: RangeNodeID): ref NotLeaderError =
   ## Create a not-leader error
   new(result)
   result.rangeId = rangeId
@@ -144,7 +144,7 @@ type
     rangeId*: RangeID
     responses*: seq[KVResponse]
     error*: Option[string]
-    leaderHint*: Option[NodeID]
+    leaderHint*: Option[RangeNodeID]
 
 # ============================================================================
 # Request Constructors

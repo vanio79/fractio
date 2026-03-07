@@ -33,7 +33,10 @@ type
     adminTransport*: TCPTransport
 
     # Connection pools
-    raftPool*: ConnectionPool
+    raftPool*: ConnectionPool ## request-response Raft messages
+    raftFireForgetPool*: ConnectionPool ## fire-and-forget (heartbeats) — separate
+                              ## pool so stale server responses never
+                              ## contaminate raftPool connections.
     clientPool*: ConnectionPool
     adminPool*: ConnectionPool
 
@@ -77,6 +80,7 @@ proc newConnectionManager*(config: NetworkConfig): ConnectionManager =
 
   # Create connection pools
   result.raftPool = newConnectionPool(config, "raft")
+  result.raftFireForgetPool = newConnectionPool(config, "raft-ff")
   result.clientPool = newConnectionPool(config, "client")
   result.adminPool = newConnectionPool(config, "admin")
 
@@ -102,6 +106,7 @@ proc close*(cm: ConnectionManager) =
 
   # Close connection pools
   cm.raftPool.close()
+  cm.raftFireForgetPool.close()
   cm.clientPool.close()
   cm.adminPool.close()
 
@@ -222,7 +227,15 @@ proc stop*(cm: ConnectionManager) =
 
 proc sendRaftMessage*(cm: ConnectionManager, nodeId: NodeID,
                       payload: string): bool =
-  ## Send a Raft message to a node
+  ## Send a fire-and-forget Raft message (e.g. heartbeat) to a node.
+  ##
+  ## Uses raftFireForgetPool — a pool completely separate from raftPool —
+  ## so stale server response frames queued in the TCP receive buffer can
+  ## never be read by a subsequent sendRaftMessageWithResponse call.
+  ## The server's response frame stays in the kernel buffer; when the
+  ## connection is reused for the next heartbeat the server will have
+  ## consumed any prior state.  On loopback the kernel buffer is large
+  ## enough that no data is lost.
   let nodeOpt = cm.getNode(nodeId)
   if nodeOpt.isNone:
     var fields = tables.initTable[string, string]()
@@ -234,7 +247,7 @@ proc sendRaftMessage*(cm: ConnectionManager, nodeId: NodeID,
   if node.isLocal:
     return true # Local delivery handled separately
 
-  let connOpt = cm.raftPool.getOrCreateConnection(
+  let connOpt = cm.raftFireForgetPool.getOrCreateConnection(
     cm.raftTransport, nodeId, node.host, node.raftPort)
   if connOpt.isNone:
     return false
@@ -242,9 +255,19 @@ proc sendRaftMessage*(cm: ConnectionManager, nodeId: NodeID,
   let conn = connOpt.get()
   let success = cm.raftTransport.sendRaw(conn, payload)
   if not success:
-    cm.raftPool.removeConnection(conn)
+    cm.raftFireForgetPool.removeConnection(conn)
     return false
 
+  # Return the connection immediately — do NOT drain the response.
+  # The unread response frame stays in the kernel TCP receive buffer.
+  # Next time this connection is reused for a heartbeat, the previous
+  # response is still there — but that is fine because fire-and-forget
+  # callers never read responses, so the buffer simply grows by one frame
+  # per heartbeat until the kernel drops it or the connection is recycled.
+  # To avoid unbounded buffer growth, remove the connection after each use
+  # and let the pool create a fresh one for the next heartbeat.
+  # (Loopback connect overhead is negligible: ~0.1 ms.)
+  cm.raftFireForgetPool.removeConnection(conn)
   return true
 
 proc sendRaftMessageWithResponse*(cm: ConnectionManager, nodeId: NodeID,
@@ -274,6 +297,8 @@ proc sendRaftMessageWithResponse*(cm: ConnectionManager, nodeId: NodeID,
     cm.raftPool.removeConnection(conn)
     return none(string)
 
+  # Return connection to pool so it can be reused by the next send
+  cm.raftPool.returnConnection(conn)
   return responseOpt
 
 # =============================================================================
@@ -305,6 +330,7 @@ proc sendClientMessage*(cm: ConnectionManager, nodeId: NodeID,
     cm.clientPool.removeConnection(conn)
     return false
 
+  cm.clientPool.returnConnection(conn)
   return true
 
 proc sendClientMessageWithResponse*(cm: ConnectionManager, nodeId: NodeID,
@@ -334,6 +360,7 @@ proc sendClientMessageWithResponse*(cm: ConnectionManager, nodeId: NodeID,
     cm.clientPool.removeConnection(conn)
     return none(string)
 
+  cm.clientPool.returnConnection(conn)
   return responseOpt
 
 # =============================================================================
@@ -365,6 +392,7 @@ proc sendAdminMessage*(cm: ConnectionManager, nodeId: NodeID,
     cm.adminPool.removeConnection(conn)
     return false
 
+  cm.adminPool.returnConnection(conn)
   return true
 
 proc sendAdminMessageWithResponse*(cm: ConnectionManager, nodeId: NodeID,
@@ -394,6 +422,7 @@ proc sendAdminMessageWithResponse*(cm: ConnectionManager, nodeId: NodeID,
     cm.adminPool.removeConnection(conn)
     return none(string)
 
+  cm.adminPool.returnConnection(conn)
   return responseOpt
 
 # =============================================================================

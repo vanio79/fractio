@@ -30,7 +30,7 @@ suite "Range Lookup":
       RangeID(1),
       @[byte(0)],
       @[],
-      @[newReplicaDescriptor(NodeID(1), ReplicaID(1))]
+      @[newReplicaDescriptor(RangeNodeID(1), ReplicaID(1))]
     )
 
     lookup.setMeta1Descriptor(meta1)
@@ -45,7 +45,7 @@ suite "Range Lookup":
       RangeID(2),
       @[byte(0)],
       @[byte(100)],
-      @[newReplicaDescriptor(NodeID(1), ReplicaID(1))]
+      @[newReplicaDescriptor(RangeNodeID(1), ReplicaID(1))]
     )
 
     lookup.setMeta2Descriptor(RangeID(2), meta2)
@@ -60,7 +60,7 @@ suite "Range Lookup":
       RangeID(1),
       @[byte(0)],
       @[byte(100)],
-      @[newReplicaDescriptor(NodeID(1), ReplicaID(1))]
+      @[newReplicaDescriptor(RangeNodeID(1), ReplicaID(1))]
     )
 
     cache.put(desc, 1000)
@@ -81,9 +81,9 @@ suite "Range Lookup":
       @[byte(0)],
       @[byte(100)],
       @[
-        newReplicaDescriptor(NodeID(1), ReplicaID(1)),
-        newReplicaDescriptor(NodeID(2), ReplicaID(2)),
-        newReplicaDescriptor(NodeID(3), ReplicaID(3))
+        newReplicaDescriptor(RangeNodeID(1), ReplicaID(1)),
+        newReplicaDescriptor(RangeNodeID(2), ReplicaID(2)),
+        newReplicaDescriptor(RangeNodeID(3), ReplicaID(3))
       ]
     )
 
@@ -91,7 +91,7 @@ suite "Range Lookup":
 
     let leaseholder = lookup.getLeaseholder(RangeID(1), 5000)
     check leaseholder.isSome
-    check leaseholder.get == NodeID(1) # First voter
+    check leaseholder.get == RangeNodeID(1) # First voter
 
     lookup.destroy()
     cache.destroy()
@@ -104,7 +104,7 @@ suite "Range Lookup":
       RangeID(1),
       @[byte(0)],
       @[byte(100)],
-      @[newReplicaDescriptor(NodeID(1), ReplicaID(1))]
+      @[newReplicaDescriptor(RangeNodeID(1), ReplicaID(1))]
     )
 
     lookup.updateDescriptor(desc1, 1000)
@@ -273,7 +273,7 @@ suite "DistSender":
 
     let sender = newDistSender(lookup, mockSend)
 
-    let err = newNotLeaderError(RangeID(1), NodeID(2))
+    let err = newNotLeaderError(RangeID(1), RangeNodeID(2))
     check sender.shouldRetry(err, 0)
     check sender.shouldRetry(err, 4)
     check not sender.shouldRetry(err, 5) # Max retries
@@ -308,7 +308,7 @@ suite "DistSender":
       RangeID(1),
       @[byte(0)],
       @[byte(100)],
-      @[newReplicaDescriptor(NodeID(1), ReplicaID(1))]
+      @[newReplicaDescriptor(RangeNodeID(1), ReplicaID(1))]
     )
     cache.put(desc, 1000)
 
@@ -341,7 +341,7 @@ suite "DistSender":
       RangeID(1),
       @[byte(0)],
       @[byte(100)],
-      @[newReplicaDescriptor(NodeID(1), ReplicaID(1))]
+      @[newReplicaDescriptor(RangeNodeID(1), ReplicaID(1))]
     )
     cache.put(desc, 1000)
 
@@ -369,9 +369,9 @@ suite "DistSender":
 
 suite "Error Types":
   test "not leader error":
-    let err = newNotLeaderError(RangeID(1), NodeID(2))
+    let err = newNotLeaderError(RangeID(1), RangeNodeID(2))
     check err.rangeId == RangeID(1)
-    check err.leaderHint == NodeID(2)
+    check err.leaderHint == RangeNodeID(2)
     check "Not leader" in err.msg
 
   test "range unavailable error":

@@ -73,13 +73,13 @@ suite "LogEntry":
 suite "RaftGroup":
   test "create group":
     let desc = newRangeDescriptor(RangeID(1), @[byte 0x00], @[byte 0xFF])
-    discard desc.addReplica(NodeID(1))
-    discard desc.addReplica(NodeID(2))
-    discard desc.addReplica(NodeID(3))
+    discard desc.addReplica(RangeNodeID(1))
+    discard desc.addReplica(RangeNodeID(2))
+    discard desc.addReplica(RangeNodeID(3))
 
-    let group = newRaftGroup(RangeID(1), NodeID(1), ReplicaID(1), desc)
+    let group = newRaftGroup(RangeID(1), RangeNodeID(1), ReplicaID(1), desc)
     check group.rangeId == RangeID(1)
-    check group.nodeId == NodeID(1)
+    check group.nodeId == RangeNodeID(1)
     check group.replicaId == ReplicaID(1)
     check group.state.load() == rsFollower
     check group.getTerm() == 0
@@ -87,9 +87,9 @@ suite "RaftGroup":
 
   test "state transitions":
     let desc = newRangeDescriptor(RangeID(1), @[byte 0x00], @[byte 0xFF])
-    discard desc.addReplica(NodeID(1))
+    discard desc.addReplica(RangeNodeID(1))
 
-    let group = newRaftGroup(RangeID(1), NodeID(1), ReplicaID(1), desc)
+    let group = newRaftGroup(RangeID(1), RangeNodeID(1), ReplicaID(1), desc)
 
     # Start as follower
     check group.state.load() == rsFollower
@@ -115,11 +115,11 @@ suite "RaftGroup":
 
   test "quorum calculation":
     let desc = newRangeDescriptor(RangeID(1), @[byte 0x00], @[byte 0xFF])
-    discard desc.addReplica(NodeID(1))
-    discard desc.addReplica(NodeID(2))
-    discard desc.addReplica(NodeID(3))
+    discard desc.addReplica(RangeNodeID(1))
+    discard desc.addReplica(RangeNodeID(2))
+    discard desc.addReplica(RangeNodeID(3))
 
-    let group = newRaftGroup(RangeID(1), NodeID(1), ReplicaID(1), desc)
+    let group = newRaftGroup(RangeID(1), RangeNodeID(1), ReplicaID(1), desc)
     check group.quorum() == 2 # Majority of 3
     check group.hasQuorum(2)
     check not group.hasQuorum(1)
@@ -128,9 +128,9 @@ suite "RaftGroup":
 
   test "heartbeat tracking":
     let desc = newRangeDescriptor(RangeID(1), @[byte 0x00], @[byte 0xFF])
-    discard desc.addReplica(NodeID(1))
+    discard desc.addReplica(RangeNodeID(1))
 
-    let group = newRaftGroup(RangeID(1), NodeID(1), ReplicaID(1), desc)
+    let group = newRaftGroup(RangeID(1), RangeNodeID(1), ReplicaID(1), desc)
 
     group.updateHeartbeat()
     let elapsed = group.timeSinceHeartbeat()
@@ -142,11 +142,11 @@ suite "RaftGroup":
 suite "Lease":
   test "lease creation":
     let lease = Lease(
-      leaseholder: NodeID(1),
+      leaseholder: RangeNodeID(1),
       startTs: 0,
       expirationTs: 1_000_000_000
     )
-    check lease.leaseholder == NodeID(1)
+    check lease.leaseholder == RangeNodeID(1)
 
   test "lease states":
     check lsNone.ord < lsAcquiring.ord

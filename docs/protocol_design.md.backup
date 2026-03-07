@@ -1,0 +1,239 @@
+# Fractio Client/Server Protocol Design
+**Version:** 1.0-draft **Status:** Design Phase **Last Updated:** 2025-03-07 ---
+## 1. Overview
+### 1.1 Goals
+- Provide a robust, efficient binary protocol for client/server communication - Support key-value operations and distributed transactions - Enable 
+easy extension for future query languages (SQL, Graph, Vector) - Maintain backward compatibility across protocol versions - Support both synchronous 
+and asynchronous operations
+### 1.2 Design Principles
+1. **Extensibility**: New operation types can be added without breaking existing clients 2. **Versioning**: Protocol version negotiation at 
+connection startup 3. **Efficiency**: Binary encoding, optional compression, connection multiplexing 4. **Safety**: CRC checksums, proper framing, 
+transactional semantics 5. **Simplicity**: Clear message structure, easy to implement clients
+### 1.3 Protocol Layers
+``` +-------------------------------------------------------------+
+|                     Application Layer | (KV API, Transactions, SQL, Graph, Vector, Admin, ...)  |
++-------------------------------------------------------------+
+|                     Protocol Layer | (Message framing, versioning, multiplexing, compression) |
++-------------------------------------------------------------+
+|                     Transport Layer | (TCP with TLS option, connection management) |
++-------------------------------------------------------------+ ``` ---
+## 2. Connection Lifecycle
+### 2.1 Connection Establishment
+``` Client Server
+  |                                               |
+  |----------- TCP Connect --------------------->|
+  |                                               |
+  |<----------- Server Greeting -----------------|
+  |                                               |
+  |----------- Client Handshake ---------------->|
+  |                                               |
+  |<----------- Handshake Response --------------|
+  |                                               |
+  |            [Ready for requests] |
+  |                                               |
+```
+### 2.2 Server Greeting
+Sent immediately upon TCP connection acceptance: ``` +--------------------------------------------------------+
+| Magic (4 bytes): "FRC1" | Protocol Version (2 bytes uint16): 0x0001 | Server Features (4 bytes uint32): feature flags | Auth Methods (1 byte + 
+| list): supported auth types | Server ID (2 bytes uint16): unique server identifier | Cluster ID (8 bytes uint64): cluster identifier |
++--------------------------------------------------------+ ``` **Server Features Flags:** ``` bit 0: Supports TLS bit 1: Supports Compression 
+(Snappy) bit 2: Supports Pipelining bit 3: Supports Async Operations bit 4: Supports Transactions bit 5: Supports SQL bit 6: Supports Graph Queries 
+bit 7: Supports Vector Operations bit 8-31: Reserved ```
+### 2.3 Client Handshake
+``` +--------------------------------------------------------+
+| Protocol Version (2 bytes uint16): client version | Requested Features (4 bytes uint32): feature flags | Auth Type (1 byte): authentication method 
+| |
+| Auth Data Length (2 bytes uint16) | Auth Data (variable): authentication credentials | Client ID Length (1 byte) | Client ID (variable): optional 
+| client identifier |
++--------------------------------------------------------+ ```
+### 2.4 Handshake Response
+``` +--------------------------------------------------------+
+| Status (1 byte): 0x00 = OK, 0x01+ = error codes | Negotiated Features (4 bytes uint32): agreed features | Server Name Length (1 byte) | Server Name 
+| (variable): server identifier string | Error Message Length (2 bytes, if error) | Error Message (variable, if error) |
++--------------------------------------------------------+ ``` ---
+## 3. Wire Protocol
+### 3.1 Frame Structure
+Every message is framed with a header: ``` +--------------------------------------------------------+
+|                  Frame Header (12 bytes) |
++--------------------------------------------------------+
+| Payload Length (4 bytes uint32 BE) | Request ID (4 bytes uint32 BE) | Flags (2 bytes uint16 BE) | Checksum (2 bytes uint16 CRC16) |
++--------------------------------------------------------+
+|                  Payload (variable) |
++--------------------------------------------------------+
+| Message Type (2 bytes uint16 BE) | Message Data (variable) |
++--------------------------------------------------------+ ``` **Frame Flags:** ``` bit 0: Compression enabled (Snappy) bit 1: Requires 
+acknowledgment bit 2: Is a response bit 3: Is an error response bit 4: End of stream (for multi-part responses) bit 5-15: Reserved ```
+### 3.2 Request ID
+- Client generates unique request IDs (uint32) - Server echoes the same ID in responses - Enables request/response correlation and pipelining
+### 3.3 Message Types
+Message types are organized into categories: ``` Category Range Description ---------------------------------------------------------- Core/Control 
+0x0000-0x00FF Connection, admin KV Operations 0x0100-0x01FF Key-value API Transactions 0x0200-0x02FF Transaction management SQL 0x0300-0x03FF SQL 
+queries (future) Graph 0x0400-0x04FF Graph operations (future) Vector 0x0500-0x05FF Vector operations (future) Replication 0x0600-0x06FF Internal 
+replication Admin/Metrics 0x0700-0x07FF Admin, monitoring Reserved 0x0800-0xFFFF Future expansion ``` ---
+## 4. Message Definitions
+### 4.1 Core/Control Messages (0x0000-0x00FF)
+#### 0x0001: Ping
+``` Request: (no payload) Response: Timestamp (8 bytes uint64 BE): server timestamp in microseconds ```
+#### 0x0002: Echo
+``` Request: Data Length (4 bytes uint32 BE) Data (variable) Response: Data Length (4 bytes uint32 BE) Data (variable): echoed back ```
+#### 0x0003: Close
+``` Request: Reason Length (1 byte) Reason (variable): optional close reason Response: (none, connection closed after send) ```
+### 4.2 KV Operations (0x0100-0x01FF)
+All KV operations can optionally include a transaction ID for transactional operations.
+#### 0x0100: Get
+``` Request: Flags (1 byte): bit 0: Include timestamp bit 1: Include version bit 2-7: Reserved Transaction ID (8 bytes uint64, 0 if 
+  non-transactional) Read Timestamp (8 bytes uint64, 0 for latest, optional based on flags) Key Length (4 bytes uint32 BE) Key (variable)
+Response (success): Flags (1 byte): bit 0: Found bit 1: Has timestamp bit 2: Has version bit 3-7: Reserved Timestamp (8 bytes uint64, optional) 
+  Version (8 bytes uint64, optional) Value Length (4 bytes uint32 BE) Value (variable)
+Response (not found): Flags (1 byte): 0x00 ```
+#### 0x0101: Put
+``` Request: Flags (1 byte): bit 0: Return previous value bit 1: Sync write (fsync) bit 2: Compare-and-swap (requires version) bit 3-7: Reserved 
+  Transaction ID (8 bytes uint64, 0 if non-transactional) Expected Version (8 bytes uint64, for CAS) Key Length (4 bytes uint32 BE) Key (variable) 
+  Value Length (4 bytes uint32 BE) Value (variable)
+Response: Status (1 byte): 0x00: OK 0x01: CAS failed 0x02: Transaction aborted Timestamp (8 bytes uint64): commit timestamp Version (8 bytes uint64): 
+  new version Previous Value (optional, if requested):
+    Length (4 bytes uint32 BE) Value (variable) ```
+#### 0x0102: Delete
+``` Request: Flags (1 byte): bit 0: Return previous value bit 1: Sync write bit 2: Only if exists bit 3-7: Reserved Transaction ID (8 bytes uint64, 0 
+  if non-transactional) Key Length (4 bytes uint32 BE) Key (variable)
+Response: Status (1 byte): 0x00: Deleted 0x01: Not found 0x02: Transaction aborted Previous Value (optional, if requested): Length (4 bytes uint32 
+    BE) Value (variable)
+```
+#### 0x0103: Batch
+Atomic batch of operations. Operations within a batch are executed atomically. ``` Request: Flags (1 byte): bit 0: All-or-nothing (atomic) bit 1: 
+    Continue on error bit 2-7: Reserved
+  Transaction ID (8 bytes uint64, 0 if non-transactional) Operation Count (4 bytes uint32 BE) For each operation: Op Type (1 byte): 0x00=Get, 
+    0x01=Put, 0x02=Delete Op Flags (1 byte) Op Data (variable, depends on type)
+Response: Status (1 byte): 0x00: All OK 0x01: Partial failure 0x02: All failed Results Count (4 bytes uint32 BE) For each result: Status (1 byte) 
+    Result Data (variable, depends on operation type)
+```
+#### 0x0104: Scan
+Stream key-value pairs in a range. ``` Request: Flags (1 byte): bit 0: Include timestamp bit 1: Include version bit 2: Keys only bit 3: Reverse scan 
+    bit 4-7: Reserved
+  Transaction ID (8 bytes uint64, 0 if non-transactional) Read Timestamp (8 bytes uint64, 0 for latest) Start Key Length (4 bytes uint32 BE, 0 for 
+  beginning) Start Key (variable) End Key Length (4 bytes uint32 BE, 0 for end) End Key (variable) Limit (4 bytes uint32 BE): max pairs to return
+Response (stream, multiple frames): Flags (1 byte): bit 0: Has more bit 1: End of scan Count (4 bytes uint32 BE): pairs in this frame For each pair: 
+    Key Length (4 bytes uint32 BE) Key (variable) Value Length (4 bytes uint32 BE, 0 if keys-only) Value (variable) Timestamp (8 bytes uint64, 
+    optional) Version (8 bytes uint64, optional)
+```
+### 4.3 Transaction Messages (0x0200-0x02FF)
+#### 0x0200: Begin Transaction
+``` Request: Flags (1 byte): bit 0: Read-only bit 1: Serializable isolation bit 2-7: Reserved Timeout (4 bytes uint32 BE): timeout in milliseconds, 0 
+  for default
+Response: Transaction ID (8 bytes uint64) Read Timestamp (8 bytes uint64): snapshot timestamp ```
+#### 0x0201: Commit Transaction
+``` Request: Transaction ID (8 bytes uint64) Response: Status (1 byte): 0x00: Committed 0x01: Aborted (conflict) 0x02: Aborted (timeout) 0x03: Not 
+    found
+  Commit Timestamp (8 bytes uint64, if committed) ```
+#### 0x0202: Rollback Transaction
+``` Request: Transaction ID (8 bytes uint64) Response: Status (1 byte): 0x00: Rolled back 0x01: Not found ```
+#### 0x0203: Get Transaction Status
+``` Request: Transaction ID (8 bytes uint64) Response: Status (1 byte): 0x00: Active 0x01: Committed 0x02: Aborted 0x03: Not found Commit Timestamp 
+  (8 bytes uint64, if committed)
+```
+### 4.4 SQL Messages (0x0300-0x03FF) - Future
+#### 0x0300: Prepare Statement
+``` Request: Flags (1 byte) SQL Length (4 bytes uint32 BE) SQL (variable) Response: Statement ID (4 bytes uint32 BE) Parameter Count (1 byte) 
+  Parameter Types (variable)
+```
+#### 0x0301: Execute Statement
+``` Request: Statement ID (4 bytes uint32 BE) Transaction ID (8 bytes uint64, 0 if auto-commit) Parameter Count (1 byte) Parameters (variable) 
+Response:
+  Column Count (2 bytes uint16 BE) Row Count (4 bytes uint32 BE) Rows (variable) ```
+#### 0x0302: Query (Direct)
+``` Request: Flags (1 byte) Transaction ID (8 bytes uint64, 0 if auto-commit) SQL Length (4 bytes uint32 BE) SQL (variable) Parameters (variable) 
+Response:
+  (stream of result rows) ```
+### 4.5 Graph Messages (0x0400-0x04FF) - Future
+#### 0x0400: Graph Query
+``` Request: Query Type (1 byte): 0x00: Traversal 0x01: Pattern match 0x02: Shortest path Query Data (variable) Response: (structured graph results) 
+```
+### 4.6 Vector Messages (0x0500-0x05FF) - Future
+#### 0x0500: Vector Insert
+``` Request: Key Length (4 bytes uint32 BE) Key (variable) Dimensions (2 bytes uint16 BE) Vector Data (dimensions * 4 bytes, float32) Metadata 
+  (variable)
+Response: Status (1 byte) ```
+#### 0x0501: Vector Search
+``` Request: Dimensions (2 bytes uint16 BE) Query Vector (dimensions * 4 bytes) K (4 bytes uint32 BE): top-k results Filter (variable): optional 
+  filter expression
+Response: Count (4 bytes uint32 BE) For each result: Key Length (4 bytes uint32 BE) Key (variable) Distance (4 bytes float32 BE) Metadata (variable) 
+```
+### 4.7 Admin/Metrics Messages (0x0700-0x07FF)
+#### 0x0700: Server Info
+``` Request: (no payload) Response: Version Length (1 byte) Version (variable) Uptime (8 bytes uint64 BE): seconds Node ID (2 bytes uint16 BE) Role 
+  (1 byte): 0=follower, 1=candidate, 2=leader Cluster Size (1 byte) Metrics (variable): JSON string
+```
+#### 0x0701: Metrics
+``` Request: Flags (1 byte): bit 0: Include detailed metrics bit 1: Include histogram data Response: Metrics JSON Length (4 bytes uint32 BE) Metrics 
+  JSON (variable)
+```
+#### 0x0702: Health Check
+``` Request: (no payload) Response: Status (1 byte): 0x00: Healthy 0x01: Degraded 0x02: Unhealthy Details Length (2 bytes uint16 BE) Details 
+  (variable): JSON with health details
+``` ---
+## 5. Error Handling
+### 5.1 Error Response Format
+When the error flag is set in the frame header, the payload contains: ``` +--------------------------------------------------------+
+| Error Code (4 bytes uint32 BE) | Error Category (1 byte) | Message Length (2 bytes uint16 BE) | Message (variable): human-readable error | Details 
+| Length (2 bytes uint16 BE) | Details (variable): optional JSON with extra details |
++--------------------------------------------------------+ ```
+### 5.2 Error Categories
+``` Category Code Description ---------------------------------------------------------- Protocol 0x00 Protocol-level errors KV 0x01 Key-value 
+operation errors Transaction 0x02 Transaction errors SQL 0x03 SQL parsing/execution errors Graph 0x04 Graph query errors Vector 0x05 Vector operation 
+errors Auth 0x06 Authentication/authorization errors System 0x07 System/cluster errors ```
+### 5.3 Common Error Codes
+``` Code Hex Description ---------------------------------------------------------- OK 0x00000000 Success PROTOCOL_ERROR 0x00000001 Invalid protocol 
+message VERSION_ERROR 0x00000002 Unsupported protocol version AUTH_REQUIRED 0x00000003 Authentication required AUTH_FAILED 0x00000004 Authentication 
+failed NOT_FOUND 0x01000001 Key not found ALREADY_EXISTS 0x01000002 Key already exists TXN_ABORTED 0x02000001 Transaction was aborted TXN_TIMEOUT 
+0x02000002 Transaction timed out TXN_CONFLICT 0x02000003 Transaction conflict TXN_NOT_FOUND 0x02000004 Transaction not found NOT_LEADER 0x07000001 
+Not the leader CLUSTER_DOWN 0x07000002 Cluster unavailable OVERLOADED 0x07000003 Server overloaded ``` ---
+## 6. Streaming and Pipelining
+### 6.1 Request Pipelining
+Clients can send multiple requests without waiting for responses: ``` Client sends: Request A, Request B, Request C Server sends: Response A, 
+Response B, Response C ``` - Request IDs correlate requests to responses - Server processes requests in order per connection - Responses may be 
+reordered for async operations
+### 6.2 Streaming Responses
+For operations returning large result sets (Scan, SQL Query): ``` Request Frame -> Response Frame 1 (has_more=true) -> Response Frame 2 
+              (has_more=true) -> Response Frame 3 (has_more=false, end_of_stream=true)
+``` - Each frame has same Request ID - Client can cancel stream by sending a Cancel message
+#### 0x0004: Cancel Stream
+``` Request: Request ID (4 bytes uint32 BE): request to cancel Response: Status (1 byte): 0x00=cancelled, 0x01=already complete ``` ---
+## 7. Authentication
+### 7.1 Authentication Methods
+``` Method Code Description ---------------------------------------------------------- None 0x00 No authentication (development only) Password 0x01 
+Username/password Token 0x02 Bearer token TLS 0x03 TLS client certificates ```
+### 7.2 Password Authentication
+``` Auth Data: Username Length (1 byte) Username (variable) Password Length (1 byte) Password (variable) ```
+### 7.3 Token Authentication
+``` Auth Data: Token Length (2 bytes uint16 BE) Token (variable) ``` ---
+## 8. Compression
+When compression flag is set in frame header: 1. Entire payload (after frame header) is compressed with Snappy 2. Checksum is computed on 
+uncompressed payload 3. Payload Length in header includes compressed size ---
+## 9. Thread Safety and Concurrency
+### 9.1 Connection Multiplexing
+A single TCP connection can handle multiple concurrent operations: - Requests are processed concurrently on server - Responses maintain ordering via 
+Request ID - Transaction-affinity: requests for same transaction processed sequentially
+### 9.2 Connection Pooling
+Clients should pool connections for efficiency: - Maintain multiple connections for parallel operations - Reuse connections across transactions - 
+Implement connection keepalive with Ping messages ---
+## 10. Future Extensions
+### 10.1 Planned Features
+| Version | Feature | Description | ---------|-----------------------------|---------------------------------------| 1.1 | Watch/Subscribe | Key 
+| change notifications | 1.2 | Bulk Import/Export | Efficient bulk data transfer | 1.3 | SQL Prepared Statements | Parameterized SQL queries | 2.0 | 
+| Graph Query Language | Gremlin/Cypher-style queries | 2.1 | Vector Similarity Search | ANN index for vector operations | 3.0 | Stored Procedures | 
+| Server-side script execution |
+### 10.2 Extension Mechanism
+New message types can be added without breaking compatibility: 1. Server advertises supported features in greeting 2. Client only uses features 
+server supports 3. Unknown message types return `PROTOCOL_ERROR` 4. Feature flags enable capability negotiation ---
+## 11. Implementation Notes
+### 11.1 Recommended Buffer Sizes
+- Minimum frame size: 12 bytes (header only) - Maximum frame size: 16 MB (configurable) - Recommended read buffer: 64 KB - Recommended write buffer: 
+64 KB
+### 11.2 Timeout Recommendations
+- Connection timeout: 5 seconds - Read timeout: 30 seconds (configurable per operation) - Write timeout: 30 seconds - Transaction timeout: 60 seconds 
+(default)
+### 11.3 Implementation Phases
+**Phase 1: Core Protocol** - Frame encoding/decoding - Connection handshake - Ping/Echo/Close messages - Error handling **Phase 2: KV Operations** - 
+Get/Put/Delete - Batch operations - Scan with streaming **Phase 3: Transactions** - Begin/Commit/Rollback - Transaction status - Conflict detection 
+**Phase 4: Advanced Features** - Authentication - Compression - TLS support **Phase 5: Future Extensions** - SQL support - Graph queries
+- Vector operations

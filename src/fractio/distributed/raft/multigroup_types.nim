@@ -59,7 +59,7 @@ type
       changeType*: ReplicaChangeType
       replica*: ReplicaDescriptor
     of ckTransferLease:
-      targetNode*: NodeID
+      targetNode*: RangeNodeID
     of ckAcquireLease:
       leaseStart*: int64
       leaseExpiration*: int64
@@ -99,7 +99,7 @@ type
   RaftGroup* = ref object
     ## A single Raft group (one per range)
     rangeId*: RangeID
-    nodeId*: NodeID
+    nodeId*: RangeNodeID
     replicaId*: ReplicaID
 
     # Persistent state (stored in WiscKey)
@@ -132,7 +132,7 @@ type
 type
   Lease* = object
     ## Leader lease for a range
-    leaseholder*: NodeID
+    leaseholder*: RangeNodeID
     startTs*: int64      # nanoseconds
     expirationTs*: int64 # nanoseconds
     epoch*: uint64       # For compatibility, deprecated
@@ -196,7 +196,7 @@ type
 
   NotLeaderError* = object of MultiRaftError
     ## Current node is not the leader
-    leaderHint*: Option[NodeID]
+    leaderHint*: Option[RangeNodeID]
 
   RangeNotFoundError* = object of MultiRaftError
     ## Range not found on this node
@@ -209,10 +209,22 @@ type
     ## Cannot achieve quorum
 
 # ============================================================================
+# Time utilities
+# ============================================================================
+
+proc nowNs*(): int64 {.inline.} =
+  ## Current wall-clock time in nanoseconds with sub-second precision.
+  ## Both the seconds and nanosecond fields of getTime() are used so that
+  ## heartbeat / election-timeout comparisons work correctly within a single
+  ## second (i.e. toUnix alone would truncate to whole-second resolution).
+  let t = getTime()
+  t.toUnix * 1_000_000_000 + t.nanosecond.int64
+
+# ============================================================================
 # Raft Group Operations
 # ============================================================================
 
-proc newRaftGroup*(rangeId: RangeID, nodeId: NodeID,
+proc newRaftGroup*(rangeId: RangeID, nodeId: RangeNodeID,
                    replicaId: ReplicaID,
                    descriptor: RangeDescriptor): RaftGroup =
   ## Create a new Raft group for a range
@@ -228,7 +240,10 @@ proc newRaftGroup*(rangeId: RangeID, nodeId: NodeID,
   result.commitIndex.store(0)
   result.lastApplied.store(0)
   result.state.store(rsFollower)
-  result.lastHeartbeat.store(0)
+  # Initialize to now so the election timer doesn't fire immediately.
+  # A follower that just joined needs a full electionTimeout before it starts
+  # its first election, giving the existing leader time to send a heartbeat.
+  result.lastHeartbeat.store(nowNs())
 
   # Initialize leader state
   for rep in descriptor.replicas:
@@ -277,6 +292,9 @@ proc becomeLeader*(group: RaftGroup) =
   ## Transition to leader state
   withLock group.lock:
     group.state.store(rsLeader)
+    # Reset heartbeat so the heartbeat timer doesn't think we're overdue
+    # immediately after becoming leader, which would block the timer thread.
+    group.lastHeartbeat.store(nowNs())
     # Initialize leader state
     let lastIndex = group.lastApplied.load
     for rep in group.descriptor.replicas:
@@ -285,12 +303,12 @@ proc becomeLeader*(group: RaftGroup) =
         group.matchIndex[rep.replicaId] = 0
 
 proc updateHeartbeat*(group: RaftGroup) =
-  ## Update last heartbeat time
-  group.lastHeartbeat.store(getTime().toUnix * 1_000_000_000)
+  ## Update last heartbeat time (nanosecond precision)
+  group.lastHeartbeat.store(nowNs())
 
 proc timeSinceHeartbeat*(group: RaftGroup): int64 =
-  ## Time since last heartbeat in nanoseconds
-  getTime().toUnix * 1_000_000_000 - group.lastHeartbeat.load
+  ## Time since last heartbeat in nanoseconds (nanosecond precision)
+  nowNs() - group.lastHeartbeat.load
 
 proc quorum*(group: RaftGroup): int =
   ## Calculate quorum size for this group

@@ -173,6 +173,28 @@ proc sendAppendEntries*(rt: RaftTransport, targetServerId: int32,
   if responseOpt.isSome:
     result = some(decodeAppendEntriesResponseMsg(responseOpt.get()))
 
+proc sendAppendEntriesNoWait*(rt: RaftTransport, targetServerId: int32,
+                               term: uint64, leaderId: int32,
+                               prevLogIndex: uint64, prevLogTerm: uint64,
+                               commitIndex: uint64,
+                               entries: seq[raft_types.LogEntry]): bool =
+  ## Send an AppendEntries RPC without waiting for a response (fire-and-forget).
+  ## Used for heartbeats so the timer thread is not blocked by per-peer timeouts.
+  let targetNodeId = toNodeID(targetServerId)
+
+  var msg: AppendEntriesMsg
+  msg.header = newMessageHeader(uint16(rmtAppendEntries), 0'u64, rt.nodeId,
+      targetNodeId, term)
+  msg.leaderId = toNodeID(leaderId)
+  msg.prevLogIndex = prevLogIndex
+  msg.prevLogTerm = prevLogTerm
+  msg.commitIndex = commitIndex
+  msg.numEntries = uint32(entries.len)
+  msg.entriesData = encodeLogEntries(entries)
+
+  let payload = encodeAppendEntriesMsg(msg)
+  result = rt.connManager.sendRaftMessage(targetNodeId, payload)
+
 proc handleAppendEntries*(rt: RaftTransport, data: string): string {.gcsafe.} =
   ## Handle incoming AppendEntries message
   let msg = decodeAppendEntriesMsg(data)

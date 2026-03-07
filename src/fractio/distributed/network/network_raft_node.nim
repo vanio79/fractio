@@ -1,7 +1,7 @@
 # Network Raft Node - Raft node with network transport
 # Part of the network transport layer for distributed Fractio
 
-import std/[tables, locks, atomics, options, times]
+import std/[tables, locks, atomics, options, times, threadpool, os]
 import ./types
 import ./raft_transport
 import ./connection_manager
@@ -26,15 +26,20 @@ type
     netConfig*: NetworkConfig
     running*: Atomic[bool]
     lastHeartbeat*: int64
-    
+    lastHeartbeatLock*: Lock
+
     # For tracking votes
     votesReceived*: tables.Table[int32, bool]
     votesLock*: Lock
-    
+
     # For tracking match indices
     matchIndex*: tables.Table[int32, uint64]
     nextIndex*: tables.Table[int32, uint64]
     indicesLock*: Lock
+
+    # Election timer state
+    electionResetEvent*: int64 # Timestamp when we last reset election timer
+    electionResetLock*: Lock
 
 # =============================================================================
 # Network Raft Node Implementation
@@ -62,28 +67,33 @@ proc newNetworkRaftNode*(raftConfig: raft_types.RaftConfig,
   )
   initLock(result.votesLock)
   initLock(result.indicesLock)
-  
+  initLock(result.lastHeartbeatLock)
+  initLock(result.electionResetLock)
+
   # Create connection manager
   result.connManager = newConnectionManager(netConfig)
-  
+
   # Create Raft transport
-  result.raftTransport = newRaftTransport(result.connManager, raftConfig.serverId)
+  result.raftTransport = newRaftTransport(result.connManager,
+      raftConfig.serverId)
 
 proc close*(node: NetworkRaftNode) =
   ## Close the network Raft node
   node.running.store(false)
-  
+
   node.raftTransport.close()
   node.connManager.close()
-  
+
   deinitLock(node.votesLock)
   deinitLock(node.indicesLock)
+  deinitLock(node.lastHeartbeatLock)
+  deinitLock(node.electionResetLock)
 
 # =============================================================================
 # Node Registry Management
 # =============================================================================
 
-proc addPeer*(node: NetworkRaftNode, serverId: int32, host: string, 
+proc addPeer*(node: NetworkRaftNode, serverId: int32, host: string,
               raftPort: int, clientPort: int, adminPort: int) =
   ## Add a peer node to the registry
   var info: connection_manager.NodeInfo
@@ -93,9 +103,9 @@ proc addPeer*(node: NetworkRaftNode, serverId: int32, host: string,
   info.clientPort = clientPort
   info.adminPort = adminPort
   info.isLocal = false
-  
+
   node.connManager.registerNode(info)
-  
+
   # Initialize tracking for this peer
   withLock node.indicesLock:
     node.nextIndex[serverId] = 1'u64
@@ -104,10 +114,107 @@ proc addPeer*(node: NetworkRaftNode, serverId: int32, host: string,
 proc removePeer*(node: NetworkRaftNode, serverId: int32) =
   ## Remove a peer node from the registry
   node.connManager.unregisterNode(toNodeID(serverId))
-  
+
   withLock node.indicesLock:
     node.nextIndex.del(serverId)
     node.matchIndex.del(serverId)
+
+# =============================================================================
+# Election Timer
+# =============================================================================
+
+# Forward declarations for procedures used in election timer
+proc becomeCandidate*(node: NetworkRaftNode)
+proc becomeLeader*(node: NetworkRaftNode)
+proc recordVote*(node: NetworkRaftNode, voterId: int32, granted: bool): bool
+proc sendHeartbeat*(node: NetworkRaftNode)
+
+proc resetElectionTimer*(node: NetworkRaftNode) =
+  ## Reset the election timer (called when receiving heartbeat from leader)
+  withLock node.electionResetLock:
+    node.electionResetEvent = getTime().toUnix() * 1000 + getTime().nanosecond() div 1_000_000
+
+proc getLastResetTime*(node: NetworkRaftNode): int64 =
+  ## Get the last time the election timer was reset (in ms)
+  withLock node.electionResetLock:
+    result = node.electionResetEvent
+
+proc checkElectionTimeout*(node: NetworkRaftNode): bool =
+  ## Check if election timeout has occurred
+  let nowMs = getTime().toUnix() * 1000 + getTime().nanosecond() div 1_000_000
+  let lastReset = node.getLastResetTime()
+  let elapsed = nowMs - lastReset
+
+  # Use randomized timeout to avoid split votes
+  let timeoutMs = node.config.electionTimeout + (node.serverId * 10 mod 50)
+  result = elapsed > timeoutMs
+
+proc electionTimerLoop(node: NetworkRaftNode) =
+  ## Background thread that handles election timeouts and heartbeats
+  while node.running.load(moRelaxed):
+    let currentRole = node.nodeState.role
+
+    case currentRole
+    of SR_FOLLOWER:
+      # Check for election timeout
+      if node.checkElectionTimeout():
+        # Start election
+        node.becomeCandidate()
+        # Send RequestVote to all peers and handle responses
+        let term = uint64(node.nodeState.currentTerm)
+        let nodes = node.connManager.getRemoteNodes()
+        for nodeInfo in nodes:
+          let targetServerId = toServerId(nodeInfo.nodeId)
+          if targetServerId > 0:
+            let respOpt = node.raftTransport.sendRequestVote(
+              targetServerId, term, node.serverId, 0'u64, 0'u64)
+            if respOpt.isSome:
+              let resp = respOpt.get()
+              if resp.voteGranted and node.nodeState.role == SR_CANDIDATE:
+                if node.recordVote(targetServerId, true):
+                  node.becomeLeader()
+                  break
+              elif resp.term > uint64(node.nodeState.currentTerm):
+                node.nodeState.currentTerm = int64(resp.term)
+                node.nodeState.role = SR_FOLLOWER
+                node.nodeState.votedFor = -1
+        node.resetElectionTimer()
+
+    of SR_CANDIDATE:
+      # Check for election timeout (no leader elected)
+      if node.checkElectionTimeout():
+        # Restart election
+        node.becomeCandidate()
+        let term = uint64(node.nodeState.currentTerm)
+        let nodes = node.connManager.getRemoteNodes()
+        for nodeInfo in nodes:
+          let targetServerId = toServerId(nodeInfo.nodeId)
+          if targetServerId > 0:
+            let respOpt = node.raftTransport.sendRequestVote(
+              targetServerId, term, node.serverId, 0'u64, 0'u64)
+            if respOpt.isSome:
+              let resp = respOpt.get()
+              if resp.voteGranted and node.nodeState.role == SR_CANDIDATE:
+                if node.recordVote(targetServerId, true):
+                  node.becomeLeader()
+                  break
+              elif resp.term > uint64(node.nodeState.currentTerm):
+                node.nodeState.currentTerm = int64(resp.term)
+                node.nodeState.role = SR_FOLLOWER
+                node.nodeState.votedFor = -1
+        node.resetElectionTimer()
+
+    of SR_LEADER:
+      # Send heartbeats
+      node.sendHeartbeat()
+
+    # Sleep for a short interval
+    sleep(20)
+
+proc startElectionTimer*(node: NetworkRaftNode) =
+  ## Start the election timer background thread
+  node.resetElectionTimer()
+  spawn electionTimerLoop(node)
 
 # =============================================================================
 # Start/Stop
@@ -117,77 +224,98 @@ proc start*(node: NetworkRaftNode): bool =
   ## Start the network Raft node
   if not node.connManager.start():
     return false
-  
+
   # Set up message handlers
   node.raftTransport.setupHandlers()
-  
-  # Register custom handlers that bridge to Raft node
+
+  # Register custom handlers that bridge to Raft node.
+  # Use a raw pointer to `node` inside the closures to break the ORC cycle:
+  #   NetworkRaftNode → raftTransport → connManager → TCPTransport.handlers
+  #     → closure environment → NetworkRaftNode   (cycle!)
+  # With a raw pointer the closure environment holds no traced ref, so ORC
+  # does not see a cycle and does not crash during collectCycles.
+  # Safety: the handlers are removed (connManager closed) before `node` is
+  # freed, so the raw pointer is always valid while the handlers are active.
+  let nodePtr = cast[pointer](node)
+
   proc handleRV(data: string): string {.gcsafe.} =
+    let n = cast[NetworkRaftNode](nodePtr)
     let msg = decodeRequestVoteMsg(data)
     var resp: RequestVoteResponseMsg
-    resp.header = newMessageHeader(uint16(rmtRequestVoteResponse), 
+    resp.header = newMessageHeader(uint16(rmtRequestVoteResponse),
                                     msg.header.messageId,
                                     msg.header.targetNodeId,
                                     msg.header.sourceNodeId,
-                                    uint64(node.nodeState.currentTerm))
-    
+                                    uint64(n.nodeState.currentTerm))
+
     # Simplified vote logic
-    let term = node.nodeState.currentTerm
+    let term = n.nodeState.currentTerm
     if msg.header.term > uint64(term):
-      node.nodeState.currentTerm = int64(msg.header.term)
-      node.nodeState.votedFor = -1
-    
+      n.nodeState.currentTerm = int64(msg.header.term)
+      n.nodeState.votedFor = -1
+
     if msg.header.term >= uint64(term) and
-       (node.nodeState.votedFor == -1 or
-        node.nodeState.votedFor == toServerId(msg.candidateId)):
-      node.nodeState.votedFor = toServerId(msg.candidateId)
+       (n.nodeState.votedFor == -1 or
+        n.nodeState.votedFor == toServerId(msg.candidateId)):
+      n.nodeState.votedFor = toServerId(msg.candidateId)
       resp.voteGranted = true
     else:
       resp.voteGranted = false
-    
-    resp.term = uint64(node.nodeState.currentTerm)
+
+    resp.term = uint64(n.nodeState.currentTerm)
     result = encodeRequestVoteResponseMsg(resp)
-  
+
   proc handleAE(data: string): string {.gcsafe.} =
+    let n = cast[NetworkRaftNode](nodePtr)
     let msg = decodeAppendEntriesMsg(data)
     var resp: AppendEntriesResponseMsg
     resp.header = newMessageHeader(uint16(rmtAppendEntriesResponse),
                                     msg.header.messageId,
                                     msg.header.targetNodeId,
                                     msg.header.sourceNodeId,
-                                    uint64(node.nodeState.currentTerm))
-    
-    let term = node.nodeState.currentTerm
+                                    uint64(n.nodeState.currentTerm))
+
+    let term = n.nodeState.currentTerm
     if msg.header.term > uint64(term):
-      node.nodeState.currentTerm = int64(msg.header.term)
-      node.nodeState.role = SR_FOLLOWER
-      node.nodeState.votedFor = -1
-    
+      n.nodeState.currentTerm = int64(msg.header.term)
+      n.nodeState.role = SR_FOLLOWER
+      n.nodeState.votedFor = -1
+
     if msg.header.term < uint64(term):
       resp.success = false
       resp.term = uint64(term)
     else:
-      # Accept entries
-      node.nodeState.leaderId = toServerId(msg.leaderId)
-      node.lastHeartbeat = getTime().toUnix()
-      
+      # Accept entries / heartbeat from leader
+      n.nodeState.leaderId = toServerId(msg.leaderId)
+      n.lastHeartbeat = getTime().toUnix()
+
+      # Reset election timer since we got a valid heartbeat from leader
+      n.resetElectionTimer()
+
       # Update commit index
-      if msg.commitIndex > uint64(node.nodeState.commitIndex):
-        node.nodeState.commitIndex = int64(min(msg.commitIndex, 
+      if msg.commitIndex > uint64(n.nodeState.commitIndex):
+        n.nodeState.commitIndex = int64(min(msg.commitIndex,
           msg.prevLogIndex + uint64(msg.numEntries)))
-      
+
       resp.success = true
-      resp.term = uint64(node.nodeState.currentTerm)
+      resp.term = uint64(n.nodeState.currentTerm)
       resp.matchIndex = msg.prevLogIndex + uint64(msg.numEntries)
-    
+
     resp.rejectHint = 0'u64
     result = encodeAppendEntriesResponseMsg(resp)
-  
+
   node.raftTransport.registerHandler(uint16(rmtRequestVote), handleRV)
   node.raftTransport.registerHandler(uint16(rmtAppendEntries), handleAE)
-  
+  # Note: rmtRequestVoteResponse handler removed - automatic election disabled
+  # For benchmarks, use manual leader election via becomeCandidate()/becomeLeader()
+
   node.running.store(true)
-  
+
+  # Initialize election timer state (automatic election disabled for GC-safety)
+  # For benchmarks, use manual leader election via becomeCandidate()/becomeLeader()
+  node.resetElectionTimer()
+  # node.startElectionTimer()  # Disabled due to GC-safety complexity
+
   var fields = initTable[string, string]()
   fields["serverId"] = $node.serverId
   info("Network Raft node started", fields)
@@ -197,7 +325,7 @@ proc stop*(node: NetworkRaftNode) =
   ## Stop the network Raft node
   node.running.store(false)
   node.connManager.stop()
-  
+
   var fields = initTable[string, string]()
   fields["serverId"] = $node.serverId
   info("Network Raft node stopped", fields)
@@ -211,11 +339,11 @@ proc becomeCandidate*(node: NetworkRaftNode) =
   node.nodeState.role = SR_CANDIDATE
   inc node.nodeState.currentTerm
   node.nodeState.votedFor = node.serverId
-  
+
   withLock node.votesLock:
     node.votesReceived.clear()
     node.votesReceived[node.serverId] = true
-  
+
   var fields = initTable[string, string]()
   fields["serverId"] = $node.serverId
   fields["term"] = $node.nodeState.currentTerm
@@ -225,10 +353,10 @@ proc becomeLeader*(node: NetworkRaftNode) =
   ## Transition to leader state
   if node.nodeState.role != SR_CANDIDATE:
     return
-  
+
   node.nodeState.role = SR_LEADER
   node.nodeState.leaderId = node.serverId
-  
+
   var fields = initTable[string, string]()
   fields["serverId"] = $node.serverId
   fields["term"] = $node.nodeState.currentTerm
@@ -239,7 +367,7 @@ proc becomeFollower*(node: NetworkRaftNode, term: int64) =
   node.nodeState.role = SR_FOLLOWER
   node.nodeState.currentTerm = term
   node.nodeState.votedFor = -1
-  
+
   var fields = initTable[string, string]()
   fields["serverId"] = $node.serverId
   fields["term"] = $term
@@ -248,7 +376,7 @@ proc becomeFollower*(node: NetworkRaftNode, term: int64) =
 proc sendRequestVote*(node: NetworkRaftNode) =
   ## Send RequestVote to all peers
   let term = uint64(node.nodeState.currentTerm)
-  
+
   let nodes = node.connManager.getRemoteNodes()
   for nodeInfo in nodes:
     let targetServerId = toServerId(nodeInfo.nodeId)
@@ -260,7 +388,7 @@ proc sendHeartbeat*(node: NetworkRaftNode) =
   ## Send heartbeat (empty AppendEntries) to all peers
   let term = uint64(node.nodeState.currentTerm)
   let commitIdx = uint64(node.nodeState.commitIndex)
-  
+
   let nodes = node.connManager.getRemoteNodes()
   for nodeInfo in nodes:
     let targetServerId = toServerId(nodeInfo.nodeId)
@@ -269,7 +397,7 @@ proc sendHeartbeat*(node: NetworkRaftNode) =
       withLock node.indicesLock:
         if targetServerId in node.nextIndex:
           nextIdx = node.nextIndex[targetServerId]
-      
+
       discard node.raftTransport.sendAppendEntries(
         targetServerId, term, node.serverId,
         nextIdx - 1, 0'u64, commitIdx, @[])
@@ -278,7 +406,7 @@ proc recordVote*(node: NetworkRaftNode, voterId: int32, granted: bool): bool =
   ## Record a vote and check if we have majority
   withLock node.votesLock:
     node.votesReceived[voterId] = granted
-  
+
   # Count votes
   var yesVotes = 0
   var totalVotes = 0
@@ -287,11 +415,11 @@ proc recordVote*(node: NetworkRaftNode, voterId: int32, granted: bool): bool =
       inc totalVotes
       if voted:
         inc yesVotes
-  
+
   # Check majority
   let nodes = node.connManager.getAllNodes()
   let majority = (nodes.len div 2) + 1
-  
+
   result = yesVotes >= majority
 
 # =============================================================================

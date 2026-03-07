@@ -80,6 +80,12 @@ type
     mtMetrics = 0x0701
     mtHealth = 0x0702
 
+    # Cluster Admin (0x0703-0x0706)
+    mtJoinNode = 0x0703        ## Add a node to the cluster
+    mtRemoveNode = 0x0704      ## Remove a node from the cluster
+    mtListNodes = 0x0705       ## List all known cluster nodes
+    mtRebalanceStatus = 0x0706 ## Query rebalance operation status
+
 # ---------------------------------------------------------------------------
 # Authentication methods
 # ---------------------------------------------------------------------------

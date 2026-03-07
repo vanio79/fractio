@@ -81,27 +81,27 @@ method isOpen*(backend: StorageBackend): bool {.base.} =
   result = false
 
 method put*(backend: StorageBackend, key: string,
-    value: string): bool {.base.} =
+    value: string): bool {.base, gcsafe.} =
   ## Put a key-value pair into storage
   ## Returns true if successful
   discard false
 
-method get*(backend: StorageBackend, key: string): Option[string] {.base.} =
+method get*(backend: StorageBackend, key: string): Option[string] {.base, gcsafe.} =
   ## Get a value by key
   ## Returns some(value) if found, none if not found
   result = none(string)
 
-method delete*(backend: StorageBackend, key: string): bool {.base.} =
+method delete*(backend: StorageBackend, key: string): bool {.base, gcsafe.} =
   ## Delete a key from storage
   ## Returns true if the key was found and deleted
   discard false
 
-method exists*(backend: StorageBackend, key: string): bool {.base.} =
+method exists*(backend: StorageBackend, key: string): bool {.base, gcsafe.} =
   ## Check if a key exists in storage
   discard false
 
 method writeBatch*(backend: StorageBackend, pairs: seq[KeyValuePair],
-                   deletes: seq[string]): bool {.base.} =
+                   deletes: seq[string]): bool {.base, gcsafe.} =
   ## Write multiple key-value pairs and deletions atomically
   discard false
 
