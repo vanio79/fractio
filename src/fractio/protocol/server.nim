@@ -617,8 +617,13 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
 
     var resp: GetResponse
     if not server.raftStore.isNil:
-      # Phase 5: Raft-backed read
-      let rr = server.raftStore.raftGet(req.key)
+      # Phase 5: Raft-backed read.
+      # If the request is inside a transaction, use raftGetForTxn so that
+      # writes buffered as intents by this txn are visible (reads-your-own-writes).
+      let rr = if req.txnId != 0:
+                 server.raftStore.raftGetForTxn(req.txnId, req.key)
+               else:
+                 server.raftStore.raftGet(req.key)
       if not rr.isOk:
         if rr.error.kind == rseNotLeader:
           sendError(conn, requestId, ErrNotLeader, ErrCatKV,

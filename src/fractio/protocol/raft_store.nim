@@ -580,6 +580,46 @@ proc raftCommitTxn*(store: RaftKVStoreExt, txnId: uint64,
 
   proposeWrite(store, rid, batch)
 
+proc raftGetForTxn*(store: RaftKVStoreExt, txnId: uint64,
+    key: string): RSResult[Option[RaftKVEntry]] {.gcsafe, raises: [].} =
+  ## Transactional read: returns the intent value if this transaction has a
+  ## buffered write for `key` (reads-your-own-writes), otherwise falls back to
+  ## the committed value visible via raftGet.
+  ##
+  ## The lookup order is:
+  ##   1. Intent key  ("\x00INTENT\x00<txnId8be><key>") in the local SM
+  ##   2. Committed key (same as raftGet)
+  let ridOpt = store.findRangeId(key)
+  if ridOpt.isNone:
+    return rsErr[Option[RaftKVEntry]](newRSE(rseRangeNotFound,
+        &"no shard for key '{key}'"))
+
+  let sm = store.getOrCreateSM(ridOpt.get())
+  let intentKey = encodeIntentKey(txnId, key)
+
+  acquire(store.smMu)
+  let hasIntent = sm.kvStore.hasKey(intentKey)
+  let intentVal = if hasIntent: sm.kvStore.getOrDefault(intentKey) else: ""
+  # Also check committed key while holding the lock
+  let hasCommitted = (not hasIntent) and sm.kvStore.hasKey(key)
+  let committedVal = if hasCommitted: sm.kvStore.getOrDefault(key) else: ""
+  release(store.smMu)
+
+  let ts = uint64(getTime().toUnixFloat() * 1_000_000_000)
+  if hasIntent:
+    return rsOk[Option[RaftKVEntry]](some(RaftKVEntry(
+      value: intentVal,
+      version: 1'u64,
+      timestamp: ts,
+    )))
+  if hasCommitted:
+    return rsOk[Option[RaftKVEntry]](some(RaftKVEntry(
+      value: committedVal,
+      version: 1'u64,
+      timestamp: ts,
+    )))
+  rsOk[Option[RaftKVEntry]](none(RaftKVEntry))
+
 proc raftResolveIntent*(store: RaftKVStoreExt, txnId: uint64,
     key: string, commit: bool,
     commitValue: string = ""): RSVoidResult {.gcsafe, raises: [].} =
