@@ -4,19 +4,35 @@
 #   ProtocolServer (in-process) ← TCP → ProtocolClient
 #
 # Benchmarks:
-#   1. Sequential mixed   (2:1 read:write)
-#   2. Write-only
-#   3. Read-only
-#   4. Scan
-#   5. Transactional      (begin / put / commit)
+#   1. Sequential mixed        (2:1 read:write, single client)
+#   2. Write-only              (single client)
+#   3. Read-only               (single client)
+#   4. Scan                    (single client)
+#   5. Transactional           (begin / put / commit, single client)
+#   6. Concurrent mixed        (2:1 read:write, N clients in parallel)
+#      Mirrors the workload in db_benchmarks.py for PostgreSQL/MySQL/SQLite.
+#      Each thread owns its own ProtocolClient connection.  Key space is
+#      partitioned identically to the Python benchmark:
+#        key = (threadId * opsPerThread + i) mod numKeys
+#      Thread counts: 2, 4, 8 — same as the Python driver.
 #
 # The server is started once and shared across all benchmark runs.
 # The client reconnects between benchmarks so each run starts with a
 # fresh connection and a clean request-ID counter.
 #
+# CLI flags (mirror db_benchmarks.py):
+#   --keys   N        number of distinct keys   (default 5000)
+#   --ops    N        total ops per benchmark    (default 1000)
+#   --threads N       threads for concurrent run (default 4; also runs 2 and 8)
+#   --value-size N    value size in bytes        (default 100)
+#   --warmup N        warmup ops                 (default 100)
+#   --skip-sequential  skip benchmarks 1-5
+#   --skip-concurrent  skip benchmark 6
+#
 # Port: 29000  (well clear of all protocol test ports ≤ 20499)
 
-import std/[os, times, strutils, math]
+import std/[os, times, strutils, math, atomics, algorithm]
+import std/typedthreads
 import fractio/protocol/server
 import fractio/protocol/client
 import fractio/protocol/types
@@ -29,10 +45,6 @@ import fractio/protocol/messages/txn as txnMsgs
 const
   BENCH_PORT = 29000
   BENCH_HOST = "127.0.0.1"
-  NUM_KEYS = 2000
-  VALUE_SIZE = 100
-  WARMUP_OPS = 50
-  BENCH_OPS = 500
   SERVER_WAIT_MS = 80 ## ms to sleep after server.start() before connecting
 
 # =============================================================================
@@ -45,6 +57,7 @@ type
     numOps*: int
     valueSize*: int
     warmupOps*: int
+    numThreads*: int ## used by concurrent benchmark
 
   BenchmarkResult* = object
     name*: string
@@ -52,7 +65,18 @@ type
     avgLatencyUs*: float
     minLatencyUs*: float
     maxLatencyUs*: float
+    p99LatencyUs*: float
     totalOps*: int
+    errors*: int
+
+# ---------------------------------------------------------------------------
+# Per-thread result bag written by the concurrent worker; collected afterward.
+# Must be a plain object (not a ref) so it can cross thread boundaries safely.
+# ---------------------------------------------------------------------------
+
+type
+  ThreadResult* = object
+    latencies*: seq[float]
     errors*: int
 
 # =============================================================================
@@ -83,11 +107,16 @@ proc calcResult(name: string, latencies: seq[float],
   result.totalOps = latencies.len
   result.errors = errors
   result.opsPerSec = if durationSec > 0.0: float(latencies.len) / durationSec
-                      else: 0.0
+                     else: 0.0
   if latencies.len > 0:
     result.avgLatencyUs = sum(latencies) / float(latencies.len)
     result.minLatencyUs = min(latencies)
     result.maxLatencyUs = max(latencies)
+    # p99: sort a copy and take the 99th-percentile element
+    var sorted = latencies
+    sorted.sort(system.cmp[float])
+    let p99idx = max(0, int(float(sorted.len) * 0.99) - 1)
+    result.p99LatencyUs = sorted[p99idx]
 
 # =============================================================================
 # Benchmark 1: Sequential mixed  (2:1 read:write)
@@ -244,6 +273,124 @@ proc runTransactionalBenchmark*(client: ProtocolClient,
   result = calcResult("Transactional", latencies, errors, durationSec)
 
 # =============================================================================
+# Benchmark 6: Concurrent mixed  (2:1 read:write, N threads)
+#
+# Mirrors db_benchmarks.py exactly:
+#   - N threads, each with its own ProtocolClient connection
+#   - ops_per_thread = numOps div numThreads
+#   - key = (threadId * opsPerThread + i) mod numKeys
+#   - every 3rd op is a Put, the rest are Gets
+#   - all threads start simultaneously (countdown latch via Atomic[int])
+#   - wall-clock duration measured across the full concurrent run
+# =============================================================================
+
+type
+  WorkerArgs* = object
+    threadId*: int
+    opsPerThread*: int
+    numKeys*: int
+    valueSize*: int
+    host*: string
+    port*: int
+    ## Countdown latch: main decrements to 0 after spawning all threads,
+    ## each worker spins until it reads 0, then starts.
+    startLatch*: ptr Atomic[int]
+    ## Output written by the worker (main reads after joinThread).
+    resultOut*: ptr ThreadResult
+
+proc concurrentWorker(args: WorkerArgs) {.thread, gcsafe.} =
+  ## Thread entry point: connects its own client, waits for the latch,
+  ## runs the mixed workload, writes results into args.resultOut.
+  var ccfg = defaultClientConfig(args.host, args.port)
+  ccfg.timeoutMs = 30_000
+  let c = newProtocolClient(ccfg)
+  let cr = c.connect()
+  if cr.isErr:
+    args.resultOut[].errors = args.opsPerThread
+    return
+
+  let value = block:
+    var v = newString(args.valueSize)
+    for i in 0..<args.valueSize:
+      v[i] = char(ord('a') + (i mod 26))
+    v
+
+  # Spin-wait for start latch to reach 0 (all threads ready)
+  while args.startLatch[].load(moAcquire) > 0:
+    discard
+
+  var latencies: seq[float] = newSeqOfCap[float](args.opsPerThread)
+  var errors = 0
+
+  for i in 0..<args.opsPerThread:
+    let opStart = getTime()
+    let key = "key_" & $(((args.threadId * args.opsPerThread) +
+        i) mod args.numKeys)
+
+    if i mod 3 == 0:
+      let r = c.kvPut(key, value)
+      if r.isErr: inc errors
+    else:
+      let r = c.kvGet(key)
+      if r.isErr: inc errors
+
+    latencies.add(float((getTime() - opStart).inMicroseconds))
+
+  c.disconnect()
+  args.resultOut[].latencies = latencies
+  args.resultOut[].errors = errors
+
+proc runConcurrentBenchmark*(config: BenchmarkConfig,
+    numThreads: int): BenchmarkResult =
+  ## Spin up numThreads clients simultaneously, run the mixed workload,
+  ## collect latencies across all threads, report wall-clock throughput.
+  let opsPerThread = config.numOps div numThreads
+
+  # Allocate per-thread result storage on the heap so threads can write safely
+  var threadResults = newSeq[ThreadResult](numThreads)
+  var threads = newSeq[Thread[WorkerArgs]](numThreads)
+
+  var latch: Atomic[int]
+  latch.store(1, moRelaxed) # workers spin until we store 0
+
+  for t in 0..<numThreads:
+    let args = WorkerArgs(
+      threadId: t,
+      opsPerThread: opsPerThread,
+      numKeys: config.numKeys,
+      valueSize: config.valueSize,
+      host: BENCH_HOST,
+      port: BENCH_PORT,
+      startLatch: addr latch,
+      resultOut: addr threadResults[t],
+    )
+    createThread(threads[t], concurrentWorker, args)
+
+  # Give threads a moment to connect and reach the spin-wait, then release
+  sleep(120)
+  let wallStart = getTime()
+  latch.store(0, moRelease)
+
+  for t in 0..<numThreads:
+    joinThread(threads[t])
+
+  let wallSec = float((getTime() - wallStart).inMilliseconds) / 1000.0
+
+  # Merge all per-thread latencies
+  var allLatencies: seq[float] = @[]
+  var totalErrors = 0
+  for t in 0..<numThreads:
+    allLatencies.add(threadResults[t].latencies)
+    totalErrors += threadResults[t].errors
+
+  result = calcResult(
+    "Concurrent Mixed " & $numThreads & "t",
+    allLatencies,
+    totalErrors,
+    wallSec,
+  )
+
+# =============================================================================
 # Seed helper — pre-populate keys so reads have data to find
 # =============================================================================
 
@@ -260,27 +407,33 @@ proc seedData(client: ProtocolClient, config: BenchmarkConfig) =
 proc printResult(r: BenchmarkResult) =
   echo "  Ops/sec:     " & formatFloat(r.opsPerSec, ffDecimal, 1)
   echo "  Avg latency: " & formatFloat(r.avgLatencyUs, ffDecimal, 2) & " us"
+  echo "  p99 latency: " & formatFloat(r.p99LatencyUs, ffDecimal, 2) & " us"
   echo "  Min latency: " & formatFloat(r.minLatencyUs, ffDecimal, 2) & " us"
   echo "  Max latency: " & formatFloat(r.maxLatencyUs, ffDecimal, 2) & " us"
   echo "  Total ops:   " & $r.totalOps
   echo "  Errors:      " & $r.errors
 
+# Width: 30 + 3 + 12 + 3 + 14 + 3 + 12 + 3 + 8 = 88
+const SUMMARY_WIDTH = 88
+
 proc printSummary(results: seq[BenchmarkResult]) =
   echo ""
-  echo "=".repeat(64)
+  echo "=".repeat(SUMMARY_WIDTH)
   echo "BENCHMARK RESULTS SUMMARY"
-  echo "=".repeat(64)
+  echo "=".repeat(SUMMARY_WIDTH)
   echo ""
-  let hdr = "Benchmark".center(22) & " | " &
+  let hdr = "Benchmark".center(30) & " | " &
             "Ops/sec".center(12) & " | " &
             "Avg Lat (us)".center(14) & " | " &
+            "p99 Lat (us)".center(12) & " | " &
             "Errors".center(8)
   echo hdr
-  echo "-".repeat(64)
+  echo "-".repeat(SUMMARY_WIDTH)
   for r in results:
-    let row = r.name.center(22) & " | " &
+    let row = r.name.center(30) & " | " &
               formatFloat(r.opsPerSec, ffDecimal, 1).center(12) & " | " &
               formatFloat(r.avgLatencyUs, ffDecimal, 2).center(14) & " | " &
+              formatFloat(r.p99LatencyUs, ffDecimal, 2).center(12) & " | " &
               ($r.errors).center(8)
     echo row
   echo ""
@@ -290,123 +443,190 @@ proc printSummary(results: seq[BenchmarkResult]) =
 # =============================================================================
 
 when isMainModule:
-  echo "========================================"
+  # ---------------------------------------------------------------------------
+  # CLI argument parsing (mirrors db_benchmarks.py flags)
+  # ---------------------------------------------------------------------------
+  var numKeys = 5000
+  var numOps = 1000
+  var valueSize = 100
+  var warmupOps = 100
+  var numThreads = 4
+  var skipSeq = false
+  var skipConc = false
+
+  let args = commandLineParams()
+  var i = 0
+  while i < args.len:
+    case args[i]
+    of "--keys":
+      inc i; numKeys = parseInt(args[i])
+    of "--ops":
+      inc i; numOps = parseInt(args[i])
+    of "--threads":
+      inc i; numThreads = parseInt(args[i])
+    of "--value-size":
+      inc i; valueSize = parseInt(args[i])
+    of "--warmup":
+      inc i; warmupOps = parseInt(args[i])
+    of "--skip-sequential":
+      skipSeq = true
+    of "--skip-concurrent":
+      skipConc = true
+    of "--help", "-h":
+      echo "Usage: fractio_fullstack_benchmarks [options]"
+      echo "  --keys N          number of distinct keys (default 5000)"
+      echo "  --ops N           total ops per benchmark (default 1000)"
+      echo "  --threads N       threads for concurrent run (default 4)"
+      echo "  --value-size N    value size in bytes (default 100)"
+      echo "  --warmup N        warmup ops (default 100)"
+      echo "  --skip-sequential skip benchmarks 1-5"
+      echo "  --skip-concurrent skip benchmark 6 (concurrent mixed)"
+      quit(0)
+    else:
+      echo "Unknown flag: " & args[i]
+      quit(1)
+    inc i
+
+  let benchConfig = BenchmarkConfig(
+    numKeys: numKeys,
+    numOps: numOps,
+    valueSize: valueSize,
+    warmupOps: warmupOps,
+    numThreads: numThreads,
+  )
+
+  echo "=".repeat(SUMMARY_WIDTH)
   echo "Fractio Full-Stack Benchmarks"
-  echo "========================================"
+  echo "=".repeat(SUMMARY_WIDTH)
   echo ""
   echo "Configuration:"
-  echo "  Server:    " & BENCH_HOST & ":" & $BENCH_PORT
-  echo "  Keys:      " & $NUM_KEYS
-  echo "  Ops/bench: " & $BENCH_OPS
-  echo "  Value size:" & $VALUE_SIZE & " bytes"
-  echo "  Warmup:    " & $WARMUP_OPS & " ops"
+  echo "  Server:     " & BENCH_HOST & ":" & $BENCH_PORT
+  echo "  Keys:       " & $numKeys
+  echo "  Ops/bench:  " & $numOps
+  echo "  Value size: " & $valueSize & " bytes"
+  echo "  Warmup:     " & $warmupOps & " ops"
+  echo "  Threads:    " & $numThreads & " (concurrent benchmark also runs 2 and 8)"
   echo ""
 
   # -------------------------------------------------------------------------
   # Start server (single instance, shared across all benchmarks)
   # -------------------------------------------------------------------------
-  var cfg = defaultServerConfig()
-  cfg.host = BENCH_HOST
-  cfg.port = BENCH_PORT
-  cfg.idleTimeoutSecs = 300
-  cfg.serverName = "fractio-bench"
+  var srvCfg = defaultServerConfig()
+  srvCfg.host = BENCH_HOST
+  srvCfg.port = BENCH_PORT
+  srvCfg.idleTimeoutSecs = 300
+  srvCfg.serverName = "fractio-bench"
 
-  let srv = newProtocolServer(cfg)
+  let srv = newProtocolServer(srvCfg)
   srv.start()
-  sleep(SERVER_WAIT_MS) # allow accept loop to come up
+  sleep(SERVER_WAIT_MS)
 
   echo "Server started on " & BENCH_HOST & ":" & $BENCH_PORT
   echo ""
 
-  let benchConfig = BenchmarkConfig(
-    numKeys: NUM_KEYS,
-    numOps: BENCH_OPS,
-    valueSize: VALUE_SIZE,
-    warmupOps: WARMUP_OPS,
-  )
-
   var allResults: seq[BenchmarkResult] = @[]
 
   # -------------------------------------------------------------------------
-  # Benchmark 1: Sequential mixed
+  # Benchmarks 1-5: single-client sequential workloads
   # -------------------------------------------------------------------------
-  echo "=".repeat(50)
-  echo "Sequential Mixed Benchmark (2:1 read:write)"
-  echo "=".repeat(50)
+  if not skipSeq:
+    # Benchmark 1: Sequential mixed
+    echo "=".repeat(50)
+    echo "1. Sequential Mixed Benchmark (2:1 read:write)"
+    echo "=".repeat(50)
+    block:
+      let c = newClient()
+      seedData(c, benchConfig)
+      let r = runSequentialBenchmark(c, benchConfig)
+      allResults.add(r)
+      c.disconnect()
+      echo "\nResults:"
+      printResult(r)
 
-  block:
-    let c = newClient()
-    seedData(c, benchConfig)
-    let r = runSequentialBenchmark(c, benchConfig)
-    allResults.add(r)
-    c.disconnect()
-    echo "\nResults:"
-    printResult(r)
+    # Benchmark 2: Write-only
+    echo "\n" & "=".repeat(50)
+    echo "2. Write-Only Benchmark"
+    echo "=".repeat(50)
+    block:
+      let c = newClient()
+      let r = runWriteBenchmark(c, benchConfig)
+      allResults.add(r)
+      c.disconnect()
+      echo "\nResults:"
+      printResult(r)
 
-  # -------------------------------------------------------------------------
-  # Benchmark 2: Write-only
-  # -------------------------------------------------------------------------
-  echo "\n" & "=".repeat(50)
-  echo "Write-Only Benchmark"
-  echo "=".repeat(50)
+    # Benchmark 3: Read-only
+    echo "\n" & "=".repeat(50)
+    echo "3. Read-Only Benchmark"
+    echo "=".repeat(50)
+    block:
+      let c = newClient()
+      seedData(c, benchConfig)
+      let r = runReadBenchmark(c, benchConfig)
+      allResults.add(r)
+      c.disconnect()
+      echo "\nResults:"
+      printResult(r)
 
-  block:
-    let c = newClient()
-    let r = runWriteBenchmark(c, benchConfig)
-    allResults.add(r)
-    c.disconnect()
-    echo "\nResults:"
-    printResult(r)
+    # Benchmark 4: Scan
+    echo "\n" & "=".repeat(50)
+    echo "4. Scan Benchmark"
+    echo "=".repeat(50)
+    block:
+      let c = newClient()
+      seedData(c, benchConfig)
+      let r = runScanBenchmark(c, benchConfig)
+      allResults.add(r)
+      c.disconnect()
+      echo "\nResults:"
+      printResult(r)
 
-  # -------------------------------------------------------------------------
-  # Benchmark 3: Read-only
-  # -------------------------------------------------------------------------
-  echo "\n" & "=".repeat(50)
-  echo "Read-Only Benchmark"
-  echo "=".repeat(50)
-
-  block:
-    let c = newClient()
-    seedData(c, benchConfig)
-    let r = runReadBenchmark(c, benchConfig)
-    allResults.add(r)
-    c.disconnect()
-    echo "\nResults:"
-    printResult(r)
-
-  # -------------------------------------------------------------------------
-  # Benchmark 4: Scan
-  # -------------------------------------------------------------------------
-  echo "\n" & "=".repeat(50)
-  echo "Scan Benchmark"
-  echo "=".repeat(50)
-
-  block:
-    let c = newClient()
-    seedData(c, benchConfig)
-    let r = runScanBenchmark(c, benchConfig)
-    allResults.add(r)
-    c.disconnect()
-    echo "\nResults:"
-    printResult(r)
-
-  # -------------------------------------------------------------------------
-  # Benchmark 5: Transactional
-  # -------------------------------------------------------------------------
-  echo "\n" & "=".repeat(50)
-  echo "Transactional Benchmark (begin/put/commit)"
-  echo "=".repeat(50)
-
-  block:
-    let c = newClient()
-    let r = runTransactionalBenchmark(c, benchConfig)
-    allResults.add(r)
-    c.disconnect()
-    echo "\nResults:"
-    printResult(r)
+    # Benchmark 5: Transactional
+    echo "\n" & "=".repeat(50)
+    echo "5. Transactional Benchmark (begin/put/commit)"
+    echo "=".repeat(50)
+    block:
+      let c = newClient()
+      let r = runTransactionalBenchmark(c, benchConfig)
+      allResults.add(r)
+      c.disconnect()
+      echo "\nResults:"
+      printResult(r)
 
   # -------------------------------------------------------------------------
-  # Summary
+  # Benchmark 6: Concurrent mixed  (mirrors db_benchmarks.py)
+  # Run at thread counts 2, 4, 8 just like the Python driver does.
+  # If the user passed --threads T we include T in the set (deduped).
+  # -------------------------------------------------------------------------
+  if not skipConc:
+    echo "\n" & "=".repeat(50)
+    echo "6. Concurrent Mixed Benchmark (2:1 read:write)"
+    echo "   Mirrors db_benchmarks.py PostgreSQL/MySQL/SQLite workload"
+    echo "=".repeat(50)
+
+    # Seed once with a dedicated client before spawning workers
+    block:
+      let c = newClient()
+      seedData(c, benchConfig)
+      c.disconnect()
+
+    # Build the set of thread counts to run, always including 2, 4, 8
+    var threadCounts: seq[int] = @[]
+    for t in [2, 4, 8]:
+      threadCounts.add(t)
+    if numThreads notin threadCounts:
+      threadCounts.add(numThreads)
+      threadCounts.sort(system.cmp[int])
+
+    for t in threadCounts:
+      echo "\n--- " & $t & " threads ---"
+      let r = runConcurrentBenchmark(benchConfig, t)
+      allResults.add(r)
+      echo "Results:"
+      printResult(r)
+
+  # -------------------------------------------------------------------------
+  # Summary table
   # -------------------------------------------------------------------------
   printSummary(allResults)
 
