@@ -53,6 +53,14 @@ A `Get` inside a transaction now checks the intent key for that transaction firs
 falling back to the committed value.  This gives full snapshot isolation within a
 transaction with zero extra fsyncs and correct isolation from other transactions.
 
+**SM write-through → no-sync (Phase 13):**
+The `applyBatchToSM` callback (fired after every committed Raft log entry) previously
+called `writeBatch` with `sync=true` — a second `fdatasync()` on top of the one
+already paid in `putEntryAndState`.  Since the Raft log is the durability guarantee,
+the SM write-through only needs to survive a *clean* restart, not a crash mid-write.
+Changed to `writeBatchNoSync`: the data lands in LevelDB's memtable (readable on clean
+restart after log replay) with zero additional fdatasync cost per commit.
+
 ---
 
 ## Sequential Mixed Workload (2:1 read:write, single client)
@@ -62,7 +70,8 @@ transaction with zero extra fsyncs and correct isolation from other transactions
 | MySQL | 5,723 | 174 | 135 | 412 |
 | PostgreSQL | 772 | 1,295 | 95 | 8,030 |
 | SQLite | 405 | 2,470 | 5 | 15,100 |
-| **Fractio (release, GC, Phase 12)** | **247** | **4,043** | **22** | **~20k** |
+| **Fractio (release, GC, Phase 13)** | **335** | **2,989** | **20** | **~87k** |
+| Fractio (release, GC, Phase 12) | 247 | 4,043 | 22 | ~20k |
 | Fractio (debug, GC, Phase 10) | 193 | 5,191 | 44 | ~100k |
 | Fractio (GC, pre-fix) | 123 | 8,103 | 35 | 343,622 |
 | Fractio (no GC, pre-fix) | 86 | 11,608 | 35 | 306,307 |
@@ -156,6 +165,20 @@ identical read:write ratio, identical thread counts, wall-clock throughput.
 
 ## Fractio Full-Stack Numbers — Release Build (`-d:release --checks:off`)
 
+> **Phase 13, GC enabled** — `-d:release --checks:off` (production build, 2000 ops)
+> SM write-through now uses `writeBatchNoSync` — 1 fdatasync per commit (down from 2).
+
+| Benchmark | Ops/sec | Avg Lat (μs) | p99 Lat (μs) | Errors |
+|-----------|--------:|-------------:|-------------:|-------:|
+| Sequential Mixed (2:1 r/w) | **335** | 2,989 | 16,050 | 0 |
+| Write-Only | **109** | 9,207 | 19,255 | 0 |
+| Read-Only | **41,667** | 24 | 44 | 0 |
+| Scan (100-key range) | **8,231** | 121 | 203 | 0 |
+| Transactional (begin/put/commit) | **86** | 11,616 | 23,723 | 0 |
+| Concurrent Mixed 2t | **279** | 7,133 | 35,216 | 0 |
+| Concurrent Mixed 4t | **283** | 14,034 | 63,597 | 0 |
+| Concurrent Mixed 8t | **270** | 29,489 | 117,381 | 0 |
+
 > **Phase 12, GC enabled** — `-d:release --checks:off` (production build)
 
 | Benchmark | Ops/sec | Avg Lat (μs) | p99 Lat (μs) | Errors |
@@ -233,18 +256,18 @@ identical read:write ratio, identical thread counts, wall-clock throughput.
 ### Phase 10 fsync Batching Fix
 The root cause of the performance gap was **triple fdatasync per write**:
 
-| Path | Before fix | After fix |
-|------|-----------|----------|
-| Log entry write | 1 fdatasync | combined → |
-| Raft state (term/vote/commitIndex) | 1 fdatasync | **1 fdatasync total** |
-| State machine apply (per key) | K fdatasyncs | **1 fdatasync total** |
-| **Total per commit** | **K + 2** | **1** |
+| Path | Before Ph10 | After Ph10 | After Ph13 |
+|------|------------|-----------|-----------|
+| Log entry write | 1 fdatasync | combined → | combined → |
+| Raft state (term/vote/commitIndex) | 1 fdatasync | **1 fdatasync** | **1 fdatasync** |
+| State machine apply (per key) | K fdatasyncs | 1 fdatasync | **0 fdatasyncs** |
+| **Total per commit** | **K + 2** | **2** | **1** |
 
-With group commit + fsync batching, a batch of N proposals with K total keys
-now costs exactly **1 fdatasync** for the log/state combined write, plus
-**1 fdatasync** for the state machine apply — down from `K + 2` to **2**.
-With group commit merging N proposals, the per-proposal cost approaches
-**2/N fdatasyncs**, which is why concurrent throughput scales so much better.
+Phase 10 reduced `K+2` fdatasyncs to **2** by batching the log+state write and
+the SM apply each into one `WriteBatch`.  Phase 13 eliminates the SM apply fsync
+entirely — the Raft log write is the sole durability guarantee; the SM write uses
+`writeBatchNoSync` and survives clean restarts via log replay on crash.
+With group commit merging N proposals, the per-proposal cost is now **1/N fdatasyncs**.
 
 ### Comparison with production databases (release build, GC + Phase 12)
 

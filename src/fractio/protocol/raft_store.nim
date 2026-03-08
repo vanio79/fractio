@@ -287,22 +287,26 @@ proc fromBytes(b: seq[byte]): string {.inline.} =
 
 proc applyBatchToSM*(storePtr: pointer, rid: RangeID,
     batch: WriteBatch) {.gcsafe, raises: [].} =
-  ## Callback registered with the coordinator so that follower nodes can apply
-  ## committed WriteBatch entries to their local KVStateMachine.
-  ## `storePtr` is a raw `pointer` cast from `RaftKVStoreExt` to break
-  ## the raft_store → coordinator → raft_store circular import.
+  ## Callback registered with the coordinator so that committed WriteBatch
+  ## entries are applied to the local KVStateMachine and persisted to the
+  ## WiscKey backend.  `storePtr` is a raw `pointer` cast from `RaftKVStoreExt`
+  ## to break the raft_store → coordinator → raft_store circular import.
   ##
-  ## Write-through: every committed entry is also persisted to the WiscKey
-  ## backend (opened with syncWrites=true → fdatasync per batch) so that
-  ## committed data survives a crash.  This makes the hot path comparable to
-  ## PostgreSQL/MySQL/SQLite which all fsync on every commit.
+  ## Durability model: the Raft log entry was already written with fdatasync
+  ## in putEntryAndState, so the commit is durable before this callback fires.
+  ## The WiscKey write here uses writeBatchNoSync (no second fdatasync) — it
+  ## keeps committed data readable after a clean restart.  On a crash the Raft
+  ## log is replayed from lastApplied to reconstruct any missing SM state.
   if storePtr == nil: return
   let store = cast[RaftKVStoreExt](storePtr)
   let sm = store.getOrCreateSM(rid)
 
-  # --- Persist to WiscKey (single fdatasync for entire batch) ---
-  # Uses LevelDB's native WriteBatch API so all puts+deletes are flushed
-  # in one atomic fdatasync instead of one fdatasync per key.
+  # --- Persist to WiscKey (no fdatasync — Raft log is the durability guarantee) ---
+  # The committed entry is already durable in the Raft log (written with
+  # fdatasync in putEntryAndState).  Writing the SM snapshot here with
+  # writeBatchNoSync keeps the data visible after a clean restart without
+  # paying a second fdatasync on every commit.  On a crash, the Raft log
+  # is replayed from lastApplied to reconstruct the SM.
   let backend = store.coordinator.store
   if backend != nil and backend.isOpen:
     {.cast(raises: []).}:
@@ -312,7 +316,7 @@ proc applyBatchToSM*(storePtr: pointer, rid: RangeID,
         pairs.add((key: fromBytes(k), value: fromBytes(v)))
       for k in batch.deletes:
         delKeys.add(fromBytes(k))
-      discard backend.writeBatch(pairs, delKeys)
+      discard backend.writeBatchNoSync(pairs, delKeys)
 
   # --- Update in-memory state machine (for fast reads) ---
   acquire(store.smMu)
