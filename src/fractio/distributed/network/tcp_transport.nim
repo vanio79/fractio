@@ -380,17 +380,17 @@ proc connHandlerProc(ctx: ConnHandlerCtx) {.thread.} =
     t.connections.del(string(conn.nodeId))
 
 proc selectReadable(fd: SocketHandle, timeoutMs: int): bool =
-  ## Poll a single file descriptor for readability using select() with timeout.
+  ## Poll a single file descriptor for readability using poll() with timeout.
   ## Returns true if the fd is readable (i.e. accept() will not block).
+  ## Uses poll() instead of select() because select() crashes with
+  ## FD_SET buffer overflow when fd >= FD_SETSIZE (1024).
   when defined(posix):
-    var readSet: posix.TFdSet
-    FD_ZERO(readSet)
-    FD_SET(fd, readSet)
-    var tv: Timeval
-    tv.tv_sec = posix.Time(timeoutMs div 1000)
-    tv.tv_usec = Suseconds((timeoutMs mod 1000) * 1000)
-    let n = posix.select(fd.cint + 1, addr readSet, nil, nil, addr tv)
-    result = n > 0
+    var pfd: TPollfd
+    pfd.fd = fd.cint
+    pfd.events = POLLIN
+    pfd.revents = 0
+    let n = poll(addr pfd, 1, timeoutMs.cint)
+    result = n > 0 and (pfd.revents and POLLIN) != 0
   else:
     # Fallback: always return true (will block on accept)
     result = true
@@ -404,15 +404,34 @@ proc acceptLoopWrapper(t: TCPTransport) {.thread.} =
   ## blocking accept() on Linux).
   while t.running.load(moRelaxed):
     try:
+      # Guard: if serverSocket was closed by stopServer, exit immediately.
+      if t.serverSocket.isNil:
+        return
+
       # Poll the server socket for 200ms; if nothing arrives, loop back
       # and re-check the running flag. This avoids blocking indefinitely
       # in accept() which would prevent clean shutdown.
-      if not selectReadable(t.serverSocket.getFd(), 200):
+      let fd = t.serverSocket.getFd()
+      if fd == osInvalidSocket:
+        return
+      if not selectReadable(fd, 200):
         continue
+
+      # Re-check running flag after select returns — stopServer may have
+      # closed the socket between selectReadable and acceptAddr.
+      if not t.running.load(moRelaxed):
+        return
+
+      # Final nil check — stopServer may have closed the socket
+      if t.serverSocket.isNil:
+        return
 
       var client: Socket
       var clientAddr: string
       t.serverSocket.acceptAddr(client, clientAddr)
+
+      if client.isNil:
+        continue
 
       client.setSockOpt(OptNoDelay, t.config.tcpNoDelay,
           level = IPPROTO_TCP.cint)
@@ -477,6 +496,7 @@ proc stopServer*(t: TCPTransport) =
       t.serverSocket.close()
     except:
       discard
+    t.serverSocket = nil
 
   # Wait for accept thread to finish (at most ~200ms for select timeout)
   if t.acceptThread.running:
