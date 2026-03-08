@@ -21,7 +21,7 @@
 #   ordering is preserved (groupsLock → group.lock → smMu never inverted).
 #   Fan-out threads communicate results via built-in Channel[T] (value type).
 
-import std/[tables, locks, options, atomics, times, os, typedthreads, strutils, sequtils]
+import std/[tables, locks, options, atomics, typedthreads, strutils, sequtils]
 
 import fractio/distributed/range/types as rangeTypes
 import fractio/distributed/raft/multigroup_types
@@ -288,41 +288,47 @@ proc replicateEntry*(t: RaftGroupTransport,
       c.ackPtr[].ch.send(ack)
     , ctx)
 
-  # Count acks (self = 1). Poll until quorum reached or deadline exceeded.
+  # Count acks (self = 1). Each fan-out thread sends exactly one ack via
+  # blocking recv(). The fan-out threads have their own socket timeouts
+  # (tcpReadTimeoutMs) so recv() always returns promptly.
   var acks = 1
   var received = 0
-  let deadline = int64(getTime().toUnixFloat * 1000) + int64(timeoutMs)
-  while received < peers.len and int64(getTime().toUnixFloat * 1000) < deadline:
-    let (avail, ack) = ackPtr[].ch.tryRecv()
-    if avail:
-      inc received
-      if ack.success:
-        for rep2 in group.descriptor.replicas:
-          if rep2.nodeId == ack.nodeId:
-            withLock group.lock:
-              group.matchIndex[rep2.replicaId] = ack.matchIndex
-              group.nextIndex[rep2.replicaId] = ack.matchIndex + 1
-            break
-        inc acks
-      else:
-        # Raft: on rejection, decrement nextIndex for this peer so the next
-        # replicateEntry will send earlier entries (log backoff).
-        for rep2 in group.descriptor.replicas:
-          if rep2.nodeId == ack.nodeId:
-            withLock group.lock:
-              let cur = group.nextIndex.getOrDefault(rep2.replicaId, 1'u64)
-              if cur > 1:
-                group.nextIndex[rep2.replicaId] = cur - 1
-            break
-      if acks >= quorum: break
-    else:
-      sleep(1)
+  var quorumReached = false
 
-  # Join fan-out threads
+  # Receive all acks using blocking recv(). Each fan-out thread always sends
+  # exactly one ack, so we will get exactly peers.len acks total.
+  # We process them as they arrive and check quorum after each.
+  for _ in 0..<peers.len:
+    let ack = ackPtr[].ch.recv()
+    inc received
+    if ack.success:
+      for rep2 in group.descriptor.replicas:
+        if rep2.nodeId == ack.nodeId:
+          withLock group.lock:
+            group.matchIndex[rep2.replicaId] = ack.matchIndex
+            group.nextIndex[rep2.replicaId] = ack.matchIndex + 1
+          break
+      inc acks
+    else:
+      # Raft: on rejection, decrement nextIndex for this peer so the next
+      # replicateEntry will send earlier entries (log backoff).
+      for rep2 in group.descriptor.replicas:
+        if rep2.nodeId == ack.nodeId:
+          withLock group.lock:
+            let cur = group.nextIndex.getOrDefault(rep2.replicaId, 1'u64)
+            if cur > 1:
+              group.nextIndex[rep2.replicaId] = cur - 1
+          break
+    if acks >= quorum:
+      quorumReached = true
+      break
+
+  # Join fan-out threads (must complete before we free the ack channel)
   for i in 0..<threadSeq.len:
     joinThread(threadSeq[i])
 
-  # Drain remaining acks after join
+  # After join, all remaining acks are in the channel. Drain them to update
+  # matchIndex/nextIndex for peers that responded after quorum was reached.
   while received < peers.len:
     let (avail, ack) = ackPtr[].ch.tryRecv()
     if not avail: break
@@ -424,24 +430,21 @@ proc startElection*(t: RaftGroupTransport,
         c.votePtr[].ch.send(0'i8) # network failure — treat as denied
     , ctx)
 
-  # Count votes (self = 1). Use nanosecond clock to avoid whole-second truncation.
+  # Count votes (self = 1). Each fan-out thread sends exactly one vote
+  # result, so blocking recv() always returns promptly (bounded by the
+  # socket timeout in sendRequestVote).
   var granted = 1
   var higherTermSeen = false
-  let deadlineNs = nowNs() + 500_000_000'i64 # 500 ms in nanoseconds
 
   for _ in 0..<peers.len:
-    while true:
-      let (avail, v) = votePtr[].ch.tryRecv()
-      if avail:
-        if v == 1'i8:
-          inc granted
-        elif v == -1'i8:
-          higherTermSeen = true
-        # v == 0: denied — don't count, don't step down
-        break
-      if nowNs() >= deadlineNs: break
-      sleep(1)
-    if nowNs() >= deadlineNs: break
+    let v = votePtr[].ch.recv()
+    if v == 1'i8:
+      inc granted
+    elif v == -1'i8:
+      higherTermSeen = true
+    # v == 0: denied — don't count, don't step down
+    if higherTermSeen: break # no point continuing if we must step down
+    if granted >= quorum: break # already won
 
   for i in 0..<tseq.len:
     joinThread(tseq[i])

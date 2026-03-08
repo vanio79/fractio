@@ -50,7 +50,6 @@
 import std/atomics
 import std/times
 import std/typedthreads
-import os
 
 import fractio/distributed/range/types
 import fractio/distributed/raft/multigroup_types
@@ -146,11 +145,10 @@ proc flushProc(bPtr: ptr GroupCommitBatcher) {.thread.} =
 
   while b[].running.load():
     # Block-recv first item so we don't busy-spin when idle.
-    let (gotFirst, first) = b[].pendingCh.tryRecv()
-    if not gotFirst:
-      # Nothing pending — short sleep then retry.
-      sleep(1)
-      continue
+    # stopBatcher() sends a sentinel (rangeId == 0) to unblock this recv().
+    let first = b[].pendingCh.recv()
+    if first.rangeId.uint64 == 0:
+      break # Shutdown sentinel
 
     # Collect items for this batch window.
     # We coalesce ALL pending items (regardless of RangeID) into one pass.
@@ -248,6 +246,13 @@ proc stopBatcher*(b: ptr GroupCommitBatcher) =
   var expected = true
   if not b[].running.compareExchange(expected, false):
     return # already stopped or never started
+  # Send shutdown sentinel (rangeId == 0) to unblock the blocking recv()
+  # in flushProc. resultPtr is nil since no one waits for this result.
+  b[].pendingCh.send(GroupCommitItem(
+    rangeId: RangeID(0),
+    command: RaftCommand(kind: ckNoop),
+    resultPtr: nil,
+  ))
   joinThread(b[].flushThread)
 
 # ---------------------------------------------------------------------------
