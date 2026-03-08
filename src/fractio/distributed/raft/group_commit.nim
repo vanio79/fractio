@@ -234,14 +234,20 @@ proc flushProc(bPtr: ptr GroupCommitBatcher) {.thread.} =
 
 proc startBatcher*(b: ptr GroupCommitBatcher) =
   ## Spawn the flush background thread.
-  if b[].running.load(): return
-  b[].running.store(true)
+  ## compareExchange guarantees only one caller starts the thread even under
+  ## concurrent invocations (start-once semantics).
+  var expected = false
+  if not b[].running.compareExchange(expected, true):
+    return # already running
   createThread(b[].flushThread, flushProc, b)
 
 proc stopBatcher*(b: ptr GroupCommitBatcher) =
   ## Signal stop and join the flush thread.
-  if not b[].running.load(): return
-  b[].running.store(false)
+  ## compareExchange guarantees only one caller joins the thread even under
+  ## concurrent invocations (stop-once semantics).
+  var expected = true
+  if not b[].running.compareExchange(expected, false):
+    return # already stopped or never started
   joinThread(b[].flushThread)
 
 # ---------------------------------------------------------------------------

@@ -104,7 +104,7 @@ type
     coordinator: MultiRaftCoordinator
     workerId: int
 
-  MultiRaftCoordinator* = ref object
+  MultiRaftCoordinator* {.acyclic.} = ref object
     nodeId*: RangeNodeID
     config*: CoordinatorConfig
 
@@ -127,7 +127,7 @@ type
 
     # Timer thread (election + heartbeat) — only active when transport != nil
     timerThread*: Thread[TimerContext]
-    timerRunning*: bool
+    timerRunning*: Atomic[bool]
 
     # Timing
     electionTimeoutNs*: int64
@@ -222,7 +222,7 @@ proc newMultiRaftCoordinator*(config: CoordinatorConfig): MultiRaftCoordinator =
   result.heartbeatIntervalNs = config.heartbeatIntervalNs
   result.transport = config.transport
   result.kvStorePtr = nil
-  result.timerRunning = false
+  result.timerRunning.store(false)
 
   result.store = newWiscKeyBackend(StorageConfig(
     path: config.storagePath, createIfMissing: true, syncWrites: true))
@@ -287,6 +287,7 @@ proc start*(c: MultiRaftCoordinator) =
       var entry: LogEntry
       {.cast(raises: []).}:
         acquire(coord.groupsLock)
+        defer: release(coord.groupsLock) # always released, even on exception
         let log = coord.logs.getOrDefault(rangeId)
         let term = group.getTerm()
         let idx = log.lastIndex.load + 1
@@ -300,7 +301,6 @@ proc start*(c: MultiRaftCoordinator) =
           lastApplied: group.lastApplied.load(),
         )
         log.putEntryAndState(e, state)
-        release(coord.groupsLock)
         entry = e
         index = idx
       # Single-node: commit immediately.
@@ -374,9 +374,10 @@ proc start*(c: MultiRaftCoordinator) =
       group.updateHeartbeat()
     release(c.groupsLock)
 
-    # Timer thread for elections and heartbeats
+    # Timer thread for elections and heartbeats.
+    # Store true BEFORE createThread so stop() cannot race past the join.
+    c.timerRunning.store(true)
     createThread(c.timerThread, timerProc, TimerContext(coordinator: c))
-    c.timerRunning = true
 
   {.cast(gcsafe).}:
     var fields = initTable[string, string]()
@@ -411,8 +412,9 @@ proc stop*(c: MultiRaftCoordinator) =
   if c.transport != nil:
     # Join timer thread BEFORE stopping transports so the timer thread can
     # finish its current election/heartbeat cycle without hitting closed sockets.
-    if c.timerRunning:
+    if c.timerRunning.load():
       joinThread(c.timerThread)
+      c.timerRunning.store(false)
     c.transport.stopFn()
 
   withLock c.groupsLock:
@@ -577,6 +579,7 @@ proc workerProc(ctx: WorkerContext) {.thread.} =
       var index: uint64
       block appendBlock:
         acquire(c.groupsLock)
+        defer: release(c.groupsLock) # always released, even on exception
         let log = c.logs.getOrDefault(proposal.rangeId)
         let term = group.getTerm()
         let idx = log.lastIndex.load + 1
@@ -589,7 +592,6 @@ proc workerProc(ctx: WorkerContext) {.thread.} =
           lastApplied: group.lastApplied.load(),
         )
         log.putEntryAndState(e, state)
-        release(c.groupsLock)
         entry = e
         index = idx
 

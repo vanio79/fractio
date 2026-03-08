@@ -31,7 +31,7 @@ task test, "Run all unit, integration, and concurrency tests":
     let name = extractFilename(file)
     if name.startsWith("test_") and name.endswith(".nim"):
       echo "Running tests: ", file
-      exec "nim c -r --checks:on -p:src " & file
+      exec "nim c -r --checks:on --mm:atomicArc -p:src " & file
 
 task test_storage, "Run only storage engine unit tests":
   # Run storage tests from tests/unit/storage/

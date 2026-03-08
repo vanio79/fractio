@@ -146,7 +146,7 @@ type
 # ---------------------------------------------------------------------------
 
 type
-  RaftKVStore* = ref object of RootObj
+  RaftKVStore* {.acyclic.} = ref object of RootObj
     coordinator*: MultiRaftCoordinator
     shards*: seq[ShardEntry] ## sorted by startKey ascending
     shardsMu*: Lock
@@ -232,6 +232,8 @@ type
     stateMachines*: Table[RangeID, KVStateMachine]
     smMu*: Lock
 
+
+
 proc newRaftKVStoreExt*(coord: MultiRaftCoordinator,
     proposeTimeoutMs: int = 5000): RaftKVStoreExt =
   result = RaftKVStoreExt(
@@ -259,11 +261,6 @@ proc addShardExt*(store: RaftKVStoreExt, startKey, endKey: string,
     rangeId: RangeID) {.gcsafe, raises: [].} =
   store.addShard(startKey, endKey, rangeId)
   discard store.getOrCreateSM(rangeId) # pre-create
-
-proc bootstrapSingleShardExt*(store: RaftKVStoreExt,
-    rangeId: RangeID) {.gcsafe, raises: [].} =
-  store.bootstrapSingleShard(rangeId)
-  discard store.getOrCreateSM(rangeId)
 
 # ---------------------------------------------------------------------------
 # Internal: propose a WriteBatch and apply to local state machine
@@ -297,16 +294,17 @@ proc applyBatchToSM*(storePtr: pointer, rid: RangeID,
   ## The WiscKey write here uses writeBatchNoSync (no second fdatasync) — it
   ## keeps committed data readable after a clean restart.  On a crash the Raft
   ## log is replayed from lastApplied to reconstruct any missing SM state.
+  ##
+  ## ORC safety: We must never create a local `RaftKVStoreExt` (managed ref)
+  ## from the raw pointer — ORC would try to destroy it on scope exit, racing
+  ## with other threads.  Instead we GC_ref/GC_unref around the cast so the
+  ## refcount is balanced and ORC never frees the object.
   if storePtr == nil: return
   let store = cast[RaftKVStoreExt](storePtr)
+  GC_ref(store) # prevent ORC from freeing on scope exit (balances the decrement)
   let sm = store.getOrCreateSM(rid)
 
   # --- Persist to WiscKey (no fdatasync — Raft log is the durability guarantee) ---
-  # The committed entry is already durable in the Raft log (written with
-  # fdatasync in putEntryAndState).  Writing the SM snapshot here with
-  # writeBatchNoSync keeps the data visible after a clean restart without
-  # paying a second fdatasync on every commit.  On a crash, the Raft log
-  # is replayed from lastApplied to reconstruct the SM.
   let backend = store.coordinator.store
   if backend != nil and backend.isOpen:
     {.cast(raises: []).}:
@@ -330,9 +328,24 @@ proc wireApplyCallback*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
   ## Wire the applyBatchToSM callback into the coordinator so that committed
   ## log entries are applied to the local KV state machine on followers.
   ## Call this once after newRaftKVStoreExt() and before coordinator.start().
+  ##
+  ## GC safety: The store is kept alive by the caller (ProtocolServer.raftStore).
+  ## The coordinator is always stopped before the server (and thus before the
+  ## store ref is released), so kvStorePtr is never a dangling pointer.
+  ## In the callback, wasMoved() prevents ORC from decrementing the refcount
+  ## on the cast-from-pointer local, since the cast does not transfer ownership.
   {.cast(gcsafe).}: {.cast(raises: []).}:
     multigroup_coordinator.applyBatchCallback = applyBatchToSM
   store.coordinator.kvStorePtr = cast[pointer](store)
+
+proc bootstrapSingleShardExt*(store: RaftKVStoreExt,
+    rangeId: RangeID) {.gcsafe, raises: [].} =
+  ## Bootstrap a single shard for the store and wire the apply callback so that
+  ## committed Raft entries are applied to the local state machine.
+  ## Must be called after coord.start() (or at least after the store is ready).
+  store.bootstrapSingleShard(rangeId)
+  discard store.getOrCreateSM(rangeId)
+  store.wireApplyCallback()
 
 proc proposeWrite(store: RaftKVStoreExt, rangeId: RangeID,
     batch: WriteBatch): RSVoidResult {.gcsafe, raises: [].} =
@@ -349,18 +362,10 @@ proc proposeWrite(store: RaftKVStoreExt, rangeId: RangeID,
       return rsVErr(newRSE(rseTimeout, res.error))
     return rsVErr(newRSE(rseInternal, res.error))
 
-  # Apply to local state machine under smMu to serialise with readers
-  let sm = store.getOrCreateSM(rangeId)
-  acquire(store.smMu)
-  defer: release(store.smMu)
-  for (k, v) in batch.puts:
-    let ks = fromBytes(k)
-    let vs = fromBytes(v)
-    sm.kvStore[ks] = vs
-  for k in batch.deletes:
-    let ks = fromBytes(k)
-    sm.kvStore.del(ks)
-
+  # The SM was already updated by applyBatchToSM (called inside applyUpTo,
+  # which fires before proposeAndWait returns on the single-node path).
+  # A second apply here would be a duplicate write — removed to avoid
+  # double-apply data corruption and unnecessary smMu contention.
   rsVOk()
 
 # ---------------------------------------------------------------------------

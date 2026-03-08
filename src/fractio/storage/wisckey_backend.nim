@@ -1,7 +1,7 @@
 # WiscKey Storage Backend Implementation
 # Implements the StorageBackend interface using WiscKey (LSM-Tree with value log separation)
 
-import std/options
+import std/[options, locks]
 import backend
 
 # WiscKey C bindings - static linking
@@ -9,16 +9,19 @@ import backend
 {.passC: "-I/usr/local/include".}
 
 type
-  WiscKeyBackend* = ref object of StorageBackend
-    ## WiscKey storage backend
-    db*: pointer                 # leveldb_t*
-    options*: pointer            # leveldb_options_t*
-    readOptions*: pointer        # leveldb_readoptions_t*
-    writeOptions*: pointer       # leveldb_writeoptions_t* (sync=configured)
+  WiscKeyBackend* {.acyclic.} = ref object of StorageBackend
+    ## WiscKey storage backend.
+    ## mu guards isOpen, db, and all options pointers against concurrent
+    ## close vs put/get/writeBatch races (TOCTOU → nil ptr → SIGSEGV).
+    mu*: Lock
+    db*: pointer # leveldb_t*
+    options*: pointer # leveldb_options_t*
+    readOptions*: pointer # leveldb_readoptions_t*
+    writeOptions*: pointer # leveldb_writeoptions_t* (sync=configured)
     noSyncWriteOptions*: pointer # leveldb_writeoptions_t* (sync=false, always)
     path*: string
     isOpen*: bool
-    syncWrites*: bool            # Whether to sync writes to disk
+    syncWrites*: bool # Whether to sync writes to disk
 
   WiscKeyIterator* = ref object of StorageIterator
     ## WiscKey iterator
@@ -117,6 +120,7 @@ proc c_leveldb_writebatch_delete(batch: pointer; key: cstring,
 proc newWiscKeyBackend*(config: StorageConfig): WiscKeyBackend =
   ## Create a new WiscKey backend
   new(result)
+  initLock(result.mu)
   result.path = config.path
   result.isOpen = false
 
@@ -185,6 +189,8 @@ method open*(backend: WiscKeyBackend, config: StorageConfig): bool =
   return openWiscKey(backend, config)
 
 method close*(backend: WiscKeyBackend) =
+  acquire(backend.mu)
+  defer: release(backend.mu)
   if not backend.isOpen:
     return
 
@@ -200,6 +206,8 @@ method close*(backend: WiscKeyBackend) =
   backend.isOpen = false
 
 method isOpen*(backend: WiscKeyBackend): bool =
+  acquire(backend.mu)
+  defer: release(backend.mu)
   return backend.isOpen
 
 proc checkError(backend: WiscKeyBackend, errPtr: cstring): bool =
@@ -209,6 +217,8 @@ proc checkError(backend: WiscKeyBackend, errPtr: cstring): bool =
   return false
 
 method put*(backend: WiscKeyBackend, key: string, value: string): bool =
+  acquire(backend.mu)
+  defer: release(backend.mu)
   if not backend.isOpen:
     return false
 
@@ -219,6 +229,8 @@ method put*(backend: WiscKeyBackend, key: string, value: string): bool =
   return not checkError(backend, errPtr)
 
 method get*(backend: WiscKeyBackend, key: string): Option[string] =
+  acquire(backend.mu)
+  defer: release(backend.mu)
   if not backend.isOpen:
     return none(string)
 
@@ -243,6 +255,8 @@ method get*(backend: WiscKeyBackend, key: string): Option[string] =
   return some(resultVal)
 
 method delete*(backend: WiscKeyBackend, key: string): bool =
+  acquire(backend.mu)
+  defer: release(backend.mu)
   if not backend.isOpen:
     return false
 
@@ -253,10 +267,13 @@ method delete*(backend: WiscKeyBackend, key: string): bool =
   return not checkError(backend, errPtr)
 
 method exists*(backend: WiscKeyBackend, key: string): bool =
+  # get() acquires mu internally; do not acquire here to avoid recursive lock
   result = backend.get(key).isSome
 
 method writeBatch*(backend: WiscKeyBackend, pairs: seq[KeyValuePair],
                   deletes: seq[string]): bool =
+  acquire(backend.mu)
+  defer: release(backend.mu)
   if not backend.isOpen:
     return false
 
@@ -281,6 +298,8 @@ method writeBatchNoSync*(backend: WiscKeyBackend, pairs: seq[KeyValuePair],
   ## Safe for transactional intents: data lands in LevelDB's memtable
   ## immediately (readable via get()) but is not fdatasync'd until the
   ## subsequent commit write (which goes through writeBatch with sync=true).
+  acquire(backend.mu)
+  defer: release(backend.mu)
   if not backend.isOpen:
     return false
 
