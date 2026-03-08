@@ -23,9 +23,10 @@
 #   2 — connection / protocol error
 #   3 — server returned failure response
 
-import std/[os, parseopt, strformat, strutils, tables]
+import std/[os, parseopt, strformat, strutils, tables, times]
 import fractio/protocol/types
 import fractio/protocol/client
+import fractio/protocol/server
 import fractio/protocol/messages/cluster as clusterMsgs
 import fractio/protocol/messages/admin as adminMsgs
 
@@ -50,6 +51,8 @@ Global options:
   --timeout MS     Socket timeout ms (default: 10000)
 
 Commands:
+  start       --id ID --host HOST --raft-port PORT --client-port PORT
+              --data-dir DIR [--join PEER_HOST:PORT]
   node join   --id ID --host HOST --raft-port PORT --client-port PORT
   node remove --id ID
   node list
@@ -69,6 +72,90 @@ proc statusStr(s: uint8): string =
 # ---------------------------------------------------------------------------
 # Command implementations
 # ---------------------------------------------------------------------------
+
+proc cmdStart(flags: Table[string, string], globalHost: string) =
+  let idStr = flags.getOrDefault("id", "")
+  # --host may appear before or after "start" — take from flags if present,
+  # otherwise fall back to globalHost (both are the same value now)
+  let host = flags.getOrDefault("host", globalHost)
+  let raftPortStr = flags.getOrDefault("raft-port", "8300")
+  let clientPortStr = flags.getOrDefault("client-port", "9000")
+  let dataDir = flags.getOrDefault("data-dir", "")
+  let joinPeer = flags.getOrDefault("join", "")
+
+  if idStr == "":
+    die("start requires --id")
+  if dataDir == "":
+    die("start requires --data-dir")
+
+  var nodeId: int
+  var raftPort: int
+  var clientPort: int
+  try:
+    nodeId = parseInt(idStr)
+    raftPort = parseInt(raftPortStr)
+    clientPort = parseInt(clientPortStr)
+  except ValueError as e:
+    die("invalid numeric argument: " & e.msg)
+
+  if nodeId < 1 or nodeId > 65535:
+    die("--id must be 1..65535")
+
+  try: createDir(dataDir)
+  except CatchableError as e: die("cannot create data-dir: " & e.msg)
+
+  var cfg = defaultServerConfig()
+  cfg.host = host
+  cfg.port = clientPort
+  cfg.serverId = uint16(nodeId)
+  cfg.serverName = "fractio-" & idStr
+  cfg.dataDir = dataDir
+  cfg.idleTimeoutSecs = 120
+
+  let server = newProtocolServer(cfg)
+  server.start()
+
+  if joinPeer != "":
+    # Give the server time to bind
+    sleep(200)
+    # Parse peer address
+    let colonIdx = joinPeer.rfind(':')
+    var peerHost: string
+    var peerPort: int
+    if colonIdx < 0:
+      peerHost = joinPeer
+      peerPort = 9000
+    else:
+      peerHost = joinPeer[0..<colonIdx]
+      try: peerPort = parseInt(joinPeer[colonIdx+1..^1])
+      except ValueError: die("invalid join address: " & joinPeer)
+
+    let peerCfg = ClientConfig(
+      host: peerHost,
+      port: peerPort,
+      timeoutMs: 10_000,
+      clientId: "fractio-cli-start",
+      authMethod: amNone,
+      authData: "",
+    )
+    let peer = newProtocolClient(peerCfg)
+    let connR = peer.connect()
+    if connR.isErr:
+      writeLine(stderr, "warning: could not connect to peer " & joinPeer &
+        ": " & $connR.error)
+    else:
+      let r = peer.joinNode(uint16(nodeId), host, uint16(raftPort),
+        uint16(clientPort))
+      if r.isErr:
+        writeLine(stderr, "warning: self-registration failed: " & $r.error)
+      elif not r.value.success:
+        writeLine(stderr, "warning: self-registration refused: " &
+          r.value.message)
+      peer.disconnect()
+
+  # Block until killed
+  while true:
+    sleep(1000)
 
 proc cmdNodeJoin(c: ProtocolClient, args: Table[string, string]) =
   let idStr = args.getOrDefault("id", "")
@@ -215,7 +302,9 @@ proc main() =
       let key = p.key
       let val = p.val
       case key
-      of "host": globalHost = val
+      of "host":
+        globalHost = val
+        flags[key] = val  # also store so subcommands (node join, start) can read it
       of "port":
         try: globalPort = parseInt(val)
         except ValueError: die("--port must be an integer")
@@ -233,6 +322,11 @@ proc main() =
   if positional.len == 0:
     printUsage()
     quit(1)
+
+  # Handle 'start' before connecting to any server
+  if positional[0] == "start":
+    cmdStart(flags, globalHost)
+    quit(0)
 
   # Connect to server
   let cfg = ClientConfig(
@@ -252,6 +346,10 @@ proc main() =
   # Dispatch command
   let cmd = positional[0]
   case cmd
+
+  of "start":
+    # already handled above, unreachable
+    discard
 
   of "node":
     if positional.len < 2:

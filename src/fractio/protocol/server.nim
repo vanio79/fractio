@@ -14,7 +14,7 @@
 #
 # All shared mutable state is protected by Locks.
 
-import std/[net, tables, strformat, times, atomics, locks, options, algorithm]
+import std/[net, tables, strformat, times, atomics, locks, options, algorithm, os]
 import posix as posixSys
 import ./types
 import ./codec as protoCodec
@@ -70,6 +70,7 @@ type
     sharedTimerNodeId*: string  ## human-readable node ID for SharedTimer (default: serverName)
     sharedTimerNumericNodeId*: uint16 ## 10-bit numeric node ID for Snowflake transaction IDs (default: serverId)
     sharedTimerPeers*: seq[PeerConfig] ## peer nodes for NTP-style clock sync (empty = single-node mode)
+    dataDir*: string ## directory for persistent state (registry, etc.); "" = no persistence
 
 proc defaultServerConfig*(): ServerConfig =
   ServerConfig(
@@ -92,6 +93,7 @@ proc defaultServerConfig*(): ServerConfig =
     sharedTimerNodeId: "",
     sharedTimerNumericNodeId: 0,
     sharedTimerPeers: @[],
+    dataDir: "",
   )
 
 # ---------------------------------------------------------------------------
@@ -255,6 +257,44 @@ proc listNodes*(reg: NodeRegistry): seq[ClusterNodeEntry] {.gcsafe, raises: [].}
   for _, v in reg.nodes:
     result.add(v)
 
+proc saveRegistry*(reg: NodeRegistry, path: string) {.gcsafe, raises: [].} =
+  ## Persist registry to disk using the ListNodes wire format.
+  try:
+    let entries = reg.listNodes()
+    var nodes = newSeq[clusterMsgs.NodeInfo](entries.len)
+    for i, e in entries:
+      nodes[i] = clusterMsgs.NodeInfo(
+        nodeId: e.nodeId,
+        host: e.host,
+        raftPort: e.raftPort,
+        clientPort: e.clientPort,
+        status: e.status,
+      )
+    let data = clusterMsgs.encodeListNodesResponse(
+      clusterMsgs.ListNodesResponse(nodes: nodes))
+    writeFile(path, data)
+  except CatchableError: discard
+  except Exception: discard
+
+proc loadRegistry*(path: string): NodeRegistry {.gcsafe, raises: [].} =
+  ## Load registry from disk; returns empty registry on missing or corrupt file.
+  result = newNodeRegistry()
+  try:
+    if not fileExists(path): return
+    let data = readFile(path)
+    let respR = clusterMsgs.decodeListNodesResponse(data)
+    if respR.isErr: return
+    for n in respR.value.nodes:
+      result.nodes[n.nodeId] = ClusterNodeEntry(
+        nodeId: n.nodeId,
+        host: n.host,
+        raftPort: n.raftPort,
+        clientPort: n.clientPort,
+        status: n.status,
+      )
+  except CatchableError: discard
+  except Exception: discard
+
 # ---------------------------------------------------------------------------
 # Metrics counters (Phase 4)
 # ---------------------------------------------------------------------------
@@ -355,6 +395,11 @@ initLock(threadStoreMu)
 # ---------------------------------------------------------------------------
 
 proc newProtocolServer*(config: ServerConfig): ProtocolServer =
+  let reg =
+    if config.dataDir != "":
+      loadRegistry(config.dataDir / "node_registry.dat")
+    else:
+      newNodeRegistry()
   result = ProtocolServer(
     config: config,
     logger: newLogger("protocol.server"),
@@ -364,7 +409,7 @@ proc newProtocolServer*(config: ServerConfig): ProtocolServer =
     txnMgr: newTransactionManager(),
     metrics: newServerMetrics(),
     authenticator: newAuthenticator(config.authMethod),
-    nodeRegistry: newNodeRegistry(),
+    nodeRegistry: reg,
     startedAt: getTime().toUnix(),
   )
   initLock(result.clientsMu)
@@ -1114,6 +1159,8 @@ proc handleBuiltinCluster(server: ProtocolServer, conn: ClientConnection,
       status: clusterMsgs.NodeStatusActive,
     )
     server.nodeRegistry.addNode(entry)
+    if server.config.dataDir != "":
+      saveRegistry(server.nodeRegistry, server.config.dataDir / "node_registry.dat")
     let resp = clusterMsgs.JoinNodeResponse(success: true,
       message: "node " & $req.nodeId & " joined")
     sendFrame(conn, clusterMsgs.encodeJoinNodeResponse(resp), requestId)
@@ -1125,6 +1172,8 @@ proc handleBuiltinCluster(server: ProtocolServer, conn: ClientConnection,
       return
     let req = reqR.value
     let removed = server.nodeRegistry.removeNode(req.nodeId)
+    if removed and server.config.dataDir != "":
+      saveRegistry(server.nodeRegistry, server.config.dataDir / "node_registry.dat")
     let resp = clusterMsgs.RemoveNodeResponse(
       success: removed,
       message: if removed: "node " & $req.nodeId & " removed"
