@@ -288,7 +288,45 @@ proc start*(c: MultiRaftCoordinator) =
     let cPtr = cast[pointer](c)
     proc gcFlush(rangeId: RangeID, batch: WriteBatch,
         resultPtrs: seq[ptr ProposalResultChannel]) {.gcsafe, raises: [].} =
+      ## Flush a coalesced WriteBatch for one RangeID.
+      ##
+      ## Phase 17 routing: instead of calling putEntryAndState directly in this
+      ## batcher thread (which held groupsLock during fdatasync, serialising all
+      ## shards), we now forward the merged batch to the shard's own worker
+      ## channel.  The shard worker runs the fdatasync in its own thread without
+      ## holding groupsLock, so concurrent gcFlush calls for different shards
+      ## run their fsyncs in parallel.
+      ##
+      ## If the shard worker is not available (not yet started, or the rangeId
+      ## is unknown) we fall back to the old direct-write path so the batcher
+      ## continues to work during coordinator startup and in edge cases.
       let coord = cast[MultiRaftCoordinator](cPtr)
+
+      # --- Try the per-shard worker path (fast, lock-free fdatasync) ---
+      acquire(coord.shardWorkersMu)
+      let swPtr = coord.shardWorkers.getOrDefault(rangeId, nil)
+      release(coord.shardWorkersMu)
+
+      if swPtr != nil and swPtr[].running.load:
+        # Allocate a single internal result channel for this merged batch.
+        let prc = cast[ptr ProposalResultChannel](
+          allocShared0(sizeof(ProposalResultChannel)))
+        prc[].ch.open(1)
+        swPtr[].ch.send(Proposal(
+          rangeId: rangeId,
+          command: RaftCommand(kind: ckWrite, writeBatch: batch),
+          resultPtr: prc,
+        ))
+        # Block until the shard worker completes the fdatasync.
+        let res = prc[].ch.recv()
+        prc[].ch.close()
+        deallocShared(prc)
+        # Fan the single result out to all original callers (microseconds).
+        for rp in resultPtrs:
+          if rp != nil: rp[].ch.send(res)
+        return
+
+      # --- Fallback: direct write path (startup / no shard worker) ---
       var groupOpt: Option[RaftGroup]
       {.cast(raises: []).}: groupOpt = coord.getGroup(rangeId)
       if groupOpt.isNone:
@@ -305,33 +343,27 @@ proc start*(c: MultiRaftCoordinator) =
         return
       # Append ONE combined log entry for the entire batch.
       var index: uint64
-      var entry: LogEntry
       {.cast(raises: []).}:
         acquire(coord.groupsLock)
-        defer: release(coord.groupsLock) # always released, even on exception
         let log = coord.logs.getOrDefault(rangeId)
         let term = group.getTerm()
         let idx = log.lastIndex.load + 1
         let cmd = RaftCommand(kind: ckWrite, writeBatch: batch)
         let e = newLogEntry(term, idx, cmd)
-        # Combined log entry + Raft state in a single fdatasync
         let state = RaftPersistentState(
           currentTerm: group.currentTerm.load(),
           votedFor: group.votedFor.load(),
           commitIndex: group.commitIndex.load(),
           lastApplied: group.lastApplied.load(),
         )
+        release(coord.groupsLock) # release BEFORE fdatasync
         log.putEntryAndState(e, state)
-        entry = e
         index = idx
-      # Single-node: commit immediately.
       group.commitIndex.store(index)
       {.cast(raises: []).}: coord.applyUpTo(rangeId, group, index)
-      # Signal all waiters with the same index.
       let res = RaftResult(success: true, index: index)
       for rp in resultPtrs:
-        if rp != nil:
-          rp[].ch.send(res)
+        if rp != nil: rp[].ch.send(res)
     c.groupCommitBatcherPtr[].flushFn = gcFlush
     startBatcher(c.groupCommitBatcherPtr)
 
@@ -575,17 +607,21 @@ proc proposeParallel*(c: MultiRaftCoordinator,
     proposals: seq[tuple[rangeId: RangeID, command: RaftCommand]],
     timeoutMs: int = 5000): seq[RaftResult] =
   ## Submit N proposals to N different Raft groups simultaneously and wait for
-  ## all of them to commit.  Each proposal is dispatched to the proposalCh
-  ## (or the group-commit batcher) independently, so the coordinator's worker
-  ## threads can drive them concurrently.  The caller blocks until every result
-  ## has been received, then returns one RaftResult per input proposal.
+  ## all of them to commit.  Returns one RaftResult per input proposal.
   ##
-  ## This is the critical path for pipelined cross-shard 2PC: instead of
-  ##   propose(shard1) → wait → propose(shard2) → wait   (serial, 2× fsync)
-  ## we do:
+  ## This is the critical path for pipelined cross-shard 2PC:
   ##   propose(shard1) ─┐
   ##                    ├─ wait for both → done   (parallel, ~1× fsync wall-time)
   ##   propose(shard2) ─┘
+  ##
+  ## Routing: proposeParallel ALWAYS bypasses the group-commit batcher and
+  ## routes directly to per-shard workers (single-node) or global proposalCh
+  ## (multi-node transport).  The batcher's purpose is coalescing many
+  ## concurrent *single* proposals — routing parallel proposals through it
+  ## would serialise their fsyncs because the batcher's flush thread calls
+  ## flushFn(shard1) then flushFn(shard2) sequentially.  Direct per-shard
+  ## routing lets shard1 and shard2 fsync in parallel on their own threads,
+  ## cutting cross-shard commit latency from Σ(fsync_i) to max(fsync_i).
   ##
   ## Thread safety: each ProposalResultChannel is allocated per-proposal and
   ## freed here after recv(). No shared state between proposals.
@@ -601,14 +637,12 @@ proc proposeParallel*(c: MultiRaftCoordinator,
     prcPtrs[i][].ch.open(1)
 
   # Dispatch all proposals without waiting for any result.
+  # Always use per-shard workers for single-node path (bypass batcher).
   for i in 0 ..< n:
     let p = proposals[i]
-    if c.groupCommitEnabled and c.groupCommitBatcherPtr != nil and
-        c.transport == nil and p.command.kind == ckWrite:
-      enqueue(c.groupCommitBatcherPtr, p.rangeId, p.command, prcPtrs[i])
-    elif c.transport == nil:
-      # Per-shard worker path: route each proposal to its shard's channel so
-      # all N fdatasyncs run truly in parallel.
+    if c.transport == nil:
+      # Per-shard worker path: each proposal goes to its shard's dedicated
+      # thread so all N fdatasyncs run truly in parallel.
       acquire(c.shardWorkersMu)
       let swPtr = c.shardWorkers.getOrDefault(p.rangeId, nil)
       release(c.shardWorkersMu)
@@ -619,12 +653,14 @@ proc proposeParallel*(c: MultiRaftCoordinator,
           resultPtr: prcPtrs[i],
         ))
       else:
+        # Fallback: shard worker not available → global pool.
         c.proposalCh.send(Proposal(
           rangeId: p.rangeId,
           command: p.command,
           resultPtr: prcPtrs[i],
         ))
     else:
+      # Multi-node transport path: global worker pool handles replication.
       c.proposalCh.send(Proposal(
         rangeId: p.rangeId,
         command: p.command,
