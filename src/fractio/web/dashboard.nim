@@ -26,74 +26,98 @@ const htmlShell = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Fractio</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@shoelace-style/shoelace@2.18.0/cdn/themes/light.css">
+<script type="module" src="https://cdn.jsdelivr.net/npm/@shoelace-style/shoelace@2.18.0/cdn/shoelace-autoloader.js"></script>
 <style>
+/* ---- Shoelace design-token overrides: red/black accent on white ---- */
+:root{
+  --sl-color-primary-50:#fff0f0;
+  --sl-color-primary-100:#ffd6d6;
+  --sl-color-primary-200:#ffadad;
+  --sl-color-primary-300:#ff8080;
+  --sl-color-primary-400:#ff4d4d;
+  --sl-color-primary-500:#e81c1c;
+  --sl-color-primary-600:#c41010;
+  --sl-color-primary-700:#a00000;
+  --sl-color-primary-800:#7a0000;
+  --sl-color-primary-900:#550000;
+  --sl-color-primary-950:#330000;
+  --sl-font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+}
+/* ---- Layout ---- */
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
-  background:#0f1117;color:#e2e8f0;min-height:100vh}
+html,body{height:100%}
+body{font-family:var(--sl-font-sans);background:#f8f8f8;color:#111;min-height:100vh}
 .app{display:flex;flex-direction:column;min-height:100vh}
-header{display:flex;align-items:center;gap:1rem;padding:0 1.5rem;
-  height:56px;background:#161b26;border-bottom:1px solid #2d3748;position:sticky;top:0;z-index:10}
-.logo{font-size:1.05rem;font-weight:700;color:#63b3ed;letter-spacing:.06em;margin-right:1rem}
-nav{display:flex;gap:.25rem;flex:1}
-.tab-btn{background:transparent;border:none;color:#a0aec0;padding:.4rem .9rem;
-  border-radius:4px;cursor:pointer;font-size:.85rem;transition:all .15s}
-.tab-btn:hover{background:#2d3748;color:#e2e8f0}
-.tab-active{background:#2b6cb0 !important;color:#fff !important}
-.badge{padding:.25rem .7rem;border-radius:9999px;font-size:.75rem;font-weight:600;white-space:nowrap}
-.badge-ok{background:#276749;color:#9ae6b4}
-.badge-degraded{background:#744210;color:#fbd38d}
-.badge-critical{background:#742a2a;color:#feb2b2}
-.badge-unknown{background:#2d3748;color:#a0aec0}
-main{flex:1;padding:1.5rem;max-width:1200px;width:100%}
-.panel h2{font-size:1.05rem;font-weight:600;color:#e2e8f0;margin-bottom:1rem}
-.panel h3{font-size:.85rem;font-weight:600;color:#a0aec0;margin-bottom:.5rem}
-.stats-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:.75rem}
-.stat-card{background:#161b26;border:1px solid #2d3748;border-radius:8px;
-  padding:1rem;text-align:center}
-.stat-label{font-size:.68rem;color:#718096;text-transform:uppercase;
-  letter-spacing:.06em;margin-bottom:.4rem}
-.stat-value{font-size:1.35rem;font-weight:700;color:#63b3ed}
-.panel-header{display:flex;align-items:baseline;gap:1rem;margin-bottom:1rem}
-.panel-header h2{margin-bottom:0}
-.count-badge{font-size:.75rem;color:#a0aec0;background:#2d3748;
-  padding:.2rem .6rem;border-radius:9999px}
-.table-wrap{overflow-x:auto;margin-bottom:1.5rem}
-.data-table{width:100%;border-collapse:collapse;font-size:.85rem}
-.data-table th{background:#161b26;color:#718096;padding:.5rem .75rem;text-align:left;
-  border-bottom:1px solid #2d3748;font-weight:500;text-transform:uppercase;
-  font-size:.68rem;letter-spacing:.06em}
-.data-table td{padding:.5rem .75rem;border-bottom:1px solid #1e2533}
-.data-table tr:hover td{background:#1a2035}
-.status-pill{padding:.15rem .5rem;border-radius:9999px;font-size:.75rem}
-.status-active{background:#276749;color:#9ae6b4}
-.status-draining{background:#744210;color:#fbd38d}
-.status-down{background:#742a2a;color:#feb2b2}
-.status-unknown{background:#2d3748;color:#a0aec0}
-.btn-remove{background:#742a2a;color:#feb2b2;border:none;padding:.2rem .5rem;
-  border-radius:4px;cursor:pointer;font-size:.75rem}
-.btn-remove:hover{background:#9b2c2c}
-.form-section{background:#161b26;border:1px solid #2d3748;border-radius:8px;padding:1rem}
-.form-row{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center;margin-bottom:.5rem}
-.form-row input{background:#0f1117;border:1px solid #2d3748;color:#e2e8f0;
-  padding:.4rem .6rem;border-radius:4px;font-size:.85rem;width:130px}
-.form-row input:focus{outline:none;border-color:#2b6cb0}
-.btn-primary{background:#2b6cb0;color:#fff;border:none;padding:.4rem .8rem;
-  border-radius:4px;cursor:pointer;font-size:.85rem;font-weight:500}
-.btn-primary:hover{background:#2c5282}
-.form-msg{font-size:.8rem;margin-top:.4rem;padding:.15rem 0;min-height:1.2em}
-.form-msg.ok{color:#9ae6b4}
-.form-msg.err{color:#feb2b2}
-.metrics-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:1rem}
-.metrics-section{background:#161b26;border:1px solid #2d3748;border-radius:8px;padding:1rem}
-.metrics-table{width:100%;font-size:.85rem;border-collapse:collapse}
-.metrics-table td{padding:.3rem 0;color:#a0aec0}
-.metrics-table td:last-child{text-align:right;font-family:'SF Mono',monospace;color:#63b3ed}
-footer{padding:.75rem 1.5rem;background:#161b26;border-top:1px solid #2d3748;
-  font-size:.72rem;color:#4a5568;text-align:center}
+/* ---- Header ---- */
+header{
+  display:flex;align-items:center;gap:1rem;
+  padding:0 1.75rem;height:60px;
+  background:#e81c1c;
+  box-shadow:0 2px 8px rgba(0,0,0,.18);
+  position:sticky;top:0;z-index:100;
+}
+.logo{
+  font-size:1.1rem;font-weight:800;color:#fff;
+  letter-spacing:.1em;display:flex;align-items:center;gap:.45rem;
+}
+.logo-hex{font-size:1.35rem;line-height:1}
+/* ---- Main content ---- */
+main{flex:1;padding:1.75rem;max-width:1260px;width:100%}
+/* ---- Stat cards grid ---- */
+.stats-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fill,minmax(160px,1fr));
+  gap:1rem;
+}
+.stats-grid sl-card::part(base){
+  border-top:3px solid #e81c1c;
+  text-align:center;
+}
+.stat-label{
+  font-size:.68rem;color:#666;text-transform:uppercase;
+  letter-spacing:.07em;margin-bottom:.5rem;font-weight:600;
+}
+.stat-value{
+  font-size:1.5rem;font-weight:700;color:#e81c1c;
+}
+/* ---- Panel header (nodes tab) ---- */
+.panel-header{display:flex;align-items:center;gap:.75rem;margin-bottom:1rem}
+.panel-header h2{font-size:1.05rem;font-weight:700;color:#111;margin:0}
+/* ---- Data table ---- */
+.table-wrap{overflow-x:auto;margin-bottom:1.25rem}
+.data-table{width:100%;border-collapse:collapse;font-size:.875rem;background:#fff;
+  border:1px solid #e0e0e0;border-radius:6px;overflow:hidden}
+.data-table th{
+  background:#111;color:#fff;padding:.55rem .85rem;text-align:left;
+  font-size:.7rem;text-transform:uppercase;letter-spacing:.07em;font-weight:600;
+}
+.data-table td{padding:.55rem .85rem;border-bottom:1px solid #eee;color:#222}
+.data-table tbody tr:hover td{background:#fff5f5}
+.data-table tbody tr:last-child td{border-bottom:none}
+/* ---- Form row inside card ---- */
+.form-row{display:flex;gap:.5rem;flex-wrap:wrap;align-items:flex-end;margin-bottom:.5rem}
+.form-msg{font-size:.82rem;margin-top:.4rem;min-height:1.3em}
+.form-msg.ok{color:#1a7f37}
+.form-msg.err{color:#c41010}
+/* ---- Metrics grid ---- */
+.metrics-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:1rem}
+.metrics-table{width:100%;font-size:.875rem;border-collapse:collapse}
+.metrics-table td{padding:.35rem 0;color:#444;border-bottom:1px solid #f0f0f0}
+.metrics-table tr:last-child td{border-bottom:none}
+.metrics-table td:last-child{text-align:right;font-family:'SF Mono','Fira Mono',monospace;
+  color:#e81c1c;font-weight:600}
+/* ---- Footer ---- */
+footer{
+  padding:.75rem 1.75rem;background:#111;color:#888;
+  font-size:.75rem;text-align:center;letter-spacing:.03em;
+}
 </style>
 </head>
 <body>
-<div id="loading" style="padding:3rem;text-align:center;color:#718096">Loading dashboard&#8230;</div>
+<div id="loading" style="padding:4rem;text-align:center;color:#888;font-size:1rem">
+  Loading dashboard&#8230;
+</div>
 <script src="/app.js"></script>
 </body>
 </html>

@@ -2,7 +2,7 @@
 var framePtr = null;
 var excHandler = 0;
 var lastJSError = null;
-var NTI570425645 = {size: 0, kind: 18, base: null, node: null, finalizer: null};
+var NTI570425609 = {size: 0, kind: 18, base: null, node: null, finalizer: null};
 var NTI134217743 = {size: 0, kind: 17, base: null, node: null, finalizer: null};
 var NTI134217741 = {size: 0, kind: 17, base: null, node: null, finalizer: null};
 var NTI134217742 = {size: 0, kind: 17, base: null, node: null, finalizer: null};
@@ -44,9 +44,9 @@ NTI134217742.base = NTI134217741;
 var NNI134217743 = {kind: 2, len: 0, offset: 0, typ: null, name: null, sons: []};
 NTI134217743.node = NNI134217743;
 NTI134217743.base = NTI134217741;
-var NNI570425645 = {kind: 2, len: 2, offset: 0, typ: null, name: null, sons: [{kind: 1, offset: "Field0", len: 0, typ: NTI33554449, name: "Field0", sons: null}, 
+var NNI570425609 = {kind: 2, len: 2, offset: 0, typ: null, name: null, sons: [{kind: 1, offset: "Field0", len: 0, typ: NTI33554449, name: "Field0", sons: null}, 
 {kind: 1, offset: "Field1", len: 0, typ: NTI33554450, name: "Field1", sons: null}]};
-NTI570425645.node = NNI570425645;
+NTI570425609.node = NNI570425609;
 
 function setConstr() {
         var result = {};
@@ -434,13 +434,13 @@ function addChars__stdZprivateZdigitsutils_u202(result_p0, result_p0_Idx, x_p1, 
          else {result_p0[result_p0_Idx].length = Temporary1; };
     Label2: {
       var iHEX60gensym4_335544542 = 0;
-      var i_570426135 = 0;
+      var i_570426113 = 0;
       Label3: {
           Label4: while (true) {
-          if (!(i_570426135 < n_p3)) break Label4;
-            iHEX60gensym4_335544542 = i_570426135;
+          if (!(i_570426113 < n_p3)) break Label4;
+            iHEX60gensym4_335544542 = i_570426113;
             result_p0[result_p0_Idx][(old_335544528 + iHEX60gensym4_335544542)] = x_p1.charCodeAt((start_p2 + iHEX60gensym4_335544542));
-            i_570426135 += 1;
+            i_570426113 += 1;
           }
       };
     };
@@ -556,16 +556,16 @@ function raiseDefect() {
   
 }
 
-function el__frontend_u51(id_p0) {
-  var result_570425397 = null;
+function el__frontend_u58(id_p0) {
+  var result_570425404 = null;
 
-    result_570425397 = document.getElementById(toJSStr(id_p0));
+    result_570425404 = document.getElementById(toJSStr(id_p0));
 
-  return result_570425397;
+  return result_570425404;
 
 }
 
-function clearEl__frontend_u70(e_p0) {
+function clearEl__frontend_u77(e_p0) {
     e_p0.innerHTML = "";
 
   
@@ -586,30 +586,30 @@ function raiseIndexError(i_p0, a_p1, b_p2) {
   
 }
 
-function nodeStatusCls__frontend_u163(s_p0) {
+function nodeStatusVariant__frontend_u108(s_p0) {
     var Temporary1;
 
-  var result_570425509 = [];
+  var result_570425454 = [];
 
-    if (    s_p0 == 1    ){      Temporary1 = [115,116,97,116,117,115,45,97,99,116,105,118,101];
+    if (    s_p0 == 1    ){      Temporary1 = [115,117,99,99,101,115,115];
       }
-    else if (    s_p0 == 2    ){      Temporary1 = [115,116,97,116,117,115,45,100,114,97,105,110,105,110,103];
+    else if (    s_p0 == 2    ){      Temporary1 = [119,97,114,110,105,110,103];
       }
-    else if (    s_p0 == 3    ){      Temporary1 = [115,116,97,116,117,115,45,100,111,119,110];
+    else if (    s_p0 == 3    ){      Temporary1 = [100,97,110,103,101,114];
       }
     else{
-      Temporary1 = [115,116,97,116,117,115,45,117,110,107,110,111,119,110];
+      Temporary1 = [110,101,117,116,114,97,108];
       }
-    result_570425509 = nimCopy(null, Temporary1, NTI33554449);
+    result_570425454 = nimCopy(null, Temporary1, NTI33554449);
 
-  return result_570425509;
+  return result_570425454;
 
 }
 
-function nodeStatusStr__frontend_u160(s_p0) {
+function nodeStatusStr__frontend_u105(s_p0) {
     var Temporary1;
 
-  var result_570425506 = [];
+  var result_570425451 = [];
 
     if (    s_p0 == 1    ){      Temporary1 = [97,99,116,105,118,101];
       }
@@ -620,9 +620,9 @@ function nodeStatusStr__frontend_u160(s_p0) {
     else{
       Temporary1 = [117,110,107,110,111,119,110];
       }
-    result_570425506 = nimCopy(null, Temporary1, NTI33554449);
+    result_570425451 = nimCopy(null, Temporary1, NTI33554449);
 
-  return result_570425506;
+  return result_570425451;
 
 }
 
@@ -643,232 +643,160 @@ function failedAssertImpl__stdZassertions_u86(msg_p0) {
 
   
 }
-async function refreshNodesTable__frontend_u263() {
+async function refreshNodesTable__frontend_u224() {
     var Temporary4;
 
-  var result_570425609 = null;
+  var result_570425570 = null;
 
   BeforeRet: {
-    lastNodes_570425438[0] = (await fetch("/api/nodes").then(function(r){return r.json()}));
-    var tbody_570425619 = el__frontend_u51([110,111,100,101,115,45,116,97,98,108,101,45,98,111,100,121]);
-    if ((tbody_570425619 == null)) {
-    result_570425609 = undefined;
+    lastNodes_570425433[0] = (await fetch("/api/nodes").then(function(r){return r.json()}));
+    var tbody_570425580 = el__frontend_u58([110,111,100,101,115,45,116,97,98,108,101,45,98,111,100,121]);
+    if ((tbody_570425580 == null)) {
+    result_570425570 = undefined;
     break BeforeRet;
     }
     
-    clearEl__frontend_u70(tbody_570425619);
-    var arr_570425627 = (lastNodes_570425438[0]);
+    clearEl__frontend_u77(tbody_570425580);
+    var arr_570425588 = (lastNodes_570425433[0]);
     Label1: {
-      var node_570425650 = null;
-      var i_570426142 = 0;
-      var L_570426143 = (arr_570425627).length;
+      var node_570425611 = null;
+      var i_570426120 = 0;
+      var L_570426121 = (arr_570425588).length;
       Label2: {
           Label3: while (true) {
-          if (!(i_570426142 < L_570426143)) break Label3;
-            node_570425650 = arr_570425627[chckIndx(i_570426142, 0, (arr_570425627).length - 1)];
-            var nodeId_570425658 = (node_570425650.nodeId);
-            var host_570425666 = cstrToNimstr((node_570425650.host));
-            var raftPort_570425674 = (node_570425650.raftPort);
-            var clientPort_570425682 = (node_570425650.clientPort);
-            var status_570425690 = (node_570425650.status);
-            var tr_570425691 = document.createElement("tr");
-            tr_570425691.innerHTML = toJSStr(([60,116,100,62]).concat(HEX24__systemZdollars_u14(nodeId_570425658),[60,47,116,100,62,60,116,100,62],host_570425666,[60,47,116,100,62,60,116,100,62],HEX24__systemZdollars_u14(raftPort_570425674),[60,47,116,100,62,60,116,100,62],HEX24__systemZdollars_u14(clientPort_570425682),[60,47,116,100,62,60,116,100,62,60,115,112,97,110,32,99,108,97,115,115,61,34,115,116,97,116,117,115,45,112,105,108,108,32],nodeStatusCls__frontend_u163(status_570425690),[34,62],nodeStatusStr__frontend_u160(status_570425690),[60,47,115,112,97,110,62,60,47,116,100,62,60,116,100,62,60,98,117,116,116,111,110,32,99,108,97,115,115,61,34,98,116,110,45,114,101,109,111,118,101,34,32,111,110,99,108,105,99,107,61,34,95,114,101,109,111,118,101,78,111,100,101,40],HEX24__systemZdollars_u14(nodeId_570425658),[41,34,62,82,101,109,111,118,101,60,47,98,117,116,116,111,110,62,60,47,116,100,62]));
-            tbody_570425619.appendChild(tr_570425691);
-            i_570426142 += 1;
-            if (!(((arr_570425627).length == L_570426143))) {
+          if (!(i_570426120 < L_570426121)) break Label3;
+            node_570425611 = arr_570425588[chckIndx(i_570426120, 0, (arr_570425588).length - 1)];
+            var nodeId_570425619 = (node_570425611.nodeId);
+            var host_570425627 = cstrToNimstr((node_570425611.host));
+            var raftPort_570425635 = (node_570425611.raftPort);
+            var clientPort_570425643 = (node_570425611.clientPort);
+            var status_570425651 = (node_570425611.status);
+            var tr_570425652 = document.createElement("tr");
+            tr_570425652.innerHTML = toJSStr(([60,116,100,62]).concat(HEX24__systemZdollars_u14(nodeId_570425619),[60,47,116,100,62,60,116,100,62],host_570425627,[60,47,116,100,62,60,116,100,62],HEX24__systemZdollars_u14(raftPort_570425635),[60,47,116,100,62,60,116,100,62],HEX24__systemZdollars_u14(clientPort_570425643),[60,47,116,100,62,60,116,100,62,60,115,108,45,98,97,100,103,101,32,118,97,114,105,97,110,116,61,34],nodeStatusVariant__frontend_u108(status_570425651),[34,32,112,105,108,108,62],nodeStatusStr__frontend_u105(status_570425651),makeNimstrLit("</sl-badge></td><td><sl-button variant=\"danger\" size=\"small\" onclick=\"_removeNode("),HEX24__systemZdollars_u14(nodeId_570425619),[41,34,62,82,101,109,111,118,101,60,47,115,108,45,98,117,116,116,111,110,62,60,47,116,100,62]));
+            tbody_570425580.appendChild(tr_570425652);
+            i_570426120 += 1;
+            if (!(((arr_570425588).length == L_570426121))) {
             failedAssertImpl__stdZassertions_u86(makeNimstrLit("iterators.nim(254, 11) `len(a) == L` the length of the seq changed while iterating over it"));
             }
             
           }
       };
     };
-    var countEl_570425692 = el__frontend_u51([110,111,100,101,115,45,99,111,117,110,116]);
-    if (!((countEl_570425692 == null))) {
-    if (!(((arr_570425627).length == 1))) {
+    var countEl_570425653 = el__frontend_u58([110,111,100,101,115,45,99,111,117,110,116]);
+    if (!((countEl_570425653 == null))) {
+    if (!(((arr_570425588).length == 1))) {
     Temporary4 = [115];
     }
     else {
     Temporary4 = [];
     }
     
-    var s_570425699 = nimCopy(null, Temporary4, NTI33554449);
-    countEl_570425692.innerHTML = toJSStr((HEX24__systemZdollars_u14((arr_570425627).length)).concat([32,110,111,100,101],s_570425699,[32,114,101,103,105,115,116,101,114,101,100]));
+    var s_570425660 = nimCopy(null, Temporary4, NTI33554449);
+    countEl_570425653.innerHTML = toJSStr((HEX24__systemZdollars_u14((arr_570425588).length)).concat([32,110,111,100,101],s_570425660));
     }
     
-    result_570425609 = undefined;
+    result_570425570 = undefined;
     break BeforeRet;
   };
 
-  return result_570425609;
+  return result_570425570;
 
 }
-async function removeNodeById__frontend_u440(nodeId_p0) {
-  var result_570425787 = null;
+async function removeNodeById__frontend_u385(nodeId_p0) {
+  var result_570425732 = null;
 
   BeforeRet: {
-    var opts_570425793 = {};
-    opts_570425793.method = "DELETE";
-    ((await fetch(toJSStr(([47,97,112,105,47,110,111,100,101,115,47]).concat(HEX24__systemZdollars_u14(nodeId_p0))), opts_570425793).then(function(r){return r.json()})));
-    (await refreshNodesTable__frontend_u263());
-    result_570425787 = undefined;
+    var opts_570425738 = {};
+    opts_570425738.method = "DELETE";
+    ((await fetch(toJSStr(([47,97,112,105,47,110,111,100,101,115,47]).concat(HEX24__systemZdollars_u14(nodeId_p0))), opts_570425738).then(function(r){return r.json()})));
+    (await refreshNodesTable__frontend_u224());
+    result_570425732 = undefined;
     break BeforeRet;
   };
 
-  return result_570425787;
+  return result_570425732;
 
 }
 
 function _removeNode(nodeId_p0) {
-    (removeNodeById__frontend_u440(nodeId_p0));
+    (removeNodeById__frontend_u385(nodeId_p0));
 
   
 }
-async function joinNodeSubmit__frontend_u469() {
+async function joinNodeSubmit__frontend_u414() {
     var Temporary1;
 
-  var result_570425815 = null;
+  var result_570425760 = null;
 
   BeforeRet: {
-    var idEl_570425821 = el__frontend_u51([106,111,105,110,45,105,100]);
-    var hostEl_570425822 = el__frontend_u51([106,111,105,110,45,104,111,115,116]);
-    var raftEl_570425823 = el__frontend_u51([106,111,105,110,45,114,97,102,116]);
-    var clientEl_570425824 = el__frontend_u51([106,111,105,110,45,99,108,105,101,110,116]);
-    var msgEl_570425825 = el__frontend_u51([106,111,105,110,45,109,115,103]);
-    if (((((idEl_570425821 == null) || (hostEl_570425822 == null)) || (raftEl_570425823 == null)) || (clientEl_570425824 == null))) {
-    result_570425815 = undefined;
+    var idEl_570425766 = el__frontend_u58([106,111,105,110,45,105,100]);
+    var hostEl_570425767 = el__frontend_u58([106,111,105,110,45,104,111,115,116]);
+    var raftEl_570425768 = el__frontend_u58([106,111,105,110,45,114,97,102,116]);
+    var clientEl_570425769 = el__frontend_u58([106,111,105,110,45,99,108,105,101,110,116]);
+    var msgEl_570425770 = el__frontend_u58([106,111,105,110,45,109,115,103]);
+    if (((((idEl_570425766 == null) || (hostEl_570425767 == null)) || (raftEl_570425768 == null)) || (clientEl_570425769 == null))) {
+    result_570425760 = undefined;
     break BeforeRet;
     }
     
-    var body_570425838 = {};
-    body_570425838.nodeId = parseInt(idEl_570425821.value, 10);
-    body_570425838.host = hostEl_570425822.value;
-    body_570425838.raftPort = parseInt(raftEl_570425823.value, 10);
-    body_570425838.clientPort = parseInt(clientEl_570425824.value, 10);
-    var headers_570425879 = {};
-    headers_570425879["Content-Type"] = "application/json";
-    var opts_570425885 = {};
-    opts_570425885.method = "POST";
-    opts_570425885.headers = headers_570425879;
-    opts_570425885.body = JSON.stringify(body_570425838);
-    var resp_570425920 = (await fetch("/api/nodes", opts_570425885).then(function(r){return r.json()}));
-    var success_570425928 = (resp_570425920.success);
-    var message_570425936 = cstrToNimstr((resp_570425920.message));
-    if (!((msgEl_570425825 == null))) {
-    msgEl_570425825.innerHTML = toJSStr(message_570425936);
-    if (success_570425928) {
+    var body_570425783 = {};
+    body_570425783.nodeId = parseInt(idEl_570425766.value, 10);
+    body_570425783.host = hostEl_570425767.value;
+    body_570425783.raftPort = parseInt(raftEl_570425768.value, 10);
+    body_570425783.clientPort = parseInt(clientEl_570425769.value, 10);
+    var headers_570425824 = {};
+    headers_570425824["Content-Type"] = "application/json";
+    var opts_570425830 = {};
+    opts_570425830.method = "POST";
+    opts_570425830.headers = headers_570425824;
+    opts_570425830.body = JSON.stringify(body_570425783);
+    var resp_570425865 = (await fetch("/api/nodes", opts_570425830).then(function(r){return r.json()}));
+    var success_570425873 = (resp_570425865.success);
+    var message_570425881 = cstrToNimstr((resp_570425865.message));
+    if (!((msgEl_570425770 == null))) {
+    msgEl_570425770.innerHTML = toJSStr(message_570425881);
+    if (success_570425873) {
     Temporary1 = "form-msg ok";
     }
     else {
     Temporary1 = "form-msg err";
     }
     
-    msgEl_570425825.className = Temporary1;
+    msgEl_570425770.className = Temporary1;
     }
     
-    if (success_570425928) {
-    idEl_570425821.value = "";
-    hostEl_570425822.value = "";
-    raftEl_570425823.value = "";
-    clientEl_570425824.value = "";
-    (await refreshNodesTable__frontend_u263());
+    if (success_570425873) {
+    idEl_570425766.value = "";
+    hostEl_570425767.value = "";
+    raftEl_570425768.value = "";
+    clientEl_570425769.value = "";
+    (await refreshNodesTable__frontend_u224());
     }
     
-    result_570425815 = undefined;
+    result_570425760 = undefined;
     break BeforeRet;
   };
 
-  return result_570425815;
+  return result_570425760;
 
 }
 
 function _joinNode() {
-    (joinNodeSubmit__frontend_u469());
+    (joinNodeSubmit__frontend_u414());
 
   
 }
 
-function addCls__frontend_u78(e_p0, cls_p1) {
-    if (!((e_p0 == null))) {
-    e_p0.classList.add(toJSStr(cls_p1));
-    }
-    
+function buildUI__frontend_u684() {
+    document.body.innerHTML = "<div class=\"app\">\n  <header>\n    <div class=\"logo\">&#x2B22; FRACTIO</div>\n    <div style=\"flex:1\"></div>\n    <sl-badge id=\"health-badge\" variant=\"neutral\" pill>&#8230;</sl-badge>\n  </header>\n\n  <main>\n    <sl-tab-group id=\"main-tabs\">\n      <sl-tab slot=\"nav\" panel=\"dashboard\">Dashboard</sl-tab>\n      <sl-tab slot=\"nav\" panel=\"nodes\">Nodes</sl-tab>\n      <sl-tab slot=\"nav\" panel=\"metrics\">Metrics</sl-tab>\n\n      <sl-tab-panel name=\"dashboard\" style=\"--padding:1.25rem 0 0 0\">\n        <div class=\"stats-grid\">\n          <sl-card>\n            <div class=\"stat-label\">Node ID</div>\n            <div id=\"stat-nodeid\" class=\"stat-value\">&#8212;</div>\n          </sl-card>\n          <sl-card>\n            <div class=\"stat-label\">Role</div>\n            <div id=\"stat-role\" class=\"stat-value\">&#8212;</div>\n          </sl-card>\n          <sl-card>\n            <div class=\"stat-label\">Uptime</div>\n            <div id=\"stat-uptime\" class=\"stat-value\">&#8212;</div>\n          </sl-card>\n          <sl-card>\n            <div class=\"stat-label\">Active Clients</div>\n            <div id=\"stat-clients\" class=\"stat-value\">&#8212;</div>\n          </sl-card>\n          <sl-card>\n            <div class=\"stat-label\">Shards</div>\n            <div id=\"stat-shards\" class=\"stat-value\">&#8212;</div>\n          </sl-card>\n          <sl-card>\n            <div class=\"stat-label\">Version</div>\n            <div id=\"stat-version\" class=\"stat-value\">&#8212;</div>\n          </sl-card>\n          <sl-card>\n            <div class=\"stat-label\">Cluster</div>\n            <div id=\"stat-cluster\" class=\"stat-value\">&#8212;</div>\n          </sl-card>\n          <sl-card>\n            <div class=\"stat-label\">Healthy Replicas</div>\n            <div id=\"stat-replicas\" class=\"stat-value\">&#8212;</div>\n          </sl-card>\n        </div>\n      </sl-tab-panel>\n\n      <sl-tab-panel name=\"nodes\" style=\"--padding:1.25rem 0 0 0\">\n        <div class=\"panel-header\">\n          <h2>Cluster Nodes</h2>\n          <sl-badge id=\"nodes-count\" variant=\"neutral\">0 nodes</sl-badge>\n        </div>\n        <div class=\"table-wrap\">\n          <table class=\"data-table\">\n            <thead><tr>\n              <th>ID</th><th>Host</th><th>Raft Port</th>\n              <th>Client Port</th><th>Status</th><th>Action</th>\n            </tr></thead>\n            <tbody id=\"nodes-table-body\"></tbody>\n          </table>\n        </div>\n        <sl-card>\n          <strong slot=\"header\">Join Node</strong>\n          <div class=\"form-row\">\n            <sl-input id=\"join-id\"     type=\"number\" placeholder=\"Node ID\"     size=\"small\" style=\"width:130px\"></sl-input>\n            <sl-input id=\"join-host\"   type=\"text\"   placeholder=\"Host\"        size=\"small\" style=\"width:190px\"></sl-input>\n            <sl-input id=\"join-raft\"   type=\"number\" placeholder=\"Raft port\"   size=\"small\" style=\"width:130px\"></sl-input>\n            <sl-input id=\"join-client\" type=\"number\" placeholder=\"Client port\" size=\"small\" style=\"width:130px\"></sl-input>\n            <sl-button variant=\"primary\" onclick=\"_joinNode()\">Join</sl-button>\n          </div>\n          <div id=\"join-msg\" class=\"form-msg\"></div>\n        </sl-card>\n      </sl-tab-panel>\n\n      <sl-tab-panel name=\"metrics\" style=\"--padding:1.25rem 0 0 0\">\n        <div class=\"metrics-grid\">\n          <sl-card>\n            <strong slot=\"header\">Requests</strong>\n            <table class=\"metrics-table\">\n              <tr><td>Total</td>  <td id=\"metric-requests-total\">&#8212;</td></tr>\n              <tr><td>OK</td>     <td id=\"metric-requests-ok\">&#8212;</td></tr>\n              <tr><td>Errors</td> <td id=\"metric-requests-err\">&#8212;</td></tr>\n            </table>\n          </sl-card>\n          <sl-card>\n            <strong slot=\"header\">Network</strong>\n            <table class=\"metrics-table\">\n              <tr><td>Bytes In</td>  <td id=\"metric-bytes-in\">&#8212;</td></tr>\n              <tr><td>Bytes Out</td> <td id=\"metric-bytes-out\">&#8212;</td></tr>\n            </table>\n          </sl-card>\n          <sl-card>\n            <strong slot=\"header\">KV Operations</strong>\n            <table class=\"metrics-table\">\n              <tr><td>Gets</td>    <td id=\"metric-kv-gets\">&#8212;</td></tr>\n              <tr><td>Puts</td>    <td id=\"metric-kv-puts\">&#8212;</td></tr>\n              <tr><td>Deletes</td> <td id=\"metric-kv-deletes\">&#8212;</td></tr>\n            </table>\n          </sl-card>\n          <sl-card>\n            <strong slot=\"header\">Transactions</strong>\n            <table class=\"metrics-table\">\n              <tr><td>Active</td>    <td id=\"metric-active-txns\">&#8212;</td></tr>\n              <tr><td>Committed</td> <td id=\"metric-committed-txns\">&#8212;</td></tr>\n              <tr><td>Aborted</td>   <td id=\"metric-aborted-txns\">&#8212;</td></tr>\n            </table>\n          </sl-card>\n        </div>\n      </sl-tab-panel>\n    </sl-tab-group>\n  </main>\n\n  <footer>Fractio Management Console &middot; Auto-refresh every 5s</footer>\n</div>\n";
 
   
 }
 
-function rmCls__frontend_u84(e_p0, cls_p1) {
-    if (!((e_p0 == null))) {
-    e_p0.classList.remove(toJSStr(cls_p1));
-    }
-    
-
-  
-}
-
-function showTab__frontend_u95(name_p0) {
-            var Temporary4;
-            var Temporary5;
-
-    currentTab_570425434[0] = nimCopy(null, name_p0, NTI33554449);
-    Label1: {
-      var tab_570425467 = [];
-      var i_570426147 = 0;
-      Label2: {
-          Label3: while (true) {
-          if (!true) break Label3;
-            tab_570425467 = (Temporary4 = [[100,97,115,104,98,111,97,114,100], [110,111,100,101,115], [109,101,116,114,105,99,115]], Temporary4)[chckIndx(i_570426147, 0, (Temporary4).length - 1)];
-            var panel_570425468 = el__frontend_u51(([112,97,110,101,108,45]).concat(tab_570425467));
-            var btn_570425469 = el__frontend_u51(([116,97,98,45]).concat(tab_570425467));
-            if (!((panel_570425468 == null))) {
-            if (eqStrings(tab_570425467, name_p0)) {
-            Temporary5 = "block";
-            }
-            else {
-            Temporary5 = "none";
-            }
-            
-            panel_570425468.style.display = Temporary5;
-            }
-            
-            if (eqStrings(tab_570425467, name_p0)) {
-            addCls__frontend_u78(btn_570425469, [116,97,98,45,97,99,116,105,118,101]);
-            }
-            else {
-            rmCls__frontend_u84(btn_570425469, [116,97,98,45,97,99,116,105,118,101]);
-            }
-            
-            if ((2 <= i_570426147)) {
-            break Label2;
-            }
-            
-            i_570426147 += 1;
-          }
-      };
-    };
-
-  
-}
-
-function switchTab(name_p0) {
-    showTab__frontend_u95(cstrToNimstr(name_p0));
-    if (eqStrings(currentTab_570425434[0], [110,111,100,101,115])) {
-    (refreshNodesTable__frontend_u263());
-    }
-    
-
-  
-}
-
-function buildUI__frontend_u741() {
-    document.body.innerHTML = "<div class=\"app\">\n  <header>\n    <div class=\"logo\">&#x2B22; FRACTIO</div>\n    <nav>\n      <button id=\"tab-dashboard\" class=\"tab-btn tab-active\" onclick=\"switchTab('dashboard')\">Dashboard</button>\n      <button id=\"tab-nodes\"     class=\"tab-btn\"            onclick=\"switchTab('nodes')\">Nodes</button>\n      <button id=\"tab-metrics\"   class=\"tab-btn\"            onclick=\"switchTab('metrics')\">Metrics</button>\n    </nav>\n    <div id=\"health-badge\" class=\"badge badge-unknown\">...</div>\n  </header>\n\n  <main>\n    <div id=\"panel-dashboard\" class=\"panel\">\n      <h2>Cluster Overview</h2>\n      <div class=\"stats-grid\">\n        <div class=\"stat-card\"><div class=\"stat-label\">Node ID</div>\n          <div id=\"stat-nodeid\" class=\"stat-value\">&#8212;</div></div>\n        <div class=\"stat-card\"><div class=\"stat-label\">Role</div>\n          <div id=\"stat-role\" class=\"stat-value\">&#8212;</div></div>\n        <div class=\"stat-card\"><div class=\"stat-label\">Uptime</div>\n          <div id=\"stat-uptime\" class=\"stat-value\">&#8212;</div></div>\n        <div class=\"stat-card\"><div class=\"stat-label\">Active Clients</div>\n          <div id=\"stat-clients\" class=\"stat-value\">&#8212;</div></div>\n        <div class=\"stat-card\"><div class=\"stat-label\">Shards</div>\n          <div id=\"stat-shards\" class=\"stat-value\">&#8212;</div></div>\n        <div class=\"stat-card\"><div class=\"stat-label\">Version</div>\n          <div id=\"stat-version\" class=\"stat-value\">&#8212;</div></div>\n        <div class=\"stat-card\"><div class=\"stat-label\">Cluster</div>\n          <div id=\"stat-cluster\" class=\"stat-value\">&#8212;</div></div>\n        <div class=\"stat-card\"><div class=\"stat-label\">Healthy Replicas</div>\n          <div id=\"stat-replicas\" class=\"stat-value\">&#8212;</div></div>\n      </div>\n    </div>\n\n    <div id=\"panel-nodes\" class=\"panel\" style=\"display:none\">\n      <div class=\"panel-header\">\n        <h2>Cluster Nodes</h2>\n        <span id=\"nodes-count\" class=\"count-badge\">&#8212;</span>\n      </div>\n      <div class=\"table-wrap\">\n        <table class=\"data-table\">\n          <thead><tr>\n            <th>ID</th><th>Host</th><th>Raft Port</th>\n            <th>Client Port</th><th>Status</th><th>Action</th>\n          </tr></thead>\n          <tbody id=\"nodes-table-body\"></tbody>\n        </table>\n      </div>\n      <div class=\"form-section\">\n        <h3>Join Node</h3>\n        <div class=\"form-row\">\n          <input id=\"join-id\"     type=\"number\" placeholder=\"Node ID\" min=\"1\" max=\"65535\">\n          <input id=\"join-host\"   type=\"text\"   placeholder=\"Host (e.g. 10.0.0.2)\">\n          <input id=\"join-raft\"   type=\"number\" placeholder=\"Raft port\">\n          <input id=\"join-client\" type=\"number\" placeholder=\"Client port\">\n          <button class=\"btn-primary\" onclick=\"_joinNode()\">Join</button>\n        </div>\n        <div id=\"join-msg\" class=\"form-msg\"></div>\n      </div>\n    </div>\n\n    <div id=\"panel-metrics\" class=\"panel\" style=\"display:none\">\n      <h2>Server Metrics</h2>\n      <div class=\"metrics-grid\">\n        <div class=\"metrics-section\">\n          <h3>Requests</h3>\n          <table class=\"metrics-table\">\n            <tr><td>Total</td>    <td id=\"metric-requests-total\">&#8212;</td></tr>\n            <tr><td>OK</td>       <td id=\"metric-requests-ok\">&#8212;</td></tr>\n            <tr><td>Errors</td>   <td id=\"metric-requests-err\">&#8212;</td></tr>\n          </table>\n        </div>\n        <div class=\"metrics-section\">\n          <h3>Network</h3>\n          <table class=\"metrics-table\">\n            <tr><td>Bytes In</td>  <td id=\"metric-bytes-in\">&#8212;</td></tr>\n            <tr><td>Bytes Out</td> <td id=\"metric-bytes-out\">&#8212;</td></tr>\n          </table>\n        </div>\n        <div class=\"metrics-section\">\n          <h3>KV Operations</h3>\n          <table class=\"metrics-table\">\n            <tr><td>Gets</td>    <td id=\"metric-kv-gets\">&#8212;</td></tr>\n            <tr><td>Puts</td>    <td id=\"metric-kv-puts\">&#8212;</td></tr>\n            <tr><td>Deletes</td> <td id=\"metric-kv-deletes\">&#8212;</td></tr>\n          </table>\n        </div>\n        <div class=\"metrics-section\">\n          <h3>Transactions</h3>\n          <table class=\"metrics-table\">\n            <tr><td>Active</td>    <td id=\"metric-active-txns\">&#8212;</td></tr>\n            <tr><td>Committed</td> <td id=\"metric-committed-txns\">&#8212;</td></tr>\n            <tr><td>Aborted</td>   <td id=\"metric-aborted-txns\">&#8212;</td></tr>\n          </table>\n        </div>\n      </div>\n    </div>\n  </main>\n\n  <footer><span>Fractio Management Console &middot; Auto-refresh every 5s</span></footer>\n</div>\n";
-
-  
-}
-
-function healthStr__frontend_u154(s_p0) {
+function healthStr__frontend_u99(s_p0) {
     var Temporary1;
 
-  var result_570425500 = [];
+  var result_570425445 = [];
 
     if (    s_p0 == 0    ){      Temporary1 = [79,75];
       }
@@ -879,33 +807,33 @@ function healthStr__frontend_u154(s_p0) {
     else{
       Temporary1 = [85,78,75,78,79,87,78];
       }
-    result_570425500 = nimCopy(null, Temporary1, NTI33554449);
+    result_570425445 = nimCopy(null, Temporary1, NTI33554449);
 
-  return result_570425500;
+  return result_570425445;
 
 }
 
-function healthCls__frontend_u157(s_p0) {
+function healthVariant__frontend_u102(s_p0) {
     var Temporary1;
 
-  var result_570425503 = [];
+  var result_570425448 = [];
 
-    if (    s_p0 == 0    ){      Temporary1 = [98,97,100,103,101,45,111,107];
+    if (    s_p0 == 0    ){      Temporary1 = [115,117,99,99,101,115,115];
       }
-    else if (    s_p0 == 1    ){      Temporary1 = [98,97,100,103,101,45,100,101,103,114,97,100,101,100];
+    else if (    s_p0 == 1    ){      Temporary1 = [119,97,114,110,105,110,103];
       }
-    else if (    s_p0 == 2    ){      Temporary1 = [98,97,100,103,101,45,99,114,105,116,105,99,97,108];
+    else if (    s_p0 == 2    ){      Temporary1 = [100,97,110,103,101,114];
       }
     else{
-      Temporary1 = [98,97,100,103,101,45,117,110,107,110,111,119,110];
+      Temporary1 = [110,101,117,116,114,97,108];
       }
-    result_570425503 = nimCopy(null, Temporary1, NTI33554449);
+    result_570425448 = nimCopy(null, Temporary1, NTI33554449);
 
-  return result_570425503;
+  return result_570425448;
 
 }
 
-function setHtml__frontend_u72(e_p0, h_p1) {
+function setHtml__frontend_u79(e_p0, h_p1) {
     if (!((e_p0 == null))) {
     e_p0.innerHTML = toJSStr(h_p1);
     }
@@ -914,10 +842,10 @@ function setHtml__frontend_u72(e_p0, h_p1) {
   
 }
 
-function roleStr__frontend_u145(r_p0) {
+function roleStr__frontend_u90(r_p0) {
     var Temporary1;
 
-  var result_570425491 = [];
+  var result_570425436 = [];
 
     if (    r_p0 == 1    ){      Temporary1 = [76,101,97,100,101,114];
       }
@@ -928,9 +856,9 @@ function roleStr__frontend_u145(r_p0) {
     else{
       Temporary1 = [85,110,107,110,111,119,110];
       }
-    result_570425491 = nimCopy(null, Temporary1, NTI33554449);
+    result_570425436 = nimCopy(null, Temporary1, NTI33554449);
 
-  return result_570425491;
+  return result_570425436;
 
 }
 
@@ -946,94 +874,94 @@ function raiseOverflow() {
   
 }
 
-function uptimeStr__frontend_u148(secs_p0) {
+function uptimeStr__frontend_u93(secs_p0) {
     var Temporary1;
 
-  var result_570425494 = [];
+  var result_570425439 = [];
 
-    var h_570425495 = divInt(secs_p0, 3600);
-    var m_570425496 = divInt(modInt(secs_p0, 3600), 60);
-    var s_570425497 = modInt(secs_p0, 60);
-    if ((0 < h_570425495)) {
-    Temporary1 = (HEX24__systemZdollars_u14(h_570425495)).concat([104,32],HEX24__systemZdollars_u14(m_570425496),[109]);
+    var h_570425440 = divInt(secs_p0, 3600);
+    var m_570425441 = divInt(modInt(secs_p0, 3600), 60);
+    var s_570425442 = modInt(secs_p0, 60);
+    if ((0 < h_570425440)) {
+    Temporary1 = (HEX24__systemZdollars_u14(h_570425440)).concat([104,32],HEX24__systemZdollars_u14(m_570425441),[109]);
     }
     else {
-    if ((0 < m_570425496)) {
-    Temporary1 = (HEX24__systemZdollars_u14(m_570425496)).concat([109,32],HEX24__systemZdollars_u14(s_570425497),[115]);
+    if ((0 < m_570425441)) {
+    Temporary1 = (HEX24__systemZdollars_u14(m_570425441)).concat([109,32],HEX24__systemZdollars_u14(s_570425442),[115]);
     }
     else {
-    Temporary1 = (HEX24__systemZdollars_u14(s_570425497)).concat([115]);
+    Temporary1 = (HEX24__systemZdollars_u14(s_570425442)).concat([115]);
     }
     }
-    result_570425494 = nimCopy(null, Temporary1, NTI33554449);
+    result_570425439 = nimCopy(null, Temporary1, NTI33554449);
 
-  return result_570425494;
+  return result_570425439;
 
 }
 
-function updateDashboard__frontend_u166() {
+function updateDashboard__frontend_u111() {
   BeforeRet: {
-    if (((lastInfo_570425435[0] == null) || (lastHealth_570425436[0] == null))) {
+    if (((lastInfo_570425430[0] == null) || (lastHealth_570425431[0] == null))) {
     break BeforeRet;
     }
     
-    var nodeId_570425529 = (lastInfo_570425435[0].nodeId);
-    var version_570425537 = cstrToNimstr((lastInfo_570425435[0].version));
-    var uptime_570425545 = (lastInfo_570425435[0].uptimeSecs);
-    var role_570425553 = (lastInfo_570425435[0].role);
-    var shards_570425561 = (lastInfo_570425435[0].shardCount);
-    var clients_570425569 = (lastInfo_570425435[0].clientCount);
-    var clusterName_570425577 = cstrToNimstr((lastInfo_570425435[0].clusterName));
-    var healthStatus_570425585 = (lastHealth_570425436[0].status);
-    var replicas_570425593 = (lastHealth_570425436[0].replicaCount);
-    var healthyReplicas_570425601 = (lastHealth_570425436[0].healthyReplicas);
-    var hbadge_570425602 = el__frontend_u51([104,101,97,108,116,104,45,98,97,100,103,101]);
-    if (!((hbadge_570425602 == null))) {
-    hbadge_570425602.innerHTML = toJSStr(healthStr__frontend_u154(healthStatus_570425585));
-    hbadge_570425602.className = toJSStr(([98,97,100,103,101,32]).concat(healthCls__frontend_u157(healthStatus_570425585)));
+    var nodeId_570425474 = (lastInfo_570425430[0].nodeId);
+    var version_570425482 = cstrToNimstr((lastInfo_570425430[0].version));
+    var uptime_570425490 = (lastInfo_570425430[0].uptimeSecs);
+    var role_570425498 = (lastInfo_570425430[0].role);
+    var shards_570425506 = (lastInfo_570425430[0].shardCount);
+    var clients_570425514 = (lastInfo_570425430[0].clientCount);
+    var clusterName_570425522 = cstrToNimstr((lastInfo_570425430[0].clusterName));
+    var healthStatus_570425530 = (lastHealth_570425431[0].status);
+    var replicas_570425538 = (lastHealth_570425431[0].replicaCount);
+    var healthyReplicas_570425546 = (lastHealth_570425431[0].healthyReplicas);
+    var hbadge_570425547 = el__frontend_u58([104,101,97,108,116,104,45,98,97,100,103,101]);
+    if (!((hbadge_570425547 == null))) {
+    hbadge_570425547.innerHTML = toJSStr(healthStr__frontend_u99(healthStatus_570425530));
+    hbadge_570425547.setAttribute("variant", toJSStr(healthVariant__frontend_u102(healthStatus_570425530)));
     }
     
-    setHtml__frontend_u72(el__frontend_u51([115,116,97,116,45,110,111,100,101,105,100]), HEX24__systemZdollars_u14(nodeId_570425529));
-    setHtml__frontend_u72(el__frontend_u51([115,116,97,116,45,114,111,108,101]), roleStr__frontend_u145(role_570425553));
-    setHtml__frontend_u72(el__frontend_u51([115,116,97,116,45,117,112,116,105,109,101]), uptimeStr__frontend_u148(uptime_570425545));
-    setHtml__frontend_u72(el__frontend_u51([115,116,97,116,45,99,108,105,101,110,116,115]), HEX24__systemZdollars_u14(clients_570425569));
-    setHtml__frontend_u72(el__frontend_u51([115,116,97,116,45,115,104,97,114,100,115]), HEX24__systemZdollars_u14(shards_570425561));
-    setHtml__frontend_u72(el__frontend_u51([115,116,97,116,45,118,101,114,115,105,111,110]), version_570425537);
-    setHtml__frontend_u72(el__frontend_u51([115,116,97,116,45,99,108,117,115,116,101,114]), clusterName_570425577);
-    setHtml__frontend_u72(el__frontend_u51([115,116,97,116,45,114,101,112,108,105,99,97,115]), (HEX24__systemZdollars_u14(healthyReplicas_570425601)).concat([32,47,32],HEX24__systemZdollars_u14(replicas_570425593)));
+    setHtml__frontend_u79(el__frontend_u58([115,116,97,116,45,110,111,100,101,105,100]), HEX24__systemZdollars_u14(nodeId_570425474));
+    setHtml__frontend_u79(el__frontend_u58([115,116,97,116,45,114,111,108,101]), roleStr__frontend_u90(role_570425498));
+    setHtml__frontend_u79(el__frontend_u58([115,116,97,116,45,117,112,116,105,109,101]), uptimeStr__frontend_u93(uptime_570425490));
+    setHtml__frontend_u79(el__frontend_u58([115,116,97,116,45,99,108,105,101,110,116,115]), HEX24__systemZdollars_u14(clients_570425514));
+    setHtml__frontend_u79(el__frontend_u58([115,116,97,116,45,115,104,97,114,100,115]), HEX24__systemZdollars_u14(shards_570425506));
+    setHtml__frontend_u79(el__frontend_u58([115,116,97,116,45,118,101,114,115,105,111,110]), version_570425482);
+    setHtml__frontend_u79(el__frontend_u58([115,116,97,116,45,99,108,117,115,116,101,114]), clusterName_570425522);
+    setHtml__frontend_u79(el__frontend_u58([115,116,97,116,45,114,101,112,108,105,99,97,115]), (HEX24__systemZdollars_u14(healthyReplicas_570425546)).concat([32,47,32],HEX24__systemZdollars_u14(replicas_570425538)));
   };
 
   
 }
 
-function updateMetrics__frontend_u600() {
+function updateMetrics__frontend_u545() {
   BeforeRet: {
-    if ((lastMetrics_570425437[0] == null)) {
+    if ((lastMetrics_570425432[0] == null)) {
     break BeforeRet;
     }
     
-    var fields_570425948 = [nimCopy(null, {Field0: [114,101,113,117,101,115,116,115,45,116,111,116,97,108], Field1: "requestsTotal"}, NTI570425645), nimCopy(null, {Field0: [114,101,113,117,101,115,116,115,45,111,107], Field1: "requestsOK"}, NTI570425645), nimCopy(null, {Field0: [114,101,113,117,101,115,116,115,45,101,114,114], Field1: "requestsErr"}, NTI570425645), nimCopy(null, {Field0: [98,121,116,101,115,45,105,110], Field1: "bytesIn"}, NTI570425645), nimCopy(null, {Field0: [98,121,116,101,115,45,111,117,116], Field1: "bytesOut"}, NTI570425645), nimCopy(null, {Field0: [107,118,45,103,101,116,115], Field1: "kvGets"}, NTI570425645), nimCopy(null, {Field0: [107,118,45,112,117,116,115], Field1: "kvPuts"}, NTI570425645), nimCopy(null, {Field0: [107,118,45,100,101,108,101,116,101,115], Field1: "kvDeletes"}, NTI570425645), nimCopy(null, {Field0: [97,99,116,105,118,101,45,116,120,110,115], Field1: "activeTxns"}, NTI570425645), nimCopy(null, {Field0: [99,111,109,109,105,116,116,101,100,45,116,120,110,115], Field1: "committedTxns"}, NTI570425645), nimCopy(null, {Field0: [97,98,111,114,116,101,100,45,116,120,110,115], Field1: "abortedTxns"}, NTI570425645)];
+    var fields_570425893 = [nimCopy(null, {Field0: [114,101,113,117,101,115,116,115,45,116,111,116,97,108], Field1: "requestsTotal"}, NTI570425609), nimCopy(null, {Field0: [114,101,113,117,101,115,116,115,45,111,107], Field1: "requestsOK"}, NTI570425609), nimCopy(null, {Field0: [114,101,113,117,101,115,116,115,45,101,114,114], Field1: "requestsErr"}, NTI570425609), nimCopy(null, {Field0: [98,121,116,101,115,45,105,110], Field1: "bytesIn"}, NTI570425609), nimCopy(null, {Field0: [98,121,116,101,115,45,111,117,116], Field1: "bytesOut"}, NTI570425609), nimCopy(null, {Field0: [107,118,45,103,101,116,115], Field1: "kvGets"}, NTI570425609), nimCopy(null, {Field0: [107,118,45,112,117,116,115], Field1: "kvPuts"}, NTI570425609), nimCopy(null, {Field0: [107,118,45,100,101,108,101,116,101,115], Field1: "kvDeletes"}, NTI570425609), nimCopy(null, {Field0: [97,99,116,105,118,101,45,116,120,110,115], Field1: "activeTxns"}, NTI570425609), nimCopy(null, {Field0: [99,111,109,109,105,116,116,101,100,45,116,120,110,115], Field1: "committedTxns"}, NTI570425609), nimCopy(null, {Field0: [97,98,111,114,116,101,100,45,116,120,110,115], Field1: "abortedTxns"}, NTI570425609)];
     Label1: {
-      var elemId_570426008 = [];
-      var field_570426009 = null;
-      var i_570426151 = 0;
+      var elemId_570425953 = [];
+      var field_570425954 = null;
+      var i_570426125 = 0;
       Label2: {
           Label3: while (true) {
           if (!true) break Label3;
-            var colontmp__570426154 = nimCopy(null, fields_570425948[chckIndx(i_570426151, 0, (fields_570425948).length - 1)], NTI570425645);
-            elemId_570426008 = colontmp__570426154["Field0"];
-            field_570426009 = colontmp__570426154["Field1"];
-            var e_570426010 = el__frontend_u51(([109,101,116,114,105,99,45]).concat(elemId_570426008));
-            if (!((e_570426010 == null))) {
-            var v_570426018 = (lastMetrics_570425437[0][field_570426009]);
-            e_570426010.innerHTML = Number(v_570426018).toLocaleString();
+            var colontmp__570426128 = nimCopy(null, fields_570425893[chckIndx(i_570426125, 0, (fields_570425893).length - 1)], NTI570425609);
+            elemId_570425953 = colontmp__570426128["Field0"];
+            field_570425954 = colontmp__570426128["Field1"];
+            var e_570425955 = el__frontend_u58(([109,101,116,114,105,99,45]).concat(elemId_570425953));
+            if (!((e_570425955 == null))) {
+            var v_570425963 = (lastMetrics_570425432[0][field_570425954]);
+            e_570425955.innerHTML = Number(v_570425963).toLocaleString();
             }
             
-            if ((10 <= i_570426151)) {
+            if ((10 <= i_570426125)) {
             break Label2;
             }
             
-            i_570426151 += 1;
+            i_570426125 += 1;
           }
       };
     };
@@ -1041,36 +969,36 @@ function updateMetrics__frontend_u600() {
 
   
 }
-async function doRefresh__frontend_u692() {
+async function doRefresh__frontend_u637() {
       var Temporary2;
 
-  var result_570426038 = null;
+  var result_570425983 = null;
 
   BeforeRet: {
 ++excHandler;
     try {
-    lastInfo_570425435[0] = (await fetch("/api/info").then(function(r){return r.json()}));
-    lastHealth_570425436[0] = (await fetch("/api/health").then(function(r){return r.json()}));
-    lastMetrics_570425437[0] = (await fetch("/api/metrics").then(function(r){return r.json()}));
-    updateDashboard__frontend_u166();
-    updateMetrics__frontend_u600();
-    if (eqStrings(currentTab_570425434[0], [110,111,100,101,115])) {
-    (await refreshNodesTable__frontend_u263());
+    lastInfo_570425430[0] = (await fetch("/api/info").then(function(r){return r.json()}));
+    lastHealth_570425431[0] = (await fetch("/api/health").then(function(r){return r.json()}));
+    lastMetrics_570425432[0] = (await fetch("/api/metrics").then(function(r){return r.json()}));
+    updateDashboard__frontend_u111();
+    updateMetrics__frontend_u545();
+    if (eqStrings(currentTab_570425429[0], [110,111,100,101,115])) {
+    (await refreshNodesTable__frontend_u224());
     }
     else {
-      lastNodes_570425438[0] = (await fetch("/api/nodes").then(function(r){return r.json()}));
-      var countEl_570426064 = el__frontend_u51([110,111,100,101,115,45,99,111,117,110,116]);
-      if (!((countEl_570426064 == null))) {
-      var arr_570426072 = (lastNodes_570425438[0]);
-      if (!(((arr_570426072).length == 1))) {
+      lastNodes_570425433[0] = (await fetch("/api/nodes").then(function(r){return r.json()}));
+      var countEl_570426009 = el__frontend_u58([110,111,100,101,115,45,99,111,117,110,116]);
+      if (!((countEl_570426009 == null))) {
+      var arr_570426017 = (lastNodes_570425433[0]);
+      if (!(((arr_570426017).length == 1))) {
       Temporary2 = [115];
       }
       else {
       Temporary2 = [];
       }
       
-      var s_570426076 = nimCopy(null, Temporary2, NTI33554449);
-      countEl_570426064.innerHTML = toJSStr((HEX24__systemZdollars_u14((arr_570426072).length)).concat([32,110,111,100,101],s_570426076,[32,114,101,103,105,115,116,101,114,101,100]));
+      var s_570426021 = nimCopy(null, Temporary2, NTI33554449);
+      countEl_570426009.innerHTML = toJSStr((HEX24__systemZdollars_u14((arr_570426017).length)).concat([32,110,111,100,101],s_570426021));
       }
       
     }
@@ -1084,40 +1012,55 @@ async function doRefresh__frontend_u692() {
     lastJSError = prevJSError;
     } finally {
     }
-    result_570426038 = undefined;
+    result_570425983 = undefined;
     break BeforeRet;
   };
 
-  return result_570426038;
+  return result_570425983;
 
 }
-async function main__frontend_u743() {
+async function main__frontend_u686() {
     var Temporary1;
 
-function HEX3Aanonymous__frontend_u755() {
-    (doRefresh__frontend_u692());
+function HEX3Aanonymous__frontend_u695(e_p0) {
+    var name_570426041 = cstrToNimstr(e_p0.detail.name);
+    currentTab_570425429[0] = nimCopy(null, name_570426041, NTI33554449);
+    if (eqStrings(name_570426041, [110,111,100,101,115])) {
+    (refreshNodesTable__frontend_u224());
+    }
+    
+
+  
+}
+    var Temporary2;
+
+function HEX3Aanonymous__frontend_u702() {
+    (doRefresh__frontend_u637());
 
   
 }
 
-  var result_570426089 = null;
+  var result_570426032 = null;
 
   BeforeRet: {
-    buildUI__frontend_u741();
-    showTab__frontend_u95([100,97,115,104,98,111,97,114,100]);
-    (await doRefresh__frontend_u692());
-    Temporary1 = HEX3Aanonymous__frontend_u755.bind(null); Temporary1.ClP_0 = HEX3Aanonymous__frontend_u755; Temporary1.ClE_0 = null;
-    setInterval(Temporary1, 5000);
-    result_570426089 = undefined;
+    buildUI__frontend_u684();
+    currentTab_570425429[0] = nimCopy(null, [100,97,115,104,98,111,97,114,100], NTI33554449);
+    var tabGroup_570426038 = el__frontend_u58([109,97,105,110,45,116,97,98,115]);
+    Temporary1 = HEX3Aanonymous__frontend_u695.bind(null); Temporary1.ClP_0 = HEX3Aanonymous__frontend_u695; Temporary1.ClE_0 = null;
+    tabGroup_570426038.addEventListener('sl-tab-show', function(e){Temporary1(e)});
+    (await doRefresh__frontend_u637());
+    Temporary2 = HEX3Aanonymous__frontend_u702.bind(null); Temporary2.ClP_0 = HEX3Aanonymous__frontend_u702; Temporary2.ClE_0 = null;
+    setInterval(Temporary2, 5000);
+    result_570426032 = undefined;
     break BeforeRet;
   };
 
-  return result_570426089;
+  return result_570426032;
 
 }
-var currentTab_570425434 = [[100,97,115,104,98,111,97,114,100]];
-var lastInfo_570425435 = [null];
-var lastHealth_570425436 = [null];
-var lastMetrics_570425437 = [null];
-var lastNodes_570425438 = [null];
-(main__frontend_u743());
+var currentTab_570425429 = [[100,97,115,104,98,111,97,114,100]];
+var lastInfo_570425430 = [null];
+var lastHealth_570425431 = [null];
+var lastMetrics_570425432 = [null];
+var lastNodes_570425433 = [null];
+(main__frontend_u686());
