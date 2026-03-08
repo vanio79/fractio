@@ -103,6 +103,19 @@ type
     coordinator: MultiRaftCoordinator
     workerId: int
 
+  ## Per-shard worker state — heap-allocated (ptr) so it can be passed to
+  ## a Thread without ORC cross-thread cycle tracking.  Each RangeID that is
+  ## registered via createGroup gets one of these.  The hot path (append +
+  ## fdatasync) reads `group` and `log` directly without acquiring groupsLock.
+  ShardWorkerState* = object
+    ch*: Channel[Proposal]                ## dedicated proposal channel
+    thread*: Thread[ptr ShardWorkerState] ## dedicated flush thread
+    running*: Atomic[bool]
+    group*: RaftGroup                     ## direct ref — no lock needed
+    log*: RaftLog                         ## direct ref — no lock needed
+    rangeId*: RangeID
+    coordPtr*: pointer                    ## raw ptr → MultiRaftCoordinator
+
   MultiRaftCoordinator* {.acyclic.} = ref object
     nodeId*: RangeNodeID
     config*: CoordinatorConfig
@@ -115,14 +128,19 @@ type
     # Storage
     store*: WiscKeyBackend
 
-    # Proposal queue
+    # Proposal queue (global fallback / multi-node transport path)
     proposalCh*: Channel[Proposal]
     pendingProposals*: Table[uint64, Proposal]
     proposalIdCounter*: Atomic[uint64]
 
-    # Worker threads
+    # Global worker threads (multi-node transport / group-commit batcher path)
     workers*: seq[Thread[WorkerContext]]
     running*: Atomic[bool]
+
+    # Per-shard worker pool (Phase 17 — single-node, non-group-commit path).
+    # Populated by createGroup; workers started by start().
+    shardWorkers*: Table[RangeID, ptr ShardWorkerState]
+    shardWorkersMu*: Lock
 
     # Timer thread (election + heartbeat) — only active when transport != nil
     timerThread*: Thread[TimerContext]
@@ -152,6 +170,7 @@ type
 
 proc workerProc(ctx: WorkerContext) {.thread.}
 proc timerProc(ctx: TimerContext) {.thread.}
+proc shardWorkerProc(statePtr: ptr ShardWorkerState) {.thread.}
 proc getGroup*(c: MultiRaftCoordinator, rangeId: RangeID): Option[
     RaftGroup] {.gcsafe.}
 
@@ -238,6 +257,9 @@ proc newMultiRaftCoordinator*(config: CoordinatorConfig): MultiRaftCoordinator =
   initLock(result.groupsLock)
   result.proposalCh.open(MAX_PROPOSAL_QUEUE_SIZE)
 
+  result.shardWorkers = initTable[RangeID, ptr ShardWorkerState]()
+  initLock(result.shardWorkersMu)
+
   result.workers = newSeq[Thread[WorkerContext]](config.numWorkers)
   result.running.store(false)
 
@@ -313,7 +335,18 @@ proc start*(c: MultiRaftCoordinator) =
     c.groupCommitBatcherPtr[].flushFn = gcFlush
     startBatcher(c.groupCommitBatcherPtr)
 
-  # Start worker threads
+  # Start per-shard worker threads (single-node, non-group-commit hot path).
+  # Workers were registered in createGroup() before start() was called.
+  # We only launch them here so that all coordinator state is fully initialised
+  # before any shard thread begins processing proposals.
+  if c.transport == nil:
+    acquire(c.shardWorkersMu)
+    for sw in c.shardWorkers.mvalues:
+      sw[].running.store(true)
+      createThread(sw[].thread, shardWorkerProc, sw)
+    release(c.shardWorkersMu)
+
+  # Start global worker threads (multi-node transport / group-commit path).
   for i in 0..<c.config.numWorkers:
     createThread(c.workers[i], workerProc, WorkerContext(
         coordinator: c, workerId: i))
@@ -395,7 +428,30 @@ proc stop*(c: MultiRaftCoordinator) =
     deallocShared(c.groupCommitBatcherPtr)
     c.groupCommitBatcherPtr = nil
 
-  # Shutdown sentinel per worker (rangeId == 0)
+  # Shut down per-shard workers (single-node path).
+  # Send one sentinel per shard channel, join the thread, then free the heap
+  # object.  Must happen before the global proposalCh is closed so that any
+  # in-flight routing in proposeAndWait/proposeParallel has already finished.
+  acquire(c.shardWorkersMu)
+  for rid, sw in c.shardWorkers.mpairs:
+    sw[].running.store(false)
+    sw[].ch.send(Proposal(
+      rangeId: RangeID(0),
+      command: RaftCommand(kind: ckNoop),
+      resultPtr: nil,
+    ))
+  release(c.shardWorkersMu)
+
+  # Join outside the lock to avoid holding shardWorkersMu while blocking.
+  acquire(c.shardWorkersMu)
+  for rid, sw in c.shardWorkers.mpairs:
+    joinThread(sw[].thread)
+    sw[].ch.close()
+    deallocShared(sw)
+  c.shardWorkers.clear()
+  release(c.shardWorkersMu)
+
+  # Shutdown sentinel per global worker (rangeId == 0)
   for _ in 0..<c.workers.len:
     c.proposalCh.send(Proposal(
       rangeId: RangeID(0),
@@ -452,6 +508,21 @@ proc createGroup*(c: MultiRaftCoordinator, descriptor: RangeDescriptor,
       group.commitIndex.store(state.get.commitIndex)
       group.lastApplied.store(state.get.lastApplied)
 
+    # Register a per-shard worker state for the single-node hot path.
+    # The worker is NOT started here — start() launches it after all
+    # coordinator fields are fully initialised.
+    let sw = cast[ptr ShardWorkerState](allocShared0(sizeof(ShardWorkerState)))
+    sw[].rangeId = descriptor.rangeId
+    sw[].group = group
+    sw[].log = log
+    sw[].coordPtr = cast[pointer](c)
+    sw[].running.store(false)
+    sw[].ch.open(MAX_PROPOSAL_QUEUE_SIZE)
+
+    acquire(c.shardWorkersMu)
+    c.shardWorkers[descriptor.rangeId] = sw
+    release(c.shardWorkersMu)
+
     {.cast(gcsafe).}:
       var fields = initTable[string, string]()
       fields["rangeId"] = $descriptor.rangeId
@@ -461,6 +532,24 @@ proc createGroup*(c: MultiRaftCoordinator, descriptor: RangeDescriptor,
     result = group
 
 proc removeGroup*(c: MultiRaftCoordinator, rangeId: RangeID) =
+  # Stop and free the per-shard worker for this group (if running).
+  acquire(c.shardWorkersMu)
+  let sw = c.shardWorkers.getOrDefault(rangeId, nil)
+  if sw != nil:
+    sw[].running.store(false)
+    sw[].ch.send(Proposal(
+      rangeId: RangeID(0),
+      command: RaftCommand(kind: ckNoop),
+      resultPtr: nil,
+    ))
+    c.shardWorkers.del(rangeId)
+  release(c.shardWorkersMu)
+
+  if sw != nil:
+    joinThread(sw[].thread)
+    sw[].ch.close()
+    deallocShared(sw)
+
   withLock c.groupsLock:
     if c.groups.hasKey(rangeId):
       c.groups[rangeId].close()
@@ -482,6 +571,73 @@ proc hasGroup*(c: MultiRaftCoordinator, rangeId: RangeID): bool =
 # Proposal Handling
 # ============================================================================
 
+proc proposeParallel*(c: MultiRaftCoordinator,
+    proposals: seq[tuple[rangeId: RangeID, command: RaftCommand]],
+    timeoutMs: int = 5000): seq[RaftResult] =
+  ## Submit N proposals to N different Raft groups simultaneously and wait for
+  ## all of them to commit.  Each proposal is dispatched to the proposalCh
+  ## (or the group-commit batcher) independently, so the coordinator's worker
+  ## threads can drive them concurrently.  The caller blocks until every result
+  ## has been received, then returns one RaftResult per input proposal.
+  ##
+  ## This is the critical path for pipelined cross-shard 2PC: instead of
+  ##   propose(shard1) → wait → propose(shard2) → wait   (serial, 2× fsync)
+  ## we do:
+  ##   propose(shard1) ─┐
+  ##                    ├─ wait for both → done   (parallel, ~1× fsync wall-time)
+  ##   propose(shard2) ─┘
+  ##
+  ## Thread safety: each ProposalResultChannel is allocated per-proposal and
+  ## freed here after recv(). No shared state between proposals.
+  let n = proposals.len
+  if n == 0:
+    return @[]
+
+  # Allocate one result channel per proposal.
+  var prcPtrs = newSeq[ptr ProposalResultChannel](n)
+  for i in 0 ..< n:
+    prcPtrs[i] = cast[ptr ProposalResultChannel](
+      allocShared0(sizeof(ProposalResultChannel)))
+    prcPtrs[i][].ch.open(1)
+
+  # Dispatch all proposals without waiting for any result.
+  for i in 0 ..< n:
+    let p = proposals[i]
+    if c.groupCommitEnabled and c.groupCommitBatcherPtr != nil and
+        c.transport == nil and p.command.kind == ckWrite:
+      enqueue(c.groupCommitBatcherPtr, p.rangeId, p.command, prcPtrs[i])
+    elif c.transport == nil:
+      # Per-shard worker path: route each proposal to its shard's channel so
+      # all N fdatasyncs run truly in parallel.
+      acquire(c.shardWorkersMu)
+      let swPtr = c.shardWorkers.getOrDefault(p.rangeId, nil)
+      release(c.shardWorkersMu)
+      if swPtr != nil and swPtr[].running.load:
+        swPtr[].ch.send(Proposal(
+          rangeId: p.rangeId,
+          command: p.command,
+          resultPtr: prcPtrs[i],
+        ))
+      else:
+        c.proposalCh.send(Proposal(
+          rangeId: p.rangeId,
+          command: p.command,
+          resultPtr: prcPtrs[i],
+        ))
+    else:
+      c.proposalCh.send(Proposal(
+        rangeId: p.rangeId,
+        command: p.command,
+        resultPtr: prcPtrs[i],
+      ))
+
+  # Collect all results (each recv() blocks until its worker sends).
+  result = newSeq[RaftResult](n)
+  for i in 0 ..< n:
+    result[i] = prcPtrs[i][].ch.recv()
+    prcPtrs[i][].ch.close()
+    deallocShared(prcPtrs[i])
+
 proc proposeAndWait*(c: MultiRaftCoordinator, rangeId: RangeID,
     command: RaftCommand, timeoutMs: int = 5000): RaftResult =
   ## Propose a command and block until committed (or timeout).
@@ -502,8 +658,27 @@ proc proposeAndWait*(c: MultiRaftCoordinator, rangeId: RangeID,
       c.transport == nil and command.kind == ckWrite:
     # Group commit path: enqueue and block on the result channel.
     enqueue(c.groupCommitBatcherPtr, rangeId, command, prc)
+  elif c.transport == nil:
+    # Per-shard worker path (Phase 17): route directly to the shard's channel
+    # so its fdatasync runs in parallel with other shards.
+    acquire(c.shardWorkersMu)
+    let swPtr = c.shardWorkers.getOrDefault(rangeId, nil)
+    release(c.shardWorkersMu)
+    if swPtr != nil and swPtr[].running.load:
+      swPtr[].ch.send(Proposal(
+        rangeId: rangeId,
+        command: command,
+        resultPtr: prc,
+      ))
+    else:
+      # Fallback: shard worker not yet started or missing — use global pool.
+      c.proposalCh.send(Proposal(
+        rangeId: rangeId,
+        command: command,
+        resultPtr: prc,
+      ))
   else:
-    # Classic path: send to worker proposalCh.
+    # Multi-node transport path: send to global worker pool.
     c.proposalCh.send(Proposal(
       rangeId: rangeId,
       command: command,
@@ -639,6 +814,56 @@ proc workerProc(ctx: WorkerContext) {.thread.} =
       try:
         sendResult(proposal.resultPtr, RaftResult(
           success: false, error: e.msg))
+      except CatchableError: discard
+
+# ============================================================================
+# Per-Shard Worker Thread (Phase 17 — lock-free hot path)
+# ============================================================================
+
+proc shardWorkerProc(statePtr: ptr ShardWorkerState) {.thread.} =
+  ## Dedicated worker for a single RangeID.
+  ## Uses captured `group` and `log` refs directly — no groupsLock in the hot
+  ## path.  Each shard's fdatasync runs concurrently with every other shard's
+  ## fdatasync, eliminating the Phase 15/16 serialisation bottleneck.
+  let s = statePtr
+  let c = cast[MultiRaftCoordinator](s.coordPtr)
+
+  while s[].running.load:
+    let proposal = s[].ch.recv()
+    if proposal.rangeId.uint64 == 0:
+      break # Shutdown sentinel
+
+    let group = s[].group
+    let log = s[].log
+
+    try:
+      if not group.isLeader():
+        sendResult(proposal.resultPtr, RaftResult(
+          success: false, error: "Not the leader"))
+        continue
+
+      # --- Append to local log (NO groupsLock — log is shard-private) ---
+      let term = group.getTerm()
+      let idx = log.lastIndex.load + 1
+      let e = newLogEntry(term, idx, proposal.command)
+      let state = RaftPersistentState(
+        currentTerm: group.currentTerm.load(),
+        votedFor: group.votedFor.load(),
+        commitIndex: group.commitIndex.load(),
+        lastApplied: group.lastApplied.load(),
+      )
+      # putEntryAndState → fdatasync.  Runs fully in parallel with other shards.
+      log.putEntryAndState(e, state)
+
+      # Single-node path: commit immediately, apply to KV state machine.
+      group.commitIndex.store(idx)
+      {.cast(raises: []).}: c.applyUpTo(proposal.rangeId, group, idx)
+      sendResult(proposal.resultPtr, RaftResult(success: true, index: idx))
+
+    except CatchableError as ex:
+      try:
+        sendResult(proposal.resultPtr, RaftResult(
+          success: false, error: ex.msg))
       except CatchableError: discard
 
 # ============================================================================

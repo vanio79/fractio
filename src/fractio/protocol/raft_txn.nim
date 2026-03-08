@@ -177,20 +177,13 @@ proc coordinateCrossShardCommit*(coord: RaftTxnCoordinator, txnId: uint64,
         keySeq)
     discard coord.store.raftWriteCoordRecord(txnId, commitData)
 
-    var allCommitted = true
-    for key in writeSet:
-      var intentValue = ""
-      let intentKey = encodeIntentKey(txnId, key)
-      let ridOpt = coord.store.findRangeId(key)
-      if ridOpt.isSome:
-        let sm = coord.store.getOrCreateSM(ridOpt.get()) # acquires+releases smMu
-        acquire(coord.store.smMu)
-        intentValue = sm.kvStore.getOrDefault(intentKey)
-        release(coord.store.smMu)
-
-      let vr = coord.store.raftResolveIntent(txnId, key, true, intentValue)
-      if not vr.isOk:
-        allCommitted = false
+    # Pipelined commit: all shard proposals dispatched simultaneously so their
+    # fsyncs overlap instead of serialising.  For a 2-shard transaction this
+    # halves the wall-clock commit latency vs. the old sequential loop.
+    var writeSeq: seq[string] = @[]
+    for k in writeSet: writeSeq.add(k)
+    let vr = coord.store.raftCommitTxnPipelined(txnId, writeSeq)
+    let allCommitted = vr.isOk
 
     # Clean up COORD record on success
     if allCommitted:
@@ -249,17 +242,11 @@ proc recoverPendingCoords*(coord: RaftTxnCoordinator) {.gcsafe, raises: [].} =
 
     case state
     of CoordStateCommitting:
-      # Restart commit — intents may already be resolved, that's fine
-      for key in writeSet:
-        var intentValue = ""
-        let intentKey = encodeIntentKey(txnId, key)
-        let ridOpt = coord.store.findRangeId(key)
-        if ridOpt.isSome:
-          let sm = coord.store.getOrCreateSM(ridOpt.get()) # acquires+releases smMu
-          acquire(coord.store.smMu)
-          intentValue = sm.kvStore.getOrDefault(intentKey)
-          release(coord.store.smMu)
-        discard coord.store.raftResolveIntent(txnId, key, true, intentValue)
+      # Restart commit — intents may already be resolved, that's fine.
+      # Use pipelined commit so recovery of multi-shard txns is also fast.
+      var writeSeqR: seq[string] = @[]
+      for k in writeSet: writeSeqR.add(k)
+      discard coord.store.raftCommitTxnPipelined(txnId, writeSeqR)
       discard coord.store.raftDeleteCoordRecord(txnId)
 
     of CoordStatePrepared, CoordStateAborting:

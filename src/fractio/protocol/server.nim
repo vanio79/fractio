@@ -976,14 +976,16 @@ proc handleBuiltinTxn(server: ProtocolServer, conn: ClientConnection,
     let resp = server.txnMgr.commitTransaction(txnId)
     if resp.status == txnMsgs.TxnCommitOK:
       discard server.metrics.committedTxns.fetchAdd(1)
-      # Resolve all buffered intents in a single Raft batch (one fsync)
+      # Resolve all buffered intents via pipelined commit: all shard proposals
+      # are dispatched simultaneously so their fsyncs overlap (one fsync wall-time
+      # regardless of shard count, vs Σ(fsync_i) in the old sequential path).
       if not server.raftStore.isNil and writeSet.len > 0:
-        let cr = server.raftStore.raftCommitTxn(txnId, writeSet)
+        let cr = server.raftStore.raftCommitTxnPipelined(txnId, writeSet)
         if not cr.isOk:
           # Intent resolution failed — client sees commit OK but data may not
           # be durable; log the error. In a full impl we'd return a conflict.
           server.logger.logError(
-            "raftCommitTxn failed for txn " & $txnId & ": " & cr.error.msg)
+            "raftCommitTxnPipelined failed for txn " & $txnId & ": " & cr.error.msg)
     else:
       discard server.metrics.abortedTxns.fetchAdd(1)
       # Clean up buffered intents on conflict/timeout (no fsync needed)
@@ -1036,12 +1038,15 @@ proc handleBuiltinAdmin(server: ProtocolServer, conn: ClientConnection,
     let nowSec = getTime().toUnix()
     let uptime = uint64(if nowSec > server.startedAt: nowSec -
         server.startedAt else: 0)
+    let realShardCount: uint32 =
+      if not server.raftStore.isNil: uint32(server.raftStore.shardCount())
+      else: 1'u32
     let resp = adminMsgs.ServerInfoResponse(
       nodeId: server.config.serverId,
       version: server.config.serverVersion,
       uptimeSecs: uptime,
-      role: adminMsgs.RoleLeader, ## Phase 4: always leader (single-node)
-      shardCount: 1'u32,
+      role: adminMsgs.RoleLeader,
+      shardCount: realShardCount,
       clientCount: uint32(server.clientCount()),
     )
     sendFrame(conn, adminMsgs.encodeServerInfoResponse(resp), requestId)

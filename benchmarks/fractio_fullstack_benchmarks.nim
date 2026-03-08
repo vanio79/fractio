@@ -3,6 +3,14 @@
 # Exercises the complete network path:
 #   ProtocolServer (in-process) ← TCP → ProtocolClient
 #
+# Server backend: 3 Raft groups, each owning a key-range partition:
+#   Group 1 (RangeID 1): keys ""       .. "key_1666"   (low third)
+#   Group 2 (RangeID 2): keys "key_1666" .. "key_3333"  (mid third)
+#   Group 3 (RangeID 3): keys "key_3333" .. ""           (high third)
+#
+# Every KV operation is routed to the correct Raft group by the RaftKVStore
+# shard table, exercising real multi-Raft key-range dispatch end-to-end.
+#
 # Benchmarks:
 #   1. Sequential mixed        (2:1 read:write, single client)
 #   2. Write-only              (single client)
@@ -11,9 +19,7 @@
 #   5. Transactional           (begin / put / commit, single client)
 #   6. Concurrent mixed        (2:1 read:write, N clients in parallel)
 #      Mirrors the workload in db_benchmarks.py for PostgreSQL/MySQL/SQLite.
-#      Each thread owns its own ProtocolClient connection.  Key space is
-#      partitioned identically to the Python benchmark:
-#        key = (threadId * opsPerThread + i) mod numKeys
+#      Each thread owns its own ProtocolClient connection.
 #      Thread counts: 2, 4, 8 — same as the Python driver.
 #
 # The server is started once and shared across all benchmark runs.
@@ -49,11 +55,18 @@ import fractio/distributed/range/types as rangeTypes
 const
   BENCH_PORT = 29000
   BENCH_HOST = "127.0.0.1"
-  SERVER_WAIT_MS = 120 ## ms to sleep after server.start() before connecting
+  SERVER_WAIT_MS = 200 ## ms to sleep after server.start() before connecting
   RAFT_STORAGE_PATH = "/tmp/fractio_bench_raft"
 
+  ## Key-range boundaries for the three Raft groups.
+  ## key_0 .. key_1665  → group 1
+  ## key_1666 .. key_3332 → group 2
+  ## key_3333 .. ∞        → group 3
+  RANGE_SPLIT_LO* = "key_1666"
+  RANGE_SPLIT_HI* = "key_3333"
+
 # =============================================================================
-# Shared types (compatible with fractio_benchmarks.nim)
+# Shared types
 # =============================================================================
 
 type
@@ -117,7 +130,6 @@ proc calcResult(name: string, latencies: seq[float],
     result.avgLatencyUs = sum(latencies) / float(latencies.len)
     result.minLatencyUs = min(latencies)
     result.maxLatencyUs = max(latencies)
-    # p99: sort a copy and take the 99th-percentile element
     var sorted = latencies
     sorted.sort(system.cmp[float])
     let p99idx = max(0, int(float(sorted.len) * 0.99) - 1)
@@ -125,6 +137,7 @@ proc calcResult(name: string, latencies: seq[float],
 
 # =============================================================================
 # Benchmark 1: Sequential mixed  (2:1 read:write)
+# Keys are spread across all key-range shards automatically via RaftKVStore routing.
 # =============================================================================
 
 proc runSequentialBenchmark*(client: ProtocolClient,
@@ -135,32 +148,27 @@ proc runSequentialBenchmark*(client: ProtocolClient,
 
   # Warmup — not timed
   for i in 0..<config.warmupOps:
-    let key = makeKey(i mod config.numKeys)
-    discard client.kvGet(key)
+    discard client.kvGet(makeKey(i mod config.numKeys))
 
   let startTime = getTime()
 
   for i in 0..<config.numOps:
     let opStart = getTime()
     let key = makeKey(i mod config.numKeys)
-
     if i mod 3 == 0:
-      # Write
       let r = client.kvPut(key, value)
       if r.isErr: inc errors
     else:
-      # Read
       let r = client.kvGet(key)
       if r.isErr: inc errors
-
-    let latencyUs = float((getTime() - opStart).inMicroseconds)
-    latencies.add(latencyUs)
+    latencies.add(float((getTime() - opStart).inMicroseconds))
 
   let durationSec = float((getTime() - startTime).inMilliseconds) / 1000.0
   result = calcResult("Sequential Mixed", latencies, errors, durationSec)
 
 # =============================================================================
 # Benchmark 2: Write-only
+# Keys cycle across all three Raft range groups.
 # =============================================================================
 
 proc runWriteBenchmark*(client: ProtocolClient,
@@ -173,11 +181,8 @@ proc runWriteBenchmark*(client: ProtocolClient,
 
   for i in 0..<config.numOps:
     let opStart = getTime()
-    let key = makeKey(i mod config.numKeys)
-
-    let r = client.kvPut(key, value)
+    let r = client.kvPut(makeKey(i mod config.numKeys), value)
     if r.isErr: inc errors
-
     latencies.add(float((getTime() - opStart).inMicroseconds))
 
   let durationSec = float((getTime() - startTime).inMilliseconds) / 1000.0
@@ -185,6 +190,7 @@ proc runWriteBenchmark*(client: ProtocolClient,
 
 # =============================================================================
 # Benchmark 3: Read-only
+# Reads are routed to the correct Raft group by the shard table.
 # =============================================================================
 
 proc runReadBenchmark*(client: ProtocolClient,
@@ -192,20 +198,15 @@ proc runReadBenchmark*(client: ProtocolClient,
   var latencies: seq[float] = @[]
   var errors = 0
 
-  # Warmup
   for i in 0..<config.warmupOps:
-    let key = makeKey(i mod config.numKeys)
-    discard client.kvGet(key)
+    discard client.kvGet(makeKey(i mod config.numKeys))
 
   let startTime = getTime()
 
   for i in 0..<config.numOps:
     let opStart = getTime()
-    let key = makeKey(i mod config.numKeys)
-
-    let r = client.kvGet(key)
+    let r = client.kvGet(makeKey(i mod config.numKeys))
     if r.isErr: inc errors
-
     latencies.add(float((getTime() - opStart).inMicroseconds))
 
   let durationSec = float((getTime() - startTime).inMilliseconds) / 1000.0
@@ -213,11 +214,12 @@ proc runReadBenchmark*(client: ProtocolClient,
 
 # =============================================================================
 # Benchmark 4: Scan
+# Scans key_0..key_100 — crosses the low shard boundary and exercises
+# the raftScan multi-shard aggregation path.
 # =============================================================================
 
 proc runScanBenchmark*(client: ProtocolClient,
     config: BenchmarkConfig): BenchmarkResult =
-  ## Each operation is one Scan over the first 100 keys.
   var latencies: seq[float] = @[]
   var errors = 0
 
@@ -225,12 +227,9 @@ proc runScanBenchmark*(client: ProtocolClient,
 
   for i in 0..<config.numOps:
     let opStart = getTime()
-    let startKey = makeKey(0)
-    let endKey = makeKey(100)
-
-    let r = client.kvScan(startKey = startKey, endKey = endKey, limit = 100)
+    let r = client.kvScan(startKey = makeKey(0), endKey = makeKey(100),
+                          limit = 100)
     if r.isErr: inc errors
-
     latencies.add(float((getTime() - opStart).inMicroseconds))
 
   let durationSec = float((getTime() - startTime).inMilliseconds) / 1000.0
@@ -238,11 +237,12 @@ proc runScanBenchmark*(client: ProtocolClient,
 
 # =============================================================================
 # Benchmark 5: Transactional  (begin / put / commit)
+# Each transaction writes two keys that may land in different Raft groups,
+# exercising the cross-shard raftCommitTxn grouping path.
 # =============================================================================
 
 proc runTransactionalBenchmark*(client: ProtocolClient,
     config: BenchmarkConfig): BenchmarkResult =
-  ## Each "operation" is one full transaction: begin → put → commit.
   let value = makeValue(config.valueSize)
   var latencies: seq[float] = @[]
   var errors = 0
@@ -251,7 +251,11 @@ proc runTransactionalBenchmark*(client: ProtocolClient,
 
   for i in 0..<config.numOps:
     let opStart = getTime()
-    let key = makeKey(i mod config.numKeys)
+    ## Two keys chosen to land in different shards:
+    ##   keyA → low shard  (key_0 .. key_1665)
+    ##   keyB → high shard (key_3333 .. ∞)
+    let keyA = makeKey(i mod 1666)
+    let keyB = makeKey(3333 + (i mod (config.numKeys - 3333)))
 
     let txnR = client.beginTxn()
     if txnR.isErr:
@@ -261,8 +265,15 @@ proc runTransactionalBenchmark*(client: ProtocolClient,
 
     let txnId = txnR.value.txnId
 
-    let putR = client.kvPut(key, value, txnId = txnId)
-    if putR.isErr:
+    let putA = client.kvPut(keyA, value, txnId = txnId)
+    if putA.isErr:
+      inc errors
+      discard client.rollbackTxn(txnId)
+      latencies.add(float((getTime() - opStart).inMicroseconds))
+      continue
+
+    let putB = client.kvPut(keyB, value, txnId = txnId)
+    if putB.isErr:
       inc errors
       discard client.rollbackTxn(txnId)
       latencies.add(float((getTime() - opStart).inMicroseconds))
@@ -280,13 +291,11 @@ proc runTransactionalBenchmark*(client: ProtocolClient,
 # =============================================================================
 # Benchmark 6: Concurrent mixed  (2:1 read:write, N threads)
 #
-# Mirrors db_benchmarks.py exactly:
-#   - N threads, each with its own ProtocolClient connection
-#   - ops_per_thread = numOps div numThreads
-#   - key = (threadId * opsPerThread + i) mod numKeys
-#   - every 3rd op is a Put, the rest are Gets
-#   - all threads start simultaneously (countdown latch via Atomic[int])
-#   - wall-clock duration measured across the full concurrent run
+# N threads, each with its own ProtocolClient connection.
+# key = (threadId * opsPerThread + i) mod numKeys
+# Keys are spread across all three Raft range groups automatically.
+# All threads start simultaneously via a countdown latch (Atomic[int]).
+# Wall-clock duration is measured across the full concurrent run.
 # =============================================================================
 
 type
@@ -297,15 +306,10 @@ type
     valueSize*: int
     host*: string
     port*: int
-    ## Countdown latch: main decrements to 0 after spawning all threads,
-    ## each worker spins until it reads 0, then starts.
     startLatch*: ptr Atomic[int]
-    ## Output written by the worker (main reads after joinThread).
     resultOut*: ptr ThreadResult
 
 proc concurrentWorker(args: WorkerArgs) {.thread, gcsafe.} =
-  ## Thread entry point: connects its own client, waits for the latch,
-  ## runs the mixed workload, writes results into args.resultOut.
   var ccfg = defaultClientConfig(args.host, args.port)
   ccfg.timeoutMs = 30_000
   let c = newProtocolClient(ccfg)
@@ -314,13 +318,10 @@ proc concurrentWorker(args: WorkerArgs) {.thread, gcsafe.} =
     args.resultOut[].errors = args.opsPerThread
     return
 
-  let value = block:
-    var v = newString(args.valueSize)
-    for i in 0..<args.valueSize:
-      v[i] = char(ord('a') + (i mod 26))
-    v
+  var value = newString(args.valueSize)
+  for i in 0..<args.valueSize:
+    value[i] = char(ord('a') + (i mod 26))
 
-  # Spin-wait for start latch to reach 0 (all threads ready)
   while args.startLatch[].load(moAcquire) > 0:
     discard
 
@@ -329,16 +330,14 @@ proc concurrentWorker(args: WorkerArgs) {.thread, gcsafe.} =
 
   for i in 0..<args.opsPerThread:
     let opStart = getTime()
-    let key = "key_" & $(((args.threadId * args.opsPerThread) +
-        i) mod args.numKeys)
-
+    let key = "key_" & $(((args.threadId * args.opsPerThread) + i) mod
+        args.numKeys)
     if i mod 3 == 0:
       let r = c.kvPut(key, value)
       if r.isErr: inc errors
     else:
       let r = c.kvGet(key)
       if r.isErr: inc errors
-
     latencies.add(float((getTime() - opStart).inMicroseconds))
 
   c.disconnect()
@@ -347,19 +346,15 @@ proc concurrentWorker(args: WorkerArgs) {.thread, gcsafe.} =
 
 proc runConcurrentBenchmark*(config: BenchmarkConfig,
     numThreads: int): BenchmarkResult =
-  ## Spin up numThreads clients simultaneously, run the mixed workload,
-  ## collect latencies across all threads, report wall-clock throughput.
   let opsPerThread = config.numOps div numThreads
-
-  # Allocate per-thread result storage on the heap so threads can write safely
   var threadResults = newSeq[ThreadResult](numThreads)
   var threads = newSeq[Thread[WorkerArgs]](numThreads)
 
   var latch: Atomic[int]
-  latch.store(1, moRelaxed) # workers spin until we store 0
+  latch.store(1, moRelaxed)
 
   for t in 0..<numThreads:
-    let args = WorkerArgs(
+    createThread(threads[t], concurrentWorker, WorkerArgs(
       threadId: t,
       opsPerThread: opsPerThread,
       numKeys: config.numKeys,
@@ -368,11 +363,9 @@ proc runConcurrentBenchmark*(config: BenchmarkConfig,
       port: BENCH_PORT,
       startLatch: addr latch,
       resultOut: addr threadResults[t],
-    )
-    createThread(threads[t], concurrentWorker, args)
+    ))
 
-  # Give threads a moment to connect and reach the spin-wait, then release
-  sleep(120)
+  sleep(200) # let threads connect and reach the spin-wait
   let wallStart = getTime()
   latch.store(0, moRelease)
 
@@ -381,29 +374,25 @@ proc runConcurrentBenchmark*(config: BenchmarkConfig,
 
   let wallSec = float((getTime() - wallStart).inMilliseconds) / 1000.0
 
-  # Merge all per-thread latencies
   var allLatencies: seq[float] = @[]
   var totalErrors = 0
   for t in 0..<numThreads:
     allLatencies.add(threadResults[t].latencies)
     totalErrors += threadResults[t].errors
 
-  result = calcResult(
-    "Concurrent Mixed " & $numThreads & "t",
-    allLatencies,
-    totalErrors,
-    wallSec,
-  )
+  result = calcResult("Concurrent Mixed " & $numThreads & "t",
+                      allLatencies, totalErrors, wallSec)
 
 # =============================================================================
-# Seed helper — pre-populate keys so reads have data to find
+# Seed helper — pre-populate keys across all three Raft range groups
 # =============================================================================
 
 proc seedData(client: ProtocolClient, config: BenchmarkConfig) =
+  ## Write 500 keys spread evenly across the full key-space so that every
+  ## Raft group (low / mid / high range) receives some seed data.
   let value = makeValue(config.valueSize)
   for i in 0..<min(config.numKeys, 500):
-    let key = makeKey(i)
-    discard client.kvPut(key, value)
+    discard client.kvPut(makeKey(i), value)
 
 # =============================================================================
 # Print helpers
@@ -418,7 +407,6 @@ proc printResult(r: BenchmarkResult) =
   echo "  Total ops:   " & $r.totalOps
   echo "  Errors:      " & $r.errors
 
-# Width: 30 + 3 + 12 + 3 + 14 + 3 + 12 + 3 + 8 = 88
 const SUMMARY_WIDTH = 88
 
 proc printSummary(results: seq[BenchmarkResult]) =
@@ -435,12 +423,11 @@ proc printSummary(results: seq[BenchmarkResult]) =
   echo hdr
   echo "-".repeat(SUMMARY_WIDTH)
   for r in results:
-    let row = r.name.center(30) & " | " &
-              formatFloat(r.opsPerSec, ffDecimal, 1).center(12) & " | " &
-              formatFloat(r.avgLatencyUs, ffDecimal, 2).center(14) & " | " &
-              formatFloat(r.p99LatencyUs, ffDecimal, 2).center(12) & " | " &
-              ($r.errors).center(8)
-    echo row
+    echo r.name.center(30) & " | " &
+         formatFloat(r.opsPerSec, ffDecimal, 1).center(12) & " | " &
+         formatFloat(r.avgLatencyUs, ffDecimal, 2).center(14) & " | " &
+         formatFloat(r.p99LatencyUs, ffDecimal, 2).center(12) & " | " &
+         ($r.errors).center(8)
   echo ""
 
 # =============================================================================
@@ -449,7 +436,7 @@ proc printSummary(results: seq[BenchmarkResult]) =
 
 when isMainModule:
   # ---------------------------------------------------------------------------
-  # CLI argument parsing (mirrors db_benchmarks.py flags)
+  # CLI argument parsing
   # ---------------------------------------------------------------------------
   var numKeys = 5000
   var numOps = 1000
@@ -459,65 +446,52 @@ when isMainModule:
   var skipSeq = false
   var skipConc = false
   var useGroupCommit = false
-  var gcMaxBatch = 0 ## 0 → use library default (256)
-  var gcMaxDelayNs: int64 = 0 ## 0 → use library default (2 ms)
+  var gcMaxBatch = 0
+  var gcMaxDelayNs: int64 = 0
 
   let args = commandLineParams()
   var i = 0
   while i < args.len:
     case args[i]
-    of "--keys":
-      inc i; numKeys = parseInt(args[i])
-    of "--ops":
-      inc i; numOps = parseInt(args[i])
-    of "--threads":
-      inc i; numThreads = parseInt(args[i])
-    of "--value-size":
-      inc i; valueSize = parseInt(args[i])
-    of "--warmup":
-      inc i; warmupOps = parseInt(args[i])
-    of "--skip-sequential":
-      skipSeq = true
-    of "--skip-concurrent":
-      skipConc = true
-    of "--group-commit":
-      useGroupCommit = true
-    of "--gc-max-batch":
-      inc i; gcMaxBatch = parseInt(args[i])
-    of "--gc-max-delay-us":
-      inc i; gcMaxDelayNs = parseInt(args[i]) * 1000
+    of "--keys": inc i; numKeys = parseInt(args[i])
+    of "--ops": inc i; numOps = parseInt(args[i])
+    of "--threads": inc i; numThreads = parseInt(args[i])
+    of "--value-size": inc i; valueSize = parseInt(args[i])
+    of "--warmup": inc i; warmupOps = parseInt(args[i])
+    of "--skip-sequential": skipSeq = true
+    of "--skip-concurrent": skipConc = true
+    of "--group-commit": useGroupCommit = true
+    of "--gc-max-batch": inc i; gcMaxBatch = parseInt(args[i])
+    of "--gc-max-delay-us": inc i; gcMaxDelayNs = parseInt(args[i]) * 1000
     of "--help", "-h":
       echo "Usage: fractio_fullstack_benchmarks [options]"
-      echo "  --keys N            number of distinct keys (default 5000)"
-      echo "  --ops N             total ops per benchmark (default 1000)"
-      echo "  --threads N         threads for concurrent run (default 4)"
-      echo "  --value-size N      value size in bytes (default 100)"
-      echo "  --warmup N          warmup ops (default 100)"
-      echo "  --skip-sequential   skip benchmarks 1-5"
-      echo "  --skip-concurrent   skip benchmark 6 (concurrent mixed)"
-      echo "  --group-commit      enable group commit batching (target 500-5000 writes/sec)"
-      echo "  --gc-max-batch N    max proposals per group-commit batch (default 256)"
-      echo "  --gc-max-delay-us N max delay before flush in microseconds (default 2000)"
+      echo "  --keys N              number of distinct keys (default 5000)"
+      echo "  --ops N               total ops per benchmark (default 1000)"
+      echo "  --threads N           threads for concurrent run (default 4)"
+      echo "  --value-size N        value size in bytes (default 100)"
+      echo "  --warmup N            warmup ops (default 100)"
+      echo "  --skip-sequential     skip benchmarks 1-5"
+      echo "  --skip-concurrent     skip benchmark 6"
+      echo "  --group-commit        enable group-commit batching"
+      echo "  --gc-max-batch N      max proposals per batch (default 256)"
+      echo "  --gc-max-delay-us N   max flush delay in us (default 2000)"
       quit(0)
     else:
-      echo "Unknown flag: " & args[i]
-      quit(1)
+      echo "Unknown flag: " & args[i]; quit(1)
     inc i
 
   let benchConfig = BenchmarkConfig(
-    numKeys: numKeys,
-    numOps: numOps,
-    valueSize: valueSize,
-    warmupOps: warmupOps,
-    numThreads: numThreads,
+    numKeys: numKeys, numOps: numOps, valueSize: valueSize,
+    warmupOps: warmupOps, numThreads: numThreads,
   )
 
   echo "=".repeat(SUMMARY_WIDTH)
-  echo "Fractio Full-Stack Benchmarks"
+  echo "Fractio Full-Stack Benchmarks  (multi-Raft + key ranges)"
   echo "=".repeat(SUMMARY_WIDTH)
   echo ""
   echo "Configuration:"
   echo "  Server:       " & BENCH_HOST & ":" & $BENCH_PORT
+  echo "  Raft groups:  3  (low: ..key_1666 | mid: key_1666..key_3333 | high: key_3333..)"
   echo "  Keys:         " & $numKeys
   echo "  Ops/bench:    " & $numOps
   echo "  Value size:   " & $valueSize & " bytes"
@@ -527,25 +501,22 @@ when isMainModule:
   echo ""
 
   # -------------------------------------------------------------------------
-  # Start server with Raft + WiscKey (syncWrites=true) backend
+  # Bootstrap: 3 Raft groups, each owning a key-range partition.
   #
-  # Write path:
-  #   client kvPut → server handleBuiltinKV (raftStore branch)
-  #     → raftPut → proposeAndWait (Raft consensus, quorum=1)
-  #     → applyBatchToSM → WiscKey.put (fdatasync) + in-memory SM
+  # Group 1 (RangeID 1): ""         .. RANGE_SPLIT_LO  (key_0 .. key_1665)
+  # Group 2 (RangeID 2): SPLIT_LO   .. RANGE_SPLIT_HI  (key_1666 .. key_3332)
+  # Group 3 (RangeID 3): SPLIT_HI   .. ""              (key_3333 .. ∞)
   #
-  # This puts real fsync I/O on every write, making the comparison with
-  # PostgreSQL/MySQL/SQLite apples-to-apples.
+  # All three groups share one MultiRaftCoordinator and one WiscKey store,
+  # mirroring a single-node production deployment with range-based sharding.
   # -------------------------------------------------------------------------
 
-  # Clean up any leftover storage from a previous run
   try: removeDir(RAFT_STORAGE_PATH) except CatchableError: discard
   try: createDir(RAFT_STORAGE_PATH) except CatchableError: discard
 
-  # Build coordinator (WiscKey opened with syncWrites=true inside newMultiRaftCoordinator)
   let coordCfg = CoordinatorConfig(
     nodeId: RangeNodeID(1),
-    numWorkers: 2,
+    numWorkers: 4,
     electionTimeoutNs: DEFAULT_ELECTION_TIMEOUT_NS,
     heartbeatIntervalNs: DEFAULT_HEARTBEAT_INTERVAL_NS,
     storagePath: RAFT_STORAGE_PATH,
@@ -556,21 +527,40 @@ when isMainModule:
   )
   let coord = newMultiRaftCoordinator(coordCfg)
 
-  # Bootstrap a single shard covering the full key-space
-  let rid = RangeID(1)
-  let desc = newRangeDescriptor(rid, @[], @[])
-  let rep = desc.addReplica(RangeNodeID(1))
-  let group = coord.createGroup(desc, rep.replicaId)
-  group.becomeLeader()
+  # --- Create three range descriptors and their Raft groups ---
+  let rid1 = RangeID(1)
+  let rid2 = RangeID(2)
+  let rid3 = RangeID(3)
 
-  # Create RaftKVStoreExt and wire the apply callback BEFORE coord.start()
+  let loBytes = cast[seq[byte]](RANGE_SPLIT_LO)
+  let hiBytes = cast[seq[byte]](RANGE_SPLIT_HI)
+
+  let desc1 = newRangeDescriptor(rid1, @[], loBytes)             # "" .. key_1666
+  let desc2 = newRangeDescriptor(rid2, loBytes, hiBytes) # key_1666 .. key_3333
+  let desc3 = newRangeDescriptor(rid3, hiBytes, @[])             # key_3333 .. ""
+
+  let rep1 = desc1.addReplica(RangeNodeID(1))
+  let rep2 = desc2.addReplica(RangeNodeID(1))
+  let rep3 = desc3.addReplica(RangeNodeID(1))
+
+  let grp1 = coord.createGroup(desc1, rep1.replicaId)
+  let grp2 = coord.createGroup(desc2, rep2.replicaId)
+  let grp3 = coord.createGroup(desc3, rep3.replicaId)
+
+  grp1.becomeLeader()
+  grp2.becomeLeader()
+  grp3.becomeLeader()
+
+  # --- Wire RaftKVStoreExt with one shard entry per range group ---
   let raftSt = newRaftKVStoreExt(coord, proposeTimeoutMs = 10_000)
   raftSt.wireApplyCallback()
-  raftSt.bootstrapSingleShardExt(rid)
+
+  raftSt.addShardExt("", RANGE_SPLIT_LO, rid1)
+  raftSt.addShardExt(RANGE_SPLIT_LO, RANGE_SPLIT_HI, rid2)
+  raftSt.addShardExt(RANGE_SPLIT_HI, "", rid3)
 
   coord.start()
 
-  # Protocol server
   var srvCfg = defaultServerConfig()
   srvCfg.host = BENCH_HOST
   srvCfg.port = BENCH_PORT
@@ -584,10 +574,10 @@ when isMainModule:
 
   echo "Server started on " & BENCH_HOST & ":" & $BENCH_PORT
   if useGroupCommit:
-    echo "Backend: Raft + WiscKey + Group Commit (batch up to " &
-      $gcMaxBatch & " writes per fsync, delay " & $(gcMaxDelayNs div 1000) & " us)"
+    echo "Backend: 3x Raft groups + WiscKey + Group Commit (batch=" &
+         $gcMaxBatch & ", delay=" & $(gcMaxDelayNs div 1000) & "us)"
   else:
-    echo "Backend: Raft + WiscKey (LevelDB syncWrites=true / fdatasync per commit)"
+    echo "Backend: 3x Raft groups + WiscKey (fdatasync per commit)"
   echo ""
 
   var allResults: seq[BenchmarkResult] = @[]
@@ -596,7 +586,6 @@ when isMainModule:
   # Benchmarks 1-5: single-client sequential workloads
   # -------------------------------------------------------------------------
   if not skipSeq:
-    # Benchmark 1: Sequential mixed
     echo "=".repeat(50)
     echo "1. Sequential Mixed Benchmark (2:1 read:write)"
     echo "=".repeat(50)
@@ -606,10 +595,8 @@ when isMainModule:
       let r = runSequentialBenchmark(c, benchConfig)
       allResults.add(r)
       c.disconnect()
-      echo "\nResults:"
-      printResult(r)
+      echo "\nResults:"; printResult(r)
 
-    # Benchmark 2: Write-only
     echo "\n" & "=".repeat(50)
     echo "2. Write-Only Benchmark"
     echo "=".repeat(50)
@@ -618,10 +605,8 @@ when isMainModule:
       let r = runWriteBenchmark(c, benchConfig)
       allResults.add(r)
       c.disconnect()
-      echo "\nResults:"
-      printResult(r)
+      echo "\nResults:"; printResult(r)
 
-    # Benchmark 3: Read-only
     echo "\n" & "=".repeat(50)
     echo "3. Read-Only Benchmark"
     echo "=".repeat(50)
@@ -631,12 +616,10 @@ when isMainModule:
       let r = runReadBenchmark(c, benchConfig)
       allResults.add(r)
       c.disconnect()
-      echo "\nResults:"
-      printResult(r)
+      echo "\nResults:"; printResult(r)
 
-    # Benchmark 4: Scan
     echo "\n" & "=".repeat(50)
-    echo "4. Scan Benchmark"
+    echo "4. Scan Benchmark  (key_0..key_100, crosses shard boundary)"
     echo "=".repeat(50)
     block:
       let c = newClient()
@@ -644,42 +627,32 @@ when isMainModule:
       let r = runScanBenchmark(c, benchConfig)
       allResults.add(r)
       c.disconnect()
-      echo "\nResults:"
-      printResult(r)
+      echo "\nResults:"; printResult(r)
 
-    # Benchmark 5: Transactional
     echo "\n" & "=".repeat(50)
-    echo "5. Transactional Benchmark (begin/put/commit)"
+    echo "5. Transactional Benchmark (begin / 2x put across shards / commit)"
     echo "=".repeat(50)
     block:
       let c = newClient()
       let r = runTransactionalBenchmark(c, benchConfig)
       allResults.add(r)
       c.disconnect()
-      echo "\nResults:"
-      printResult(r)
+      echo "\nResults:"; printResult(r)
 
   # -------------------------------------------------------------------------
-  # Benchmark 6: Concurrent mixed  (mirrors db_benchmarks.py)
-  # Run at thread counts 2, 4, 8 just like the Python driver does.
-  # If the user passed --threads T we include T in the set (deduped).
+  # Benchmark 6: Concurrent mixed — run at 2, 4, 8 threads
   # -------------------------------------------------------------------------
   if not skipConc:
     echo "\n" & "=".repeat(50)
-    echo "6. Concurrent Mixed Benchmark (2:1 read:write)"
-    echo "   Mirrors db_benchmarks.py PostgreSQL/MySQL/SQLite workload"
+    echo "6. Concurrent Mixed Benchmark (2:1 read:write, multi-shard)"
     echo "=".repeat(50)
 
-    # Seed once with a dedicated client before spawning workers
     block:
       let c = newClient()
       seedData(c, benchConfig)
       c.disconnect()
 
-    # Build the set of thread counts to run, always including 2, 4, 8
-    var threadCounts: seq[int] = @[]
-    for t in [2, 4, 8]:
-      threadCounts.add(t)
+    var threadCounts: seq[int] = @[2, 4, 8]
     if numThreads notin threadCounts:
       threadCounts.add(numThreads)
       threadCounts.sort(system.cmp[int])
@@ -688,17 +661,10 @@ when isMainModule:
       echo "\n--- " & $t & " threads ---"
       let r = runConcurrentBenchmark(benchConfig, t)
       allResults.add(r)
-      echo "Results:"
-      printResult(r)
+      echo "Results:"; printResult(r)
 
-  # -------------------------------------------------------------------------
-  # Summary table
-  # -------------------------------------------------------------------------
   printSummary(allResults)
 
-  # -------------------------------------------------------------------------
-  # Shutdown
-  # -------------------------------------------------------------------------
   srv.stop()
   sleep(50)
   coord.stop()

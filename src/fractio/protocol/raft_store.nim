@@ -476,6 +476,12 @@ proc raftScan*(store: RaftKVStoreExt, startKey, endKey: string,
     pairs.setLen(int(limit))
   rsOk[seq[(string, RaftKVEntry)]](pairs)
 
+proc shardCount*(store: RaftKVStoreExt): int {.gcsafe, raises: [].} =
+  ## Returns the number of key-range shards currently registered.
+  acquire(store.shardsMu)
+  defer: release(store.shardsMu)
+  store.shards.len
+
 proc raftLen*(store: RaftKVStoreExt): int {.gcsafe, raises: [].} =
   var total = 0
   acquire(store.shardsMu)
@@ -552,42 +558,134 @@ proc raftPutIntent*(store: RaftKVStoreExt, txnId: uint64, key,
 
 proc raftCommitTxn*(store: RaftKVStoreExt, txnId: uint64,
     writeSet: seq[string]): RSVoidResult {.gcsafe, raises: [].} =
-  ## Commit a transaction by resolving all intents in a single Raft WriteBatch.
-  ## For each key in writeSet:
-  ##   - reads intent value from the in-memory state machine
-  ##   - adds (realKey → value) to the batch
-  ##   - adds (intentKey) to the delete list
-  ## Then proposes the whole batch through Raft → ONE fdatasync total.
-  ## If no intents are found (e.g. read-only txn) succeeds immediately.
+  ## Commit a transaction by resolving all intents across one or more shards.
+  ##
+  ## Keys are grouped by their RangeID so that each shard receives exactly one
+  ## Raft WriteBatch proposal (one fdatasync per shard).  For each key:
+  ##   - read the intent value from the in-memory state machine
+  ##   - add (realKey → value) and delete (intentKey) to that shard's batch
+  ## Shards whose keys have no outstanding intents are skipped entirely.
   if writeSet.len == 0:
     return rsVOk()
 
-  # All keys must belong to the same shard (single-shard assumption for now).
-  # Use the first key to determine the rangeId.
-  let ridOpt = store.findRangeId(writeSet[0])
-  if ridOpt.isNone:
-    return rsVErr(newRSE(rseRangeNotFound,
-        &"no shard for key '{writeSet[0]}'"))
-  let rid = ridOpt.get()
-  let sm = store.getOrCreateSM(rid)
-
-  let batch = newWriteBatch()
-
-  acquire(store.smMu)
+  # --- Group keys by RangeID ---
+  var batches: Table[RangeID, WriteBatch]
   for key in writeSet:
-    let intentKey = encodeIntentKey(txnId, key)
-    if sm.kvStore.hasKey(intentKey):
-      let val = sm.kvStore.getOrDefault(intentKey)
-      batch.put(toBytes(key), toBytes(val))
-      batch.delete(toBytes(intentKey))
-    # If intent not found (key was never actually written), skip silently.
-  release(store.smMu)
+    let ridOpt = store.findRangeId(key)
+    if ridOpt.isNone:
+      return rsVErr(newRSE(rseRangeNotFound, &"no shard for key '{key}'"))
+    let rid = ridOpt.get()
+    if not batches.hasKey(rid):
+      batches[rid] = newWriteBatch()
 
-  if batch.isEmpty:
-    # Nothing to persist — transaction had no actual writes that left intents
+  # --- Fill each per-shard batch from the in-memory state machine ---
+  # Iterate over a copy of the RangeIDs so we can index batches safely via
+  # mgetOrPut (avoids KeyError in raises:[] context).
+  var rids: seq[RangeID] = @[]
+  for rid in batches.keys: rids.add(rid)
+
+  for rid in rids:
+    let sm = store.getOrCreateSM(rid)
+    acquire(store.smMu)
+    for key in writeSet:
+      let keyRidOpt = store.findRangeId(key)
+      if keyRidOpt.isNone or keyRidOpt.get() != rid: continue
+      let intentKey = encodeIntentKey(txnId, key)
+      if sm.kvStore.hasKey(intentKey):
+        let val = sm.kvStore.getOrDefault(intentKey)
+        {.cast(raises: []).}:
+          batches[rid].put(toBytes(key), toBytes(val))
+          batches[rid].delete(toBytes(intentKey))
+      # Intent not found → key was never written; skip silently.
+    release(store.smMu)
+
+  # --- Propose each non-empty batch to its Raft group ---
+  for rid in rids:
+    {.cast(raises: []).}:
+      let batch = batches[rid]
+      if not batch.isEmpty:
+        let vr = proposeWrite(store, rid, batch)
+        if not vr.isOk:
+          return vr
+
+  rsVOk()
+
+proc raftCommitTxnPipelined*(store: RaftKVStoreExt, txnId: uint64,
+    writeSet: seq[string]): RSVoidResult {.gcsafe, raises: [].} =
+  ## Pipelined variant of raftCommitTxn: dispatches one Raft proposal per
+  ## shard simultaneously and waits for all of them in parallel.
+  ##
+  ## For a single-shard transaction this is identical to raftCommitTxn.
+  ## For a multi-shard transaction the wall-clock commit time drops from
+  ## Σ(fsync_i) to max(fsync_i) because all shard proposals are in-flight
+  ## concurrently — the same technique as pipelining AppendEntries in Raft.
+  ##
+  ## The implementation:
+  ##   1. Group write-set keys by RangeID (same as raftCommitTxn).
+  ##   2. Fill per-shard WriteBatches from the in-memory state machine.
+  ##   3. Call coordinator.proposeParallel() with all non-empty batches.
+  ##   4. Return the first error (if any); all shards that succeeded have
+  ##      already committed their batch (no rollback at this layer — the
+  ##      caller's 2PC protocol handles partial failures via COORD record).
+  if writeSet.len == 0:
     return rsVOk()
 
-  proposeWrite(store, rid, batch)
+  # --- Step 1: group keys by RangeID ---
+  var batches: Table[RangeID, WriteBatch]
+  for key in writeSet:
+    let ridOpt = store.findRangeId(key)
+    if ridOpt.isNone:
+      return rsVErr(newRSE(rseRangeNotFound, "no shard for key '" & key & "'"))
+    let rid = ridOpt.get()
+    if not batches.hasKey(rid):
+      batches[rid] = newWriteBatch()
+
+  # Collect the RangeIDs so we can iterate without Table invalidation.
+  var rids: seq[RangeID] = @[]
+  for rid in batches.keys: rids.add(rid)
+
+  # --- Step 2: fill per-shard WriteBatches ---
+  for rid in rids:
+    let sm = store.getOrCreateSM(rid)
+    acquire(store.smMu)
+    for key in writeSet:
+      let keyRidOpt = store.findRangeId(key)
+      if keyRidOpt.isNone or keyRidOpt.get() != rid: continue
+      let intentKey = encodeIntentKey(txnId, key)
+      if sm.kvStore.hasKey(intentKey):
+        let val = sm.kvStore.getOrDefault(intentKey)
+        {.cast(raises: []).}:
+          batches[rid].put(toBytes(key), toBytes(val))
+          batches[rid].delete(toBytes(intentKey))
+    release(store.smMu)
+
+  # --- Step 3: build the parallel proposal list ---
+  var proposals: seq[tuple[rangeId: RangeID, command: RaftCommand]] = @[]
+  for rid in rids:
+    {.cast(raises: []).}:
+      let batch = batches[rid]
+      if not batch.isEmpty:
+        proposals.add((rangeId: rid,
+                        command: RaftCommand(kind: ckWrite, writeBatch: batch)))
+
+  if proposals.len == 0:
+    return rsVOk()
+
+  # --- Step 4: dispatch all proposals simultaneously ---
+  let results = store.coordinator.proposeParallel(proposals,
+      store.proposeTimeout)
+
+  for r in results:
+    if not r.success:
+      if r.error == "Not the leader":
+        return rsVErr(newRSE(rseNotLeader, r.error))
+      if r.error.contains("Range not found"):
+        return rsVErr(newRSE(rseRangeNotFound, r.error))
+      if r.error.contains("Timeout"):
+        return rsVErr(newRSE(rseTimeout, r.error))
+      return rsVErr(newRSE(rseInternal, r.error))
+
+  rsVOk()
 
 proc raftGetForTxn*(store: RaftKVStoreExt, txnId: uint64,
     key: string): RSResult[Option[RaftKVEntry]] {.gcsafe, raises: [].} =
