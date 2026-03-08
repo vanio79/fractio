@@ -29,6 +29,7 @@ import fractio/protocol/client
 import fractio/protocol/server
 import fractio/protocol/messages/cluster as clusterMsgs
 import fractio/protocol/messages/admin as adminMsgs
+import fractio/web/dashboard
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -52,7 +53,7 @@ Global options:
 
 Commands:
   start       --id ID --host HOST --raft-port PORT --client-port PORT
-              --data-dir DIR [--join PEER_HOST:PORT]
+              --data-dir DIR [--web-port PORT] [--join PEER_HOST:PORT]
   node join   --id ID --host HOST --raft-port PORT --client-port PORT
   node remove --id ID
   node list
@@ -81,6 +82,7 @@ proc cmdStart(flags: Table[string, string], globalHost: string) =
   let raftPortStr = flags.getOrDefault("raft-port", "8300")
   let clientPortStr = flags.getOrDefault("client-port", "9000")
   let dataDir = flags.getOrDefault("data-dir", "")
+  let webPortStr = flags.getOrDefault("web-port", "0")
   let joinPeer = flags.getOrDefault("join", "")
 
   if idStr == "":
@@ -91,10 +93,12 @@ proc cmdStart(flags: Table[string, string], globalHost: string) =
   var nodeId: int
   var raftPort: int
   var clientPort: int
+  var webPort: int
   try:
     nodeId = parseInt(idStr)
     raftPort = parseInt(raftPortStr)
     clientPort = parseInt(clientPortStr)
+    webPort = parseInt(webPortStr)
   except ValueError as e:
     die("invalid numeric argument: " & e.msg)
 
@@ -110,10 +114,14 @@ proc cmdStart(flags: Table[string, string], globalHost: string) =
   cfg.serverId = uint16(nodeId)
   cfg.serverName = "fractio-" & idStr
   cfg.dataDir = dataDir
+  cfg.webPort = webPort
   cfg.idleTimeoutSecs = 120
 
   let server = newProtocolServer(cfg)
   server.start()
+  if webPort > 0:
+    launchWebDashboard(server)
+    echo &"web dashboard: http://{host}:{webPort}"
 
   if joinPeer != "":
     # Give the server time to bind

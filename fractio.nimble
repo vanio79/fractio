@@ -6,6 +6,7 @@ license       = "MIT"
 
 # Dependencies
 requires "nim >= 1.6.0"
+requires "mummy >= 0.4.6"
 
 # Source directory
 srcDir = "src"

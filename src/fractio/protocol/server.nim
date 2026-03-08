@@ -71,6 +71,7 @@ type
     sharedTimerNumericNodeId*: uint16 ## 10-bit numeric node ID for Snowflake transaction IDs (default: serverId)
     sharedTimerPeers*: seq[PeerConfig] ## peer nodes for NTP-style clock sync (empty = single-node mode)
     dataDir*: string ## directory for persistent state (registry, etc.); "" = no persistence
+    webPort*: int   ## port for the HTTP management dashboard; 0 = disabled
 
 proc defaultServerConfig*(): ServerConfig =
   ServerConfig(
@@ -94,6 +95,7 @@ proc defaultServerConfig*(): ServerConfig =
     sharedTimerNumericNodeId: 0,
     sharedTimerPeers: @[],
     dataDir: "",
+    webPort: 0,
   )
 
 # ---------------------------------------------------------------------------
