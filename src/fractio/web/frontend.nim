@@ -88,7 +88,7 @@ appRoutes "app":
           tTable(style = "width:100%;border-collapse:collapse;font-size:.875rem;background:#fff;border:1px solid #e0e0e0;border-radius:6px;overflow:hidden"):
             tThead:
               tTr:
-                for h in ["ID","Host","Raft Port","Client Port","Status","Action"]:
+                for h in ["ID","Host","Raft Port","Client Port","Role","Status","Action"]:
                   tTh(style = "background:#3a3a3a;color:#fff;padding:.55rem .85rem;text-align:left;font-size:.7rem;text-transform:uppercase;letter-spacing:.07em;font-weight:600"):
                     "{h}"
             tTbody:
@@ -97,9 +97,8 @@ appRoutes "app":
                 let nhost = $safeStr(node, "host")
                 let nrp   = $safeIntStr(node, "raftPort")
                 let ncp   = $safeIntStr(node, "clientPort")
-                let nst   = safeInt(node, "status")
-                let nsc   = statusColor(nst)
-                let nss   = statusStr(nst)
+                let nrole = $safeStr(node, "role")
+                let nalive = safeBool(node, "alive")
                 let nidStr = $safeIntStr(node, "nodeId")
                 tTr:
                   tTd(style = "padding:.55rem .85rem;border-bottom:1px solid #eee"): "{nidStr}"
@@ -107,7 +106,16 @@ appRoutes "app":
                   tTd(style = "padding:.55rem .85rem;border-bottom:1px solid #eee"): "{nrp}"
                   tTd(style = "padding:.55rem .85rem;border-bottom:1px solid #eee"): "{ncp}"
                   tTd(style = "padding:.55rem .85rem;border-bottom:1px solid #eee"):
-                    tSpan(style = "color:{nsc};font-weight:600"): "{nss}"
+                    let rc = case nrole
+                      of "leader": "#1a7f37"
+                      of "follower": "#2563eb"
+                      else: "#888"
+                    tSpan(style = "color:{rc};font-weight:600"): "{nrole}"
+                  tTd(style = "padding:.55rem .85rem;border-bottom:1px solid #eee"):
+                    if nalive:
+                      tSpan(style = "color:#1a7f37;font-weight:600"): "alive"
+                    else:
+                      tSpan(style = "color:#c41010;font-weight:600"): "unreachable"
                   tTd(style = "padding:.55rem .85rem;border-bottom:1px solid #eee"):
                     tButton(style = "background:#e81c1c;color:#fff;border:none;padding:.3rem .75rem;border-radius:4px;cursor:pointer;font-size:.8rem"):
                       "Remove"

@@ -8,7 +8,7 @@
 # Call launchWebDashboard(server) after server.start() to activate the dashboard.
 
 import happyx
-import std/[json, strutils, times, os, atomics, random, asyncdispatch]
+import std/[json, strutils, times, os, atomics, random, asyncdispatch, httpclient]
 import zippy
 import ../protocol/server as pserver
 import ../protocol/messages/cluster as clusterMsgs
@@ -251,6 +251,36 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
               "clientPort": e.clientPort.int,
               "status":     e.status.int,
             })
+        # Enrich each node entry with live role and alive status
+        for entry in arr:
+          let entryNodeId = entry.getOrDefault("nodeId").getInt(0)
+          if entryNodeId == srv.config.serverId.int:
+            # Local node — use local Raft state directly
+            let role = if srv.raftStore.isNil: "unknown"
+                       elif srv.raftStore.coordinator.getLeaderCount() > 0: "leader"
+                       else: "follower"
+            entry["role"] = %role
+            entry["alive"] = %true
+          else:
+            # Probe peer's /api/info endpoint
+            let peerHost = entry.getOrDefault("host").getStr("")
+            let peerWebPort = entry.getOrDefault("webPort").getInt(0)
+            if peerHost != "" and peerWebPort > 0:
+              try:
+                let client = newHttpClient(timeout = 500)
+                let resp = client.request(
+                  "http://" & peerHost & ":" & $peerWebPort & "/api/info",
+                  httpMethod = HttpGet)
+                client.close()
+                let info = parseJson(resp.body)
+                entry["role"] = %info.getOrDefault("role").getStr("unknown")
+                entry["alive"] = %true
+              except CatchableError:
+                entry["role"] = %"unknown"
+                entry["alive"] = %false
+            else:
+              entry["role"] = %"unknown"
+              entry["alive"] = %false
         return arr
 
       # ---- REST: nodes POST ----

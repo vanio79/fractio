@@ -47,6 +47,9 @@ proc safeIntStr*(obj: JsObject, field: cstring): cstring
 proc jsLen*(obj: JsObject): cstring
     {.importjs: "String((#)?.length??0)".}
 
+proc safeBool*(obj: JsObject, field: cstring): bool
+    {.importjs: "(#[#]===true)".}
+
 # WebSocket native JS interop
 proc jsParseJsonStr*(s: cstring): JsObject
     {.importjs: "JSON.parse(#)".}
