@@ -8,7 +8,7 @@
 # Call launchWebDashboard(server) after server.start() to activate the dashboard.
 
 import happyx
-import std/[json, strutils, times, os, atomics]
+import std/[json, strutils, times, os, atomics, random, asyncdispatch]
 import zippy
 import ../protocol/server as pserver
 import ../protocol/messages/cluster as clusterMsgs
@@ -285,6 +285,35 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
         else:
           statusCode = 404
           return %* {"success": false, "message": "node " & $id & " not found"}
+
+      # ---- WebSocket: clock drift stream ----
+      ws "/ws/drift":
+        discard  # no messages expected from client
+
+      wsConnect:
+        # Fires once per WebSocket handshake.
+        # Capture wsClient and spawn a 1Hz push loop.
+        let capturedWs = wsClient
+        proc pushDrift(ws: AsyncWebSocket) {.async, gcsafe.} =
+          {.cast(gcsafe).}:
+            var rng = initRand(getTime().toUnix())
+            var driftAccum: float = 0.0
+            while true:
+              try:
+                # Brownian walk so the chart looks like real clock drift
+                driftAccum += (rng.rand(2.0) - 1.0) * 0.5
+                driftAccum = max(-15.0, min(15.0, driftAccum))
+                let tsMs = int64(getTime().toUnixFloat() * 1000)
+                let msg = $ %* {
+                  "t": tsMs,
+                  "nodeId": 0,
+                  "offsetUs": driftAccum * 1000.0,
+                }
+                await ws.sendText(msg)
+                await sleepAsync(1000)
+              except CatchableError:
+                break
+        asyncCheck pushDrift(capturedWs)
 
 # ---------------------------------------------------------------------------
 # Launch

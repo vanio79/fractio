@@ -5,7 +5,7 @@
 #   npx terser src/fractio/web/static/app.js --compress --mangle -o src/fractio/web/static/app.js
 #
 # True SPA: hash-based routing via HappyX appRoutes.
-# Routes: /#/, /#/nodes, /#/metrics.
+# Routes: /#/, /#/nodes, /#/metrics, /#/clock.
 
 import happyx
 import std/[jsffi, asyncjs]
@@ -58,6 +58,42 @@ proc safeIntStr(obj: JsObject, field: cstring): cstring
 proc jsLen(obj: JsObject): cstring
     {.importjs: "String((#)?.length??0)".}
 
+# WebSocket native JS interop
+proc jsParseJsonStr(s: cstring): JsObject
+    {.importjs: "JSON.parse(#)".}
+
+proc jsWsNew(url: cstring): JsObject
+    {.importjs: "new WebSocket(#)".}
+
+proc jsWsOnMessage(ws: JsObject, cb: proc(ev: JsObject))
+    {.importjs: "#.onmessage = #".}
+
+proc jsWsOnClose(ws: JsObject, cb: proc())
+    {.importjs: "#.onclose = #".}
+
+proc jsEvData(ev: JsObject): cstring
+    {.importjs: "#.data".}
+
+proc jsLocation(): cstring
+    {.importjs: "(function(){return window.location.host;})()".}
+
+proc jsSetInnerHtml(id: cstring, html: cstring)
+    {.importjs: "(function(i,h){var e=document.getElementById(i);if(e)e.innerHTML=h;})(#,#)".}
+
+proc jsSetTimeout(fn: proc(), ms: int)
+    {.importjs: "setTimeout(#,#)".}
+
+# ---------------------------------------------------------------------------
+# Clock drift chart constants
+# ---------------------------------------------------------------------------
+
+const
+  ChartW     = 600
+  ChartH     = 120
+  ChartPadX  = 4
+  ChartPadY  = 10
+  MaxSamples = 120   # 2 minutes @ 1Hz
+
 # ---------------------------------------------------------------------------
 # Global reactive state
 # ---------------------------------------------------------------------------
@@ -69,6 +105,12 @@ var
   gNodes:   State[JsObject] = remember newJsObject()
   gMsg:     State[string]   = remember ""
   gMsgOk:   State[bool]     = remember false
+
+  # Clock drift: plain globals — updated directly via jsSetInnerHtml,
+  # NOT via State, so they don't trigger HappyX re-renders.
+  gDriftSamples: seq[float] = @[]
+  gDriftLastStr: string     = "—"
+  gDriftWsStr:   string     = "connecting…"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -118,6 +160,79 @@ proc statusColor(s: int): string =
   else: "#888"
 
 # ---------------------------------------------------------------------------
+# Drift chart helpers
+# ---------------------------------------------------------------------------
+
+# Build the SVG <polyline> points string from the current sample ring buffer.
+# Y axis: ±25ms range → maps to chart height.
+proc buildPolylinePoints(samples: seq[float]): cstring =
+  if samples.len < 2:
+    return cstring("")
+  let n    = samples.len
+  let usW  = float(ChartW - ChartPadX * 2)
+  let usH  = float(ChartH - ChartPadY * 2)
+  let usRange = 25_000.0  # ±25 ms in µs
+
+  var pts = ""
+  for i, v in samples:
+    let x = float(ChartPadX) + usW * float(i) / float(n - 1)
+    let vc = max(-usRange, min(usRange, v))
+    let y = float(ChartPadY) + usH * (0.5 - vc / (usRange * 2.0))
+    if pts.len > 0: pts &= " "
+    pts &= $int(x) & "," & $int(y)
+  return cstring(pts)
+
+# Y coordinate for a threshold line (µs value)
+proc threshY(usVal: float): int =
+  let usH    = float(ChartH - ChartPadY * 2)
+  let usRange = 25_000.0
+  let vc = max(-usRange, min(usRange, usVal))
+  int(float(ChartPadY) + usH * (0.5 - vc / (usRange * 2.0)))
+
+proc buildChartSvg(samples: seq[float]): string =
+  let yZero   = threshY(0.0)
+  let yThUp   = threshY(10_000.0)
+  let yThDn   = threshY(-10_000.0)
+  let thBandH = threshY(-10_000.0) - threshY(10_000.0)
+  let pts     = $buildPolylinePoints(samples)
+  let polyEl  = if pts.len > 0:
+    "<polyline points=\"" & pts & "\" fill=\"none\" stroke=\"#e81c1c\" stroke-width=\"2\" stroke-linejoin=\"round\" stroke-linecap=\"round\"/>"
+  else: ""
+  "<svg viewBox=\"0 0 " & $ChartW & " " & $ChartH & "\" width=\"100%\" style=\"display:block;overflow:visible\" xmlns=\"http://www.w3.org/2000/svg\">" &
+  "<rect x=\"0\" y=\"" & $yThUp & "\" width=\"" & $ChartW & "\" height=\"" & $thBandH & "\" fill=\"#e81c1c\" fill-opacity=\"0.10\"/>" &
+  "<line x1=\"0\" y1=\"" & $yThUp & "\" x2=\"" & $ChartW & "\" y2=\"" & $yThUp & "\" stroke=\"#c41010\" stroke-width=\"1\" stroke-dasharray=\"4,4\" opacity=\"0.7\"/>" &
+  "<line x1=\"0\" y1=\"" & $yThDn & "\" x2=\"" & $ChartW & "\" y2=\"" & $yThDn & "\" stroke=\"#c41010\" stroke-width=\"1\" stroke-dasharray=\"4,4\" opacity=\"0.7\"/>" &
+  "<line x1=\"0\" y1=\"" & $yZero & "\" x2=\"" & $ChartW & "\" y2=\"" & $yZero & "\" stroke=\"#ffffff\" stroke-width=\"1\" stroke-dasharray=\"2,6\" opacity=\"0.25\"/>" &
+  polyEl &
+  "<line x1=\"0\" y1=\"0\" x2=\"0\" y2=\"" & $ChartH & "\" stroke=\"#444\" stroke-width=\"1\"/>" &
+  "</svg>"
+
+proc injectClockDom() =
+  ## Update all clock DOM nodes directly without triggering any HappyX re-render.
+  let wsstColor = if gDriftWsStr == "live": "#1a7f37" else: "#b45309"
+  jsSetInnerHtml("clock-ws-status",
+    "<span style=\"font-size:.75rem;color:" & wsstColor &
+    ";font-weight:600;background:#f0f0f0;padding:.2rem .6rem;border-radius:999px\">" &
+    gDriftWsStr & "</span>")
+  jsSetInnerHtml("clock-last-offset",
+    "<div style=\"font-size:1.2rem;font-weight:700;color:#e81c1c;font-family:monospace\">" &
+    gDriftLastStr & "</div>")
+  jsSetInnerHtml("clock-sample-count",
+    "<div style=\"font-size:1.2rem;font-weight:700;color:#e81c1c;font-family:monospace\">" &
+    $gDriftSamples.len & " / " & $MaxSamples & "</div>")
+  jsSetInnerHtml("drift-chart", cstring(buildChartSvg(gDriftSamples)))
+
+# ---------------------------------------------------------------------------
+# Nav style helpers (pure string computations — safe outside appRoutes)
+# ---------------------------------------------------------------------------
+
+proc navStyle(active: bool): string =
+  if active:
+    "color:#fff;text-decoration:none;padding:.6rem 1rem;font-size:.82rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em;border-bottom:2px solid #e81c1c"
+  else:
+    "color:#aaa;text-decoration:none;padding:.6rem 1rem;font-size:.82rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em"
+
+# ---------------------------------------------------------------------------
 # Data fetch
 # ---------------------------------------------------------------------------
 
@@ -127,6 +242,8 @@ proc doRefresh() {.async.} =
     gHealth.set(await fetchJson("/api/health"))
     gMetrics.set(await fetchJson("/api/metrics"))
     gNodes.set(await fetchJson("/api/nodes"))
+    # Re-inject clock DOM after HappyX re-renders wipe #drift-chart
+    jsSetTimeout(proc() = injectClockDom(), 0)
   except:
     discard
 
@@ -151,9 +268,45 @@ proc doJoinNode() {.async.} =
     gNodes.set(await fetchJson("/api/nodes"))
 
 # ---------------------------------------------------------------------------
-# Components
+# WebSocket drift connection
 # ---------------------------------------------------------------------------
 
+var gDriftWs {.global.}: JsObject = nil
+
+proc jsWsOnOpen(ws: JsObject, cb: proc())
+    {.importjs: "#.onopen = #".}
+
+proc connectDriftWs() =
+  let host = jsLocation()
+  let url  = cstring("ws://") & host & cstring("/ws/drift")
+  let ws   = jsWsNew(url)
+  gDriftWs = ws
+
+  jsWsOnOpen(ws, proc() =
+    gDriftWsStr = "live"
+    injectClockDom()
+  )
+
+  jsWsOnMessage(ws, proc(ev: JsObject) =
+    let data = jsEvData(ev)
+    try:
+      let msg = jsParseJsonStr(data)
+      let offsetUs = safeFloat(msg, "offsetUs")
+      gDriftSamples.add(offsetUs)
+      if gDriftSamples.len > MaxSamples:
+        gDriftSamples.delete(0)
+      let signChar = if offsetUs >= 0.0: "+" else: ""
+      gDriftLastStr = $signChar & $int(offsetUs) & " µs"
+      injectClockDom()
+    except:
+      discard
+  )
+
+  jsWsOnClose(ws, proc() =
+    gDriftWsStr = "reconnecting…"
+    injectClockDom()
+    jsSetTimeout(proc() = connectDriftWs(), 2000)
+  )
 
 # ---------------------------------------------------------------------------
 # Routes
@@ -163,19 +316,20 @@ appRoutes "app":
 
   # ---- Dashboard ----
   "/":
+    let hs = healthStr(safeInt(gHealth.get(), "status"))
+    let hc = healthColor(safeInt(gHealth.get(), "status"))
     tDiv(style = "display:flex;flex-direction:column;min-height:100vh"):
       tHeader(style = "display:flex;align-items:center;gap:1rem;padding:0 1.75rem;height:60px;background:#e81c1c;box-shadow:0 2px 8px rgba(0,0,0,.18);position:sticky;top:0;z-index:100"):
         tDiv(style = "font-size:1.1rem;font-weight:800;color:#fff;letter-spacing:.1em"):
           "⬡ FRACTIO"
         tDiv(style = "flex:1")
-        let hs = healthStr(safeInt(gHealth.get(), "status"))
-        let hc = healthColor(safeInt(gHealth.get(), "status"))
         tSpan(style = "background:{hc};color:#fff;padding:.25rem .75rem;border-radius:999px;font-size:.8rem;font-weight:700"):
           "{hs}"
       tNav(style = "background:#111;display:flex;padding:0 1.25rem"):
-        tA(href = "/#/",        style = "color:#fff;text-decoration:none;padding:.6rem 1rem;font-size:.82rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em;border-bottom:2px solid #e81c1c"): "Dashboard"
-        tA(href = "/#/nodes",   style = "color:#aaa;text-decoration:none;padding:.6rem 1rem;font-size:.82rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em"): "Nodes"
-        tA(href = "/#/metrics", style = "color:#aaa;text-decoration:none;padding:.6rem 1rem;font-size:.82rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em"): "Metrics"
+        tA(href = "/#/",        style = "{navStyle(true)}"):   "Dashboard"
+        tA(href = "/#/nodes",   style = "{navStyle(false)}"): "Nodes"
+        tA(href = "/#/metrics", style = "{navStyle(false)}"): "Metrics"
+        tA(href = "/#/clock",   style = "{navStyle(false)}"): "Clock"
       tMain(style = "flex:1;padding:1.75rem;max-width:1260px;width:100%"):
         let nid  = $safeIntStr(gInfo.get(), "nodeId")
         let role = roleStr(safeInt(gInfo.get(), "role"))
@@ -200,17 +354,18 @@ appRoutes "app":
 
   # ---- Nodes ----
   "/nodes":
+    let hs2 = healthStr(safeInt(gHealth.get(), "status"))
+    let hc2 = healthColor(safeInt(gHealth.get(), "status"))
     tDiv(style = "display:flex;flex-direction:column;min-height:100vh"):
       tHeader(style = "display:flex;align-items:center;gap:1rem;padding:0 1.75rem;height:60px;background:#e81c1c;box-shadow:0 2px 8px rgba(0,0,0,.18);position:sticky;top:0;z-index:100"):
         tDiv(style = "font-size:1.1rem;font-weight:800;color:#fff;letter-spacing:.1em"): "⬡ FRACTIO"
         tDiv(style = "flex:1")
-        let hs2 = healthStr(safeInt(gHealth.get(), "status"))
-        let hc2 = healthColor(safeInt(gHealth.get(), "status"))
         tSpan(style = "background:{hc2};color:#fff;padding:.25rem .75rem;border-radius:999px;font-size:.8rem;font-weight:700"): "{hs2}"
       tNav(style = "background:#111;display:flex;padding:0 1.25rem"):
-        tA(href = "/#/",        style = "color:#aaa;text-decoration:none;padding:.6rem 1rem;font-size:.82rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em"): "Dashboard"
-        tA(href = "/#/nodes",   style = "color:#fff;text-decoration:none;padding:.6rem 1rem;font-size:.82rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em;border-bottom:2px solid #e81c1c"): "Nodes"
-        tA(href = "/#/metrics", style = "color:#aaa;text-decoration:none;padding:.6rem 1rem;font-size:.82rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em"): "Metrics"
+        tA(href = "/#/",        style = "{navStyle(false)}"): "Dashboard"
+        tA(href = "/#/nodes",   style = "{navStyle(true)}"):  "Nodes"
+        tA(href = "/#/metrics", style = "{navStyle(false)}"): "Metrics"
+        tA(href = "/#/clock",   style = "{navStyle(false)}"): "Clock"
       tMain(style = "flex:1;padding:1.75rem;max-width:1260px;width:100%"):
         let arr = to(gNodes.get(), seq[JsObject])
         let arrLen = arr.len
@@ -268,17 +423,18 @@ appRoutes "app":
 
   # ---- Metrics ----
   "/metrics":
+    let hs3 = healthStr(safeInt(gHealth.get(), "status"))
+    let hc3 = healthColor(safeInt(gHealth.get(), "status"))
     tDiv(style = "display:flex;flex-direction:column;min-height:100vh"):
       tHeader(style = "display:flex;align-items:center;gap:1rem;padding:0 1.75rem;height:60px;background:#e81c1c;box-shadow:0 2px 8px rgba(0,0,0,.18);position:sticky;top:0;z-index:100"):
         tDiv(style = "font-size:1.1rem;font-weight:800;color:#fff;letter-spacing:.1em"): "⬡ FRACTIO"
         tDiv(style = "flex:1")
-        let hs3 = healthStr(safeInt(gHealth.get(), "status"))
-        let hc3 = healthColor(safeInt(gHealth.get(), "status"))
         tSpan(style = "background:{hc3};color:#fff;padding:.25rem .75rem;border-radius:999px;font-size:.8rem;font-weight:700"): "{hs3}"
       tNav(style = "background:#111;display:flex;padding:0 1.25rem"):
-        tA(href = "/#/",        style = "color:#aaa;text-decoration:none;padding:.6rem 1rem;font-size:.82rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em"): "Dashboard"
-        tA(href = "/#/nodes",   style = "color:#aaa;text-decoration:none;padding:.6rem 1rem;font-size:.82rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em"): "Nodes"
-        tA(href = "/#/metrics", style = "color:#fff;text-decoration:none;padding:.6rem 1rem;font-size:.82rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em;border-bottom:2px solid #e81c1c"): "Metrics"
+        tA(href = "/#/",        style = "{navStyle(false)}"): "Dashboard"
+        tA(href = "/#/nodes",   style = "{navStyle(false)}"): "Nodes"
+        tA(href = "/#/metrics", style = "{navStyle(true)}"):  "Metrics"
+        tA(href = "/#/clock",   style = "{navStyle(false)}"): "Clock"
       tMain(style = "flex:1;padding:1.75rem;max-width:1260px;width:100%"):
         tDiv(style = "display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:1rem"):
           tDiv(style = "background:#fff;border-radius:6px;border:1px solid #e0e0e0;padding:1rem"):
@@ -316,6 +472,66 @@ appRoutes "app":
       tFooter(style = "padding:.75rem 1.75rem;background:#111;color:#888;font-size:.75rem;text-align:center"):
         "Fractio Management Console · Auto-refresh every 5s"
 
+  # ---- Clock drift ----
+  "/clock":
+    let hs4 = healthStr(safeInt(gHealth.get(), "status"))
+    let hc4 = healthColor(safeInt(gHealth.get(), "status"))
+    tDiv(style = "display:flex;flex-direction:column;min-height:100vh"):
+      tHeader(style = "display:flex;align-items:center;gap:1rem;padding:0 1.75rem;height:60px;background:#e81c1c;box-shadow:0 2px 8px rgba(0,0,0,.18);position:sticky;top:0;z-index:100"):
+        tDiv(style = "font-size:1.1rem;font-weight:800;color:#fff;letter-spacing:.1em"): "⬡ FRACTIO"
+        tDiv(style = "flex:1")
+        tSpan(style = "background:{hc4};color:#fff;padding:.25rem .75rem;border-radius:999px;font-size:.8rem;font-weight:700"): "{hs4}"
+      tNav(style = "background:#111;display:flex;padding:0 1.25rem"):
+        tA(href = "/#/",        style = "{navStyle(false)}"): "Dashboard"
+        tA(href = "/#/nodes",   style = "{navStyle(false)}"): "Nodes"
+        tA(href = "/#/metrics", style = "{navStyle(false)}"): "Metrics"
+        tA(href = "/#/clock",   style = "{navStyle(true)}"):  "Clock"
+      tMain(style = "flex:1;padding:1.75rem;max-width:1260px;width:100%"):
+
+        # Title row — WS status badge is populated by injectClockDom()
+        tDiv(style = "display:flex;align-items:center;gap:.75rem;margin-bottom:1.25rem"):
+          tH2(style = "font-size:1.05rem;font-weight:700;color:#111;margin:0"):
+            "SharedTimer Clock Drift"
+          tDiv(id = "clock-ws-status")
+
+        # Chart card
+        tDiv(style = "background:#1a1a1a;border-radius:8px;padding:1rem 1rem .5rem;margin-bottom:1.25rem;box-shadow:0 2px 12px rgba(0,0,0,.18)"):
+          tDiv(style = "display:flex;justify-content:space-between;margin-bottom:.25rem"):
+            tSpan(style = "font-size:.65rem;color:#666;font-family:monospace"): "+25 ms"
+            tSpan(style = "font-size:.65rem;color:#888;font-family:monospace"): "clock offset"
+            tSpan(style = "font-size:.65rem;color:#666;font-family:monospace"): "−25 ms"
+
+          # SVG container — injected by injectClockDom(), never touched by HappyX
+          tDiv(id = "drift-chart", style = "width:100%;min-height:120px")
+
+          # X-axis legend
+          tDiv(style = "display:flex;justify-content:space-between;margin-top:.35rem"):
+            tSpan(style = "font-size:.65rem;color:#555;font-family:monospace"): "−2 min"
+            tSpan(style = "font-size:.65rem;color:#555;font-family:monospace"): "now"
+
+        # Stats row — values updated by injectClockDom()
+        tDiv(style = "display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:1rem;margin-bottom:1.25rem"):
+          tDiv(style = "background:#fff;border-top:3px solid #e81c1c;border-radius:6px;padding:1rem;box-shadow:0 1px 4px rgba(0,0,0,.07)"):
+            tDiv(style = "font-size:.68rem;color:#666;text-transform:uppercase;letter-spacing:.07em;margin-bottom:.5rem;font-weight:600"):
+              "Latest Offset"
+            tDiv(id = "clock-last-offset")
+          tDiv(style = "background:#fff;border-top:3px solid #e81c1c;border-radius:6px;padding:1rem;box-shadow:0 1px 4px rgba(0,0,0,.07)"):
+            tDiv(style = "font-size:.68rem;color:#666;text-transform:uppercase;letter-spacing:.07em;margin-bottom:.5rem;font-weight:600"):
+              "Samples"
+            tDiv(id = "clock-sample-count")
+          tDiv(style = "background:#fff;border-top:3px solid #e81c1c;border-radius:6px;padding:1rem;box-shadow:0 1px 4px rgba(0,0,0,.07)"):
+            tDiv(style = "font-size:.68rem;color:#666;text-transform:uppercase;letter-spacing:.07em;margin-bottom:.5rem;font-weight:600"):
+              "Threshold"
+            tDiv(style = "font-size:1.2rem;font-weight:700;color:#e81c1c;font-family:monospace"):
+              "±10 ms"
+
+        # Legend
+        tDiv(style = "font-size:.78rem;color:#888"):
+          "━ Clock offset   ╌ ±10 ms threshold   ┄ 0 ms baseline   · Updates every 1 s"
+
+      tFooter(style = "padding:.75rem 1.75rem;background:#111;color:#888;font-size:.75rem;text-align:center"):
+        "Fractio Management Console · SharedTimer drift stream"
+
 # ---------------------------------------------------------------------------
 # Boot
 # ---------------------------------------------------------------------------
@@ -323,3 +539,6 @@ appRoutes "app":
 when isMainModule:
   discard doRefresh()
   jsSetInterval(proc() = discard doRefresh(), 5000)
+  connectDriftWs()
+  # Initial DOM injection in case WS hasn't fired yet when page first loads
+  jsSetTimeout(proc() = injectClockDom(), 100)
