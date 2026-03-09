@@ -230,7 +230,7 @@ proc navStyle(active: bool): string =
   if active:
     "color:#fff;text-decoration:none;padding:.6rem 1rem;font-size:.82rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em;border-bottom:2px solid #e81c1c"
   else:
-    "color:#aaa;text-decoration:none;padding:.6rem 1rem;font-size:.82rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em"
+    "color:#bbb;text-decoration:none;padding:.6rem 1rem;font-size:.82rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em"
 
 # ---------------------------------------------------------------------------
 # Data fetch
@@ -325,7 +325,7 @@ appRoutes "app":
         tDiv(style = "flex:1")
         tSpan(style = "background:{hc};color:#fff;padding:.25rem .75rem;border-radius:999px;font-size:.8rem;font-weight:700"):
           "{hs}"
-      tNav(style = "background:#111;display:flex;padding:0 1.25rem"):
+      tNav(style = "background:#2d2d2d;display:flex;padding:0 1.25rem"):
         tA(href = "/#/",        style = "{navStyle(true)}"):   "Dashboard"
         tA(href = "/#/nodes",   style = "{navStyle(false)}"): "Nodes"
         tA(href = "/#/metrics", style = "{navStyle(false)}"): "Metrics"
@@ -349,7 +349,7 @@ appRoutes "app":
                 "{cardLbl}"
               tDiv(style = "font-size:1.5rem;font-weight:700;color:#e81c1c"):
                 "{cardVal}"
-      tFooter(style = "padding:.75rem 1.75rem;background:#111;color:#888;font-size:.75rem;text-align:center"):
+      tFooter(style = "padding:.75rem 1.75rem;background:#2d2d2d;color:#999;font-size:.75rem;text-align:center"):
         "Fractio Management Console · Auto-refresh every 5s"
 
   # ---- Nodes ----
@@ -361,7 +361,7 @@ appRoutes "app":
         tDiv(style = "font-size:1.1rem;font-weight:800;color:#fff;letter-spacing:.1em"): "⬡ FRACTIO"
         tDiv(style = "flex:1")
         tSpan(style = "background:{hc2};color:#fff;padding:.25rem .75rem;border-radius:999px;font-size:.8rem;font-weight:700"): "{hs2}"
-      tNav(style = "background:#111;display:flex;padding:0 1.25rem"):
+      tNav(style = "background:#2d2d2d;display:flex;padding:0 1.25rem"):
         tA(href = "/#/",        style = "{navStyle(false)}"): "Dashboard"
         tA(href = "/#/nodes",   style = "{navStyle(true)}"):  "Nodes"
         tA(href = "/#/metrics", style = "{navStyle(false)}"): "Metrics"
@@ -379,7 +379,7 @@ appRoutes "app":
             tThead:
               tTr:
                 for h in ["ID","Host","Raft Port","Client Port","Status","Action"]:
-                  tTh(style = "background:#111;color:#fff;padding:.55rem .85rem;text-align:left;font-size:.7rem;text-transform:uppercase;letter-spacing:.07em;font-weight:600"):
+                  tTh(style = "background:#3a3a3a;color:#fff;padding:.55rem .85rem;text-align:left;font-size:.7rem;text-transform:uppercase;letter-spacing:.07em;font-weight:600"):
                     "{h}"
             tTbody:
               for node in arr:
@@ -418,7 +418,7 @@ appRoutes "app":
             let mc = if gMsgOk: "#1a7f37" else: "#c41010"
             let mt = $gMsg
             tDiv(style = "font-size:.82rem;color:{mc}"): "{mt}"
-      tFooter(style = "padding:.75rem 1.75rem;background:#111;color:#888;font-size:.75rem;text-align:center"):
+      tFooter(style = "padding:.75rem 1.75rem;background:#2d2d2d;color:#999;font-size:.75rem;text-align:center"):
         "Fractio Management Console · Auto-refresh every 5s"
 
   # ---- Metrics ----
@@ -430,7 +430,7 @@ appRoutes "app":
         tDiv(style = "font-size:1.1rem;font-weight:800;color:#fff;letter-spacing:.1em"): "⬡ FRACTIO"
         tDiv(style = "flex:1")
         tSpan(style = "background:{hc3};color:#fff;padding:.25rem .75rem;border-radius:999px;font-size:.8rem;font-weight:700"): "{hs3}"
-      tNav(style = "background:#111;display:flex;padding:0 1.25rem"):
+      tNav(style = "background:#2d2d2d;display:flex;padding:0 1.25rem"):
         tA(href = "/#/",        style = "{navStyle(false)}"): "Dashboard"
         tA(href = "/#/nodes",   style = "{navStyle(false)}"): "Nodes"
         tA(href = "/#/metrics", style = "{navStyle(true)}"):  "Metrics"
@@ -469,7 +469,7 @@ appRoutes "app":
                 tTr:
                   tTd(style = "padding:.35rem 0;color:#444"): "{lbl}"
                   tTd(style = "text-align:right;font-family:monospace;color:#e81c1c;font-weight:600"): "{v}"
-      tFooter(style = "padding:.75rem 1.75rem;background:#111;color:#888;font-size:.75rem;text-align:center"):
+      tFooter(style = "padding:.75rem 1.75rem;background:#2d2d2d;color:#999;font-size:.75rem;text-align:center"):
         "Fractio Management Console · Auto-refresh every 5s"
 
   # ---- Clock drift ----
@@ -481,7 +481,7 @@ appRoutes "app":
         tDiv(style = "font-size:1.1rem;font-weight:800;color:#fff;letter-spacing:.1em"): "⬡ FRACTIO"
         tDiv(style = "flex:1")
         tSpan(style = "background:{hc4};color:#fff;padding:.25rem .75rem;border-radius:999px;font-size:.8rem;font-weight:700"): "{hs4}"
-      tNav(style = "background:#111;display:flex;padding:0 1.25rem"):
+      tNav(style = "background:#2d2d2d;display:flex;padding:0 1.25rem"):
         tA(href = "/#/",        style = "{navStyle(false)}"): "Dashboard"
         tA(href = "/#/nodes",   style = "{navStyle(false)}"): "Nodes"
         tA(href = "/#/metrics", style = "{navStyle(false)}"): "Metrics"
@@ -495,7 +495,7 @@ appRoutes "app":
           tDiv(id = "clock-ws-status")
 
         # Chart card
-        tDiv(style = "background:#1a1a1a;border-radius:8px;padding:1rem 1rem .5rem;margin-bottom:1.25rem;box-shadow:0 2px 12px rgba(0,0,0,.18)"):
+        tDiv(style = "background:#2a2a2a;border-radius:8px;padding:1rem 1rem .5rem;margin-bottom:1.25rem;box-shadow:0 2px 12px rgba(0,0,0,.18)"):
           tDiv(style = "display:flex;justify-content:space-between;margin-bottom:.25rem"):
             tSpan(style = "font-size:.65rem;color:#666;font-family:monospace"): "+25 ms"
             tSpan(style = "font-size:.65rem;color:#888;font-family:monospace"): "clock offset"
@@ -529,7 +529,7 @@ appRoutes "app":
         tDiv(style = "font-size:.78rem;color:#888"):
           "━ Clock offset   ╌ ±10 ms threshold   ┄ 0 ms baseline   · Updates every 1 s"
 
-      tFooter(style = "padding:.75rem 1.75rem;background:#111;color:#888;font-size:.75rem;text-align:center"):
+      tFooter(style = "padding:.75rem 1.75rem;background:#2d2d2d;color:#999;font-size:.75rem;text-align:center"):
         "Fractio Management Console · SharedTimer drift stream"
 
 # ---------------------------------------------------------------------------

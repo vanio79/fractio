@@ -65,9 +65,9 @@ header{
   position:sticky;top:0;z-index:100;
 }
 .logo{font-size:1.1rem;font-weight:800;color:#fff;letter-spacing:.1em;display:flex;align-items:center;gap:.45rem}
-.main-nav{background:#111;display:flex;gap:0;padding:0 1.25rem}
+.main-nav{background:#2d2d2d;display:flex;gap:0;padding:0 1.25rem}
 .main-nav a{
-  color:#aaa;text-decoration:none;padding:.6rem 1rem;font-size:.82rem;
+  color:#bbb;text-decoration:none;padding:.6rem 1rem;font-size:.82rem;
   font-weight:600;text-transform:uppercase;letter-spacing:.06em;
   border-bottom:2px solid transparent;transition:color .15s,border-color .15s;
 }
@@ -87,7 +87,7 @@ main{flex:1;padding:1.75rem;max-width:1260px;width:100%}
 .data-table{width:100%;border-collapse:collapse;font-size:.875rem;background:#fff;
   border:1px solid #e0e0e0;border-radius:6px;overflow:hidden}
 .data-table th{
-  background:#111;color:#fff;padding:.55rem .85rem;text-align:left;
+  background:#3a3a3a;color:#fff;padding:.55rem .85rem;text-align:left;
   font-size:.7rem;text-transform:uppercase;letter-spacing:.07em;font-weight:600;
 }
 .data-table td{padding:.55rem .85rem;border-bottom:1px solid #eee;color:#222}
@@ -102,7 +102,7 @@ main{flex:1;padding:1.75rem;max-width:1260px;width:100%}
 .metrics-table td{padding:.35rem 0;color:#444;border-bottom:1px solid #f0f0f0}
 .metrics-table tr:last-child td{border-bottom:none}
 .metrics-table td:last-child{text-align:right;font-family:'SF Mono','Fira Mono',monospace;color:#e81c1c;font-weight:600}
-footer{padding:.75rem 1.75rem;background:#111;color:#888;font-size:.75rem;text-align:center;letter-spacing:.03em}
+footer{padding:.75rem 1.75rem;background:#2d2d2d;color:#999;font-size:.75rem;text-align:center;letter-spacing:.03em}
 </style>
 </head>
 <body>
