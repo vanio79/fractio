@@ -20,6 +20,8 @@ type
     tkCreate
     tkDrop
     tkTable
+    tkDatabase
+    tkSchema
     tkIfExists
     tkIfNotExists
     tkPrimary
@@ -105,6 +107,8 @@ const keywords = {
   "CREATE":      tkCreate,
   "DROP":        tkDrop,
   "TABLE":       tkTable,
+  "DATABASE":    tkDatabase,
+  "SCHEMA":      tkSchema,
   "IF":          tkIdent,   # handled contextually by the parser
   "PRIMARY":     tkPrimary,
   "KEY":         tkKey,

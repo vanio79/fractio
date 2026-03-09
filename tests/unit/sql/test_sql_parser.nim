@@ -277,6 +277,64 @@ suite "SQL Parser — multi-statement":
     let stmts = parseAll("COMMIT;;;")
     check stmts.len == 1
 
+suite "SQL Parser — DDL: DATABASE":
+
+  test "CREATE DATABASE":
+    let s = parseStatement("CREATE DATABASE mydb")
+    check s.kind == stmtCreateDatabase
+    check s.cdbName == "mydb"
+    check s.cdbIfNotExists == false
+
+  test "CREATE DATABASE IF NOT EXISTS":
+    let s = parseStatement("CREATE DATABASE IF NOT EXISTS mydb")
+    check s.kind == stmtCreateDatabase
+    check s.cdbName == "mydb"
+    check s.cdbIfNotExists == true
+
+  test "DROP DATABASE":
+    let s = parseStatement("DROP DATABASE mydb")
+    check s.kind == stmtDropDatabase
+    check s.ddbName == "mydb"
+    check s.ddbIfExists == false
+
+  test "DROP DATABASE IF EXISTS":
+    let s = parseStatement("DROP DATABASE IF EXISTS mydb")
+    check s.kind == stmtDropDatabase
+    check s.ddbName == "mydb"
+    check s.ddbIfExists == true
+
+suite "SQL Parser — DDL: SCHEMA":
+
+  test "CREATE SCHEMA":
+    let s = parseStatement("CREATE SCHEMA reporting")
+    check s.kind == stmtCreateSchema
+    check s.csName == "reporting"
+    check s.csIfNotExists == false
+
+  test "CREATE SCHEMA IF NOT EXISTS":
+    let s = parseStatement("CREATE SCHEMA IF NOT EXISTS reporting")
+    check s.kind == stmtCreateSchema
+    check s.csName == "reporting"
+    check s.csIfNotExists == true
+
+  test "DROP SCHEMA":
+    let s = parseStatement("DROP SCHEMA reporting")
+    check s.kind == stmtDropSchema
+    check s.dsName == "reporting"
+    check s.dsIfExists == false
+
+  test "DROP SCHEMA IF EXISTS":
+    let s = parseStatement("DROP SCHEMA IF EXISTS reporting")
+    check s.kind == stmtDropSchema
+    check s.dsName == "reporting"
+    check s.dsIfExists == true
+
+  test "DATABASE and SCHEMA names are usable as identifiers in table DDL":
+    let s = parseStatement("CREATE TABLE schema (database INT)")
+    check s.kind == stmtCreateTable
+    check s.ctTable == "schema"
+    check s.ctColumns[0].name == "database"
+
 suite "SQL Parser — error cases":
 
   test "raises ParseError on garbage input":

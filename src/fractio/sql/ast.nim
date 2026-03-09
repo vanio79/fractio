@@ -117,6 +117,10 @@ type
   StmtKind* = enum
     stmtCreateTable
     stmtDropTable
+    stmtCreateDatabase
+    stmtDropDatabase
+    stmtCreateSchema
+    stmtDropSchema
     stmtSelect
     stmtInsert
     stmtUpdate
@@ -139,6 +143,26 @@ type
     of stmtDropTable:
       dtTable*:    string
       dtIfExists*: bool
+
+    # ---- CREATE DATABASE ----
+    of stmtCreateDatabase:
+      cdbName*:       string
+      cdbIfNotExists*: bool
+
+    # ---- DROP DATABASE ----
+    of stmtDropDatabase:
+      ddbName*:    string
+      ddbIfExists*: bool
+
+    # ---- CREATE SCHEMA ----
+    of stmtCreateSchema:
+      csName*:        string
+      csIfNotExists*: bool
+
+    # ---- DROP SCHEMA ----
+    of stmtDropSchema:
+      dsName*:    string
+      dsIfExists*: bool
 
     # ---- SELECT ----
     of stmtSelect:

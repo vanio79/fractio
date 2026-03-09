@@ -71,7 +71,8 @@ proc expectIdent(p: var Parser): string =
   ## Accept any token that can serve as an identifier (including keyword-reuse).
   let t = p.peek
   case t.kind
-  of tkIdent, tkCreate, tkDrop, tkTable, tkPrimary, tkKey, tkUnique,
+  of tkIdent, tkCreate, tkDrop, tkTable, tkDatabase, tkSchema,
+     tkPrimary, tkKey, tkUnique,
      tkNot, tkDefault, tkSelect, tkInsert, tkUpdate, tkDelete, tkInto,
      tkValues, tkSet, tkFrom, tkWhere, tkAnd, tkOr, tkIn, tkIs,
      tkBetween, tkLike, tkLimit, tkOffset, tkOrder, tkBy, tkAsc, tkDesc,
@@ -106,6 +107,12 @@ proc parseUpdate(p: var Parser): Stmt
 proc parseDelete(p: var Parser): Stmt
 proc parseCreateTable(p: var Parser): Stmt
 proc parseDropTable(p: var Parser): Stmt
+proc parseIfNotExists(p: var Parser): bool
+proc parseIfExists(p: var Parser): bool
+proc parseCreateDatabase(p: var Parser): Stmt
+proc parseDropDatabase(p: var Parser): Stmt
+proc parseCreateSchema(p: var Parser): Stmt
+proc parseDropSchema(p: var Parser): Stmt
 
 # ---------------------------------------------------------------------------
 # Expression parsing — Pratt/precedence-climbing
@@ -165,7 +172,8 @@ proc parsePrimary(p: var Parser): Expr =
     let inner = p.parseExpr
     discard p.expect(tkRParen)
     return inner
-  of tkIdent, tkCreate, tkDrop, tkTable, tkPrimary, tkKey, tkUnique,
+  of tkIdent, tkCreate, tkDrop, tkTable, tkDatabase, tkSchema,
+     tkPrimary, tkKey, tkUnique,
      tkDefault, tkSelect, tkInsert, tkUpdate, tkDelete, tkInto, tkValues,
      tkSet, tkFrom, tkWhere, tkAnd, tkOr, tkIn, tkIs, tkBetween, tkLike,
      tkLimit, tkOffset, tkOrder, tkBy, tkAsc, tkDesc, tkAll, tkDistinct,
@@ -297,15 +305,7 @@ proc parseColDef(p: var Parser): ColDef =
 
 proc parseCreateTable(p: var Parser): Stmt =
   ## Called after CREATE TABLE has been consumed.
-  var ifNotExists = false
-  # IF NOT EXISTS
-  if p.peekKind == tkIdent and p.peek.value.toUpperAscii == "IF":
-    discard p.advance
-    discard p.expect(tkNot)
-    let ex = p.expectIdent
-    if ex.toUpperAscii != "EXISTS":
-      raise parseError("expected EXISTS after IF NOT", p.peek)
-    ifNotExists = true
+  let ifNotExists = p.parseIfNotExists
 
   let tableName = p.expectIdent
   discard p.expect(tkLParen)
@@ -345,13 +345,7 @@ proc parseCreateTable(p: var Parser): Stmt =
 
 proc parseDropTable(p: var Parser): Stmt =
   ## Called after DROP TABLE has been consumed.
-  var ifExists = false
-  if p.peekKind == tkIdent and p.peek.value.toUpperAscii == "IF":
-    discard p.advance
-    let ex = p.expectIdent
-    if ex.toUpperAscii != "EXISTS":
-      raise parseError("expected EXISTS after IF", p.peek)
-    ifExists = true
+  let ifExists = p.parseIfExists
   let tableName = p.expectIdent
   result = Stmt(kind: stmtDropTable, dtTable: tableName, dtIfExists: ifExists)
 
@@ -511,6 +505,51 @@ proc parseDelete(p: var Parser): Stmt =
                 delWhere: whereExpr)
 
 # ---------------------------------------------------------------------------
+# CREATE / DROP DATABASE and SCHEMA
+# ---------------------------------------------------------------------------
+
+proc parseIfNotExists(p: var Parser): bool =
+  ## Consume IF NOT EXISTS and return true, or return false if absent.
+  if p.peekKind == tkIdent and p.peek.value.toUpperAscii == "IF":
+    discard p.advance
+    discard p.expect(tkNot)
+    let ex = p.expectIdent
+    if ex.toUpperAscii != "EXISTS":
+      raise parseError("expected EXISTS after IF NOT", p.peek)
+    return true
+  false
+
+proc parseIfExists(p: var Parser): bool =
+  ## Consume IF EXISTS and return true, or return false if absent.
+  if p.peekKind == tkIdent and p.peek.value.toUpperAscii == "IF":
+    discard p.advance
+    let ex = p.expectIdent
+    if ex.toUpperAscii != "EXISTS":
+      raise parseError("expected EXISTS after IF", p.peek)
+    return true
+  false
+
+proc parseCreateDatabase(p: var Parser): Stmt =
+  let ine = p.parseIfNotExists
+  let name = p.expectIdent
+  Stmt(kind: stmtCreateDatabase, cdbName: name, cdbIfNotExists: ine)
+
+proc parseDropDatabase(p: var Parser): Stmt =
+  let ie = p.parseIfExists
+  let name = p.expectIdent
+  Stmt(kind: stmtDropDatabase, ddbName: name, ddbIfExists: ie)
+
+proc parseCreateSchema(p: var Parser): Stmt =
+  let ine = p.parseIfNotExists
+  let name = p.expectIdent
+  Stmt(kind: stmtCreateSchema, csName: name, csIfNotExists: ine)
+
+proc parseDropSchema(p: var Parser): Stmt =
+  let ie = p.parseIfExists
+  let name = p.expectIdent
+  Stmt(kind: stmtDropSchema, dsName: name, dsIfExists: ie)
+
+# ---------------------------------------------------------------------------
 # Transaction statements
 # ---------------------------------------------------------------------------
 
@@ -528,12 +567,32 @@ proc parseOne*(p: var Parser): Stmt =
   case t.kind
   of tkCreate:
     discard p.advance
-    discard p.expect(tkTable)
-    return p.parseCreateTable
+    case p.peekKind
+    of tkTable:
+      discard p.advance
+      return p.parseCreateTable
+    of tkDatabase:
+      discard p.advance
+      return p.parseCreateDatabase
+    of tkSchema:
+      discard p.advance
+      return p.parseCreateSchema
+    else:
+      raise parseError(&"expected TABLE, DATABASE, or SCHEMA after CREATE but got '{p.peek.value}'", p.peek)
   of tkDrop:
     discard p.advance
-    discard p.expect(tkTable)
-    return p.parseDropTable
+    case p.peekKind
+    of tkTable:
+      discard p.advance
+      return p.parseDropTable
+    of tkDatabase:
+      discard p.advance
+      return p.parseDropDatabase
+    of tkSchema:
+      discard p.advance
+      return p.parseDropSchema
+    else:
+      raise parseError(&"expected TABLE, DATABASE, or SCHEMA after DROP but got '{p.peek.value}'", p.peek)
   of tkSelect:
     discard p.advance
     return p.parseSelect
