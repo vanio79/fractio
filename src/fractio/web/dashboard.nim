@@ -9,6 +9,7 @@
 
 import happyx
 import std/[json, strutils, times, os, atomics]
+import zippy
 import ../protocol/server as pserver
 import ../protocol/messages/cluster as clusterMsgs
 
@@ -29,7 +30,7 @@ template getSrv(): pserver.ProtocolServer =
 
 const appJs = staticRead("static/app.js")
 
-const htmlShell = """<!DOCTYPE html>
+const htmlShellStr = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -111,6 +112,10 @@ footer{padding:.75rem 1.75rem;background:#111;color:#888;font-size:.75rem;text-a
 </html>
 """
 
+# Pre-compressed at startup (not const — zippy uses pointer casts)
+var appJsGz     {.global.}: string
+var htmlShellGz {.global.}: string
+
 # ---------------------------------------------------------------------------
 # Helper
 # ---------------------------------------------------------------------------
@@ -133,12 +138,28 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
       # ---- Static assets ----
       get "/":
         outHeaders["Content-Type"] = "text/html; charset=utf-8"
-        return htmlShell
+        outHeaders["Vary"] = "Accept-Encoding"
+        let wantsGzip = headers.hasKey("accept-encoding") and
+                        "gzip" in $headers["accept-encoding"]
+        var body: string
+        {.cast(gcsafe).}:
+          body = if wantsGzip: htmlShellGz else: htmlShellStr
+        if wantsGzip:
+          outHeaders["Content-Encoding"] = "gzip"
+        return body
 
       get "/app.js":
         outHeaders["Content-Type"] = "application/javascript; charset=utf-8"
         outHeaders["Cache-Control"] = "no-cache"
-        return appJs
+        outHeaders["Vary"] = "Accept-Encoding"
+        let wantsGzip = headers.hasKey("accept-encoding") and
+                        "gzip" in $headers["accept-encoding"]
+        var body: string
+        {.cast(gcsafe).}:
+          body = if wantsGzip: appJsGz else: appJs
+        if wantsGzip:
+          outHeaders["Content-Encoding"] = "gzip"
+        return body
 
       # ---- REST: info ----
       get "/api/info":
@@ -274,6 +295,10 @@ proc launchWebDashboard*(srv: pserver.ProtocolServer) {.gcsafe, raises: [Catchab
   ## Must be called after server.start().
   gSrvPtr  = cast[pointer](srv)
   gWebPort = srv.config.webPort
+  # Pre-compress static assets once; globals are written before thread starts.
+  {.cast(gcsafe).}:
+    appJsGz     = compress(appJs,       BestCompression, dfGzip)
+    htmlShellGz = compress(htmlShellStr, BestCompression, dfGzip)
   try:
     let tRef = new Thread[int]
     createThread(tRef[], webServeThread, 0)
