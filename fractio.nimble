@@ -42,6 +42,11 @@ task test_storage, "Run only storage engine unit tests":
       echo "Running storage test: ", file
       exec "nim c -r --checks:on -p:src " & file
 
+task build_web, "Compile frontend SPA to JS, minify, then build server binary":
+  exec "nim js -d:release -o:src/fractio/web/static/app.js src/fractio/web/frontend.nim"
+  exec "npx terser src/fractio/web/static/app.js --compress --mangle -o src/fractio/web/static/app.js"
+  exec "nim c -d:beast --mm:atomicArc --threads:on -p:src -o:bin/fractio_web src/fractio/cli/main.nim"
+
 task test_storage_integration, "Run storage integration tests including stress tests":
   # Run storage integration tests from tests/integration/storage/
   for file in walkDirRec("tests/integration/storage"):

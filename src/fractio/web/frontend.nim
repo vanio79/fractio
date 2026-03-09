@@ -2,6 +2,7 @@
 #
 # Compiled to JavaScript with:
 #   nim js -d:release -o:src/fractio/web/static/app.js src/fractio/web/frontend.nim
+#   npx terser src/fractio/web/static/app.js --compress --mangle -o src/fractio/web/static/app.js
 #
 # True SPA: hash-based routing via HappyX appRoutes.
 # Routes: /#/, /#/nodes, /#/metrics.
