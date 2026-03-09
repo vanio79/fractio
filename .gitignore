@@ -26,22 +26,18 @@ dist/
 *~
 .DS_Store
 
-# Testing
+# Testing — temp files and compiled binaries
 tmp/
+tmp_*/
 testresults/
 test.txt
-# Ignore compiled test binaries in root (no extension = binary)
-test_err
-test_newerror
-test_recovery_only
-test_rotate_only
-test_simple
-/test_db_integration
-/test_sharedtimer_udp_integration
-# Ignore compiled test binaries in src
-src/fractio/test_*
-!src/fractio/test_*.nim
-# Ignore compiled test binaries in tests directories  
+# Compiled test binaries in root (no extension = Nim binary)
+/test_*
+!/test_*.nim
+# Compiled test binaries in src/
+src/**/test_*
+!src/**/*.nim
+# Compiled test binaries in tests/
 tests/**/test_*
 !tests/**/*.nim
 
@@ -61,8 +57,23 @@ config.local.nim
 
 # OS-specific
 Thumbs.db
-# Benchmark binaries
-benchmarks/fractio_bench
+# Benchmark binaries and temp dirs
+benchmarks/fractio_bench*
+!benchmarks/*.nim
+bench_persist_*/
 
 # Rust build artifacts (target directories)
 benchmarks/**/target/
+
+# Build output
+bin/
+
+# Screenshots (browser testing artifacts)
+*.png
+
+# Sourcemaps
+*.js.map
+
+# Playwright MCP
+.playwright-mcp/
+
