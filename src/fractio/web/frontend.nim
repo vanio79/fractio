@@ -83,16 +83,48 @@ proc jsSetInnerHtml(id: cstring, html: cstring)
 proc jsSetTimeout(fn: proc(), ms: int)
     {.importjs: "setTimeout(#,#)".}
 
+# Safe float→integer-string for SVG attributes (avoids BigInt crash)
+proc istrJs(v: float): cstring {.importjs: "String(Math.round(#))".}
+proc istr(v: float): string = $istrJs(v)
+
 # ---------------------------------------------------------------------------
-# Clock drift chart constants
+# Reusable SVG line chart
 # ---------------------------------------------------------------------------
 
-const
-  ChartW     = 600
-  ChartH     = 120
-  ChartPadX  = 4
-  ChartPadY  = 10
-  MaxSamples = 120   # 2 minutes @ 1Hz
+type
+  ChartThreshold = object
+    value: float           # Y-axis data value for the line
+    color: string          # stroke color
+    dashed: bool           # dashed or solid
+    bandTo: float          # if != value, fill a band between value..bandTo
+    bandColor: string      # band fill color
+    bandOpacity: float     # band fill-opacity
+
+  LineChartConfig = object
+    width, height: float
+    padX, padY: float
+    yMin, yMax: float      # data range (symmetric: -yMax..+yMax)
+    lineColor: string      # polyline stroke
+    lineWidth: float
+    bgColor: string        # SVG background rect fill
+    borderColor: string    # SVG border rect stroke
+    gridColor: string      # zero-line color
+    axisColor: string      # Y-axis line color
+    thresholds: seq[ChartThreshold]
+
+const MaxSamples = 120  # 2 minutes @ 1Hz
+
+let driftChartCfg = LineChartConfig(
+  width: 600.0, height: 120.0, padX: 4.0, padY: 10.0,
+  yMin: -25_000.0, yMax: 25_000.0,
+  lineColor: "#e81c1c", lineWidth: 2.0,
+  bgColor: "#fafafa", borderColor: "#e0e0e0",
+  gridColor: "#ccc", axisColor: "#ddd",
+  thresholds: @[
+    ChartThreshold(value: 10_000.0, color: "#c41010", dashed: true,
+                   bandTo: -10_000.0, bandColor: "#e81c1c", bandOpacity: 0.06),
+  ],
+)
 
 # ---------------------------------------------------------------------------
 # Global reactive state
@@ -160,52 +192,84 @@ proc statusColor(s: int): string =
   else: "#888"
 
 # ---------------------------------------------------------------------------
-# Drift chart helpers
+# Generic line chart helpers
 # ---------------------------------------------------------------------------
 
-# Build the SVG <polyline> points string from the current sample ring buffer.
-# Y axis: ±25ms range → maps to chart height.
-proc buildPolylinePoints(samples: seq[float]): cstring =
-  if samples.len < 2:
-    return cstring("")
-  let n    = samples.len
-  let usW  = float(ChartW - ChartPadX * 2)
-  let usH  = float(ChartH - ChartPadY * 2)
-  let usRange = 25_000.0  # ±25 ms in µs
+proc chartY(cfg: LineChartConfig, value: float): float =
+  ## Map a data value to pixel Y coordinate.
+  let usH = cfg.height - cfg.padY * 2.0
+  let vc  = max(cfg.yMin, min(cfg.yMax, value))
+  cfg.padY + usH * (0.5 - vc / (cfg.yMax - cfg.yMin))
 
+proc buildPolyline(cfg: LineChartConfig, samples: seq[float]): string =
+  ## Build SVG polyline points string from samples.
+  if samples.len < 2: return ""
+  let n   = samples.len
+  let usW = cfg.width - cfg.padX * 2.0
   var pts = ""
   for i, v in samples:
-    let x = float(ChartPadX) + usW * float(i) / float(n - 1)
-    let vc = max(-usRange, min(usRange, v))
-    let y = float(ChartPadY) + usH * (0.5 - vc / (usRange * 2.0))
+    let x = cfg.padX + usW * float(i) / float(n - 1)
+    let y = chartY(cfg, v)
     if pts.len > 0: pts &= " "
-    pts &= $int(x) & "," & $int(y)
-  return cstring(pts)
+    pts &= istr(x) & "," & istr(y)
+  pts
 
-# Y coordinate for a threshold line (µs value)
-proc threshY(usVal: float): int =
-  let usH    = float(ChartH - ChartPadY * 2)
-  let usRange = 25_000.0
-  let vc = max(-usRange, min(usRange, usVal))
-  int(float(ChartPadY) + usH * (0.5 - vc / (usRange * 2.0)))
+proc buildLineChartSvg(cfg: LineChartConfig, samples: seq[float]): string =
+  ## Build a complete SVG string for a line chart.
+  let yZero = chartY(cfg, 0.0)
+  let pts   = buildPolyline(cfg, samples)
+  let w = istr(cfg.width)
+  let h = istr(cfg.height)
 
-proc buildChartSvg(samples: seq[float]): string =
-  let yZero   = threshY(0.0)
-  let yThUp   = threshY(10_000.0)
-  let yThDn   = threshY(-10_000.0)
-  let thBandH = threshY(-10_000.0) - threshY(10_000.0)
-  let pts     = $buildPolylinePoints(samples)
-  let polyEl  = if pts.len > 0:
-    "<polyline points=\"" & pts & "\" fill=\"none\" stroke=\"#e81c1c\" stroke-width=\"2\" stroke-linejoin=\"round\" stroke-linecap=\"round\"/>"
-  else: ""
-  "<svg viewBox=\"0 0 " & $ChartW & " " & $ChartH & "\" width=\"100%\" style=\"display:block;overflow:visible\" xmlns=\"http://www.w3.org/2000/svg\">" &
-  "<rect x=\"0\" y=\"" & $yThUp & "\" width=\"" & $ChartW & "\" height=\"" & $thBandH & "\" fill=\"#e81c1c\" fill-opacity=\"0.10\"/>" &
-  "<line x1=\"0\" y1=\"" & $yThUp & "\" x2=\"" & $ChartW & "\" y2=\"" & $yThUp & "\" stroke=\"#c41010\" stroke-width=\"1\" stroke-dasharray=\"4,4\" opacity=\"0.7\"/>" &
-  "<line x1=\"0\" y1=\"" & $yThDn & "\" x2=\"" & $ChartW & "\" y2=\"" & $yThDn & "\" stroke=\"#c41010\" stroke-width=\"1\" stroke-dasharray=\"4,4\" opacity=\"0.7\"/>" &
-  "<line x1=\"0\" y1=\"" & $yZero & "\" x2=\"" & $ChartW & "\" y2=\"" & $yZero & "\" stroke=\"#ffffff\" stroke-width=\"1\" stroke-dasharray=\"2,6\" opacity=\"0.25\"/>" &
-  polyEl &
-  "<line x1=\"0\" y1=\"0\" x2=\"0\" y2=\"" & $ChartH & "\" stroke=\"#444\" stroke-width=\"1\"/>" &
-  "</svg>"
+  # Open SVG
+  result = "<svg viewBox=\"0 0 " & w & " " & h &
+    "\" width=\"100%\" style=\"display:block;overflow:visible\" xmlns=\"http://www.w3.org/2000/svg\">"
+
+  # Background
+  result &= "<rect width=\"" & w & "\" height=\"" & h &
+    "\" fill=\"" & cfg.bgColor & "\" rx=\"4\"/>"
+
+  # Threshold bands and lines
+  for th in cfg.thresholds:
+    if th.bandTo != th.value:
+      let yTop = chartY(cfg, th.value)
+      let yBot = chartY(cfg, th.bandTo)
+      let bandH = yBot - yTop
+      result &= "<rect x=\"0\" y=\"" & istr(yTop) & "\" width=\"" & w &
+        "\" height=\"" & istr(bandH) & "\" fill=\"" & th.bandColor &
+        "\" fill-opacity=\"" & $th.bandOpacity & "\"/>"
+    # Threshold lines
+    let yTh = chartY(cfg, th.value)
+    let dash = if th.dashed: " stroke-dasharray=\"4,4\"" else: ""
+    result &= "<line x1=\"0\" y1=\"" & istr(yTh) & "\" x2=\"" & w &
+      "\" y2=\"" & istr(yTh) & "\" stroke=\"" & th.color &
+      "\" stroke-width=\"1\"" & dash & " opacity=\"0.7\"/>"
+    if th.bandTo != th.value:
+      let yTh2 = chartY(cfg, th.bandTo)
+      result &= "<line x1=\"0\" y1=\"" & istr(yTh2) & "\" x2=\"" & w &
+        "\" y2=\"" & istr(yTh2) & "\" stroke=\"" & th.color &
+        "\" stroke-width=\"1\"" & dash & " opacity=\"0.7\"/>"
+
+  # Zero / grid line
+  result &= "<line x1=\"0\" y1=\"" & istr(yZero) & "\" x2=\"" & w &
+    "\" y2=\"" & istr(yZero) & "\" stroke=\"" & cfg.gridColor &
+    "\" stroke-width=\"1\" stroke-dasharray=\"2,6\" opacity=\"0.4\"/>"
+
+  # Data polyline
+  if pts.len > 0:
+    result &= "<polyline points=\"" & pts & "\" fill=\"none\" stroke=\"" &
+      cfg.lineColor & "\" stroke-width=\"" & istr(cfg.lineWidth) &
+      "\" stroke-linejoin=\"round\" stroke-linecap=\"round\"/>"
+
+  # Y-axis
+  result &= "<line x1=\"0\" y1=\"0\" x2=\"0\" y2=\"" & h &
+    "\" stroke=\"" & cfg.axisColor & "\" stroke-width=\"1\"/>"
+
+  # Border
+  result &= "<rect width=\"" & w & "\" height=\"" & h &
+    "\" fill=\"none\" stroke=\"" & cfg.borderColor & "\" stroke-width=\"1\" rx=\"4\"/>"
+
+  result &= "</svg>"
 
 proc injectClockDom() =
   ## Update all clock DOM nodes directly without triggering any HappyX re-render.
@@ -220,7 +284,7 @@ proc injectClockDom() =
   jsSetInnerHtml("clock-sample-count",
     "<div style=\"font-size:1.2rem;font-weight:700;color:#e81c1c;font-family:monospace\">" &
     $gDriftSamples.len & " / " & $MaxSamples & "</div>")
-  jsSetInnerHtml("drift-chart", cstring(buildChartSvg(gDriftSamples)))
+  jsSetInnerHtml("drift-chart", cstring(buildLineChartSvg(driftChartCfg, gDriftSamples)))
 
 # ---------------------------------------------------------------------------
 # Nav style helpers (pure string computations — safe outside appRoutes)
@@ -495,19 +559,19 @@ appRoutes "app":
           tDiv(id = "clock-ws-status")
 
         # Chart card
-        tDiv(style = "background:#2a2a2a;border-radius:8px;padding:1rem 1rem .5rem;margin-bottom:1.25rem;box-shadow:0 2px 12px rgba(0,0,0,.18)"):
+        tDiv(style = "background:#fff;border:1px solid #e0e0e0;border-radius:8px;padding:1rem 1rem .5rem;margin-bottom:1.25rem;box-shadow:0 1px 4px rgba(0,0,0,.07)"):
           tDiv(style = "display:flex;justify-content:space-between;margin-bottom:.25rem"):
-            tSpan(style = "font-size:.65rem;color:#666;font-family:monospace"): "+25 ms"
-            tSpan(style = "font-size:.65rem;color:#888;font-family:monospace"): "clock offset"
-            tSpan(style = "font-size:.65rem;color:#666;font-family:monospace"): "−25 ms"
+            tSpan(style = "font-size:.65rem;color:#999;font-family:monospace"): "+25 ms"
+            tSpan(style = "font-size:.65rem;color:#666;font-family:monospace"): "clock offset"
+            tSpan(style = "font-size:.65rem;color:#999;font-family:monospace"): "−25 ms"
 
           # SVG container — injected by injectClockDom(), never touched by HappyX
           tDiv(id = "drift-chart", style = "width:100%;min-height:120px")
 
           # X-axis legend
           tDiv(style = "display:flex;justify-content:space-between;margin-top:.35rem"):
-            tSpan(style = "font-size:.65rem;color:#555;font-family:monospace"): "−2 min"
-            tSpan(style = "font-size:.65rem;color:#555;font-family:monospace"): "now"
+            tSpan(style = "font-size:.65rem;color:#999;font-family:monospace"): "−2 min"
+            tSpan(style = "font-size:.65rem;color:#999;font-family:monospace"): "now"
 
         # Stats row — values updated by injectClockDom()
         tDiv(style = "display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:1rem;margin-bottom:1.25rem"):
