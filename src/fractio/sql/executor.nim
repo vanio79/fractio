@@ -17,10 +17,12 @@ import ../core/types as coreTypes
 
 type
   ExecResultKind* = enum
-    erkRows      ## SELECT results
-    erkModified  ## INSERT/UPDATE/DELETE affected rows
-    erkOk        ## DDL success
-    erkError     ## Error
+    erkRows         ## SELECT results
+    erkModified     ## INSERT/UPDATE/DELETE affected rows
+    erkOk           ## DDL success
+    erkError        ## Error
+    erkUseDatabase  ## USE DATABASE — caller should update session context
+    erkUseSchema    ## USE SCHEMA — caller should update session context
 
   ExecResult* = ref object
     case kind*: ExecResultKind
@@ -34,6 +36,10 @@ type
       okMessage*: string
     of erkError:
       error*: string
+    of erkUseDatabase:
+      newDatabase*: string
+    of erkUseSchema:
+      newSchema*: string
 
 proc okResult*(msg: string): ExecResult =
   ExecResult(kind: erkOk, okMessage: msg)
@@ -405,6 +411,24 @@ proc execDelete(op: PlanOp, store: RaftKVStoreExt): ExecResult =
 
   modifiedResult(count, &"DELETE {count}")
 
+proc execUseDatabase(op: PlanOp, store: RaftKVStoreExt): ExecResult =
+  # Verify the database exists
+  let key = encodeTableKey(SYS_DATABASES_TABLE_ID, op.udName)
+  let existing = store.raftGet(key)
+  if not existing.isOk or existing.value.isNone:
+    return errorResult(&"database '{op.udName}' does not exist")
+  ExecResult(kind: erkUseDatabase, newDatabase: op.udName)
+
+proc execUseSchema(op: PlanOp, store: RaftKVStoreExt,
+    database: string): ExecResult =
+  # Verify the schema exists in the current database
+  let key = encodeTableKey(SYS_SCHEMAS_TABLE_ID,
+      database & "." & op.usName)
+  let existing = store.raftGet(key)
+  if not existing.isOk or existing.value.isNone:
+    return errorResult(&"schema '{op.usName}' does not exist in database '{database}'")
+  ExecResult(kind: erkUseSchema, newSchema: op.usName)
+
 proc execShowDatabases(op: PlanOp, store: RaftKVStoreExt): ExecResult =
   let startKey = encodeTableKey(SYS_DATABASES_TABLE_ID, "")
   let endKey = encodeTableKey(SYS_DATABASES_TABLE_ID + 1, "")
@@ -478,7 +502,8 @@ proc execShowTables(op: PlanOp, store: RaftKVStoreExt): ExecResult =
 # Main entry point
 # ---------------------------------------------------------------------------
 
-proc execute*(plan: Plan, store: RaftKVStoreExt): ExecResult =
+proc execute*(plan: Plan, store: RaftKVStoreExt,
+    database: string = "default"): ExecResult =
   ## Execute a Plan against a RaftKVStoreExt, returning an ExecResult.
   ## Processes ops sequentially; returns the result of the last op
   ## (or the first error).
@@ -500,6 +525,8 @@ proc execute*(plan: Plan, store: RaftKVStoreExt): ExecResult =
     of poShowDatabases:  execShowDatabases(op, store)
     of poShowSchemas:    execShowSchemas(op, store)
     of poShowTables:     execShowTables(op, store)
+    of poUseDatabase:    execUseDatabase(op, store)
+    of poUseSchema:      execUseSchema(op, store, database)
     of poBeginTxn:       okResult("BEGIN")
     of poCommitTxn:      okResult("COMMIT")
     of poRollbackTxn:    okResult("ROLLBACK")
@@ -524,7 +551,7 @@ proc executeSQL*(sql: string, store: RaftKVStoreExt,
     var lastResult = okResult("ok")
     for stmt in stmts:
       let plan = planStatement(stmt, store, database, schema)
-      lastResult = execute(plan, store)
+      lastResult = execute(plan, store, database)
       if lastResult.kind == erkError:
         return lastResult
     lastResult

@@ -62,8 +62,9 @@ type
     tkTransaction
     tkWork
 
-    # SHOW keywords
+    # SHOW / USE keywords
     tkShow       ## SHOW
+    tkUse        ## USE
     tkDatabases  ## DATABASES
     tkSchemas    ## SCHEMAS
     tkTables     ## TABLES
@@ -157,6 +158,7 @@ const keywords = {
   "FALSE":       tkFalse,
   "WITH":        tkWith,
   "SHOW":        tkShow,
+  "USE":         tkUse,
   "DATABASES":   tkDatabases,
   "SCHEMAS":     tkSchemas,
   "TABLES":      tkTables,

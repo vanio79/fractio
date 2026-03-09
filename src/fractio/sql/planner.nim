@@ -30,6 +30,8 @@ type
     poShowDatabases
     poShowSchemas
     poShowTables
+    poUseDatabase
+    poUseSchema
     poBeginTxn
     poCommitTxn
     poRollbackTxn
@@ -117,6 +119,12 @@ type
     of poShowTables:
       stDatabase*: string  # filter by database (empty = current)
       stSchema*: string    # filter by schema (empty = current)
+
+    of poUseDatabase:
+      udName*: string
+
+    of poUseSchema:
+      usName*: string
 
     of poBeginTxn:
       btReadOnly*: bool
@@ -534,6 +542,14 @@ proc planStatement*(stmt: Stmt, store: RaftKVStoreExt,
     let db = if stmt.showTablesDb.len > 0: stmt.showTablesDb else: database
     let sc = if stmt.showTablesSchema.len > 0: stmt.showTablesSchema else: schema
     plan.add(PlanOp(kind: poShowTables, stDatabase: db, stSchema: sc))
+    plan
+  of stmtUseDatabase:
+    let plan = newPlan()
+    plan.add(PlanOp(kind: poUseDatabase, udName: stmt.useDbName))
+    plan
+  of stmtUseSchema:
+    let plan = newPlan()
+    plan.add(PlanOp(kind: poUseSchema, usName: stmt.useSchemaName))
     plan
   of stmtBegin:
     let plan = newPlan()

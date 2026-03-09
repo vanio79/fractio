@@ -303,6 +303,26 @@ suite "SQL Planner":
     check plan.ops[0].stDatabase == "mydb"
     check plan.ops[0].stSchema == "myschema"
 
+  test "plan USE DATABASE":
+    let stmt = parseStatement("USE DATABASE mydb")
+    let plan = planStatement(stmt, store)
+    check plan.ops.len == 1
+    check plan.ops[0].kind == poUseDatabase
+    check plan.ops[0].udName == "mydb"
+
+  test "plan USE (bare, defaults to database)":
+    let stmt = parseStatement("USE mydb")
+    let plan = planStatement(stmt, store)
+    check plan.ops[0].kind == poUseDatabase
+    check plan.ops[0].udName == "mydb"
+
+  test "plan USE SCHEMA":
+    let stmt = parseStatement("USE SCHEMA myschema")
+    let plan = planStatement(stmt, store)
+    check plan.ops.len == 1
+    check plan.ops[0].kind == poUseSchema
+    check plan.ops[0].usName == "myschema"
+
   test "nextTableId allocates incrementally":
     let id1 = nextTableId(store)
     check id1 == FIRST_USER_TABLE_ID

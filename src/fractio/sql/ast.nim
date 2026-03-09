@@ -128,6 +128,8 @@ type
     stmtShowDatabases
     stmtShowSchemas
     stmtShowTables
+    stmtUseDatabase
+    stmtUseSchema
     stmtBegin
     stmtCommit
     stmtRollback
@@ -208,6 +210,12 @@ type
     of stmtShowTables:
       showTablesDb*:     string  ## database (may be empty → use current)
       showTablesSchema*: string  ## schema (may be empty → use current)
+
+    # ---- USE ----
+    of stmtUseDatabase:
+      useDbName*: string
+    of stmtUseSchema:
+      useSchemaName*: string
 
     # ---- Transaction ----
     of stmtBegin:

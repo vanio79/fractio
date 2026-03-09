@@ -77,7 +77,7 @@ proc expectIdent(p: var Parser): string =
      tkValues, tkSet, tkFrom, tkWhere, tkAnd, tkOr, tkIn, tkIs,
      tkBetween, tkLike, tkLimit, tkOffset, tkOrder, tkBy, tkAsc, tkDesc,
      tkAll, tkDistinct, tkBegin, tkCommit, tkRollback, tkTransaction, tkWork,
-     tkWith, tkShow, tkDatabases, tkSchemas, tkTables,
+     tkWith, tkShow, tkUse, tkDatabases, tkSchemas, tkTables,
      tkTkInt, tkTkFloat, tkTkText, tkTkBool, tkTkDate, tkTkDateTime, tkTkBytes:
     discard p.advance
     t.value
@@ -681,6 +681,21 @@ proc parseOne*(p: var Parser): Stmt =
                   showTablesSchema: schema)
     else:
       raise parseError(&"expected DATABASES, SCHEMAS, or TABLES after SHOW but got '{p.peek.value}'", p.peek)
+  of tkUse:
+    discard p.advance
+    case p.peekKind
+    of tkDatabase:
+      discard p.advance
+      let name = p.expectIdent
+      return Stmt(kind: stmtUseDatabase, useDbName: name)
+    of tkSchema:
+      discard p.advance
+      let name = p.expectIdent
+      return Stmt(kind: stmtUseSchema, useSchemaName: name)
+    else:
+      # Bare "USE <name>" defaults to USE DATABASE
+      let name = p.expectIdent
+      return Stmt(kind: stmtUseDatabase, useDbName: name)
   else:
     raise parseError(&"expected a SQL statement but got '{t.value}'", t)
 

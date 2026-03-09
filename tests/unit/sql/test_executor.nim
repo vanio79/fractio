@@ -464,6 +464,56 @@ suite "SQL Executor — SHOW statements":
     check res.rows[0][0] == "t2"
 
 
+suite "SQL Executor — USE statements":
+  var store: RaftKVStoreExt
+  let testDir = "/tmp/fractio_test_executor_use_" & $getCurrentProcessId()
+
+  setup:
+    cleanupTestDir(testDir)
+    store = createTestStore(testDir)
+
+  teardown:
+    store.coordinator.stop()
+    cleanupTestDir(testDir)
+
+  test "USE DATABASE succeeds when database exists":
+    discard exec(store, "CREATE DATABASE mydb")
+    let res = exec(store, "USE DATABASE mydb")
+    check res.kind == erkUseDatabase
+    check res.newDatabase == "mydb"
+
+  test "USE DATABASE fails when database does not exist":
+    let res = exec(store, "USE DATABASE nope")
+    check res.kind == erkError
+    check "does not exist" in res.error
+
+  test "USE (bare) defaults to USE DATABASE":
+    discard exec(store, "CREATE DATABASE mydb")
+    let res = exec(store, "USE mydb")
+    check res.kind == erkUseDatabase
+    check res.newDatabase == "mydb"
+
+  test "USE SCHEMA succeeds when schema exists":
+    discard exec(store, "CREATE DATABASE mydb")
+    discard exec(store, "CREATE SCHEMA api", database = "mydb")
+    let res = exec(store, "USE SCHEMA api", database = "mydb")
+    check res.kind == erkUseSchema
+    check res.newSchema == "api"
+
+  test "USE SCHEMA fails when schema does not exist":
+    discard exec(store, "CREATE DATABASE mydb")
+    let res = exec(store, "USE SCHEMA nope", database = "mydb")
+    check res.kind == erkError
+    check "does not exist" in res.error
+
+  test "USE SCHEMA fails when schema is in different database":
+    discard exec(store, "CREATE DATABASE db1")
+    discard exec(store, "CREATE DATABASE db2")
+    discard exec(store, "CREATE SCHEMA api", database = "db1")
+    let res = exec(store, "USE SCHEMA api", database = "db2")
+    check res.kind == erkError
+
+
 suite "SQL Executor — Full round-trip":
   var store: RaftKVStoreExt
   let testDir = "/tmp/fractio_test_executor_roundtrip_" & $getCurrentProcessId()
