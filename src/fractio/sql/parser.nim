@@ -77,6 +77,7 @@ proc expectIdent(p: var Parser): string =
      tkValues, tkSet, tkFrom, tkWhere, tkAnd, tkOr, tkIn, tkIs,
      tkBetween, tkLike, tkLimit, tkOffset, tkOrder, tkBy, tkAsc, tkDesc,
      tkAll, tkDistinct, tkBegin, tkCommit, tkRollback, tkTransaction, tkWork,
+     tkWith,
      tkTkInt, tkTkFloat, tkTkText, tkTkBool, tkTkDate, tkTkDateTime, tkTkBytes:
     discard p.advance
     t.value
@@ -113,6 +114,7 @@ proc parseCreateDatabase(p: var Parser): Stmt
 proc parseDropDatabase(p: var Parser): Stmt
 proc parseCreateSchema(p: var Parser): Stmt
 proc parseDropSchema(p: var Parser): Stmt
+proc parseWithReplicas(p: var Parser): Option[int]
 
 # ---------------------------------------------------------------------------
 # Expression parsing — Pratt/precedence-climbing
@@ -177,7 +179,7 @@ proc parsePrimary(p: var Parser): Expr =
      tkDefault, tkSelect, tkInsert, tkUpdate, tkDelete, tkInto, tkValues,
      tkSet, tkFrom, tkWhere, tkAnd, tkOr, tkIn, tkIs, tkBetween, tkLike,
      tkLimit, tkOffset, tkOrder, tkBy, tkAsc, tkDesc, tkAll, tkDistinct,
-     tkBegin, tkCommit, tkRollback, tkTransaction, tkWork,
+     tkBegin, tkCommit, tkRollback, tkTransaction, tkWork, tkWith,
      tkTkInt, tkTkFloat, tkTkText, tkTkBool, tkTkDate, tkTkDateTime, tkTkBytes:
     let name = t.value
     discard p.advance
@@ -335,9 +337,10 @@ proc parseCreateTable(p: var Parser): Stmt =
     if not p.match(tkComma): break
 
   discard p.expect(tkRParen)
+  let replicas = p.parseWithReplicas
   result = Stmt(kind: stmtCreateTable, ctTable: tableName,
                 ctIfNotExists: ifNotExists, ctColumns: cols,
-                ctPrimaryKey: tablePK)
+                ctPrimaryKey: tablePK, ctReplicas: replicas)
 
 # ---------------------------------------------------------------------------
 # DROP TABLE
@@ -529,10 +532,28 @@ proc parseIfExists(p: var Parser): bool =
     return true
   false
 
+proc parseWithReplicas(p: var Parser): Option[int] =
+  ## Parse optional WITH REPLICAS = N clause.
+  ## Returns none if absent; raises ParseError if malformed.
+  if p.peekKind != tkWith:
+    return none(int)
+  discard p.advance  # consume WITH
+  let kw = p.expectIdent
+  if kw.toUpperAscii != "REPLICAS":
+    raise parseError("expected REPLICAS after WITH but got '" & kw & "'", p.peek)
+  discard p.expect(tkEq)
+  let tok = p.expect(tkInt)
+  let n = parseInt(tok.value)
+  if n < 1:
+    raise parseError("REPLICAS must be >= 1, got " & $n, tok)
+  some(n)
+
 proc parseCreateDatabase(p: var Parser): Stmt =
   let ine = p.parseIfNotExists
   let name = p.expectIdent
-  Stmt(kind: stmtCreateDatabase, cdbName: name, cdbIfNotExists: ine)
+  let replicas = p.parseWithReplicas
+  Stmt(kind: stmtCreateDatabase, cdbName: name, cdbIfNotExists: ine,
+       cdbReplicas: replicas)
 
 proc parseDropDatabase(p: var Parser): Stmt =
   let ie = p.parseIfExists
@@ -542,7 +563,9 @@ proc parseDropDatabase(p: var Parser): Stmt =
 proc parseCreateSchema(p: var Parser): Stmt =
   let ine = p.parseIfNotExists
   let name = p.expectIdent
-  Stmt(kind: stmtCreateSchema, csName: name, csIfNotExists: ine)
+  let replicas = p.parseWithReplicas
+  Stmt(kind: stmtCreateSchema, csName: name, csIfNotExists: ine,
+       csReplicas: replicas)
 
 proc parseDropSchema(p: var Parser): Stmt =
   let ie = p.parseIfExists

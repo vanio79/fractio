@@ -335,6 +335,91 @@ suite "SQL Parser — DDL: SCHEMA":
     check s.ctTable == "schema"
     check s.ctColumns[0].name == "database"
 
+suite "SQL Parser — WITH REPLICAS":
+
+  test "CREATE DATABASE with replicas":
+    let s = parseStatement("CREATE DATABASE mydb WITH REPLICAS = 5")
+    check s.kind == stmtCreateDatabase
+    check s.cdbName == "mydb"
+    check s.cdbReplicas == some(5)
+
+  test "CREATE DATABASE without replicas":
+    let s = parseStatement("CREATE DATABASE mydb")
+    check s.kind == stmtCreateDatabase
+    check s.cdbReplicas.isNone
+
+  test "CREATE DATABASE IF NOT EXISTS with replicas":
+    let s = parseStatement("CREATE DATABASE IF NOT EXISTS mydb WITH REPLICAS = 3")
+    check s.cdbIfNotExists == true
+    check s.cdbName == "mydb"
+    check s.cdbReplicas == some(3)
+
+  test "CREATE SCHEMA with replicas":
+    let s = parseStatement("CREATE SCHEMA reporting WITH REPLICAS = 7")
+    check s.kind == stmtCreateSchema
+    check s.csName == "reporting"
+    check s.csReplicas == some(7)
+
+  test "CREATE SCHEMA without replicas":
+    let s = parseStatement("CREATE SCHEMA reporting")
+    check s.csReplicas.isNone
+
+  test "CREATE SCHEMA IF NOT EXISTS with replicas":
+    let s = parseStatement("CREATE SCHEMA IF NOT EXISTS reporting WITH REPLICAS = 1")
+    check s.csIfNotExists == true
+    check s.csReplicas == some(1)
+
+  test "CREATE TABLE with replicas":
+    let s = parseStatement("""
+      CREATE TABLE users (
+        id   INT PRIMARY KEY,
+        name TEXT
+      ) WITH REPLICAS = 5
+    """)
+    check s.kind == stmtCreateTable
+    check s.ctTable == "users"
+    check s.ctColumns.len == 2
+    check s.ctReplicas == some(5)
+
+  test "CREATE TABLE without replicas":
+    let s = parseStatement("CREATE TABLE t (x INT)")
+    check s.ctReplicas.isNone
+
+  test "CREATE TABLE IF NOT EXISTS with replicas":
+    let s = parseStatement("CREATE TABLE IF NOT EXISTS t (x INT) WITH REPLICAS = 3")
+    check s.ctIfNotExists == true
+    check s.ctReplicas == some(3)
+
+  test "REPLICAS = 1 is valid (single-replica)":
+    let s = parseStatement("CREATE DATABASE dev WITH REPLICAS = 1")
+    check s.cdbReplicas == some(1)
+
+  test "'with' and 'replicas' can be used as identifiers":
+    let s = parseStatement("CREATE TABLE with (replicas INT)")
+    check s.ctTable == "with"
+    check s.ctColumns[0].name == "replicas"
+
+  test "replicas value must be >= 1":
+    try:
+      discard parseStatement("CREATE DATABASE bad WITH REPLICAS = 0")
+      fail()
+    except ParseError:
+      discard
+
+  test "replicas requires integer value":
+    try:
+      discard parseStatement("CREATE DATABASE bad WITH REPLICAS = abc")
+      fail()
+    except ParseError:
+      discard
+
+  test "WITH without REPLICAS raises error":
+    try:
+      discard parseStatement("CREATE DATABASE bad WITH SOMETHING = 3")
+      fail()
+    except ParseError:
+      discard
+
 suite "SQL Parser — error cases":
 
   test "raises ParseError on garbage input":

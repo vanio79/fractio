@@ -62,6 +62,9 @@ type
     tkTransaction
     tkWork
 
+    # Storage / replication keywords
+    tkWith       ## WITH
+
     # Data type keywords
     tkTkInt      ## INT / INTEGER / BIGINT
     tkTkFloat    ## FLOAT / DOUBLE / REAL
@@ -146,6 +149,7 @@ const keywords = {
   "WORK":        tkWork,
   "TRUE":        tkTrue,
   "FALSE":       tkFalse,
+  "WITH":        tkWith,
   # Type aliases
   "INT":         tkTkInt,
   "INTEGER":     tkTkInt,

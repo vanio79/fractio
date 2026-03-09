@@ -138,6 +138,7 @@ type
       ctIfNotExists*: bool
       ctColumns*:     seq[ColDef]
       ctPrimaryKey*:  seq[string]  ## multi-column PK from table constraint
+      ctReplicas*:    Option[int]  ## WITH REPLICAS = N; none → inherit from schema
 
     # ---- DROP TABLE ----
     of stmtDropTable:
@@ -148,6 +149,7 @@ type
     of stmtCreateDatabase:
       cdbName*:       string
       cdbIfNotExists*: bool
+      cdbReplicas*:   Option[int]  ## WITH REPLICAS = N; none → cluster default
 
     # ---- DROP DATABASE ----
     of stmtDropDatabase:
@@ -158,6 +160,7 @@ type
     of stmtCreateSchema:
       csName*:        string
       csIfNotExists*: bool
+      csReplicas*:    Option[int]  ## WITH REPLICAS = N; none → inherit from database
 
     # ---- DROP SCHEMA ----
     of stmtDropSchema:
