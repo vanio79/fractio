@@ -47,8 +47,31 @@ proc sqlQuery(sql: string, db: string = "default",
   body.schema = cstring(schema)
   return await fetchPost("/api/sql", jsStringify(body))
 
+# Fetch guards: fetching* = request in-flight, loaded* = result received.
+# Triggers skip if loaded key matches OR fetch is in-flight for same key.
+# This prevents re-render cascades (even for 0-row results).
+var
+  fetchingDatabases {.global.}: bool = false
+  fetchingSchemas {.global.}: bool = false
+  fetchingSchemasKey {.global.}: string = ""
+  fetchingTables {.global.}: bool = false
+  fetchingTablesKey {.global.}: string = ""
+  fetchingTableData {.global.}: bool = false
+  fetchingTableDataKey {.global.}: string = ""
+  fetchingSysTables {.global.}: bool = false
+  fetchingSysTableData {.global.}: bool = false
+  fetchingSysTableDataKey {.global.}: string = ""
+  loadedDatabases* {.global.}: bool = false
+  loadedSchemasKey* {.global.}: string = ""
+  loadedTablesKey* {.global.}: string = ""
+  loadedTableDataKey* {.global.}: string = ""
+  loadedSysTables* {.global.}: bool = false
+  loadedSysTableDataKey* {.global.}: string = ""
+
 proc doLoadDatabases*() {.async.} =
   let resp = await sqlQuery("SHOW DATABASES")
+  fetchingDatabases = false
+  loadedDatabases = true
   if safeStr(resp, "kind") == "rows":
     var dbs: seq[string]
     let rows = resp.rows
@@ -60,6 +83,8 @@ proc doLoadDatabases*() {.async.} =
 
 proc doLoadSchemas*(db: string) {.async.} =
   let resp = await sqlQuery("SHOW SCHEMAS IN " & db, db)
+  fetchingSchemas = false
+  loadedSchemasKey = fetchingSchemasKey
   if safeStr(resp, "kind") == "rows":
     var schemas: seq[string]
     let rows = resp.rows
@@ -71,6 +96,8 @@ proc doLoadSchemas*(db: string) {.async.} =
 
 proc doLoadTables*(db, schema: string) {.async.} =
   let resp = await sqlQuery("SHOW TABLES IN " & db & "." & schema, db, schema)
+  fetchingTables = false
+  loadedTablesKey = fetchingTablesKey
   if safeStr(resp, "kind") == "rows":
     var tables: seq[string]
     let rows = resp.rows
@@ -82,14 +109,20 @@ proc doLoadTables*(db, schema: string) {.async.} =
 
 proc doLoadTableData*(db, schema, table: string) {.async.} =
   let resp = await sqlQuery("SELECT * FROM " & table & " LIMIT 100", db, schema)
+  fetchingTableData = false
+  loadedTableDataKey = fetchingTableDataKey
   gTableData.set(resp)
 
 proc doLoadSystemTables*() {.async.} =
   let resp = await fetchJson("/api/sql/system-tables")
+  fetchingSysTables = false
+  loadedSysTables = true
   gSysTables.set(resp)
 
 proc doLoadSystemTableData*(tableId: int, tableName: string) {.async.} =
   let resp = await fetchJson(cstring("/api/sql/system-table/" & $tableId))
+  fetchingSysTableData = false
+  loadedSysTableDataKey = fetchingSysTableDataKey
   gSysTableData.set(resp)
 
 proc sysTableIdByName*(name: string): int =
@@ -104,22 +137,44 @@ proc sysTableIdByName*(name: string): int =
 
 # Fire-and-forget wrappers — return int so they can be used in `let` bindings
 # inside HappyX buildHtml DSL without producing text nodes.
+#
+# Guards prevent re-fetching: each trigger checks if data is already loaded
+# OR a fetch is in-flight. This is critical because .set() on State vars
+# triggers HappyX re-renders which re-execute the route body.
+
 proc triggerLoadDatabases*(): int =
+  if loadedDatabases or fetchingDatabases:
+    return 0
+  fetchingDatabases = true
   jsSetTimeout(proc() = discard doLoadDatabases(), 0)
   0
 
 proc triggerLoadSchemas*(db: string): int =
+  if (loadedSchemasKey == db) or (fetchingSchemas and fetchingSchemasKey == db):
+    return 0
+  fetchingSchemas = true
+  fetchingSchemasKey = db
   let d = db
   jsSetTimeout(proc() = discard doLoadSchemas(d), 0)
   0
 
 proc triggerLoadTables*(db, schema: string): int =
+  let key = db & "." & schema
+  if (loadedTablesKey == key) or (fetchingTables and fetchingTablesKey == key):
+    return 0
+  fetchingTables = true
+  fetchingTablesKey = key
   let d = db
   let s = schema
   jsSetTimeout(proc() = discard doLoadTables(d, s), 0)
   0
 
 proc triggerLoadTableData*(db, schema, table: string): int =
+  let key = db & "." & schema & "." & table
+  if (loadedTableDataKey == key) or (fetchingTableData and fetchingTableDataKey == key):
+    return 0
+  fetchingTableData = true
+  fetchingTableDataKey = key
   let d = db
   let s = schema
   let t = table
@@ -127,10 +182,17 @@ proc triggerLoadTableData*(db, schema, table: string): int =
   0
 
 proc triggerLoadSystemTables*(): int =
+  if loadedSysTables or fetchingSysTables:
+    return 0
+  fetchingSysTables = true
   jsSetTimeout(proc() = discard doLoadSystemTables(), 0)
   0
 
 proc triggerLoadSystemTableData*(tableId: int, tableName: string): int =
+  if (loadedSysTableDataKey == tableName) or (fetchingSysTableData and fetchingSysTableDataKey == tableName):
+    return 0
+  fetchingSysTableData = true
+  fetchingSysTableDataKey = tableName
   let tid = tableId
   let tn = tableName
   jsSetTimeout(proc() = discard doLoadSystemTableData(tid, tn), 0)

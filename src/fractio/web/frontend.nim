@@ -320,8 +320,10 @@ appRoutes "app":
                 tDiv(style = "font-size:.95rem;font-weight:600;color:#111"): "default"
         else:
           let schemas = gSchemas.get()
-          if schemas.len == 0:
+          if schemas.len == 0 and loadedSchemasKey != db:
             tDiv(style = "color:#888;font-size:.85rem;padding:1rem"): "Loading schemas..."
+          elif schemas.len == 0:
+            tDiv(style = "color:#888;font-size:.85rem;padding:1rem"): "No schemas found."
           else:
             tDiv(style = "display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:.75rem"):
               for s in schemas:
@@ -378,13 +380,18 @@ appRoutes "app":
                       "{stName}"
                     tDiv(style = "font-size:.75rem;color:#888"):
                       "{stDesc} · {stRows} rows"
+          elif loadedSysTables:
+            tDiv(style = "color:#888;font-size:.85rem;padding:.5rem"): "No system tables found."
           else:
             tDiv(style = "color:#888;font-size:.85rem;padding:.5rem"): "Loading system tables..."
         else:
           # User tables
           let tables = gTables.get()
-          if tables.len == 0:
+          let tablesKey = db & "." & schema
+          if tables.len == 0 and loadedTablesKey != tablesKey:
             tDiv(style = "color:#888;font-size:.85rem;padding:1rem"): "Loading tables..."
+          elif tables.len == 0:
+            tDiv(style = "color:#888;font-size:.85rem;padding:1rem"): "No tables found."
           else:
             tDiv(style = "display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:.75rem"):
               for t in tables:
@@ -439,36 +446,32 @@ appRoutes "app":
             tDiv(style = "color:#888;font-size:.85rem"): "Loading..."
           else:
             let std = gSysTableData.get()
+            let sysCols = std.columns
+            let numCols = jsArrayLen(sysCols)
             let sysRows = std.rows
-            let checkLen = jsArrayLen(sysRows)
-            if checkLen == 0:
+            let sysRowLen = jsArrayLen(sysRows)
+            if numCols == 0 and loadedSysTableDataKey != table:
               tDiv(style = "color:#888;font-size:.85rem"): "Loading system table data..."
             else:
-              # Render system table rows
-              let sysRowLen = jsArrayLen(sysRows)
               tDiv(style = "margin-bottom:.75rem;font-size:.82rem;color:#888"):
                 "{sysRowLen} row(s)"
-              if sysRowLen > 0:
-                let firstRow = sysRows[0]
-                let keys = jsObjectKeys(firstRow)
-                let numCols = jsArrayLen(keys)
-                tDiv(style = "overflow-x:auto"):
-                  tTable(style = "width:100%;border-collapse:collapse;font-size:.875rem;background:#fff;border:1px solid #e0e0e0;border-radius:6px;overflow:hidden"):
-                    tThead:
+              tDiv(style = "overflow-x:auto"):
+                tTable(style = "width:100%;border-collapse:collapse;font-size:.875rem;background:#fff;border:1px solid #e0e0e0;border-radius:6px;overflow:hidden"):
+                  tThead:
+                    tTr:
+                      for ci in 0 ..< numCols:
+                        let colName = $jsArrayGet(sysCols, ci)
+                        tTh(style = "background:#3a3a3a;color:#fff;padding:.55rem .85rem;text-align:left;font-size:.7rem;text-transform:uppercase;letter-spacing:.07em;font-weight:600"):
+                          "{colName}"
+                  tTbody:
+                    for ri in 0 ..< sysRowLen:
+                      let row = sysRows[ri]
                       tTr:
                         for ci in 0 ..< numCols:
-                          let colName = $jsArrayGet(keys, ci)
-                          tTh(style = "background:#3a3a3a;color:#fff;padding:.55rem .85rem;text-align:left;font-size:.7rem;text-transform:uppercase;letter-spacing:.07em;font-weight:600"):
-                            "{colName}"
-                    tTbody:
-                      for ri in 0 ..< sysRowLen:
-                        let row = sysRows[ri]
-                        tTr:
-                          for ci in 0 ..< numCols:
-                            let colKey = jsArrayGet(keys, ci)
-                            let cellVal = $jsObjField(row, colKey)
-                            tTd(style = "padding:.55rem .85rem;border-bottom:1px solid #eee;font-family:monospace;font-size:.82rem"):
-                              "{cellVal}"
+                          let colKey = jsArrayGet(sysCols, ci)
+                          let cellVal = $jsObjField(row, colKey)
+                          tTd(style = "padding:.55rem .85rem;border-bottom:1px solid #eee;font-family:monospace;font-size:.82rem"):
+                            "{cellVal}"
         else:
           # User table rows
           let td = gTableData.get()

@@ -450,7 +450,27 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
               except JsonParsingError:
                 rowObj["_value"] = newJString(entry.value)
               rows.add(rowObj)
-        return %* {"tableId": int(tid), "rows": rows}
+        # Column names: from first row if available, otherwise from schema
+        var columns = newJArray()
+        if rows.len > 0:
+          for k, v in rows[0]:
+            columns.add(newJString(k))
+        else:
+          # Hardcoded schemas for empty system tables
+          let sysColumns = case tid
+            of SYS_DATABASES_TABLE_ID: @["_key", "id", "name", "replicaCount", "createdAt"]
+            of SYS_SCHEMAS_TABLE_ID: @["_key", "id", "databaseId", "name", "createdAt"]
+            of SYS_TABLES_TABLE_ID: @["_key", "id", "schemaId", "name", "columns", "indices", "createdAt"]
+            of SYS_RANGES_TABLE_ID: @["_key", "rangeId", "startKey", "endKey", "replicas"]
+            of SYS_NODES_TABLE_ID: @["_key", "nodeId", "host", "raftPort", "clientPort", "status"]
+            of SYS_SETTINGS_TABLE_ID: @["_key", "value"]
+            of SYS_NODE_METRICS_ID: @["_key", "nodeId", "cpuPercent", "memUsedBytes", "diskUsedBytes"]
+            of SYS_RANGE_METRICS_ID: @["_key", "rangeId", "keyCount", "sizeBytes", "readQps", "writeQps"]
+            of SYS_EVENTS_TABLE_ID: @["_key", "timestamp", "eventType", "nodeId", "message"]
+            else: @["_key", "_value"]
+          for c in sysColumns:
+            columns.add(newJString(c))
+        return %* {"tableId": int(tid), "columns": columns, "rows": rows}
 
       # ---- WebSocket: clock drift stream ----
       ws "/ws/drift":
