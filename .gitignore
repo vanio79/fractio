@@ -43,6 +43,7 @@ tests/**/test_*
 
 # Third-party libraries
 thirdparty/
+node_modules/
 
 # Generated documentation
 docs/api/

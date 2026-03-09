@@ -228,6 +228,7 @@ type
     host*: string
     raftPort*: uint16
     clientPort*: uint16
+    webPort*: uint16
     status*: uint8 ## clusterMsgs.NodeStatus* constant
 
   NodeRegistry* = ref object
@@ -1362,16 +1363,117 @@ proc acceptLoop(args: AcceptLoopArgs) {.thread.} =
     createThread(tRef[], clientLoopThread, (server, conn))
 
 # ---------------------------------------------------------------------------
+# Cluster membership persistence
+# ---------------------------------------------------------------------------
+
+type
+  ClusterMember = object
+    nodeId: uint32
+    host: string
+    raftPort: int
+    clientPort: int
+    webPort: int
+
+proc clusterStatePath(server: ProtocolServer): string =
+  server.config.dataDir / "cluster.json"
+
+proc saveClusterState*(server: ProtocolServer) =
+  ## Persist current cluster membership to disk so a restarted node can
+  ## rejoin as a follower without requiring --join.
+  if server.config.dataDir == "": return
+  if server.raftTransport.isNil: return
+
+  var members: seq[ClusterMember] = @[]
+  for p in server.raftTransport.peers:
+    members.add(ClusterMember(
+      nodeId: p.nodeId.uint32,
+      host: p.host,
+      raftPort: p.raftPort,
+    ))
+
+  # Also include self so we know our own identity
+  let selfEntry = ClusterMember(
+    nodeId: uint32(server.config.serverId),
+    host: server.config.host,
+    raftPort: 0, # filled by caller if needed
+    clientPort: server.config.port,
+    webPort: server.config.webPort,
+  )
+
+  var peersArr = newJArray()
+  for m in members:
+    peersArr.add(%* {
+      "nodeId": m.nodeId.int,
+      "host": m.host,
+      "raftPort": m.raftPort,
+    })
+
+  let j = %* {
+    "self": {
+      "nodeId": selfEntry.nodeId.int,
+      "host": selfEntry.host,
+      "clientPort": selfEntry.clientPort,
+      "webPort": selfEntry.webPort,
+    },
+    "peers": peersArr,
+  }
+
+  try:
+    writeFile(server.clusterStatePath, $j)
+  except CatchableError: discard
+
+proc loadClusterState(dataDir: string): Option[JsonNode] =
+  ## Load saved cluster membership. Returns none if no state exists.
+  let path = dataDir / "cluster.json"
+  if not fileExists(path): return none(JsonNode)
+  try:
+    result = some(parseJson(readFile(path)))
+  except CatchableError:
+    result = none(JsonNode)
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
+proc addPeerToRaft*(server: ProtocolServer, peerNodeId: uint32,
+                     host: string, raftPort: int) =
+  ## Dynamically add a peer to the Raft transport and all group descriptors.
+  ## Called when a new node joins the cluster.
+  if server.raftTransport.isNil: return
+
+  let rangeNodeId = rangeTypes.RangeNodeID(peerNodeId)
+
+  # Add to transport layer (connection manager + peer list)
+  server.raftTransport.addPeer(rangeNodeId, host, raftPort)
+
+  # Add replica to all Raft groups
+  let coord = server.raftCoord
+  if coord.isNil: return
+  withLock coord.groupsLock:
+    for rangeId, group in coord.groups:
+      discard group.descriptor.addReplica(rangeNodeId, rangeTypes.rtVoter)
+
+  # Persist membership so restarts can rejoin without --join
+  server.saveClusterState()
+
 proc setupRaftNode*(server: ProtocolServer, raftPort: int,
-                    rawPeers: seq[string]) {.raises: [Exception].} =
+                    rawPeers: seq[string],
+                    startAsLeader: bool = true) {.raises: [Exception].} =
   ## Wire a real Raft + WiscKey stack into the server.
   ## rawPeers: each entry "ID:HOST:RAFT_PORT", empty = single-node mode.
+  ## startAsLeader: when true and no peers, immediately become leader.
 
   let nodeId = rangeTypes.RangeNodeID(uint32(server.config.serverId))
   let raftDir = server.config.dataDir / "raft"
+
+  # When joining with --join, clear Raft state so the leader's log
+  # replays from scratch. This avoids stale entries from a previous
+  # cluster incarnation sharing term numbers with new entries.
+  # A killed node that simply restarts (without --join) keeps its log
+  # and catches up incrementally via the leader's heartbeats.
+  if not startAsLeader:
+    removeDir(raftDir)
+
   createDir(raftDir)
 
   # Parse peer strings → PeerAddr
@@ -1387,12 +1489,34 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
       ))
     except ValueError: discard
 
-  # Build transport (nil = single-node)
-  var transport: MultiRaftTransport = nil
-  if peers.len > 0:
-    let rgt = newRaftGroupTransport(nodeId, server.config.host, raftPort, peers)
-    server.raftTransport = rgt          # keep alive for ORC
-    transport = newMultiRaftTransport(rgt)
+  # Check for saved cluster state (from a previous run as part of a cluster).
+  # If found and no explicit peers/join, load peers from disk and start as
+  # follower so the existing leader's heartbeats catch us up incrementally.
+  var isRejoining = false
+  if peers.len == 0 and startAsLeader:
+    let saved = loadClusterState(server.config.dataDir)
+    if saved.isSome:
+      let sj = saved.get
+      let savedPeers = sj.getOrDefault("peers")
+      if not savedPeers.isNil and savedPeers.kind == JArray and savedPeers.len > 0:
+        isRejoining = true
+        for p in savedPeers:
+          let pNodeId = uint32(p.getOrDefault("nodeId").getInt(0))
+          let pHost = p.getOrDefault("host").getStr("")
+          let pRaftPort = p.getOrDefault("raftPort").getInt(0)
+          if pNodeId > 0 and pHost != "" and pRaftPort > 0:
+            peers.add(PeerAddr(
+              nodeId: rangeTypes.RangeNodeID(pNodeId),
+              host: pHost,
+              raftPort: pRaftPort,
+            ))
+        if peers.len > 0:
+          echo "recovered cluster membership from disk: " & $peers.len & " peers"
+
+  # Always create transport (even for single-node) so joining nodes can connect
+  let rgt = newRaftGroupTransport(nodeId, server.config.host, raftPort, peers)
+  server.raftTransport = rgt
+  let transport = newMultiRaftTransport(rgt)
 
   # Coordinator
   let coord = newMultiRaftCoordinator(CoordinatorConfig(
@@ -1415,8 +1539,8 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
   let group = coord.createGroup(desc, myReplica.replicaId)
   coord.start()
 
-  # Single-node cluster: immediately become leader (no election needed)
-  if peers.len == 0:
+  # Become leader only for a truly fresh single-node cluster (no saved peers)
+  if peers.len == 0 and startAsLeader and not isRejoining:
     group.becomeLeader()
 
   # KV store
@@ -1424,14 +1548,28 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
   bootstrapSingleShardExt(store, rangeId)
   server.raftStore = store
 
+  # Recovery: replay committed Raft log entries to rebuild in-memory state machine.
+  # On a fresh start lastApplied=0 so this is a no-op. On restart after a kill,
+  # we need to re-apply entries 1..lastApplied because the in-memory KVStateMachine
+  # is empty (only WiscKey has the data on disk, but reads go through the in-memory SM).
+  let lastApplied = group.lastApplied.load()
+  if lastApplied > 0:
+    echo "replaying " & $lastApplied & " committed log entries to rebuild state machine..."
+    # Reset lastApplied to 0 so applyUpTo replays from the beginning
+    group.lastApplied.store(0)
+    coord.applyUpTo(rangeId, group, lastApplied)
+    echo "state machine recovery complete (applied up to " & $group.lastApplied.load() & ")"
+
   # Seed system tables: sys.nodes (table 5) and sys.ranges (table 4)
-  block:
+  # Only seed when starting as fresh leader (not rejoining and not joining)
+  if startAsLeader and not isRejoining:
     let nodeKey = encodeTableKey(SYS_NODES_TABLE_ID, $server.config.serverId)
     let nodeVal = $ %* {
       "nodeId": server.config.serverId.int,
       "host": server.config.host,
       "raftPort": raftPort,
       "clientPort": server.config.port,
+      "webPort": server.config.webPort,
       "status": 1,
     }
     discard store.raftPut(nodeKey, nodeVal)
@@ -1486,6 +1624,10 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
     )
     server.sharedTimer = timer
     server.txnMgr.setTimeProvider(timer)
+
+  # Persist cluster membership for restart recovery
+  if peers.len > 0:
+    server.saveClusterState()
 
 proc start*(server: ProtocolServer) {.raises: [].} =
   server.running.store(true)

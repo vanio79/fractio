@@ -32,7 +32,7 @@
 #   2 — connection / protocol error
 #   3 — server returned failure response
 
-import std/[os, parseopt, strformat, strutils, tables, times, json]
+import std/[os, parseopt, strformat, strutils, tables, times, json, httpclient]
 import fractio/protocol/types
 import fractio/protocol/client
 import fractio/protocol/server
@@ -159,9 +159,14 @@ proc cmdStart(flags: Table[string, string], globalHost: string,
   let server = newProtocolServer(cfg)
   server.start()
 
+  let isJoining = joinPeer != ""
+
   if dataDir != "":
     try:
-      server.setupRaftNode(raftPort, peerFlags)
+      # When joining, start Raft but don't become leader — the existing
+      # cluster leader will replicate its log to us.
+      server.setupRaftNode(raftPort, peerFlags,
+                           startAsLeader = not isJoining)
     except Exception as e:
       writeLine(stderr, "warning: raft setup failed: " & e.msg)
 
@@ -169,41 +174,56 @@ proc cmdStart(flags: Table[string, string], globalHost: string,
     launchWebDashboard(server)
     echo &"web dashboard: http://{host}:{webPort}"
 
-  if joinPeer != "":
+  if isJoining:
     sleep(200)
     let colonIdx = joinPeer.rfind(':')
     var peerHost: string
-    var peerPort: int
+    var peerWebPort: int
     if colonIdx < 0:
       peerHost = joinPeer
-      peerPort = 9000
+      peerWebPort = 9876
     else:
       peerHost = joinPeer[0..<colonIdx]
-      try: peerPort = parseInt(joinPeer[colonIdx+1..^1])
+      try: peerWebPort = parseInt(joinPeer[colonIdx+1..^1])
       except ValueError: die("invalid join address: " & joinPeer)
 
-    let peerCfg = ClientConfig(
-      host: peerHost,
-      port: peerPort,
-      timeoutMs: 10_000,
-      clientId: "fractio-cli-start",
-      authMethod: amNone,
-      authData: "",
-    )
-    let peer = newProtocolClient(peerCfg)
-    let connR = peer.connect()
-    if connR.isErr:
-      writeLine(stderr, "warning: could not connect to peer " & joinPeer &
-        ": " & $connR.error)
-    else:
-      let r = peer.joinNode(uint16(nodeId), host, uint16(raftPort),
-        uint16(clientPort))
-      if r.isErr:
-        writeLine(stderr, "warning: self-registration failed: " & $r.error)
-      elif not r.value.success:
-        writeLine(stderr, "warning: self-registration refused: " &
-          r.value.message)
-      peer.disconnect()
+    # Send HTTP join request to the existing cluster's web port
+    let joinUrl = "http://" & peerHost & ":" & $peerWebPort & "/api/cluster/join"
+    let body = $ %* {
+      "nodeId": nodeId,
+      "host": host,
+      "raftPort": raftPort,
+      "clientPort": clientPort,
+      "webPort": webPort,
+    }
+
+    echo &"joining cluster via {joinUrl} ..."
+
+    try:
+      let httpClient = newHttpClient(timeout = 10_000)
+      httpClient.headers = newHttpHeaders({"Content-Type": "application/json"})
+      let resp = httpClient.request(joinUrl, httpMethod = HttpPost, body = body)
+      let respBody = resp.body
+      let rj = parseJson(respBody)
+
+      if rj.getOrDefault("success").getBool(false):
+        echo "join successful"
+        # Add all returned cluster members as Raft peers
+        let members = rj.getOrDefault("members")
+        if not members.isNil and members.kind == JArray:
+          for m in members:
+            let mNodeId = uint32(m.getOrDefault("nodeId").getInt(0))
+            let mHost = m.getOrDefault("host").getStr("")
+            let mRaftPort = m.getOrDefault("raftPort").getInt(0)
+            if mNodeId > 0 and mHost != "" and mRaftPort > 0:
+              echo &"  adding peer: node {mNodeId} at {mHost}:{mRaftPort}"
+              server.addPeerToRaft(mNodeId, mHost, mRaftPort)
+      else:
+        let errMsg = rj.getOrDefault("error").getStr("unknown error")
+        writeLine(stderr, "warning: join refused: " & errMsg)
+      httpClient.close()
+    except CatchableError as e:
+      writeLine(stderr, "warning: join request failed: " & e.msg)
 
   while true:
     sleep(1000)

@@ -132,6 +132,31 @@ proc newRaftGroupTransport*(localNodeId: rangeTypes.RangeNodeID,
       p.raftPort + 1, p.raftPort + 2)
 
 # ============================================================================
+# Runtime peer addition
+# ============================================================================
+
+proc addPeer*(t: RaftGroupTransport, nodeId: rangeTypes.RangeNodeID,
+              host: string, raftPort: int) =
+  ## Register a new peer at runtime (for dynamic cluster join).
+  ## Adds to both the NetworkConfig and ConnectionManager.
+  let peer = PeerAddr(nodeId: nodeId, host: host, raftPort: raftPort)
+
+  # Avoid duplicate
+  for p in t.peers:
+    if p.nodeId == nodeId: return
+  t.peers.add(peer)
+
+  # Register in NetworkConfig so connection manager can connect
+  let raftNodeId = raft_transport.toNodeID(int32(nodeId.uint32))
+  let pc = netCfgMod.newPeerConfig(raftNodeId, host, raftPort)
+  t.raftNode.raftTransport.connManager.config.addPeer(pc)
+
+  # Register in connection manager
+  t.raftNode.addPeer(
+    int32(nodeId.uint32), host, raftPort,
+    raftPort + 1, raftPort + 2)
+
+# ============================================================================
 # Start / Stop
 # ============================================================================
 
@@ -473,41 +498,80 @@ proc sendHeartbeats*(t: RaftGroupTransport,
                      groups: tables.Table[rangeTypes.RangeID, RaftGroup],
                      logs: tables.Table[rangeTypes.RangeID,
                          RaftLog]) {.gcsafe.} =
-  ## For every group where this node is leader, send an empty AppendEntries
-  ## to each peer replica. Fire-and-forget (no quorum wait).
+  ## For every group where this node is leader, send AppendEntries
+  ## to each peer replica. Uses per-peer nextIndex to include missing
+  ## entries so lagging followers catch up during heartbeats.
   for rangeId, group in groups:
     if not group.isLeader(): continue
 
     let rawTerm = group.currentTerm.load()
-    # Encode rangeId so receiver can dispatch to the correct group
     let encodedTerm = encodeRangeInTerm(rawTerm, rangeId)
     let commitIndex = group.commitIndex.load()
     let leaderId = int32(t.localNodeId.uint32)
     let log = logs.getOrDefault(rangeId)
     if log.isNil: continue
     let lastIdx = log.lastIndex.load()
-    # Look up the actual term of the last log entry so the follower's
-    # consistency check (prevLogTerm) passes.  Without this, heartbeats
-    # send prevLogTerm=0 which is rejected when the log is non-empty.
-    let lastTerm = block:
-      if lastIdx == 0: 0'u64
-      else:
-        try:
-          let e = log.getEntry(lastIdx)
-          if e.isSome: e.get.term else: 0'u64
-        except CatchableError: 0'u64
 
     let voters = group.descriptor.getVoters()
     for rep in voters:
       if rep.nodeId == t.localNodeId: continue
       let tid = int32(rep.nodeId.uint32)
+
+      # Use per-peer nextIndex so lagging followers get missing entries
+      var peerNextIdx: uint64
+      withLock group.lock:
+        peerNextIdx = group.nextIndex.getOrDefault(rep.replicaId, 1'u64)
+      if peerNextIdx < 1: peerNextIdx = 1
+      if peerNextIdx > lastIdx + 1: peerNextIdx = lastIdx + 1
+
+      let prevIdx = if peerNextIdx > 1: peerNextIdx - 1 else: 0'u64
+      let prevTm = block:
+        if prevIdx == 0: 0'u64
+        else:
+          try:
+            let e = log.getEntry(prevIdx)
+            if e.isSome: e.get.term else: 0'u64
+          except CatchableError: 0'u64
+
+      # If peer is behind, include up to 64 entries for catch-up
+      var entries: seq[oldRaftTypes.LogEntry] = @[]
+      if peerNextIdx <= lastIdx:
+        let batchEnd = min(lastIdx, peerNextIdx + 63)
+        for idx in peerNextIdx .. batchEnd:
+          let eOpt = try: log.getEntry(idx)
+                     except CatchableError: none(multigroup_types.LogEntry)
+          if eOpt.isNone: break
+          let encoded = try: encodeEntry(eOpt.get)
+                        except CatchableError: ""
+          if encoded.len == 0: break
+          var oe: oldRaftTypes.LogEntry
+          oe.term = int64(eOpt.get.term)
+          oe.entryType = oldRaftTypes.LET_NORMAL
+          oe.data = encoded
+          entries.add(oe)
+
+      # Use blocking send to process responses and detect lagging peers.
+      # The TCP read timeout (5s) bounds how long we block per peer.
+      # TODO: parallelize heartbeats to avoid blocking on slow/dead peers.
       {.cast(gcsafe).}:
-        # Use NoWait variant so the timer thread is never blocked by per-peer
-        # TCP read timeouts (which can be up to 30 s by default).
-        discard t.raftNode.raftTransport.sendAppendEntriesNoWait(
+        let respOpt = t.raftNode.raftTransport.sendAppendEntries(
           tid, encodedTerm, leaderId,
-          lastIdx, lastTerm,
-          commitIndex, @[])
+          prevIdx, prevTm,
+          commitIndex, entries)
+        if respOpt.isSome:
+          let resp = respOpt.get()
+          if resp.success:
+            withLock group.lock:
+              group.matchIndex[rep.replicaId] = resp.matchIndex
+              group.nextIndex[rep.replicaId] = resp.matchIndex + 1
+          else:
+            # Rejection — back off nextIndex for next heartbeat
+            withLock group.lock:
+              let cur = group.nextIndex.getOrDefault(rep.replicaId, 1'u64)
+              if resp.rejectHint > 0 and resp.rejectHint < cur:
+                group.nextIndex[rep.replicaId] = resp.rejectHint
+              elif cur > 1:
+                group.nextIndex[rep.replicaId] = cur - 1
 
     group.updateHeartbeat()
 
@@ -673,9 +737,17 @@ proc setupIncomingHandlers*(t: RaftGroupTransport,
           let idx = nextIdx
           inc nextIdx
           let existing = log.getEntry(idx)
+          var needWrite = false
           if existing.isSome and existing.get.term != uint64(rawEntry.term):
             log.truncate(idx)
-          if existing.isNone:
+            # Reset lastApplied so truncated entries get re-applied
+            let newApplied = if idx > 1: idx - 1 else: 0'u64
+            if group.lastApplied.load() >= idx:
+              group.lastApplied.store(newApplied)
+            needWrite = true
+          elif existing.isNone:
+            needWrite = true
+          if needWrite:
             # Decode full LogEntry from the JSON payload stored in .data
             try:
               let decoded = decodeEntry(rawEntry.data)

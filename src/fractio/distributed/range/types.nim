@@ -244,6 +244,10 @@ proc newRangeDescriptor*(rangeId: RangeID, startKey, endKey: seq[byte],
 proc addReplica*(desc: RangeDescriptor, nodeId: RangeNodeID,
                   replicaType: ReplicaType = rtVoter): ReplicaDescriptor =
   ## Add a new replica to the range. Returns the new replica descriptor.
+  ## If a replica with this nodeId already exists, returns the existing one.
+  for rep in desc.replicas:
+    if rep.nodeId == nodeId:
+      return rep
   result = ReplicaDescriptor(
     nodeId: nodeId,
     replicaId: desc.nextReplicaId,

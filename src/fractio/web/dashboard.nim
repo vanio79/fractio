@@ -15,6 +15,8 @@ import ../protocol/messages/cluster as clusterMsgs
 import ../sql/executor
 import ../distributed/meta/system_tables
 import ../protocol/raft_store
+import ../distributed/raft/multigroup_coordinator
+import ../distributed/raft/multigroup_transport
 
 # ---------------------------------------------------------------------------
 # Server reference — plain pointer so {.gcsafe.} handlers can access it.
@@ -123,12 +125,6 @@ var htmlShellGz {.global.}: string
 # Helper
 # ---------------------------------------------------------------------------
 
-proc roleStr(r: uint8): string =
-  case r
-  of 1'u8: "leader"
-  of 2'u8: "follower"
-  of 3'u8: "candidate"
-  else: "unknown"
 
 # ---------------------------------------------------------------------------
 # Web server thread
@@ -172,12 +168,17 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
           return %* {"error": "server not ready"}
         let nowSecs = getTime().toUnix()
         let uptime = uint64(max(0'i64, nowSecs - srv.startedAt))
+        let role = if srv.raftStore.isNil: "unknown"
+                   elif srv.raftStore.coordinator.getLeaderCount() > 0: "leader"
+                   else: "follower"
+        let shards = if srv.raftStore.isNil: 0
+                     else: srv.raftStore.coordinator.getGroupCount()
         return %* {
           "nodeId":      srv.config.serverId.int,
           "version":     srv.config.serverVersion,
           "uptimeSecs":  uptime,
-          "role":        roleStr(1'u8),
-          "shardCount":  0,
+          "role":        role,
+          "shardCount":  shards,
           "clientCount": srv.clientCount(),
           "clusterName": srv.config.clusterName,
         }
@@ -225,16 +226,31 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
         if srv.isNil:
           statusCode = 503
           return %* {"error": "server not ready"}
-        let entries = srv.nodeRegistry.listNodes()
         var arr = newJArray()
-        for e in entries:
-          arr.add(%* {
-            "nodeId":     e.nodeId.int,
-            "host":       e.host,
-            "raftPort":   e.raftPort.int,
-            "clientPort": e.clientPort.int,
-            "status":     e.status.int,
-          })
+        if not srv.raftStore.isNil:
+          let startKey = encodeTableKey(SYS_NODES_TABLE_ID, "")
+          let endKey = encodeTableKey(SYS_NODES_TABLE_ID + 1, "")
+          {.cast(gcsafe).}:
+            let sr = srv.raftStore.raftScan(startKey, endKey, 0,
+                includeSystemKeys = true)
+            if sr.isOk:
+              for (key, entry) in sr.value:
+                try:
+                  let j = parseJson(entry.value)
+                  arr.add(j)
+                except JsonParsingError:
+                  discard
+        else:
+          # Fallback to local registry when raft store is not available
+          let entries = srv.nodeRegistry.listNodes()
+          for e in entries:
+            arr.add(%* {
+              "nodeId":     e.nodeId.int,
+              "host":       e.host,
+              "raftPort":   e.raftPort.int,
+              "clientPort": e.clientPort.int,
+              "status":     e.status.int,
+            })
         return arr
 
       # ---- REST: nodes POST ----
@@ -262,6 +278,25 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
           statusCode = 400
           return %* {"success": false, "message": "host must not be empty"}
 
+        # Write to Raft-backed sys.nodes table for cluster-wide replication
+        if not srv.raftStore.isNil:
+          let nodeKey = encodeTableKey(SYS_NODES_TABLE_ID, $nodeId)
+          let nodeVal = $ %* {
+            "nodeId": nodeId.int,
+            "host": host,
+            "raftPort": raftPort.int,
+            "clientPort": clientPort.int,
+            "status": 1,
+          }
+          var putOk = false
+          {.cast(gcsafe).}:
+            let putResult = srv.raftStore.raftPut(nodeKey, nodeVal)
+            putOk = putResult.isOk
+          if not putOk:
+            statusCode = 500
+            return %* {"success": false, "message": "raft write failed"}
+
+        # Keep local registry for connection management
         let entry = pserver.ClusterNodeEntry(
           nodeId: nodeId, host: host,
           raftPort: raftPort, clientPort: clientPort,
@@ -273,12 +308,96 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
             srv.config.dataDir / "node_registry.dat")
         return %* {"success": true, "message": "node " & $nodeId & " joined"}
 
+      # ---- REST: cluster join ----
+      post "/api/cluster/join":
+        let srv = getSrv()
+        if srv.isNil:
+          statusCode = 503
+          return %* {"success": false, "error": "server not ready"}
+        var j: JsonNode
+        try:
+          j = parseJson(req.body.get(""))
+        except JsonParsingError:
+          statusCode = 400
+          return %* {"success": false, "error": "invalid JSON body"}
+
+        let peerNodeId = uint32(j.getOrDefault("nodeId").getInt(0))
+        let peerHost   = j.getOrDefault("host").getStr("")
+        let peerRaftPort = j.getOrDefault("raftPort").getInt(0)
+        let peerClientPort = j.getOrDefault("clientPort").getInt(0)
+        let peerWebPort = j.getOrDefault("webPort").getInt(0)
+
+        if peerNodeId == 0 or peerHost == "":
+          statusCode = 400
+          return %* {"success": false, "error": "nodeId and host required"}
+
+        # Add to local registry
+        let entry = pserver.ClusterNodeEntry(
+          nodeId: uint16(peerNodeId), host: peerHost,
+          raftPort: uint16(peerRaftPort), clientPort: uint16(peerClientPort),
+          webPort: uint16(peerWebPort),
+          status: clusterMsgs.NodeStatusActive,
+        )
+        srv.nodeRegistry.addNode(entry)
+
+        # Add peer to Raft transport + group descriptor FIRST, so the
+        # subsequent raftPut replication fanout includes this new node.
+        # The new peer's nextIndex defaults to 1, so replicateEntry will
+        # send the entire log (full backfill).
+        {.cast(gcsafe).}:
+          srv.addPeerToRaft(peerNodeId, peerHost, peerRaftPort)
+
+        # Now write to sys.nodes via Raft. The replication will include
+        # the new peer, triggering full log sync.
+        if not srv.raftStore.isNil:
+          let nodeKey = encodeTableKey(SYS_NODES_TABLE_ID, $peerNodeId)
+          let nodeVal = $ %* {
+            "nodeId": peerNodeId.int,
+            "host": peerHost,
+            "raftPort": peerRaftPort,
+            "clientPort": peerClientPort,
+            "webPort": peerWebPort,
+            "status": 1,
+          }
+          var putOk = false
+          {.cast(gcsafe).}:
+            let putResult = srv.raftStore.raftPut(nodeKey, nodeVal)
+            putOk = putResult.isOk
+          if not putOk:
+            statusCode = 500
+            return %* {"success": false, "error": "raft write failed"}
+
+        # Return current cluster members (excluding the joining node)
+        var members = newJArray()
+        if not srv.raftStore.isNil:
+          let startKey = encodeTableKey(SYS_NODES_TABLE_ID, "")
+          let endKey = encodeTableKey(SYS_NODES_TABLE_ID + 1, "")
+          {.cast(gcsafe).}:
+            let sr = srv.raftStore.raftScan(startKey, endKey, 0,
+                includeSystemKeys = true)
+            if sr.isOk:
+              for (key, ent) in sr.value:
+                try:
+                  let mj = parseJson(ent.value)
+                  if mj.getOrDefault("nodeId").getInt(0) != int(peerNodeId):
+                    members.add(mj)
+                except JsonParsingError:
+                  discard
+
+        return %* {"success": true, "members": members}
+
       # ---- REST: nodes DELETE ----
       delete "/api/nodes/{id:int}":
         let srv = getSrv()
         if srv.isNil:
           statusCode = 503
           return %* {"error": "server not ready"}
+        # Delete from Raft-backed sys.nodes table
+        if not srv.raftStore.isNil:
+          let nodeKey = encodeTableKey(SYS_NODES_TABLE_ID, $id)
+          {.cast(gcsafe).}:
+            discard srv.raftStore.raftDelete(nodeKey)
+        # Remove from local registry
         let removed = srv.nodeRegistry.removeNode(uint16(id))
         if removed and srv.config.dataDir != "":
           pserver.saveRegistry(srv.nodeRegistry,
