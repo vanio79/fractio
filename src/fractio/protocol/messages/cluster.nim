@@ -290,3 +290,50 @@ proc decodeRebalanceStatusResponse*(payload: string): Result[
   resp.failed = failR.value
 
   peOk(resp)
+
+# ---------------------------------------------------------------------------
+# DrainNode (0x0707)
+# ---------------------------------------------------------------------------
+
+type
+  DrainNodeRequest* = object
+    nodeId*: uint16 ## ID of the node to mark as draining
+
+  DrainNodeResponse* = object
+    success*: bool
+    message*: string
+
+proc encodeDrainNodeRequest*(req: DrainNodeRequest): string =
+  var buf = ""
+  buf.writeUint16BE(uint16(mtDrainNode))
+  buf.writeUint16BE(req.nodeId)
+  buf
+
+proc decodeDrainNodeRequest*(payload: string): Result[DrainNodeRequest,
+    ProtocolError] =
+  var pos = 2
+  let nodeIdR = readUint16BE(payload, pos)
+  if nodeIdR.isErr: return peErr(nodeIdR.error)
+  peOk(DrainNodeRequest(nodeId: nodeIdR.value))
+
+proc encodeDrainNodeResponse*(resp: DrainNodeResponse): string =
+  var buf = ""
+  buf.writeUint16BE(uint16(mtDrainNode))
+  buf.writeUint8(if resp.success: 0x01'u8 else: 0x00'u8)
+  buf.writeBytes8(resp.message)
+  buf
+
+proc decodeDrainNodeResponse*(payload: string): Result[DrainNodeResponse,
+    ProtocolError] =
+  var pos = 2
+  var resp: DrainNodeResponse
+
+  let successR = readUint8(payload, pos)
+  if successR.isErr: return peErr(successR.error)
+  resp.success = successR.value != 0
+
+  let msgR = readBytes8(payload, pos)
+  if msgR.isErr: return peErr(msgR.error)
+  resp.message = msgR.value
+
+  peOk(resp)

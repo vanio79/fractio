@@ -253,6 +253,14 @@ proc removeNode*(reg: NodeRegistry, nodeId: uint16): bool {.gcsafe, raises: [].}
     return true
   false
 
+proc drainNode*(reg: NodeRegistry, nodeId: uint16): bool {.gcsafe, raises: [].} =
+  acquire(reg.mu)
+  defer: release(reg.mu)
+  reg.nodes.withValue(nodeId, entry):
+    entry.status = clusterMsgs.NodeStatusDraining
+    return true
+  return false
+
 proc listNodes*(reg: NodeRegistry): seq[ClusterNodeEntry] {.gcsafe, raises: [].} =
   acquire(reg.mu)
   defer: release(reg.mu)
@@ -1205,6 +1213,22 @@ proc handleBuiltinCluster(server: ProtocolServer, conn: ClientConnection,
       failed: server.nodeRegistry.rebalanceFailed.load(),
     )
     sendFrame(conn, clusterMsgs.encodeRebalanceStatusResponse(resp), requestId)
+
+  of uint16(mtDrainNode):
+    let reqR = clusterMsgs.decodeDrainNodeRequest(payload)
+    if reqR.isErr:
+      sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
+      return
+    let req = reqR.value
+    let drained = server.nodeRegistry.drainNode(req.nodeId)
+    if drained and server.config.dataDir != "":
+      saveRegistry(server.nodeRegistry, server.config.dataDir / "node_registry.dat")
+    let resp = clusterMsgs.DrainNodeResponse(
+      success: drained,
+      message: if drained: "node " & $req.nodeId & " is draining"
+               else: "node " & $req.nodeId & " not found",
+    )
+    sendFrame(conn, clusterMsgs.encodeDrainNodeResponse(resp), requestId)
 
   else:
     sendError(conn, requestId, ErrProtocol, ErrCatSystem,

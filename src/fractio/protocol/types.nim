@@ -85,6 +85,7 @@ type
     mtRemoveNode = 0x0704      ## Remove a node from the cluster
     mtListNodes = 0x0705       ## List all known cluster nodes
     mtRebalanceStatus = 0x0706 ## Query rebalance operation status
+    mtDrainNode = 0x0707       ## Mark a node as draining (graceful shutdown)
 
 # ---------------------------------------------------------------------------
 # Authentication methods

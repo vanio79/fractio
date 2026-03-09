@@ -485,3 +485,12 @@ proc rebalanceStatus*(client: ProtocolClient): Result[
   let r = client.send(clusterMsgs.encodeRebalanceStatusRequest())
   if r.isErr: return peErr(r.error)
   clusterMsgs.decodeRebalanceStatusResponse(r.value.payload)
+
+proc drainNode*(client: ProtocolClient,
+    nodeId: uint16): Result[clusterMsgs.DrainNodeResponse,
+    ProtocolError] {.gcsafe, raises: [].} =
+  ## Request that the server mark a cluster node as draining.
+  let req = clusterMsgs.DrainNodeRequest(nodeId: nodeId)
+  let r = client.send(clusterMsgs.encodeDrainNodeRequest(req))
+  if r.isErr: return peErr(r.error)
+  clusterMsgs.decodeDrainNodeResponse(r.value.payload)
