@@ -263,6 +263,46 @@ suite "SQL Planner":
     let plan = planStatement(stmt, store)
     check plan.ops[0].kind == poRollbackTxn
 
+  test "plan SHOW DATABASES":
+    let stmt = parseStatement("SHOW DATABASES")
+    let plan = planStatement(stmt, store)
+    check plan.ops.len == 1
+    check plan.ops[0].kind == poShowDatabases
+
+  test "plan SHOW SCHEMAS":
+    let stmt = parseStatement("SHOW SCHEMAS")
+    let plan = planStatement(stmt, store)
+    check plan.ops.len == 1
+    check plan.ops[0].kind == poShowSchemas
+    check plan.ops[0].ssDatabase == "default"  # uses default database
+
+  test "plan SHOW SCHEMAS IN mydb":
+    let stmt = parseStatement("SHOW SCHEMAS IN mydb")
+    let plan = planStatement(stmt, store)
+    check plan.ops[0].kind == poShowSchemas
+    check plan.ops[0].ssDatabase == "mydb"
+
+  test "plan SHOW TABLES":
+    let stmt = parseStatement("SHOW TABLES")
+    let plan = planStatement(stmt, store)
+    check plan.ops.len == 1
+    check plan.ops[0].kind == poShowTables
+    check plan.ops[0].stDatabase == "default"
+    check plan.ops[0].stSchema == "public"
+
+  test "plan SHOW TABLES IN myschema":
+    let stmt = parseStatement("SHOW TABLES IN myschema")
+    let plan = planStatement(stmt, store)
+    check plan.ops[0].kind == poShowTables
+    check plan.ops[0].stSchema == "myschema"
+
+  test "plan SHOW TABLES IN mydb.myschema":
+    let stmt = parseStatement("SHOW TABLES IN mydb.myschema")
+    let plan = planStatement(stmt, store)
+    check plan.ops[0].kind == poShowTables
+    check plan.ops[0].stDatabase == "mydb"
+    check plan.ops[0].stSchema == "myschema"
+
   test "nextTableId allocates incrementally":
     let id1 = nextTableId(store)
     check id1 == FIRST_USER_TABLE_ID

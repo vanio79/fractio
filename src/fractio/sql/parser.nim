@@ -77,7 +77,7 @@ proc expectIdent(p: var Parser): string =
      tkValues, tkSet, tkFrom, tkWhere, tkAnd, tkOr, tkIn, tkIs,
      tkBetween, tkLike, tkLimit, tkOffset, tkOrder, tkBy, tkAsc, tkDesc,
      tkAll, tkDistinct, tkBegin, tkCommit, tkRollback, tkTransaction, tkWork,
-     tkWith,
+     tkWith, tkShow, tkDatabases, tkSchemas, tkTables,
      tkTkInt, tkTkFloat, tkTkText, tkTkBool, tkTkDate, tkTkDateTime, tkTkBytes:
     discard p.advance
     t.value
@@ -180,6 +180,7 @@ proc parsePrimary(p: var Parser): Expr =
      tkSet, tkFrom, tkWhere, tkAnd, tkOr, tkIn, tkIs, tkBetween, tkLike,
      tkLimit, tkOffset, tkOrder, tkBy, tkAsc, tkDesc, tkAll, tkDistinct,
      tkBegin, tkCommit, tkRollback, tkTransaction, tkWork, tkWith,
+     tkShow, tkDatabases, tkSchemas, tkTables,
      tkTkInt, tkTkFloat, tkTkText, tkTkBool, tkTkDate, tkTkDateTime, tkTkBytes:
     let name = t.value
     discard p.advance
@@ -647,6 +648,39 @@ proc parseOne*(p: var Parser): Stmt =
     discard p.advance
     p.skipTxnSuffix
     return Stmt(kind: stmtRollback)
+  of tkShow:
+    discard p.advance
+    case p.peekKind
+    of tkDatabases:
+      discard p.advance
+      return Stmt(kind: stmtShowDatabases)
+    of tkSchemas:
+      discard p.advance
+      # optional IN <database>
+      var db = ""
+      if p.peekKind == tkIn:
+        discard p.advance
+        db = p.expectIdent
+      return Stmt(kind: stmtShowSchemas, showSchemasDb: db)
+    of tkTables:
+      discard p.advance
+      # optional IN <schema> or IN <database>.<schema>
+      var db = ""
+      var schema = ""
+      if p.peekKind == tkIn:
+        discard p.advance
+        let first = p.expectIdent
+        if p.check(tkDot):
+          discard p.advance
+          let second = p.expectIdent
+          db = first
+          schema = second
+        else:
+          schema = first
+      return Stmt(kind: stmtShowTables, showTablesDb: db,
+                  showTablesSchema: schema)
+    else:
+      raise parseError(&"expected DATABASES, SCHEMAS, or TABLES after SHOW but got '{p.peek.value}'", p.peek)
   else:
     raise parseError(&"expected a SQL statement but got '{t.value}'", t)
 

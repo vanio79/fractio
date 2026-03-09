@@ -350,6 +350,120 @@ suite "SQL Executor — Transactions":
     check res.okMessage == "ROLLBACK"
 
 
+suite "SQL Executor — SHOW statements":
+  var store: RaftKVStoreExt
+  let testDir = "/tmp/fractio_test_executor_show_" & $getCurrentProcessId()
+
+  setup:
+    cleanupTestDir(testDir)
+    store = createTestStore(testDir)
+
+  teardown:
+    store.coordinator.stop()
+    cleanupTestDir(testDir)
+
+  test "SHOW DATABASES empty":
+    let res = exec(store, "SHOW DATABASES")
+    check res.kind == erkRows
+    check res.columns == @["database_name"]
+    check res.rows.len == 0
+
+  test "SHOW DATABASES after creating some":
+    discard exec(store, "CREATE DATABASE alpha")
+    discard exec(store, "CREATE DATABASE beta")
+    discard exec(store, "CREATE DATABASE gamma")
+    let res = exec(store, "SHOW DATABASES")
+    check res.kind == erkRows
+    check res.rows.len == 3
+    # Check all names are present (order may vary by key sort)
+    var names: seq[string]
+    for row in res.rows:
+      names.add(row[0])
+    check "alpha" in names
+    check "beta" in names
+    check "gamma" in names
+
+  test "SHOW DATABASES reflects drops":
+    discard exec(store, "CREATE DATABASE db1")
+    discard exec(store, "CREATE DATABASE db2")
+    discard exec(store, "DROP DATABASE db1")
+    let res = exec(store, "SHOW DATABASES")
+    check res.rows.len == 1
+    check res.rows[0][0] == "db2"
+
+  test "SHOW SCHEMAS empty":
+    let res = exec(store, "SHOW SCHEMAS", database = "mydb")
+    check res.kind == erkRows
+    check res.columns == @["schema_name"]
+    check res.rows.len == 0
+
+  test "SHOW SCHEMAS after creating some":
+    discard exec(store, "CREATE SCHEMA api", database = "mydb")
+    discard exec(store, "CREATE SCHEMA internal", database = "mydb")
+    discard exec(store, "CREATE SCHEMA other", database = "otherdb")
+    let res = exec(store, "SHOW SCHEMAS", database = "mydb")
+    check res.kind == erkRows
+    check res.rows.len == 2
+    var names: seq[string]
+    for row in res.rows:
+      names.add(row[0])
+    check "api" in names
+    check "internal" in names
+
+  test "SHOW SCHEMAS IN specific_db":
+    discard exec(store, "CREATE SCHEMA s1", database = "db1")
+    discard exec(store, "CREATE SCHEMA s2", database = "db2")
+    let res = exec(store, "SHOW SCHEMAS IN db1")
+    check res.rows.len == 1
+    check res.rows[0][0] == "s1"
+
+  test "SHOW TABLES empty":
+    let res = exec(store, "SHOW TABLES")
+    check res.kind == erkRows
+    check res.columns == @["table_name"]
+    check res.rows.len == 0
+
+  test "SHOW TABLES after creating some":
+    discard exec(store, "CREATE TABLE users (id INT PRIMARY KEY)")
+    discard exec(store, "CREATE TABLE orders (id INT PRIMARY KEY)")
+    let res = exec(store, "SHOW TABLES")
+    check res.kind == erkRows
+    check res.rows.len == 2
+    var names: seq[string]
+    for row in res.rows:
+      names.add(row[0])
+    check "users" in names
+    check "orders" in names
+
+  test "SHOW TABLES filters by schema":
+    discard exec(store, "CREATE TABLE t1 (id INT PRIMARY KEY)",
+        database = "mydb", schema = "api")
+    discard exec(store, "CREATE TABLE t2 (id INT PRIMARY KEY)",
+        database = "mydb", schema = "internal")
+    let res = exec(store, "SHOW TABLES IN api", database = "mydb")
+    check res.rows.len == 1
+    check res.rows[0][0] == "t1"
+
+  test "SHOW TABLES IN db.schema":
+    discard exec(store, "CREATE TABLE t1 (id INT PRIMARY KEY)",
+        database = "db1", schema = "s1")
+    discard exec(store, "CREATE TABLE t2 (id INT PRIMARY KEY)",
+        database = "db1", schema = "s2")
+    discard exec(store, "CREATE TABLE t3 (id INT PRIMARY KEY)",
+        database = "db2", schema = "s1")
+    let res = exec(store, "SHOW TABLES IN db1.s1")
+    check res.rows.len == 1
+    check res.rows[0][0] == "t1"
+
+  test "SHOW TABLES reflects drops":
+    discard exec(store, "CREATE TABLE t1 (id INT PRIMARY KEY)")
+    discard exec(store, "CREATE TABLE t2 (id INT PRIMARY KEY)")
+    discard exec(store, "DROP TABLE t1")
+    let res = exec(store, "SHOW TABLES")
+    check res.rows.len == 1
+    check res.rows[0][0] == "t2"
+
+
 suite "SQL Executor — Full round-trip":
   var store: RaftKVStoreExt
   let testDir = "/tmp/fractio_test_executor_roundtrip_" & $getCurrentProcessId()

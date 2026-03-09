@@ -405,6 +405,75 @@ proc execDelete(op: PlanOp, store: RaftKVStoreExt): ExecResult =
 
   modifiedResult(count, &"DELETE {count}")
 
+proc execShowDatabases(op: PlanOp, store: RaftKVStoreExt): ExecResult =
+  let startKey = encodeTableKey(SYS_DATABASES_TABLE_ID, "")
+  let endKey = encodeTableKey(SYS_DATABASES_TABLE_ID + 1, "")
+  let res = store.raftScan(startKey, endKey, 0, includeSystemKeys = true)
+  if not res.isOk:
+    return errorResult(&"failed to scan databases: {res.error.msg}")
+
+  var resultRows: seq[seq[string]]
+  for (key, entry) in res.value:
+    try:
+      let j = parseJson(entry.value)
+      resultRows.add(@[j["name"].getStr()])
+    except JsonParsingError:
+      # Fall back to extracting name from the key
+      let decoded = decodeTableKey(key)
+      resultRows.add(@[decoded.primaryKey])
+
+  rowsResult(@["database_name"], resultRows)
+
+proc execShowSchemas(op: PlanOp, store: RaftKVStoreExt): ExecResult =
+  let prefix = op.ssDatabase & "."
+  let startKey = encodeTableKey(SYS_SCHEMAS_TABLE_ID, "")
+  let endKey = encodeTableKey(SYS_SCHEMAS_TABLE_ID + 1, "")
+  let res = store.raftScan(startKey, endKey, 0, includeSystemKeys = true)
+  if not res.isOk:
+    return errorResult(&"failed to scan schemas: {res.error.msg}")
+
+  var resultRows: seq[seq[string]]
+  for (key, entry) in res.value:
+    try:
+      let j = parseJson(entry.value)
+      let db = j.getOrDefault("database").getStr("")
+      let name = j["name"].getStr()
+      if db == op.ssDatabase or op.ssDatabase.len == 0:
+        resultRows.add(@[name])
+    except JsonParsingError:
+      let decoded = decodeTableKey(key)
+      let pk = decoded.primaryKey
+      if pk.startsWith(prefix):
+        resultRows.add(@[pk[prefix.len .. ^1]])
+
+  rowsResult(@["schema_name"], resultRows)
+
+proc execShowTables(op: PlanOp, store: RaftKVStoreExt): ExecResult =
+  let prefix = op.stDatabase & "." & op.stSchema & "."
+  let startKey = encodeTableKey(SYS_TABLES_TABLE_ID, "")
+  let endKey = encodeTableKey(SYS_TABLES_TABLE_ID + 1, "")
+  let res = store.raftScan(startKey, endKey, 0, includeSystemKeys = true)
+  if not res.isOk:
+    return errorResult(&"failed to scan tables: {res.error.msg}")
+
+  var resultRows: seq[seq[string]]
+  for (key, entry) in res.value:
+    try:
+      let j = parseJson(entry.value)
+      let db = j.getOrDefault("database").getStr("")
+      let sc = j.getOrDefault("schema").getStr("")
+      let name = j["name"].getStr()
+      if (db == op.stDatabase or op.stDatabase.len == 0) and
+         (sc == op.stSchema or op.stSchema.len == 0):
+        resultRows.add(@[name])
+    except JsonParsingError:
+      let decoded = decodeTableKey(key)
+      let pk = decoded.primaryKey
+      if pk.startsWith(prefix):
+        resultRows.add(@[pk[prefix.len .. ^1]])
+
+  rowsResult(@["table_name"], resultRows)
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -428,6 +497,9 @@ proc execute*(plan: Plan, store: RaftKVStoreExt): ExecResult =
     of poScan:           execScan(op, store)
     of poUpdate:         execUpdate(op, store)
     of poDelete:         execDelete(op, store)
+    of poShowDatabases:  execShowDatabases(op, store)
+    of poShowSchemas:    execShowSchemas(op, store)
+    of poShowTables:     execShowTables(op, store)
     of poBeginTxn:       okResult("BEGIN")
     of poCommitTxn:      okResult("COMMIT")
     of poRollbackTxn:    okResult("ROLLBACK")

@@ -62,6 +62,12 @@ type
     tkTransaction
     tkWork
 
+    # SHOW keywords
+    tkShow       ## SHOW
+    tkDatabases  ## DATABASES
+    tkSchemas    ## SCHEMAS
+    tkTables     ## TABLES
+
     # Storage / replication keywords
     tkWith       ## WITH
 
@@ -150,6 +156,10 @@ const keywords = {
   "TRUE":        tkTrue,
   "FALSE":       tkFalse,
   "WITH":        tkWith,
+  "SHOW":        tkShow,
+  "DATABASES":   tkDatabases,
+  "SCHEMAS":     tkSchemas,
+  "TABLES":      tkTables,
   # Type aliases
   "INT":         tkTkInt,
   "INTEGER":     tkTkInt,

@@ -125,6 +125,9 @@ type
     stmtInsert
     stmtUpdate
     stmtDelete
+    stmtShowDatabases
+    stmtShowSchemas
+    stmtShowTables
     stmtBegin
     stmtCommit
     stmtRollback
@@ -196,6 +199,15 @@ type
       delTable*:   string
       delAlias*:   string
       delWhere*:   Option[Expr]
+
+    # ---- SHOW ----
+    of stmtShowDatabases:
+      discard
+    of stmtShowSchemas:
+      showSchemasDb*: string   ## database to list schemas from (may be empty → use current)
+    of stmtShowTables:
+      showTablesDb*:     string  ## database (may be empty → use current)
+      showTablesSchema*: string  ## schema (may be empty → use current)
 
     # ---- Transaction ----
     of stmtBegin:

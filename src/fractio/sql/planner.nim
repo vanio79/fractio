@@ -27,6 +27,9 @@ type
     poScan
     poUpdate
     poDelete
+    poShowDatabases
+    poShowSchemas
+    poShowTables
     poBeginTxn
     poCommitTxn
     poRollbackTxn
@@ -104,6 +107,16 @@ type
       delFilter*: Option[Expr]
       delAllColumns*: seq[string]
       delPkColumn*: string
+
+    of poShowDatabases:
+      discard
+
+    of poShowSchemas:
+      ssDatabase*: string  # filter by database (empty = current)
+
+    of poShowTables:
+      stDatabase*: string  # filter by database (empty = current)
+      stSchema*: string    # filter by schema (empty = current)
 
     of poBeginTxn:
       btReadOnly*: bool
@@ -507,6 +520,21 @@ proc planStatement*(stmt: Stmt, store: RaftKVStoreExt,
   of stmtSelect:   planSelect(stmt, store, database, schema)
   of stmtUpdate:   planUpdate(stmt, store, database, schema)
   of stmtDelete:   planDelete(stmt, store, database, schema)
+  of stmtShowDatabases:
+    let plan = newPlan()
+    plan.add(PlanOp(kind: poShowDatabases))
+    plan
+  of stmtShowSchemas:
+    let plan = newPlan()
+    let db = if stmt.showSchemasDb.len > 0: stmt.showSchemasDb else: database
+    plan.add(PlanOp(kind: poShowSchemas, ssDatabase: db))
+    plan
+  of stmtShowTables:
+    let plan = newPlan()
+    let db = if stmt.showTablesDb.len > 0: stmt.showTablesDb else: database
+    let sc = if stmt.showTablesSchema.len > 0: stmt.showTablesSchema else: schema
+    plan.add(PlanOp(kind: poShowTables, stDatabase: db, stSchema: sc))
+    plan
   of stmtBegin:
     let plan = newPlan()
     plan.add(PlanOp(kind: poBeginTxn, btReadOnly: stmt.beginReadOnly))
