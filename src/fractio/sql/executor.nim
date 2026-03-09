@@ -237,6 +237,12 @@ proc execCreateDatabase(op: PlanOp, store: RaftKVStoreExt): ExecResult =
   let res = store.raftPut(key, op.cdbValue)
   if not res.isOk:
     return errorResult(&"failed to create database: {res.error.msg}")
+
+  # Seed a default "public" schema for every new database
+  let pubKey = encodeTableKey(SYS_SCHEMAS_TABLE_ID, op.cdbName & ".public")
+  let pubVal = $ %* {"name": "public", "database": op.cdbName}
+  discard store.raftPut(pubKey, pubVal)
+
   okResult(&"CREATE DATABASE")
 
 proc execDropDatabase(op: PlanOp, store: RaftKVStoreExt): ExecResult =

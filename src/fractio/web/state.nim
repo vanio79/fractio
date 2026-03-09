@@ -13,6 +13,16 @@ var
   gMsg*:     State[string]   = remember ""
   gMsgOk*:   State[bool]     = remember false
 
+  # Data browser state — caches only, navigation is URL-based
+  gDatabases*: State[seq[string]] = remember newSeq[string]()
+  gSchemas*:   State[seq[string]] = remember newSeq[string]()
+  gTables*:    State[seq[string]] = remember newSeq[string]()
+  gTableData*: State[JsObject]   = remember newJsObject()
+
+  # System table browser state
+  gSysTables*:    State[JsObject] = remember newJsObject()
+  gSysTableData*: State[JsObject] = remember newJsObject()
+
   # Clock drift: plain globals — updated directly via jsSetInnerHtml,
   # NOT via State, so they don't trigger HappyX re-renders.
   gDriftSamples*: seq[float] = @[]

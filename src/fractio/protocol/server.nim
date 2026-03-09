@@ -14,7 +14,7 @@
 #
 # All shared mutable state is protected by Locks.
 
-import std/[net, tables, strformat, times, atomics, locks, options, algorithm, os]
+import std/[net, tables, strformat, strutils, times, atomics, locks, options, algorithm, os]
 import posix as posixSys
 import ./types
 import ./codec as protoCodec
@@ -30,6 +30,13 @@ import ./txn_manager
 import ./raft_store
 import ../utils/logging
 import ../distributed/sharedtimer
+import ../distributed/raft/multigroup_coordinator
+import ../distributed/raft/multigroup_transport
+import ../distributed/raft/multigroup_types
+import ../distributed/range/types as rangeTypes
+import ../distributed/sharedtimer/udptransport as udpXport
+import ../distributed/meta/system_tables
+import std/json
 
 # ---------------------------------------------------------------------------
 # Safe logging helper — swallows any logger exception so callers can be raises:[]
@@ -386,6 +393,8 @@ type
     authenticator*: Authenticator ## Phase 4: auth validator
     sharedTimer*: SharedTimer     ## Phase 7: P2P clock sync (nil when disabled)
     nodeRegistry*: NodeRegistry   ## Phase 8: in-memory cluster node registry
+    raftCoord*: MultiRaftCoordinator  ## lifecycle owner; nil until setupRaftNode
+    raftTransport*: RaftGroupTransport ## kept alive for ORC safety; nil in single-node
 
 # ---------------------------------------------------------------------------
 # Thread argument types — defined after ProtocolServer to avoid forward refs
@@ -1355,6 +1364,128 @@ proc acceptLoop(args: AcceptLoopArgs) {.thread.} =
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+proc setupRaftNode*(server: ProtocolServer, raftPort: int,
+                    rawPeers: seq[string]) {.raises: [Exception].} =
+  ## Wire a real Raft + WiscKey stack into the server.
+  ## rawPeers: each entry "ID:HOST:RAFT_PORT", empty = single-node mode.
+
+  let nodeId = rangeTypes.RangeNodeID(uint32(server.config.serverId))
+  let raftDir = server.config.dataDir / "raft"
+  createDir(raftDir)
+
+  # Parse peer strings → PeerAddr
+  var peers: seq[PeerAddr] = @[]
+  for raw in rawPeers:
+    let parts = raw.split(':')
+    if parts.len < 3: continue
+    try:
+      peers.add(PeerAddr(
+        nodeId: rangeTypes.RangeNodeID(uint32(parseInt(parts[0]))),
+        host: parts[1],
+        raftPort: parseInt(parts[2]),
+      ))
+    except ValueError: discard
+
+  # Build transport (nil = single-node)
+  var transport: MultiRaftTransport = nil
+  if peers.len > 0:
+    let rgt = newRaftGroupTransport(nodeId, server.config.host, raftPort, peers)
+    server.raftTransport = rgt          # keep alive for ORC
+    transport = newMultiRaftTransport(rgt)
+
+  # Coordinator
+  let coord = newMultiRaftCoordinator(CoordinatorConfig(
+    nodeId: nodeId,
+    numWorkers: DEFAULT_NUM_WORKERS,
+    electionTimeoutNs: DEFAULT_ELECTION_TIMEOUT_NS,
+    heartbeatIntervalNs: DEFAULT_HEARTBEAT_INTERVAL_NS,
+    storagePath: raftDir,
+    transport: transport,
+    proposeTimeoutMs: 5000,
+  ))
+  server.raftCoord = coord
+
+  # Raft group: single shard, all-keys
+  let rangeId = rangeTypes.RangeID(1'u64)
+  var desc = rangeTypes.newRangeDescriptor(rangeId, @[], @[])
+  let myReplica = desc.addReplica(nodeId, rangeTypes.rtVoter)
+  for p in peers:
+    discard desc.addReplica(p.nodeId, rangeTypes.rtVoter)
+  let group = coord.createGroup(desc, myReplica.replicaId)
+  coord.start()
+
+  # Single-node cluster: immediately become leader (no election needed)
+  if peers.len == 0:
+    group.becomeLeader()
+
+  # KV store
+  let store = newRaftKVStoreExt(coord)
+  bootstrapSingleShardExt(store, rangeId)
+  server.raftStore = store
+
+  # Seed system tables: sys.nodes (table 5) and sys.ranges (table 4)
+  block:
+    let nodeKey = encodeTableKey(SYS_NODES_TABLE_ID, $server.config.serverId)
+    let nodeVal = $ %* {
+      "nodeId": server.config.serverId.int,
+      "host": server.config.host,
+      "raftPort": raftPort,
+      "clientPort": server.config.port,
+      "status": 1,
+    }
+    discard store.raftPut(nodeKey, nodeVal)
+
+    let rangeKey = encodeTableKey(SYS_RANGES_TABLE_ID, $rangeId.uint64)
+    let rangeVal = $ %* {
+      "rangeId": rangeId.uint64.int,
+      "startKey": "",
+      "endKey": "",
+      "replicas": [{"nodeId": server.config.serverId.int, "type": "voter"}],
+    }
+    discard store.raftPut(rangeKey, rangeVal)
+
+    for p in peers:
+      let peerKey = encodeTableKey(SYS_NODES_TABLE_ID, $p.nodeId.uint32)
+      let peerVal = $ %* {
+        "nodeId": p.nodeId.uint32.int,
+        "host": p.host,
+        "raftPort": p.raftPort.int,
+        "clientPort": 0,
+        "status": 1,
+      }
+      discard store.raftPut(peerKey, peerVal)
+
+    # Seed default database and public schema
+    let dbKey = encodeTableKey(SYS_DATABASES_TABLE_ID, "default")
+    discard store.raftPut(dbKey, $ %* {"name": "default"})
+
+    let scKey = encodeTableKey(SYS_SCHEMAS_TABLE_ID, "default.public")
+    discard store.raftPut(scKey, $ %* {
+      "name": "public", "database": "default",
+    })
+
+  # SharedTimer: enable when we have peers and timer not yet configured
+  if peers.len > 0 and server.sharedTimer.isNil:
+    var timerPeers: seq[PeerConfig] = @[]
+    for p in peers:
+      timerPeers.add(PeerConfig(
+        peerId: $p.nodeId.uint32,
+        address: p.host,
+        port: uint16(p.raftPort + 1),
+        weight: 1.0,
+      ))
+    let selfTimerPort = uint16(raftPort + 1)
+    let timerNet = udpXport.newUDPTransport(selfTimerPort, server.logger)
+    let timer = newSharedTimer(
+      nodeId = server.config.serverName,
+      numericNodeId = server.config.serverId,
+      peers = timerPeers,
+      network = timerNet,
+      logger = server.logger,
+    )
+    server.sharedTimer = timer
+    server.txnMgr.setTimeProvider(timer)
 
 proc start*(server: ProtocolServer) {.raises: [].} =
   server.running.store(true)

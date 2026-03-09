@@ -5,7 +5,7 @@
 #   npx terser src/fractio/web/static/app.js --compress --mangle -o src/fractio/web/static/app.js
 #
 # True SPA: hash-based routing via HappyX appRoutes.
-# Routes: /#/, /#/nodes, /#/metrics, /#/clock.
+# Routes: /#/, /#/nodes, /#/metrics, /#/clock, /#/data/...
 
 import happyx
 import std/jsffi
@@ -38,6 +38,7 @@ appRoutes "app":
         tA(href = "/#/nodes",   style = "{navStyle(false)}"): "Nodes"
         tA(href = "/#/metrics", style = "{navStyle(false)}"): "Metrics"
         tA(href = "/#/clock",   style = "{navStyle(false)}"): "Clock"
+        tA(href = "/#/data",   style = "{navStyle(false)}"): "Data"
       tMain(style = "flex:1;padding:1.75rem;max-width:1260px;width:100%"):
         let nid  = $safeIntStr(gInfo.get(), "nodeId")
         let role = roleStr(safeInt(gInfo.get(), "role"))
@@ -74,6 +75,7 @@ appRoutes "app":
         tA(href = "/#/nodes",   style = "{navStyle(true)}"):  "Nodes"
         tA(href = "/#/metrics", style = "{navStyle(false)}"): "Metrics"
         tA(href = "/#/clock",   style = "{navStyle(false)}"): "Clock"
+        tA(href = "/#/data",    style = "{navStyle(false)}"): "Data"
       tMain(style = "flex:1;padding:1.75rem;max-width:1260px;width:100%"):
         let arr = to(gNodes.get(), seq[JsObject])
         let arrLen = arr.len
@@ -143,6 +145,7 @@ appRoutes "app":
         tA(href = "/#/nodes",   style = "{navStyle(false)}"): "Nodes"
         tA(href = "/#/metrics", style = "{navStyle(true)}"):  "Metrics"
         tA(href = "/#/clock",   style = "{navStyle(false)}"): "Clock"
+        tA(href = "/#/data",    style = "{navStyle(false)}"): "Data"
       tMain(style = "flex:1;padding:1.75rem;max-width:1260px;width:100%"):
         tDiv(style = "display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:1rem"):
           tDiv(style = "background:#fff;border-radius:6px;border:1px solid #e0e0e0;padding:1rem"):
@@ -194,6 +197,7 @@ appRoutes "app":
         tA(href = "/#/nodes",   style = "{navStyle(false)}"): "Nodes"
         tA(href = "/#/metrics", style = "{navStyle(false)}"): "Metrics"
         tA(href = "/#/clock",   style = "{navStyle(true)}"):  "Clock"
+        tA(href = "/#/data",    style = "{navStyle(false)}"): "Data"
       tMain(style = "flex:1;padding:1.75rem;max-width:1260px;width:100%"):
 
         # Title row — WS status badge is populated by injectClockDom()
@@ -240,11 +244,276 @@ appRoutes "app":
       tFooter(style = "padding:.75rem 1.75rem;background:#2d2d2d;color:#999;font-size:.75rem;text-align:center"):
         "Fractio Management Console · SharedTimer drift stream"
 
+  # ===========================================================================
+  # Data Browser — URL-routed
+  # ===========================================================================
+
+  # ---- /data — database list ----
+  "/data":
+    let hsD = healthStr(safeInt(gHealth.get(), "status") + triggerLoadDatabases())
+    let hcD = healthColor(safeInt(gHealth.get(), "status"))
+    tDiv(style = "display:flex;flex-direction:column;min-height:100vh"):
+      tHeader(style = "display:flex;align-items:center;gap:1rem;padding:0 1.75rem;height:60px;background:#e81c1c;box-shadow:0 2px 8px rgba(0,0,0,.18);position:sticky;top:0;z-index:100"):
+        tDiv(style = "font-size:1.1rem;font-weight:800;color:#fff;letter-spacing:.1em"): "⬡ FRACTIO"
+        tDiv(style = "flex:1")
+        tSpan(style = "background:{hcD};color:#fff;padding:.25rem .75rem;border-radius:999px;font-size:.8rem;font-weight:700"): "{hsD}"
+      tNav(style = "background:#2d2d2d;display:flex;padding:0 1.25rem"):
+        tA(href = "/#/",        style = "{navStyle(false)}"): "Dashboard"
+        tA(href = "/#/nodes",   style = "{navStyle(false)}"): "Nodes"
+        tA(href = "/#/metrics", style = "{navStyle(false)}"): "Metrics"
+        tA(href = "/#/clock",   style = "{navStyle(false)}"): "Clock"
+        tA(href = "/#/data",    style = "{navStyle(true)}"):  "Data"
+      tMain(style = "flex:1;padding:1.75rem;max-width:1260px;width:100%"):
+        # Breadcrumb
+        tDiv(style = "display:flex;align-items:center;gap:.35rem;margin-bottom:1.25rem;font-size:.85rem;color:#666"):
+          tSpan(style = "font-weight:600;color:#111"): "Databases"
+
+        tDiv(style = "display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:.75rem"):
+          # Virtual "sys" database
+          tA(href = "/#/data/sys", style = "text-decoration:none;color:inherit"):
+            tDiv(style = "background:#fff;border:1px solid #e0e0e0;border-radius:6px;padding:.85rem 1rem;transition:border-color .15s,box-shadow .15s"):
+              tDiv(style = "font-size:.65rem;color:#999;text-transform:uppercase;letter-spacing:.07em;margin-bottom:.25rem;font-weight:600"):
+                "SYSTEM DATABASE"
+              tDiv(style = "font-size:.95rem;font-weight:600;color:#111"): "sys"
+              tDiv(style = "font-size:.75rem;color:#888"): "System tables (nodes, ranges, settings, ...)"
+
+          # User databases
+          let dbs = gDatabases.get()
+          for d in dbs:
+            tA(href = "/#/data/" & d, style = "text-decoration:none;color:inherit"):
+              tDiv(style = "background:#fff;border:1px solid #e0e0e0;border-radius:6px;padding:.85rem 1rem;transition:border-color .15s,box-shadow .15s"):
+                tDiv(style = "font-size:.65rem;color:#999;text-transform:uppercase;letter-spacing:.07em;margin-bottom:.25rem;font-weight:600"):
+                  "DATABASE"
+                tDiv(style = "font-size:.95rem;font-weight:600;color:#111"): "{d}"
+
+      tFooter(style = "padding:.75rem 1.75rem;background:#2d2d2d;color:#999;font-size:.75rem;text-align:center"):
+        "Fractio Management Console · Data Browser"
+
+  # ---- /data/{db} — schema list ----
+  "/data/{db}":
+    let hsD2 = healthStr(safeInt(gHealth.get(), "status") + (if db != "sys": triggerLoadSchemas(db) else: 0))
+    let hcD2 = healthColor(safeInt(gHealth.get(), "status"))
+    tDiv(style = "display:flex;flex-direction:column;min-height:100vh"):
+      tHeader(style = "display:flex;align-items:center;gap:1rem;padding:0 1.75rem;height:60px;background:#e81c1c;box-shadow:0 2px 8px rgba(0,0,0,.18);position:sticky;top:0;z-index:100"):
+        tDiv(style = "font-size:1.1rem;font-weight:800;color:#fff;letter-spacing:.1em"): "⬡ FRACTIO"
+        tDiv(style = "flex:1")
+        tSpan(style = "background:{hcD2};color:#fff;padding:.25rem .75rem;border-radius:999px;font-size:.8rem;font-weight:700"): "{hsD2}"
+      tNav(style = "background:#2d2d2d;display:flex;padding:0 1.25rem"):
+        tA(href = "/#/",        style = "{navStyle(false)}"): "Dashboard"
+        tA(href = "/#/nodes",   style = "{navStyle(false)}"): "Nodes"
+        tA(href = "/#/metrics", style = "{navStyle(false)}"): "Metrics"
+        tA(href = "/#/clock",   style = "{navStyle(false)}"): "Clock"
+        tA(href = "/#/data",    style = "{navStyle(true)}"):  "Data"
+      tMain(style = "flex:1;padding:1.75rem;max-width:1260px;width:100%"):
+        # Breadcrumb
+        tDiv(style = "display:flex;align-items:center;gap:.35rem;margin-bottom:1.25rem;font-size:.85rem;color:#666"):
+          tA(href = "/#/data", style = "color:#e81c1c;font-weight:600;text-decoration:none"): "Databases"
+          tSpan: " / "
+          tSpan(style = "font-weight:600;color:#111"): "{db}"
+
+        if db == "sys":
+          tDiv(style = "display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:.75rem"):
+            tA(href = "/#/data/sys/default", style = "text-decoration:none;color:inherit"):
+              tDiv(style = "background:#fff;border:1px solid #e0e0e0;border-radius:6px;padding:.85rem 1rem;transition:border-color .15s,box-shadow .15s"):
+                tDiv(style = "font-size:.65rem;color:#999;text-transform:uppercase;letter-spacing:.07em;margin-bottom:.25rem;font-weight:600"):
+                  "SCHEMA"
+                tDiv(style = "font-size:.95rem;font-weight:600;color:#111"): "default"
+        else:
+          let schemas = gSchemas.get()
+          if schemas.len == 0:
+            tDiv(style = "color:#888;font-size:.85rem;padding:1rem"): "Loading schemas..."
+          else:
+            tDiv(style = "display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:.75rem"):
+              for s in schemas:
+                tA(href = "/#/data/" & db & "/" & s, style = "text-decoration:none;color:inherit"):
+                  tDiv(style = "background:#fff;border:1px solid #e0e0e0;border-radius:6px;padding:.85rem 1rem;transition:border-color .15s,box-shadow .15s"):
+                    tDiv(style = "font-size:.65rem;color:#999;text-transform:uppercase;letter-spacing:.07em;margin-bottom:.25rem;font-weight:600"):
+                      "SCHEMA"
+                    tDiv(style = "font-size:.95rem;font-weight:600;color:#111"): "{s}"
+
+      tFooter(style = "padding:.75rem 1.75rem;background:#2d2d2d;color:#999;font-size:.75rem;text-align:center"):
+        "Fractio Management Console · Data Browser"
+
+  # ---- /data/{db}/{schema} — table list ----
+  "/data/{db}/{schema}":
+    let hsD3 = healthStr(safeInt(gHealth.get(), "status") + (if db == "sys": triggerLoadSystemTables() else: triggerLoadTables(db, schema)))
+    let hcD3 = healthColor(safeInt(gHealth.get(), "status"))
+    tDiv(style = "display:flex;flex-direction:column;min-height:100vh"):
+      tHeader(style = "display:flex;align-items:center;gap:1rem;padding:0 1.75rem;height:60px;background:#e81c1c;box-shadow:0 2px 8px rgba(0,0,0,.18);position:sticky;top:0;z-index:100"):
+        tDiv(style = "font-size:1.1rem;font-weight:800;color:#fff;letter-spacing:.1em"): "⬡ FRACTIO"
+        tDiv(style = "flex:1")
+        tSpan(style = "background:{hcD3};color:#fff;padding:.25rem .75rem;border-radius:999px;font-size:.8rem;font-weight:700"): "{hsD3}"
+      tNav(style = "background:#2d2d2d;display:flex;padding:0 1.25rem"):
+        tA(href = "/#/",        style = "{navStyle(false)}"): "Dashboard"
+        tA(href = "/#/nodes",   style = "{navStyle(false)}"): "Nodes"
+        tA(href = "/#/metrics", style = "{navStyle(false)}"): "Metrics"
+        tA(href = "/#/clock",   style = "{navStyle(false)}"): "Clock"
+        tA(href = "/#/data",    style = "{navStyle(true)}"):  "Data"
+      tMain(style = "flex:1;padding:1.75rem;max-width:1260px;width:100%"):
+        # Breadcrumb
+        tDiv(style = "display:flex;align-items:center;gap:.35rem;margin-bottom:1.25rem;font-size:.85rem;color:#666"):
+          tA(href = "/#/data", style = "color:#e81c1c;font-weight:600;text-decoration:none"): "Databases"
+          tSpan: " / "
+          tA(href = "/#/data/" & db, style = "color:#e81c1c;font-weight:600;text-decoration:none"): "{db}"
+          tSpan: " / "
+          tSpan(style = "font-weight:600;color:#111"): "{schema}"
+
+        if db == "sys":
+          # System tables
+          let stArr = gSysTables.get()
+          let stLen = jsArrayLen(stArr)
+          if stLen > 0:
+            tDiv(style = "display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:.75rem"):
+              for si in 0 ..< stLen:
+                let st = stArr[si]
+                let stName = $safeStr(st, "name")
+                let stDesc = $safeStr(st, "description")
+                let stId = safeInt(st, "id")
+                let stRows = $safeIntStr(st, "rowCount")
+                tA(href = "/#/data/sys/default/" & stName, style = "text-decoration:none;color:inherit"):
+                  tDiv(style = "background:#fff;border:1px solid #e0e0e0;border-left:3px solid #e81c1c;border-radius:6px;padding:.85rem 1rem;transition:border-color .15s,box-shadow .15s"):
+                    tDiv(style = "font-size:.65rem;color:#999;text-transform:uppercase;letter-spacing:.07em;margin-bottom:.25rem;font-weight:600"):
+                      "SYSTEM TABLE · ID {stId}"
+                    tDiv(style = "font-size:.95rem;font-weight:600;color:#111"):
+                      "{stName}"
+                    tDiv(style = "font-size:.75rem;color:#888"):
+                      "{stDesc} · {stRows} rows"
+          else:
+            tDiv(style = "color:#888;font-size:.85rem;padding:.5rem"): "Loading system tables..."
+        else:
+          # User tables
+          let tables = gTables.get()
+          if tables.len == 0:
+            tDiv(style = "color:#888;font-size:.85rem;padding:1rem"): "Loading tables..."
+          else:
+            tDiv(style = "display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:.75rem"):
+              for t in tables:
+                tA(href = "/#/data/" & db & "/" & schema & "/" & t, style = "text-decoration:none;color:inherit"):
+                  tDiv(style = "background:#fff;border:1px solid #e0e0e0;border-radius:6px;padding:.85rem 1rem;transition:border-color .15s,box-shadow .15s"):
+                    tDiv(style = "font-size:.65rem;color:#999;text-transform:uppercase;letter-spacing:.07em;margin-bottom:.25rem;font-weight:600"):
+                      "TABLE"
+                    tDiv(style = "font-size:.95rem;font-weight:600;color:#111"): "{t}"
+
+      tFooter(style = "padding:.75rem 1.75rem;background:#2d2d2d;color:#999;font-size:.75rem;text-align:center"):
+        "Fractio Management Console · Data Browser"
+
+  # ---- /data/{db}/{schema}/{table} — table rows ----
+  "/data/{db}/{schema}/{table}":
+    let hsD4 = healthStr(safeInt(gHealth.get(), "status") + (block:
+      if db == "sys":
+        let stId = sysTableIdByName(table)
+        if stId < 0: triggerLoadSystemTables()
+        else: triggerLoadSystemTableData(stId, table)
+      else:
+        triggerLoadTableData(db, schema, table)))
+    let hcD4 = healthColor(safeInt(gHealth.get(), "status"))
+    tDiv(style = "display:flex;flex-direction:column;min-height:100vh"):
+      tHeader(style = "display:flex;align-items:center;gap:1rem;padding:0 1.75rem;height:60px;background:#e81c1c;box-shadow:0 2px 8px rgba(0,0,0,.18);position:sticky;top:0;z-index:100"):
+        tDiv(style = "font-size:1.1rem;font-weight:800;color:#fff;letter-spacing:.1em"): "⬡ FRACTIO"
+        tDiv(style = "flex:1")
+        tSpan(style = "background:{hcD4};color:#fff;padding:.25rem .75rem;border-radius:999px;font-size:.8rem;font-weight:700"): "{hsD4}"
+      tNav(style = "background:#2d2d2d;display:flex;padding:0 1.25rem"):
+        tA(href = "/#/",        style = "{navStyle(false)}"): "Dashboard"
+        tA(href = "/#/nodes",   style = "{navStyle(false)}"): "Nodes"
+        tA(href = "/#/metrics", style = "{navStyle(false)}"): "Metrics"
+        tA(href = "/#/clock",   style = "{navStyle(false)}"): "Clock"
+        tA(href = "/#/data",    style = "{navStyle(true)}"):  "Data"
+      tMain(style = "flex:1;padding:1.75rem;max-width:1260px;width:100%"):
+        # Breadcrumb
+        tDiv(style = "display:flex;align-items:center;gap:.35rem;margin-bottom:1.25rem;font-size:.85rem;color:#666"):
+          tA(href = "/#/data", style = "color:#e81c1c;font-weight:600;text-decoration:none"): "Databases"
+          tSpan: " / "
+          tA(href = "/#/data/" & db, style = "color:#e81c1c;font-weight:600;text-decoration:none"): "{db}"
+          tSpan: " / "
+          tA(href = "/#/data/" & db & "/" & schema, style = "color:#e81c1c;font-weight:600;text-decoration:none"): "{schema}"
+          tSpan: " / "
+          tSpan(style = "font-weight:600;color:#111"): "{table}"
+
+        tDiv(style = "display:flex;align-items:center;gap:.75rem;margin-bottom:1rem"):
+          tH2(style = "font-size:1.05rem;font-weight:700;color:#111;margin:0"): "{table}"
+
+        if db == "sys":
+          # System table rows
+          let stId = sysTableIdByName(table)
+          if stId < 0:
+            tDiv(style = "color:#888;font-size:.85rem"): "Loading..."
+          else:
+            let std = gSysTableData.get()
+            let sysRows = std.rows
+            let checkLen = jsArrayLen(sysRows)
+            if checkLen == 0:
+              tDiv(style = "color:#888;font-size:.85rem"): "Loading system table data..."
+            else:
+              # Render system table rows
+              let sysRowLen = jsArrayLen(sysRows)
+              tDiv(style = "margin-bottom:.75rem;font-size:.82rem;color:#888"):
+                "{sysRowLen} row(s)"
+              if sysRowLen > 0:
+                let firstRow = sysRows[0]
+                let keys = jsObjectKeys(firstRow)
+                let numCols = jsArrayLen(keys)
+                tDiv(style = "overflow-x:auto"):
+                  tTable(style = "width:100%;border-collapse:collapse;font-size:.875rem;background:#fff;border:1px solid #e0e0e0;border-radius:6px;overflow:hidden"):
+                    tThead:
+                      tTr:
+                        for ci in 0 ..< numCols:
+                          let colName = $jsArrayGet(keys, ci)
+                          tTh(style = "background:#3a3a3a;color:#fff;padding:.55rem .85rem;text-align:left;font-size:.7rem;text-transform:uppercase;letter-spacing:.07em;font-weight:600"):
+                            "{colName}"
+                    tTbody:
+                      for ri in 0 ..< sysRowLen:
+                        let row = sysRows[ri]
+                        tTr:
+                          for ci in 0 ..< numCols:
+                            let colKey = jsArrayGet(keys, ci)
+                            let cellVal = $jsObjField(row, colKey)
+                            tTd(style = "padding:.55rem .85rem;border-bottom:1px solid #eee;font-family:monospace;font-size:.82rem"):
+                              "{cellVal}"
+        else:
+          # User table rows
+          let td = gTableData.get()
+          let tdKind = $safeStr(td, "kind")
+          if tdKind.len == 0:
+            tDiv(style = "color:#888;font-size:.85rem"): "Loading table data..."
+          elif tdKind == "rows":
+            let cols = td.columns
+            let colLen = safeInt(cols, "length")
+            let dataRows = td.rows
+            let rowLen = safeInt(dataRows, "length")
+            tDiv(style = "margin-bottom:.75rem;font-size:.82rem;color:#888"):
+              "{rowLen} row(s)"
+            tDiv(style = "overflow-x:auto"):
+              tTable(style = "width:100%;border-collapse:collapse;font-size:.875rem;background:#fff;border:1px solid #e0e0e0;border-radius:6px;overflow:hidden"):
+                tThead:
+                  tTr:
+                    for ci in 0 ..< colLen:
+                      let colName = $safeStr(cols, cstring($ci))
+                      tTh(style = "background:#3a3a3a;color:#fff;padding:.55rem .85rem;text-align:left;font-size:.7rem;text-transform:uppercase;letter-spacing:.07em;font-weight:600"):
+                        "{colName}"
+                tTbody:
+                  for ri in 0 ..< rowLen:
+                    let row = dataRows[ri]
+                    tTr:
+                      for ci in 0 ..< colLen:
+                        let cn = $safeStr(cols, cstring($ci))
+                        let cellVal = $safeStr(row, cstring(cn))
+                        tTd(style = "padding:.55rem .85rem;border-bottom:1px solid #eee;font-family:monospace;font-size:.82rem"):
+                          "{cellVal}"
+          elif tdKind == "error":
+            let errMsg = $safeStr(td, "error")
+            tDiv(style = "color:#c41010;font-size:.85rem"): "{errMsg}"
+          else:
+            tDiv(style = "color:#888;font-size:.85rem"): "Loading table data..."
+
+      tFooter(style = "padding:.75rem 1.75rem;background:#2d2d2d;color:#999;font-size:.75rem;text-align:center"):
+        "Fractio Management Console · Data Browser"
+
 # ---------------------------------------------------------------------------
 # Boot
 # ---------------------------------------------------------------------------
 
 when isMainModule:
+  installLinkInterceptor()
   discard doRefresh()
   jsSetInterval(proc() = discard doRefresh(), 5000)
   connectDriftWs()

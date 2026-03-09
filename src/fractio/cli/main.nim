@@ -78,6 +78,7 @@ Commands:
     --data-dir DIR    Persistent data directory (required)
     --web-port PORT   Web dashboard port (0 = disabled)
     --join HOST:PORT  Peer to register with on startup
+    --peer ID:HOST:RAFT_PORT  Raft cluster peer (repeatable; omit for single-node)
 
   node ls           List all cluster nodes
   node status [ID]  Show status of all nodes, or detail for one node
@@ -119,7 +120,8 @@ proc healthStatusStr(s: uint8): string =
 # start
 # ---------------------------------------------------------------------------
 
-proc cmdStart(flags: Table[string, string], globalHost: string) =
+proc cmdStart(flags: Table[string, string], globalHost: string,
+              peerFlags: seq[string]) =
   let idStr = flags.getOrDefault("id", "")
   let host = flags.getOrDefault("host", globalHost)
   let raftPortStr = flags.getOrDefault("raft-port", "8300")
@@ -156,6 +158,13 @@ proc cmdStart(flags: Table[string, string], globalHost: string) =
 
   let server = newProtocolServer(cfg)
   server.start()
+
+  if dataDir != "":
+    try:
+      server.setupRaftNode(raftPort, peerFlags)
+    except Exception as e:
+      writeLine(stderr, "warning: raft setup failed: " & e.msg)
+
   if webPort > 0:
     launchWebDashboard(server)
     echo &"web dashboard: http://{host}:{webPort}"
@@ -454,6 +463,7 @@ proc main() =
 
   var positional: seq[string] = @[]
   var flags: Table[string, string] = initTable[string, string]()
+  var peerFlags: seq[string] = @[]
 
   var p = initOptParser(commandLineParams())
   while true:
@@ -481,6 +491,8 @@ proc main() =
       of "h", "help":
         printUsage()
         quit(0)
+      of "peer":
+        peerFlags.add(val)
       else:
         flags[key] = val
     of cmdArgument:
@@ -498,7 +510,7 @@ proc main() =
     echo "fractio " & FractioVersion
     quit(0)
   of "start":
-    cmdStart(flags, globalHost)
+    cmdStart(flags, globalHost, peerFlags)
     quit(0)
   of "-h", "--help", "help":
     printUsage()

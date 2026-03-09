@@ -12,6 +12,9 @@ import std/[json, strutils, times, os, atomics, random, asyncdispatch]
 import zippy
 import ../protocol/server as pserver
 import ../protocol/messages/cluster as clusterMsgs
+import ../sql/executor
+import ../distributed/meta/system_tables
+import ../protocol/raft_store
 
 # ---------------------------------------------------------------------------
 # Server reference — plain pointer so {.gcsafe.} handlers can access it.
@@ -285,6 +288,169 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
         else:
           statusCode = 404
           return %* {"success": false, "message": "node " & $id & " not found"}
+
+      # ---- REST: SQL query ----
+      post "/api/sql":
+        let srv = getSrv()
+        if srv.isNil or srv.raftStore.isNil:
+          statusCode = 503
+          return %* {"error": "server not ready"}
+        var j: JsonNode
+        try:
+          j = parseJson(req.body.get(""))
+        except JsonParsingError:
+          statusCode = 400
+          return %* {"error": "invalid JSON body"}
+        let sql = j.getOrDefault("sql").getStr("")
+        let db = j.getOrDefault("database").getStr("default")
+        let sc = j.getOrDefault("schema").getStr("public")
+        if sql.len == 0:
+          statusCode = 400
+          return %* {"error": "missing 'sql' field"}
+        var execResult: ExecResult
+        {.cast(gcsafe).}:
+          execResult = executeSQL(sql, srv.raftStore, db, sc)
+        case execResult.kind
+        of erkRows:
+          var rowsJson = newJArray()
+          for row in execResult.rows:
+            var rowObj = newJObject()
+            for i, col in execResult.columns:
+              if i < row.len:
+                rowObj[col] = newJString(row[i])
+            rowsJson.add(rowObj)
+          return %* {"kind": "rows", "columns": execResult.columns, "rows": rowsJson}
+        of erkModified:
+          return %* {"kind": "modified", "count": execResult.count, "message": execResult.message}
+        of erkOk:
+          return %* {"kind": "ok", "message": execResult.okMessage}
+        of erkError:
+          statusCode = 400
+          return %* {"kind": "error", "error": execResult.error}
+        of erkUseDatabase:
+          return %* {"kind": "useDatabase", "database": execResult.newDatabase}
+        of erkUseSchema:
+          return %* {"kind": "useSchema", "schema": execResult.newSchema}
+
+      # ---- REST: SQL convenience endpoints ----
+      get "/api/sql/databases":
+        let srv = getSrv()
+        if srv.isNil or srv.raftStore.isNil:
+          statusCode = 503
+          return %* {"error": "server not ready"}
+        var execResult: ExecResult
+        {.cast(gcsafe).}:
+          execResult = executeSQL("SHOW DATABASES", srv.raftStore)
+        if execResult.kind == erkRows:
+          var arr = newJArray()
+          for row in execResult.rows:
+            if row.len > 0:
+              arr.add(newJString(row[0]))
+          return arr
+        return newJArray()
+
+      get "/api/sql/schemas":
+        let srv = getSrv()
+        if srv.isNil or srv.raftStore.isNil:
+          statusCode = 503
+          return %* {"error": "server not ready"}
+        let db = ($headers.getOrDefault("X-Database")).strip()
+        let dbName = if db.len > 0: db else: "default"
+        var execResult: ExecResult
+        {.cast(gcsafe).}:
+          execResult = executeSQL("SHOW SCHEMAS IN " & dbName, srv.raftStore, dbName)
+        if execResult.kind == erkRows:
+          var arr = newJArray()
+          for row in execResult.rows:
+            if row.len > 0:
+              arr.add(newJString(row[0]))
+          return arr
+        return newJArray()
+
+      get "/api/sql/tables":
+        let srv = getSrv()
+        if srv.isNil or srv.raftStore.isNil:
+          statusCode = 503
+          return %* {"error": "server not ready"}
+        let db = ($headers.getOrDefault("X-Database")).strip()
+        let sc = ($headers.getOrDefault("X-Schema")).strip()
+        let dbName = if db.len > 0: db else: "default"
+        let scName = if sc.len > 0: sc else: "public"
+        var execResult: ExecResult
+        {.cast(gcsafe).}:
+          execResult = executeSQL("SHOW TABLES IN " & dbName & "." & scName,
+              srv.raftStore, dbName, scName)
+        if execResult.kind == erkRows:
+          var arr = newJArray()
+          for row in execResult.rows:
+            if row.len > 0:
+              arr.add(newJString(row[0]))
+          return arr
+        return newJArray()
+
+      # ---- REST: system table browser ----
+      get "/api/sql/system-tables":
+        let srv = getSrv()
+        if srv.isNil or srv.raftStore.isNil:
+          statusCode = 503
+          return %* {"error": "server not ready"}
+        # Return the list of known system tables with row counts
+        let sysTables = [
+          (id: SYS_DATABASES_TABLE_ID, name: "sys.databases", desc: "Database catalog"),
+          (id: SYS_SCHEMAS_TABLE_ID, name: "sys.schemas", desc: "Schema catalog"),
+          (id: SYS_TABLES_TABLE_ID, name: "sys.tables", desc: "Table descriptors"),
+          (id: SYS_RANGES_TABLE_ID, name: "sys.ranges", desc: "Range map"),
+          (id: SYS_NODES_TABLE_ID, name: "sys.nodes", desc: "Node registry"),
+          (id: SYS_SETTINGS_TABLE_ID, name: "sys.settings", desc: "Cluster settings"),
+          (id: SYS_NODE_METRICS_ID, name: "sys.node_metrics", desc: "Node metrics"),
+          (id: SYS_RANGE_METRICS_ID, name: "sys.range_metrics", desc: "Range metrics"),
+          (id: SYS_EVENTS_TABLE_ID, name: "sys.events", desc: "Cluster events"),
+        ]
+        var arr = newJArray()
+        for st in sysTables:
+          let startKey = encodeTableKey(st.id, "")
+          let endKey = encodeTableKey(st.id + 1, "")
+          var rowCount = 0
+          {.cast(gcsafe).}:
+            let sr = srv.raftStore.raftScan(startKey, endKey, 0,
+                includeSystemKeys = true)
+            if sr.isOk:
+              rowCount = sr.value.len
+          arr.add(%* {
+            "id": int(st.id),
+            "name": st.name,
+            "description": st.desc,
+            "rowCount": rowCount,
+          })
+        return arr
+
+      get "/api/sql/system-table/{tableId:int}":
+        let srv = getSrv()
+        if srv.isNil or srv.raftStore.isNil:
+          statusCode = 503
+          return %* {"error": "server not ready"}
+        let tid = uint32(tableId)
+        if tid < 1 or tid > MAX_SYSTEM_TABLE_ID:
+          statusCode = 400
+          return %* {"error": "invalid system table ID"}
+        let startKey = encodeTableKey(tid, "")
+        let endKey = encodeTableKey(tid + 1, "")
+        var rows = newJArray()
+        {.cast(gcsafe).}:
+          let sr = srv.raftStore.raftScan(startKey, endKey, 0,
+              includeSystemKeys = true)
+          if sr.isOk:
+            for (key, entry) in sr.value:
+              let decoded = decodeTableKey(key)
+              var rowObj = %* {"_key": decoded.primaryKey}
+              try:
+                let j = parseJson(entry.value)
+                for k, v in j:
+                  rowObj[k] = v
+              except JsonParsingError:
+                rowObj["_value"] = newJString(entry.value)
+              rows.add(rowObj)
+        return %* {"tableId": int(tid), "rows": rows}
 
       # ---- WebSocket: clock drift stream ----
       ws "/ws/drift":
