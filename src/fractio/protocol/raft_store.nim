@@ -34,6 +34,7 @@ import fractio/distributed/raft/multigroup_coordinator
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/range/types as rangeTypes
 import fractio/distributed/raft/state_machine
+import fractio/distributed/meta/system_tables
 import fractio/storage/wisckey_backend
 import fractio/storage/backend
 import ../utils/logging
@@ -188,6 +189,11 @@ proc bootstrapSingleShard*(store: RaftKVStore, rangeId: RangeID) {.gcsafe,
 proc findRangeId*(store: RaftKVStore, key: string): Option[RangeID] {.gcsafe,
     raises: [].} =
   ## Returns the RangeID whose shard covers `key`, or none.
+  ##
+  ## System table keys (tableID 1-6) and meta keys (/sys/meta1/, /sys/meta2/)
+  ## are always routed to the meta range (Range 1) regardless of shard config.
+  if isMetaRangeKey(key):
+    return some(META_RANGE_ID)
   acquire(store.shardsMu)
   defer: release(store.shardsMu)
   for entry in store.shards:
@@ -449,9 +455,12 @@ proc raftDelete*(store: RaftKVStoreExt,
   rsOk[Option[RaftKVEntry]](prevEntry)
 
 proc raftScan*(store: RaftKVStoreExt, startKey, endKey: string,
-    limit: uint32): RSResult[seq[(string, RaftKVEntry)]] {.gcsafe, raises: [].} =
+    limit: uint32,
+    includeSystemKeys: bool = false): RSResult[seq[(string, RaftKVEntry)]] {.gcsafe, raises: [].} =
   ## Scan keys in [startKey, endKey) up to `limit` results.
   ## Aggregates across all shards whose ranges overlap the query span.
+  ## By default, system table keys (/t/0000000001/... through /t/0000000099/...)
+  ## are excluded from results. Set includeSystemKeys=true to include them.
   var pairs: seq[(string, RaftKVEntry)] = @[]
 
   acquire(store.shardsMu)
@@ -464,6 +473,8 @@ proc raftScan*(store: RaftKVStoreExt, startKey, endKey: string,
     for k, v in sm.kvStore:
       # Skip internal intent / coord keys
       if isIntentKey(k) or isCoordKey(k): continue
+      # Skip system table keys unless explicitly requested
+      if not includeSystemKeys and isSystemKey(k): continue
       let afterStart = startKey.len == 0 or k >= startKey
       let beforeEnd = endKey.len == 0 or k < endKey
       if afterStart and beforeEnd:
@@ -795,3 +806,19 @@ proc raftReadCoordRecord*(store: RaftKVStoreExt,
   if sm.kvStore.hasKey(coordKey):
     return some(sm.kvStore.getOrDefault(coordKey))
   none(string)
+
+# ---------------------------------------------------------------------------
+# Meta-range-aware bootstrap
+# ---------------------------------------------------------------------------
+
+proc bootstrapWithMetaRange*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
+  ## Bootstrap the store with a two-range layout:
+  ##   Range 1 (meta range): covers ["", META_RANGE_END_KEY)
+  ##     — system tables 1-6, /sys/meta1/*, /sys/meta2/*
+  ##   Range 2 (first data range): covers [META_RANGE_END_KEY, "")
+  ##     — user tables, metrics, events, all other data
+  ##
+  ## Also wires the apply callback for committed Raft entries.
+  store.addShardExt("", META_RANGE_END_KEY, META_RANGE_ID)
+  store.addShardExt(META_RANGE_END_KEY, "", DATA_RANGE_START_ID)
+  store.wireApplyCallback()

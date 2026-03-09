@@ -1,12 +1,14 @@
 # Cluster Bootstrap - Utilities to start and manage a Fractio cluster
 # Part of the network transport layer for distributed Fractio
 
-import std/[os, tables, atomics, options, times]
+import std/[os, tables, atomics, options, times, json]
 import ./network/config
 import ./network/network_raft_node
 import ./network/client_handler
 import ./network/raft_transport
 import ./raft/types as raft_types
+import ./range/types as rangeTypes
+import ./meta/system_tables
 import ../utils/logging
 
 # =============================================================================
@@ -363,3 +365,69 @@ proc waitForReplication*(cluster: Cluster, timeoutMs: int = 10000): bool =
       return false
 
     sleep(100)
+
+# =============================================================================
+# Meta Range Bootstrap
+# =============================================================================
+
+proc createMetaRangeDescriptor*(cluster: Cluster): RangeDescriptor =
+  ## Create the RangeDescriptor for Range 1 (the meta range).
+  ## The meta range covers ["", META_RANGE_END_KEY) and has a replica on
+  ## every node in the cluster.
+  var startKey: seq[byte] = @[]  # "" — beginning of keyspace
+  var endKey: seq[byte] = @[]
+  for c in META_RANGE_END_KEY:
+    endKey.add(byte(c))
+
+  result = newRangeDescriptor(META_RANGE_ID, startKey, endKey)
+  for node in cluster.nodes:
+    discard result.addReplica(RangeNodeID(node.config.serverId.uint32))
+
+proc createDataRangeDescriptor*(cluster: Cluster,
+    numReplicas: int = 3): RangeDescriptor =
+  ## Create the RangeDescriptor for Range 2 (first data range).
+  ## Covers [META_RANGE_END_KEY, "") with standard replication factor.
+  var startKey: seq[byte] = @[]
+  for c in META_RANGE_END_KEY:
+    startKey.add(byte(c))
+  var endKey: seq[byte] = @[]  # "" — end of keyspace
+
+  result = newRangeDescriptor(DATA_RANGE_START_ID, startKey, endKey)
+  let n = min(numReplicas, cluster.nodes.len)
+  for i in 0 ..< n:
+    discard result.addReplica(RangeNodeID(cluster.nodes[i].config.serverId.uint32))
+
+proc buildInitialCatalog*(nodeConfigs: seq[NodeConfig]): seq[
+    tuple[key, value: string]] =
+  ## Build the initial system catalog entries written to the meta range
+  ## during first bootstrap. Returns a list of (key, value) pairs.
+  ##
+  ## Creates:
+  ##   - sys.databases: "default" database entry
+  ##   - sys.nodes: one entry per founding cluster member
+  var pairs: seq[tuple[key, value: string]] = @[]
+
+  # Default database
+  let dbKey = encodeTableKey(SYS_DATABASES_TABLE_ID, "default")
+  let dbVal = $(%*{
+    "id": 1,
+    "name": "default",
+    "owner": "system",
+    "createdAt": $getTime().toUnix()
+  })
+  pairs.add((key: dbKey, value: dbVal))
+
+  # Node entries
+  for cfg in nodeConfigs:
+    let nodeKey = encodeTableKey(SYS_NODES_TABLE_ID, $cfg.serverId)
+    let nodeVal = $(%*{
+      "nodeId": cfg.serverId,
+      "host": cfg.host,
+      "basePort": cfg.basePort,
+      "dataDir": cfg.dataDir,
+      "status": "active",
+      "joinedAt": $getTime().toUnix()
+    })
+    pairs.add((key: nodeKey, value: nodeVal))
+
+  result = pairs

@@ -348,6 +348,11 @@ proc `$`*(desc: RangeDescriptor): string =
     "replicas=" & $desc.replicas.len & ", " &
     "gen=" & $desc.generation & ")"
 
+proc isMetaRange*(desc: RangeDescriptor): bool =
+  ## Check whether this RangeDescriptor covers the meta range (Range 1).
+  ## The meta range stores system catalog tables and is replicated on all nodes.
+  desc.rangeId == RangeID(1)
+
 # ============================================================================
 # Key encoding utilities
 # ============================================================================
