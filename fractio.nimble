@@ -5,8 +5,8 @@ description   = "A distributed SQL database with sharding and replication"
 license       = "MIT"
 
 # Dependencies
-requires "nim >= 1.6.0"
-requires "mummy >= 0.4.6"
+requires "nim >= 2.0.0"
+requires "happyx >= 3.0.0"
 
 # Source directory
 srcDir = "src"
