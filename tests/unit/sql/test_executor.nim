@@ -1,0 +1,469 @@
+# Tests for the SQL Executor
+#
+# Integration-style tests: parse SQL → plan → execute → verify KV state.
+# Uses a real single-node RaftKVStoreExt.
+
+import std/[unittest, options, json, os, strutils]
+import fractio/sql/parser
+import fractio/sql/ast
+import fractio/sql/planner
+import fractio/sql/executor
+import fractio/distributed/meta/system_tables
+import fractio/protocol/raft_store
+import fractio/distributed/raft/multigroup_coordinator
+import fractio/distributed/raft/multigroup_types
+import fractio/distributed/range/types as rangeTypes
+
+# ---------------------------------------------------------------------------
+# Test helper: create a single-node RaftKVStoreExt
+# ---------------------------------------------------------------------------
+
+proc createTestStore(testDir: string): RaftKVStoreExt =
+  createDir(testDir)
+  let nodeId = RangeNodeID(1)
+  let coord = newMultiRaftCoordinator(CoordinatorConfig(
+    nodeId: nodeId,
+    numWorkers: 1,
+    electionTimeoutNs: 5_000_000_000'i64,
+    heartbeatIntervalNs: 1_000_000_000'i64,
+    storagePath: testDir,
+    proposeTimeoutMs: 5000,
+  ))
+
+  let rangeId = RangeID(1'u64)
+  var desc = newRangeDescriptor(rangeId, @[], @[])
+  let myReplica = desc.addReplica(nodeId, rtVoter)
+  let group = coord.createGroup(desc, myReplica.replicaId)
+  group.becomeLeader()
+  coord.start()
+
+  result = newRaftKVStoreExt(coord)
+  bootstrapSingleShardExt(result, rangeId)
+
+proc cleanupTestDir(testDir: string) =
+  if dirExists(testDir):
+    removeDir(testDir)
+
+# ---------------------------------------------------------------------------
+# Helper: execute SQL and return result
+# ---------------------------------------------------------------------------
+
+proc exec(store: RaftKVStoreExt, sql: string,
+    database = "default", schema = "public"): ExecResult =
+  executeSQL(sql, store, database, schema)
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+suite "SQL Executor — DDL":
+  var store: RaftKVStoreExt
+  let testDir = "/tmp/fractio_test_executor_ddl_" & $getCurrentProcessId()
+
+  setup:
+    cleanupTestDir(testDir)
+    store = createTestStore(testDir)
+
+  teardown:
+    store.coordinator.stop()
+    cleanupTestDir(testDir)
+
+  test "CREATE DATABASE":
+    let res = exec(store, "CREATE DATABASE testdb")
+    check res.kind == erkOk
+    check res.okMessage == "CREATE DATABASE"
+
+    # Verify in catalog
+    let key = encodeTableKey(SYS_DATABASES_TABLE_ID, "testdb")
+    let got = store.raftGet(key)
+    check got.isOk
+    check got.value.isSome
+
+  test "CREATE DATABASE duplicate error":
+    discard exec(store, "CREATE DATABASE testdb")
+    let res = exec(store, "CREATE DATABASE testdb")
+    check res.kind == erkError
+    check "already exists" in res.error
+
+  test "CREATE DATABASE IF NOT EXISTS":
+    discard exec(store, "CREATE DATABASE testdb")
+    let res = exec(store, "CREATE DATABASE IF NOT EXISTS testdb")
+    check res.kind == erkOk
+
+  test "DROP DATABASE":
+    discard exec(store, "CREATE DATABASE testdb")
+    let res = exec(store, "DROP DATABASE testdb")
+    check res.kind == erkOk
+    # Verify removed
+    let key = encodeTableKey(SYS_DATABASES_TABLE_ID, "testdb")
+    let got = store.raftGet(key)
+    check got.isOk
+    check got.value.isNone
+
+  test "DROP DATABASE non-existent error":
+    let res = exec(store, "DROP DATABASE nope")
+    check res.kind == erkError
+
+  test "DROP DATABASE IF EXISTS":
+    let res = exec(store, "DROP DATABASE IF EXISTS nope")
+    check res.kind == erkOk
+
+  test "CREATE SCHEMA":
+    let res = exec(store, "CREATE SCHEMA myschema", database = "testdb")
+    check res.kind == erkOk
+
+  test "DROP SCHEMA":
+    discard exec(store, "CREATE SCHEMA myschema", database = "testdb")
+    let res = exec(store, "DROP SCHEMA myschema", database = "testdb")
+    check res.kind == erkOk
+
+  test "CREATE TABLE":
+    let res = exec(store,
+        "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT)")
+    check res.kind == erkOk
+    check res.okMessage == "CREATE TABLE"
+
+    # Verify catalog entry
+    let key = encodeTableKey(SYS_TABLES_TABLE_ID,
+        "default.public.users")
+    let got = store.raftGet(key)
+    check got.isOk
+    check got.value.isSome
+    let j = parseJson(got.value.get().value)
+    check j["name"].getStr == "users"
+    check j["columns"].len == 3
+
+  test "CREATE TABLE IF NOT EXISTS":
+    discard exec(store,
+        "CREATE TABLE users (id INT PRIMARY KEY)")
+    let res = exec(store,
+        "CREATE TABLE IF NOT EXISTS users (id INT PRIMARY KEY)")
+    check res.kind == erkOk
+
+  test "CREATE TABLE duplicate error":
+    discard exec(store,
+        "CREATE TABLE users (id INT PRIMARY KEY)")
+    let res = exec(store,
+        "CREATE TABLE users (id INT PRIMARY KEY)")
+    check res.kind == erkError
+    check "already exists" in res.error
+
+  test "DROP TABLE":
+    discard exec(store,
+        "CREATE TABLE users (id INT PRIMARY KEY)")
+    let res = exec(store, "DROP TABLE users")
+    check res.kind == erkOk
+
+  test "DROP TABLE IF EXISTS":
+    let res = exec(store, "DROP TABLE IF EXISTS nope")
+    check res.kind == erkOk
+
+
+suite "SQL Executor — DML":
+  var store: RaftKVStoreExt
+  let testDir = "/tmp/fractio_test_executor_dml_" & $getCurrentProcessId()
+
+  setup:
+    cleanupTestDir(testDir)
+    store = createTestStore(testDir)
+    # Create a test table
+    discard exec(store,
+        "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT)")
+
+  teardown:
+    store.coordinator.stop()
+    cleanupTestDir(testDir)
+
+  test "INSERT single row":
+    let res = exec(store,
+        "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)")
+    check res.kind == erkModified
+    check res.count == 1
+
+    # Verify data row exists
+    let key = encodeDataRowKey(100, "1")
+    let got = store.raftGet(key)
+    check got.isOk
+    check got.value.isSome
+    let row = parseJson(got.value.get().value)
+    check row["name"].getStr == "Alice"
+    check row["age"].getInt == 30
+
+  test "INSERT multiple rows":
+    let res = exec(store,
+        "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30), (2, 'Bob', 25)")
+    check res.kind == erkModified
+    check res.count == 2
+
+  test "INSERT into non-existent table":
+    let res = exec(store,
+        "INSERT INTO nonexistent (id) VALUES (1)")
+    check res.kind == erkError
+    check "not found" in res.error
+
+  test "SELECT all rows":
+    discard exec(store,
+        "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)")
+    discard exec(store,
+        "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)")
+
+    let res = exec(store, "SELECT * FROM users")
+    check res.kind == erkRows
+    check res.columns == @["id", "name", "age"]
+    check res.rows.len == 2
+
+  test "SELECT with point get":
+    discard exec(store,
+        "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)")
+    discard exec(store,
+        "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)")
+
+    let res = exec(store, "SELECT * FROM users WHERE id = 1")
+    check res.kind == erkRows
+    check res.rows.len == 1
+    check res.rows[0][1] == "Alice"  # name column
+
+  test "SELECT with filter":
+    discard exec(store,
+        "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)")
+    discard exec(store,
+        "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)")
+    discard exec(store,
+        "INSERT INTO users (id, name, age) VALUES (3, 'Carol', 35)")
+
+    let res = exec(store, "SELECT * FROM users WHERE age > 28")
+    check res.kind == erkRows
+    check res.rows.len == 2  # Alice (30) and Carol (35)
+
+  test "SELECT with LIMIT":
+    discard exec(store,
+        "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)")
+    discard exec(store,
+        "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)")
+    discard exec(store,
+        "INSERT INTO users (id, name, age) VALUES (3, 'Carol', 35)")
+
+    let res = exec(store, "SELECT * FROM users LIMIT 2")
+    check res.kind == erkRows
+    check res.rows.len == 2
+
+  test "SELECT specific columns":
+    discard exec(store,
+        "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)")
+
+    let res = exec(store, "SELECT name, age FROM users")
+    check res.kind == erkRows
+    check res.columns == @["name", "age"]
+    check res.rows.len == 1
+    check res.rows[0][0] == "Alice"
+    check res.rows[0][1] == "30"
+
+  test "SELECT from empty table":
+    let res = exec(store, "SELECT * FROM users")
+    check res.kind == erkRows
+    check res.rows.len == 0
+
+  test "SELECT from non-existent table":
+    let res = exec(store, "SELECT * FROM nonexistent")
+    check res.kind == erkError
+    check "not found" in res.error
+
+  test "UPDATE rows":
+    discard exec(store,
+        "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)")
+    discard exec(store,
+        "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)")
+
+    let res = exec(store, "UPDATE users SET age = 31 WHERE id = 1")
+    check res.kind == erkModified
+    check res.count == 1
+
+    # Verify the update
+    let sel = exec(store, "SELECT * FROM users WHERE id = 1")
+    check sel.kind == erkRows
+    check sel.rows[0][2] == "31"  # age column
+
+  test "UPDATE all rows (no WHERE)":
+    discard exec(store,
+        "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)")
+    discard exec(store,
+        "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)")
+
+    let res = exec(store, "UPDATE users SET name = 'Unknown'")
+    check res.kind == erkModified
+    check res.count == 2
+
+  test "DELETE rows":
+    discard exec(store,
+        "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)")
+    discard exec(store,
+        "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)")
+
+    let res = exec(store, "DELETE FROM users WHERE id = 1")
+    check res.kind == erkModified
+    check res.count == 1
+
+    # Verify deletion
+    let sel = exec(store, "SELECT * FROM users")
+    check sel.kind == erkRows
+    check sel.rows.len == 1
+
+  test "DELETE all rows (no WHERE)":
+    discard exec(store,
+        "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)")
+    discard exec(store,
+        "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)")
+
+    let res = exec(store, "DELETE FROM users")
+    check res.kind == erkModified
+    check res.count == 2
+
+    let sel = exec(store, "SELECT * FROM users")
+    check sel.rows.len == 0
+
+
+suite "SQL Executor — Transactions":
+  var store: RaftKVStoreExt
+  let testDir = "/tmp/fractio_test_executor_txn_" & $getCurrentProcessId()
+
+  setup:
+    cleanupTestDir(testDir)
+    store = createTestStore(testDir)
+
+  teardown:
+    store.coordinator.stop()
+    cleanupTestDir(testDir)
+
+  test "BEGIN returns OK":
+    let res = exec(store, "BEGIN")
+    check res.kind == erkOk
+    check res.okMessage == "BEGIN"
+
+  test "COMMIT returns OK":
+    let res = exec(store, "COMMIT")
+    check res.kind == erkOk
+    check res.okMessage == "COMMIT"
+
+  test "ROLLBACK returns OK":
+    let res = exec(store, "ROLLBACK")
+    check res.kind == erkOk
+    check res.okMessage == "ROLLBACK"
+
+
+suite "SQL Executor — Full round-trip":
+  var store: RaftKVStoreExt
+  let testDir = "/tmp/fractio_test_executor_roundtrip_" & $getCurrentProcessId()
+
+  setup:
+    cleanupTestDir(testDir)
+    store = createTestStore(testDir)
+
+  teardown:
+    store.coordinator.stop()
+    cleanupTestDir(testDir)
+
+  test "full DDL + DML round-trip":
+    # Create database
+    var res = exec(store, "CREATE DATABASE myapp")
+    check res.kind == erkOk
+
+    # Create schema
+    res = exec(store, "CREATE SCHEMA api", database = "myapp")
+    check res.kind == erkOk
+
+    # Create table
+    res = exec(store,
+        "CREATE TABLE products (id INT PRIMARY KEY, name TEXT, price INT)",
+        database = "myapp", schema = "api")
+    check res.kind == erkOk
+
+    # Insert rows
+    res = exec(store,
+        "INSERT INTO products (id, name, price) VALUES (1, 'Widget', 999), (2, 'Gadget', 1999)",
+        database = "myapp", schema = "api")
+    check res.kind == erkModified
+    check res.count == 2
+
+    # Select all
+    res = exec(store, "SELECT * FROM products",
+        database = "myapp", schema = "api")
+    check res.kind == erkRows
+    check res.rows.len == 2
+
+    # Update one
+    res = exec(store, "UPDATE products SET price = 1099 WHERE id = 1",
+        database = "myapp", schema = "api")
+    check res.kind == erkModified
+    check res.count == 1
+
+    # Verify update
+    res = exec(store, "SELECT * FROM products WHERE id = 1",
+        database = "myapp", schema = "api")
+    check res.kind == erkRows
+    check res.rows.len == 1
+    check res.rows[0][2] == "1099"
+
+    # Delete one
+    res = exec(store, "DELETE FROM products WHERE id = 2",
+        database = "myapp", schema = "api")
+    check res.kind == erkModified
+    check res.count == 1
+
+    # Verify only one remains
+    res = exec(store, "SELECT * FROM products",
+        database = "myapp", schema = "api")
+    check res.kind == erkRows
+    check res.rows.len == 1
+
+    # Drop table
+    res = exec(store, "DROP TABLE products",
+        database = "myapp", schema = "api")
+    check res.kind == erkOk
+
+    # Drop schema
+    res = exec(store, "DROP SCHEMA api", database = "myapp")
+    check res.kind == erkOk
+
+    # Drop database
+    res = exec(store, "DROP DATABASE myapp")
+    check res.kind == erkOk
+
+
+suite "SQL Executor — Expression evaluation":
+  var store: RaftKVStoreExt
+  let testDir = "/tmp/fractio_test_executor_expr_" & $getCurrentProcessId()
+
+  setup:
+    cleanupTestDir(testDir)
+    store = createTestStore(testDir)
+    discard exec(store,
+        "CREATE TABLE items (id INT PRIMARY KEY, name TEXT, qty INT, active BOOL)")
+    discard exec(store,
+        "INSERT INTO items (id, name, qty, active) VALUES (1, 'apple', 10, true)")
+    discard exec(store,
+        "INSERT INTO items (id, name, qty, active) VALUES (2, 'banana', 0, false)")
+    discard exec(store,
+        "INSERT INTO items (id, name, qty, active) VALUES (3, 'cherry', 5, true)")
+
+  teardown:
+    store.coordinator.stop()
+    cleanupTestDir(testDir)
+
+  test "WHERE with AND":
+    let res = exec(store,
+        "SELECT * FROM items WHERE qty > 0 AND active = true")
+    check res.kind == erkRows
+    check res.rows.len == 2  # apple and cherry
+
+  test "WHERE with OR":
+    let res = exec(store,
+        "SELECT * FROM items WHERE qty = 0 OR qty = 10")
+    check res.kind == erkRows
+    check res.rows.len == 2  # apple and banana
+
+  test "WHERE with comparison operators":
+    var res = exec(store, "SELECT * FROM items WHERE qty >= 5")
+    check res.rows.len == 2  # apple (10) and cherry (5)
+
+    res = exec(store, "SELECT * FROM items WHERE qty <= 5")
+    check res.rows.len == 2  # banana (0) and cherry (5)

@@ -1,0 +1,521 @@
+# SQL Planner for Fractio
+#
+# Translates a Stmt AST into a Plan — a sequence of KV operations.
+# The planner resolves table names to table IDs via catalog lookups
+# and generates the appropriate key encodings for reads/writes.
+
+import std/[options, json, strutils, strformat]
+import ./ast
+import ../distributed/meta/system_tables
+import ../protocol/raft_store
+import ../core/types as coreTypes
+
+# ---------------------------------------------------------------------------
+# Plan types
+# ---------------------------------------------------------------------------
+
+type
+  PlanOpKind* = enum
+    poCreateDatabase
+    poDropDatabase
+    poCreateSchema
+    poDropSchema
+    poCreateTable
+    poDropTable
+    poInsert
+    poPointGet
+    poScan
+    poUpdate
+    poDelete
+    poBeginTxn
+    poCommitTxn
+    poRollbackTxn
+
+  PlanOp* = ref object
+    case kind*: PlanOpKind
+    of poCreateDatabase:
+      cdbName*: string
+      cdbIfNotExists*: bool
+      cdbReplicas*: Option[int]
+      cdbValue*: string  # JSON value to store
+
+    of poDropDatabase:
+      ddbName*: string
+      ddbIfExists*: bool
+
+    of poCreateSchema:
+      csName*: string
+      csIfNotExists*: bool
+      csReplicas*: Option[int]
+      csValue*: string
+      csDatabase*: string  # owning database
+
+    of poDropSchema:
+      dsName*: string
+      dsIfExists*: bool
+      dsDatabase*: string
+
+    of poCreateTable:
+      ctName*: string
+      ctIfNotExists*: bool
+      ctValue*: string  # JSON table descriptor
+      ctSchema*: string
+      ctDatabase*: string
+
+    of poDropTable:
+      dtName*: string
+      dtIfExists*: bool
+      dtSchema*: string
+      dtDatabase*: string
+
+    of poInsert:
+      insTableId*: uint32
+      insTableName*: string
+      insColumns*: seq[string]   # column names in order
+      insPkColumn*: string       # primary key column name
+      insRows*: seq[string]      # JSON-encoded row objects
+
+    of poPointGet:
+      pgTableId*: uint32
+      pgKey*: string             # primary key value
+      pgColumns*: seq[string]    # columns to return (empty = all)
+      pgAllColumns*: seq[string] # all table columns for decoding
+
+    of poScan:
+      scTableId*: uint32
+      scStartKey*: string
+      scEndKey*: string
+      scLimit*: uint32
+      scFilter*: Option[Expr]
+      scColumns*: seq[string]    # columns to return (empty = all)
+      scAllColumns*: seq[string] # all table columns for decoding
+
+    of poUpdate:
+      upTableId*: uint32
+      upTableName*: string
+      upFilter*: Option[Expr]
+      upSets*: seq[tuple[col: string, val: Expr]]
+      upAllColumns*: seq[string]
+      upPkColumn*: string
+
+    of poDelete:
+      delTableId*: uint32
+      delTableName*: string
+      delFilter*: Option[Expr]
+      delAllColumns*: seq[string]
+      delPkColumn*: string
+
+    of poBeginTxn:
+      btReadOnly*: bool
+
+    of poCommitTxn:
+      discard
+
+    of poRollbackTxn:
+      discard
+
+  Plan* = ref object
+    ops*: seq[PlanOp]
+
+# ---------------------------------------------------------------------------
+# Plan construction helpers
+# ---------------------------------------------------------------------------
+
+proc newPlan*(): Plan =
+  Plan(ops: @[])
+
+proc add*(p: Plan, op: PlanOp) =
+  p.ops.add(op)
+
+# ---------------------------------------------------------------------------
+# Planner errors
+# ---------------------------------------------------------------------------
+
+type
+  PlanError* = object of CatchableError
+
+proc planError(msg: string): ref PlanError =
+  newException(PlanError, msg)
+
+# ---------------------------------------------------------------------------
+# Table descriptor helpers
+# ---------------------------------------------------------------------------
+
+type
+  TableDescriptor* = object
+    tableId*: uint32
+    name*: string
+    schema*: string
+    database*: string
+    columns*: seq[ColDef]
+    primaryKey*: seq[string]
+
+proc findPkColumn*(desc: TableDescriptor): string =
+  ## Find the primary key column name. Returns the first PK column or
+  ## the first column from the table-level PK constraint.
+  if desc.primaryKey.len > 0:
+    return desc.primaryKey[0]
+  for col in desc.columns:
+    if col.primaryKey:
+      return col.name
+  if desc.columns.len > 0:
+    return desc.columns[0].name
+  ""
+
+proc columnNames*(desc: TableDescriptor): seq[string] =
+  for col in desc.columns:
+    result.add(col.name)
+
+# ---------------------------------------------------------------------------
+# Catalog lookups
+# ---------------------------------------------------------------------------
+
+proc resolveTable*(store: RaftKVStoreExt, database, schema,
+    tableName: string): Option[TableDescriptor] =
+  ## Look up a table descriptor from the system catalog.
+  ## Key format: /t/<SYS_TABLES_TABLE_ID>/<database>.<schema>.<tableName>
+  let catalogKey = encodeTableKey(SYS_TABLES_TABLE_ID,
+      database & "." & schema & "." & tableName)
+  let res = store.raftGet(catalogKey)
+  if not res.isOk:
+    return none(TableDescriptor)
+  let entryOpt = res.value
+  if entryOpt.isNone:
+    return none(TableDescriptor)
+
+  try:
+    let j = parseJson(entryOpt.get().value)
+    var desc = TableDescriptor(
+      tableId: uint32(j["tableId"].getInt()),
+      name: j["name"].getStr(),
+      schema: j.getOrDefault("schema").getStr(""),
+      database: j.getOrDefault("database").getStr(""),
+    )
+    if j.hasKey("primaryKey"):
+      for pk in j["primaryKey"]:
+        desc.primaryKey.add(pk.getStr())
+    if j.hasKey("columns"):
+      for c in j["columns"]:
+        var cd = ColDef(name: c["name"].getStr())
+        let dt = c.getOrDefault("type").getStr("TEXT")
+        case dt.toUpperAscii
+        of "INT", "INTEGER": cd.dataType = dtInt
+        of "FLOAT", "REAL", "DOUBLE": cd.dataType = dtFloat
+        of "BOOL", "BOOLEAN": cd.dataType = dtBool
+        of "DATE": cd.dataType = dtDate
+        of "DATETIME", "TIMESTAMP": cd.dataType = dtDateTime
+        of "BYTES", "BLOB": cd.dataType = dtBytes
+        else: cd.dataType = dtString
+        cd.primaryKey = c.getOrDefault("primaryKey").getBool(false)
+        cd.notNull = c.getOrDefault("notNull").getBool(false)
+        desc.columns.add(cd)
+    some(desc)
+  except JsonParsingError:
+    none(TableDescriptor)
+
+proc nextTableId*(store: RaftKVStoreExt): uint32 =
+  ## Allocate the next available user table ID by scanning existing tables.
+  let startKey = encodeTableKey(SYS_TABLES_TABLE_ID, "")
+  let endKey = encodeTableKey(SYS_TABLES_TABLE_ID + 1, "")
+  let res = store.raftScan(startKey, endKey, 0, includeSystemKeys = true)
+  var maxId = FIRST_USER_TABLE_ID - 1
+  if res.isOk:
+    for (key, entry) in res.value:
+      try:
+        let j = parseJson(entry.value)
+        let tid = uint32(j["tableId"].getInt())
+        if tid >= FIRST_USER_TABLE_ID and tid > maxId:
+          maxId = tid
+      except JsonParsingError:
+        discard
+  maxId + 1
+
+# ---------------------------------------------------------------------------
+# Serialization helpers
+# ---------------------------------------------------------------------------
+
+proc dataTypeToString*(dt: DataType): string =
+  case dt
+  of dtInt: "INT"
+  of dtFloat: "FLOAT"
+  of dtString: "TEXT"
+  of dtBool: "BOOL"
+  of dtDate: "DATE"
+  of dtDateTime: "DATETIME"
+  of dtBytes: "BYTES"
+
+proc exprToJsonValue*(e: Expr): JsonNode =
+  ## Convert a literal expression to a JSON value.
+  if e.kind != exLiteral:
+    return newJNull()
+  if e.litValue == nil:
+    return newJNull()
+  case e.litValue.kind
+  of dtInt: newJInt(e.litValue.intValue)
+  of dtFloat: newJFloat(e.litValue.floatValue)
+  of dtString: newJString(e.litValue.strValue)
+  of dtBool: newJBool(e.litValue.boolValue)
+  else: newJNull()
+
+# ---------------------------------------------------------------------------
+# Statement planners
+# ---------------------------------------------------------------------------
+
+proc planCreateDatabase(stmt: Stmt): Plan =
+  let plan = newPlan()
+  let value = %*{
+    "name": stmt.cdbName,
+    "replicas": if stmt.cdbReplicas.isSome: %stmt.cdbReplicas.get else: newJNull(),
+  }
+  plan.add(PlanOp(kind: poCreateDatabase,
+    cdbName: stmt.cdbName,
+    cdbIfNotExists: stmt.cdbIfNotExists,
+    cdbReplicas: stmt.cdbReplicas,
+    cdbValue: $value,
+  ))
+  plan
+
+proc planDropDatabase(stmt: Stmt): Plan =
+  let plan = newPlan()
+  plan.add(PlanOp(kind: poDropDatabase,
+    ddbName: stmt.ddbName,
+    ddbIfExists: stmt.ddbIfExists,
+  ))
+  plan
+
+proc planCreateSchema(stmt: Stmt, database: string): Plan =
+  let plan = newPlan()
+  let value = %*{
+    "name": stmt.csName,
+    "database": database,
+    "replicas": if stmt.csReplicas.isSome: %stmt.csReplicas.get else: newJNull(),
+  }
+  plan.add(PlanOp(kind: poCreateSchema,
+    csName: stmt.csName,
+    csIfNotExists: stmt.csIfNotExists,
+    csReplicas: stmt.csReplicas,
+    csValue: $value,
+    csDatabase: database,
+  ))
+  plan
+
+proc planDropSchema(stmt: Stmt, database: string): Plan =
+  let plan = newPlan()
+  plan.add(PlanOp(kind: poDropSchema,
+    dsName: stmt.dsName,
+    dsIfExists: stmt.dsIfExists,
+    dsDatabase: database,
+  ))
+  plan
+
+proc planCreateTable(stmt: Stmt, store: RaftKVStoreExt,
+    database, schema: string): Plan =
+  let plan = newPlan()
+
+  # Build column JSON
+  var colsJson = newJArray()
+  for col in stmt.ctColumns:
+    var c = %*{
+      "name": col.name,
+      "type": dataTypeToString(col.dataType),
+      "notNull": col.notNull,
+      "primaryKey": col.primaryKey,
+      "unique": col.unique,
+    }
+    colsJson.add(c)
+
+  # Determine primary key
+  var pk: seq[string]
+  if stmt.ctPrimaryKey.len > 0:
+    pk = stmt.ctPrimaryKey
+  else:
+    for col in stmt.ctColumns:
+      if col.primaryKey:
+        pk.add(col.name)
+
+  let tableId = nextTableId(store)
+  let value = %*{
+    "tableId": int(tableId),
+    "name": stmt.ctTable,
+    "schema": schema,
+    "database": database,
+    "columns": colsJson,
+    "primaryKey": pk,
+    "replicas": if stmt.ctReplicas.isSome: %stmt.ctReplicas.get else: newJNull(),
+  }
+
+  plan.add(PlanOp(kind: poCreateTable,
+    ctName: stmt.ctTable,
+    ctIfNotExists: stmt.ctIfNotExists,
+    ctValue: $value,
+    ctSchema: schema,
+    ctDatabase: database,
+  ))
+  plan
+
+proc planInsert(stmt: Stmt, store: RaftKVStoreExt,
+    database, schema: string): Plan =
+  let plan = newPlan()
+  let descOpt = resolveTable(store, database, schema, stmt.intoTable)
+  if descOpt.isNone:
+    raise planError(&"table '{stmt.intoTable}' not found")
+  let desc = descOpt.get()
+  let pkCol = findPkColumn(desc)
+  let colNames = if stmt.intoCols.len > 0: stmt.intoCols
+                 else: columnNames(desc)
+
+  var rows: seq[string]
+  for row in stmt.intoValues:
+    var rowObj = newJObject()
+    for i, expr in row:
+      if i < colNames.len:
+        rowObj[colNames[i]] = exprToJsonValue(expr)
+    rows.add($rowObj)
+
+  plan.add(PlanOp(kind: poInsert,
+    insTableId: desc.tableId,
+    insTableName: desc.name,
+    insColumns: colNames,
+    insPkColumn: pkCol,
+    insRows: rows,
+  ))
+  plan
+
+proc planSelect(stmt: Stmt, store: RaftKVStoreExt,
+    database, schema: string): Plan =
+  let plan = newPlan()
+  let descOpt = resolveTable(store, database, schema, stmt.selFrom)
+  if descOpt.isNone:
+    raise planError(&"table '{stmt.selFrom}' not found")
+  let desc = descOpt.get()
+  let allCols = columnNames(desc)
+
+  # Determine requested columns
+  var reqCols: seq[string]
+  if stmt.selCols.len == 1 and stmt.selCols[0].expr.kind == exStar:
+    reqCols = allCols
+  else:
+    for sc in stmt.selCols:
+      if sc.expr.kind == exColumn:
+        reqCols.add(sc.expr.colName)
+      elif sc.alias.len > 0:
+        reqCols.add(sc.alias)
+      else:
+        reqCols.add("?")
+
+  # Check for point get: WHERE pk = literal
+  let pkCol = findPkColumn(desc)
+  if stmt.selWhere.isSome:
+    let w = stmt.selWhere.get()
+    if w.kind == exBinOp and w.binOp == boEq:
+      if w.binLeft.kind == exColumn and w.binLeft.colName == pkCol and
+         w.binRight.kind == exLiteral:
+        var pkVal: string
+        if w.binRight.litValue != nil:
+          case w.binRight.litValue.kind
+          of dtInt: pkVal = $w.binRight.litValue.intValue
+          of dtString: pkVal = w.binRight.litValue.strValue
+          else: pkVal = $w.binRight.litValue.intValue
+        plan.add(PlanOp(kind: poPointGet,
+          pgTableId: desc.tableId,
+          pgKey: pkVal,
+          pgColumns: reqCols,
+          pgAllColumns: allCols,
+        ))
+        return plan
+
+  # Full scan with optional filter
+  let startKey = encodeDataRowKey(desc.tableId, "")
+  let endKey = encodeDataRowKey(desc.tableId + 1, "")
+  var limit: uint32 = 0
+  if stmt.selLimit.isSome:
+    let limExpr = stmt.selLimit.get()
+    if limExpr.kind == exLiteral and limExpr.litValue != nil and
+       limExpr.litValue.kind == dtInt:
+      limit = uint32(limExpr.litValue.intValue)
+
+  plan.add(PlanOp(kind: poScan,
+    scTableId: desc.tableId,
+    scStartKey: startKey,
+    scEndKey: endKey,
+    scLimit: limit,
+    scFilter: stmt.selWhere,
+    scColumns: reqCols,
+    scAllColumns: allCols,
+  ))
+  plan
+
+proc planUpdate(stmt: Stmt, store: RaftKVStoreExt,
+    database, schema: string): Plan =
+  let plan = newPlan()
+  let descOpt = resolveTable(store, database, schema, stmt.updTable)
+  if descOpt.isNone:
+    raise planError(&"table '{stmt.updTable}' not found")
+  let desc = descOpt.get()
+
+  plan.add(PlanOp(kind: poUpdate,
+    upTableId: desc.tableId,
+    upTableName: desc.name,
+    upFilter: stmt.updWhere,
+    upSets: stmt.updSets,
+    upAllColumns: columnNames(desc),
+    upPkColumn: findPkColumn(desc),
+  ))
+  plan
+
+proc planDelete(stmt: Stmt, store: RaftKVStoreExt,
+    database, schema: string): Plan =
+  let plan = newPlan()
+  let descOpt = resolveTable(store, database, schema, stmt.delTable)
+  if descOpt.isNone:
+    raise planError(&"table '{stmt.delTable}' not found")
+  let desc = descOpt.get()
+
+  plan.add(PlanOp(kind: poDelete,
+    delTableId: desc.tableId,
+    delTableName: desc.name,
+    delFilter: stmt.delWhere,
+    delAllColumns: columnNames(desc),
+    delPkColumn: findPkColumn(desc),
+  ))
+  plan
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+proc planStatement*(stmt: Stmt, store: RaftKVStoreExt,
+    database: string = "default",
+    schema: string = "public"): Plan =
+  ## Translate a Stmt AST into a Plan (sequence of KV operations).
+  case stmt.kind
+  of stmtCreateDatabase: planCreateDatabase(stmt)
+  of stmtDropDatabase:   planDropDatabase(stmt)
+  of stmtCreateSchema:   planCreateSchema(stmt, database)
+  of stmtDropSchema:     planDropSchema(stmt, database)
+  of stmtCreateTable:    planCreateTable(stmt, store, database, schema)
+  of stmtDropTable:
+    let plan = newPlan()
+    plan.add(PlanOp(kind: poDropTable,
+      dtName: stmt.dtTable,
+      dtIfExists: stmt.dtIfExists,
+      dtSchema: schema,
+      dtDatabase: database,
+    ))
+    plan
+  of stmtInsert:   planInsert(stmt, store, database, schema)
+  of stmtSelect:   planSelect(stmt, store, database, schema)
+  of stmtUpdate:   planUpdate(stmt, store, database, schema)
+  of stmtDelete:   planDelete(stmt, store, database, schema)
+  of stmtBegin:
+    let plan = newPlan()
+    plan.add(PlanOp(kind: poBeginTxn, btReadOnly: stmt.beginReadOnly))
+    plan
+  of stmtCommit:
+    let plan = newPlan()
+    plan.add(PlanOp(kind: poCommitTxn))
+    plan
+  of stmtRollback:
+    let plan = newPlan()
+    plan.add(PlanOp(kind: poRollbackTxn))
+    plan
