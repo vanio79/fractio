@@ -60,14 +60,16 @@ proc newConnectionPool*(config: NetworkConfig, role: string): ConnectionPool =
   initLock(result.poolLock)
 
 proc close*(pool: ConnectionPool) =
-  ## Close the pool and all connections
+  ## Close the pool — close all sockets but leave ref cleanup to GC.
   withLock pool.poolLock:
     for nodeId, conns in pool.pool:
       for pc in conns:
         pc.conn.close()
         pool.totalClosed += 1
-    pool.pool.clear()
-  deinitLock(pool.poolLock)
+    # Don't clear the table here — under atomicArc, clearing triggers
+    # dealloc of Connection refs which races with other threads that
+    # may still hold refs.  The table is cleaned up when the pool
+    # itself is collected.
 
 # =============================================================================
 # Connection Management
@@ -145,27 +147,23 @@ proc returnConnection*(pool: ConnectionPool, conn: Connection) =
           return
 
 proc removeConnection*(pool: ConnectionPool, conn: Connection) =
-  ## Remove a connection from the pool
-  let key = string(conn.nodeId)
+  ## Mark a connection as closed and unusable within the pool.
+  ## The socket is closed but the PooledConnection entry is NOT removed
+  ## from the pool's deque.  Under --mm:atomicArc, removing/deallocating
+  ## a PooledConnection (and its Connection ref) on a different thread than
+  ## the one that allocated it can SIGSEGV in addToSharedFreeList.  The stale
+  ## entry stays in the deque; getOrCreateConnection skips it (state != csConnected)
+  ## and pruneIdleConnections will clean it up on the allocating thread.
+  conn.close()
 
   withLock pool.poolLock:
+    let key = string(conn.nodeId)
     if key in pool.pool:
-      var conns = pool.pool[key]
-      var newConns = initDeque[PooledConnection]()
-      var found = false
-      for pc in conns:
+      for pc in pool.pool[key]:
         if pc.conn == conn:
-          pc.conn.close()
+          pc.inUse = false
           pool.totalClosed += 1
-          found = true
-        else:
-          newConns.addLast(pc)
-
-      if found:
-        if newConns.len == 0:
-          pool.pool.del(key)
-        else:
-          pool.pool[key] = newConns
+          break
 
 proc getStats*(pool: ConnectionPool): tuple[created: int64, reused: int64,
     closed: int64, active: int] =

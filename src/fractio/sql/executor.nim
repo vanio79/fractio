@@ -10,6 +10,9 @@ import ./planner
 import ../distributed/meta/system_tables
 import ../protocol/raft_store
 import ../core/types as coreTypes
+import ../distributed/raft/multigroup_coordinator
+import ../distributed/raft/group_types as rangeTypes
+import ../distributed/raft/multigroup_types
 
 # ---------------------------------------------------------------------------
 # Result types
@@ -681,14 +684,34 @@ proc execCreateSpace(op: PlanOp, store: RaftKVStoreExt): ExecResult =
     let groupVal = $ %*{
       "groupId": groupId,
       "spaceId": spaceId,
-      "startKey": "",
-      "endKey": "",
       "replicas": replicasJson,
       "preferredLeader": members[0],
     }
     let putRes = store.raftPut(groupKey, groupVal)
     if not putRes.isOk:
       return errorResult(&"failed to create group {groupId}: {putRes.error.msg}")
+
+    # Create actual Raft group in the coordinator
+    let coord = store.coordinator
+    let gid = GroupID(uint64(groupId))
+    if not coord.hasGroup(gid):
+      var desc = rangeTypes.newGroupDescriptor(gid)
+      for m in members:
+        discard desc.addReplica(rangeTypes.NodeID(uint32(m)), rangeTypes.rtVoter)
+      var myReplicaId = rangeTypes.ReplicaID(0)
+      for r in desc.replicas:
+        if r.nodeId == coord.nodeId:
+          myReplicaId = r.replicaId
+          break
+      if myReplicaId != rangeTypes.ReplicaID(0):
+        discard coord.createAndStartGroup(desc, myReplicaId)
+        store.registerGroup(gid)
+        # Single-node: become leader immediately if meta group is leader
+        let metaGroup = coord.getGroup(META_GROUP_ID)
+        if metaGroup.isSome and metaGroup.get().isLeader():
+          let newGroup = coord.getGroup(gid)
+          if newGroup.isSome:
+            newGroup.get().becomeLeader()
 
   # Write space record
   let spaceKey = encodeSpaceKey(spaceId)
@@ -706,6 +729,7 @@ proc execCreateSpace(op: PlanOp, store: RaftKVStoreExt): ExecResult =
 
   # Reload space caches so newly created space is immediately routable
   store.loadSpaces()
+  store.loadGroupMembers()
 
   okResult(&"CREATE SPACE ({groupCount} groups)")
 

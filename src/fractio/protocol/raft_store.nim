@@ -197,6 +197,8 @@ type
     spaces*: Table[int, SpaceInfo]  ## spaceId → SpaceInfo
     tableSpaces*: Table[uint32, int] ## tableId → spaceId
     spacesMu*: Lock
+    peerStores*: Table[uint32, RaftKVStoreExt]  ## nodeId → peer store for forwarding
+    groupMembers*: Table[GroupID, seq[uint32]]   ## groupId → member nodeIds
 
 
 
@@ -209,6 +211,8 @@ proc newRaftKVStoreExt*(coord: MultiRaftCoordinator,
     stateMachines: initTable[GroupID, KVStateMachine](),
     spaces: initTable[int, SpaceInfo](),
     tableSpaces: initTable[uint32, int](),
+    peerStores: initTable[uint32, RaftKVStoreExt](),
+    groupMembers: initTable[GroupID, seq[uint32]](),
   )
   initLock(result.smMu)
   initLock(result.spacesMu)
@@ -237,6 +241,62 @@ proc registerGroup*(store: RaftKVStoreExt,
     groupId: GroupID) {.gcsafe, raises: [].} =
   ## Pre-create a state machine for the given group.
   discard store.getOrCreateSM(groupId)
+
+proc addPeerStore*(store: RaftKVStoreExt, nodeId: uint32,
+    peer: RaftKVStoreExt) {.gcsafe, raises: [].} =
+  ## Register a peer node's store for forwarding writes/reads to groups
+  ## that this node doesn't own.
+  store.peerStores[nodeId] = peer
+
+proc loadGroupMembers*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
+  ## Scan sys.groups and populate the groupMembers table (groupId → member nodeIds).
+  let startKey = "/t/" & align($SYS_GROUPS_TABLE_ID, 10, '0') & "/"
+  let endKey = "/t/" & align($(SYS_GROUPS_TABLE_ID + 1), 10, '0') & "/"
+  let sm = store.getOrCreateSM(META_GROUP_ID)
+  acquire(store.smMu)
+  var entries: seq[(string, string)] = @[]
+  for k, v in sm.kvStore:
+    if k >= startKey and k < endKey:
+      entries.add((k, v))
+  release(store.smMu)
+
+  store.groupMembers.clear()
+  for (k, v) in entries:
+    {.cast(raises: []).}:
+      try:
+        let j = parseJson(v)
+        let gid = GroupID(uint64(j["groupId"].getInt()))
+        var members: seq[uint32] = @[]
+        if j.hasKey("replicas"):
+          for r in j["replicas"]:
+            members.add(uint32(r["nodeId"].getInt()))
+        store.groupMembers[gid] = members
+      except:
+        discard
+
+proc findPeerForGroup(store: RaftKVStoreExt,
+    groupId: GroupID): Option[RaftKVStoreExt] {.gcsafe, raises: [].} =
+  ## Find a peer store that owns the given group.
+  ## Prefers a peer whose coordinator has the group and is leader.
+  if not store.groupMembers.hasKey(groupId):
+    return none(RaftKVStoreExt)
+  let members = store.groupMembers.getOrDefault(groupId)
+  {.cast(raises: []).}:
+    # First pass: find a peer that is the leader for this group
+    for nid in members:
+      if store.peerStores.hasKey(nid):
+        let peer = store.peerStores.getOrDefault(nid)
+        if peer.coordinator.hasGroup(groupId):
+          let g = peer.coordinator.getGroup(groupId)
+          if g.isSome and g.get.isLeader():
+            return some(peer)
+    # Second pass: find any peer that has the group
+    for nid in members:
+      if store.peerStores.hasKey(nid):
+        let peer = store.peerStores.getOrDefault(nid)
+        if peer.coordinator.hasGroup(groupId):
+          return some(peer)
+  none(RaftKVStoreExt)
 
 # ---------------------------------------------------------------------------
 # Internal: propose a WriteBatch and apply to local state machine
@@ -840,15 +900,62 @@ proc getSpaceForTable*(store: RaftKVStoreExt,
 # These bypass resolveGroupId() and route directly to a space's Raft group
 # using hash(primaryKey) mod numGroups.
 
+proc findAllPeersForGroup(store: RaftKVStoreExt,
+    groupId: GroupID): seq[RaftKVStoreExt] {.gcsafe, raises: [].} =
+  ## Return all peer stores that own the given group, leader first.
+  if not store.groupMembers.hasKey(groupId):
+    return @[]
+  let members = store.groupMembers.getOrDefault(groupId)
+  var leader: seq[RaftKVStoreExt] = @[]
+  var others: seq[RaftKVStoreExt] = @[]
+  {.cast(raises: []).}:
+    for nid in members:
+      if store.peerStores.hasKey(nid):
+        let peer = store.peerStores.getOrDefault(nid)
+        if peer.coordinator.hasGroup(groupId):
+          let g = peer.coordinator.getGroup(groupId)
+          if g.isSome and g.get.isLeader():
+            leader.add(peer)
+          else:
+            others.add(peer)
+  leader & others
+
+proc forwardPutToLeader(store: RaftKVStoreExt, rid: GroupID,
+    key, value: string): RSResult[RaftKVEntry] {.gcsafe, raises: [].} =
+  ## Try all peers that own `rid` until one succeeds (leader found).
+  ## Calls proposeWrite directly on the peer (no recursion).
+  let peers = store.findAllPeersForGroup(rid)
+  let batch = newWriteBatch()
+  batch.put(toBytes(key), toBytes(value))
+  for peer in peers:
+    let vr = proposeWrite(peer, rid, batch)
+    if vr.isOk:
+      let ver = peer.nextVersion.fetchAdd(1)
+      let ts = uint64(getTime().toUnixFloat() * 1_000_000_000)
+      return rsOk[RaftKVEntry](RaftKVEntry(value: value, version: ver, timestamp: ts))
+    if vr.error.kind != rseNotLeader:
+      return rsErr[RaftKVEntry](vr.error)
+  if peers.len > 0:
+    return rsErr[RaftKVEntry](newRSE(rseNotLeader,
+        "no leader found for group " & $rid.uint64))
+  rsErr[RaftKVEntry](newRSE(rseGroupNotFound,
+      "no local or peer store for group " & $rid.uint64))
+
 proc raftPutInSpace*(store: RaftKVStoreExt, key, value: string,
     space: SpaceInfo, primaryKey: string): RSResult[RaftKVEntry] {.gcsafe, raises: [].} =
   ## Write `value` under `key` through Raft consensus, routing to the
   ## correct group in the space via hash(primaryKey).
+  ## If the local coordinator doesn't own the target group, or if the local
+  ## node is not the leader, forward to a peer that is.
   let rid = routeToGroup(primaryKey, space.groupIds)
+  if not store.coordinator.hasGroup(rid):
+    return store.forwardPutToLeader(rid, key, value)
   let batch = newWriteBatch()
   batch.put(toBytes(key), toBytes(value))
   let vr = proposeWrite(store, rid, batch)
   if not vr.isOk:
+    if vr.error.kind == rseNotLeader and store.peerStores.len > 0:
+      return store.forwardPutToLeader(rid, key, value)
     return rsErr[RaftKVEntry](vr.error)
   let ver = store.nextVersion.fetchAdd(1)
   let ts = uint64(getTime().toUnixFloat() * 1_000_000_000)
@@ -857,24 +964,90 @@ proc raftPutInSpace*(store: RaftKVStoreExt, key, value: string,
 proc raftGetInSpace*(store: RaftKVStoreExt, key: string,
     space: SpaceInfo, primaryKey: string): RSResult[Option[RaftKVEntry]] {.gcsafe, raises: [].} =
   ## Read the current value for `key` from the space group owning `primaryKey`.
+  ## If the local coordinator doesn't own the target group, forward to a peer
+  ## that does (preferring the leader for read consistency).
   let rid = routeToGroup(primaryKey, space.groupIds)
-  let sm = store.getOrCreateSM(rid)
-  acquire(store.smMu)
-  defer: release(store.smMu)
-  if sm.kvStore.hasKey(key):
-    let v = sm.kvStore.getOrDefault(key)
-    let entry = RaftKVEntry(
-      value: v,
-      version: 1'u64,
-      timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
-    )
-    return rsOk[Option[RaftKVEntry]](some(entry))
-  rsOk[Option[RaftKVEntry]](none(RaftKVEntry))
+  if not store.coordinator.hasGroup(rid):
+    let peerOpt = store.findPeerForGroup(rid)
+    if peerOpt.isSome:
+      return peerOpt.get().raftGetInSpace(key, space, primaryKey)
+    return rsErr[Option[RaftKVEntry]](newRSE(rseGroupNotFound,
+        "no local or peer store for group " & $rid.uint64))
+  # Check if we're the leader for this group
+  var isLocalLeader = false
+  {.cast(raises: []).}:
+    let localGroup = store.coordinator.getGroup(rid)
+    isLocalLeader = localGroup.isSome and localGroup.get.isLeader()
+
+  if isLocalLeader or store.peerStores.len == 0:
+    # We're the leader — read from our local SM
+    let sm = store.getOrCreateSM(rid)
+    acquire(store.smMu)
+    defer: release(store.smMu)
+    if sm.kvStore.hasKey(key):
+      let v = sm.kvStore.getOrDefault(key)
+      let entry = RaftKVEntry(
+        value: v,
+        version: 1'u64,
+        timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
+      )
+      return rsOk[Option[RaftKVEntry]](some(entry))
+    return rsOk[Option[RaftKVEntry]](none(RaftKVEntry))
+  else:
+    # Not the leader — forward to the leader's SM for consistent reads
+    let peerOpt = store.findPeerForGroup(rid)
+    if peerOpt.isSome:
+      return peerOpt.get().raftGetInSpace(key, space, primaryKey)
+    # Fallback: read from local SM even though we're not leader
+    let sm = store.getOrCreateSM(rid)
+    acquire(store.smMu)
+    defer: release(store.smMu)
+    if sm.kvStore.hasKey(key):
+      let v = sm.kvStore.getOrDefault(key)
+      let entry = RaftKVEntry(
+        value: v,
+        version: 1'u64,
+        timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
+      )
+      return rsOk[Option[RaftKVEntry]](some(entry))
+    return rsOk[Option[RaftKVEntry]](none(RaftKVEntry))
+
+proc forwardDeleteToLeader(store: RaftKVStoreExt, rid: GroupID,
+    key: string): RSResult[Option[RaftKVEntry]] {.gcsafe, raises: [].} =
+  ## Try all peers that own `rid` until one succeeds (leader found).
+  let peers = store.findAllPeersForGroup(rid)
+  let batch = newWriteBatch()
+  batch.delete(toBytes(key))
+  for peer in peers:
+    # Capture previous value from peer's SM
+    var prevEntry: Option[RaftKVEntry]
+    let sm = peer.getOrCreateSM(rid)
+    acquire(peer.smMu)
+    if sm.kvStore.hasKey(key):
+      prevEntry = some(RaftKVEntry(
+        value: sm.kvStore.getOrDefault(key),
+        version: 1'u64,
+        timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
+      ))
+    release(peer.smMu)
+    let vr = proposeWrite(peer, rid, batch)
+    if vr.isOk:
+      return rsOk[Option[RaftKVEntry]](prevEntry)
+    if vr.error.kind != rseNotLeader:
+      return rsErr[Option[RaftKVEntry]](vr.error)
+  if peers.len > 0:
+    return rsErr[Option[RaftKVEntry]](newRSE(rseNotLeader,
+        "no leader found for group " & $rid.uint64))
+  rsErr[Option[RaftKVEntry]](newRSE(rseGroupNotFound,
+      "no local or peer store for group " & $rid.uint64))
 
 proc raftDeleteInSpace*(store: RaftKVStoreExt, key: string,
     space: SpaceInfo, primaryKey: string): RSResult[Option[RaftKVEntry]] {.gcsafe, raises: [].} =
   ## Delete `key` through Raft consensus, routing to the correct space group.
+  ## If the local coordinator doesn't own the target group, forward to a peer.
   let rid = routeToGroup(primaryKey, space.groupIds)
+  if not store.coordinator.hasGroup(rid):
+    return store.forwardDeleteToLeader(rid, key)
   # Capture previous value
   var prevEntry: Option[RaftKVEntry]
   let sm = store.getOrCreateSM(rid)
@@ -890,8 +1063,29 @@ proc raftDeleteInSpace*(store: RaftKVStoreExt, key: string,
   batch.delete(toBytes(key))
   let vr = proposeWrite(store, rid, batch)
   if not vr.isOk:
+    if vr.error.kind == rseNotLeader and store.peerStores.len > 0:
+      return store.forwardDeleteToLeader(rid, key)
     return rsErr[Option[RaftKVEntry]](vr.error)
   rsOk[Option[RaftKVEntry]](prevEntry)
+
+proc scanLocalGroup(store: RaftKVStoreExt, rid: GroupID,
+    startKey, endKey: string,
+    includeSystemKeys: bool): seq[(string, RaftKVEntry)] {.gcsafe, raises: [].} =
+  ## Scan a single local group's state machine for matching keys.
+  let sm = store.getOrCreateSM(rid)
+  var pairs: seq[(string, RaftKVEntry)] = @[]
+  acquire(store.smMu)
+  for k, v in sm.kvStore:
+    if isIntentKey(k) or isCoordKey(k): continue
+    if not includeSystemKeys and isSystemKey(k): continue
+    let afterStart = startKey.len == 0 or k >= startKey
+    let beforeEnd = endKey.len == 0 or k < endKey
+    if afterStart and beforeEnd:
+      pairs.add((k, RaftKVEntry(value: v, version: 1'u64,
+          timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000))))
+  release(store.smMu)
+  pairs.sort(proc(a, b: (string, RaftKVEntry)): int = cmp(a[0], b[0]))
+  pairs
 
 proc raftScanSpace*(store: RaftKVStoreExt, startKey, endKey: string,
     space: SpaceInfo, limit: uint32 = 0,
@@ -899,24 +1093,32 @@ proc raftScanSpace*(store: RaftKVStoreExt, startKey, endKey: string,
   ## Fan-out scan across ALL groups in a space, then N-way merge-sort by key.
   ## Each group's matching keys are collected and sorted independently,
   ## then merged to produce a globally sorted result.
+  ## For groups not owned locally, the scan is forwarded to a peer store.
 
   # Phase 1: collect sorted results per group
+  # For each group, scan the leader's SM (preferring local if we're leader).
   var groupResults: seq[seq[(string, RaftKVEntry)]] = @[]
   for rid64 in space.groupIds:
     let rid = GroupID(rid64)
-    let sm = store.getOrCreateSM(rid)
-    var pairs: seq[(string, RaftKVEntry)] = @[]
-    acquire(store.smMu)
-    for k, v in sm.kvStore:
-      if isIntentKey(k) or isCoordKey(k): continue
-      if not includeSystemKeys and isSystemKey(k): continue
-      let afterStart = startKey.len == 0 or k >= startKey
-      let beforeEnd = endKey.len == 0 or k < endKey
-      if afterStart and beforeEnd:
-        pairs.add((k, RaftKVEntry(value: v, version: 1'u64,
-            timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000))))
-    release(store.smMu)
-    pairs.sort(proc(a, b: (string, RaftKVEntry)): int = cmp(a[0], b[0]))
+    # Determine the best store to scan from (leader preferred)
+    var scanStore = store
+    if not store.coordinator.hasGroup(rid):
+      # Group not local — must forward to a peer
+      let peerOpt = store.findPeerForGroup(rid)
+      if peerOpt.isSome:
+        scanStore = peerOpt.get()
+      else:
+        continue  # no store has this group; skip
+    else:
+      # Group is local. Check if we're leader; if not, scan the leader's SM.
+      {.cast(raises: []).}:
+        let localGroup = store.coordinator.getGroup(rid)
+        let isLocalLeader = localGroup.isSome and localGroup.get.isLeader()
+        if not isLocalLeader and store.peerStores.len > 0:
+          let peerOpt = store.findPeerForGroup(rid)
+          if peerOpt.isSome:
+            scanStore = peerOpt.get()
+    let pairs = scanStore.scanLocalGroup(rid, startKey, endKey, includeSystemKeys)
     if pairs.len > 0:
       groupResults.add(pairs)
 

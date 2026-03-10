@@ -1541,10 +1541,9 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
 
   # Become leader only for a truly fresh single-node cluster (no saved peers)
   if peers.len == 0 and startAsLeader and not isRejoining:
-    for groupId in [META_GROUP_ID, DATA_GROUP_START_ID]:
-      let g = coord.getGroup(groupId)
-      if g.isSome:
-        g.get().becomeLeader()
+    withLock coord.groupsLock:
+      for groupId, group in coord.groups:
+        group.becomeLeader()
 
   # KV store
   let store = newRaftKVStoreExt(coord)
@@ -1569,6 +1568,55 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
   # Load space caches from recovered state machine
   store.loadSpaces()
   store.loadTableSpaces()
+  store.loadGroupMembers()
+
+  # Recovery: re-create Raft groups for spaces from sys.groups metadata
+  block spaceGroupRecovery:
+    let grpStart = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
+    let grpEnd = encodeTableKey(SYS_GROUPS_TABLE_ID + 1, "")
+    let grpScan = store.raftScan(grpStart, grpEnd, 0, includeSystemKeys = true)
+    if grpScan.isOk:
+      for (key, entry) in grpScan.value:
+        try:
+          let j = parseJson(entry.value)
+          let gid = GroupID(uint64(j["groupId"].getInt()))
+          if gid == META_GROUP_ID or gid == DATA_GROUP_START_ID: continue
+          if coord.hasGroup(gid): continue
+
+          var desc = rangeTypes.newGroupDescriptor(gid)
+          if j.hasKey("replicas"):
+            for r in j["replicas"]:
+              discard desc.addReplica(
+                rangeTypes.NodeID(uint32(r["nodeId"].getInt())),
+                rangeTypes.rtVoter)
+
+          var myReplicaId = rangeTypes.ReplicaID(0)
+          for r in desc.replicas:
+            if r.nodeId == nodeId:
+              myReplicaId = r.replicaId
+              break
+
+          if myReplicaId != rangeTypes.ReplicaID(0):
+            discard coord.createAndStartGroup(desc, myReplicaId)
+            store.registerGroup(gid)
+            # Replay committed log entries for this space group
+            let groupOpt = coord.getGroup(gid)
+            if groupOpt.isSome:
+              let group = groupOpt.get()
+              let lastApplied = group.lastApplied.load()
+              if lastApplied > 0:
+                echo "replaying " & $lastApplied & " committed log entries for space group " & $gid.uint64 & "..."
+                group.lastApplied.store(0)
+                coord.applyUpTo(gid, group, lastApplied)
+                echo "space group " & $gid.uint64 & " recovery complete (applied up to " & $group.lastApplied.load() & ")"
+              # Single-node: become leader for recovered space groups
+              if peers.len == 0 and startAsLeader and not isRejoining:
+                group.becomeLeader()
+        except:
+          discard
+
+  # Reload group membership cache after space group recovery
+  store.loadGroupMembers()
 
   # Seed system tables: sys.nodes (table 5) and sys.groups (table 4)
   # Only seed when starting as fresh leader (not rejoining and not joining)
@@ -1626,6 +1674,7 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
     # Load space caches after seeding
     store.loadSpaces()
     store.loadTableSpaces()
+    store.loadGroupMembers()
 
   # SharedTimer: enable when we have peers and timer not yet configured
   if peers.len > 0 and server.sharedTimer.isNil:

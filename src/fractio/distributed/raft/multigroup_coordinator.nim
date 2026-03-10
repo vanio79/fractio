@@ -563,6 +563,20 @@ proc createGroup*(c: MultiRaftCoordinator, descriptor: GroupDescriptor,
 
     result = group
 
+proc createAndStartGroup*(c: MultiRaftCoordinator, descriptor: GroupDescriptor,
+    replicaId: ReplicaID): RaftGroup =
+  ## Like createGroup, but also starts the shard worker thread immediately
+  ## if the coordinator is already running (for dynamically created groups
+  ## after start() has been called).
+  result = c.createGroup(descriptor, replicaId)
+  if c.running.load and c.transport == nil:
+    acquire(c.shardWorkersMu)
+    let sw = c.shardWorkers.getOrDefault(descriptor.groupId, nil)
+    if sw != nil and not sw[].running.load:
+      sw[].running.store(true)
+      createThread(sw[].thread, shardWorkerProc, sw)
+    release(c.shardWorkersMu)
+
 proc removeGroup*(c: MultiRaftCoordinator, groupId: GroupID) =
   # Stop and free the per-shard worker for this group (if running).
   acquire(c.shardWorkersMu)

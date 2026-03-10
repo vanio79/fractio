@@ -72,14 +72,19 @@ proc newConnection*(nodeId: NodeID, socket: Socket,
   initLock(result.recvLock)
 
 proc close*(conn: Connection) =
+  ## Close the connection's socket.  The Locks are NOT deinitialized here
+  ## because other threads may still hold a ref to this Connection and
+  ## attempt to acquire/release them.  Under --mm:atomicArc the Lock
+  ## storage lives inside the ref object and is freed when the last ref
+  ## is dropped — deinitLock at that point is unnecessary (the memory
+  ## is returned to the allocator as a whole).
   if conn.state != csClosed:
     conn.state = csClosed
-    try:
-      conn.socket.close()
-    except:
-      discard
-    deinitLock(conn.sendLock)
-    deinitLock(conn.recvLock)
+    if conn.socket != nil:
+      try:
+        conn.socket.close()
+      except:
+        discard
 
 # =============================================================================
 # TCP Transport
@@ -515,8 +520,12 @@ proc stopServer*(t: TCPTransport) =
       deallocShared(thr)
     t.connThreads.setLen(0)
 
-  withLock t.connectionsLock:
-    t.connections.clear()
+  # Note: do NOT call t.connections.clear() here.  Under --mm:atomicArc,
+  # clearing the table deallocates Connection refs.  If a pool thread
+  # obtained a ref via getOrCreateConnection before the pool lock was
+  # acquired and still holds it, the dealloc races in addToSharedFreeList
+  # causing SIGSEGV.  The sockets are already closed above; the table
+  # entries will be cleaned up when the TCPTransport ref is collected.
 
   var fields = tables.initTable[string, string]()
   fields["role"] = t.role
