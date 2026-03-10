@@ -39,6 +39,7 @@ import fractio/protocol/server
 import fractio/protocol/messages/cluster as clusterMsgs
 import fractio/protocol/messages/admin as adminMsgs
 import fractio/web/dashboard
+import fractio/cli/config
 
 const FractioVersion = "0.1.0"
 
@@ -70,17 +71,9 @@ Global options:
   --format FORMAT  Output format: table (default) | json
 
 Commands:
-  start           Start a Fractio node (daemon)
-    --id ID           Node ID (1-65535, required)
-    --host HOST       Bind address (default: 127.0.0.1)
-    --raft-port PORT  Raft RPC port (default: 8300)
-    --client-port PORT  Client listen port (default: 9000)
-    --data-dir DIR    Persistent data directory (required)
-    --web-port PORT   Web dashboard port (0 = disabled)
-    --join HOST:PORT  Peer to register with on startup
-    --peer ID:HOST:RAFT_PORT  Raft cluster peer (repeatable; omit for single-node)
-    --write-buffer-size MB  LevelDB write buffer size in MB (default: 4)
-    --block-cache-size MB   LevelDB block cache size in MB (default: 8)
+  start           Start a Fractio node
+    --config=PATH     Path to fractio.toml config file (required)
+    --join=HOST:PORT  Peer to register with on startup
 
   node ls           List all cluster nodes
   node status [ID]  Show status of all nodes, or detail for one node
@@ -122,46 +115,26 @@ proc healthStatusStr(s: uint8): string =
 # start
 # ---------------------------------------------------------------------------
 
-proc cmdStart(flags: Table[string, string], globalHost: string,
-              peerFlags: seq[string]) =
-  let idStr = flags.getOrDefault("id", "")
-  let host = flags.getOrDefault("host", globalHost)
-  let raftPortStr = flags.getOrDefault("raft-port", "8300")
-  let clientPortStr = flags.getOrDefault("client-port", "9000")
-  let dataDir = flags.getOrDefault("data-dir", "")
-  let webPortStr = flags.getOrDefault("web-port", "0")
+proc cmdStart(flags: Table[string, string]) =
+  let configPath = flags.getOrDefault("config", "")
   let joinPeer = flags.getOrDefault("join", "")
-  let writeBufferMBStr = flags.getOrDefault("write-buffer-size", "4")
-  let blockCacheMBStr = flags.getOrDefault("block-cache-size", "8")
 
-  if idStr == "": die("start requires --id")
-  if dataDir == "": die("start requires --data-dir")
+  if configPath == "": die("start requires --config PATH")
 
-  var nodeId, raftPort, clientPort, webPort, writeBufferMB, blockCacheMB: int
-  try:
-    nodeId = parseInt(idStr)
-    raftPort = parseInt(raftPortStr)
-    clientPort = parseInt(clientPortStr)
-    webPort = parseInt(webPortStr)
-    writeBufferMB = parseInt(writeBufferMBStr)
-    blockCacheMB = parseInt(blockCacheMBStr)
-  except ValueError as e:
-    die("invalid numeric argument: " & e.msg)
+  let conf = loadConfig(configPath)
 
-  if nodeId < 1 or nodeId > 65535: die("--id must be 1..65535")
-
-  try: createDir(dataDir)
+  try: createDir(conf.dataDir)
   except CatchableError as e: die("cannot create data-dir: " & e.msg)
 
   var cfg = defaultServerConfig()
-  cfg.host = host
-  cfg.port = clientPort
-  cfg.serverId = uint16(nodeId)
-  cfg.serverName = "fractio-" & idStr
-  cfg.dataDir = dataDir
-  cfg.webPort = webPort
-  cfg.writeBufferSize = writeBufferMB * 1024 * 1024
-  cfg.blockCacheSize = blockCacheMB * 1024 * 1024
+  cfg.host = conf.host
+  cfg.port = conf.clientPort
+  cfg.serverId = uint16(conf.nodeId)
+  cfg.serverName = "fractio-" & $conf.nodeId
+  cfg.dataDir = conf.dataDir
+  cfg.webPort = conf.webPort
+  cfg.writeBufferSize = conf.writeBufferSizeMB * 1024 * 1024
+  cfg.blockCacheSize = conf.blockCacheSizeMB * 1024 * 1024
   cfg.idleTimeoutSecs = 120
 
   let server = newProtocolServer(cfg)
@@ -169,18 +142,17 @@ proc cmdStart(flags: Table[string, string], globalHost: string,
 
   let isJoining = joinPeer != ""
 
-  if dataDir != "":
-    try:
-      # When joining, start Raft but don't become leader — the existing
-      # cluster leader will replicate its log to us.
-      server.setupRaftNode(raftPort, peerFlags,
-                           startAsLeader = not isJoining)
-    except Exception as e:
-      writeLine(stderr, "warning: raft setup failed: " & e.msg)
+  try:
+    # When joining, start Raft but don't become leader — the existing
+    # cluster leader will replicate its log to us.
+    server.setupRaftNode(conf.raftPort,
+                         startAsLeader = not isJoining)
+  except Exception as e:
+    writeLine(stderr, "warning: raft setup failed: " & e.msg)
 
-  if webPort > 0:
+  if conf.webPort > 0:
     launchWebDashboard(server)
-    echo &"web dashboard: http://{host}:{webPort}"
+    echo &"web dashboard: http://{conf.host}:{conf.webPort}"
 
   if isJoining:
     sleep(200)
@@ -198,11 +170,11 @@ proc cmdStart(flags: Table[string, string], globalHost: string,
     # Send HTTP join request to the existing cluster's web port
     let joinUrl = "http://" & peerHost & ":" & $peerWebPort & "/api/cluster/join"
     let body = $ %* {
-      "nodeId": nodeId,
-      "host": host,
-      "raftPort": raftPort,
-      "clientPort": clientPort,
-      "webPort": webPort,
+      "nodeId": conf.nodeId,
+      "host": conf.host,
+      "raftPort": conf.raftPort,
+      "clientPort": conf.clientPort,
+      "webPort": conf.webPort,
     }
 
     echo &"joining cluster via {joinUrl} ..."
@@ -491,7 +463,6 @@ proc main() =
 
   var positional: seq[string] = @[]
   var flags: Table[string, string] = initTable[string, string]()
-  var peerFlags: seq[string] = @[]
 
   var p = initOptParser(commandLineParams())
   while true:
@@ -519,8 +490,6 @@ proc main() =
       of "h", "help":
         printUsage()
         quit(0)
-      of "peer":
-        peerFlags.add(val)
       else:
         flags[key] = val
     of cmdArgument:
@@ -538,7 +507,7 @@ proc main() =
     echo "fractio " & FractioVersion
     quit(0)
   of "start":
-    cmdStart(flags, globalHost, peerFlags)
+    cmdStart(flags)
     quit(0)
   of "-h", "--help", "help":
     printUsage()

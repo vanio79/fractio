@@ -1,0 +1,11 @@
+[node]
+id = 1
+host = "127.0.0.1"
+raft-port = 7001
+client-port = 9001
+data-dir = "/tmp/fractio-node1"
+web-port = 9876
+
+[storage]
+write-buffer-size-mb = 4
+block-cache-size-mb = 8

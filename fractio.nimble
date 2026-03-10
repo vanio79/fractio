@@ -8,6 +8,7 @@ license       = "MIT"
 requires "nim >= 2.0.0"
 requires "happyx >= 3.0.0"
 requires "zippy >= 0.10.0"
+requires "parsetoml >= 0.7.0"
 
 # Source directory
 srcDir = "src"

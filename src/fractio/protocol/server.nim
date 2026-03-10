@@ -1459,10 +1459,8 @@ proc addPeerToRaft*(server: ProtocolServer, peerNodeId: uint32,
   server.saveClusterState()
 
 proc setupRaftNode*(server: ProtocolServer, raftPort: int,
-                    rawPeers: seq[string],
                     startAsLeader: bool = true) {.raises: [Exception].} =
   ## Wire a real Raft + WiscKey stack into the server.
-  ## rawPeers: each entry "ID:HOST:RAFT_PORT", empty = single-node mode.
   ## startAsLeader: when true and no peers, immediately become leader.
 
   let nodeId = rangeTypes.NodeID(uint32(server.config.serverId))
@@ -1478,18 +1476,7 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
 
   createDir(raftDir)
 
-  # Parse peer strings → PeerAddr
   var peers: seq[PeerAddr] = @[]
-  for raw in rawPeers:
-    let parts = raw.split(':')
-    if parts.len < 3: continue
-    try:
-      peers.add(PeerAddr(
-        nodeId: rangeTypes.NodeID(uint32(parseInt(parts[0]))),
-        host: parts[1],
-        raftPort: parseInt(parts[2]),
-      ))
-    except ValueError: discard
 
   # Check for saved cluster state (from a previous run as part of a cluster).
   # If found and no explicit peers/join, load peers from disk and start as
