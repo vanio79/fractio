@@ -23,6 +23,7 @@ import fractio/distributed/raft/multigroup_coordinator
 import fractio/distributed/raft/multigroup_transport
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/range/types as rangeTypes
+import fractio/distributed/meta/system_tables
 import fractio/protocol/raft_store
 
 # ---------------------------------------------------------------------------
@@ -85,8 +86,7 @@ proc makeNode(nodeNum: int, ## 1, 2, or 3
   discard coord.createGroup(desc, rep.get.replicaId)
 
   let store = newRaftKVStoreExt(coord, proposeTimeoutMs = 6000)
-  store.bootstrapSingleShardExt(rid)
-  store.wireApplyCallback()
+  store.bootstrapStore(@[rid])
 
   NodeSetup(coord: coord, store: store, storagePath: storagePath, rgt: rgt)
 
@@ -110,7 +110,7 @@ proc findLeader(nodes: seq[NodeSetup]): int =
 # ---------------------------------------------------------------------------
 
 proc makeCluster(): (seq[NodeSetup], RangeID, RangeDescriptor) =
-  let rid = RangeID(1)
+  let rid = DATA_RANGE_START_ID
   let desc = newRangeDescriptor(rid, @[], @[])
   # Pre-add all 3 replicas so every node knows the quorum configuration
   discard desc.addReplica(rangeTypes.RangeNodeID(1))

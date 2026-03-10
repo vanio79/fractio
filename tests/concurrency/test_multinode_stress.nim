@@ -24,6 +24,7 @@ import fractio/distributed/raft/multigroup_coordinator
 import fractio/distributed/raft/multigroup_transport
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/range/types as rangeTypes
+import fractio/distributed/meta/system_tables
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -78,8 +79,7 @@ proc makeNode(nodeNum: int, basePort: int,
   discard coord.createGroup(desc, rep.get.replicaId)
 
   let store = newRaftKVStoreExt(coord, proposeTimeoutMs = 30_000)
-  store.bootstrapSingleShardExt(rid)
-  store.wireApplyCallback()
+  store.bootstrapStore(@[rid])
 
   NodeSetup(coord: coord, store: store, storagePath: storagePath, rgt: rgt)
 
@@ -106,7 +106,7 @@ proc electLeader(nodes: seq[NodeSetup], rid: RangeID, leaderIdx: int) =
 
 proc make3NodeCluster(basePort: int): (seq[NodeSetup], RangeID) =
   ## 3 nodes: node 1 & 2 are voters, node 3 is non-voter.
-  let rid = RangeID(1)
+  let rid = DATA_RANGE_START_ID
   let desc = newRangeDescriptor(rid, @[], @[])
   discard desc.addReplica(RangeNodeID(1), rtVoter)
   discard desc.addReplica(RangeNodeID(2), rtVoter)
@@ -122,7 +122,7 @@ proc make3NodeCluster(basePort: int): (seq[NodeSetup], RangeID) =
 proc make5NodeCluster(basePort: int): (seq[NodeSetup], RangeID) =
   ## 5 nodes: nodes 1, 2, 3 are voters, nodes 4, 5 are non-voters.
   ## Uses 2 coordinator workers per node to handle the higher fan-out.
-  let rid = RangeID(1)
+  let rid = DATA_RANGE_START_ID
   let desc = newRangeDescriptor(rid, @[], @[])
   discard desc.addReplica(RangeNodeID(1), rtVoter)
   discard desc.addReplica(RangeNodeID(2), rtVoter)

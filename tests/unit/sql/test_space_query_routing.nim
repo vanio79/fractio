@@ -64,9 +64,7 @@ proc createMultiGroupTestStore(testDir: string, groupCount: int): RaftKVStoreExt
   coord.start()
 
   result = newRaftKVStoreExt(coord, proposeTimeoutMs = 5000)
-  result.addShardExt("", META_RANGE_END_KEY, META_RANGE_ID)
-  result.addShardExt(META_RANGE_END_KEY, "", DATA_RANGE_START_ID)
-  result.wireApplyCallback()
+  result.bootstrapStore(@[META_RANGE_ID, DATA_RANGE_START_ID])
 
   # Pre-create SMs for space groups
   for i in 0 ..< groupCount:

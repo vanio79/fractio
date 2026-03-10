@@ -33,6 +33,7 @@ import fractio/protocol/messages/txn as txnMsgs
 import fractio/distributed/raft/multigroup_coordinator
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/range/types as rangeTypes
+import fractio/distributed/meta/system_tables
 import fractio/distributed/raft/state_machine
 
 # ---------------------------------------------------------------------------
@@ -54,15 +55,15 @@ proc makeStore(storagePath: string): tuple[
     storagePath: storagePath,
   )
   let coord = newMultiRaftCoordinator(cfg)
-  let rid = RangeID(1)
-  let desc = newRangeDescriptor(rid, @[], @[])
-  let rep = desc.addReplica(RangeNodeID(1))
-  let group = coord.createGroup(desc, rep.replicaId)
-  group.becomeLeader()
+  for rid in [META_RANGE_ID, DATA_RANGE_START_ID]:
+    let desc = newRangeDescriptor(rid, @[], @[])
+    let rep = desc.addReplica(RangeNodeID(1))
+    let group = coord.createGroup(desc, rep.replicaId)
+    group.becomeLeader()
   coord.start()
   let store = newRaftKVStoreExt(coord, proposeTimeoutMs = 3000)
-  store.bootstrapSingleShardExt(rid)
-  (coord, store, rid)
+  store.bootstrapStore(@[META_RANGE_ID, DATA_RANGE_START_ID])
+  (coord, store, DATA_RANGE_START_ID)
 
 proc teardownStore(coord: MultiRaftCoordinator, storagePath: string) =
   coord.stop()
@@ -77,14 +78,14 @@ proc makeRaftServer(port: int, storagePath: string): ProtocolServer =
     storagePath: storagePath,
   )
   let coord = newMultiRaftCoordinator(coordCfg)
-  let rid = RangeID(1)
-  let desc = newRangeDescriptor(rid, @[], @[])
-  let rep = desc.addReplica(RangeNodeID(1))
-  let group = coord.createGroup(desc, rep.replicaId)
-  group.becomeLeader()
+  for rid in [META_RANGE_ID, DATA_RANGE_START_ID]:
+    let desc = newRangeDescriptor(rid, @[], @[])
+    let rep = desc.addReplica(RangeNodeID(1))
+    let group = coord.createGroup(desc, rep.replicaId)
+    group.becomeLeader()
   coord.start()
   let raftSt = newRaftKVStoreExt(coord, proposeTimeoutMs = 3000)
-  raftSt.bootstrapSingleShardExt(rid)
+  raftSt.bootstrapStore(@[META_RANGE_ID, DATA_RANGE_START_ID])
   var cfg = defaultServerConfig()
   cfg.host = "127.0.0.1"
   cfg.port = port

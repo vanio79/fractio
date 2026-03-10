@@ -60,9 +60,7 @@ proc makeMultiGroupStore(storagePath: string, groupCount: int): tuple[
 
   let store = newRaftKVStoreExt(coord, proposeTimeoutMs = 2000)
   # Bootstrap meta range for system key routing
-  store.addShardExt("", META_RANGE_END_KEY, META_RANGE_ID)
-  store.addShardExt(META_RANGE_END_KEY, "", RangeID(10))
-  store.wireApplyCallback()
+  store.bootstrapStore(@[META_RANGE_ID, RangeID(10)])
 
   # Pre-create state machines for all space groups
   for rid64 in rangeIds:

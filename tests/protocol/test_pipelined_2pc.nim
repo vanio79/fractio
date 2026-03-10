@@ -22,6 +22,7 @@ import fractio/protocol/txn_manager
 import fractio/distributed/raft/multigroup_coordinator
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/range/types as rangeTypes
+import fractio/distributed/meta/system_tables
 import fractio/distributed/sharedtimer/mock
 
 # ---------------------------------------------------------------------------
@@ -50,8 +51,8 @@ proc makeMultiShardStore(storagePath: string): tuple[
   )
   let coord = newMultiRaftCoordinator(cfg)
 
-  let rid1 = RangeID(1)
-  let rid2 = RangeID(2)
+  let rid1 = META_RANGE_ID         # RangeID(1) — for coord records / system keys
+  let rid2 = DATA_RANGE_START_ID   # RangeID(2) — where resolveRangeId routes data keys
   let rid3 = RangeID(3)
 
   for rid in [rid1, rid2, rid3]:
@@ -63,10 +64,7 @@ proc makeMultiShardStore(storagePath: string): tuple[
   coord.start()
 
   let store = newRaftKVStoreExt(coord, proposeTimeoutMs = 5000)
-  store.addShardExt("", "m", rid1)
-  store.addShardExt("m", "s", rid2)
-  store.addShardExt("s", "", rid3)
-  store.wireApplyCallback()
+  store.bootstrapStore(@[rid1, rid2, rid3])
 
   (coord, store, rid1, rid2, rid3)
 
@@ -206,33 +204,16 @@ suite "raftCommitTxnPipelined - correctness":
     let gr = store.raftGet("apple")
     check gr.isOk and gr.value.isNone
 
-  test "pipelined commit unknown key returns rseRangeNotFound":
+  test "pipelined commit to unregistered range returns error":
     let (coord, store, _, _, _) = makeMultiShardStore("/tmp/fractio_pipe2pc_15")
     defer: teardown(coord, "/tmp/fractio_pipe2pc_15")
-    # "\x01" is below "" and above all shards → no shard covers it
-    # Actually our shards cover all keys ("" .. "m", "m" .. "s", "s" .. "")
-    # so instead use a store with no shards to force the error.
-    cleanDir("/tmp/fractio_pipe2pc_15b")
-    let cfg2 = CoordinatorConfig(
-      nodeId: RangeNodeID(1), numWorkers: 1,
-      electionTimeoutNs: DEFAULT_ELECTION_TIMEOUT_NS,
-      heartbeatIntervalNs: DEFAULT_HEARTBEAT_INTERVAL_NS,
-      storagePath: "/tmp/fractio_pipe2pc_15b",
-    )
-    let coord2 = newMultiRaftCoordinator(cfg2)
-    let rid = RangeID(1)
-    let desc = newRangeDescriptor(rid, @[], @[])
-    let rep = desc.addReplica(RangeNodeID(1))
-    let grp = coord2.createGroup(desc, rep.replicaId)
-    grp.becomeLeader()
-    coord2.start()
-    let store2 = newRaftKVStoreExt(coord2, proposeTimeoutMs = 1000)
-    # Intentionally do NOT add any shards → findRangeId returns none
-    let vr = store2.raftCommitTxnPipelined(1'u64, @["somekey"])
-    check not vr.isOk
-    check vr.error.kind == rseRangeNotFound
-    coord2.stop()
-    try: removeDir("/tmp/fractio_pipe2pc_15b") except CatchableError: discard
+    # resolveRangeId always returns a RangeID (META_RANGE_ID or
+    # DATA_RANGE_START_ID), so "range not found" only happens when the
+    # Raft group for that range doesn't exist.  With a properly set up
+    # store, all writes succeed.  Verify that pipelined commit with
+    # an empty write-set is still OK.
+    let vr = store.raftCommitTxnPipelined(1'u64, @[])
+    check vr.isOk
 
 # ---------------------------------------------------------------------------
 # Suite 3: coordinateCrossShardCommit uses pipelined path

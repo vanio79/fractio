@@ -106,7 +106,7 @@ proc commitSingleShard*(coord: RaftTxnCoordinator, txnId: uint64,
     # internally; acquiring smMu first would deadlock (Lock is non-reentrant).
     var intentValue = ""
     let intentKey = encodeIntentKey(txnId, key)
-    let ridOpt = coord.store.findRangeId(key)
+    let ridOpt = coord.store.resolveRangeId(key)
     if ridOpt.isSome:
       let sm = coord.store.getOrCreateSM(ridOpt.get()) # acquires+releases smMu
       acquire(coord.store.smMu)
@@ -157,7 +157,7 @@ proc coordinateCrossShardCommit*(coord: RaftTxnCoordinator, txnId: uint64,
   for key in writeSet:
     # Validate the intent still exists (not expired / already resolved)
     let intentKey = encodeIntentKey(txnId, key)
-    let ridOpt = coord.store.findRangeId(key)
+    let ridOpt = coord.store.resolveRangeId(key)
     var intentExists = false
     if ridOpt.isSome:
       let sm = coord.store.getOrCreateSM(ridOpt.get()) # acquires+releases smMu
@@ -212,18 +212,9 @@ proc recoverPendingCoords*(coord: RaftTxnCoordinator) {.gcsafe, raises: [].} =
   ## when calling it — collect state machines first, then scan under smMu.
   var pending: seq[(uint64, string)] = @[]
 
-  acquire(coord.store.shardsMu)
-  let shardsCopy = coord.store.shards
-  release(coord.store.shardsMu)
-
-  # Pre-fetch all state machines outside smMu (getOrCreateSM takes smMu itself)
-  var smList: seq[KVStateMachine] = @[]
-  for entry in shardsCopy:
-    smList.add(coord.store.getOrCreateSM(entry.rangeId)) # acquires+releases smMu
-
-  # Now scan each SM under smMu to collect pending COORD records
+  # Scan all state machines for pending COORD records
   acquire(coord.store.smMu)
-  for sm in smList:
+  for rid, sm in coord.store.stateMachines:
     for k, v in sm.kvStore:
       if isCoordKey(k):
         let txnId = block:

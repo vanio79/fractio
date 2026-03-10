@@ -25,6 +25,7 @@ import fractio/protocol/raft_store
 import fractio/distributed/raft/multigroup_coordinator
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/range/types as rangeTypes
+import fractio/distributed/meta/system_tables
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -80,8 +81,8 @@ suite "Phase18 ParallelGcFlush coordinator structure":
     # Phase 18 invariant: shard workers are ALWAYS created (they are the
     # target of gcFlush fast-path), regardless of groupCommitEnabled.
     let c = makeCoord(655, groupCommit = true)
-    discard addLeaderGroup(c, RangeID(1))
-    discard addLeaderGroup(c, RangeID(2))
+    discard addLeaderGroup(c, DATA_RANGE_START_ID)
+    discard addLeaderGroup(c, RangeID(3))
     c.start()
     acquire(c.shardWorkersMu)
     let cnt = c.shardWorkers.len
@@ -91,7 +92,7 @@ suite "Phase18 ParallelGcFlush coordinator structure":
 
   test "batcher allocated and started when group-commit enabled":
     let c = makeCoord(656, groupCommit = true)
-    discard addLeaderGroup(c, RangeID(1))
+    discard addLeaderGroup(c, DATA_RANGE_START_ID)
     c.start()
     check c.groupCommitEnabled
     check c.groupCommitBatcherPtr != nil
@@ -99,7 +100,7 @@ suite "Phase18 ParallelGcFlush coordinator structure":
 
   test "batcher nil after stop() when group-commit enabled":
     let c = makeCoord(657, groupCommit = true)
-    discard addLeaderGroup(c, RangeID(1))
+    discard addLeaderGroup(c, DATA_RANGE_START_ID)
     c.start()
     c.stop()
     check c.groupCommitBatcherPtr == nil
@@ -107,7 +108,7 @@ suite "Phase18 ParallelGcFlush coordinator structure":
 
   test "shard worker table empty after stop() with group-commit":
     let c = makeCoord(658, groupCommit = true)
-    discard addLeaderGroup(c, RangeID(1))
+    discard addLeaderGroup(c, DATA_RANGE_START_ID)
     c.start()
     c.stop()
     acquire(c.shardWorkersMu)
@@ -126,22 +127,20 @@ suite "Phase18 ParallelGcFlush proposeAndWait correctness":
     # proposeAndWait with GC enabled → batcher → gcFlush → shard worker.
     # Verify the write round-trips correctly.
     let c = makeCoord(659, groupCommit = true)
-    discard addLeaderGroup(c, RangeID(1))
+    discard addLeaderGroup(c, DATA_RANGE_START_ID)
     c.start()
     let store = newRaftKVStoreExt(c, proposeTimeoutMs = 5000)
-    store.addShardExt("", "", RangeID(1))
-    store.wireApplyCallback()
+    store.bootstrapStore(@[DATA_RANGE_START_ID])
     check writeKV(store, "gcf_key", "gcf_val")
     check readKV(store, "gcf_key") == "gcf_val"
     teardown(c, 659)
 
   test "multiple sequential writes via gcFlush all committed":
     let c = makeCoord(660, groupCommit = true)
-    discard addLeaderGroup(c, RangeID(1))
+    discard addLeaderGroup(c, DATA_RANGE_START_ID)
     c.start()
     let store = newRaftKVStoreExt(c, proposeTimeoutMs = 5000)
-    store.addShardExt("", "", RangeID(1))
-    store.wireApplyCallback()
+    store.bootstrapStore(@[DATA_RANGE_START_ID])
     for i in 0 ..< 30:
       check writeKV(store, "k" & $i, "v" & $i)
     for i in 0 ..< 30:
@@ -156,11 +155,10 @@ suite "Phase18 ParallelGcFlush proposeAndWait correctness":
       OPS_PER_THREAD = 40
 
     let c = makeCoord(661, groupCommit = true)
-    discard addLeaderGroup(c, RangeID(1))
+    discard addLeaderGroup(c, DATA_RANGE_START_ID)
     c.start()
     let store = newRaftKVStoreExt(c, proposeTimeoutMs = 10000)
-    store.addShardExt("", "", RangeID(1))
-    store.wireApplyCallback()
+    store.bootstrapStore(@[DATA_RANGE_START_ID])
 
     var errors: Atomic[int]
     errors.store(0)
@@ -195,12 +193,12 @@ suite "Phase18 ParallelGcFlush proposeAndWait correctness":
     # When the shard worker is available but the group is not leader,
     # shardWorkerProc returns an error — verify it propagates correctly.
     let c = makeCoord(662, groupCommit = true)
-    let desc = newRangeDescriptor(RangeID(1), @[], @[])
+    let desc = newRangeDescriptor(DATA_RANGE_START_ID, @[], @[])
     let rep = desc.addReplica(RangeNodeID(1))
     discard c.createGroup(desc, rep.replicaId)
     # Do NOT becomeLeader — stays follower
     c.start()
-    let res = c.proposeAndWait(RangeID(1),
+    let res = c.proposeAndWait(DATA_RANGE_START_ID,
       RaftCommand(kind: ckWrite, writeBatch: newWriteBatch()), 1000)
     check not res.success
     check res.error.len > 0
@@ -217,8 +215,8 @@ suite "Phase18 ParallelGcFlush proposeParallel bypass":
     # proposeParallel which must bypass the batcher and go directly to
     # shard workers so both fsyncs run in parallel.
     let c = makeCoord(663, groupCommit = true)
-    discard addLeaderGroup(c, RangeID(1))
-    discard addLeaderGroup(c, RangeID(2))
+    discard addLeaderGroup(c, DATA_RANGE_START_ID)
+    discard addLeaderGroup(c, RangeID(3))
     c.start()
 
     let b1 = newWriteBatch()
@@ -227,9 +225,9 @@ suite "Phase18 ParallelGcFlush proposeParallel bypass":
     b2.put(@[byte 'z'], @[byte '2'])
 
     let results = c.proposeParallel(@[
-      (rangeId: RangeID(1), command: RaftCommand(kind: ckWrite,
+      (rangeId: DATA_RANGE_START_ID, command: RaftCommand(kind: ckWrite,
           writeBatch: b1)),
-      (rangeId: RangeID(2), command: RaftCommand(kind: ckWrite,
+      (rangeId: RangeID(3), command: RaftCommand(kind: ckWrite,
           writeBatch: b2)),
     ], 5000)
 
@@ -240,12 +238,12 @@ suite "Phase18 ParallelGcFlush proposeParallel bypass":
 
   test "proposeParallel with group-commit: 3-shard cross-shard txn succeeds":
     let c = makeCoord(664, groupCommit = true)
-    for i in 1..3:
+    for i in [2, 3, 4]:
       discard addLeaderGroup(c, RangeID(i))
     c.start()
 
     var props: seq[tuple[rangeId: RangeID, command: RaftCommand]] = @[]
-    for i in 1..3:
+    for i in [2, 3, 4]:
       let b = newWriteBatch()
       b.put(@[byte i], @[byte i])
       props.add((RangeID(i), RaftCommand(kind: ckWrite, writeBatch: b)))
@@ -258,7 +256,7 @@ suite "Phase18 ParallelGcFlush proposeParallel bypass":
 
   test "proposeParallel with group-commit: empty input returns empty seq":
     let c = makeCoord(665, groupCommit = true)
-    discard addLeaderGroup(c, RangeID(1))
+    discard addLeaderGroup(c, DATA_RANGE_START_ID)
     c.start()
     let results = c.proposeParallel(@[], 5000)
     check results.len == 0
@@ -266,13 +264,13 @@ suite "Phase18 ParallelGcFlush proposeParallel bypass":
 
   test "proposeParallel with group-commit: single-shard succeeds":
     let c = makeCoord(666, groupCommit = true)
-    discard addLeaderGroup(c, RangeID(1))
+    discard addLeaderGroup(c, DATA_RANGE_START_ID)
     c.start()
 
     let b = newWriteBatch()
     b.put(@[byte 'x'], @[byte '9'])
     let results = c.proposeParallel(@[
-      (rangeId: RangeID(1), command: RaftCommand(kind: ckWrite, writeBatch: b)),
+      (rangeId: DATA_RANGE_START_ID, command: RaftCommand(kind: ckWrite, writeBatch: b)),
     ], 5000)
     check results.len == 1
     check results[0].success
@@ -282,7 +280,7 @@ suite "Phase18 ParallelGcFlush proposeParallel bypass":
     # proposeParallel to a RangeID that has no group registered should
     # return a failure result — not hang or crash.
     let c = makeCoord(667, groupCommit = true)
-    discard addLeaderGroup(c, RangeID(1))
+    discard addLeaderGroup(c, DATA_RANGE_START_ID)
     c.start()
 
     let b = newWriteBatch()
@@ -311,13 +309,11 @@ suite "Phase18 ParallelGcFlush concurrent multi-shard":
       OPS_PER_THREAD = 30
 
     let c = makeCoord(668, groupCommit = true)
-    discard addLeaderGroup(c, RangeID(1))
-    discard addLeaderGroup(c, RangeID(2))
+    discard addLeaderGroup(c, DATA_RANGE_START_ID)
+    discard addLeaderGroup(c, RangeID(3))
     c.start()
     let store = newRaftKVStoreExt(c, proposeTimeoutMs = 10000)
-    store.addShardExt("", "m", RangeID(1))
-    store.addShardExt("m", "", RangeID(2))
-    store.wireApplyCallback()
+    store.bootstrapStore(@[DATA_RANGE_START_ID, RangeID(3)])
 
     var errors: Atomic[int]
     errors.store(0)
@@ -354,8 +350,8 @@ suite "Phase18 ParallelGcFlush concurrent multi-shard":
     # Simulate 10 successive cross-shard transactions each committing in
     # parallel to 2 shards.  All 20 proposals must succeed.
     let c = makeCoord(669, groupCommit = true)
-    discard addLeaderGroup(c, RangeID(1))
-    discard addLeaderGroup(c, RangeID(2))
+    discard addLeaderGroup(c, DATA_RANGE_START_ID)
+    discard addLeaderGroup(c, RangeID(3))
     c.start()
 
     var failures = 0
@@ -365,9 +361,9 @@ suite "Phase18 ParallelGcFlush concurrent multi-shard":
       let b2 = newWriteBatch()
       b2.put(@[byte txn], @[byte 2])
       let results = c.proposeParallel(@[
-        (rangeId: RangeID(1), command: RaftCommand(kind: ckWrite,
+        (rangeId: DATA_RANGE_START_ID, command: RaftCommand(kind: ckWrite,
             writeBatch: b1)),
-        (rangeId: RangeID(2), command: RaftCommand(kind: ckWrite,
+        (rangeId: RangeID(3), command: RaftCommand(kind: ckWrite,
             writeBatch: b2)),
       ], 5000)
       for r in results:
@@ -390,26 +386,23 @@ suite "Phase18 ParallelGcFlush gcFlush fallback":
     # The simplest observable proxy: start() then immediately stop() then
     # verify the batcher cleaned up cleanly (no hang, no crash).
     let c = makeCoord(670, groupCommit = true)
-    discard addLeaderGroup(c, RangeID(1))
+    discard addLeaderGroup(c, DATA_RANGE_START_ID)
     c.start()
     # Write one entry to warm up, then stop — verifies teardown is clean.
     let b = newWriteBatch()
     b.put(@[byte 'x'], @[byte '1'])
-    let res = c.proposeAndWait(RangeID(1),
+    let res = c.proposeAndWait(DATA_RANGE_START_ID,
       RaftCommand(kind: ckWrite, writeBatch: b), 5000)
     check res.success
     teardown(c, 670)
 
   test "group-commit with 3 shards: all writes readable after commit":
     let c = makeCoord(671, groupCommit = true)
-    for i in 1..3:
+    for i in [2, 3, 4]:
       discard addLeaderGroup(c, RangeID(i))
     c.start()
     let store = newRaftKVStoreExt(c, proposeTimeoutMs = 5000)
-    store.addShardExt("", "d", RangeID(1))
-    store.addShardExt("d", "p", RangeID(2))
-    store.addShardExt("p", "", RangeID(3))
-    store.wireApplyCallback()
+    store.bootstrapStore(@[RangeID(2), RangeID(3), RangeID(4)])
     # Write to each shard
     check writeKV(store, "apple", "1") # shard 1
     check writeKV(store, "dog", "2") # shard 2

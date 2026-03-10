@@ -25,6 +25,7 @@ import fractio/protocol/messages/txn as txnMsgs
 import fractio/distributed/raft/multigroup_coordinator
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/range/types as rangeTypes
+import fractio/distributed/meta/system_tables
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -46,14 +47,14 @@ proc makeStressServer(port: int, storagePath: string,
     proposeTimeoutMs: 10_000,
   )
   let coord = newMultiRaftCoordinator(coordCfg)
-  let rid = RangeID(1)
-  let desc = newRangeDescriptor(rid, @[], @[])
-  let rep = desc.addReplica(RangeNodeID(1))
-  let group = coord.createGroup(desc, rep.replicaId)
-  group.becomeLeader()
+  for rid in [META_RANGE_ID, DATA_RANGE_START_ID]:
+    let desc = newRangeDescriptor(rid, @[], @[])
+    let rep = desc.addReplica(RangeNodeID(1))
+    let group = coord.createGroup(desc, rep.replicaId)
+    group.becomeLeader()
   coord.start()
   let raftSt = newRaftKVStoreExt(coord, proposeTimeoutMs = 10_000)
-  raftSt.bootstrapSingleShardExt(rid)
+  raftSt.bootstrapStore(@[META_RANGE_ID, DATA_RANGE_START_ID])
   var cfg = defaultServerConfig()
   cfg.host = "127.0.0.1"
   cfg.port = port

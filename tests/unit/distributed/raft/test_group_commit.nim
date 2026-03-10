@@ -11,6 +11,7 @@ import fractio/distributed/raft/group_commit
 import fractio/distributed/raft/multigroup_coordinator
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/range/types as rangeTypes
+import fractio/distributed/meta/system_tables
 import fractio/protocol/raft_store
 
 # ---------------------------------------------------------------------------
@@ -38,16 +39,15 @@ proc makeStore(storagePath: string,
     groupCommitMaxDelayNs: gcMaxDelayNs,
   )
   let coord = newMultiRaftCoordinator(cfg)
-  let rid = RangeID(1)
-  let desc = newRangeDescriptor(rid, @[], @[])
-  let rep = desc.addReplica(RangeNodeID(1))
-  let group = coord.createGroup(desc, rep.replicaId)
-  group.becomeLeader()
+  for rid in [META_RANGE_ID, DATA_RANGE_START_ID]:
+    let desc = newRangeDescriptor(rid, @[], @[])
+    let rep = desc.addReplica(RangeNodeID(1))
+    let group = coord.createGroup(desc, rep.replicaId)
+    group.becomeLeader()
   let store = newRaftKVStoreExt(coord, proposeTimeoutMs = 2000)
-  store.wireApplyCallback()
   coord.start()
-  store.bootstrapSingleShardExt(rid)
-  (coord, store, rid)
+  store.bootstrapStore(@[META_RANGE_ID, DATA_RANGE_START_ID])
+  (coord, store, DATA_RANGE_START_ID)
 
 proc teardownStore(coord: MultiRaftCoordinator, storagePath: string) =
   coord.stop()

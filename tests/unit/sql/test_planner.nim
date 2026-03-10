@@ -29,15 +29,15 @@ proc createTestStore(testDir: string): RaftKVStoreExt =
     proposeTimeoutMs: 5000,
   ))
 
-  let rangeId = RangeID(1'u64)
-  var desc = newRangeDescriptor(rangeId, @[], @[])
-  let myReplica = desc.addReplica(nodeId, rtVoter)
-  let group = coord.createGroup(desc, myReplica.replicaId)
-  group.becomeLeader()
+  for rangeId in [META_RANGE_ID, DATA_RANGE_START_ID]:
+    var desc = newRangeDescriptor(rangeId, @[], @[])
+    let myReplica = desc.addReplica(nodeId, rtVoter)
+    let group = coord.createGroup(desc, myReplica.replicaId)
+    group.becomeLeader()
   coord.start()
 
   result = newRaftKVStoreExt(coord)
-  bootstrapSingleShardExt(result, rangeId)
+  result.bootstrapStore(@[META_RANGE_ID, DATA_RANGE_START_ID])
 
 proc cleanupTestDir(testDir: string) =
   if dirExists(testDir):

@@ -131,16 +131,8 @@ proc decodeIntentUserKey*(k: string): string {.inline.} =
   k[INTENT_PREFIX.len + 8 ..< k.len]
 
 # ---------------------------------------------------------------------------
-# Shard mapping helper
+# Unified key → RangeID routing
 # ---------------------------------------------------------------------------
-# Maps a string key to a RangeID by looking up the RouterTable shard list.
-# RaftKVStore holds a flat seq of (startKey, endKey, rangeId) tuples.
-
-type
-  ShardEntry* = object
-    startKey*: string
-    endKey*: string
-    rangeId*: RangeID
 
 # ---------------------------------------------------------------------------
 # RaftKVStore
@@ -149,8 +141,6 @@ type
 type
   RaftKVStore* {.acyclic.} = ref object of RootObj
     coordinator*: MultiRaftCoordinator
-    shards*: seq[ShardEntry] ## sorted by startKey ascending
-    shardsMu*: Lock
     nextVersion*: Atomic[uint64]
     proposeTimeout*: int     ## ms; default 5000
     logger*: Logger
@@ -159,49 +149,10 @@ proc newRaftKVStore*(coord: MultiRaftCoordinator,
     proposeTimeoutMs: int = 5000): RaftKVStore =
   result = RaftKVStore(
     coordinator: coord,
-    shards: @[],
     proposeTimeout: proposeTimeoutMs,
     logger: newLogger("protocol.raft_store"),
   )
-  initLock(result.shardsMu)
   result.nextVersion.store(1)
-
-# ---------------------------------------------------------------------------
-# Shard management
-# ---------------------------------------------------------------------------
-
-proc addShard*(store: RaftKVStore, startKey, endKey: string,
-    rangeId: RangeID) {.gcsafe, raises: [].} =
-  ## Register a shard range mapping. Must be called before using the store.
-  ## Ranges must be non-overlapping; kept sorted by startKey.
-  acquire(store.shardsMu)
-  defer: release(store.shardsMu)
-  store.shards.add(ShardEntry(startKey: startKey, endKey: endKey,
-      rangeId: rangeId))
-  store.shards.sort(proc(a, b: ShardEntry): int = cmp(a.startKey, b.startKey))
-
-proc bootstrapSingleShard*(store: RaftKVStore, rangeId: RangeID) {.gcsafe,
-    raises: [].} =
-  ## Set up a single shard covering the entire keyspace. Suitable for
-  ## single-node / test deployments.
-  store.addShard("", "", rangeId)
-
-proc findRangeId*(store: RaftKVStore, key: string): Option[RangeID] {.gcsafe,
-    raises: [].} =
-  ## Returns the RangeID whose shard covers `key`, or none.
-  ##
-  ## System table keys (tableID 1-6) and meta keys (/sys/meta1/, /sys/meta2/)
-  ## are always routed to the meta range (Range 1) regardless of shard config.
-  if isMetaRangeKey(key):
-    return some(META_RANGE_ID)
-  acquire(store.shardsMu)
-  defer: release(store.shardsMu)
-  for entry in store.shards:
-    let afterStart = entry.startKey.len == 0 or key >= entry.startKey
-    let beforeEnd = entry.endKey.len == 0 or key < entry.endKey
-    if afterStart and beforeEnd:
-      return some(entry.rangeId)
-  none(RangeID)
 
 # ---------------------------------------------------------------------------
 # Internal: get KVStateMachine for a RangeID
@@ -253,17 +204,24 @@ proc newRaftKVStoreExt*(coord: MultiRaftCoordinator,
     proposeTimeoutMs: int = 5000): RaftKVStoreExt =
   result = RaftKVStoreExt(
     coordinator: coord,
-    shards: @[],
     proposeTimeout: proposeTimeoutMs,
     logger: newLogger("protocol.raft_store"),
     stateMachines: initTable[RangeID, KVStateMachine](),
     spaces: initTable[int, SpaceInfo](),
     tableSpaces: initTable[uint32, int](),
   )
-  initLock(result.shardsMu)
   initLock(result.smMu)
   initLock(result.spacesMu)
   result.nextVersion.store(1)
+
+proc resolveRangeId*(store: RaftKVStoreExt, key: string): Option[RangeID] {.gcsafe,
+    raises: [].} =
+  ## Unified key → RangeID routing. Meta/system keys go to META_RANGE_ID,
+  ## everything else goes to DATA_RANGE_START_ID (the default data range).
+  ## Space-routed keys bypass this via raftPutInSpace/raftGetInSpace/etc.
+  if isMetaRangeKey(key):
+    return some(META_RANGE_ID)
+  some(DATA_RANGE_START_ID)
 
 proc getOrCreateSM*(store: RaftKVStoreExt,
     rangeId: RangeID): KVStateMachine {.gcsafe, raises: [].} =
@@ -275,10 +233,10 @@ proc getOrCreateSM*(store: RaftKVStoreExt,
   store.stateMachines[rangeId] = sm
   sm
 
-proc addShardExt*(store: RaftKVStoreExt, startKey, endKey: string,
+proc registerRange*(store: RaftKVStoreExt,
     rangeId: RangeID) {.gcsafe, raises: [].} =
-  store.addShard(startKey, endKey, rangeId)
-  discard store.getOrCreateSM(rangeId) # pre-create
+  ## Pre-create a state machine for the given range.
+  discard store.getOrCreateSM(rangeId)
 
 # ---------------------------------------------------------------------------
 # Internal: propose a WriteBatch and apply to local state machine
@@ -356,13 +314,12 @@ proc wireApplyCallback*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
     multigroup_coordinator.applyBatchCallback = applyBatchToSM
   store.coordinator.kvStorePtr = cast[pointer](store)
 
-proc bootstrapSingleShardExt*(store: RaftKVStoreExt,
-    rangeId: RangeID) {.gcsafe, raises: [].} =
-  ## Bootstrap a single shard for the store and wire the apply callback so that
-  ## committed Raft entries are applied to the local state machine.
-  ## Must be called after coord.start() (or at least after the store is ready).
-  store.bootstrapSingleShard(rangeId)
-  discard store.getOrCreateSM(rangeId)
+proc bootstrapStore*(store: RaftKVStoreExt,
+    rangeIds: seq[RangeID]) {.gcsafe, raises: [].} =
+  ## Pre-create state machines for the given ranges and wire the apply callback.
+  ## Call after coord.start() (or at least after the store is ready).
+  for rid in rangeIds:
+    discard store.getOrCreateSM(rid)
   store.wireApplyCallback()
 
 proc proposeWrite(store: RaftKVStoreExt, rangeId: RangeID,
@@ -394,7 +351,7 @@ proc raftGet*(store: RaftKVStoreExt,
     key: string): RSResult[Option[RaftKVEntry]] {.gcsafe, raises: [].} =
   ## Read the current value for `key` from the local state machine.
   ## Reads are served locally (leader / leaseholder read semantics).
-  let ridOpt = store.findRangeId(key)
+  let ridOpt = store.resolveRangeId(key)
   if ridOpt.isNone:
     return rsErr[Option[RaftKVEntry]](newRSE(rseRangeNotFound,
         &"no shard for key '{key}'"))
@@ -421,7 +378,7 @@ proc raftGet*(store: RaftKVStoreExt,
 proc raftPut*(store: RaftKVStoreExt, key, value: string): RSResult[
     RaftKVEntry] {.gcsafe, raises: [].} =
   ## Write `value` under `key` through Raft consensus.
-  let ridOpt = store.findRangeId(key)
+  let ridOpt = store.resolveRangeId(key)
   if ridOpt.isNone:
     return rsErr[RaftKVEntry](newRSE(rseRangeNotFound,
         &"no shard for key '{key}'"))
@@ -440,7 +397,7 @@ proc raftPut*(store: RaftKVStoreExt, key, value: string): RSResult[
 proc raftDelete*(store: RaftKVStoreExt,
     key: string): RSResult[Option[RaftKVEntry]] {.gcsafe, raises: [].} =
   ## Delete `key` through Raft consensus.
-  let ridOpt = store.findRangeId(key)
+  let ridOpt = store.resolveRangeId(key)
   if ridOpt.isNone:
     return rsErr[Option[RaftKVEntry]](newRSE(rseRangeNotFound,
         &"no shard for key '{key}'"))
@@ -475,12 +432,13 @@ proc raftScan*(store: RaftKVStoreExt, startKey, endKey: string,
   ## are excluded from results. Set includeSystemKeys=true to include them.
   var pairs: seq[(string, RaftKVEntry)] = @[]
 
-  acquire(store.shardsMu)
-  let shardsCopy = store.shards
-  release(store.shardsMu)
+  acquire(store.smMu)
+  var smCopy: seq[(RangeID, KVStateMachine)] = @[]
+  for rid, sm in store.stateMachines:
+    smCopy.add((rid, sm))
+  release(store.smMu)
 
-  for entry in shardsCopy:
-    let sm = store.getOrCreateSM(entry.rangeId)
+  for (rid, sm) in smCopy:
     acquire(store.smMu)
     for k, v in sm.kvStore:
       # Skip internal intent / coord keys
@@ -500,22 +458,18 @@ proc raftScan*(store: RaftKVStoreExt, startKey, endKey: string,
   rsOk[seq[(string, RaftKVEntry)]](pairs)
 
 proc shardCount*(store: RaftKVStoreExt): int {.gcsafe, raises: [].} =
-  ## Returns the number of key-range shards currently registered.
-  acquire(store.shardsMu)
-  defer: release(store.shardsMu)
-  store.shards.len
+  ## Returns the number of registered state machines (ranges).
+  acquire(store.smMu)
+  defer: release(store.smMu)
+  store.stateMachines.len
 
 proc raftLen*(store: RaftKVStoreExt): int {.gcsafe, raises: [].} =
   var total = 0
-  acquire(store.shardsMu)
-  let shardsCopy = store.shards
-  release(store.shardsMu)
-  for entry in shardsCopy:
-    let sm = store.getOrCreateSM(entry.rangeId)
-    acquire(store.smMu)
+  acquire(store.smMu)
+  for rid, sm in store.stateMachines:
     for k in sm.kvStore.keys:
       if not isIntentKey(k) and not isCoordKey(k): inc total
-    release(store.smMu)
+  release(store.smMu)
   total
 
 # ---------------------------------------------------------------------------
@@ -536,7 +490,7 @@ proc raftBufferIntent*(store: RaftKVStoreExt, txnId: uint64, key,
   ## The commit path (raftResolveIntent) writes the real key through Raft
   ## with fdatasync, which is the only fsync this transaction requires.
   let intentKey = encodeIntentKey(txnId, key)
-  let ridOpt = store.findRangeId(key)
+  let ridOpt = store.resolveRangeId(key)
   if ridOpt.isNone:
     return rsVErr(newRSE(rseRangeNotFound, &"no shard for key '{key}'"))
 
@@ -558,7 +512,7 @@ proc raftDeleteIntent*(store: RaftKVStoreExt, txnId: uint64,
     key: string): RSVoidResult {.gcsafe, raises: [].} =
   ## Remove the intent (used during rollback or abort) — also no fsync needed.
   let intentKey = encodeIntentKey(txnId, key)
-  let ridOpt = store.findRangeId(key)
+  let ridOpt = store.resolveRangeId(key)
   if ridOpt.isNone:
     return rsVErr(newRSE(rseRangeNotFound, &"no shard for key '{key}'"))
 
@@ -594,7 +548,7 @@ proc raftCommitTxn*(store: RaftKVStoreExt, txnId: uint64,
   # --- Group keys by RangeID ---
   var batches: Table[RangeID, WriteBatch]
   for key in writeSet:
-    let ridOpt = store.findRangeId(key)
+    let ridOpt = store.resolveRangeId(key)
     if ridOpt.isNone:
       return rsVErr(newRSE(rseRangeNotFound, &"no shard for key '{key}'"))
     let rid = ridOpt.get()
@@ -611,7 +565,7 @@ proc raftCommitTxn*(store: RaftKVStoreExt, txnId: uint64,
     let sm = store.getOrCreateSM(rid)
     acquire(store.smMu)
     for key in writeSet:
-      let keyRidOpt = store.findRangeId(key)
+      let keyRidOpt = store.resolveRangeId(key)
       if keyRidOpt.isNone or keyRidOpt.get() != rid: continue
       let intentKey = encodeIntentKey(txnId, key)
       if sm.kvStore.hasKey(intentKey):
@@ -656,7 +610,7 @@ proc raftCommitTxnPipelined*(store: RaftKVStoreExt, txnId: uint64,
   # --- Step 1: group keys by RangeID ---
   var batches: Table[RangeID, WriteBatch]
   for key in writeSet:
-    let ridOpt = store.findRangeId(key)
+    let ridOpt = store.resolveRangeId(key)
     if ridOpt.isNone:
       return rsVErr(newRSE(rseRangeNotFound, "no shard for key '" & key & "'"))
     let rid = ridOpt.get()
@@ -672,7 +626,7 @@ proc raftCommitTxnPipelined*(store: RaftKVStoreExt, txnId: uint64,
     let sm = store.getOrCreateSM(rid)
     acquire(store.smMu)
     for key in writeSet:
-      let keyRidOpt = store.findRangeId(key)
+      let keyRidOpt = store.resolveRangeId(key)
       if keyRidOpt.isNone or keyRidOpt.get() != rid: continue
       let intentKey = encodeIntentKey(txnId, key)
       if sm.kvStore.hasKey(intentKey):
@@ -719,7 +673,7 @@ proc raftGetForTxn*(store: RaftKVStoreExt, txnId: uint64,
   ## The lookup order is:
   ##   1. Intent key  ("\x00INTENT\x00<txnId8be><key>") in the local SM
   ##   2. Committed key (same as raftGet)
-  let ridOpt = store.findRangeId(key)
+  let ridOpt = store.resolveRangeId(key)
   if ridOpt.isNone:
     return rsErr[Option[RaftKVEntry]](newRSE(rseRangeNotFound,
         &"no shard for key '{key}'"))
@@ -756,7 +710,7 @@ proc raftResolveIntent*(store: RaftKVStoreExt, txnId: uint64,
   ## On commit: move the intent to the committed slot.
   ## On abort:  delete the intent.
   let intentKey = encodeIntentKey(txnId, key)
-  let ridOpt = store.findRangeId(key)
+  let ridOpt = store.resolveRangeId(key)
   if ridOpt.isNone:
     return rsVErr(newRSE(rseRangeNotFound, &"no shard for key '{key}'"))
 
@@ -775,65 +729,30 @@ proc raftResolveIntent*(store: RaftKVStoreExt, txnId: uint64,
 
 proc raftWriteCoordRecord*(store: RaftKVStoreExt, txnId: uint64,
     payload: string): RSVoidResult {.gcsafe, raises: [].} =
-  ## Write a durable 2PC coordinator record to the local Raft log.
-  ## Used to ensure coordinator recovery after crash (Phase 5).
+  ## Write a durable 2PC coordinator record to the meta range.
   let coordKey = encodeCoordKey(txnId)
-  # Coordinator records go into the first (local) shard.
-  acquire(store.shardsMu)
-  let firstRid = if store.shards.len > 0: store.shards[0].rangeId
-                 else: RangeID(0)
-  release(store.shardsMu)
-  if firstRid.uint64 == 0:
-    return rsVErr(newRSE(rseRangeNotFound, "no shards registered"))
   let batch = newWriteBatch()
   batch.put(toBytes(coordKey), toBytes(payload))
-  proposeWrite(store, firstRid, batch)
+  proposeWrite(store, META_RANGE_ID, batch)
 
 proc raftDeleteCoordRecord*(store: RaftKVStoreExt,
     txnId: uint64): RSVoidResult {.gcsafe, raises: [].} =
   ## Remove the coordinator record after a 2PC round completes.
   let coordKey = encodeCoordKey(txnId)
-  acquire(store.shardsMu)
-  let firstRid = if store.shards.len > 0: store.shards[0].rangeId
-                 else: RangeID(0)
-  release(store.shardsMu)
-  if firstRid.uint64 == 0:
-    return rsVErr(newRSE(rseRangeNotFound, "no shards registered"))
   let batch = newWriteBatch()
   batch.delete(toBytes(coordKey))
-  proposeWrite(store, firstRid, batch)
+  proposeWrite(store, META_RANGE_ID, batch)
 
 proc raftReadCoordRecord*(store: RaftKVStoreExt,
     txnId: uint64): Option[string] {.gcsafe, raises: [].} =
   ## Read back a coordinator record (for recovery).
   let coordKey = encodeCoordKey(txnId)
-  acquire(store.shardsMu)
-  let firstRid = if store.shards.len > 0: store.shards[0].rangeId
-                 else: RangeID(0)
-  release(store.shardsMu)
-  if firstRid.uint64 == 0: return none(string)
-  let sm = store.getOrCreateSM(firstRid)
+  let sm = store.getOrCreateSM(META_RANGE_ID)
   acquire(store.smMu)
   defer: release(store.smMu)
   if sm.kvStore.hasKey(coordKey):
     return some(sm.kvStore.getOrDefault(coordKey))
   none(string)
-
-# ---------------------------------------------------------------------------
-# Meta-range-aware bootstrap
-# ---------------------------------------------------------------------------
-
-proc bootstrapWithMetaRange*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
-  ## Bootstrap the store with a two-range layout:
-  ##   Range 1 (meta range): covers ["", META_RANGE_END_KEY)
-  ##     — system tables 1-7, /sys/meta1/*, /sys/meta2/*
-  ##   Range 2 (first data range): covers [META_RANGE_END_KEY, "")
-  ##     — user tables, metrics, events, all other data
-  ##
-  ## Also wires the apply callback for committed Raft entries.
-  store.addShardExt("", META_RANGE_END_KEY, META_RANGE_ID)
-  store.addShardExt(META_RANGE_END_KEY, "", DATA_RANGE_START_ID)
-  store.wireApplyCallback()
 
 # ---------------------------------------------------------------------------
 # Space-aware routing
@@ -918,7 +837,7 @@ proc getSpaceForTable*(store: RaftKVStoreExt,
 # ---------------------------------------------------------------------------
 # Space-aware KV operations
 # ---------------------------------------------------------------------------
-# These bypass findRangeId() and route directly to a space's Raft group
+# These bypass resolveRangeId() and route directly to a space's Raft group
 # using hash(primaryKey) mod numGroups.
 
 proc raftPutInSpace*(store: RaftKVStoreExt, key, value: string,

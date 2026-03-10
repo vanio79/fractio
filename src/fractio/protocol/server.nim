@@ -1530,35 +1530,41 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
   ))
   server.raftCoord = coord
 
-  # Raft group: single shard, all-keys
-  let rangeId = rangeTypes.RangeID(1'u64)
-  var desc = rangeTypes.newRangeDescriptor(rangeId, @[], @[])
-  let myReplica = desc.addReplica(nodeId, rangeTypes.rtVoter)
-  for p in peers:
-    discard desc.addReplica(p.nodeId, rangeTypes.rtVoter)
-  let group = coord.createGroup(desc, myReplica.replicaId)
+  # Raft groups: meta range (Range 1) and data range (Range 2)
+  for rangeId in [META_RANGE_ID, DATA_RANGE_START_ID]:
+    var desc = rangeTypes.newRangeDescriptor(rangeId, @[], @[])
+    let myReplica = desc.addReplica(nodeId, rangeTypes.rtVoter)
+    for p in peers:
+      discard desc.addReplica(p.nodeId, rangeTypes.rtVoter)
+    discard coord.createGroup(desc, myReplica.replicaId)
   coord.start()
 
   # Become leader only for a truly fresh single-node cluster (no saved peers)
   if peers.len == 0 and startAsLeader and not isRejoining:
-    group.becomeLeader()
+    for rangeId in [META_RANGE_ID, DATA_RANGE_START_ID]:
+      let g = coord.getGroup(rangeId)
+      if g.isSome:
+        g.get().becomeLeader()
 
   # KV store
   let store = newRaftKVStoreExt(coord)
-  bootstrapSingleShardExt(store, rangeId)
+  store.bootstrapStore(@[META_RANGE_ID, DATA_RANGE_START_ID])
   server.raftStore = store
 
   # Recovery: replay committed Raft log entries to rebuild in-memory state machine.
   # On a fresh start lastApplied=0 so this is a no-op. On restart after a kill,
   # we need to re-apply entries 1..lastApplied because the in-memory KVStateMachine
   # is empty (only WiscKey has the data on disk, but reads go through the in-memory SM).
-  let lastApplied = group.lastApplied.load()
-  if lastApplied > 0:
-    echo "replaying " & $lastApplied & " committed log entries to rebuild state machine..."
-    # Reset lastApplied to 0 so applyUpTo replays from the beginning
-    group.lastApplied.store(0)
-    coord.applyUpTo(rangeId, group, lastApplied)
-    echo "state machine recovery complete (applied up to " & $group.lastApplied.load() & ")"
+  for rangeId in [META_RANGE_ID, DATA_RANGE_START_ID]:
+    let groupOpt = coord.getGroup(rangeId)
+    if groupOpt.isSome:
+      let group = groupOpt.get()
+      let lastApplied = group.lastApplied.load()
+      if lastApplied > 0:
+        echo "replaying " & $lastApplied & " committed log entries for range " & $rangeId.uint64 & "..."
+        group.lastApplied.store(0)
+        coord.applyUpTo(rangeId, group, lastApplied)
+        echo "state machine recovery complete (applied up to " & $group.lastApplied.load() & ")"
 
   # Load space caches from recovered state machine
   store.loadSpaces()
@@ -1578,14 +1584,15 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
     }
     discard store.raftPut(nodeKey, nodeVal)
 
-    let rangeKey = encodeTableKey(SYS_RANGES_TABLE_ID, $rangeId.uint64)
-    let rangeVal = $ %* {
-      "rangeId": rangeId.uint64.int,
-      "startKey": "",
-      "endKey": "",
-      "replicas": [{"nodeId": server.config.serverId.int, "type": "voter"}],
-    }
-    discard store.raftPut(rangeKey, rangeVal)
+    for rid in [META_RANGE_ID, DATA_RANGE_START_ID]:
+      let rangeKey = encodeTableKey(SYS_RANGES_TABLE_ID, $rid.uint64)
+      let rangeVal = $ %* {
+        "rangeId": rid.uint64.int,
+        "startKey": "",
+        "endKey": "",
+        "replicas": [{"nodeId": server.config.serverId.int, "type": "voter"}],
+      }
+      discard store.raftPut(rangeKey, rangeVal)
 
     for p in peers:
       let peerKey = encodeTableKey(SYS_NODES_TABLE_ID, $p.nodeId.uint32)
