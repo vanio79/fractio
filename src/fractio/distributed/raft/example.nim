@@ -70,10 +70,9 @@ proc exampleUsage*() =
   let deleteIndex = raftNode.commit(deleteData)
   echo "Delete operation committed at index: $#, Data: $#".format($deleteIndex, deleteData)
 
-  # Print state machine contents
-  echo "\n=== State Machine Contents ==="
-  for key, value in stateMachine.kvStore.pairs():
-    echo "Key: $#, Value: $#".format(key, value)
+  # Print state machine info
+  echo "\n=== State Machine ==="
+  echo "Last applied index: $#".format($stateMachine.lastIndex)
 
   # Cleanup
   raftNode.shutdown()

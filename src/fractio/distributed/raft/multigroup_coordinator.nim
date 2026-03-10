@@ -95,6 +95,8 @@ type
     groupCommitEnabled*: bool
     groupCommitMaxBatch*: int ## 0 → use GC_DEFAULT_MAX_BATCH_SIZE (256)
     groupCommitMaxDelayNs*: int64 ## 0 → use GC_DEFAULT_MAX_DELAY_NS  (2 ms)
+    writeBufferSize*: int  ## LevelDB write buffer in bytes; 0 = default (4 MB)
+    blockCacheSize*: int  ## LevelDB block cache in bytes; 0 = LevelDB default (8 MB)
 
   TimerContext = object
     coordinator: MultiRaftCoordinator
@@ -256,11 +258,15 @@ proc newMultiRaftCoordinator*(config: CoordinatorConfig): MultiRaftCoordinator =
   result.kvStorePtr = nil
   result.timerRunning.store(false)
 
-  result.store = newWiscKeyBackend(StorageConfig(
-    path: config.storagePath, createIfMissing: true, syncWrites: true))
+  let wbs = if config.writeBufferSize > 0: config.writeBufferSize
+            else: 4 * 1024 * 1024
+  let bcs = config.blockCacheSize  # 0 = use LevelDB default (8 MB)
+  let storeCfg = StorageConfig(
+    path: config.storagePath, createIfMissing: true, syncWrites: true,
+    writeBufferSize: wbs, blockCacheSize: bcs)
+  result.store = newWiscKeyBackend(storeCfg)
 
-  if not result.store.open(StorageConfig(
-      path: config.storagePath, createIfMissing: true, syncWrites: true)):
+  if not result.store.open(storeCfg):
     raise newException(MultiRaftError, "Failed to open storage backend")
 
   result.groups = initTable[GroupID, RaftGroup]()

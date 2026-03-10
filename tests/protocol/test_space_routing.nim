@@ -13,6 +13,7 @@ import fractio/distributed/raft/multigroup_coordinator
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
+import fractio/storage/wisckey_backend
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -136,7 +137,7 @@ suite "Space routing — put and get with 3 groups":
     check gr.value.isSome
     check gr.value.get().value == val
 
-  test "get from wrong group returns none":
+  test "get with different routing pk still finds key (shared backend)":
     let (coord, store, space) = makeMultiGroupStore(
         "/tmp/fractio_sr_t02", 3)
     defer: teardown(coord, "/tmp/fractio_sr_t02")
@@ -150,8 +151,8 @@ suite "Space routing — put and get with 3 groups":
     check gr.isOk
     check gr.value.isSome
 
-    # Reading with a different pk that routes to a different group should miss.
-    # We need to find a pk that routes to a different group.
+    # Reading with a different pk that routes to a different group should
+    # STILL find the key because all groups share one WiscKey backend.
     var otherPk = ""
     let targetRid = routeToGroup(pkVal, space.groupIds)
     for i in 0 ..< 100:
@@ -162,7 +163,7 @@ suite "Space routing — put and get with 3 groups":
     check otherPk.len > 0  # found one
     let gr2 = store.raftGetInSpace(key, space, otherPk)
     check gr2.isOk
-    check gr2.value.isNone  # not in this group's SM
+    check gr2.value.isSome  # found via shared backend
 
   test "multiple keys distribute across groups":
     let (coord, store, space) = makeMultiGroupStore(
@@ -340,13 +341,10 @@ suite "Space routing — fan-out scan with merge-sort":
     let key = encodeDataRowKey(100, pk)
     discard store.raftPutInSpace(key, "value", space, pk)
 
-    # Inject intent key directly into the first group's SM
-    let rid = GroupID(space.groupIds[0])
-    let sm = store.getOrCreateSM(rid)
+    # Inject intent key directly into the backend
     let intentKey = encodeIntentKey(99, key)
-    acquire(store.smMu)
-    sm.kvStore[intentKey] = "intent_val"
-    release(store.smMu)
+    let backend = store.getBackend()
+    discard backend.put(intentKey, "intent_val")
 
     let sr = store.raftScanSpace(
         "", "", space, 0, includeSystemKeys = true)

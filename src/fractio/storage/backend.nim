@@ -20,6 +20,8 @@ type
     errorIfExists*: bool
     syncWrites*: bool
       ## If true, writes are synced to disk before returning (default: false)
+    blockCacheSize*: int
+      ## LevelDB block cache size in bytes; 0 = LevelDB default (8 MB)
 
     # WiscKey-specific options (key-value separation)
     vlogMaxSize*: int64

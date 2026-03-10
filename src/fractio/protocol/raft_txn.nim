@@ -37,7 +37,8 @@ import std/[tables, sets, locks, times, atomics, strformat, strutils, options]
 import ./raft_store
 import ./txn_manager
 import ./messages/txn as txnMsgs
-import fractio/distributed/raft/state_machine
+import fractio/storage/wisckey_backend
+import fractio/storage/backend
 
 # ---------------------------------------------------------------------------
 # 2PC Coordinator record wire format (stored as plain string in COORD key)
@@ -106,12 +107,12 @@ proc commitSingleShard*(coord: RaftTxnCoordinator, txnId: uint64,
     # internally; acquiring smMu first would deadlock (Lock is non-reentrant).
     var intentValue = ""
     let intentKey = encodeIntentKey(txnId, key)
-    let ridOpt = coord.store.resolveGroupId(key)
-    if ridOpt.isSome:
-      let sm = coord.store.getOrCreateSM(ridOpt.get()) # acquires+releases smMu
-      acquire(coord.store.smMu)
-      intentValue = sm.kvStore.getOrDefault(intentKey)
-      release(coord.store.smMu)
+    let backend = coord.store.getBackend()
+    if backend != nil and backend.isOpen:
+      {.cast(raises: []).}:
+        let valOpt = backend.get(intentKey)
+        if valOpt.isSome:
+          intentValue = valOpt.get()
 
     let vr = coord.store.raftResolveIntent(txnId, key, true, intentValue)
     if not vr.isOk:
@@ -157,13 +158,12 @@ proc coordinateCrossShardCommit*(coord: RaftTxnCoordinator, txnId: uint64,
   for key in writeSet:
     # Validate the intent still exists (not expired / already resolved)
     let intentKey = encodeIntentKey(txnId, key)
-    let ridOpt = coord.store.resolveGroupId(key)
     var intentExists = false
-    if ridOpt.isSome:
-      let sm = coord.store.getOrCreateSM(ridOpt.get()) # acquires+releases smMu
-      acquire(coord.store.smMu)
-      intentExists = sm.kvStore.hasKey(intentKey)
-      release(coord.store.smMu)
+    let backend = coord.store.getBackend()
+    if backend != nil and backend.isOpen:
+      {.cast(raises: []).}:
+        let valOpt = backend.get(intentKey)
+        intentExists = valOpt.isSome
 
     if not intentExists:
       # Intent missing — another transaction may have aborted ours
@@ -212,11 +212,13 @@ proc recoverPendingCoords*(coord: RaftTxnCoordinator) {.gcsafe, raises: [].} =
   ## when calling it — collect state machines first, then scan under smMu.
   var pending: seq[(uint64, string)] = @[]
 
-  # Scan all state machines for pending COORD records
-  acquire(coord.store.smMu)
-  for rid, sm in coord.store.stateMachines:
-    for k, v in sm.kvStore:
-      if isCoordKey(k):
+  # Scan the backend for pending COORD records (prefix \x00COORD\x00)
+  let backend = coord.store.getBackend()
+  if backend != nil and backend.isOpen:
+    {.cast(raises: []).}:
+      let raw = backend.scan(COORD_PREFIX, "")
+      for (k, v) in raw:
+        if not isCoordKey(k): break  # past the COORD prefix range
         let txnId = block:
           var r = 0'u64
           let off = COORD_PREFIX.len
@@ -224,7 +226,6 @@ proc recoverPendingCoords*(coord: RaftTxnCoordinator) {.gcsafe, raises: [].} =
             r = (r shl 8) or uint64(uint8(k[off + i]))
           r
         pending.add((txnId, v))
-  release(coord.store.smMu)
 
   for (txnId, data) in pending:
     let (state, _, commitTs, keys) = decodeCoordRecord(data)

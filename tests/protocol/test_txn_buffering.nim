@@ -29,7 +29,7 @@ import fractio/distributed/raft/multigroup_coordinator
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
-import fractio/distributed/raft/state_machine
+import fractio/storage/wisckey_backend
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -65,16 +65,18 @@ proc teardownStore(coord: MultiRaftCoordinator, storagePath: string) =
   try: removeDir(storagePath) except CatchableError: discard
 
 proc smHasKey(store: RaftKVStoreExt, rid: GroupID, key: string): bool =
-  let sm = store.getOrCreateSM(rid)
-  acquire(store.smMu)
-  result = sm.kvStore.hasKey(key)
-  release(store.smMu)
+  let backend = store.getBackend()
+  if backend != nil and backend.isOpen:
+    return backend.get(key).isSome
+  false
 
 proc smGetVal(store: RaftKVStoreExt, rid: GroupID, key: string): string =
-  let sm = store.getOrCreateSM(rid)
-  acquire(store.smMu)
-  result = sm.kvStore.getOrDefault(key)
-  release(store.smMu)
+  let backend = store.getBackend()
+  if backend != nil and backend.isOpen:
+    let valOpt = backend.get(key)
+    if valOpt.isSome:
+      return valOpt.get()
+  ""
 
 proc makeRaftServer(port: int, storagePath: string): ProtocolServer =
   let coordCfg = CoordinatorConfig(

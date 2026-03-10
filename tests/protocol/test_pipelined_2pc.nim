@@ -24,6 +24,7 @@ import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
 import fractio/distributed/sharedtimer/mock
+import fractio/storage/wisckey_backend
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -158,10 +159,8 @@ suite "raftCommitTxnPipelined - correctness":
     check gr.value.get().value == "cider"
     # Intent key must be gone
     let intentKey = encodeIntentKey(txnId, "apple")
-    let sm = store.getOrCreateSM(GroupID(1))
-    acquire(store.smMu)
-    let intentGone = not sm.kvStore.hasKey(intentKey)
-    release(store.smMu)
+    let backend = store.getBackend()
+    let intentGone = backend.get(intentKey).isNone
     check intentGone
 
   test "two-shard pipelined commit commits both shards":

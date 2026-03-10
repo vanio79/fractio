@@ -17,6 +17,7 @@ import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
 import fractio/distributed/sharedtimer/timeprovider as tp
 import fractio/distributed/sharedtimer/mock
+import fractio/storage/wisckey_backend
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -164,12 +165,10 @@ suite "RaftKVStore - scan":
     let (coord, store, rid) = makeStore("/tmp/fractio_raft_t14")
     defer: teardownStore(coord, "/tmp/fractio_raft_t14")
     discard store.raftPut("user_key", "user_val")
-    # Write an intent key directly into the SM (bypassing Raft for test speed)
+    # Write an intent key directly into the backend (bypassing Raft for test speed)
     let intentKey = encodeIntentKey(99'u64, "internal_key")
-    let sm = store.getOrCreateSM(rid)
-    acquire(store.smMu)
-    sm.kvStore[intentKey] = "intent_value"
-    release(store.smMu)
+    let backend = store.getBackend()
+    discard backend.put(intentKey, "intent_value")
     let sr = store.raftScan("", "", 0)
     check sr.isOk
     for (k, _) in sr.value:
@@ -219,12 +218,10 @@ suite "RaftKVStore - intent API":
     let gr = store.raftGet("mykey")
     check gr.isOk
     check gr.value.isNone
-    # Intent key should exist in SM
+    # Intent key should exist in the backend
     let intentKey = encodeIntentKey(txnId, "mykey")
-    let sm = store.getOrCreateSM(rid)
-    acquire(store.smMu)
-    let intentExists = sm.kvStore.hasKey(intentKey)
-    release(store.smMu)
+    let backend = store.getBackend()
+    let intentExists = backend.get(intentKey).isSome
     check intentExists
 
   test "raftResolveIntent commit makes value visible":
@@ -258,10 +255,8 @@ suite "RaftKVStore - intent API":
     let vr = store.raftDeleteIntent(txnId, "del_intent_key")
     check vr.isOk
     let intentKey = encodeIntentKey(txnId, "del_intent_key")
-    let sm = store.getOrCreateSM(rid)
-    acquire(store.smMu)
-    let intentGone = not sm.kvStore.hasKey(intentKey)
-    release(store.smMu)
+    let backend = store.getBackend()
+    let intentGone = backend.get(intentKey).isNone
     check intentGone
 
 # ---------------------------------------------------------------------------

@@ -19,6 +19,7 @@ type
     readOptions*: pointer # leveldb_readoptions_t*
     writeOptions*: pointer # leveldb_writeoptions_t* (sync=configured)
     noSyncWriteOptions*: pointer # leveldb_writeoptions_t* (sync=false, always)
+    blockCache*: pointer # leveldb_cache_t* (LRU block cache, nil if default)
     path*: string
     isOpen*: bool
     syncWrites*: bool # Whether to sync writes to disk
@@ -94,6 +95,12 @@ proc c_leveldb_options_set_block_size(options: pointer; size: csize_t) {.
   importc: "leveldb_options_set_block_size", dynlib: "libleveldb.so".}
 proc c_leveldb_options_set_compression(options: pointer; compression: cint) {.
   importc: "leveldb_options_set_compression", dynlib: "libleveldb.so".}
+proc c_leveldb_cache_create_lru(capacity: csize_t): pointer {.
+  importc: "leveldb_cache_create_lru", dynlib: "libleveldb.so".}
+proc c_leveldb_cache_destroy(cache: pointer) {.
+  importc: "leveldb_cache_destroy", dynlib: "libleveldb.so".}
+proc c_leveldb_options_set_cache(options, cache: pointer) {.
+  importc: "leveldb_options_set_cache", dynlib: "libleveldb.so".}
 proc c_leveldb_readoptions_create(): pointer {.
   importc: "leveldb_readoptions_create", dynlib: "libleveldb.so".}
 proc c_leveldb_readoptions_destroy(options: pointer) {.
@@ -151,6 +158,14 @@ proc openWiscKey*(backend: WiscKeyBackend, config: StorageConfig): bool =
     config.maxOpenFiles))
   c_leveldb_options_set_block_size(backend.options, csize_t(config.blockSize))
 
+  # Block cache
+  if backend.blockCache != nil:
+    c_leveldb_cache_destroy(backend.blockCache)
+    backend.blockCache = nil
+  if config.blockCacheSize > 0:
+    backend.blockCache = c_leveldb_cache_create_lru(csize_t(config.blockCacheSize))
+    c_leveldb_options_set_cache(backend.options, backend.blockCache)
+
   # Set compression
   case config.compression
   of ctSnappy:
@@ -200,6 +215,11 @@ method close*(backend: WiscKeyBackend) =
     c_leveldb_compact_range(backend.db, nil, 0, nil, 0)
     c_leveldb_close(backend.db)
     backend.db = nil
+
+  # Destroy block cache (it's set on options, must be freed after db close)
+  if backend.blockCache != nil:
+    c_leveldb_cache_destroy(backend.blockCache)
+    backend.blockCache = nil
 
   # Don't destroy options - they can be reused for reopening
   # Just reset the state
@@ -425,6 +445,48 @@ proc destroyIter*(iter: StorageIterator) =
     if witer.iter != nil:
       c_leveldb_iter_destroy(witer.iter)
       witer.iter = nil
+
+proc scan*(backend: WiscKeyBackend, startKey, endKey: string,
+           limit: int = 0): seq[KeyValuePair] =
+  ## High-level range scan: collect key-value pairs in [startKey, endKey).
+  ## If endKey is empty, scans to the end of the database.
+  ## If limit > 0, returns at most `limit` pairs.
+  acquire(backend.mu)
+  defer: release(backend.mu)
+  if not backend.isOpen:
+    return @[]
+
+  let iter = c_leveldb_create_iterator(backend.db, backend.readOptions)
+  defer: c_leveldb_iter_destroy(iter)
+
+  if startKey.len > 0:
+    c_leveldb_iter_seek(iter, startKey.cstring, startKey.len.csize_t)
+  else:
+    c_leveldb_iter_seek_to_first(iter)
+
+  while c_leveldb_iter_valid(iter) != 0:
+    var keylen: csize_t
+    let keyC = c_leveldb_iter_key(iter, addr keylen)
+    if keyC == nil: break
+    var k = newString(keylen)
+    if keylen > 0:
+      copyMem(k[0].addr, keyC, keylen)
+
+    # Check upper bound
+    if endKey.len > 0 and k >= endKey:
+      break
+
+    var vallen: csize_t
+    let valC = c_leveldb_iter_value(iter, addr vallen)
+    var v = newString(vallen)
+    if vallen > 0 and valC != nil:
+      copyMem(v[0].addr, valC, vallen)
+
+    result.add((key: k, value: v))
+    if limit > 0 and result.len >= limit:
+      break
+
+    c_leveldb_iter_next(iter)
 
 method compactRange*(backend: WiscKeyBackend, startKey: Option[string] = none(string),
                    endKey: Option[string] = none(string)) =

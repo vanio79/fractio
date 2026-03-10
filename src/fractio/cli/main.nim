@@ -79,6 +79,8 @@ Commands:
     --web-port PORT   Web dashboard port (0 = disabled)
     --join HOST:PORT  Peer to register with on startup
     --peer ID:HOST:RAFT_PORT  Raft cluster peer (repeatable; omit for single-node)
+    --write-buffer-size MB  LevelDB write buffer size in MB (default: 4)
+    --block-cache-size MB   LevelDB block cache size in MB (default: 8)
 
   node ls           List all cluster nodes
   node status [ID]  Show status of all nodes, or detail for one node
@@ -129,16 +131,20 @@ proc cmdStart(flags: Table[string, string], globalHost: string,
   let dataDir = flags.getOrDefault("data-dir", "")
   let webPortStr = flags.getOrDefault("web-port", "0")
   let joinPeer = flags.getOrDefault("join", "")
+  let writeBufferMBStr = flags.getOrDefault("write-buffer-size", "4")
+  let blockCacheMBStr = flags.getOrDefault("block-cache-size", "8")
 
   if idStr == "": die("start requires --id")
   if dataDir == "": die("start requires --data-dir")
 
-  var nodeId, raftPort, clientPort, webPort: int
+  var nodeId, raftPort, clientPort, webPort, writeBufferMB, blockCacheMB: int
   try:
     nodeId = parseInt(idStr)
     raftPort = parseInt(raftPortStr)
     clientPort = parseInt(clientPortStr)
     webPort = parseInt(webPortStr)
+    writeBufferMB = parseInt(writeBufferMBStr)
+    blockCacheMB = parseInt(blockCacheMBStr)
   except ValueError as e:
     die("invalid numeric argument: " & e.msg)
 
@@ -154,6 +160,8 @@ proc cmdStart(flags: Table[string, string], globalHost: string,
   cfg.serverName = "fractio-" & idStr
   cfg.dataDir = dataDir
   cfg.webPort = webPort
+  cfg.writeBufferSize = writeBufferMB * 1024 * 1024
+  cfg.blockCacheSize = blockCacheMB * 1024 * 1024
   cfg.idleTimeoutSecs = 120
 
   let server = newProtocolServer(cfg)

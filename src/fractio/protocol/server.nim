@@ -79,6 +79,8 @@ type
     sharedTimerPeers*: seq[PeerConfig] ## peer nodes for NTP-style clock sync (empty = single-node mode)
     dataDir*: string ## directory for persistent state (registry, etc.); "" = no persistence
     webPort*: int   ## port for the HTTP management dashboard; 0 = disabled
+    writeBufferSize*: int ## LevelDB write buffer in bytes; 0 = default (4 MB)
+    blockCacheSize*: int ## LevelDB block cache in bytes; 0 = LevelDB default (8 MB)
 
 proc defaultServerConfig*(): ServerConfig =
   ServerConfig(
@@ -1527,6 +1529,8 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
     storagePath: raftDir,
     transport: transport,
     proposeTimeoutMs: 5000,
+    writeBufferSize: server.config.writeBufferSize,
+    blockCacheSize: server.config.blockCacheSize,
   ))
   server.raftCoord = coord
 
@@ -1550,10 +1554,10 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
   store.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
   server.raftStore = store
 
-  # Recovery: replay committed Raft log entries to rebuild in-memory state machine.
-  # On a fresh start lastApplied=0 so this is a no-op. On restart after a kill,
-  # we need to re-apply entries 1..lastApplied because the in-memory KVStateMachine
-  # is empty (only WiscKey has the data on disk, but reads go through the in-memory SM).
+  # Recovery: replay committed Raft log entries to ensure WiscKey backend is up-to-date.
+  # On a fresh start lastApplied=0 so this is a no-op. On restart after a crash,
+  # entries committed to the Raft log but not yet written to WiscKey are re-applied.
+  # On a clean shutdown all data is already in WiscKey, so replay is fast (no-op writes).
   for groupId in [META_GROUP_ID, DATA_GROUP_START_ID]:
     let groupOpt = coord.getGroup(groupId)
     if groupOpt.isSome:

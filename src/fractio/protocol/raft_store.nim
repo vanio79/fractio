@@ -5,11 +5,11 @@
 # handler changes.
 #
 # Design:
-#   - Reads:  served from the Raft state machine's KVStateMachine (local read
-#             if leader; will add follower-read / leaseholder reads later).
+#   - Reads:  served from the WiscKey/LevelDB backend directly (no in-memory
+#             mirror). LevelDB's memtable + block cache handle read performance.
 #   - Writes: proposed as WriteBatch commands via proposeAndWait so they go
 #             through Raft consensus before returning to the client.
-#   - Scan:   iterates the KVStateMachine's in-memory table (sorted).
+#   - Scan:   uses WiscKey backend.scan() for range queries.
 #   - Transactions: intents are stored as special prefixed keys in the same
 #             WriteBatch; resolveIntent commits or aborts them.
 #
@@ -160,15 +160,9 @@ proc newRaftKVStore*(coord: MultiRaftCoordinator,
 
 proc getKVSM(store: RaftKVStore,
     groupId: GroupID): Option[KVStateMachine] {.gcsafe, raises: [].} =
-  ## Retrieve the KVStateMachine from the coordinator's state machine registry.
-  ## In the current MultiRaftCoordinator implementation the state machine is
-  ## tracked inside the coordinator.  We expose it via a helper stored in the
-  ## coordinator's logs table (KVStateMachine is attached there).
-  ##
-  ## Note: The upstream MultiRaftCoordinator does not yet maintain a separate
-  ## state machine registry.  We keep our own stateMachines table (one per
-  ## GroupID) inside RaftKVStore and apply committed entries there.
-  none(KVStateMachine) # See stateMachines below
+  ## Legacy stub — kept for compatibility. State machines are lightweight
+  ## index trackers only; all data reads go through the WiscKey backend.
+  none(KVStateMachine)
 
 # ---------------------------------------------------------------------------
 # State machine registry (owned by RaftKVStore)
@@ -192,8 +186,8 @@ type
     groupIds*: seq[uint64]
 
   RaftKVStoreExt* = ref object of RaftKVStore
-    stateMachines*: Table[GroupID, KVStateMachine]
-    smMu*: Lock
+    stateMachines*: Table[GroupID, KVStateMachine]  ## lightweight index tracking only
+    smMu*: Lock  ## guards stateMachines table
     spaces*: Table[int, SpaceInfo]  ## spaceId → SpaceInfo
     tableSpaces*: Table[uint32, int] ## tableId → spaceId
     spacesMu*: Lock
@@ -250,17 +244,19 @@ proc addPeerStore*(store: RaftKVStoreExt, nodeId: uint32,
   ## that this node doesn't own.
   store.peerStores[nodeId] = peer
 
+proc getBackend*(store: RaftKVStoreExt): WiscKeyBackend {.inline.} =
+  ## Return the WiscKey backend from the coordinator's store.
+  store.coordinator.store
+
 proc loadGroupMembers*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
   ## Scan sys.groups and populate the groupMembers table (groupId → member nodeIds).
   let startKey = "/t/" & align($SYS_GROUPS_TABLE_ID, 10, '0') & "/"
   let endKey = "/t/" & align($(SYS_GROUPS_TABLE_ID + 1), 10, '0') & "/"
-  let sm = store.getOrCreateSM(META_GROUP_ID)
-  acquire(store.smMu)
-  var entries: seq[(string, string)] = @[]
-  for k, v in sm.kvStore:
-    if k >= startKey and k < endKey:
-      entries.add((k, v))
-  release(store.smMu)
+  let backend = store.getBackend()
+  var entries: seq[KeyValuePair] = @[]
+  if backend != nil and backend.isOpen:
+    {.cast(raises: []).}:
+      entries = backend.scan(startKey, endKey)
 
   store.groupMembers.clear()
   store.preferredLeaders.clear()
@@ -345,7 +341,6 @@ proc applyBatchToSM*(storePtr: pointer, rid: GroupID,
   if storePtr == nil: return
   let store = cast[RaftKVStoreExt](storePtr)
   GC_ref(store) # prevent ORC from freeing on scope exit (balances the decrement)
-  let sm = store.getOrCreateSM(rid)
 
   # --- Persist to WiscKey (no fdatasync — Raft log is the durability guarantee) ---
   let backend = store.coordinator.store
@@ -359,17 +354,9 @@ proc applyBatchToSM*(storePtr: pointer, rid: GroupID,
         delKeys.add(fromBytes(k))
       discard backend.writeBatchNoSync(pairs, delKeys)
 
-  # --- Update in-memory state machine (for fast reads) ---
-  acquire(store.smMu)
-  for (k, v) in batch.puts:
-    sm.kvStore[fromBytes(k)] = fromBytes(v)
-  for k in batch.deletes:
-    sm.kvStore.del(fromBytes(k))
-  release(store.smMu)
+  # No in-memory state machine to update — reads go through WiscKey directly.
 
   # --- Notify on sys.groups metadata changes (peer group creation) ---
-  # Must run AFTER releasing smMu since the callback calls registerGroup
-  # which acquires smMu (Nim Locks are not reentrant).
   let groupsPrefix = "/t/" & align($SYS_GROUPS_TABLE_ID, 10, '0') & "/"
   for (k, v) in batch.puts:
     let key = fromBytes(k)
@@ -480,29 +467,28 @@ proc proposeWrite(store: RaftKVStoreExt, groupId: GroupID,
 
 proc raftGet*(store: RaftKVStoreExt,
     key: string): RSResult[Option[RaftKVEntry]] {.gcsafe, raises: [].} =
-  ## Read the current value for `key` from the local state machine.
+  ## Read the current value for `key` from the WiscKey backend.
   ## Reads are served locally (leader / leaseholder read semantics).
   let ridOpt = store.resolveGroupId(key)
   if ridOpt.isNone:
     return rsErr[Option[RaftKVEntry]](newRSE(rseGroupNotFound,
         &"no shard for key '{key}'"))
 
-  let sm = store.getOrCreateSM(ridOpt.get())
-  acquire(store.smMu)
-  defer: release(store.smMu)
-
   # Skip intent keys on plain reads
   if isIntentKey(key) or isCoordKey(key):
     return rsOk[Option[RaftKVEntry]](none(RaftKVEntry))
 
-  if sm.kvStore.hasKey(key):
-    let v = sm.kvStore.getOrDefault(key)
-    let entry = RaftKVEntry(
-      value: v,
-      version: 1'u64, # TODO: track versions per key when needed
-      timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
-    )
-    return rsOk[Option[RaftKVEntry]](some(entry))
+  let backend = store.getBackend()
+  if backend != nil and backend.isOpen:
+    {.cast(raises: []).}:
+      let valOpt = backend.get(key)
+      if valOpt.isSome:
+        let entry = RaftKVEntry(
+          value: valOpt.get(),
+          version: 1'u64,
+          timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
+        )
+        return rsOk[Option[RaftKVEntry]](some(entry))
 
   rsOk[Option[RaftKVEntry]](none(RaftKVEntry))
 
@@ -533,17 +519,18 @@ proc raftDelete*(store: RaftKVStoreExt,
     return rsErr[Option[RaftKVEntry]](newRSE(rseGroupNotFound,
         &"no shard for key '{key}'"))
 
-  # Capture previous value first (under smMu)
+  # Capture previous value from backend
   var prevEntry: Option[RaftKVEntry]
-  let sm = store.getOrCreateSM(ridOpt.get())
-  acquire(store.smMu)
-  if sm.kvStore.hasKey(key):
-    prevEntry = some(RaftKVEntry(
-      value: sm.kvStore.getOrDefault(key),
-      version: 1'u64,
-      timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
-    ))
-  release(store.smMu)
+  let backend = store.getBackend()
+  if backend != nil and backend.isOpen:
+    {.cast(raises: []).}:
+      let valOpt = backend.get(key)
+      if valOpt.isSome:
+        prevEntry = some(RaftKVEntry(
+          value: valOpt.get(),
+          version: 1'u64,
+          timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
+        ))
 
   let batch = newWriteBatch()
   batch.delete(toBytes(key))
@@ -558,34 +545,25 @@ proc raftScan*(store: RaftKVStoreExt, startKey, endKey: string,
     limit: uint32,
     includeSystemKeys: bool = false): RSResult[seq[(string, RaftKVEntry)]] {.gcsafe, raises: [].} =
   ## Scan keys in [startKey, endKey) up to `limit` results.
-  ## Aggregates across all shards whose groups overlap the query span.
+  ## Uses WiscKey backend.scan() directly — results are already sorted by key.
   ## By default, system table keys (/t/0000000001/... through /t/0000000099/...)
   ## are excluded from results. Set includeSystemKeys=true to include them.
   var pairs: seq[(string, RaftKVEntry)] = @[]
+  let backend = store.getBackend()
+  if backend == nil or not backend.isOpen:
+    return rsOk[seq[(string, RaftKVEntry)]](@[])
 
-  acquire(store.smMu)
-  var smCopy: seq[(GroupID, KVStateMachine)] = @[]
-  for rid, sm in store.stateMachines:
-    smCopy.add((rid, sm))
-  release(store.smMu)
-
-  for (rid, sm) in smCopy:
-    acquire(store.smMu)
-    for k, v in sm.kvStore:
-      # Skip internal intent / coord keys
+  {.cast(raises: []).}:
+    # Scan with no limit; we filter below. LevelDB iterates in sorted order.
+    let raw = backend.scan(startKey, endKey)
+    let ts = uint64(getTime().toUnixFloat() * 1_000_000_000)
+    for (k, v) in raw:
       if isIntentKey(k) or isCoordKey(k): continue
-      # Skip system table keys unless explicitly requested
       if not includeSystemKeys and isSystemKey(k): continue
-      let afterStart = startKey.len == 0 or k >= startKey
-      let beforeEnd = endKey.len == 0 or k < endKey
-      if afterStart and beforeEnd:
-        pairs.add((k, RaftKVEntry(value: v, version: 1'u64,
-            timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000))))
-    release(store.smMu)
+      pairs.add((k, RaftKVEntry(value: v, version: 1'u64, timestamp: ts)))
+      if limit > 0 and pairs.len >= int(limit):
+        break
 
-  pairs.sort(proc(a, b: (string, RaftKVEntry)): int = cmp(a[0], b[0]))
-  if limit > 0 and pairs.len > int(limit):
-    pairs.setLen(int(limit))
   rsOk[seq[(string, RaftKVEntry)]](pairs)
 
 proc shardCount*(store: RaftKVStoreExt): int {.gcsafe, raises: [].} =
@@ -595,12 +573,15 @@ proc shardCount*(store: RaftKVStoreExt): int {.gcsafe, raises: [].} =
   store.stateMachines.len
 
 proc raftLen*(store: RaftKVStoreExt): int {.gcsafe, raises: [].} =
+  ## Count all user keys (excluding intents and coord records) via backend scan.
   var total = 0
-  acquire(store.smMu)
-  for rid, sm in store.stateMachines:
-    for k in sm.kvStore.keys:
+  let backend = store.getBackend()
+  if backend == nil or not backend.isOpen:
+    return 0
+  {.cast(raises: []).}:
+    let raw = backend.scan("", "")
+    for (k, _) in raw:
       if not isIntentKey(k) and not isCoordKey(k): inc total
-  release(store.smMu)
   total
 
 # ---------------------------------------------------------------------------
@@ -625,17 +606,11 @@ proc raftBufferIntent*(store: RaftKVStoreExt, txnId: uint64, key,
   if ridOpt.isNone:
     return rsVErr(newRSE(rseGroupNotFound, &"no shard for key '{key}'"))
 
-  let backend = store.coordinator.store
+  let backend = store.getBackend()
   if backend != nil and backend.isOpen:
     {.cast(raises: []).}:
       let pairs: seq[KeyValuePair] = @[(key: intentKey, value: value)]
       discard backend.writeBatchNoSync(pairs, @[])
-
-  # Also update the in-memory state machine so reads-your-own-writes work
-  let sm = store.getOrCreateSM(ridOpt.get())
-  acquire(store.smMu)
-  sm.kvStore[intentKey] = value
-  release(store.smMu)
 
   rsVOk()
 
@@ -647,15 +622,10 @@ proc raftDeleteIntent*(store: RaftKVStoreExt, txnId: uint64,
   if ridOpt.isNone:
     return rsVErr(newRSE(rseGroupNotFound, &"no shard for key '{key}'"))
 
-  let backend = store.coordinator.store
+  let backend = store.getBackend()
   if backend != nil and backend.isOpen:
     {.cast(raises: []).}:
       discard backend.writeBatchNoSync(@[], @[intentKey])
-
-  let sm = store.getOrCreateSM(ridOpt.get())
-  acquire(store.smMu)
-  sm.kvStore.del(intentKey)
-  release(store.smMu)
 
   rsVOk()
 
@@ -692,20 +662,19 @@ proc raftCommitTxn*(store: RaftKVStoreExt, txnId: uint64,
   var rids: seq[GroupID] = @[]
   for rid in batches.keys: rids.add(rid)
 
+  let backend = store.getBackend()
   for rid in rids:
-    let sm = store.getOrCreateSM(rid)
-    acquire(store.smMu)
     for key in writeSet:
       let keyRidOpt = store.resolveGroupId(key)
       if keyRidOpt.isNone or keyRidOpt.get() != rid: continue
       let intentKey = encodeIntentKey(txnId, key)
-      if sm.kvStore.hasKey(intentKey):
-        let val = sm.kvStore.getOrDefault(intentKey)
+      if backend != nil and backend.isOpen:
         {.cast(raises: []).}:
-          batches[rid].put(toBytes(key), toBytes(val))
-          batches[rid].delete(toBytes(intentKey))
+          let valOpt = backend.get(intentKey)
+          if valOpt.isSome:
+            batches[rid].put(toBytes(key), toBytes(valOpt.get()))
+            batches[rid].delete(toBytes(intentKey))
       # Intent not found → key was never written; skip silently.
-    release(store.smMu)
 
   # --- Propose each non-empty batch to its Raft group ---
   for rid in rids:
@@ -753,19 +722,18 @@ proc raftCommitTxnPipelined*(store: RaftKVStoreExt, txnId: uint64,
   for rid in batches.keys: rids.add(rid)
 
   # --- Step 2: fill per-shard WriteBatches ---
+  let backend = store.getBackend()
   for rid in rids:
-    let sm = store.getOrCreateSM(rid)
-    acquire(store.smMu)
     for key in writeSet:
       let keyRidOpt = store.resolveGroupId(key)
       if keyRidOpt.isNone or keyRidOpt.get() != rid: continue
       let intentKey = encodeIntentKey(txnId, key)
-      if sm.kvStore.hasKey(intentKey):
-        let val = sm.kvStore.getOrDefault(intentKey)
+      if backend != nil and backend.isOpen:
         {.cast(raises: []).}:
-          batches[rid].put(toBytes(key), toBytes(val))
-          batches[rid].delete(toBytes(intentKey))
-    release(store.smMu)
+          let valOpt = backend.get(intentKey)
+          if valOpt.isSome:
+            batches[rid].put(toBytes(key), toBytes(valOpt.get()))
+            batches[rid].delete(toBytes(intentKey))
 
   # --- Step 3: build the parallel proposal list ---
   var proposals: seq[tuple[groupId: GroupID, command: RaftCommand]] = @[]
@@ -809,30 +777,29 @@ proc raftGetForTxn*(store: RaftKVStoreExt, txnId: uint64,
     return rsErr[Option[RaftKVEntry]](newRSE(rseGroupNotFound,
         &"no shard for key '{key}'"))
 
-  let sm = store.getOrCreateSM(ridOpt.get())
   let intentKey = encodeIntentKey(txnId, key)
-
-  acquire(store.smMu)
-  let hasIntent = sm.kvStore.hasKey(intentKey)
-  let intentVal = if hasIntent: sm.kvStore.getOrDefault(intentKey) else: ""
-  # Also check committed key while holding the lock
-  let hasCommitted = (not hasIntent) and sm.kvStore.hasKey(key)
-  let committedVal = if hasCommitted: sm.kvStore.getOrDefault(key) else: ""
-  release(store.smMu)
-
+  let backend = store.getBackend()
   let ts = uint64(getTime().toUnixFloat() * 1_000_000_000)
-  if hasIntent:
-    return rsOk[Option[RaftKVEntry]](some(RaftKVEntry(
-      value: intentVal,
-      version: 1'u64,
-      timestamp: ts,
-    )))
-  if hasCommitted:
-    return rsOk[Option[RaftKVEntry]](some(RaftKVEntry(
-      value: committedVal,
-      version: 1'u64,
-      timestamp: ts,
-    )))
+
+  if backend != nil and backend.isOpen:
+    {.cast(raises: []).}:
+      # Check intent first (reads-your-own-writes)
+      let intentOpt = backend.get(intentKey)
+      if intentOpt.isSome:
+        return rsOk[Option[RaftKVEntry]](some(RaftKVEntry(
+          value: intentOpt.get(),
+          version: 1'u64,
+          timestamp: ts,
+        )))
+      # Fall back to committed value
+      let committedOpt = backend.get(key)
+      if committedOpt.isSome:
+        return rsOk[Option[RaftKVEntry]](some(RaftKVEntry(
+          value: committedOpt.get(),
+          version: 1'u64,
+          timestamp: ts,
+        )))
+
   rsOk[Option[RaftKVEntry]](none(RaftKVEntry))
 
 proc raftResolveIntent*(store: RaftKVStoreExt, txnId: uint64,
@@ -878,11 +845,10 @@ proc raftReadCoordRecord*(store: RaftKVStoreExt,
     txnId: uint64): Option[string] {.gcsafe, raises: [].} =
   ## Read back a coordinator record (for recovery).
   let coordKey = encodeCoordKey(txnId)
-  let sm = store.getOrCreateSM(META_GROUP_ID)
-  acquire(store.smMu)
-  defer: release(store.smMu)
-  if sm.kvStore.hasKey(coordKey):
-    return some(sm.kvStore.getOrDefault(coordKey))
+  let backend = store.getBackend()
+  if backend != nil and backend.isOpen:
+    {.cast(raises: []).}:
+      return backend.get(coordKey)
   none(string)
 
 # ---------------------------------------------------------------------------
@@ -894,13 +860,11 @@ proc loadSpaces*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
   ## Call after bootstrap/recovery when the state machine is populated.
   let startKey = "/t/" & align($SYS_SPACES_TABLE_ID, 10, '0') & "/"
   let endKey = "/t/" & align($(SYS_SPACES_TABLE_ID + 1), 10, '0') & "/"
-  let sm = store.getOrCreateSM(META_GROUP_ID)
-  acquire(store.smMu)
-  var entries: seq[(string, string)] = @[]
-  for k, v in sm.kvStore:
-    if k >= startKey and k < endKey:
-      entries.add((k, v))
-  release(store.smMu)
+  let backend = store.getBackend()
+  var entries: seq[KeyValuePair] = @[]
+  if backend != nil and backend.isOpen:
+    {.cast(raises: []).}:
+      entries = backend.scan(startKey, endKey)
 
   acquire(store.spacesMu)
   store.spaces.clear()
@@ -925,13 +889,11 @@ proc loadTableSpaces*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
   ## Scan sys.tables and populate the tableId → spaceId mapping.
   let startKey = "/t/" & align($SYS_TABLES_TABLE_ID, 10, '0') & "/"
   let endKey = "/t/" & align($(SYS_TABLES_TABLE_ID + 1), 10, '0') & "/"
-  let sm = store.getOrCreateSM(META_GROUP_ID)
-  acquire(store.smMu)
-  var entries: seq[(string, string)] = @[]
-  for k, v in sm.kvStore:
-    if k >= startKey and k < endKey:
-      entries.add((k, v))
-  release(store.smMu)
+  let backend = store.getBackend()
+  var entries: seq[KeyValuePair] = @[]
+  if backend != nil and backend.isOpen:
+    {.cast(raises: []).}:
+      entries = backend.scan(startKey, endKey)
 
   acquire(store.spacesMu)
   store.tableSpaces.clear()
@@ -1051,36 +1013,36 @@ proc raftGetInSpace*(store: RaftKVStoreExt, key: string,
     isLocalLeader = localGroup.isSome and localGroup.get.isLeader()
 
   if isLocalLeader or store.peerStores.len == 0:
-    # We're the leader — read from our local SM
-    let sm = store.getOrCreateSM(rid)
-    acquire(store.smMu)
-    defer: release(store.smMu)
-    if sm.kvStore.hasKey(key):
-      let v = sm.kvStore.getOrDefault(key)
-      let entry = RaftKVEntry(
-        value: v,
-        version: 1'u64,
-        timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
-      )
-      return rsOk[Option[RaftKVEntry]](some(entry))
+    # We're the leader — read from our local backend
+    let backend = store.getBackend()
+    if backend != nil and backend.isOpen:
+      {.cast(raises: []).}:
+        let valOpt = backend.get(key)
+        if valOpt.isSome:
+          let entry = RaftKVEntry(
+            value: valOpt.get(),
+            version: 1'u64,
+            timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
+          )
+          return rsOk[Option[RaftKVEntry]](some(entry))
     return rsOk[Option[RaftKVEntry]](none(RaftKVEntry))
   else:
-    # Not the leader — forward to the leader's SM for consistent reads
+    # Not the leader — forward to the leader for consistent reads
     let peerOpt = store.findPeerForGroup(rid)
     if peerOpt.isSome:
       return peerOpt.get().raftGetInSpace(key, space, primaryKey)
-    # Fallback: read from local SM even though we're not leader
-    let sm = store.getOrCreateSM(rid)
-    acquire(store.smMu)
-    defer: release(store.smMu)
-    if sm.kvStore.hasKey(key):
-      let v = sm.kvStore.getOrDefault(key)
-      let entry = RaftKVEntry(
-        value: v,
-        version: 1'u64,
-        timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
-      )
-      return rsOk[Option[RaftKVEntry]](some(entry))
+    # Fallback: read from local backend even though we're not leader
+    let backend = store.getBackend()
+    if backend != nil and backend.isOpen:
+      {.cast(raises: []).}:
+        let valOpt = backend.get(key)
+        if valOpt.isSome:
+          let entry = RaftKVEntry(
+            value: valOpt.get(),
+            version: 1'u64,
+            timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
+          )
+          return rsOk[Option[RaftKVEntry]](some(entry))
     return rsOk[Option[RaftKVEntry]](none(RaftKVEntry))
 
 proc forwardDeleteToLeader(store: RaftKVStoreExt, rid: GroupID,
@@ -1090,17 +1052,18 @@ proc forwardDeleteToLeader(store: RaftKVStoreExt, rid: GroupID,
   let batch = newWriteBatch()
   batch.delete(toBytes(key))
   for peer in peers:
-    # Capture previous value from peer's SM
+    # Capture previous value from peer's backend
     var prevEntry: Option[RaftKVEntry]
-    let sm = peer.getOrCreateSM(rid)
-    acquire(peer.smMu)
-    if sm.kvStore.hasKey(key):
-      prevEntry = some(RaftKVEntry(
-        value: sm.kvStore.getOrDefault(key),
-        version: 1'u64,
-        timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
-      ))
-    release(peer.smMu)
+    let peerBackend = peer.getBackend()
+    if peerBackend != nil and peerBackend.isOpen:
+      {.cast(raises: []).}:
+        let valOpt = peerBackend.get(key)
+        if valOpt.isSome:
+          prevEntry = some(RaftKVEntry(
+            value: valOpt.get(),
+            version: 1'u64,
+            timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
+          ))
     let vr = proposeWrite(peer, rid, batch)
     if vr.isOk:
       return rsOk[Option[RaftKVEntry]](prevEntry)
@@ -1119,17 +1082,18 @@ proc raftDeleteInSpace*(store: RaftKVStoreExt, key: string,
   let rid = routeToGroup(primaryKey, space.groupIds)
   if not store.coordinator.hasGroup(rid):
     return store.forwardDeleteToLeader(rid, key)
-  # Capture previous value
+  # Capture previous value from backend
   var prevEntry: Option[RaftKVEntry]
-  let sm = store.getOrCreateSM(rid)
-  acquire(store.smMu)
-  if sm.kvStore.hasKey(key):
-    prevEntry = some(RaftKVEntry(
-      value: sm.kvStore.getOrDefault(key),
-      version: 1'u64,
-      timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
-    ))
-  release(store.smMu)
+  let backend = store.getBackend()
+  if backend != nil and backend.isOpen:
+    {.cast(raises: []).}:
+      let valOpt = backend.get(key)
+      if valOpt.isSome:
+        prevEntry = some(RaftKVEntry(
+          value: valOpt.get(),
+          version: 1'u64,
+          timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
+        ))
   let batch = newWriteBatch()
   batch.delete(toBytes(key))
   let vr = proposeWrite(store, rid, batch)
@@ -1142,46 +1106,56 @@ proc raftDeleteInSpace*(store: RaftKVStoreExt, key: string,
 proc scanLocalGroup(store: RaftKVStoreExt, rid: GroupID,
     startKey, endKey: string,
     includeSystemKeys: bool): seq[(string, RaftKVEntry)] {.gcsafe, raises: [].} =
-  ## Scan a single local group's state machine for matching keys.
-  let sm = store.getOrCreateSM(rid)
+  ## Scan the WiscKey backend for matching keys in the given range.
+  ## Note: with a single shared backend, `rid` is informational only; the
+  ## backend stores all groups' data in one LevelDB instance.
   var pairs: seq[(string, RaftKVEntry)] = @[]
-  acquire(store.smMu)
-  for k, v in sm.kvStore:
-    if isIntentKey(k) or isCoordKey(k): continue
-    if not includeSystemKeys and isSystemKey(k): continue
-    let afterStart = startKey.len == 0 or k >= startKey
-    let beforeEnd = endKey.len == 0 or k < endKey
-    if afterStart and beforeEnd:
-      pairs.add((k, RaftKVEntry(value: v, version: 1'u64,
-          timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000))))
-  release(store.smMu)
-  pairs.sort(proc(a, b: (string, RaftKVEntry)): int = cmp(a[0], b[0]))
+  let backend = store.getBackend()
+  if backend == nil or not backend.isOpen:
+    return pairs
+  {.cast(raises: []).}:
+    let raw = backend.scan(startKey, endKey)
+    let ts = uint64(getTime().toUnixFloat() * 1_000_000_000)
+    for (k, v) in raw:
+      if isIntentKey(k) or isCoordKey(k): continue
+      if not includeSystemKeys and isSystemKey(k): continue
+      pairs.add((k, RaftKVEntry(value: v, version: 1'u64, timestamp: ts)))
   pairs
 
 proc raftScanSpace*(store: RaftKVStoreExt, startKey, endKey: string,
     space: SpaceInfo, limit: uint32 = 0,
     includeSystemKeys: bool = false): RSResult[seq[(string, RaftKVEntry)]] {.gcsafe, raises: [].} =
-  ## Fan-out scan across ALL groups in a space, then N-way merge-sort by key.
-  ## Each group's matching keys are collected and sorted independently,
-  ## then merged to produce a globally sorted result.
-  ## For groups not owned locally, the scan is forwarded to a peer store.
+  ## Scan keys in the space's key range.
+  ## With a shared WiscKey backend, all groups share the same store, so we
+  ## do a single backend scan (no per-group fan-out needed). For multi-node
+  ## clusters where peers may own different groups, we prefer scanning from
+  ## a leader node that has up-to-date data.
+  ##
+  ## For multi-node: if any of the space's groups are not locally owned,
+  ## forward to a peer that is the leader for that group and merge results.
+  ## For single-node: just scan the local backend directly.
 
-  # Phase 1: collect sorted results per group
-  # For each group, scan the leader's SM (preferring local if we're leader).
-  var groupResults: seq[seq[(string, RaftKVEntry)]] = @[]
+  if store.peerStores.len == 0:
+    # Single-node fast path: scan directly from the local backend
+    return store.raftScan(startKey, endKey, limit,
+        includeSystemKeys = includeSystemKeys)
+
+  # Multi-node: fan-out to group leaders.
+  # Since all groups on the same node share one backend, we track which
+  # stores we've already scanned to avoid duplicate results.
+  var scannedStores: seq[pointer] = @[]
+  var allPairs: seq[(string, RaftKVEntry)] = @[]
+
   for rid64 in space.groupIds:
     let rid = GroupID(rid64)
-    # Determine the best store to scan from (leader preferred)
     var scanStore = store
     if not store.coordinator.hasGroup(rid):
-      # Group not local — must forward to a peer
       let peerOpt = store.findPeerForGroup(rid)
       if peerOpt.isSome:
         scanStore = peerOpt.get()
       else:
-        continue  # no store has this group; skip
+        continue
     else:
-      # Group is local. Check if we're leader; if not, scan the leader's SM.
       {.cast(raises: []).}:
         let localGroup = store.coordinator.getGroup(rid)
         let isLocalLeader = localGroup.isSome and localGroup.get.isLeader()
@@ -1189,39 +1163,32 @@ proc raftScanSpace*(store: RaftKVStoreExt, startKey, endKey: string,
           let peerOpt = store.findPeerForGroup(rid)
           if peerOpt.isSome:
             scanStore = peerOpt.get()
+
+    # Skip if we've already scanned this store's backend
+    let storePtr = cast[pointer](scanStore)
+    var alreadyScanned = false
+    for s in scannedStores:
+      if s == storePtr:
+        alreadyScanned = true
+        break
+    if alreadyScanned: continue
+    scannedStores.add(storePtr)
+
     let pairs = scanStore.scanLocalGroup(rid, startKey, endKey, includeSystemKeys)
-    if pairs.len > 0:
-      groupResults.add(pairs)
+    for p in pairs:
+      allPairs.add(p)
 
-  # Phase 2: N-way merge-sort
-  if groupResults.len == 0:
-    return rsOk[seq[(string, RaftKVEntry)]](@[])
+  # Sort and deduplicate
+  allPairs.sort(proc(a, b: (string, RaftKVEntry)): int = cmp(a[0], b[0]))
+  # Deduplicate by key (same key from different node scans)
+  var deduped: seq[(string, RaftKVEntry)] = @[]
+  var lastKey = ""
+  for p in allPairs:
+    if p[0] != lastKey:
+      deduped.add(p)
+      lastKey = p[0]
 
-  if groupResults.len == 1:
-    var result = groupResults[0]
-    if limit > 0 and result.len > int(limit):
-      result.setLen(int(limit))
-    return rsOk[seq[(string, RaftKVEntry)]](result)
+  if limit > 0 and deduped.len > int(limit):
+    deduped.setLen(int(limit))
 
-  # Maintain an index per group into its sorted results
-  var indices = newSeq[int](groupResults.len)
-  var merged: seq[(string, RaftKVEntry)] = @[]
-
-  while true:
-    # Find the minimum key across all group heads
-    var minIdx = -1
-    var minKey = ""
-    for g in 0 ..< groupResults.len:
-      if indices[g] < groupResults[g].len:
-        let k = groupResults[g][indices[g]][0]
-        if minIdx < 0 or k < minKey:
-          minIdx = g
-          minKey = k
-    if minIdx < 0:
-      break  # all groups exhausted
-    merged.add(groupResults[minIdx][indices[minIdx]])
-    inc indices[minIdx]
-    if limit > 0 and merged.len >= int(limit):
-      break
-
-  rsOk[seq[(string, RaftKVEntry)]](merged)
+  rsOk[seq[(string, RaftKVEntry)]](deduped)
