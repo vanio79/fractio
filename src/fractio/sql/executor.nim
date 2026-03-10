@@ -706,12 +706,6 @@ proc execCreateSpace(op: PlanOp, store: RaftKVStoreExt): ExecResult =
       if myReplicaId != rangeTypes.ReplicaID(0):
         discard coord.createAndStartGroup(desc, myReplicaId)
         store.registerGroup(gid)
-        # Single-node: become leader immediately if meta group is leader
-        let metaGroup = coord.getGroup(META_GROUP_ID)
-        if metaGroup.isSome and metaGroup.get().isLeader():
-          let newGroup = coord.getGroup(gid)
-          if newGroup.isSome:
-            newGroup.get().becomeLeader()
 
   # Write space record
   let spaceKey = encodeSpaceKey(spaceId)

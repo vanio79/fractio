@@ -8,10 +8,10 @@
 #   Node 1 is forced to be the initial leader for determinism.
 #   A space with REPLICAS 3 is created via executeSQL on the leader.
 #
-# After CREATE SPACE, `distributeSpaceGroups` replicates the group metadata
-# to followers and triggers group creation on each node that is a member.
-# This mirrors what happens in a production cluster where the server.nim
-# recovery path creates groups from sys.groups after Raft log replay.
+# After CREATE SPACE, the onGroupMetadataApplied callback automatically
+# creates space groups on peer nodes as sys.groups entries replicate via
+# Raft. Tests wait for replication and then force-elect leaders for
+# determinism.
 #
 # Port allocation: 21500–21599 (Raft TCP ports)
 # Temp storage: /tmp/fractio_space_mn_<nodeId>/ (cleaned up per test)
@@ -145,40 +145,6 @@ proc seedDefaults(leaderStore: RaftKVStoreExt) =
   let scKey = encodeTableKey(SYS_SCHEMAS_TABLE_ID, "default.public")
   discard leaderStore.raftPut(scKey, $ %*{"name": "public", "database": "default"})
 
-proc createSpaceGroupsOnNode(node: TestNode) =
-  ## Scan sys.groups and create space groups that this node is a member of.
-  let store = node.store
-  let coord = node.coord
-  let nodeId = rangeTypes.NodeID(uint32(node.id))
-  let grpStart = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
-  let grpEnd = encodeTableKey(SYS_GROUPS_TABLE_ID + 1, "")
-  let grpScan = store.raftScan(grpStart, grpEnd, 0, includeSystemKeys = true)
-  if grpScan.isOk:
-    for (key, entry) in grpScan.value:
-      try:
-        let j = parseJson(entry.value)
-        let gid = GroupID(uint64(j["groupId"].getInt()))
-        if gid == META_GROUP_ID or gid == DATA_GROUP_START_ID: continue
-        if coord.hasGroup(gid): continue
-
-        var desc = rangeTypes.newGroupDescriptor(gid)
-        if j.hasKey("replicas"):
-          for r in j["replicas"]:
-            discard desc.addReplica(
-              rangeTypes.NodeID(uint32(r["nodeId"].getInt())),
-              rangeTypes.rtVoter)
-
-        var myReplicaId = rangeTypes.ReplicaID(0)
-        for r in desc.replicas:
-          if r.nodeId == nodeId:
-            myReplicaId = r.replicaId
-            break
-
-        if myReplicaId != rangeTypes.ReplicaID(0):
-          discard coord.createAndStartGroup(desc, myReplicaId)
-          store.registerGroup(gid)
-      except: discard
-
 proc wirePeerStores(nodes: seq[TestNode]) =
   ## Register every node's store as a peer of every other node.
   for i in 0 ..< nodes.len:
@@ -186,16 +152,28 @@ proc wirePeerStores(nodes: seq[TestNode]) =
       if i != j:
         nodes[i].store.addPeerStore(uint32(nodes[j].id), nodes[j].store)
 
-proc distributeSpaceGroups(nodes: seq[TestNode]) =
-  ## After CREATE SPACE on the leader: wait for replication of sys.groups
-  ## entries, create space groups on all follower nodes, then elect a leader
-  ## for each space group (the first member node).
-  sleep(500)
-  for node in nodes:
-    createSpaceGroupsOnNode(node)
+proc waitForAutoDistribution(nodes: seq[TestNode], expectedGroupIds: seq[uint64],
+    replicaCount: int, maxWaitMs: int = 3000) =
+  ## Wait for the onGroupMetadataApplied callback to create space groups on
+  ## all peer nodes. Polls until the expected total membership count is reached
+  ## or the timeout expires.
+  let expectedTotal = expectedGroupIds.len * replicaCount
+  let stepMs = 50
+  var waited = 0
+  while waited < maxWaitMs:
+    var totalMemberships = 0
+    for node in nodes:
+      for gid in expectedGroupIds:
+        if node.coord.hasGroup(GroupID(gid)):
+          inc totalMemberships
+    if totalMemberships >= expectedTotal:
+      break
+    sleep(stepMs)
+    waited += stepMs
 
-  # For each space group, make the first member node the leader.
-  # Read sys.groups from the leader to determine membership.
+proc electSpaceLeaders(nodes: seq[TestNode]) =
+  ## Force-elect a leader for each space group (the first member node).
+  ## Used for deterministic tests after automatic group distribution.
   let store = nodes[0].store
   let grpStart = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
   let grpEnd = encodeTableKey(SYS_GROUPS_TABLE_ID + 1, "")
@@ -217,6 +195,12 @@ proc distributeSpaceGroups(nodes: seq[TestNode]) =
               break
       except: discard
   sleep(300)
+
+proc distributeSpaceGroups(nodes: seq[TestNode]) =
+  ## After CREATE SPACE on the leader: wait for the onGroupMetadataApplied
+  ## callback to create space groups on peer nodes, then force-elect leaders.
+  waitForAutoDistribution(nodes, @[3'u64, 4, 5, 6, 7], 3)
+  electSpaceLeaders(nodes)
 
 proc reelectLeaders(nodes: seq[TestNode], deadNodeIds: seq[int]) =
   ## After killing nodes, find groups with no leader among surviving nodes
@@ -323,12 +307,15 @@ suite "Space multinode — CREATE SPACE creates real Raft groups":
         inc leaderGroupCount
     check leaderGroupCount >= 3  # node 1 is in at least 3 of 5 groups
 
-  test "distributeSpaceGroups creates groups on all member nodes":
+  test "onGroupMetadataApplied creates groups on all member nodes":
     var nodes = makeCluster5()
     defer: stopCluster(nodes)
 
     discard exec(nodes[0].store, "CREATE SPACE testspace WITH REPLICAS = 3")
-    distributeSpaceGroups(nodes)
+
+    # Wait for the callback to automatically create groups on peer nodes.
+    # No manual createSpaceGroupsOnNode — the callback does it.
+    waitForAutoDistribution(nodes, @[3'u64, 4, 5, 6, 7], 3)
 
     # With RF=3, each group is on exactly 3 nodes. Count total group
     # memberships: 5 groups × 3 replicas = 15 total memberships.

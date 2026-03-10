@@ -361,11 +361,22 @@ proc applyBatchToSM*(storePtr: pointer, rid: GroupID,
 
   # --- Update in-memory state machine (for fast reads) ---
   acquire(store.smMu)
-  defer: release(store.smMu)
   for (k, v) in batch.puts:
     sm.kvStore[fromBytes(k)] = fromBytes(v)
   for k in batch.deletes:
     sm.kvStore.del(fromBytes(k))
+  release(store.smMu)
+
+  # --- Notify on sys.groups metadata changes (peer group creation) ---
+  # Must run AFTER releasing smMu since the callback calls registerGroup
+  # which acquires smMu (Nim Locks are not reentrant).
+  let groupsPrefix = "/t/" & align($SYS_GROUPS_TABLE_ID, 10, '0') & "/"
+  for (k, v) in batch.puts:
+    let key = fromBytes(k)
+    if key.startsWith(groupsPrefix):
+      {.cast(gcsafe).}:
+        if onGroupMetadataApplied != nil:
+          onGroupMetadataApplied(storePtr, key, fromBytes(v))
 
 proc wireApplyCallback*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
   ## Wire the applyBatchToSM callback into the coordinator so that committed
@@ -388,6 +399,50 @@ proc wireApplyCallback*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
         result = some(NodeID(pl))
       else:
         result = none(NodeID)
+    multigroup_coordinator.onGroupMetadataApplied = proc(
+        storePtr: pointer,
+        groupKey: string, groupValue: string) {.gcsafe, raises: [].} =
+      ## When sys.groups metadata replicates via Raft, create the local Raft
+      ## group if this node is a member but hasn't instantiated it yet.
+      if storePtr == nil: return
+      let s = cast[RaftKVStoreExt](storePtr)
+      GC_ref(s)
+      defer: GC_unref(s)
+      let coord = s.coordinator
+      {.cast(gcsafe).}:
+        try:
+          let j = parseJson(groupValue)
+          let gid = GroupID(uint64(j["groupId"].getInt()))
+          if gid == META_GROUP_ID or gid == DATA_GROUP_START_ID: return
+          if coord.hasGroup(gid): return
+
+          var desc = rangeTypes.newGroupDescriptor(gid)
+          if j.hasKey("replicas"):
+            for r in j["replicas"]:
+              discard desc.addReplica(
+                rangeTypes.NodeID(uint32(r["nodeId"].getInt())),
+                rangeTypes.rtVoter)
+
+          var myReplicaId = rangeTypes.ReplicaID(0)
+          for r in desc.replicas:
+            if r.nodeId == coord.nodeId:
+              myReplicaId = r.replicaId
+              break
+
+          if myReplicaId != rangeTypes.ReplicaID(0):
+            discard coord.createAndStartGroup(desc, myReplicaId)
+            s.registerGroup(gid)
+            # Update group membership cache
+            var members: seq[uint32] = @[]
+            for r in desc.replicas:
+              members.add(uint32(r.nodeId))
+            s.groupMembers[gid] = members
+            if j.hasKey("preferredLeader"):
+              let pl = uint32(j["preferredLeader"].getInt())
+              if pl > 0:
+                s.preferredLeaders[gid] = pl
+        except:
+          discard
   store.coordinator.kvStorePtr = cast[pointer](store)
 
 proc bootstrapStore*(store: RaftKVStoreExt,

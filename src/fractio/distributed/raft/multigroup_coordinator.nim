@@ -207,6 +207,11 @@ var applyBatchCallback*: proc(storePtr: pointer, rid: GroupID,
 var getPreferredLeaderCallback*: proc(storePtr: pointer,
     groupId: GroupID): Option[NodeID] {.gcsafe, raises: [].} = nil
 
+# Module-level callback triggered when a sys.groups key is applied via Raft.
+# Allows peer nodes to create Raft groups at runtime when metadata replicates.
+var onGroupMetadataApplied*: proc(storePtr: pointer,
+    groupKey: string, groupValue: string) {.gcsafe, raises: [].} = nil
+
 const PREFERRED_LEADER_STEPDOWN_COOLDOWN_NS* = 10_000_000_000'i64 # 10 seconds
 
 proc applyUpTo*(c: MultiRaftCoordinator, groupId: GroupID,
