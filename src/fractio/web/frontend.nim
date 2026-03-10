@@ -26,21 +26,15 @@ appRoutes "app":
   "/":
     let hs = healthStr(safeInt(gHealth.get(), "status"))
     let hc = healthColor(safeInt(gHealth.get(), "status"))
-    tDiv(style = "display:flex;flex-direction:column;min-height:100vh"):
-      tHeader(style = "display:flex;align-items:center;gap:1rem;padding:0 1.75rem;height:60px;background:#e81c1c;box-shadow:0 2px 8px rgba(0,0,0,.18);position:sticky;top:0;z-index:100"):
-        tDiv(style = "font-size:1.1rem;font-weight:800;color:#fff;letter-spacing:.1em"):
-          "⬡ FRACTIO"
+    tDiv(style = shellStyle):
+      tHeader(style = headerStyle):
+        tDiv(style = logoStyle): "⬡ FRACTIO"
         tDiv(style = "flex:1")
-        tSpan(style = "background:{hc};color:#fff;padding:.25rem .75rem;border-radius:999px;font-size:.8rem;font-weight:700"):
-          "{hs}"
-      tNav(style = "background:#2d2d2d;display:flex;padding:0 1.25rem"):
-        tA(href = "/#/",        style = "{navStyle(true)}"):   "Dashboard"
-        tA(href = "/#/nodes",   style = "{navStyle(false)}"): "Nodes"
-        tA(href = "/#/metrics", style = "{navStyle(false)}"): "Metrics"
-        tA(href = "/#/clock",   style = "{navStyle(false)}"): "Clock"
-        tA(href = "/#/spaces", style = "{navStyle(false)}"): "Spaces"
-        tA(href = "/#/data",   style = "{navStyle(false)}"): "Data"
-      tMain(style = "flex:1;padding:1.75rem;max-width:1260px;width:100%"):
+        tSpan(style = "{badgeStyle(hc)}"): "{hs}"
+      tNav(style = navBarStyle):
+        for (href, label) in navItems:
+          tA(href = href, style = "{navStyle(label == \"Dashboard\")}"): "{label}"
+      tMain(style = mainStyle):
         let nid  = $safeIntStr(gInfo.get(), "nodeId")
         let role = roleStr(safeInt(gInfo.get(), "role"))
         let upt  = uptimeStr(safeInt(gInfo.get(), "uptimeSecs"))
@@ -59,25 +53,22 @@ appRoutes "app":
                 "{cardLbl}"
               tDiv(style = "font-size:1.5rem;font-weight:700;color:#e81c1c"):
                 "{cardVal}"
-      tFooter(style = "padding:.75rem 1.75rem;background:#2d2d2d;color:#999;font-size:.75rem;text-align:center"):
+      tFooter(style = footerStyle):
         "Fractio Management Console · Auto-refresh every 5s"
 
   # ---- Nodes ----
   "/nodes":
     let hs2 = healthStr(safeInt(gHealth.get(), "status"))
     let hc2 = healthColor(safeInt(gHealth.get(), "status"))
-    tDiv(style = "display:flex;flex-direction:column;min-height:100vh"):
-      tHeader(style = "display:flex;align-items:center;gap:1rem;padding:0 1.75rem;height:60px;background:#e81c1c;box-shadow:0 2px 8px rgba(0,0,0,.18);position:sticky;top:0;z-index:100"):
-        tDiv(style = "font-size:1.1rem;font-weight:800;color:#fff;letter-spacing:.1em"): "⬡ FRACTIO"
+    tDiv(style = shellStyle):
+      tHeader(style = headerStyle):
+        tDiv(style = logoStyle): "⬡ FRACTIO"
         tDiv(style = "flex:1")
-        tSpan(style = "background:{hc2};color:#fff;padding:.25rem .75rem;border-radius:999px;font-size:.8rem;font-weight:700"): "{hs2}"
-      tNav(style = "background:#2d2d2d;display:flex;padding:0 1.25rem"):
-        tA(href = "/#/",        style = "{navStyle(false)}"): "Dashboard"
-        tA(href = "/#/nodes",   style = "{navStyle(true)}"):  "Nodes"
-        tA(href = "/#/metrics", style = "{navStyle(false)}"): "Metrics"
-        tA(href = "/#/clock",   style = "{navStyle(false)}"): "Clock"
-        tA(href = "/#/data",    style = "{navStyle(false)}"): "Data"
-      tMain(style = "flex:1;padding:1.75rem;max-width:1260px;width:100%"):
+        tSpan(style = "{badgeStyle(hc2)}"): "{hs2}"
+      tNav(style = navBarStyle):
+        for (href, label) in navItems:
+          tA(href = href, style = "{navStyle(label == \"Nodes\")}"): "{label}"
+      tMain(style = mainStyle):
         let arr = to(gNodes.get(), seq[JsObject])
         let arrLen = arr.len
         let nodeCount = $jsLen(gNodes.get()) & (if arrLen != 1: " nodes" else: " node")
@@ -137,25 +128,22 @@ appRoutes "app":
             let mc = if gMsgOk: "#1a7f37" else: "#c41010"
             let mt = $gMsg
             tDiv(style = "font-size:.82rem;color:{mc}"): "{mt}"
-      tFooter(style = "padding:.75rem 1.75rem;background:#2d2d2d;color:#999;font-size:.75rem;text-align:center"):
+      tFooter(style = footerStyle):
         "Fractio Management Console · Auto-refresh every 5s"
 
   # ---- Metrics ----
   "/metrics":
     let hs3 = healthStr(safeInt(gHealth.get(), "status"))
     let hc3 = healthColor(safeInt(gHealth.get(), "status"))
-    tDiv(style = "display:flex;flex-direction:column;min-height:100vh"):
-      tHeader(style = "display:flex;align-items:center;gap:1rem;padding:0 1.75rem;height:60px;background:#e81c1c;box-shadow:0 2px 8px rgba(0,0,0,.18);position:sticky;top:0;z-index:100"):
-        tDiv(style = "font-size:1.1rem;font-weight:800;color:#fff;letter-spacing:.1em"): "⬡ FRACTIO"
+    tDiv(style = shellStyle):
+      tHeader(style = headerStyle):
+        tDiv(style = logoStyle): "⬡ FRACTIO"
         tDiv(style = "flex:1")
-        tSpan(style = "background:{hc3};color:#fff;padding:.25rem .75rem;border-radius:999px;font-size:.8rem;font-weight:700"): "{hs3}"
-      tNav(style = "background:#2d2d2d;display:flex;padding:0 1.25rem"):
-        tA(href = "/#/",        style = "{navStyle(false)}"): "Dashboard"
-        tA(href = "/#/nodes",   style = "{navStyle(false)}"): "Nodes"
-        tA(href = "/#/metrics", style = "{navStyle(true)}"):  "Metrics"
-        tA(href = "/#/clock",   style = "{navStyle(false)}"): "Clock"
-        tA(href = "/#/data",    style = "{navStyle(false)}"): "Data"
-      tMain(style = "flex:1;padding:1.75rem;max-width:1260px;width:100%"):
+        tSpan(style = "{badgeStyle(hc3)}"): "{hs3}"
+      tNav(style = navBarStyle):
+        for (href, label) in navItems:
+          tA(href = href, style = "{navStyle(label == \"Metrics\")}"): "{label}"
+      tMain(style = mainStyle):
         tDiv(style = "display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:1rem"):
           tDiv(style = "background:#fff;border-radius:6px;border:1px solid #e0e0e0;padding:1rem"):
             tStrong: "Requests"
@@ -189,26 +177,22 @@ appRoutes "app":
                 tTr:
                   tTd(style = "padding:.35rem 0;color:#444"): "{lbl}"
                   tTd(style = "text-align:right;font-family:monospace;color:#e81c1c;font-weight:600"): "{v}"
-      tFooter(style = "padding:.75rem 1.75rem;background:#2d2d2d;color:#999;font-size:.75rem;text-align:center"):
+      tFooter(style = footerStyle):
         "Fractio Management Console · Auto-refresh every 5s"
 
   # ---- Clock drift ----
   "/clock":
     let hs4 = healthStr(safeInt(gHealth.get(), "status"))
     let hc4 = healthColor(safeInt(gHealth.get(), "status"))
-    tDiv(style = "display:flex;flex-direction:column;min-height:100vh"):
-      tHeader(style = "display:flex;align-items:center;gap:1rem;padding:0 1.75rem;height:60px;background:#e81c1c;box-shadow:0 2px 8px rgba(0,0,0,.18);position:sticky;top:0;z-index:100"):
-        tDiv(style = "font-size:1.1rem;font-weight:800;color:#fff;letter-spacing:.1em"): "⬡ FRACTIO"
+    tDiv(style = shellStyle):
+      tHeader(style = headerStyle):
+        tDiv(style = logoStyle): "⬡ FRACTIO"
         tDiv(style = "flex:1")
-        tSpan(style = "background:{hc4};color:#fff;padding:.25rem .75rem;border-radius:999px;font-size:.8rem;font-weight:700"): "{hs4}"
-      tNav(style = "background:#2d2d2d;display:flex;padding:0 1.25rem"):
-        tA(href = "/#/",        style = "{navStyle(false)}"): "Dashboard"
-        tA(href = "/#/nodes",   style = "{navStyle(false)}"): "Nodes"
-        tA(href = "/#/metrics", style = "{navStyle(false)}"): "Metrics"
-        tA(href = "/#/clock",   style = "{navStyle(true)}"):  "Clock"
-        tA(href = "/#/spaces", style = "{navStyle(false)}"): "Spaces"
-        tA(href = "/#/data",    style = "{navStyle(false)}"): "Data"
-      tMain(style = "flex:1;padding:1.75rem;max-width:1260px;width:100%"):
+        tSpan(style = "{badgeStyle(hc4)}"): "{hs4}"
+      tNav(style = navBarStyle):
+        for (href, label) in navItems:
+          tA(href = href, style = "{navStyle(label == \"Clock\")}"): "{label}"
+      tMain(style = mainStyle):
 
         # Title row — WS status badge is populated by injectClockDom()
         tDiv(style = "display:flex;align-items:center;gap:.75rem;margin-bottom:1.25rem"):
@@ -251,26 +235,22 @@ appRoutes "app":
         tDiv(style = "font-size:.78rem;color:#888"):
           "━ Clock offset   ╌ ±10 ms threshold   ┄ 0 ms baseline   · Updates every 1 s"
 
-      tFooter(style = "padding:.75rem 1.75rem;background:#2d2d2d;color:#999;font-size:.75rem;text-align:center"):
+      tFooter(style = footerStyle):
         "Fractio Management Console · SharedTimer drift stream"
 
   # ---- Spaces ----
   "/spaces":
     let hs5 = healthStr(safeInt(gHealth.get(), "status") + triggerLoadSpaces())
     let hc5 = healthColor(safeInt(gHealth.get(), "status"))
-    tDiv(style = "display:flex;flex-direction:column;min-height:100vh"):
-      tHeader(style = "display:flex;align-items:center;gap:1rem;padding:0 1.75rem;height:60px;background:#e81c1c;box-shadow:0 2px 8px rgba(0,0,0,.18);position:sticky;top:0;z-index:100"):
-        tDiv(style = "font-size:1.1rem;font-weight:800;color:#fff;letter-spacing:.1em"): "⬡ FRACTIO"
+    tDiv(style = shellStyle):
+      tHeader(style = headerStyle):
+        tDiv(style = logoStyle): "⬡ FRACTIO"
         tDiv(style = "flex:1")
-        tSpan(style = "background:{hc5};color:#fff;padding:.25rem .75rem;border-radius:999px;font-size:.8rem;font-weight:700"): "{hs5}"
-      tNav(style = "background:#2d2d2d;display:flex;padding:0 1.25rem"):
-        tA(href = "/#/",        style = "{navStyle(false)}"): "Dashboard"
-        tA(href = "/#/nodes",   style = "{navStyle(false)}"): "Nodes"
-        tA(href = "/#/metrics", style = "{navStyle(false)}"): "Metrics"
-        tA(href = "/#/clock",   style = "{navStyle(false)}"): "Clock"
-        tA(href = "/#/spaces",  style = "{navStyle(true)}"):  "Spaces"
-        tA(href = "/#/data",    style = "{navStyle(false)}"): "Data"
-      tMain(style = "flex:1;padding:1.75rem;max-width:1260px;width:100%"):
+        tSpan(style = "{badgeStyle(hc5)}"): "{hs5}"
+      tNav(style = navBarStyle):
+        for (href, label) in navItems:
+          tA(href = href, style = "{navStyle(label == \"Spaces\")}"): "{label}"
+      tMain(style = mainStyle):
         tDiv(style = "display:flex;align-items:center;gap:.75rem;margin-bottom:1rem"):
           tH2(style = "font-size:1.05rem;font-weight:700;color:#111;margin:0"): "Spaces"
         let spacesArr = gSpaces.get()
@@ -302,7 +282,7 @@ appRoutes "app":
                     tTd(style = "padding:.55rem .85rem;border-bottom:1px solid #eee"): "{srepStr}"
                     tTd(style = "padding:.55rem .85rem;border-bottom:1px solid #eee"): "{sgc}"
                     tTd(style = "padding:.55rem .85rem;border-bottom:1px solid #eee;font-family:monospace;font-size:.82rem"): "{sranges}"
-      tFooter(style = "padding:.75rem 1.75rem;background:#2d2d2d;color:#999;font-size:.75rem;text-align:center"):
+      tFooter(style = footerStyle):
         "Fractio Management Console · Spaces"
 
   # ===========================================================================
@@ -313,19 +293,15 @@ appRoutes "app":
   "/data":
     let hsD = healthStr(safeInt(gHealth.get(), "status") + triggerLoadDatabases())
     let hcD = healthColor(safeInt(gHealth.get(), "status"))
-    tDiv(style = "display:flex;flex-direction:column;min-height:100vh"):
-      tHeader(style = "display:flex;align-items:center;gap:1rem;padding:0 1.75rem;height:60px;background:#e81c1c;box-shadow:0 2px 8px rgba(0,0,0,.18);position:sticky;top:0;z-index:100"):
-        tDiv(style = "font-size:1.1rem;font-weight:800;color:#fff;letter-spacing:.1em"): "⬡ FRACTIO"
+    tDiv(style = shellStyle):
+      tHeader(style = headerStyle):
+        tDiv(style = logoStyle): "⬡ FRACTIO"
         tDiv(style = "flex:1")
-        tSpan(style = "background:{hcD};color:#fff;padding:.25rem .75rem;border-radius:999px;font-size:.8rem;font-weight:700"): "{hsD}"
-      tNav(style = "background:#2d2d2d;display:flex;padding:0 1.25rem"):
-        tA(href = "/#/",        style = "{navStyle(false)}"): "Dashboard"
-        tA(href = "/#/nodes",   style = "{navStyle(false)}"): "Nodes"
-        tA(href = "/#/metrics", style = "{navStyle(false)}"): "Metrics"
-        tA(href = "/#/clock",   style = "{navStyle(false)}"): "Clock"
-        tA(href = "/#/spaces", style = "{navStyle(false)}"): "Spaces"
-        tA(href = "/#/data",    style = "{navStyle(true)}"):  "Data"
-      tMain(style = "flex:1;padding:1.75rem;max-width:1260px;width:100%"):
+        tSpan(style = "{badgeStyle(hcD)}"): "{hsD}"
+      tNav(style = navBarStyle):
+        for (href, label) in navItems:
+          tA(href = href, style = "{navStyle(label == \"Data\")}"): "{label}"
+      tMain(style = mainStyle):
         # Breadcrumb
         tDiv(style = "display:flex;align-items:center;gap:.35rem;margin-bottom:1.25rem;font-size:.85rem;color:#666"):
           tSpan(style = "font-weight:600;color:#111"): "Databases"
@@ -348,26 +324,22 @@ appRoutes "app":
                   "DATABASE"
                 tDiv(style = "font-size:.95rem;font-weight:600;color:#111"): "{d}"
 
-      tFooter(style = "padding:.75rem 1.75rem;background:#2d2d2d;color:#999;font-size:.75rem;text-align:center"):
+      tFooter(style = footerStyle):
         "Fractio Management Console · Data Browser"
 
   # ---- /data/{db} — schema list ----
   "/data/{db}":
     let hsD2 = healthStr(safeInt(gHealth.get(), "status") + (if db != "sys": triggerLoadSchemas(db) else: 0))
     let hcD2 = healthColor(safeInt(gHealth.get(), "status"))
-    tDiv(style = "display:flex;flex-direction:column;min-height:100vh"):
-      tHeader(style = "display:flex;align-items:center;gap:1rem;padding:0 1.75rem;height:60px;background:#e81c1c;box-shadow:0 2px 8px rgba(0,0,0,.18);position:sticky;top:0;z-index:100"):
-        tDiv(style = "font-size:1.1rem;font-weight:800;color:#fff;letter-spacing:.1em"): "⬡ FRACTIO"
+    tDiv(style = shellStyle):
+      tHeader(style = headerStyle):
+        tDiv(style = logoStyle): "⬡ FRACTIO"
         tDiv(style = "flex:1")
-        tSpan(style = "background:{hcD2};color:#fff;padding:.25rem .75rem;border-radius:999px;font-size:.8rem;font-weight:700"): "{hsD2}"
-      tNav(style = "background:#2d2d2d;display:flex;padding:0 1.25rem"):
-        tA(href = "/#/",        style = "{navStyle(false)}"): "Dashboard"
-        tA(href = "/#/nodes",   style = "{navStyle(false)}"): "Nodes"
-        tA(href = "/#/metrics", style = "{navStyle(false)}"): "Metrics"
-        tA(href = "/#/clock",   style = "{navStyle(false)}"): "Clock"
-        tA(href = "/#/spaces", style = "{navStyle(false)}"): "Spaces"
-        tA(href = "/#/data",    style = "{navStyle(true)}"):  "Data"
-      tMain(style = "flex:1;padding:1.75rem;max-width:1260px;width:100%"):
+        tSpan(style = "{badgeStyle(hcD2)}"): "{hsD2}"
+      tNav(style = navBarStyle):
+        for (href, label) in navItems:
+          tA(href = href, style = "{navStyle(label == \"Data\")}"): "{label}"
+      tMain(style = mainStyle):
         # Breadcrumb
         tDiv(style = "display:flex;align-items:center;gap:.35rem;margin-bottom:1.25rem;font-size:.85rem;color:#666"):
           tA(href = "/#/data", style = "color:#e81c1c;font-weight:600;text-decoration:none"): "Databases"
@@ -396,26 +368,22 @@ appRoutes "app":
                       "SCHEMA"
                     tDiv(style = "font-size:.95rem;font-weight:600;color:#111"): "{s}"
 
-      tFooter(style = "padding:.75rem 1.75rem;background:#2d2d2d;color:#999;font-size:.75rem;text-align:center"):
+      tFooter(style = footerStyle):
         "Fractio Management Console · Data Browser"
 
   # ---- /data/{db}/{schema} — table list ----
   "/data/{db}/{schema}":
     let hsD3 = healthStr(safeInt(gHealth.get(), "status") + (if db == "sys": triggerLoadSystemTables() else: triggerLoadTables(db, schema)))
     let hcD3 = healthColor(safeInt(gHealth.get(), "status"))
-    tDiv(style = "display:flex;flex-direction:column;min-height:100vh"):
-      tHeader(style = "display:flex;align-items:center;gap:1rem;padding:0 1.75rem;height:60px;background:#e81c1c;box-shadow:0 2px 8px rgba(0,0,0,.18);position:sticky;top:0;z-index:100"):
-        tDiv(style = "font-size:1.1rem;font-weight:800;color:#fff;letter-spacing:.1em"): "⬡ FRACTIO"
+    tDiv(style = shellStyle):
+      tHeader(style = headerStyle):
+        tDiv(style = logoStyle): "⬡ FRACTIO"
         tDiv(style = "flex:1")
-        tSpan(style = "background:{hcD3};color:#fff;padding:.25rem .75rem;border-radius:999px;font-size:.8rem;font-weight:700"): "{hsD3}"
-      tNav(style = "background:#2d2d2d;display:flex;padding:0 1.25rem"):
-        tA(href = "/#/",        style = "{navStyle(false)}"): "Dashboard"
-        tA(href = "/#/nodes",   style = "{navStyle(false)}"): "Nodes"
-        tA(href = "/#/metrics", style = "{navStyle(false)}"): "Metrics"
-        tA(href = "/#/clock",   style = "{navStyle(false)}"): "Clock"
-        tA(href = "/#/spaces", style = "{navStyle(false)}"): "Spaces"
-        tA(href = "/#/data",    style = "{navStyle(true)}"):  "Data"
-      tMain(style = "flex:1;padding:1.75rem;max-width:1260px;width:100%"):
+        tSpan(style = "{badgeStyle(hcD3)}"): "{hsD3}"
+      tNav(style = navBarStyle):
+        for (href, label) in navItems:
+          tA(href = href, style = "{navStyle(label == \"Data\")}"): "{label}"
+      tMain(style = mainStyle):
         # Breadcrumb
         tDiv(style = "display:flex;align-items:center;gap:.35rem;margin-bottom:1.25rem;font-size:.85rem;color:#666"):
           tA(href = "/#/data", style = "color:#e81c1c;font-weight:600;text-decoration:none"): "Databases"
@@ -465,7 +433,7 @@ appRoutes "app":
                       "TABLE"
                     tDiv(style = "font-size:.95rem;font-weight:600;color:#111"): "{t}"
 
-      tFooter(style = "padding:.75rem 1.75rem;background:#2d2d2d;color:#999;font-size:.75rem;text-align:center"):
+      tFooter(style = footerStyle):
         "Fractio Management Console · Data Browser"
 
   # ---- /data/{db}/{schema}/{table} — table rows ----
@@ -478,19 +446,15 @@ appRoutes "app":
       else:
         triggerLoadTableData(db, schema, table)))
     let hcD4 = healthColor(safeInt(gHealth.get(), "status"))
-    tDiv(style = "display:flex;flex-direction:column;min-height:100vh"):
-      tHeader(style = "display:flex;align-items:center;gap:1rem;padding:0 1.75rem;height:60px;background:#e81c1c;box-shadow:0 2px 8px rgba(0,0,0,.18);position:sticky;top:0;z-index:100"):
-        tDiv(style = "font-size:1.1rem;font-weight:800;color:#fff;letter-spacing:.1em"): "⬡ FRACTIO"
+    tDiv(style = shellStyle):
+      tHeader(style = headerStyle):
+        tDiv(style = logoStyle): "⬡ FRACTIO"
         tDiv(style = "flex:1")
-        tSpan(style = "background:{hcD4};color:#fff;padding:.25rem .75rem;border-radius:999px;font-size:.8rem;font-weight:700"): "{hsD4}"
-      tNav(style = "background:#2d2d2d;display:flex;padding:0 1.25rem"):
-        tA(href = "/#/",        style = "{navStyle(false)}"): "Dashboard"
-        tA(href = "/#/nodes",   style = "{navStyle(false)}"): "Nodes"
-        tA(href = "/#/metrics", style = "{navStyle(false)}"): "Metrics"
-        tA(href = "/#/clock",   style = "{navStyle(false)}"): "Clock"
-        tA(href = "/#/spaces", style = "{navStyle(false)}"): "Spaces"
-        tA(href = "/#/data",    style = "{navStyle(true)}"):  "Data"
-      tMain(style = "flex:1;padding:1.75rem;max-width:1260px;width:100%"):
+        tSpan(style = "{badgeStyle(hcD4)}"): "{hsD4}"
+      tNav(style = navBarStyle):
+        for (href, label) in navItems:
+          tA(href = href, style = "{navStyle(label == \"Data\")}"): "{label}"
+      tMain(style = mainStyle):
         # Breadcrumb
         tDiv(style = "display:flex;align-items:center;gap:.35rem;margin-bottom:1.25rem;font-size:.85rem;color:#666"):
           tA(href = "/#/data", style = "color:#e81c1c;font-weight:600;text-decoration:none"): "Databases"
@@ -573,7 +537,7 @@ appRoutes "app":
           else:
             tDiv(style = "color:#888;font-size:.85rem"): "Loading table data..."
 
-      tFooter(style = "padding:.75rem 1.75rem;background:#2d2d2d;color:#999;font-size:.75rem;text-align:center"):
+      tFooter(style = footerStyle):
         "Fractio Management Console · Data Browser"
 
 # ---------------------------------------------------------------------------
