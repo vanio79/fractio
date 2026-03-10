@@ -1560,6 +1560,10 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
     coord.applyUpTo(rangeId, group, lastApplied)
     echo "state machine recovery complete (applied up to " & $group.lastApplied.load() & ")"
 
+  # Load space caches from recovered state machine
+  store.loadSpaces()
+  store.loadTableSpaces()
+
   # Seed system tables: sys.nodes (table 5) and sys.ranges (table 4)
   # Only seed when starting as fresh leader (not rejoining and not joining)
   if startAsLeader and not isRejoining:
@@ -1613,6 +1617,10 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
       "rangeIds": [1],
       "createdAt": $now(),
     })
+
+    # Load space caches after seeding
+    store.loadSpaces()
+    store.loadTableSpaces()
 
   # SharedTimer: enable when we have peers and timer not yet configured
   if peers.len > 0 and server.sharedTimer.isNil:

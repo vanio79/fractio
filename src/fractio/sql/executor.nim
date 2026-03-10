@@ -221,6 +221,20 @@ proc getPkValue(row: JsonNode, pkColumn: string): string =
   ""
 
 # ---------------------------------------------------------------------------
+# Space routing helper
+# ---------------------------------------------------------------------------
+
+proc getTableSpace(store: RaftKVStoreExt, tableId: uint32): Option[SpaceInfo] =
+  ## Returns Some(SpaceInfo) if the table is in a non-default space with >1 group.
+  ## Returns none otherwise (fall through to existing shard-based routing).
+  let spaceOpt = store.getSpaceForTable(tableId)
+  if spaceOpt.isSome:
+    let space = spaceOpt.get()
+    if space.rangeIds.len > 1:
+      return some(space)
+  none(SpaceInfo)
+
+# ---------------------------------------------------------------------------
 # Per-op executors
 # ---------------------------------------------------------------------------
 
@@ -330,6 +344,11 @@ proc execCreateTable(op: PlanOp, store: RaftKVStoreExt): ExecResult =
   let res = store.raftPut(key, tableValue)
   if not res.isOk:
     return errorResult(&"failed to create table: {res.error.msg}")
+
+  # Reload table-space caches so the new table is immediately routable
+  if op.ctSpaceName.isSome:
+    store.loadTableSpaces()
+
   okResult("CREATE TABLE")
 
 proc execDropTable(op: PlanOp, store: RaftKVStoreExt): ExecResult =
@@ -349,6 +368,7 @@ proc execDropTable(op: PlanOp, store: RaftKVStoreExt): ExecResult =
   okResult("DROP TABLE")
 
 proc execInsert(op: PlanOp, store: RaftKVStoreExt): ExecResult =
+  let spaceOpt = getTableSpace(store, op.insTableId)
   var count = 0
   for rowJson in op.insRows:
     let row = parseJson(rowJson)
@@ -356,15 +376,24 @@ proc execInsert(op: PlanOp, store: RaftKVStoreExt): ExecResult =
     if pkVal.len == 0:
       return errorResult("INSERT requires a primary key value")
     let key = encodeDataRowKey(op.insTableId, pkVal)
-    let res = store.raftPut(key, rowJson)
-    if not res.isOk:
-      return errorResult(&"failed to insert row: {res.error.msg}")
+    if spaceOpt.isSome:
+      let res = store.raftPutInSpace(key, rowJson, spaceOpt.get(), pkVal)
+      if not res.isOk:
+        return errorResult(&"failed to insert row: {res.error.msg}")
+    else:
+      let res = store.raftPut(key, rowJson)
+      if not res.isOk:
+        return errorResult(&"failed to insert row: {res.error.msg}")
     inc count
   modifiedResult(count, &"INSERT {count}")
 
 proc execPointGet(op: PlanOp, store: RaftKVStoreExt): ExecResult =
   let key = encodeDataRowKey(op.pgTableId, op.pgKey)
-  let res = store.raftGet(key)
+  let spaceOpt = getTableSpace(store, op.pgTableId)
+  let res = if spaceOpt.isSome:
+              store.raftGetInSpace(key, spaceOpt.get(), op.pgKey)
+            else:
+              store.raftGet(key)
   if not res.isOk:
     return errorResult(&"failed to read: {res.error.msg}")
   if res.value.isNone:
@@ -375,12 +404,13 @@ proc execPointGet(op: PlanOp, store: RaftKVStoreExt): ExecResult =
   rowsResult(op.pgColumns, @[vals])
 
 proc execScan(op: PlanOp, store: RaftKVStoreExt): ExecResult =
-  # Scan uses includeSystemKeys=false for data rows (they are user table keys,
-  # not system table keys), but the scan range is already scoped to the data
-  # row prefix. We need includeSystemKeys=true since data row keys live under
-  # /t/<tableId>/d/... which may not be system keys but are still table keys.
-  let res = store.raftScan(op.scStartKey, op.scEndKey, 0,
-      includeSystemKeys = true)
+  let spaceOpt = getTableSpace(store, op.scTableId)
+  let res = if spaceOpt.isSome:
+              store.raftScanSpace(op.scStartKey, op.scEndKey, spaceOpt.get(),
+                  0, includeSystemKeys = true)
+            else:
+              store.raftScan(op.scStartKey, op.scEndKey, 0,
+                  includeSystemKeys = true)
   if not res.isOk:
     return errorResult(&"failed to scan: {res.error.msg}")
 
@@ -402,7 +432,12 @@ proc execScan(op: PlanOp, store: RaftKVStoreExt): ExecResult =
 proc execUpdate(op: PlanOp, store: RaftKVStoreExt): ExecResult =
   let startKey = encodeDataRowKey(op.upTableId, "")
   let endKey = encodeDataRowKey(op.upTableId + 1, "")
-  let res = store.raftScan(startKey, endKey, 0, includeSystemKeys = true)
+  let spaceOpt = getTableSpace(store, op.upTableId)
+  let res = if spaceOpt.isSome:
+              store.raftScanSpace(startKey, endKey, spaceOpt.get(), 0,
+                  includeSystemKeys = true)
+            else:
+              store.raftScan(startKey, endKey, 0, includeSystemKeys = true)
   if not res.isOk:
     return errorResult(&"failed to scan for update: {res.error.msg}")
 
@@ -411,13 +446,18 @@ proc execUpdate(op: PlanOp, store: RaftKVStoreExt): ExecResult =
     try:
       let row = parseJson(entry.value)
       if matchesFilter(op.upFilter, row):
-        # Apply SET clauses
         var updated = row.copy()
         for (col, valExpr) in op.upSets:
           updated[col] = evalExpr(valExpr, row)
-        let putRes = store.raftPut(key, $updated)
-        if not putRes.isOk:
-          return errorResult(&"failed to update row: {putRes.error.msg}")
+        let pkVal = getPkValue(updated, op.upPkColumn)
+        if spaceOpt.isSome and pkVal.len > 0:
+          let putRes = store.raftPutInSpace(key, $updated, spaceOpt.get(), pkVal)
+          if not putRes.isOk:
+            return errorResult(&"failed to update row: {putRes.error.msg}")
+        else:
+          let putRes = store.raftPut(key, $updated)
+          if not putRes.isOk:
+            return errorResult(&"failed to update row: {putRes.error.msg}")
         inc count
     except JsonParsingError:
       discard
@@ -427,7 +467,12 @@ proc execUpdate(op: PlanOp, store: RaftKVStoreExt): ExecResult =
 proc execDelete(op: PlanOp, store: RaftKVStoreExt): ExecResult =
   let startKey = encodeDataRowKey(op.delTableId, "")
   let endKey = encodeDataRowKey(op.delTableId + 1, "")
-  let res = store.raftScan(startKey, endKey, 0, includeSystemKeys = true)
+  let spaceOpt = getTableSpace(store, op.delTableId)
+  let res = if spaceOpt.isSome:
+              store.raftScanSpace(startKey, endKey, spaceOpt.get(), 0,
+                  includeSystemKeys = true)
+            else:
+              store.raftScan(startKey, endKey, 0, includeSystemKeys = true)
   if not res.isOk:
     return errorResult(&"failed to scan for delete: {res.error.msg}")
 
@@ -436,9 +481,15 @@ proc execDelete(op: PlanOp, store: RaftKVStoreExt): ExecResult =
     try:
       let row = parseJson(entry.value)
       if matchesFilter(op.delFilter, row):
-        let delRes = store.raftDelete(key)
-        if not delRes.isOk:
-          return errorResult(&"failed to delete row: {delRes.error.msg}")
+        let pkVal = getPkValue(row, op.delPkColumn)
+        if spaceOpt.isSome and pkVal.len > 0:
+          let delRes = store.raftDeleteInSpace(key, spaceOpt.get(), pkVal)
+          if not delRes.isOk:
+            return errorResult(&"failed to delete row: {delRes.error.msg}")
+        else:
+          let delRes = store.raftDelete(key)
+          if not delRes.isOk:
+            return errorResult(&"failed to delete row: {delRes.error.msg}")
         inc count
     except JsonParsingError:
       discard
@@ -652,6 +703,9 @@ proc execCreateSpace(op: PlanOp, store: RaftKVStoreExt): ExecResult =
   let putRes = store.raftPut(spaceKey, spaceVal)
   if not putRes.isOk:
     return errorResult(&"failed to write space record: {putRes.error.msg}")
+
+  # Reload space caches so newly created space is immediately routable
+  store.loadSpaces()
 
   okResult(&"CREATE SPACE ({groupCount} groups)")
 

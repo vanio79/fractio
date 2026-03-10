@@ -914,3 +914,122 @@ proc getSpaceForTable*(store: RaftKVStoreExt,
   if store.spaces.hasKey(sid):
     return some(store.spaces.getOrDefault(sid))
   none(SpaceInfo)
+
+# ---------------------------------------------------------------------------
+# Space-aware KV operations
+# ---------------------------------------------------------------------------
+# These bypass findRangeId() and route directly to a space's Raft group
+# using hash(primaryKey) mod numGroups.
+
+proc raftPutInSpace*(store: RaftKVStoreExt, key, value: string,
+    space: SpaceInfo, primaryKey: string): RSResult[RaftKVEntry] {.gcsafe, raises: [].} =
+  ## Write `value` under `key` through Raft consensus, routing to the
+  ## correct group in the space via hash(primaryKey).
+  let rid = routeToGroup(primaryKey, space.rangeIds)
+  let batch = newWriteBatch()
+  batch.put(toBytes(key), toBytes(value))
+  let vr = proposeWrite(store, rid, batch)
+  if not vr.isOk:
+    return rsErr[RaftKVEntry](vr.error)
+  let ver = store.nextVersion.fetchAdd(1)
+  let ts = uint64(getTime().toUnixFloat() * 1_000_000_000)
+  rsOk[RaftKVEntry](RaftKVEntry(value: value, version: ver, timestamp: ts))
+
+proc raftGetInSpace*(store: RaftKVStoreExt, key: string,
+    space: SpaceInfo, primaryKey: string): RSResult[Option[RaftKVEntry]] {.gcsafe, raises: [].} =
+  ## Read the current value for `key` from the space group owning `primaryKey`.
+  let rid = routeToGroup(primaryKey, space.rangeIds)
+  let sm = store.getOrCreateSM(rid)
+  acquire(store.smMu)
+  defer: release(store.smMu)
+  if sm.kvStore.hasKey(key):
+    let v = sm.kvStore.getOrDefault(key)
+    let entry = RaftKVEntry(
+      value: v,
+      version: 1'u64,
+      timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
+    )
+    return rsOk[Option[RaftKVEntry]](some(entry))
+  rsOk[Option[RaftKVEntry]](none(RaftKVEntry))
+
+proc raftDeleteInSpace*(store: RaftKVStoreExt, key: string,
+    space: SpaceInfo, primaryKey: string): RSResult[Option[RaftKVEntry]] {.gcsafe, raises: [].} =
+  ## Delete `key` through Raft consensus, routing to the correct space group.
+  let rid = routeToGroup(primaryKey, space.rangeIds)
+  # Capture previous value
+  var prevEntry: Option[RaftKVEntry]
+  let sm = store.getOrCreateSM(rid)
+  acquire(store.smMu)
+  if sm.kvStore.hasKey(key):
+    prevEntry = some(RaftKVEntry(
+      value: sm.kvStore.getOrDefault(key),
+      version: 1'u64,
+      timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
+    ))
+  release(store.smMu)
+  let batch = newWriteBatch()
+  batch.delete(toBytes(key))
+  let vr = proposeWrite(store, rid, batch)
+  if not vr.isOk:
+    return rsErr[Option[RaftKVEntry]](vr.error)
+  rsOk[Option[RaftKVEntry]](prevEntry)
+
+proc raftScanSpace*(store: RaftKVStoreExt, startKey, endKey: string,
+    space: SpaceInfo, limit: uint32 = 0,
+    includeSystemKeys: bool = false): RSResult[seq[(string, RaftKVEntry)]] {.gcsafe, raises: [].} =
+  ## Fan-out scan across ALL groups in a space, then N-way merge-sort by key.
+  ## Each group's matching keys are collected and sorted independently,
+  ## then merged to produce a globally sorted result.
+
+  # Phase 1: collect sorted results per group
+  var groupResults: seq[seq[(string, RaftKVEntry)]] = @[]
+  for rid64 in space.rangeIds:
+    let rid = RangeID(rid64)
+    let sm = store.getOrCreateSM(rid)
+    var pairs: seq[(string, RaftKVEntry)] = @[]
+    acquire(store.smMu)
+    for k, v in sm.kvStore:
+      if isIntentKey(k) or isCoordKey(k): continue
+      if not includeSystemKeys and isSystemKey(k): continue
+      let afterStart = startKey.len == 0 or k >= startKey
+      let beforeEnd = endKey.len == 0 or k < endKey
+      if afterStart and beforeEnd:
+        pairs.add((k, RaftKVEntry(value: v, version: 1'u64,
+            timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000))))
+    release(store.smMu)
+    pairs.sort(proc(a, b: (string, RaftKVEntry)): int = cmp(a[0], b[0]))
+    if pairs.len > 0:
+      groupResults.add(pairs)
+
+  # Phase 2: N-way merge-sort
+  if groupResults.len == 0:
+    return rsOk[seq[(string, RaftKVEntry)]](@[])
+
+  if groupResults.len == 1:
+    var result = groupResults[0]
+    if limit > 0 and result.len > int(limit):
+      result.setLen(int(limit))
+    return rsOk[seq[(string, RaftKVEntry)]](result)
+
+  # Maintain an index per group into its sorted results
+  var indices = newSeq[int](groupResults.len)
+  var merged: seq[(string, RaftKVEntry)] = @[]
+
+  while true:
+    # Find the minimum key across all group heads
+    var minIdx = -1
+    var minKey = ""
+    for g in 0 ..< groupResults.len:
+      if indices[g] < groupResults[g].len:
+        let k = groupResults[g][indices[g]][0]
+        if minIdx < 0 or k < minKey:
+          minIdx = g
+          minKey = k
+    if minIdx < 0:
+      break  # all groups exhausted
+    merged.add(groupResults[minIdx][indices[minIdx]])
+    inc indices[minIdx]
+    if limit > 0 and merged.len >= int(limit):
+      break
+
+  rsOk[seq[(string, RaftKVEntry)]](merged)
