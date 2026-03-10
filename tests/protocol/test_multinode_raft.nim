@@ -100,7 +100,7 @@ proc stopNode(ns: NodeSetup) =
 proc findLeader(nodes: seq[NodeSetup]): int =
   ## Return index of the node that believes itself to be leader, or -1.
   for i, ns in nodes:
-    let grpOpt = ns.coord.getGroup(RangeID(1))
+    let grpOpt = ns.coord.getGroup(DATA_RANGE_START_ID)
     if grpOpt.isSome and grpOpt.get.isLeader():
       return i
   -1
