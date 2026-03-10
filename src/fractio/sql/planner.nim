@@ -38,6 +38,7 @@ type
     poBeginTxn
     poCommitTxn
     poRollbackTxn
+    poExplain
 
   PlanOp* = ref object
     case kind*: PlanOpKind
@@ -149,6 +150,9 @@ type
 
     of poRollbackTxn:
       discard
+
+    of poExplain:
+      exInnerPlan*: Plan  ## the plan being explained
 
   Plan* = ref object
     ops*: seq[PlanOp]
@@ -544,6 +548,101 @@ proc planDropSpace(stmt: Stmt): Plan =
   plan
 
 # ---------------------------------------------------------------------------
+# EXPLAIN formatting
+# ---------------------------------------------------------------------------
+
+proc formatExpr*(e: Expr): string =
+  ## Format an expression for EXPLAIN output.
+  case e.kind
+  of exLiteral:
+    if e.litValue == nil: return "NULL"
+    case e.litValue.kind
+    of dtInt: return $e.litValue.intValue
+    of dtFloat: return $e.litValue.floatValue
+    of dtString: return "'" & e.litValue.strValue & "'"
+    of dtBool: return $e.litValue.boolValue
+    else: return "?"
+  of exColumn:
+    if e.colTable.len > 0: return e.colTable & "." & e.colName
+    return e.colName
+  of exBinOp:
+    let opStr = case e.binOp
+      of boEq: "="
+      of boNeq: "<>"
+      of boLt: "<"
+      of boLte: "<="
+      of boGt: ">"
+      of boGte: ">="
+      of boAnd: "AND"
+      of boOr: "OR"
+      of boAdd: "+"
+      of boSub: "-"
+      of boMul: "*"
+      of boDiv: "/"
+      of boMod: "%"
+    return formatExpr(e.binLeft) & " " & opStr & " " & formatExpr(e.binRight)
+  of exUnaryOp:
+    case e.unaryOp
+    of uoNot: return "NOT " & formatExpr(e.unaryExpr)
+    of uoNeg: return "-" & formatExpr(e.unaryExpr)
+  of exIsNull:
+    if e.isNullNot: return formatExpr(e.isNullExpr) & " IS NOT NULL"
+    return formatExpr(e.isNullExpr) & " IS NULL"
+  of exStar: return "*"
+  else: return "?"
+
+proc formatPlanOp*(op: PlanOp): string =
+  ## Format a single PlanOp as a human-readable string.
+  case op.kind
+  of poCreateDatabase: &"CreateDatabase name={op.cdbName}"
+  of poDropDatabase:   &"DropDatabase name={op.ddbName}"
+  of poCreateSchema:   &"CreateSchema name={op.csDatabase}.{op.csName}"
+  of poDropSchema:     &"DropSchema name={op.dsDatabase}.{op.dsName}"
+  of poCreateTable:    &"CreateTable name={op.ctDatabase}.{op.ctSchema}.{op.ctName}"
+  of poDropTable:      &"DropTable name={op.dtDatabase}.{op.dtSchema}.{op.dtName}"
+  of poInsert:
+    &"Insert table={op.insTableName} (id={op.insTableId}) rows={op.insRows.len}"
+  of poPointGet:
+    &"PointGet table_id={op.pgTableId} key={op.pgKey} cols={op.pgColumns}"
+  of poScan:
+    var s = &"Scan table_id={op.scTableId} cols={op.scColumns}"
+    if op.scFilter.isSome:
+      s &= &" filter=({formatExpr(op.scFilter.get())})"
+    if op.scLimit > 0:
+      s &= &" limit={op.scLimit}"
+    s
+  of poUpdate:
+    var s = &"Update table={op.upTableName} (id={op.upTableId})"
+    if op.upFilter.isSome:
+      s &= &" filter=({formatExpr(op.upFilter.get())})"
+    s &= &" set=[{op.upSets.len} cols]"
+    s
+  of poDelete:
+    var s = &"Delete table={op.delTableName} (id={op.delTableId})"
+    if op.delFilter.isSome:
+      s &= &" filter=({formatExpr(op.delFilter.get())})"
+    s
+  of poShowDatabases:  "ShowDatabases"
+  of poShowSchemas:    &"ShowSchemas db={op.ssDatabase}"
+  of poShowTables:     &"ShowTables db={op.stDatabase} schema={op.stSchema}"
+  of poShowSpaces:     "ShowSpaces"
+  of poCreateSpace:    &"CreateSpace name={op.cspName} replicas={op.cspReplicas}"
+  of poDropSpace:      &"DropSpace name={op.dspName}"
+  of poUseDatabase:    &"UseDatabase name={op.udName}"
+  of poUseSchema:      &"UseSchema name={op.usName}"
+  of poBeginTxn:       &"BeginTxn readOnly={op.btReadOnly}"
+  of poCommitTxn:      "CommitTxn"
+  of poRollbackTxn:    "RollbackTxn"
+  of poExplain:        "Explain"
+
+proc formatPlan*(plan: Plan): string =
+  ## Format a Plan as a multi-line EXPLAIN output.
+  var lines: seq[string]
+  for i, op in plan.ops:
+    lines.add(formatPlanOp(op))
+  lines.join("\n")
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -610,4 +709,9 @@ proc planStatement*(stmt: Stmt, store: RaftKVStoreExt,
   of stmtRollback:
     let plan = newPlan()
     plan.add(PlanOp(kind: poRollbackTxn))
+    plan
+  of stmtExplain:
+    let innerPlan = planStatement(stmt.explainStmt, store, database, schema)
+    let plan = newPlan()
+    plan.add(PlanOp(kind: poExplain, exInnerPlan: innerPlan))
     plan

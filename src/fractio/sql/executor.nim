@@ -800,6 +800,12 @@ proc execute*(plan: Plan, store: RaftKVStoreExt,
     of poBeginTxn:       okResult("BEGIN")
     of poCommitTxn:      okResult("COMMIT")
     of poRollbackTxn:    okResult("ROLLBACK")
+    of poExplain:
+      let text = formatPlan(op.exInnerPlan)
+      var rows: seq[seq[string]]
+      for line in text.split('\n'):
+        rows.add(@[line])
+      rowsResult(@["plan"], rows)
 
     if lastResult.kind == erkError:
       return lastResult

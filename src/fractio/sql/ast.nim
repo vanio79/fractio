@@ -136,6 +136,7 @@ type
     stmtBegin
     stmtCommit
     stmtRollback
+    stmtExplain
 
   Stmt* = ref object
     case kind*: StmtKind
@@ -237,3 +238,7 @@ type
       discard
     of stmtRollback:
       discard
+
+    # ---- EXPLAIN ----
+    of stmtExplain:
+      explainStmt*: Stmt  ## the inner statement being explained

@@ -631,3 +631,66 @@ suite "SQL Executor — Expression evaluation":
 
     res = exec(store, "SELECT * FROM items WHERE qty <= 5")
     check res.rows.len == 2  # banana (0) and cherry (5)
+
+
+suite "SQL Executor — EXPLAIN":
+  var store: RaftKVStoreExt
+  let testDir = "/tmp/fractio_test_executor_explain_" & $getCurrentProcessId()
+
+  setup:
+    cleanupTestDir(testDir)
+    store = createTestStore(testDir)
+
+  teardown:
+    store.coordinator.stop()
+    cleanupTestDir(testDir)
+
+  test "EXPLAIN SELECT full scan":
+    discard exec(store,
+        "CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
+    let res = exec(store, "EXPLAIN SELECT * FROM users")
+    check res.kind == erkRows
+    check res.columns == @["plan"]
+    check res.rows.len == 1
+    check "Scan" in res.rows[0][0]
+
+  test "EXPLAIN SELECT point get":
+    discard exec(store,
+        "CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
+    let res = exec(store, "EXPLAIN SELECT * FROM users WHERE id = 42")
+    check res.kind == erkRows
+    check res.rows.len == 1
+    check "PointGet" in res.rows[0][0]
+    check "42" in res.rows[0][0]
+
+  test "EXPLAIN SELECT with filter":
+    discard exec(store,
+        "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT)")
+    let res = exec(store, "EXPLAIN SELECT * FROM users WHERE age > 21")
+    check res.kind == erkRows
+    check "Scan" in res.rows[0][0]
+    check "filter" in res.rows[0][0]
+
+  test "EXPLAIN INSERT":
+    discard exec(store,
+        "CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
+    let res = exec(store,
+        "EXPLAIN INSERT INTO users (id, name) VALUES (1, 'Alice')")
+    check res.kind == erkRows
+    check "Insert" in res.rows[0][0]
+    check "rows=1" in res.rows[0][0]
+
+  test "EXPLAIN CREATE TABLE":
+    let res = exec(store,
+        "EXPLAIN CREATE TABLE t1 (id INT PRIMARY KEY)")
+    check res.kind == erkRows
+    check "CreateTable" in res.rows[0][0]
+
+  test "EXPLAIN does not execute the statement":
+    let res = exec(store,
+        "EXPLAIN CREATE TABLE invisible (id INT PRIMARY KEY)")
+    check res.kind == erkRows
+    # The table should NOT have been created
+    let showRes = exec(store, "SHOW TABLES")
+    check showRes.kind == erkRows
+    check showRes.rows.len == 0

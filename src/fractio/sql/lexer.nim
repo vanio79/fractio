@@ -69,6 +69,9 @@ type
     tkSchemas    ## SCHEMAS
     tkTables     ## TABLES
 
+    # Misc keywords
+    tkExplain    ## EXPLAIN
+
     # Storage / replication keywords
     tkWith       ## WITH
     tkSpace      ## SPACE
@@ -158,6 +161,7 @@ const keywords = {
   "WORK":        tkWork,
   "TRUE":        tkTrue,
   "FALSE":       tkFalse,
+  "EXPLAIN":     tkExplain,
   "WITH":        tkWith,
   "SHOW":        tkShow,
   "USE":         tkUse,

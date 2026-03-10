@@ -754,6 +754,10 @@ proc parseOne*(p: var Parser): Stmt =
       # Bare "USE <name>" defaults to USE DATABASE
       let name = p.expectIdent
       return Stmt(kind: stmtUseDatabase, useDbName: name)
+  of tkExplain:
+    discard p.advance
+    let inner = p.parseOne
+    return Stmt(kind: stmtExplain, explainStmt: inner)
   else:
     raise parseError(&"expected a SQL statement but got '{t.value}'", t)
 

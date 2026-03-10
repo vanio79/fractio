@@ -323,6 +323,38 @@ suite "SQL Planner":
     check plan.ops[0].kind == poUseSchema
     check plan.ops[0].usName == "myschema"
 
+  test "plan EXPLAIN SELECT":
+    seedTable(store, "default", "public", "users", 100,
+      @[("id", "INT"), ("name", "TEXT")], @["id"])
+    let stmt = parseStatement("EXPLAIN SELECT * FROM users")
+    let plan = planStatement(stmt, store)
+    check plan.ops.len == 1
+    check plan.ops[0].kind == poExplain
+    check plan.ops[0].exInnerPlan.ops.len == 1
+    check plan.ops[0].exInnerPlan.ops[0].kind == poScan
+
+  test "plan EXPLAIN SELECT point get":
+    seedTable(store, "default", "public", "users", 100,
+      @[("id", "INT"), ("name", "TEXT")], @["id"])
+    let stmt = parseStatement("EXPLAIN SELECT * FROM users WHERE id = 1")
+    let plan = planStatement(stmt, store)
+    check plan.ops[0].kind == poExplain
+    check plan.ops[0].exInnerPlan.ops[0].kind == poPointGet
+
+  test "plan EXPLAIN INSERT":
+    seedTable(store, "default", "public", "users", 100,
+      @[("id", "INT"), ("name", "TEXT")], @["id"])
+    let stmt = parseStatement("EXPLAIN INSERT INTO users (id, name) VALUES (1, 'Alice')")
+    let plan = planStatement(stmt, store)
+    check plan.ops[0].kind == poExplain
+    check plan.ops[0].exInnerPlan.ops[0].kind == poInsert
+
+  test "plan EXPLAIN CREATE TABLE":
+    let stmt = parseStatement("EXPLAIN CREATE TABLE t1 (id INT PRIMARY KEY)")
+    let plan = planStatement(stmt, store)
+    check plan.ops[0].kind == poExplain
+    check plan.ops[0].exInnerPlan.ops[0].kind == poCreateTable
+
   test "nextTableId allocates incrementally":
     let id1 = nextTableId(store)
     check id1 == FIRST_USER_TABLE_ID
