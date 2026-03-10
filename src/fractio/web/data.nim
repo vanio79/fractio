@@ -14,6 +14,7 @@ proc doRefresh*() {.async.} =
     gHealth.set(await fetchJson("/api/health"))
     gMetrics.set(await fetchJson("/api/metrics"))
     gNodes.set(await fetchJson("/api/nodes"))
+    gStorage.set(await fetchJson("/api/storage"))
     # Re-inject clock DOM after HappyX re-renders wipe #drift-chart
     jsSetTimeout(proc() = injectClockDom(), 0)
   except:
@@ -214,6 +215,15 @@ proc triggerLoadSpaces*(): int =
   fetchingSpaces = true
   jsSetTimeout(proc() = discard doLoadSpaces(), 0)
   0
+
+proc toggleNodeExpanded*(nodeId: int) =
+  var cur = gExpandedNodes.get()
+  let idx = cur.find(nodeId)
+  if idx >= 0:
+    cur.delete(idx)
+  else:
+    cur.add(nodeId)
+  gExpandedNodes.set(cur)
 
 proc connectDriftWs*() =
   let host = jsLocation()

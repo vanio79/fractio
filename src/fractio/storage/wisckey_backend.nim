@@ -79,6 +79,8 @@ proc c_leveldb_destroy_db(options: pointer; name: cstring; err: ptr cstring) {.
   importc: "leveldb_destroy_db", dynlib: "libleveldb.so".}
 proc c_leveldb_free(p: pointer) {.
   importc: "leveldb_free", dynlib: "libleveldb.so".}
+proc c_leveldb_property_value(db: pointer, name: cstring): cstring {.
+  importc: "leveldb_property_value", dynlib: "libleveldb.so".}
 proc c_leveldb_options_create(): pointer {.
   importc: "leveldb_options_create", dynlib: "libleveldb.so".}
 proc c_leveldb_options_destroy(options: pointer) {.
@@ -514,6 +516,18 @@ method flush*(backend: WiscKeyBackend): bool =
   # LevelDB writes are always synchronous at some level
   # This is a no-op for LevelDB
   return backend.isOpen
+
+proc getProperty*(backend: WiscKeyBackend, name: string): string =
+  ## Query a LevelDB property (e.g. "leveldb.stats", "leveldb.num-files-at-level<N>").
+  acquire(backend.mu)
+  defer: release(backend.mu)
+  if not backend.isOpen or backend.db == nil:
+    return ""
+  let val = c_leveldb_property_value(backend.db, name.cstring)
+  if val == nil:
+    return ""
+  result = $val
+  c_leveldb_free(val)
 
 method destroy*(backend: WiscKeyBackend): bool =
   # First, close the database to flush any pending writes

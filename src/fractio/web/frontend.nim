@@ -43,7 +43,7 @@ appRoutes "app":
         let ver  = $safeStr(gInfo.get(), "version")
         let cln  = $safeStr(gInfo.get(), "clusterName")
         let rep  = $safeIntStr(gHealth.get(), "healthyReplicas") & " / " & $safeIntStr(gHealth.get(), "replicaCount")
-        tDiv(style = "display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:1rem"):
+        tDiv(style = "display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:1rem;margin-bottom:1.5rem"):
           for (cardLbl, cardVal) in [("Node ID", nid), ("Role", role), ("Uptime", upt),
                                      ("Active Clients", cli), ("Shards", shd),
                                      ("Version", ver), ("Cluster", cln),
@@ -53,10 +53,82 @@ appRoutes "app":
                 "{cardLbl}"
               tDiv(style = "font-size:1.5rem;font-weight:700;color:#e81c1c"):
                 "{cardVal}"
+
+        # ---- Nodes list (clickable, expandable with storage details) ----
+        let arr = to(gNodes.get(), seq[JsObject])
+        let arrLen = arr.len
+        let nodeCount = $jsLen(gNodes.get()) & (if arrLen != 1: " nodes" else: " node")
+        let expanded = gExpandedNodes.get()
+        tDiv(style = "display:flex;align-items:center;gap:.75rem;margin-bottom:.75rem"):
+          tH2(style = "font-size:1.05rem;font-weight:700;color:#111;margin:0"): "Nodes"
+          tSpan(style = "background:#eee;color:#444;padding:.2rem .6rem;border-radius:999px;font-size:.8rem"):
+            "{nodeCount}"
+        tDiv(style = "display:flex;flex-direction:column;gap:0;margin-bottom:1.25rem"):
+          for node in arr:
+            let nid   = safeInt(node, "nodeId")
+            let nhost = $safeStr(node, "host")
+            let nrp   = $safeIntStr(node, "raftPort")
+            let ncp   = $safeIntStr(node, "clientPort")
+            let nrole = $safeStr(node, "role")
+            let nalive = safeBool(node, "alive")
+            let nidStr = $safeIntStr(node, "nodeId")
+            let isExpanded = nid in expanded
+            let chevron = if isExpanded: "▾" else: "▸"
+            let rc = case nrole
+              of "leader": "#1a7f37"
+              of "follower": "#2563eb"
+              else: "#888"
+            let sc = if nalive: "#1a7f37" else: "#c41010"
+            let ss = if nalive: "alive" else: "unreachable"
+            let borderBot = if isExpanded: "none" else: "1px solid #e0e0e0"
+            let borderRad = if isExpanded: "6px 6px 0 0" else: "6px"
+            # Node header row (clickable)
+            tDiv(id = "node-row-" & nidStr, style = "background:#fff;border:1px solid #e0e0e0;border-bottom:{borderBot};border-radius:{borderRad};padding:.65rem 1rem;cursor:pointer;display:flex;align-items:center;gap:.75rem"):
+              tSpan(style = "color:#888;font-size:.85rem;width:1rem;text-align:center"): "{chevron}"
+              tSpan(style = "font-weight:700;font-size:.9rem;min-width:2.5rem"): "{nidStr}"
+              tSpan(style = "color:#555;font-size:.85rem"): "{nhost}"
+              tSpan(style = "color:#999;font-size:.8rem"): ":{nrp}"
+              tDiv(style = "flex:1")
+              tSpan(style = "color:{rc};font-weight:600;font-size:.82rem"): "{nrole}"
+              tSpan(style = "color:{sc};font-weight:600;font-size:.82rem;margin-left:.5rem"): "{ss}"
+            # Expanded storage detail
+            if isExpanded:
+              tDiv(style = "background:#fafafa;border:1px solid #e0e0e0;border-top:none;border-radius:0 0 6px 6px;padding:1rem"):
+                tDiv(style = "font-size:.82rem;font-weight:600;color:#444;margin-bottom:.65rem"): "Storage"
+                let nf = node.numFiles
+                let nfLen = jsArrayLen(nf)
+                if nfLen > 0:
+                  # Table with Level, Files, Size columns
+                  tTable(style = "width:100%;max-width:420px;border-collapse:collapse;font-size:.82rem"):
+                    tThead:
+                      tTr:
+                        for h in ["Level", "Files", "Size (MB)"]:
+                          tTh(style = "background:#3a3a3a;color:#fff;padding:.4rem .7rem;text-align:left;font-size:.68rem;text-transform:uppercase;letter-spacing:.06em;font-weight:600"):
+                            "{h}"
+                    tTbody:
+                      for lvl in 0 ..< nfLen:
+                        let fc = jsParseInt(jsArrayGet(nf, lvl))
+                        let fcStr = $fc
+                        let lvlStr = $lvl
+                        let sizeMB = $safeFloat(node.levelSizes, cstring($lvl))
+                        # Color gradient: L0=#e81c1c (red) → L6=#2563eb (blue)
+                        let r = int(float(232) + float(37 - 232) * float(lvl) / 6.0)
+                        let g = int(float(28) + float(99 - 28) * float(lvl) / 6.0)
+                        let b = int(float(28) + float(235 - 28) * float(lvl) / 6.0)
+                        let barColor = "rgb(" & $r & "," & $g & "," & $b & ")"
+                        let rowBg = if fc > 0: "#fff" else: "transparent"
+                        tTr:
+                          tTd(style = "padding:.35rem .7rem;border-bottom:1px solid #eee;background:{rowBg}"):
+                            tSpan(style = "display:inline-block;width:8px;height:8px;border-radius:2px;background:{barColor};margin-right:.4rem")
+                            tSpan: "L{lvlStr}"
+                          tTd(style = "padding:.35rem .7rem;border-bottom:1px solid #eee;font-family:monospace;background:{rowBg}"): "{fcStr}"
+                          tTd(style = "padding:.35rem .7rem;border-bottom:1px solid #eee;font-family:monospace;background:{rowBg}"): "{sizeMB}"
+                else:
+                  tDiv(style = "color:#999;font-size:.82rem"): "No storage data"
       tFooter(style = footerStyle):
         "Fractio Management Console · Auto-refresh every 5s"
 
-  # ---- Nodes ----
+  # ---- Nodes (Join form) ----
   "/nodes":
     let hs2 = healthStr(safeInt(gHealth.get(), "status"))
     let hc2 = healthColor(safeInt(gHealth.get(), "status"))
@@ -69,50 +141,8 @@ appRoutes "app":
         for (href, label) in navItems:
           tA(href = href, style = "{navStyle(label == \"Nodes\")}"): "{label}"
       tMain(style = mainStyle):
-        let arr = to(gNodes.get(), seq[JsObject])
-        let arrLen = arr.len
-        let nodeCount = $jsLen(gNodes.get()) & (if arrLen != 1: " nodes" else: " node")
         tDiv(style = "display:flex;align-items:center;gap:.75rem;margin-bottom:1rem"):
           tH2(style = "font-size:1.05rem;font-weight:700;color:#111;margin:0"): "Cluster Nodes"
-          tSpan(style = "background:#eee;color:#444;padding:.2rem .6rem;border-radius:999px;font-size:.8rem"):
-            "{nodeCount}"
-        tDiv(style = "overflow-x:auto;margin-bottom:1.25rem"):
-          tTable(style = "width:100%;border-collapse:collapse;font-size:.875rem;background:#fff;border:1px solid #e0e0e0;border-radius:6px;overflow:hidden"):
-            tThead:
-              tTr:
-                for h in ["ID","Host","Raft Port","Client Port","Role","Status","Action"]:
-                  tTh(style = "background:#3a3a3a;color:#fff;padding:.55rem .85rem;text-align:left;font-size:.7rem;text-transform:uppercase;letter-spacing:.07em;font-weight:600"):
-                    "{h}"
-            tTbody:
-              for node in arr:
-                let nid   = safeInt(node, "nodeId")
-                let nhost = $safeStr(node, "host")
-                let nrp   = $safeIntStr(node, "raftPort")
-                let ncp   = $safeIntStr(node, "clientPort")
-                let nrole = $safeStr(node, "role")
-                let nalive = safeBool(node, "alive")
-                let nidStr = $safeIntStr(node, "nodeId")
-                tTr:
-                  tTd(style = "padding:.55rem .85rem;border-bottom:1px solid #eee"): "{nidStr}"
-                  tTd(style = "padding:.55rem .85rem;border-bottom:1px solid #eee"): "{nhost}"
-                  tTd(style = "padding:.55rem .85rem;border-bottom:1px solid #eee"): "{nrp}"
-                  tTd(style = "padding:.55rem .85rem;border-bottom:1px solid #eee"): "{ncp}"
-                  tTd(style = "padding:.55rem .85rem;border-bottom:1px solid #eee"):
-                    let rc = case nrole
-                      of "leader": "#1a7f37"
-                      of "follower": "#2563eb"
-                      else: "#888"
-                    tSpan(style = "color:{rc};font-weight:600"): "{nrole}"
-                  tTd(style = "padding:.55rem .85rem;border-bottom:1px solid #eee"):
-                    if nalive:
-                      tSpan(style = "color:#1a7f37;font-weight:600"): "alive"
-                    else:
-                      tSpan(style = "color:#c41010;font-weight:600"): "unreachable"
-                  tTd(style = "padding:.55rem .85rem;border-bottom:1px solid #eee"):
-                    tButton(style = "background:#e81c1c;color:#fff;border:none;padding:.3rem .75rem;border-radius:4px;cursor:pointer;font-size:.8rem"):
-                      "Remove"
-                      @click:
-                        discard doRemoveNode(nid)
         tDiv(style = "background:#fff;border-radius:6px;border:1px solid #e0e0e0;padding:1rem"):
           tStrong: "Join Node"
           tDiv(style = "display:flex;gap:.5rem;flex-wrap:wrap;align-items:flex-end;margin:.75rem 0 .5rem"):
@@ -284,6 +314,53 @@ appRoutes "app":
                     tTd(style = "padding:.55rem .85rem;border-bottom:1px solid #eee;font-family:monospace;font-size:.82rem"): "{sranges}"
       tFooter(style = footerStyle):
         "Fractio Management Console · Spaces"
+
+  # ---- Storage ----
+  "/storage":
+    let hs6 = healthStr(safeInt(gHealth.get(), "status"))
+    let hc6 = healthColor(safeInt(gHealth.get(), "status"))
+    tDiv(style = shellStyle):
+      tHeader(style = headerStyle):
+        tDiv(style = logoStyle): "⬡ FRACTIO"
+        tDiv(style = "flex:1")
+        tSpan(style = "{badgeStyle(hc6)}"): "{hs6}"
+      tNav(style = navBarStyle):
+        for (href, label) in navItems:
+          tA(href = href, style = "{navStyle(label == \"Storage\")}"): "{label}"
+      tMain(style = mainStyle):
+        let storagePath = $safeStr(gStorage.get(), "path")
+        tDiv(style = "display:flex;align-items:center;gap:.75rem;margin-bottom:1rem"):
+          tH2(style = "font-size:1.05rem;font-weight:700;color:#111;margin:0"): "Storage"
+          if storagePath.len > 0:
+            tSpan(style = "background:#eee;color:#444;padding:.2rem .6rem;border-radius:999px;font-size:.8rem"):
+              "{storagePath}"
+
+        # Per-level file counts
+        let numFiles = gStorage.get().numFiles
+        let numFilesLen = jsArrayLen(numFiles)
+        if numFilesLen > 0:
+          tDiv(style = "display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:1rem;margin-bottom:1.25rem"):
+            for lvl in 0 ..< numFilesLen:
+              let fc = $jsArrayGet(numFiles, lvl)
+              let lvlStr = $lvl
+              tDiv(style = "background:#fff;border-top:3px solid #e81c1c;border-radius:6px;padding:1rem;box-shadow:0 1px 4px rgba(0,0,0,.07);text-align:center"):
+                tDiv(style = "font-size:.68rem;color:#666;text-transform:uppercase;letter-spacing:.07em;margin-bottom:.5rem;font-weight:600"):
+                  "Level {lvlStr}"
+                tDiv(style = "font-size:1.5rem;font-weight:700;color:#e81c1c"):
+                  "{fc} files"
+
+        # LevelDB stats table
+        let statsText = $safeStr(gStorage.get(), "stats")
+        if statsText.len > 0:
+          tDiv(style = "background:#fff;border-radius:6px;border:1px solid #e0e0e0;padding:1rem;margin-bottom:1.25rem"):
+            tStrong: "LevelDB Compaction Stats"
+            tPre(style = "margin-top:.75rem;font-size:.82rem;font-family:'SF Mono','Fira Mono',monospace;color:#222;overflow-x:auto;white-space:pre;line-height:1.5"):
+              "{statsText}"
+        else:
+          tDiv(style = "color:#888;font-size:.85rem;padding:1rem"): "Waiting for storage data..."
+
+      tFooter(style = footerStyle):
+        "Fractio Management Console · Storage"
 
   # ===========================================================================
   # Data Browser — URL-routed
@@ -546,6 +623,7 @@ appRoutes "app":
 
 when isMainModule:
   installLinkInterceptor()
+  installNodeClickHandler(proc(nid: int) = toggleNodeExpanded(nid))
   discard doRefresh()
   jsSetInterval(proc() = discard doRefresh(), 5000)
   connectDriftWs()

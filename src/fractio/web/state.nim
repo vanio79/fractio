@@ -26,6 +26,12 @@ var
   # Spaces state
   gSpaces*: State[JsObject] = remember newJsObject()
 
+  # Storage state
+  gStorage*: State[JsObject] = remember newJsObject()
+
+  # Expanded node IDs on dashboard (toggle storage details)
+  gExpandedNodes*: State[seq[int]] = remember newSeq[int]()
+
   # Clock drift: plain globals — updated directly via jsSetInnerHtml,
   # NOT via State, so they don't trigger HappyX re-renders.
   gDriftSamples*: seq[float] = @[]

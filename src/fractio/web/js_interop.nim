@@ -101,6 +101,22 @@ proc jsCaptureClickIntStr*(el: JsObject, id: int, name: cstring, cb: proc(id: in
 proc istrJs*(v: float): cstring {.importjs: "String(Math.round(#))".}
 proc istr*(v: float): string = $istrJs(v)
 
+# Delegated click handler for expandable node rows (class="node-row").
+# Reads the node ID from the second child span's textContent.
+proc installNodeClickHandler*(cb: proc(nid: int)) =
+  {.emit: """
+  document.addEventListener('click', function(e) {
+    var el = e.target;
+    while (el && el !== document.body) {
+      if (el.id && el.id.substring(0, 9) === 'node-row-') {
+        var nid = parseInt(el.id.substring(9), 10);
+        if (!isNaN(nid)) { `cb`(nid); return; }
+      }
+      el = el.parentElement;
+    }
+  });
+  """.}
+
 # Intercept clicks on internal hash links (/#/...) to use HappyX's route()
 # instead of default browser navigation.  This avoids double history entries
 # (one from the href change, one from HappyX's hashchange → pushState).

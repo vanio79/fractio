@@ -19,6 +19,7 @@ import ../distributed/raft/multigroup_coordinator
 import ../distributed/raft/multigroup_transport
 import ../distributed/raft/group_types
 import ../distributed/raft/multigroup_types
+import ../storage/wisckey_backend
 
 # ---------------------------------------------------------------------------
 # Server reference — plain pointer so {.gcsafe.} handlers can access it.
@@ -127,6 +128,24 @@ var htmlShellGz {.global.}: string
 # Helper
 # ---------------------------------------------------------------------------
 
+proc parseLevelSizes(stats: string): seq[float] =
+  ## Parse "leveldb.stats" output to extract per-level Size(MB) values.
+  ## Returns a 7-element seq (levels 0-6), defaulting to 0.0 for missing levels.
+  result = newSeq[float](7)
+  for line in stats.splitLines():
+    let stripped = line.strip()
+    # Lines look like: "  1        1        4         0        0         4"
+    if stripped.len > 0 and stripped[0] in '0'..'6':
+      let parts = stripped.splitWhitespace()
+      if parts.len >= 3:
+        try:
+          let level = parseInt(parts[0])
+          let sizeMB = parseFloat(parts[1 + 1])  # Files is [1], Size(MB) is [2]
+          if level >= 0 and level <= 6:
+            result[level] = sizeMB
+        except ValueError:
+          discard
+
 
 # ---------------------------------------------------------------------------
 # Web server thread
@@ -225,6 +244,29 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
           "abortedTxns":    0,
         }
 
+      # ---- REST: storage ----
+      get "/api/storage":
+        let srv = getSrv()
+        if srv.isNil or srv.raftStore.isNil:
+          statusCode = 503
+          return %* {"error": "server not ready"}
+        {.cast(gcsafe).}:
+          let backend = srv.raftStore.coordinator.store
+          let stats = backend.getProperty("leveldb.stats")
+          var numFiles = newJArray()
+          for level in 0 .. 6:
+            numFiles.add(newJString(backend.getProperty("leveldb.num-files-at-level" & $level)))
+          let sizes = parseLevelSizes(stats)
+          var levelSizes = newJArray()
+          for s in sizes:
+            levelSizes.add(newJFloat(s))
+          return %* {
+            "stats": stats,
+            "numFiles": numFiles,
+            "levelSizes": levelSizes,
+            "path": backend.path,
+          }
+
       # ---- REST: nodes GET ----
       get "/api/nodes":
         let srv = getSrv()
@@ -266,6 +308,19 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
                        else: "follower"
             entry["role"] = %role
             entry["alive"] = %true
+            # Local storage stats
+            if not srv.raftStore.isNil:
+              let backend = srv.raftStore.coordinator.store
+              var nf = newJArray()
+              for level in 0 .. 6:
+                nf.add(newJString(backend.getProperty("leveldb.num-files-at-level" & $level)))
+              entry["numFiles"] = nf
+              let stats = backend.getProperty("leveldb.stats")
+              let sizes = parseLevelSizes(stats)
+              var ls = newJArray()
+              for s in sizes:
+                ls.add(newJFloat(s))
+              entry["levelSizes"] = ls
           else:
             # Probe peer's /api/info endpoint
             let peerHost = entry.getOrDefault("host").getStr("")
@@ -283,6 +338,22 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
               except CatchableError:
                 entry["role"] = %"unknown"
                 entry["alive"] = %false
+              # Probe peer's storage stats
+              try:
+                let client2 = newHttpClient(timeout = 500)
+                let resp2 = client2.request(
+                  "http://" & peerHost & ":" & $peerWebPort & "/api/storage",
+                  httpMethod = HttpGet)
+                client2.close()
+                let storageInfo = parseJson(resp2.body)
+                let peerFiles = storageInfo.getOrDefault("numFiles")
+                if not peerFiles.isNil and peerFiles.kind == JArray:
+                  entry["numFiles"] = peerFiles
+                let peerSizes = storageInfo.getOrDefault("levelSizes")
+                if not peerSizes.isNil and peerSizes.kind == JArray:
+                  entry["levelSizes"] = peerSizes
+              except CatchableError:
+                discard
             else:
               entry["role"] = %"unknown"
               entry["alive"] = %false
