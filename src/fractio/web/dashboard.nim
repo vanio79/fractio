@@ -17,6 +17,8 @@ import ../distributed/meta/system_tables
 import ../protocol/raft_store
 import ../distributed/raft/multigroup_coordinator
 import ../distributed/raft/multigroup_transport
+import ../distributed/raft/group_types
+import ../distributed/raft/multigroup_types
 
 # ---------------------------------------------------------------------------
 # Server reference — plain pointer so {.gcsafe.} handlers can access it.
@@ -168,9 +170,12 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
           return %* {"error": "server not ready"}
         let nowSecs = getTime().toUnix()
         let uptime = uint64(max(0'i64, nowSecs - srv.startedAt))
-        let role = if srv.raftStore.isNil: "unknown"
-                   elif srv.raftStore.coordinator.getLeaderCount() > 0: "leader"
-                   else: "follower"
+        let role = block:
+          if srv.raftStore.isNil: "unknown"
+          else:
+            let metaOpt = srv.raftStore.coordinator.getGroup(META_GROUP_ID)
+            if metaOpt.isSome and metaOpt.get.isLeader(): "leader"
+            else: "follower"
         let shards = if srv.raftStore.isNil: 0
                      else: srv.raftStore.coordinator.getGroupCount()
         return %* {
