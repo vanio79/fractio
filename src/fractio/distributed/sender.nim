@@ -12,7 +12,7 @@ import std/tables
 import std/locks
 import std/atomics
 
-import fractio/distributed/range/types
+import fractio/distributed/raft/group_types
 import fractio/distributed/meta/types
 import fractio/distributed/meta/lookup
 
@@ -43,38 +43,38 @@ type
 
   NotLeaderError* = object of SendError
     ## Current node is not the leader
-    leaderHint*: RangeNodeID
+    leaderHint*: NodeID
       ## Hint about who the actual leader is
-    rangeId*: RangeID
+    groupId*: GroupID
       ## The range that has a different leader
 
-  RangeUnavailableError* = object of SendError
+  GroupUnavailableError* = object of SendError
     ## Range is unavailable (no replicas reachable)
-    rangeId*: RangeID
+    groupId*: GroupID
 
   SendTimeoutError* = object of SendError
     ## Send operation timed out
-    rangeId*: RangeID
+    groupId*: GroupID
 
-proc newNotLeaderError*(rangeId: RangeID,
-    leaderHint: RangeNodeID): ref NotLeaderError =
+proc newNotLeaderError*(groupId: GroupID,
+    leaderHint: NodeID): ref NotLeaderError =
   ## Create a not-leader error
   new(result)
-  result.rangeId = rangeId
+  result.groupId = groupId
   result.leaderHint = leaderHint
-  result.msg = "Not leader for range " & $rangeId & ", leader is " & $leaderHint
+  result.msg = "Not leader for range " & $groupId & ", leader is " & $leaderHint
 
-proc newRangeUnavailableError*(rangeId: RangeID): ref RangeUnavailableError =
+proc newGroupUnavailableError*(groupId: GroupID): ref GroupUnavailableError =
   ## Create a range unavailable error
   new(result)
-  result.rangeId = rangeId
-  result.msg = "Range " & $rangeId & " is unavailable"
+  result.groupId = groupId
+  result.msg = "Range " & $groupId & " is unavailable"
 
-proc newSendTimeoutError*(rangeId: RangeID): ref SendTimeoutError =
+proc newSendTimeoutError*(groupId: GroupID): ref SendTimeoutError =
   ## Create a send timeout error
   new(result)
-  result.rangeId = rangeId
-  result.msg = "Send to range " & $rangeId & " timed out"
+  result.groupId = groupId
+  result.msg = "Send to range " & $groupId & " timed out"
 
 # ============================================================================
 # Request/Response Types
@@ -132,19 +132,19 @@ type
     responses*: seq[KVResponse]
     error*: Option[string]
 
-  RangeRequest* = object
+  GroupRequest* = object
     ## Request to a single range
-    rangeId*: RangeID
+    groupId*: GroupID
     requests*: seq[KVRequest]
     timestampNs*: int64
     priority*: int32
 
-  RangeResponse* = object
+  GroupResponse* = object
     ## Response from a single range
-    rangeId*: RangeID
+    groupId*: GroupID
     responses*: seq[KVResponse]
     error*: Option[string]
-    leaderHint*: Option[RangeNodeID]
+    leaderHint*: Option[NodeID]
 
 # ============================================================================
 # Request Constructors
@@ -210,12 +210,12 @@ proc newEndTxnResponse*(success: bool): KVResponse =
 # ============================================================================
 
 type
-  SendCallback* = proc(req: RangeRequest): RangeResponse {.closure, gcsafe.}
+  SendCallback* = proc(req: GroupRequest): GroupResponse {.closure, gcsafe.}
     ## Callback to send a request to a node
 
   DistSender* = ref object
     ## Distributes requests across ranges
-    lookup*: RangeLookup
+    lookup*: GroupLookup
       ## Range lookup handler
 
     # Configuration
@@ -234,7 +234,7 @@ type
     sendCallback*: SendCallback
     lock*: Lock
 
-proc newDistSender*(lookup: RangeLookup,
+proc newDistSender*(lookup: GroupLookup,
                     callback: SendCallback): DistSender =
   ## Create a new DistSender
   new(result)
@@ -258,13 +258,13 @@ proc destroy*(sender: DistSender) =
 # Request Splitting
 # ============================================================================
 
-proc splitByRange*(sender: DistSender, batch: BatchRequest,
-                   nowNs: int64): seq[RangeRequest] =
+proc splitByGroup*(sender: DistSender, batch: BatchRequest,
+                   nowNs: int64): seq[GroupRequest] =
   ## Split a batch request by range
   ## Groups requests by their target range
 
-  var rangeGroups = initTable[RangeID, seq[KVRequest]]()
-  var rangeOrder: seq[RangeID] = @[]
+  var rangeGroups = initTable[GroupID, seq[KVRequest]]()
+  var rangeOrder: seq[GroupID] = @[]
 
   for req in batch.requests:
     # Get the key for this request
@@ -287,25 +287,25 @@ proc splitByRange*(sender: DistSender, batch: BatchRequest,
     if not lookupResp.found:
       continue
 
-    let rangeId = lookupResp.descriptor.rangeId
+    let groupId = lookupResp.descriptor.groupId
 
-    if not rangeGroups.contains(rangeId):
-      rangeGroups[rangeId] = @[]
-      rangeOrder.add(rangeId)
+    if not rangeGroups.contains(groupId):
+      rangeGroups[groupId] = @[]
+      rangeOrder.add(groupId)
 
-    rangeGroups[rangeId].add(req)
+    rangeGroups[groupId].add(req)
 
   # Build range requests
-  for rangeId in rangeOrder:
-    result.add(RangeRequest(
-      rangeId: rangeId,
-      requests: rangeGroups[rangeId],
+  for groupId in rangeOrder:
+    result.add(GroupRequest(
+      groupId: groupId,
+      requests: rangeGroups[groupId],
       timestampNs: batch.timestampNs,
       priority: batch.priority
     ))
 
 proc mergeResponses*(sender: DistSender,
-                     responses: seq[RangeResponse]): BatchResponse =
+                     responses: seq[GroupResponse]): BatchResponse =
   ## Merge range responses into a batch response
   var allResponses: seq[KVResponse] = @[]
   var hadError = false
@@ -344,8 +344,8 @@ proc shouldRetry*(sender: DistSender, err: ref SendError,
   if err of NotLeaderError:
     return true
 
-  # Retry on RangeUnavailableError (might come back)
-  if err of RangeUnavailableError:
+  # Retry on GroupUnavailableError (might come back)
+  if err of GroupUnavailableError:
     return attempt < sender.maxRetries div 2 # Fewer retries for unavailable
   
   # Retry on SendTimeoutError
@@ -358,8 +358,8 @@ proc shouldRetry*(sender: DistSender, err: ref SendError,
 # Send Logic
 # ============================================================================
 
-proc sendToRange*(sender: DistSender, req: RangeRequest,
-                  nowNs: int64): RangeResponse =
+proc sendToGroup*(sender: DistSender, req: GroupRequest,
+                  nowNs: int64): GroupResponse =
   ## Send a request to a specific range with retry logic
 
   var attempt = 0
@@ -369,15 +369,15 @@ proc sendToRange*(sender: DistSender, req: RangeRequest,
 
   while attempt <= sender.maxRetries:
     # Get leaseholder for this range
-    let leaseholderOpt = sender.lookup.getLeaseholder(req.rangeId, nowNs)
+    let leaseholderOpt = sender.lookup.getLeaseholder(req.groupId, nowNs)
     if leaseholderOpt.isNone:
-      lastError = newRangeUnavailableError(req.rangeId)
+      lastError = newGroupUnavailableError(req.groupId)
       if not sender.shouldRetry(lastError, attempt):
         discard sender.sendsFailed.fetchAdd(1)
-        return RangeResponse(
-          rangeId: req.rangeId,
+        return GroupResponse(
+          groupId: req.groupId,
           responses: @[],
-          error: some("Range unavailable: " & $req.rangeId)
+          error: some("Group unavailable: " & $req.groupId)
         )
 
       # Wait before retry
@@ -397,11 +397,11 @@ proc sendToRange*(sender: DistSender, req: RangeRequest,
       if resp.leaderHint.isSome:
         # Update cache with new leader hint
         # In production, would update leaseholder info
-        lastError = newNotLeaderError(req.rangeId, resp.leaderHint.get)
+        lastError = newNotLeaderError(req.groupId, resp.leaderHint.get)
         if not sender.shouldRetry(lastError, attempt):
           discard sender.sendsFailed.fetchAdd(1)
-          return RangeResponse(
-            rangeId: req.rangeId,
+          return GroupResponse(
+            groupId: req.groupId,
             responses: @[],
             error: some("Not leader: " & $resp.leaderHint.get),
             leaderHint: resp.leaderHint
@@ -419,8 +419,8 @@ proc sendToRange*(sender: DistSender, req: RangeRequest,
       lastError = e
       if not sender.shouldRetry(lastError, attempt):
         discard sender.sendsFailed.fetchAdd(1)
-        return RangeResponse(
-          rangeId: req.rangeId,
+        return GroupResponse(
+          groupId: req.groupId,
           responses: @[],
           error: some(e.msg)
         )
@@ -430,8 +430,8 @@ proc sendToRange*(sender: DistSender, req: RangeRequest,
 
   # All retries exhausted
   discard sender.sendsFailed.fetchAdd(1)
-  return RangeResponse(
-    rangeId: req.rangeId,
+  return GroupResponse(
+    groupId: req.groupId,
     responses: @[],
     error: some(if lastError != nil: lastError.msg else: "Unknown error")
   )
@@ -441,15 +441,15 @@ proc send*(sender: DistSender, batch: BatchRequest,
   ## Send a batch request, splitting by range and handling retries
 
   # Split batch by range
-  let rangeReqs = sender.splitByRange(batch, nowNs)
+  let rangeReqs = sender.splitByGroup(batch, nowNs)
 
   if rangeReqs.len == 0:
     return BatchResponse(responses: @[], error: some("No valid ranges found"))
 
   # Send to each range
-  var rangeResponses: seq[RangeResponse] = @[]
+  var rangeResponses: seq[GroupResponse] = @[]
   for req in rangeReqs:
-    rangeResponses.add(sender.sendToRange(req, nowNs))
+    rangeResponses.add(sender.sendToGroup(req, nowNs))
 
   # Merge responses
   return sender.mergeResponses(rangeResponses)

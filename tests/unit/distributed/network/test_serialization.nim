@@ -248,7 +248,7 @@ suite "Client Message Encoding/Decoding":
     msg.header = newMessageHeader(100'u16, 1'u64, NodeID("client"), NodeID(
         "server"), 0'u64)
     msg.requestId = 123'u64
-    msg.rangeId = 1'u32
+    msg.groupId = 1'u32
     msg.transactionId = 0'u64
     var req = KVRequest(kind: rkPut)
     req.putKey = "key"
@@ -257,7 +257,7 @@ suite "Client Message Encoding/Decoding":
     let encoded = encodeBatchRequestMsg(msg)
     let decoded = decodeBatchRequestMsg(encoded)
     check decoded.requestId == 123'u64
-    check decoded.rangeId == 1'u32
+    check decoded.groupId == 1'u32
     check decoded.requests.len == 1
     check decoded.requests[0].kind == rkPut
     check decoded.requests[0].putKey == "key"

@@ -6,83 +6,83 @@ import std/times
 import std/options
 import std/locks
 
-import fractio/distributed/range/types
+import fractio/distributed/raft/group_types
 import fractio/distributed/raft/liveness
 
 suite "LivenessState":
   test "create liveness state":
     let state = LivenessState(
-      nodeId: RangeNodeID(1),
+      nodeId: NodeID(1),
       lastHeartbeat: 1000,
       supportedUntil: 2000,
       epoch: 1
     )
-    check state.nodeId == RangeNodeID(1)
+    check state.nodeId == NodeID(1)
     check state.epoch == 1
 
 suite "StoreLiveness":
   test "create store liveness":
-    let sl = newStoreLiveness(RangeNodeID(1))
-    check sl.nodeId == RangeNodeID(1)
+    let sl = newStoreLiveness(NodeID(1))
+    check sl.nodeId == NodeID(1)
     check sl.getEpoch() == 1
     sl.close()
 
   test "register and check store":
-    let sl = newStoreLiveness(RangeNodeID(1))
-    sl.registerStore(RangeNodeID(2))
+    let sl = newStoreLiveness(NodeID(1))
+    sl.registerStore(NodeID(2))
 
-    check sl.isAlive(RangeNodeID(2))
+    check sl.isAlive(NodeID(2))
     sl.close()
 
   test "heartbeat processing":
-    let sl = newStoreLiveness(RangeNodeID(1))
-    sl.registerStore(RangeNodeID(2))
+    let sl = newStoreLiveness(NodeID(1))
+    sl.registerStore(NodeID(2))
 
     let msg = LivenessMessage(
-      nodeId: RangeNodeID(2),
+      nodeId: NodeID(2),
       epoch: 1,
       timestamp: getTime().toUnix * 1_000_000_000,
       messageType: lmtHeartbeat
     )
 
     let response = sl.processHeartbeat(msg)
-    check response.nodeId == RangeNodeID(1)
+    check response.nodeId == NodeID(1)
     check response.messageType == lmtHeartbeatResponse
     sl.close()
 
   test "support management":
-    let sl = newStoreLiveness(RangeNodeID(1))
+    let sl = newStoreLiveness(NodeID(1))
 
-    sl.grantSupport(RangeNodeID(2))
-    check sl.isSupporting(RangeNodeID(2))
+    sl.grantSupport(NodeID(2))
+    check sl.isSupporting(NodeID(2))
 
-    sl.withdrawSupport(RangeNodeID(2))
-    check not sl.isSupporting(RangeNodeID(2))
+    sl.withdrawSupport(NodeID(2))
+    check not sl.isSupporting(NodeID(2))
     sl.close()
 
   test "liveness expiration":
-    let sl = newStoreLiveness(RangeNodeID(1),
+    let sl = newStoreLiveness(NodeID(1),
                                heartbeatIntervalNs = 100_000_000,
                                supportExpirationNs = 200_000_000)
 
-    sl.registerStore(RangeNodeID(2))
-    check sl.isAlive(RangeNodeID(2))
+    sl.registerStore(NodeID(2))
+    check sl.isAlive(NodeID(2))
 
     # Unregister to simulate expiration
-    sl.unregisterStore(RangeNodeID(2))
-    check not sl.isAlive(RangeNodeID(2))
+    sl.unregisterStore(NodeID(2))
+    check not sl.isAlive(NodeID(2))
     sl.close()
 
   test "quorum support":
-    let sl = newStoreLiveness(RangeNodeID(1))
+    let sl = newStoreLiveness(NodeID(1))
 
     # Register 3 nodes
-    sl.registerStore(RangeNodeID(1))
-    sl.registerStore(RangeNodeID(2))
-    sl.registerStore(RangeNodeID(3))
+    sl.registerStore(NodeID(1))
+    sl.registerStore(NodeID(2))
+    sl.registerStore(NodeID(3))
 
     # All alive, should have quorum
-    let nodes = @[RangeNodeID(1), RangeNodeID(2), RangeNodeID(3)]
+    let nodes = @[NodeID(1), NodeID(2), NodeID(3)]
     check sl.hasQuorumSupport(nodes)
 
     # Count supported
@@ -90,17 +90,17 @@ suite "StoreLiveness":
     sl.close()
 
   test "can acquire lease":
-    let sl = newStoreLiveness(RangeNodeID(1))
-    sl.registerStore(RangeNodeID(1))
-    sl.registerStore(RangeNodeID(2))
-    sl.registerStore(RangeNodeID(3))
+    let sl = newStoreLiveness(NodeID(1))
+    sl.registerStore(NodeID(1))
+    sl.registerStore(NodeID(2))
+    sl.registerStore(NodeID(3))
 
     let voters = @[
-      ReplicaDescriptor(nodeId: RangeNodeID(1), replicaId: ReplicaID(1),
+      ReplicaDescriptor(nodeId: NodeID(1), replicaId: ReplicaID(1),
           replicaType: rtVoter),
-      ReplicaDescriptor(nodeId: RangeNodeID(2), replicaId: ReplicaID(2),
+      ReplicaDescriptor(nodeId: NodeID(2), replicaId: ReplicaID(2),
           replicaType: rtVoter),
-      ReplicaDescriptor(nodeId: RangeNodeID(3), replicaId: ReplicaID(3),
+      ReplicaDescriptor(nodeId: NodeID(3), replicaId: ReplicaID(3),
           replicaType: rtVoter)
     ]
 
@@ -108,7 +108,7 @@ suite "StoreLiveness":
     sl.close()
 
   test "epoch increment":
-    let sl = newStoreLiveness(RangeNodeID(1))
+    let sl = newStoreLiveness(NodeID(1))
     let initialEpoch = sl.getEpoch()
 
     sl.incrementEpoch()
@@ -116,16 +116,16 @@ suite "StoreLiveness":
     sl.close()
 
   test "heartbeat creation":
-    let sl = newStoreLiveness(RangeNodeID(1))
+    let sl = newStoreLiveness(NodeID(1))
     let msg = sl.createHeartbeat()
 
-    check msg.nodeId == RangeNodeID(1)
+    check msg.nodeId == NodeID(1)
     check msg.messageType == lmtHeartbeat
     check msg.timestamp > 0
     sl.close()
 
   test "should send heartbeat":
-    let sl = newStoreLiveness(RangeNodeID(1), heartbeatIntervalNs = 100_000_000)
+    let sl = newStoreLiveness(NodeID(1), heartbeatIntervalNs = 100_000_000)
 
     # Initially should send
     check sl.shouldSendHeartbeat()
@@ -136,20 +136,20 @@ suite "StoreLiveness":
     sl.close()
 
   test "get alive stores":
-    let sl = newStoreLiveness(RangeNodeID(1))
-    sl.registerStore(RangeNodeID(2))
-    sl.registerStore(RangeNodeID(3))
+    let sl = newStoreLiveness(NodeID(1))
+    sl.registerStore(NodeID(2))
+    sl.registerStore(NodeID(3))
 
     let alive = sl.getAliveStores()
-    check RangeNodeID(2) in alive
-    check RangeNodeID(3) in alive
+    check NodeID(2) in alive
+    check NodeID(3) in alive
     sl.close()
 
   test "get stats":
-    let sl = newStoreLiveness(RangeNodeID(1))
-    sl.registerStore(RangeNodeID(2))
-    sl.registerStore(RangeNodeID(3))
-    sl.grantSupport(RangeNodeID(2))
+    let sl = newStoreLiveness(NodeID(1))
+    sl.registerStore(NodeID(2))
+    sl.registerStore(NodeID(3))
+    sl.grantSupport(NodeID(2))
 
     let stats = sl.getStats()
     check stats.total == 2
@@ -160,12 +160,12 @@ suite "StoreLiveness":
 suite "LivenessMessage":
   test "create message":
     let msg = LivenessMessage(
-      nodeId: RangeNodeID(1),
+      nodeId: NodeID(1),
       epoch: 1,
       timestamp: 1000,
       messageType: lmtHeartbeat
     )
-    check msg.nodeId == RangeNodeID(1)
+    check msg.nodeId == NodeID(1)
     check msg.messageType == lmtHeartbeat
 
 suite "SupportState":

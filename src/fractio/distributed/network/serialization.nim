@@ -535,7 +535,7 @@ proc encodeBatchRequestMsg*(msg: BatchRequestMsg): string =
   var w = newBinaryWriter(256)
   w.writeString(encodeHeader(msg.header))
   w.writeUint64BE(msg.requestId)
-  w.writeUint32BE(msg.rangeId)
+  w.writeUint32BE(msg.groupId)
   w.writeUint64BE(msg.transactionId)
   w.writeUint32BE(msg.requests.len.uint32)
   for req in msg.requests:
@@ -547,7 +547,7 @@ proc decodeBatchRequestMsg*(data: string): BatchRequestMsg =
   let headerData = r.readString()
   result.header = decodeHeader(headerData)
   result.requestId = r.readUint64BE()
-  result.rangeId = r.readUint32BE()
+  result.groupId = r.readUint32BE()
   result.transactionId = r.readUint64BE()
   let numRequests = r.readUint32BE().int
   result.requests = @[]
@@ -583,7 +583,7 @@ proc encodeScanRequestMsg*(msg: ScanRequestMsg): string =
   var w = newBinaryWriter(128)
   w.writeString(encodeHeader(msg.header))
   w.writeUint64BE(msg.requestId)
-  w.writeUint32BE(msg.rangeId)
+  w.writeUint32BE(msg.groupId)
   w.writeString(msg.startKey)
   w.writeString(msg.endKey)
   w.writeUint32BE(msg.limit)
@@ -595,7 +595,7 @@ proc decodeScanRequestMsg*(data: string): ScanRequestMsg =
   let headerData = r.readString()
   result.header = decodeHeader(headerData)
   result.requestId = r.readUint64BE()
-  result.rangeId = r.readUint32BE()
+  result.groupId = r.readUint32BE()
   result.startKey = r.readString()
   result.endKey = r.readString()
   result.limit = r.readUint32BE()

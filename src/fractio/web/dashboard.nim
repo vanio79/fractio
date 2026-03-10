@@ -569,12 +569,12 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
           (id: SYS_DATABASES_TABLE_ID, name: "sys.databases", desc: "Database catalog"),
           (id: SYS_SCHEMAS_TABLE_ID, name: "sys.schemas", desc: "Schema catalog"),
           (id: SYS_TABLES_TABLE_ID, name: "sys.tables", desc: "Table descriptors"),
-          (id: SYS_RANGES_TABLE_ID, name: "sys.ranges", desc: "Range map"),
+          (id: SYS_GROUPS_TABLE_ID, name: "sys.groups", desc: "Group map"),
           (id: SYS_NODES_TABLE_ID, name: "sys.nodes", desc: "Node registry"),
           (id: SYS_SETTINGS_TABLE_ID, name: "sys.settings", desc: "Cluster settings"),
           (id: SYS_SPACES_TABLE_ID, name: "sys.spaces", desc: "Space catalog"),
           (id: SYS_NODE_METRICS_ID, name: "sys.node_metrics", desc: "Node metrics"),
-          (id: SYS_RANGE_METRICS_ID, name: "sys.range_metrics", desc: "Range metrics"),
+          (id: SYS_GROUP_METRICS_ID, name: "sys.group_metrics", desc: "Group metrics"),
           (id: SYS_EVENTS_TABLE_ID, name: "sys.events", desc: "Cluster events"),
         ]
         var arr = newJArray()
@@ -632,11 +632,11 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
             of SYS_DATABASES_TABLE_ID: @["_key", "id", "name", "replicaCount", "createdAt"]
             of SYS_SCHEMAS_TABLE_ID: @["_key", "id", "databaseId", "name", "createdAt"]
             of SYS_TABLES_TABLE_ID: @["_key", "id", "schemaId", "name", "columns", "indices", "createdAt"]
-            of SYS_RANGES_TABLE_ID: @["_key", "rangeId", "startKey", "endKey", "replicas"]
+            of SYS_GROUPS_TABLE_ID: @["_key", "groupId", "startKey", "endKey", "replicas"]
             of SYS_NODES_TABLE_ID: @["_key", "nodeId", "host", "raftPort", "clientPort", "status"]
             of SYS_SETTINGS_TABLE_ID: @["_key", "value"]
             of SYS_NODE_METRICS_ID: @["_key", "nodeId", "cpuPercent", "memUsedBytes", "diskUsedBytes"]
-            of SYS_RANGE_METRICS_ID: @["_key", "rangeId", "keyCount", "sizeBytes", "readQps", "writeQps"]
+            of SYS_GROUP_METRICS_ID: @["_key", "groupId", "keyCount", "sizeBytes", "readQps", "writeQps"]
             of SYS_EVENTS_TABLE_ID: @["_key", "timestamp", "eventType", "nodeId", "message"]
             else: @["_key", "_value"]
           for c in sysColumns:

@@ -284,7 +284,7 @@ appRoutes "app":
             tTable(style = "width:100%;border-collapse:collapse;font-size:.875rem;background:#fff;border:1px solid #e0e0e0;border-radius:6px;overflow:hidden"):
               tThead:
                 tTr:
-                  for h in ["ID", "Name", "Replicas", "Groups", "Range IDs"]:
+                  for h in ["ID", "Name", "Replicas", "Groups", "Group IDs"]:
                     tTh(style = "background:#3a3a3a;color:#fff;padding:.55rem .85rem;text-align:left;font-size:.7rem;text-transform:uppercase;letter-spacing:.07em;font-weight:600"):
                       "{h}"
               tTbody:
@@ -295,7 +295,7 @@ appRoutes "app":
                   let srep = safeInt(sp, "replicas")
                   let srepStr = if srep == 0: "ALL" else: $safeIntStr(sp, "replicas")
                   let sgc = $safeIntStr(sp, "groupCount")
-                  let sranges = $safeStr(sp, "rangeIds")
+                  let sranges = $safeStr(sp, "groupIds")
                   tTr:
                     tTd(style = "padding:.55rem .85rem;border-bottom:1px solid #eee"): "{sid}"
                     tTd(style = "padding:.55rem .85rem;border-bottom:1px solid #eee;font-weight:600"): "{sname}"
@@ -337,7 +337,7 @@ appRoutes "app":
               tDiv(style = "font-size:.65rem;color:#999;text-transform:uppercase;letter-spacing:.07em;margin-bottom:.25rem;font-weight:600"):
                 "SYSTEM DATABASE"
               tDiv(style = "font-size:.95rem;font-weight:600;color:#111"): "sys"
-              tDiv(style = "font-size:.75rem;color:#888"): "System tables (nodes, ranges, settings, ...)"
+              tDiv(style = "font-size:.75rem;color:#888"): "System tables (nodes, groups, settings, ...)"
 
           # User databases
           let dbs = gDatabases.get()

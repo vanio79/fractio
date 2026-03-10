@@ -13,7 +13,7 @@ import std/times
 import std/tables
 import std/json
 
-import fractio/distributed/range/types
+import fractio/distributed/raft/group_types
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/liveness
 import fractio/distributed/raft/multigroup_log
@@ -37,8 +37,8 @@ type
   LeaseManager* = ref object
     ## Manages leases for a single Raft group
 
-    rangeId*: RangeID
-    nodeId*: RangeNodeID
+    groupId*: GroupID
+    nodeId*: NodeID
 
     # Current lease state
     lease*: Atomic[Lease]
@@ -54,7 +54,7 @@ type
     lock*: Lock
 
     # Pending lease operations
-    pendingTransfer*: Option[RangeNodeID]
+    pendingTransfer*: Option[NodeID]
     transferComplete*: bool
 
   LeaseAcquisitionResult* = object
@@ -72,12 +72,12 @@ type
 # Lease Manager Operations
 # ============================================================================
 
-proc newLeaseManager*(rangeId: RangeID, nodeId: RangeNodeID,
+proc newLeaseManager*(groupId: GroupID, nodeId: NodeID,
                        storeLiveness: StoreLiveness,
                        leaseDurationNs = DEFAULT_LEASE_DURATION_NS): LeaseManager =
   ## Create a new lease manager
   new(result)
-  result.rangeId = rangeId
+  result.groupId = groupId
   result.nodeId = nodeId
   result.storeLiveness = storeLiveness
   result.leaseDurationNs = leaseDurationNs
@@ -152,7 +152,7 @@ proc proposeLeaseAcquisition*(lm: LeaseManager,
   lm.leaseState.store(lsHeld)
 
   var fields = initTable[string, string]()
-  fields["rangeId"] = $lm.rangeId
+  fields["groupId"] = $lm.groupId
   fields["nodeId"] = $lm.nodeId
   fields["expirationNs"] = $newLease.expirationTs
   info("Acquired lease", fields)
@@ -258,7 +258,7 @@ proc renewLease*(lm: LeaseManager, group: RaftGroup): LeaseAcquisitionResult =
   lm.lease.store(current)
 
   var fields = initTable[string, string]()
-  fields["rangeId"] = $lm.rangeId
+  fields["groupId"] = $lm.groupId
   fields["nodeId"] = $lm.nodeId
   fields["newExpirationNs"] = $current.expirationTs
   debug("Renewed lease", fields)
@@ -273,7 +273,7 @@ proc renewLease*(lm: LeaseManager, group: RaftGroup): LeaseAcquisitionResult =
 # Lease Transfer
 # ============================================================================
 
-proc proposeLeaseTransfer*(lm: LeaseManager, target: RangeNodeID): bool =
+proc proposeLeaseTransfer*(lm: LeaseManager, target: NodeID): bool =
   ## Propose transferring lease to another node.
   ## The transfer happens through Raft.
 
@@ -289,13 +289,13 @@ proc proposeLeaseTransfer*(lm: LeaseManager, target: RangeNodeID): bool =
     lm.leaseState.store(lsTransferring)
 
   var fields = initTable[string, string]()
-  fields["rangeId"] = $lm.rangeId
+  fields["groupId"] = $lm.groupId
   fields["target"] = $target
   info("Proposed lease transfer", fields)
 
   return true
 
-proc completeLeaseTransfer*(lm: LeaseManager, target: RangeNodeID): bool =
+proc completeLeaseTransfer*(lm: LeaseManager, target: NodeID): bool =
   ## Complete a lease transfer to the target node.
   ## Called when the transfer command is applied.
 
@@ -303,14 +303,14 @@ proc completeLeaseTransfer*(lm: LeaseManager, target: RangeNodeID): bool =
     if lm.pendingTransfer.isSome() and lm.pendingTransfer.get() == target:
       lm.transferComplete = true
       lm.leaseState.store(lsNone)
-      lm.pendingTransfer = none(RangeNodeID)
+      lm.pendingTransfer = none(NodeID)
       return true
   return false
 
 proc cancelLeaseTransfer*(lm: LeaseManager) =
   ## Cancel a pending lease transfer
   withLock lm.lock:
-    lm.pendingTransfer = none(RangeNodeID)
+    lm.pendingTransfer = none(NodeID)
     lm.transferComplete = false
     lm.leaseState.store(lsHeld)
 
@@ -327,7 +327,7 @@ proc expireLease*(lm: LeaseManager) =
   lm.leaseState.store(lsExpired)
 
   var fields = initTable[string, string]()
-  fields["rangeId"] = $lm.rangeId
+  fields["groupId"] = $lm.groupId
   fields["nodeId"] = $lm.nodeId
   warn("Lease expired", fields)
 
@@ -357,12 +357,12 @@ proc isLeaseholder*(lm: LeaseManager): bool =
   let state = lm.leaseState.load()
   result = state == lsHeld or state == lsTransferring
 
-proc getLeaseholder*(lm: LeaseManager): Option[RangeNodeID] =
+proc getLeaseholder*(lm: LeaseManager): Option[NodeID] =
   ## Get the current leaseholder
   if lm.leaseState.load() == lsHeld:
     result = some(lm.lease.load().leaseholder)
   else:
-    result = none(RangeNodeID)
+    result = none(NodeID)
 
 # ============================================================================
 # Lease Serialization
@@ -380,7 +380,7 @@ proc leaseToJson*(lease: Lease): JsonNode =
 proc parseLease*(json: JsonNode): Lease =
   ## Parse lease from JSON
   Lease(
-    leaseholder: RangeNodeID(json["leaseholder"].getInt()),
+    leaseholder: NodeID(json["leaseholder"].getInt()),
     startTs: json["startTs"].getInt(),
     expirationTs: json["expirationTs"].getInt(),
     epoch: uint64(json["epoch"].getInt())

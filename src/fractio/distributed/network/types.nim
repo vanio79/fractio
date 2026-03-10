@@ -160,7 +160,7 @@ type
     ## Batch of KV requests
     header*: MessageHeader
     requestId*: uint64
-    rangeId*: uint32
+    groupId*: uint32
     transactionId*: uint64 # 0 if not in transaction
     requests*: seq[KVRequest]
 
@@ -176,7 +176,7 @@ type
     ## Dedicated scan request for large results
     header*: MessageHeader
     requestId*: uint64
-    rangeId*: uint32
+    groupId*: uint32
     startKey*: string
     endKey*: string
     limit*: uint32

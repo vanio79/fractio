@@ -24,7 +24,7 @@ import fractio/protocol/messages/kv
 import fractio/protocol/messages/txn as txnMsgs
 import fractio/distributed/raft/multigroup_coordinator
 import fractio/distributed/raft/multigroup_types
-import fractio/distributed/range/types as rangeTypes
+import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
 
 # ---------------------------------------------------------------------------
@@ -39,7 +39,7 @@ proc makeStressServer(port: int, storagePath: string,
     numWorkers: int = 4): ProtocolServer =
   cleanDir(storagePath)
   let coordCfg = CoordinatorConfig(
-    nodeId: RangeNodeID(1),
+    nodeId: NodeID(1),
     numWorkers: numWorkers,
     electionTimeoutNs: DEFAULT_ELECTION_TIMEOUT_NS,
     heartbeatIntervalNs: DEFAULT_HEARTBEAT_INTERVAL_NS,
@@ -47,14 +47,14 @@ proc makeStressServer(port: int, storagePath: string,
     proposeTimeoutMs: 10_000,
   )
   let coord = newMultiRaftCoordinator(coordCfg)
-  for rid in [META_RANGE_ID, DATA_RANGE_START_ID]:
-    let desc = newRangeDescriptor(rid, @[], @[])
-    let rep = desc.addReplica(RangeNodeID(1))
+  for rid in [META_GROUP_ID, DATA_GROUP_START_ID]:
+    let desc = newGroupDescriptor(rid)
+    let rep = desc.addReplica(NodeID(1))
     let group = coord.createGroup(desc, rep.replicaId)
     group.becomeLeader()
   coord.start()
   let raftSt = newRaftKVStoreExt(coord, proposeTimeoutMs = 10_000)
-  raftSt.bootstrapStore(@[META_RANGE_ID, DATA_RANGE_START_ID])
+  raftSt.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
   var cfg = defaultServerConfig()
   cfg.host = "127.0.0.1"
   cfg.port = port

@@ -1,6 +1,6 @@
 # Multi-Group Raft Log Storage
 #
-# This module implements per-range Raft log storage using WiscKey backend.
+# This module implements per-group Raft log storage using WiscKey backend.
 
 import std/atomics
 import std/locks
@@ -10,7 +10,7 @@ import std/strutils
 import std/sequtils
 import std/tables
 
-import fractio/distributed/range/types
+import fractio/distributed/raft/group_types
 import fractio/distributed/raft/multigroup_types
 import fractio/storage/wisckey_backend
 import fractio/storage/backend
@@ -23,7 +23,7 @@ import fractio/utils/logging
 type
   RaftLog* = ref object
     ## Raft log for a single group, stored in WiscKey
-    rangeId*: RangeID
+    groupId*: GroupID
     store*: WiscKeyBackend
     firstIndex*: Atomic[uint64]
     lastIndex*: Atomic[uint64]
@@ -111,12 +111,12 @@ proc decodeEntry*(data: string): LogEntry =
     result.command = RaftCommand(
       kind: ckSplit,
       splitKey: splitKey,
-      newRangeId: RangeID(uint64(json["newRangeId"].getInt()))
+      newRangeId: GroupID(uint64(json["newRangeId"].getInt()))
     )
   of ckMerge:
     result.command = RaftCommand(
       kind: ckMerge,
-      otherRangeId: RangeID(uint64(json["otherRangeId"].getInt()))
+      otherRangeId: GroupID(uint64(json["otherRangeId"].getInt()))
     )
   of ckChangeReplicas:
     let repJson = json["replica"]
@@ -124,7 +124,7 @@ proc decodeEntry*(data: string): LogEntry =
       kind: ckChangeReplicas,
       changeType: ReplicaChangeType(json["changeType"].getInt()),
       replica: ReplicaDescriptor(
-        nodeId: RangeNodeID(repJson["nodeId"].getInt()),
+        nodeId: NodeID(repJson["nodeId"].getInt()),
         replicaId: ReplicaID(repJson["replicaId"].getInt()),
         replicaType: ReplicaType(repJson["replicaType"].getInt())
       )
@@ -132,7 +132,7 @@ proc decodeEntry*(data: string): LogEntry =
   of ckTransferLease:
     result.command = RaftCommand(
       kind: ckTransferLease,
-      targetNode: RangeNodeID(json["targetNode"].getInt())
+      targetNode: NodeID(json["targetNode"].getInt())
     )
   of ckAcquireLease:
     result.command = RaftCommand(
@@ -145,10 +145,10 @@ proc decodeEntry*(data: string): LogEntry =
 # Raft Log Operations
 # ============================================================================
 
-proc newRaftLog*(rangeId: RangeID, store: WiscKeyBackend): RaftLog =
-  ## Create a new Raft log for a range
+proc newRaftLog*(groupId: GroupID, store: WiscKeyBackend): RaftLog =
+  ## Create a new Raft log for a group
   new(result)
-  result.rangeId = rangeId
+  result.groupId = groupId
   result.store = store
   result.firstIndex.store(0)
   result.lastIndex.store(0)
@@ -160,7 +160,7 @@ proc close*(log: RaftLog) =
 
 proc putEntry*(log: RaftLog, entry: LogEntry) =
   ## Store a log entry
-  let key = encodeLogKey(log.rangeId, entry.index)
+  let key = encodeLogKey(log.groupId, entry.index)
   let value = encodeEntry(entry)
 
   if not log.store.put(key, value):
@@ -176,10 +176,10 @@ proc putEntryAndState*(log: RaftLog, entry: LogEntry,
     state: RaftPersistentState) =
   ## Store a log entry AND persist Raft state in a single LevelDB WriteBatch.
   ## This reduces 2 fdatasyncs (one for the entry, one for the state) to just 1.
-  let logKey = encodeLogKey(log.rangeId, entry.index)
+  let logKey = encodeLogKey(log.groupId, entry.index)
   let logValue = encodeEntry(entry)
 
-  let stateKey = encodeStateKey(log.rangeId)
+  let stateKey = encodeStateKey(log.groupId)
   let stateJson = %*{
     "currentTerm": state.currentTerm,
     "votedFor": state.votedFor.uint32,
@@ -205,7 +205,7 @@ proc putEntryAndState*(log: RaftLog, entry: LogEntry,
 
 proc getEntry*(log: RaftLog, index: uint64): Option[LogEntry] =
   ## Retrieve a log entry by index
-  let key = encodeLogKey(log.rangeId, index)
+  let key = encodeLogKey(log.groupId, index)
   let value = log.store.get(key)
 
   if value.isSome:
@@ -232,7 +232,7 @@ proc getFirstEntry*(log: RaftLog): Option[LogEntry] =
 
 proc containsIndex*(log: RaftLog, index: uint64): bool =
   ## Check if a log index exists
-  let key = encodeLogKey(log.rangeId, index)
+  let key = encodeLogKey(log.groupId, index)
   log.store.exists(key)
 
 proc truncate*(log: RaftLog, fromIndex: uint64) =
@@ -240,7 +240,7 @@ proc truncate*(log: RaftLog, fromIndex: uint64) =
   ## Used when follower has conflicting entries
   var idx = fromIndex
   while true:
-    let key = encodeLogKey(log.rangeId, idx)
+    let key = encodeLogKey(log.groupId, idx)
     if not log.store.exists(key):
       break
     discard log.store.delete(key)
@@ -257,7 +257,7 @@ proc compact*(log: RaftLog, toIndex: uint64) =
   ## Called after snapshot
   var idx = log.firstIndex.load()
   while idx < toIndex:
-    let key = encodeLogKey(log.rangeId, idx)
+    let key = encodeLogKey(log.groupId, idx)
     discard log.store.delete(key)
     inc idx
   log.firstIndex.store(toIndex)
@@ -275,7 +275,7 @@ proc recoverLog*(log: RaftLog) =
   let iter = log.store.newIterator()
   if iter != nil:
     var currentIter = WiscKeyIterator(iter)
-    let prefix = "/raft/" & $log.rangeId.uint64 & "/log/"
+    let prefix = "/raft/" & $log.groupId.uint64 & "/log/"
 
     # Seek to first entry with our prefix
     if seekToFirstWiscKey(currentIter):
@@ -294,7 +294,7 @@ proc recoverLog*(log: RaftLog) =
   log.lastIndex.store(lastIdx)
 
   var fields = initTable[string, string]()
-  fields["rangeId"] = $log.rangeId
+  fields["groupId"] = $log.groupId
   fields["firstIndex"] = $firstIdx
   fields["lastIndex"] = $lastIdx
   debug("Recovered Raft log", fields)
@@ -305,7 +305,7 @@ proc recoverLog*(log: RaftLog) =
 
 proc saveState*(log: RaftLog, state: RaftPersistentState) =
   ## Save persistent state (term, vote, commit)
-  let key = encodeStateKey(log.rangeId)
+  let key = encodeStateKey(log.groupId)
   let json = %*{
     "currentTerm": state.currentTerm,
     "votedFor": state.votedFor.uint32,
@@ -318,7 +318,7 @@ proc saveState*(log: RaftLog, state: RaftPersistentState) =
 
 proc loadState*(log: RaftLog): Option[RaftPersistentState] =
   ## Load persistent state
-  let key = encodeStateKey(log.rangeId)
+  let key = encodeStateKey(log.groupId)
   let value = log.store.get(key)
 
   if value.isSome:
@@ -336,9 +336,9 @@ proc loadState*(log: RaftLog): Option[RaftPersistentState] =
 
 proc saveSnapshot*(log: RaftLog, snapshot: Snapshot) =
   ## Save a snapshot
-  let key = encodeSnapshotKey(log.rangeId)
+  let key = encodeSnapshotKey(log.groupId)
   let json = %*{
-    "rangeId": snapshot.rangeId.uint64,
+    "groupId": snapshot.groupId.uint64,
     "lastIncludedIndex": snapshot.raftSnap.lastIncludedIndex,
     "lastIncludedTerm": snapshot.raftSnap.lastIncludedTerm,
     "configuration": snapshot.raftSnap.configuration.mapIt(it.toJson()),
@@ -350,7 +350,7 @@ proc saveSnapshot*(log: RaftLog, snapshot: Snapshot) =
 
 proc loadSnapshot*(log: RaftLog): Option[Snapshot] =
   ## Load the current snapshot
-  let key = encodeSnapshotKey(log.rangeId)
+  let key = encodeSnapshotKey(log.groupId)
   let value = log.store.get(key)
 
   if value.isSome:
@@ -364,7 +364,7 @@ proc loadSnapshot*(log: RaftLog): Option[Snapshot] =
       stateMachineSnap.add(byte(b.getInt()))
 
     result = some(Snapshot(
-      rangeId: RangeID(uint64(json["rangeId"].getInt())),
+      groupId: GroupID(uint64(json["groupId"].getInt())),
       raftSnap: RaftSnapshotMeta(
         lastIncludedIndex: uint64(json["lastIncludedIndex"].getInt()),
         lastIncludedTerm: uint64(json["lastIncludedTerm"].getInt()),

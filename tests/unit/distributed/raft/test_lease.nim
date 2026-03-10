@@ -6,18 +6,18 @@ import std/times
 import std/options
 import std/json
 
-import fractio/distributed/range/types
+import fractio/distributed/raft/group_types
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/liveness
 import fractio/distributed/raft/lease
 
 suite "LeaseManager":
   test "create lease manager":
-    let sl = newStoreLiveness(RangeNodeID(1))
-    let lm = newLeaseManager(RangeID(1), RangeNodeID(1), sl)
+    let sl = newStoreLiveness(NodeID(1))
+    let lm = newLeaseManager(GroupID(1), NodeID(1), sl)
 
-    check lm.rangeId == RangeID(1)
-    check lm.nodeId == RangeNodeID(1)
+    check lm.groupId == GroupID(1)
+    check lm.nodeId == NodeID(1)
     check lm.getLeaseState() == lsNone
     check not lm.isLeaseholder()
 
@@ -25,19 +25,19 @@ suite "LeaseManager":
     sl.close()
 
   test "lease acquisition":
-    let sl = newStoreLiveness(RangeNodeID(1))
-    sl.registerStore(RangeNodeID(1))
-    sl.registerStore(RangeNodeID(2))
-    sl.registerStore(RangeNodeID(3))
+    let sl = newStoreLiveness(NodeID(1))
+    sl.registerStore(NodeID(1))
+    sl.registerStore(NodeID(2))
+    sl.registerStore(NodeID(3))
 
-    let lm = newLeaseManager(RangeID(1), RangeNodeID(1), sl)
+    let lm = newLeaseManager(GroupID(1), NodeID(1), sl)
 
     # Create a mock group with voters
-    let desc = newRangeDescriptor(RangeID(1), @[byte 0x00], @[byte 0xFF])
-    discard desc.addReplica(RangeNodeID(1))
-    discard desc.addReplica(RangeNodeID(2))
-    discard desc.addReplica(RangeNodeID(3))
-    let group = newRaftGroup(RangeID(1), RangeNodeID(1), ReplicaID(1), desc)
+    let desc = newGroupDescriptor(GroupID(1))
+    discard desc.addReplica(NodeID(1))
+    discard desc.addReplica(NodeID(2))
+    discard desc.addReplica(NodeID(3))
+    let group = newRaftGroup(GroupID(1), NodeID(1), ReplicaID(1), desc)
 
     # Acquire lease
     let result = lm.proposeLeaseAcquisition(group)
@@ -51,18 +51,18 @@ suite "LeaseManager":
     sl.close()
 
   test "lease validation":
-    let sl = newStoreLiveness(RangeNodeID(1))
-    sl.registerStore(RangeNodeID(1))
-    sl.registerStore(RangeNodeID(2))
-    sl.registerStore(RangeNodeID(3))
+    let sl = newStoreLiveness(NodeID(1))
+    sl.registerStore(NodeID(1))
+    sl.registerStore(NodeID(2))
+    sl.registerStore(NodeID(3))
 
-    let lm = newLeaseManager(RangeID(1), RangeNodeID(1), sl)
+    let lm = newLeaseManager(GroupID(1), NodeID(1), sl)
 
-    let desc = newRangeDescriptor(RangeID(1), @[byte 0x00], @[byte 0xFF])
-    discard desc.addReplica(RangeNodeID(1))
-    discard desc.addReplica(RangeNodeID(2))
-    discard desc.addReplica(RangeNodeID(3))
-    let group = newRaftGroup(RangeID(1), RangeNodeID(1), ReplicaID(1), desc)
+    let desc = newGroupDescriptor(GroupID(1))
+    discard desc.addReplica(NodeID(1))
+    discard desc.addReplica(NodeID(2))
+    discard desc.addReplica(NodeID(3))
+    let group = newRaftGroup(GroupID(1), NodeID(1), ReplicaID(1), desc)
 
     # No lease initially
     var voters = desc.getVoters()
@@ -81,15 +81,15 @@ suite "LeaseManager":
     sl.close()
 
   test "lease expiration":
-    let sl = newStoreLiveness(RangeNodeID(1))
-    let lm = newLeaseManager(RangeID(1), RangeNodeID(1), sl,
+    let sl = newStoreLiveness(NodeID(1))
+    let lm = newLeaseManager(GroupID(1), NodeID(1), sl,
                               leaseDurationNs = 100_000_000) # 100ms
 
-    let desc = newRangeDescriptor(RangeID(1), @[byte 0x00], @[byte 0xFF])
-    discard desc.addReplica(RangeNodeID(1))
-    sl.registerStore(RangeNodeID(1))
+    let desc = newGroupDescriptor(GroupID(1))
+    discard desc.addReplica(NodeID(1))
+    sl.registerStore(NodeID(1))
 
-    let group = newRaftGroup(RangeID(1), RangeNodeID(1), ReplicaID(1), desc)
+    let group = newRaftGroup(GroupID(1), NodeID(1), ReplicaID(1), desc)
 
     # Acquire lease
     discard lm.proposeLeaseAcquisition(group)
@@ -109,18 +109,18 @@ suite "LeaseManager":
     sl.close()
 
   test "lease renewal":
-    let sl = newStoreLiveness(RangeNodeID(1))
-    sl.registerStore(RangeNodeID(1))
-    sl.registerStore(RangeNodeID(2))
-    sl.registerStore(RangeNodeID(3))
+    let sl = newStoreLiveness(NodeID(1))
+    sl.registerStore(NodeID(1))
+    sl.registerStore(NodeID(2))
+    sl.registerStore(NodeID(3))
 
-    let lm = newLeaseManager(RangeID(1), RangeNodeID(1), sl)
+    let lm = newLeaseManager(GroupID(1), NodeID(1), sl)
 
-    let desc = newRangeDescriptor(RangeID(1), @[byte 0x00], @[byte 0xFF])
-    discard desc.addReplica(RangeNodeID(1))
-    discard desc.addReplica(RangeNodeID(2))
-    discard desc.addReplica(RangeNodeID(3))
-    let group = newRaftGroup(RangeID(1), RangeNodeID(1), ReplicaID(1), desc)
+    let desc = newGroupDescriptor(GroupID(1))
+    discard desc.addReplica(NodeID(1))
+    discard desc.addReplica(NodeID(2))
+    discard desc.addReplica(NodeID(3))
+    let group = newRaftGroup(GroupID(1), NodeID(1), ReplicaID(1), desc)
 
     # Acquire lease
     discard lm.proposeLeaseAcquisition(group)
@@ -140,25 +140,25 @@ suite "LeaseManager":
     sl.close()
 
   test "lease transfer":
-    let sl = newStoreLiveness(RangeNodeID(1))
-    sl.registerStore(RangeNodeID(1))
+    let sl = newStoreLiveness(NodeID(1))
+    sl.registerStore(NodeID(1))
 
-    let lm = newLeaseManager(RangeID(1), RangeNodeID(1), sl)
+    let lm = newLeaseManager(GroupID(1), NodeID(1), sl)
 
-    let desc = newRangeDescriptor(RangeID(1), @[byte 0x00], @[byte 0xFF])
-    discard desc.addReplica(RangeNodeID(1))
-    let group = newRaftGroup(RangeID(1), RangeNodeID(1), ReplicaID(1), desc)
+    let desc = newGroupDescriptor(GroupID(1))
+    discard desc.addReplica(NodeID(1))
+    let group = newRaftGroup(GroupID(1), NodeID(1), ReplicaID(1), desc)
 
     # Acquire lease
     discard lm.proposeLeaseAcquisition(group)
 
     # Propose transfer
-    check lm.proposeLeaseTransfer(RangeNodeID(2))
+    check lm.proposeLeaseTransfer(NodeID(2))
     check lm.isTransferPending()
     check lm.getLeaseState() == lsTransferring
 
     # Complete transfer
-    check lm.completeLeaseTransfer(RangeNodeID(2))
+    check lm.completeLeaseTransfer(NodeID(2))
     check not lm.isTransferPending()
     check lm.getLeaseState() == lsNone
 
@@ -167,20 +167,20 @@ suite "LeaseManager":
     sl.close()
 
   test "cancel lease transfer":
-    let sl = newStoreLiveness(RangeNodeID(1))
-    sl.registerStore(RangeNodeID(1))
+    let sl = newStoreLiveness(NodeID(1))
+    sl.registerStore(NodeID(1))
 
-    let lm = newLeaseManager(RangeID(1), RangeNodeID(1), sl)
+    let lm = newLeaseManager(GroupID(1), NodeID(1), sl)
 
-    let desc = newRangeDescriptor(RangeID(1), @[byte 0x00], @[byte 0xFF])
-    discard desc.addReplica(RangeNodeID(1))
-    let group = newRaftGroup(RangeID(1), RangeNodeID(1), ReplicaID(1), desc)
+    let desc = newGroupDescriptor(GroupID(1))
+    discard desc.addReplica(NodeID(1))
+    let group = newRaftGroup(GroupID(1), NodeID(1), ReplicaID(1), desc)
 
     # Acquire lease
     discard lm.proposeLeaseAcquisition(group)
 
     # Propose transfer
-    discard lm.proposeLeaseTransfer(RangeNodeID(2))
+    discard lm.proposeLeaseTransfer(NodeID(2))
 
     # Cancel transfer
     lm.cancelLeaseTransfer()
@@ -192,15 +192,15 @@ suite "LeaseManager":
     sl.close()
 
   test "time until expiration":
-    let sl = newStoreLiveness(RangeNodeID(1))
-    sl.registerStore(RangeNodeID(1))
+    let sl = newStoreLiveness(NodeID(1))
+    sl.registerStore(NodeID(1))
 
-    let lm = newLeaseManager(RangeID(1), RangeNodeID(1), sl,
+    let lm = newLeaseManager(GroupID(1), NodeID(1), sl,
                               leaseDurationNs = 1_000_000_000) # 1 second
 
-    let desc = newRangeDescriptor(RangeID(1), @[byte 0x00], @[byte 0xFF])
-    discard desc.addReplica(RangeNodeID(1))
-    let group = newRaftGroup(RangeID(1), RangeNodeID(1), ReplicaID(1), desc)
+    let desc = newGroupDescriptor(GroupID(1))
+    discard desc.addReplica(NodeID(1))
+    let group = newRaftGroup(GroupID(1), NodeID(1), ReplicaID(1), desc)
 
     # No lease initially
     check lm.timeUntilExpiration() == 0
@@ -218,15 +218,15 @@ suite "LeaseManager":
     sl.close()
 
   test "should renew lease":
-    let sl = newStoreLiveness(RangeNodeID(1))
-    sl.registerStore(RangeNodeID(1))
+    let sl = newStoreLiveness(NodeID(1))
+    sl.registerStore(NodeID(1))
 
-    let lm = newLeaseManager(RangeID(1), RangeNodeID(1), sl,
+    let lm = newLeaseManager(GroupID(1), NodeID(1), sl,
                               leaseDurationNs = 600_000_000) # 600ms
 
-    let desc = newRangeDescriptor(RangeID(1), @[byte 0x00], @[byte 0xFF])
-    discard desc.addReplica(RangeNodeID(1))
-    let group = newRaftGroup(RangeID(1), RangeNodeID(1), ReplicaID(1), desc)
+    let desc = newGroupDescriptor(GroupID(1))
+    discard desc.addReplica(NodeID(1))
+    let group = newRaftGroup(GroupID(1), NodeID(1), ReplicaID(1), desc)
 
     # Acquire lease
     discard lm.proposeLeaseAcquisition(group)
@@ -241,7 +241,7 @@ suite "LeaseManager":
 suite "Lease JSON":
   test "serialize lease":
     var leaseObj = Lease(
-      leaseholder: RangeNodeID(1),
+      leaseholder: NodeID(1),
       startTs: 1000,
       expirationTs: 2000,
       epoch: 1
@@ -262,14 +262,14 @@ suite "Lease JSON":
     }
 
     let leaseObj = parseLease(json)
-    check leaseObj.leaseholder == RangeNodeID(1)
+    check leaseObj.leaseholder == NodeID(1)
     check leaseObj.startTs == 1000
     check leaseObj.expirationTs == 2000
     check leaseObj.epoch == 1
 
 suite "LeaseAcquisitionResult":
   test "success result":
-    let lease = Lease(leaseholder: RangeNodeID(1), startTs: 0, expirationTs: 1000)
+    let lease = Lease(leaseholder: NodeID(1), startTs: 0, expirationTs: 1000)
     let result = LeaseAcquisitionResult(
       success: true,
       lease: some(lease),

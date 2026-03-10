@@ -4,15 +4,15 @@
 # used to locate data ranges in the cluster.
 #
 # Meta Range Structure:
-# - meta1: /sys/meta1/<key> -> RangeDescriptor (points to meta2 range)
-# - meta2: /sys/meta2/<key> -> RangeDescriptor (points to data range)
+# - meta1: /sys/meta1/<key> -> GroupDescriptor (points to meta2 range)
+# - meta2: /sys/meta2/<key> -> GroupDescriptor (points to data range)
 
 import std/locks
 import std/json
 import std/options
 import std/strutils
 import std/tables
-import fractio/distributed/range/types
+import fractio/distributed/raft/group_types
 
 # ============================================================================
 # Constants
@@ -25,11 +25,11 @@ const
   META2_KEY_PREFIX* = "/sys/meta2/"
     ## Prefix for meta2 keys
 
-  META1_RANGE_ID* = RangeID(1)
-    ## Special RangeID for the meta1 range
+  META1_RANGE_ID* = GroupID(1)
+    ## Special GroupID for the meta1 range
 
-  META2_RANGE_ID_START* = RangeID(2)
-    ## Starting RangeID for meta2 ranges
+  META2_RANGE_ID_START* = GroupID(2)
+    ## Starting GroupID for meta2 ranges
 
   DEFAULT_CACHE_TTL_NS* = 60_000_000_000'i64
     ## Default cache TTL: 60 seconds in nanoseconds
@@ -89,7 +89,7 @@ proc isMetaKey*(key: string): bool =
 type
   CacheEntry* = ref object
     ## A cached range descriptor with metadata
-    descriptor*: RangeDescriptor
+    descriptor*: GroupDescriptor
     cachedAtNs*: int64
       ## When this entry was cached (monotonic nanoseconds)
     expiresAtNs*: int64
@@ -99,7 +99,7 @@ type
     lastAccessNs*: int64
       ## Last access time
 
-proc newCacheEntry*(desc: RangeDescriptor, nowNs, ttlNs: int64): CacheEntry =
+proc newCacheEntry*(desc: GroupDescriptor, nowNs, ttlNs: int64): CacheEntry =
   ## Create a new cache entry
   new(result)
   result.descriptor = desc
@@ -130,19 +130,16 @@ proc timeUntilExpiryNs*(entry: CacheEntry, nowNs: int64): int64 =
 # ============================================================================
 
 type
-  RangeCache* = ref object
-    ## Cache of range descriptors for fast lookup
+  GroupCache* = ref object
+    ## Cache of group descriptors for fast lookup
     ## Uses two-level caching:
-    ## 1. Direct cache by RangeID
-    ## 2. Key-based cache for meta2 ranges
+    ## 1. Direct cache by GroupID
+    ## 2. Key-based cache for meta2 groups
 
-    # Direct cache by RangeID
-    byRangeId*: Table[RangeID, CacheEntry]
+    # Direct cache by GroupID
+    byGroupId*: Table[GroupID, CacheEntry]
 
-    # Key-based cache for data ranges (maps startKey -> descriptor)
-    byStartKey*: Table[string, CacheEntry]
-
-    # Meta2 range cache (maps key prefix -> meta2 RangeDescriptor)
+    # Meta2 group cache (maps key prefix -> meta2 GroupDescriptor)
     meta2Cache*: Table[string, CacheEntry]
 
     # Configuration
@@ -157,12 +154,11 @@ type
     # Thread safety
     cacheLock*: Lock
 
-proc newRangeCache*(ttlNs: int64 = DEFAULT_CACHE_TTL_NS,
-                    maxEntries: int = MAX_CACHE_ENTRIES): RangeCache =
-  ## Create a new range cache
+proc newGroupCache*(ttlNs: int64 = DEFAULT_CACHE_TTL_NS,
+                    maxEntries: int = MAX_CACHE_ENTRIES): GroupCache =
+  ## Create a new group cache
   new(result)
-  result.byRangeId = initTable[RangeID, CacheEntry]()
-  result.byStartKey = initTable[string, CacheEntry]()
+  result.byGroupId = initTable[GroupID, CacheEntry]()
   result.meta2Cache = initTable[string, CacheEntry]()
   result.ttlNs = ttlNs
   result.maxEntries = maxEntries
@@ -171,97 +167,51 @@ proc newRangeCache*(ttlNs: int64 = DEFAULT_CACHE_TTL_NS,
   result.evictions = 0
   initLock(result.cacheLock)
 
-proc destroy*(cache: RangeCache) =
+proc destroy*(cache: GroupCache) =
   ## Clean up cache resources
   deinitLock(cache.cacheLock)
 
-proc get*(cache: RangeCache, rangeId: RangeID, nowNs: int64): Option[
-    RangeDescriptor] =
-  ## Get a cached range descriptor by RangeID
+proc get*(cache: GroupCache, groupId: GroupID, nowNs: int64): Option[
+    GroupDescriptor] =
+  ## Get a cached range descriptor by GroupID
   ## Returns none if not found or expired
   withLock cache.cacheLock:
-    if cache.byRangeId.contains(rangeId):
-      let entry = cache.byRangeId[rangeId]
+    if cache.byGroupId.contains(groupId):
+      let entry = cache.byGroupId[groupId]
       if not entry.isExpired(nowNs):
         entry.touch(nowNs)
         inc cache.hits
         return some(entry.descriptor)
       else:
         # Remove expired entry
-        cache.byRangeId.del(rangeId)
+        cache.byGroupId.del(groupId)
         inc cache.evictions
 
     inc cache.misses
-    return none(RangeDescriptor)
+    return none(GroupDescriptor)
 
-proc getByKey*(cache: RangeCache, key: seq[byte], nowNs: int64): Option[
-    RangeDescriptor] =
-  ## Get a cached range descriptor by key
-  ## Finds the range containing this key
-  withLock cache.cacheLock:
-    # Convert key to string for lookup
-    var keyStr = newString(key.len)
-    for i, b in key:
-      keyStr[i] = char(b)
-
-    # Look for exact match first
-    if cache.byStartKey.contains(keyStr):
-      let entry = cache.byStartKey[keyStr]
-      if not entry.isExpired(nowNs):
-        entry.touch(nowNs)
-        inc cache.hits
-        return some(entry.descriptor)
-
-    # Look for containing range
-    for startKey, entry in cache.byStartKey:
-      if not entry.isExpired(nowNs):
-        let desc = entry.descriptor
-        if key >= desc.startKey and key < desc.endKey:
-          entry.touch(nowNs)
-          inc cache.hits
-          return some(entry.descriptor)
-
-    inc cache.misses
-    return none(RangeDescriptor)
-
-proc put*(cache: RangeCache, desc: RangeDescriptor, nowNs: int64) =
-  ## Add a range descriptor to the cache
+proc put*(cache: GroupCache, desc: GroupDescriptor, nowNs: int64) =
+  ## Add a group descriptor to the cache
   withLock cache.cacheLock:
     let entry = newCacheEntry(desc, nowNs, cache.ttlNs)
 
-    # Add by RangeID
-    cache.byRangeId[desc.rangeId] = entry
-
-    # Add by start key
-    var startKeyStr = newString(desc.startKey.len)
-    for i, b in desc.startKey:
-      startKeyStr[i] = char(b)
-    cache.byStartKey[startKeyStr] = entry
+    # Add by GroupID
+    cache.byGroupId[desc.groupId] = entry
 
     # Evict if over limit
-    while cache.byRangeId.len > cache.maxEntries:
-      # Simple eviction: remove oldest entries
-      # In production, would use LRU
-      var oldestKey: RangeID
+    while cache.byGroupId.len > cache.maxEntries:
+      var oldestKey: GroupID
       var oldestTime = int64.high
-      for rangeId, e in cache.byRangeId:
+      for groupId, e in cache.byGroupId:
         if e.cachedAtNs < oldestTime:
           oldestTime = e.cachedAtNs
-          oldestKey = rangeId
+          oldestKey = groupId
 
-      if cache.byRangeId.contains(oldestKey):
-        let oldEntry = cache.byRangeId[oldestKey]
-        cache.byRangeId.del(oldestKey)
-
-        # Also remove from byStartKey
-        var oldStartKey = newString(oldEntry.descriptor.startKey.len)
-        for i, b in oldEntry.descriptor.startKey:
-          oldStartKey[i] = char(b)
-        cache.byStartKey.del(oldStartKey)
-
+      if cache.byGroupId.contains(oldestKey):
+        cache.byGroupId.del(oldestKey)
         inc cache.evictions
 
-proc putMeta2*(cache: RangeCache, key: seq[byte], desc: RangeDescriptor,
+proc putMeta2*(cache: GroupCache, key: seq[byte], desc: GroupDescriptor,
     nowNs: int64) =
   ## Add a meta2 range descriptor to the cache
   withLock cache.cacheLock:
@@ -282,8 +232,8 @@ proc putMeta2*(cache: RangeCache, key: seq[byte], desc: RangeDescriptor,
       cache.meta2Cache.del(oldestKey)
       inc cache.evictions
 
-proc getMeta2*(cache: RangeCache, key: seq[byte], nowNs: int64): Option[
-    RangeDescriptor] =
+proc getMeta2*(cache: GroupCache, key: seq[byte], nowNs: int64): Option[
+    GroupDescriptor] =
   ## Get a cached meta2 range descriptor
   withLock cache.cacheLock:
     var keyStr = newString(key.len)
@@ -301,36 +251,29 @@ proc getMeta2*(cache: RangeCache, key: seq[byte], nowNs: int64): Option[
         inc cache.evictions
 
     inc cache.misses
-    return none(RangeDescriptor)
+    return none(GroupDescriptor)
 
-proc invalidate*(cache: RangeCache, rangeId: RangeID) =
-  ## Invalidate a cached range descriptor
+proc invalidate*(cache: GroupCache, groupId: GroupID) =
+  ## Invalidate a cached group descriptor
   withLock cache.cacheLock:
-    if cache.byRangeId.contains(rangeId):
-      let entry = cache.byRangeId[rangeId]
-      let desc = entry.descriptor
-      var startKey = newString(desc.startKey.len)
-      for i, b in desc.startKey:
-        startKey[i] = char(b)
-      cache.byStartKey.del(startKey)
-      cache.byRangeId.del(rangeId)
+    if cache.byGroupId.contains(groupId):
+      cache.byGroupId.del(groupId)
 
-proc invalidateAll*(cache: RangeCache) =
+proc invalidateAll*(cache: GroupCache) =
   ## Invalidate all cached entries
   withLock cache.cacheLock:
-    cache.byRangeId.clear()
-    cache.byStartKey.clear()
+    cache.byGroupId.clear()
     cache.meta2Cache.clear()
 
-proc stats*(cache: RangeCache): tuple[hits, misses, evictions: int64, size: int] =
+proc stats*(cache: GroupCache): tuple[hits, misses, evictions: int64, size: int] =
   ## Get cache statistics
   withLock cache.cacheLock:
     result.hits = cache.hits
     result.misses = cache.misses
     result.evictions = cache.evictions
-    result.size = cache.byRangeId.len
+    result.size = cache.byGroupId.len
 
-proc hitRate*(cache: RangeCache): float64 =
+proc hitRate*(cache: GroupCache): float64 =
   ## Calculate cache hit rate
   withLock cache.cacheLock:
     let total = cache.hits + cache.misses
@@ -346,7 +289,7 @@ proc hitRate*(cache: RangeCache): float64 =
 type
   NodeDescriptor* = ref object
     ## Describes a node in the cluster
-    nodeId*: RangeNodeID
+    nodeId*: NodeID
     address*: string
       ## Network address (host:port)
     locality*: seq[tuple[key, value: string]]
@@ -356,7 +299,7 @@ type
     lastHeartbeatNs*: int64
       ## Last heartbeat received
 
-proc newNodeDescriptor*(nodeId: RangeNodeID, address: string): NodeDescriptor =
+proc newNodeDescriptor*(nodeId: NodeID, address: string): NodeDescriptor =
   ## Create a new node descriptor
   new(result)
   result.nodeId = nodeId
@@ -381,7 +324,7 @@ proc toJson*(desc: NodeDescriptor): JsonNode =
 proc parseNodeDescriptor*(json: JsonNode): NodeDescriptor =
   ## Parse NodeDescriptor from JSON
   new(result)
-  result.nodeId = RangeNodeID(json["nodeId"].getInt())
+  result.nodeId = NodeID(json["nodeId"].getInt())
   result.address = json["address"].getStr()
 
   for locJson in json["locality"]:
@@ -401,17 +344,17 @@ proc `$`*(desc: NodeDescriptor): string =
 type
   LeaseholderInfo* = object
     ## Information about the current leaseholder for a range
-    rangeId*: RangeID
-    leaseholder*: RangeNodeID
+    groupId*: GroupID
+    leaseholder*: NodeID
     leaseExpirationNs*: int64
     epoch*: uint64
 
-proc newLeaseholderInfo*(rangeId: RangeID, leaseholder: RangeNodeID,
+proc newLeaseholderInfo*(groupId: GroupID, leaseholder: NodeID,
                          expirationNs: int64,
                              epoch: uint64 = 0): LeaseholderInfo =
   ## Create new leaseholder info
   result = LeaseholderInfo(
-    rangeId: rangeId,
+    groupId: groupId,
     leaseholder: leaseholder,
     leaseExpirationNs: expirationNs,
     epoch: epoch
@@ -424,7 +367,7 @@ proc isValid*(info: LeaseholderInfo, nowNs: int64): bool =
 proc toJson*(info: LeaseholderInfo): JsonNode =
   ## Serialize to JSON
   result = %*{
-    "rangeId": info.rangeId.uint64,
+    "groupId": info.groupId.uint64,
     "leaseholder": info.leaseholder.uint32,
     "leaseExpirationNs": info.leaseExpirationNs,
     "epoch": info.epoch
@@ -433,8 +376,8 @@ proc toJson*(info: LeaseholderInfo): JsonNode =
 proc parseLeaseholderInfo*(json: JsonNode): LeaseholderInfo =
   ## Parse from JSON
   result = LeaseholderInfo(
-    rangeId: RangeID(json["rangeId"].getInt()),
-    leaseholder: RangeNodeID(json["leaseholder"].getInt()),
+    groupId: GroupID(json["groupId"].getInt()),
+    leaseholder: NodeID(json["leaseholder"].getInt()),
     leaseExpirationNs: json["leaseExpirationNs"].getInt(),
     epoch: uint64(json["epoch"].getInt())
   )

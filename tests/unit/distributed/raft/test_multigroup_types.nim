@@ -3,7 +3,7 @@
 import std/unittest
 import std/atomics
 
-import fractio/distributed/range/types
+import fractio/distributed/raft/group_types
 import fractio/distributed/raft/multigroup_types
 
 suite "RaftState":
@@ -64,32 +64,32 @@ suite "LogEntry":
     let entry = newLogEntry(1'u64, 1'u64, RaftCommand(
       kind: ckSplit,
       splitKey: @[byte 0x05],
-      newRangeId: RangeID(2)
+      newRangeId: GroupID(2)
     ))
     check entry.command.kind == ckSplit
     check entry.command.splitKey == @[byte 0x05]
-    check entry.command.newRangeId == RangeID(2)
+    check entry.command.newRangeId == GroupID(2)
 
 suite "RaftGroup":
   test "create group":
-    let desc = newRangeDescriptor(RangeID(1), @[byte 0x00], @[byte 0xFF])
-    discard desc.addReplica(RangeNodeID(1))
-    discard desc.addReplica(RangeNodeID(2))
-    discard desc.addReplica(RangeNodeID(3))
+    let desc = newGroupDescriptor(GroupID(1))
+    discard desc.addReplica(NodeID(1))
+    discard desc.addReplica(NodeID(2))
+    discard desc.addReplica(NodeID(3))
 
-    let group = newRaftGroup(RangeID(1), RangeNodeID(1), ReplicaID(1), desc)
-    check group.rangeId == RangeID(1)
-    check group.nodeId == RangeNodeID(1)
+    let group = newRaftGroup(GroupID(1), NodeID(1), ReplicaID(1), desc)
+    check group.groupId == GroupID(1)
+    check group.nodeId == NodeID(1)
     check group.replicaId == ReplicaID(1)
     check group.state.load() == rsFollower
     check group.getTerm() == 0
     group.close()
 
   test "state transitions":
-    let desc = newRangeDescriptor(RangeID(1), @[byte 0x00], @[byte 0xFF])
-    discard desc.addReplica(RangeNodeID(1))
+    let desc = newGroupDescriptor(GroupID(1))
+    discard desc.addReplica(NodeID(1))
 
-    let group = newRaftGroup(RangeID(1), RangeNodeID(1), ReplicaID(1), desc)
+    let group = newRaftGroup(GroupID(1), NodeID(1), ReplicaID(1), desc)
 
     # Start as follower
     check group.state.load() == rsFollower
@@ -114,12 +114,12 @@ suite "RaftGroup":
     group.close()
 
   test "quorum calculation":
-    let desc = newRangeDescriptor(RangeID(1), @[byte 0x00], @[byte 0xFF])
-    discard desc.addReplica(RangeNodeID(1))
-    discard desc.addReplica(RangeNodeID(2))
-    discard desc.addReplica(RangeNodeID(3))
+    let desc = newGroupDescriptor(GroupID(1))
+    discard desc.addReplica(NodeID(1))
+    discard desc.addReplica(NodeID(2))
+    discard desc.addReplica(NodeID(3))
 
-    let group = newRaftGroup(RangeID(1), RangeNodeID(1), ReplicaID(1), desc)
+    let group = newRaftGroup(GroupID(1), NodeID(1), ReplicaID(1), desc)
     check group.quorum() == 2 # Majority of 3
     check group.hasQuorum(2)
     check not group.hasQuorum(1)
@@ -127,10 +127,10 @@ suite "RaftGroup":
     group.close()
 
   test "heartbeat tracking":
-    let desc = newRangeDescriptor(RangeID(1), @[byte 0x00], @[byte 0xFF])
-    discard desc.addReplica(RangeNodeID(1))
+    let desc = newGroupDescriptor(GroupID(1))
+    discard desc.addReplica(NodeID(1))
 
-    let group = newRaftGroup(RangeID(1), RangeNodeID(1), ReplicaID(1), desc)
+    let group = newRaftGroup(GroupID(1), NodeID(1), ReplicaID(1), desc)
 
     group.updateHeartbeat()
     let elapsed = group.timeSinceHeartbeat()
@@ -142,11 +142,11 @@ suite "RaftGroup":
 suite "Lease":
   test "lease creation":
     let lease = Lease(
-      leaseholder: RangeNodeID(1),
+      leaseholder: NodeID(1),
       startTs: 0,
       expirationTs: 1_000_000_000
     )
-    check lease.leaseholder == RangeNodeID(1)
+    check lease.leaseholder == NodeID(1)
 
   test "lease states":
     check lsNone.ord < lsAcquiring.ord
@@ -174,5 +174,5 @@ suite "Errors":
     err = newException(NotLeaderError, "not leader")
     check err of MultiRaftError
 
-    err = newException(RangeNotFoundError, "range not found")
+    err = newException(GroupNotFoundError, "range not found")
     check err of MultiRaftError

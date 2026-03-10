@@ -11,7 +11,7 @@ import std/[unittest, os, options, tables, algorithm, hashes, json, strutils, lo
 import fractio/protocol/raft_store
 import fractio/distributed/raft/multigroup_coordinator
 import fractio/distributed/raft/multigroup_types
-import fractio/distributed/range/types as rangeTypes
+import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
 
 # ---------------------------------------------------------------------------
@@ -26,9 +26,9 @@ proc makeMultiGroupStore(storagePath: string, groupCount: int): tuple[
     coord: MultiRaftCoordinator, store: RaftKVStoreExt,
     space: SpaceInfo] =
   ## Create a store with `groupCount` Raft groups (ranges 10..10+N-1).
-  ## Returns a SpaceInfo whose rangeIds point to those groups.
+  ## Returns a SpaceInfo whose groupIds point to those groups.
   cleanDir(storagePath)
-  let nodeId = RangeNodeID(1)
+  let nodeId = NodeID(1)
   let cfg = CoordinatorConfig(
     nodeId: nodeId,
     numWorkers: 1,
@@ -40,18 +40,18 @@ proc makeMultiGroupStore(storagePath: string, groupCount: int): tuple[
   let coord = newMultiRaftCoordinator(cfg)
 
   # Create the meta range (Range 1) for system keys
-  let metaRid = RangeID(1)
-  let metaDesc = newRangeDescriptor(metaRid, @[], @[])
+  let metaRid = GroupID(1)
+  let metaDesc = newGroupDescriptor(metaRid)
   let metaRep = metaDesc.addReplica(nodeId)
   let metaGroup = coord.createGroup(metaDesc, metaRep.replicaId)
   metaGroup.becomeLeader()
 
-  # Create N space groups starting at rangeId 10
-  var rangeIds: seq[uint64] = @[]
+  # Create N space groups starting at groupId 10
+  var groupIds: seq[uint64] = @[]
   for i in 0 ..< groupCount:
-    let rid = RangeID(uint64(10 + i))
-    rangeIds.add(rid.uint64)
-    let desc = newRangeDescriptor(rid, @[], @[])
+    let rid = GroupID(uint64(10 + i))
+    groupIds.add(rid.uint64)
+    let desc = newGroupDescriptor(rid)
     let rep = desc.addReplica(nodeId)
     let group = coord.createGroup(desc, rep.replicaId)
     group.becomeLeader()
@@ -60,17 +60,17 @@ proc makeMultiGroupStore(storagePath: string, groupCount: int): tuple[
 
   let store = newRaftKVStoreExt(coord, proposeTimeoutMs = 2000)
   # Bootstrap meta range for system key routing
-  store.bootstrapStore(@[META_RANGE_ID, RangeID(10)])
+  store.bootstrapStore(@[META_GROUP_ID, GroupID(10)])
 
   # Pre-create state machines for all space groups
-  for rid64 in rangeIds:
-    discard store.getOrCreateSM(RangeID(rid64))
+  for rid64 in groupIds:
+    discard store.getOrCreateSM(GroupID(rid64))
 
   let space = SpaceInfo(
     spaceId: 2,
     name: "test_space",
     replicas: 1,
-    rangeIds: rangeIds,
+    groupIds: groupIds,
   )
 
   (coord, store, space)
@@ -85,20 +85,20 @@ proc teardown(coord: MultiRaftCoordinator, storagePath: string) =
 
 suite "Space routing — routeToGroup":
   test "single group always returns that group":
-    let rangeIds = @[42'u64]
+    let groupIds = @[42'u64]
     for pk in @["a", "b", "c", "key123", "999"]:
-      check routeToGroup(pk, rangeIds) == RangeID(42)
+      check routeToGroup(pk, groupIds) == GroupID(42)
 
-  test "empty rangeIds returns META_RANGE_ID":
-    check routeToGroup("anything", @[]) == META_RANGE_ID
+  test "empty groupIds returns META_GROUP_ID":
+    check routeToGroup("anything", @[]) == META_GROUP_ID
 
   test "multiple groups distribute keys":
-    let rangeIds = @[10'u64, 11, 12]
+    let groupIds = @[10'u64, 11, 12]
     var buckets: array[3, int]
     # Hash 100 keys and verify they spread across groups
     for i in 0 ..< 100:
       let pk = "key_" & $i
-      let rid = routeToGroup(pk, rangeIds)
+      let rid = routeToGroup(pk, groupIds)
       let idx = int(rid.uint64) - 10
       check idx >= 0 and idx < 3
       inc buckets[idx]
@@ -107,10 +107,10 @@ suite "Space routing — routeToGroup":
       check b > 0
 
   test "deterministic routing — same key always same group":
-    let rangeIds = @[10'u64, 11, 12, 13]
+    let groupIds = @[10'u64, 11, 12, 13]
     for pk in @["user_1", "user_2", "order_99"]:
-      let r1 = routeToGroup(pk, rangeIds)
-      let r2 = routeToGroup(pk, rangeIds)
+      let r1 = routeToGroup(pk, groupIds)
+      let r2 = routeToGroup(pk, groupIds)
       check r1 == r2
 
 # ---------------------------------------------------------------------------
@@ -153,10 +153,10 @@ suite "Space routing — put and get with 3 groups":
     # Reading with a different pk that routes to a different group should miss.
     # We need to find a pk that routes to a different group.
     var otherPk = ""
-    let targetRid = routeToGroup(pkVal, space.rangeIds)
+    let targetRid = routeToGroup(pkVal, space.groupIds)
     for i in 0 ..< 100:
       let candidate = "alt_" & $i
-      if routeToGroup(candidate, space.rangeIds) != targetRid:
+      if routeToGroup(candidate, space.groupIds) != targetRid:
         otherPk = candidate
         break
     check otherPk.len > 0  # found one
@@ -188,7 +188,7 @@ suite "Space routing — put and get with 3 groups":
     # Check that keys are spread across at least 2 of the 3 groups
     var groupKeys: array[3, int]
     for i in 0 ..< 30:
-      let rid = routeToGroup($i, space.rangeIds)
+      let rid = routeToGroup($i, space.groupIds)
       let idx = int(rid.uint64) - 10
       inc groupKeys[idx]
     var nonEmpty = 0
@@ -341,7 +341,7 @@ suite "Space routing — fan-out scan with merge-sort":
     discard store.raftPutInSpace(key, "value", space, pk)
 
     # Inject intent key directly into the first group's SM
-    let rid = RangeID(space.rangeIds[0])
+    let rid = GroupID(space.groupIds[0])
     let sm = store.getOrCreateSM(rid)
     let intentKey = encodeIntentKey(99, key)
     acquire(store.smMu)
@@ -371,7 +371,7 @@ suite "Space routing — cache loading":
       "spaceId": 5,
       "name": "myspace",
       "replicas": 1,
-      "rangeIds": [10, 11],
+      "groupIds": [10, 11],
     }
     discard store.raftPut(spaceKey, spaceVal)
 
@@ -392,7 +392,7 @@ suite "Space routing — cache loading":
     let spaceOpt = store.getSpaceForTable(100)
     check spaceOpt.isSome
     check spaceOpt.get().name == "myspace"
-    check spaceOpt.get().rangeIds.len == 2
+    check spaceOpt.get().groupIds.len == 2
 
   test "getSpaceForTable returns none for unknown table":
     let (coord, store, _) = makeMultiGroupStore(

@@ -230,7 +230,7 @@ proc getTableSpace(store: RaftKVStoreExt, tableId: uint32): Option[SpaceInfo] =
   let spaceOpt = store.getSpaceForTable(tableId)
   if spaceOpt.isSome:
     let space = spaceOpt.get()
-    if space.rangeIds.len > 1:
+    if space.groupIds.len > 1:
       return some(space)
   none(SpaceInfo)
 
@@ -649,46 +649,46 @@ proc execCreateSpace(op: PlanOp, store: RaftKVStoreExt): ExecResult =
   # Allocate space ID
   let spaceId = nextSpaceId(store)
 
-  # Find max existing rangeId to allocate new ones
-  let rangesStart = encodeTableKey(SYS_RANGES_TABLE_ID, "")
-  let rangesEnd = encodeTableKey(SYS_RANGES_TABLE_ID + 1, "")
+  # Find max existing groupId to allocate new ones
+  let rangesStart = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
+  let rangesEnd = encodeTableKey(SYS_GROUPS_TABLE_ID + 1, "")
   let rangesRes = store.raftScan(rangesStart, rangesEnd, 0, includeSystemKeys = true)
-  var maxRangeId: uint64 = 1
+  var maxGroupId: uint64 = 1
   if rangesRes.isOk:
     for (key, entry) in rangesRes.value:
       try:
         let j = parseJson(entry.value)
-        let rid = uint64(j["rangeId"].getInt())
-        if rid > maxRangeId: maxRangeId = rid
+        let rid = uint64(j["groupId"].getInt())
+        if rid > maxGroupId: maxGroupId = rid
       except JsonParsingError:
         discard
 
-  var rangeIds: seq[int] = @[]
+  var groupIds: seq[int] = @[]
   for g in 0 ..< groupCount:
-    let rangeId = int(maxRangeId) + 1 + g
-    rangeIds.add(rangeId)
+    let groupId = int(maxGroupId) + 1 + g
+    groupIds.add(groupId)
 
     # Compute group members using ring algorithm
     var members: seq[int] = @[]
     for j in 0 ..< replicas:
       members.add(nodeIds[(g + j) mod nodeCount])
 
-    # Write range descriptor to sys.ranges
+    # Write group descriptor to sys.groups
     var replicasJson = newJArray()
     for m in members:
       replicasJson.add(%*{"nodeId": m, "type": "voter"})
-    let rangeKey = encodeTableKey(SYS_RANGES_TABLE_ID, $rangeId)
-    let rangeVal = $ %*{
-      "rangeId": rangeId,
+    let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupId)
+    let groupVal = $ %*{
+      "groupId": groupId,
       "spaceId": spaceId,
       "startKey": "",
       "endKey": "",
       "replicas": replicasJson,
       "preferredLeader": members[0],
     }
-    let putRes = store.raftPut(rangeKey, rangeVal)
+    let putRes = store.raftPut(groupKey, groupVal)
     if not putRes.isOk:
-      return errorResult(&"failed to create range {rangeId}: {putRes.error.msg}")
+      return errorResult(&"failed to create group {groupId}: {putRes.error.msg}")
 
   # Write space record
   let spaceKey = encodeSpaceKey(spaceId)
@@ -697,7 +697,7 @@ proc execCreateSpace(op: PlanOp, store: RaftKVStoreExt): ExecResult =
     "name": op.cspName,
     "replicas": op.cspReplicas,
     "groupCount": groupCount,
-    "rangeIds": rangeIds,
+    "groupIds": groupIds,
     "createdAt": $now(),
   }
   let putRes = store.raftPut(spaceKey, spaceVal)
@@ -752,17 +752,17 @@ proc execShowSpaces(op: PlanOp, store: RaftKVStoreExt): ExecResult =
       let replicas = j["replicas"].getInt()
       let replicasStr = if replicas == 0: "ALL" else: $replicas
       let groupCount = j["groupCount"].getInt()
-      let rangeIds = if j.hasKey("rangeIds"):
+      let groupIds = if j.hasKey("groupIds"):
                        var ids: seq[string]
-                       for r in j["rangeIds"]: ids.add($r.getInt())
+                       for r in j["groupIds"]: ids.add($r.getInt())
                        ids.join(",")
                      else: ""
       resultRows.add(@[$j["spaceId"].getInt(), name, replicasStr,
-                        $groupCount, rangeIds])
+                        $groupCount, groupIds])
     except JsonParsingError:
       discard
 
-  rowsResult(@["space_id", "name", "replicas", "group_count", "range_ids"],
+  rowsResult(@["space_id", "name", "replicas", "group_count", "group_ids"],
              resultRows)
 
 # ---------------------------------------------------------------------------

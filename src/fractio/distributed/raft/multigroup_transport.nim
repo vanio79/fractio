@@ -1,11 +1,11 @@
 # multigroup_transport.nim
 #
-# Bridge between MultiRaftCoordinator (which uses range/types.RangeNodeID = distinct
+# Bridge between MultiRaftCoordinator (which uses group_types.NodeID = distinct
 # uint32) and the existing network stack (which uses core/types.NodeID =
 # distinct string).
 #
 # Responsibilities:
-#   1. RangeNodeID / NodeID translation in both directions.
+#   1. NodeID / NodeID translation in both directions.
 #   2. Starting/stopping the NetworkRaftNode that owns the TCP listener.
 #   3. Registering incoming-RPC handlers that dispatch into the coordinator's
 #      group state (handleRequestVote, handleAppendEntries, handleInstallSnapshot).
@@ -23,7 +23,7 @@
 
 import std/[tables, locks, options, atomics, typedthreads, strutils, sequtils]
 
-import fractio/distributed/range/types as rangeTypes
+import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/multigroup_log
 import fractio/distributed/raft/multigroup_coordinator
@@ -37,20 +37,20 @@ import fractio/distributed/network/serialization
 import fractio/core/types as coreTypes
 
 # ============================================================================
-# RangeNodeID translation
+# NodeID translation
 # ============================================================================
 
-proc toNetNodeID*(id: rangeTypes.RangeNodeID): coreTypes.NodeID {.inline.} =
-  ## range/types.RangeNodeID (distinct uint32) → core/types.RangeNodeID (distinct string)
+proc toNetNodeID*(id: rangeTypes.NodeID): coreTypes.NodeID {.inline.} =
+  ## group_types.NodeID (distinct uint32) → core/types.NodeID (distinct string)
   coreTypes.NodeID("rn_" & $id.uint32)
 
-proc toRangeNodeID*(id: coreTypes.NodeID): rangeTypes.RangeNodeID {.inline.} =
-  ## core/types.RangeNodeID (distinct string) → range/types.RangeNodeID (distinct uint32)
+proc toNodeID*(id: coreTypes.NodeID): rangeTypes.NodeID {.inline.} =
+  ## core/types.NodeID (distinct string) → group_types.NodeID (distinct uint32)
   let s = string(id)
   if s.startsWith("rn_"):
-    try: return rangeTypes.RangeNodeID(uint32(parseInt(s[3..^1])))
+    try: return rangeTypes.NodeID(uint32(parseInt(s[3..^1])))
     except: discard
-  rangeTypes.RangeNodeID(0)
+  rangeTypes.NodeID(0)
 
 # ============================================================================
 # RaftGroupTransport — per-coordinator transport bridge
@@ -59,7 +59,7 @@ proc toRangeNodeID*(id: coreTypes.NodeID): rangeTypes.RangeNodeID {.inline.} =
 type
   PeerAddr* = object
     ## Address information for one peer replica
-    nodeId*: rangeTypes.RangeNodeID ## peer's range-layer RangeNodeID
+    nodeId*: rangeTypes.NodeID ## peer's range-layer NodeID
     host*: string
     raftPort*: int                  ## port where peer's Raft TCP listener runs
 
@@ -73,7 +73,7 @@ type
     ## Outbound RPCs flow:
     ##   coordinator.replicateEntry → transport.replicateEntry
     ##     → NetworkRaftNode.raftTransport.sendAppendEntries
-    localNodeId*: rangeTypes.RangeNodeID
+    localNodeId*: rangeTypes.NodeID
     raftNode*: NetworkRaftNode
     peers*: seq[PeerAddr] ## all peers (not including self)
 
@@ -83,7 +83,7 @@ type
 # Construction
 # ============================================================================
 
-proc newRaftGroupTransport*(localNodeId: rangeTypes.RangeNodeID,
+proc newRaftGroupTransport*(localNodeId: rangeTypes.NodeID,
                              host: string,
                              raftPort: int,
                              peers: seq[PeerAddr]): RaftGroupTransport =
@@ -135,7 +135,7 @@ proc newRaftGroupTransport*(localNodeId: rangeTypes.RangeNodeID,
 # Runtime peer addition
 # ============================================================================
 
-proc addPeer*(t: RaftGroupTransport, nodeId: rangeTypes.RangeNodeID,
+proc addPeer*(t: RaftGroupTransport, nodeId: rangeTypes.NodeID,
               host: string, raftPort: int) =
   ## Register a new peer at runtime (for dynamic cluster join).
   ## Adds to both the NetworkConfig and ConnectionManager.
@@ -169,19 +169,19 @@ proc stop*(t: RaftGroupTransport) =
   t.raftNode.stop()
 
 # ============================================================================
-# RangeID / term encoding helpers
+# GroupID / term encoding helpers
 # (defined here so they are available to replicateEntry, startElection,
 # sendHeartbeats, and the incoming-handler procs below)
 # ============================================================================
 
-# Helper: pack RangeID into the high 32 bits of MessageHeader.term
+# Helper: pack GroupID into the high 32 bits of MessageHeader.term
 # Leader uses this when sending RequestVote / AppendEntries so the receiver
 # knows which Raft group the message belongs to.
-proc encodeRangeInTerm*(term: uint64, rangeId: rangeTypes.RangeID): uint64 {.inline.} =
-  (uint64(rangeId.uint64) shl 32) or (term and 0xFFFF_FFFF'u64)
+proc encodeGroupInTerm*(term: uint64, groupId: rangeTypes.GroupID): uint64 {.inline.} =
+  (uint64(groupId.uint64) shl 32) or (term and 0xFFFF_FFFF'u64)
 
-proc decodeRangeFromTerm*(v: uint64): rangeTypes.RangeID {.inline.} =
-  rangeTypes.RangeID(v shr 32)
+proc decodeGroupFromTerm*(v: uint64): rangeTypes.GroupID {.inline.} =
+  rangeTypes.GroupID(v shr 32)
 
 proc decodeTermFromTerm*(v: uint64): uint64 {.inline.} =
   v and 0xFFFF_FFFF'u64
@@ -192,7 +192,7 @@ proc decodeTermFromTerm*(v: uint64): uint64 {.inline.} =
 
 type
   ReplicaAck = object
-    nodeId: rangeTypes.RangeNodeID
+    nodeId: rangeTypes.NodeID
     success: bool
     matchIndex: uint64
 
@@ -218,7 +218,7 @@ proc replicateEntry*(t: RaftGroupTransport,
 
   let commitIndex = group.commitIndex.load()
   let rawTerm = group.currentTerm.load()
-  let encodedTerm = encodeRangeInTerm(rawTerm, group.rangeId)
+  let encodedTerm = encodeGroupInTerm(rawTerm, group.groupId)
   let leaderId = int32(t.localNodeId.uint32)
 
   # ---- Build per-peer entry batches based on nextIndex ----
@@ -281,7 +281,7 @@ proc replicateEntry*(t: RaftGroupTransport,
     targetId: int32, term: uint64, leaderId: int32,
     prevIdx: uint64, prevTerm: uint64, commit: uint64,
     entries: seq[oldRaftTypes.LogEntry],
-    peerNodeId: rangeTypes.RangeNodeID, ackPtr: ptr AckChanObj,
+    peerNodeId: rangeTypes.NodeID, ackPtr: ptr AckChanObj,
     replicaId: ReplicaID]
 
   var threadSeq = newSeq[Thread[FanoutCtx]](peers.len)
@@ -402,9 +402,9 @@ proc startElection*(t: RaftGroupTransport,
     return true
 
   let rawTerm = group.currentTerm.load()
-  # Encode the rangeId into the high 32 bits of term so the receiver can
-  # look up the correct Raft group via decodeRangeFromTerm().
-  let encodedTerm = encodeRangeInTerm(rawTerm, group.rangeId)
+  # Encode the groupId into the high 32 bits of term so the receiver can
+  # look up the correct Raft group via decodeGroupFromTerm().
+  let encodedTerm = encodeGroupInTerm(rawTerm, group.groupId)
   let lastIdx = log.lastIndex.load()
   let lastTerm = block:
     if lastIdx == 0: 0'u64
@@ -431,7 +431,7 @@ proc startElection*(t: RaftGroupTransport,
     let ctx: VoteCtx = (
       rt: t.raftNode.raftTransport,
       targetId: int32(rep.nodeId.uint32),
-      term: encodedTerm, # high bits = rangeId, low bits = actual term
+      term: encodedTerm, # high bits = groupId, low bits = actual term
       rawTerm: rawTerm,
       candidateId: candidateId,
       lastIdx: lastIdx,
@@ -444,7 +444,7 @@ proc startElection*(t: RaftGroupTransport,
           c.targetId, c.term, c.candidateId, c.lastIdx, c.lastTerm)
       if respOpt.isSome:
         let resp = respOpt.get()
-        # resp.term from receiver is the bare term (no rangeId encoded)
+        # resp.term from receiver is the bare term (no groupId encoded)
         if resp.term > c.rawTerm:
           c.votePtr[].ch.send(-1'i8) # higher term — step down
         elif resp.voteGranted:
@@ -495,20 +495,20 @@ proc startElection*(t: RaftGroupTransport,
 # ============================================================================
 
 proc sendHeartbeats*(t: RaftGroupTransport,
-                     groups: tables.Table[rangeTypes.RangeID, RaftGroup],
-                     logs: tables.Table[rangeTypes.RangeID,
+                     groups: tables.Table[rangeTypes.GroupID, RaftGroup],
+                     logs: tables.Table[rangeTypes.GroupID,
                          RaftLog]) {.gcsafe.} =
   ## For every group where this node is leader, send AppendEntries
   ## to each peer replica. Uses per-peer nextIndex to include missing
   ## entries so lagging followers catch up during heartbeats.
-  for rangeId, group in groups:
+  for groupId, group in groups:
     if not group.isLeader(): continue
 
     let rawTerm = group.currentTerm.load()
-    let encodedTerm = encodeRangeInTerm(rawTerm, rangeId)
+    let encodedTerm = encodeGroupInTerm(rawTerm, groupId)
     let commitIndex = group.commitIndex.load()
     let leaderId = int32(t.localNodeId.uint32)
-    let log = logs.getOrDefault(rangeId)
+    let log = logs.getOrDefault(groupId)
     if log.isNil: continue
     let lastIdx = log.lastIndex.load()
 
@@ -599,7 +599,7 @@ proc setupIncomingHandlers*(t: RaftGroupTransport,
   proc handleRV(data: string): string {.gcsafe.} =
     try:
       let msg = decodeRequestVoteMsg(data)
-      let rid = decodeRangeFromTerm(msg.header.term)
+      let rid = decodeGroupFromTerm(msg.header.term)
       let term = decodeTermFromTerm(msg.header.term)
 
       var resp: RequestVoteResponseMsg
@@ -638,7 +638,7 @@ proc setupIncomingHandlers*(t: RaftGroupTransport,
             let e = log.getEntry(myLastIdx)
             if e.isSome: e.get.term else: 0'u64
 
-        let candidateId = toRangeNodeID(msg.candidateId)
+        let candidateId = toNodeID(msg.candidateId)
         let candidateRepId = block:
           var rid2 = rangeTypes.ReplicaID(0)
           for rep in group.descriptor.replicas:
@@ -671,7 +671,7 @@ proc setupIncomingHandlers*(t: RaftGroupTransport,
   proc handleAE(data: string): string {.gcsafe.} =
     try:
       let msg = decodeAppendEntriesMsg(data)
-      let rid = decodeRangeFromTerm(msg.header.term)
+      let rid = decodeGroupFromTerm(msg.header.term)
       let term = decodeTermFromTerm(msg.header.term)
 
 
@@ -829,8 +829,8 @@ proc newMultiRaftTransport*(rgt: RaftGroupTransport): MultiRaftTransport =
     {.cast(gcsafe).}: {.cast(raises: []).}:
       result = cast[RaftGroupTransport](rgtPtr).startElection(group, log),
 
-    heartbeatFn: proc(groups: tables.Table[rangeTypes.RangeID, RaftGroup],
-        logs: tables.Table[rangeTypes.RangeID, RaftLog]) {.gcsafe, raises: [].} =
+    heartbeatFn: proc(groups: tables.Table[rangeTypes.GroupID, RaftGroup],
+        logs: tables.Table[rangeTypes.GroupID, RaftLog]) {.gcsafe, raises: [].} =
       {.cast(gcsafe).}: {.cast(raises: []).}:
         cast[RaftGroupTransport](rgtPtr).sendHeartbeats(groups, logs),
   )

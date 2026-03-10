@@ -14,7 +14,7 @@
 #   Tier 3 (Node-local):          /sys/liveness/*, /raft/*, not replicated
 
 import std/strutils
-import fractio/distributed/range/types
+import fractio/distributed/raft/group_types
 
 # ============================================================================
 # System Table IDs
@@ -33,9 +33,9 @@ const
     ## Table descriptors: /t/0000000003/<schemaId>/<tableName>
     ## Value: JSON {id, schemaId, name, columns, indices, createdAt}
 
-  SYS_RANGES_TABLE_ID* = 4'u32
-    ## Authoritative range map: /t/0000000004/<rangeId>
-    ## Value: JSON-encoded RangeDescriptor
+  SYS_GROUPS_TABLE_ID* = 4'u32
+    ## Authoritative range map: /t/0000000004/<groupId>
+    ## Value: JSON-encoded GroupDescriptor
 
   SYS_NODES_TABLE_ID* = 5'u32
     ## Cluster node registry: /t/0000000005/<nodeId>
@@ -47,14 +47,14 @@ const
 
   SYS_SPACES_TABLE_ID* = 7'u32
     ## Space catalog: /t/0000000007/<spaceId>
-    ## Value: JSON {spaceId, name, replicas, groupCount, rangeIds, createdAt}
+    ## Value: JSON {spaceId, name, replicas, groupCount, groupIds, createdAt}
 
   SYS_NODE_METRICS_ID* = 10'u32
     ## Per-node performance metrics: /t/0000000010/<nodeId>/<metricName>
     ## Value: numeric string
 
-  SYS_RANGE_METRICS_ID* = 11'u32
-    ## Per-range stats: /t/0000000011/<rangeId>/<metricName>
+  SYS_GROUP_METRICS_ID* = 11'u32
+    ## Per-range stats: /t/0000000011/<groupId>/<metricName>
     ## Value: numeric string
 
   SYS_EVENTS_TABLE_ID* = 12'u32
@@ -68,13 +68,13 @@ const
     ## System tables occupy IDs 1..99
 
   # Tier 1 system tables (replicated on all nodes via meta range)
-  MAX_META_RANGE_TABLE_ID* = 7'u32
+  MAX_META_GROUP_TABLE_ID* = 7'u32
     ## Tables 1-7 live in the meta range (Range 1)
 
-  META_RANGE_ID* = RangeID(1)
+  META_GROUP_ID* = GroupID(1)
     ## The meta range is always Range 1, replicated on every node
 
-  DATA_RANGE_START_ID* = RangeID(2)
+  DATA_GROUP_START_ID* = GroupID(2)
     ## First data range ID
 
 # ============================================================================
@@ -90,7 +90,7 @@ const
 
   # Pre-computed boundary key: one past the last meta range table
   # /t/0000000008 — first key NOT in the meta range
-  META_RANGE_END_KEY* = "/t/0000000008"
+  META_GROUP_END_KEY* = "/t/0000000008"
     ## Exclusive upper bound for meta range table keys
 
 # ============================================================================
@@ -148,7 +148,7 @@ proc isSystemKey*(key: string): bool =
   except ValueError:
     result = false
 
-proc isMetaRangeKey*(key: string): bool =
+proc isMetaGroupKey*(key: string): bool =
   ## Check if a key belongs to the meta range (tableID 1-6 or /sys/meta*).
   ## These keys are replicated on ALL nodes via Range 1.
   if key.startsWith("/sys/meta1/") or key.startsWith("/sys/meta2/"):
@@ -160,7 +160,7 @@ proc isMetaRangeKey*(key: string): bool =
     return false
   try:
     let tableId = parseUInt(afterPrefix[0 ..< TABLE_ID_WIDTH])
-    result = tableId >= 1 and tableId <= MAX_META_RANGE_TABLE_ID
+    result = tableId >= 1 and tableId <= MAX_META_GROUP_TABLE_ID
   except ValueError:
     result = false
 

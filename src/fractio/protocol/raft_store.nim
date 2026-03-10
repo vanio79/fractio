@@ -32,7 +32,7 @@
 import std/[tables, locks, options, algorithm, atomics, times, strformat, strutils, json, hashes]
 import fractio/distributed/raft/multigroup_coordinator
 import fractio/distributed/raft/multigroup_types
-import fractio/distributed/range/types as rangeTypes
+import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/raft/state_machine
 import fractio/distributed/meta/system_tables
 import fractio/storage/wisckey_backend
@@ -46,7 +46,7 @@ import ../utils/logging
 type
   RaftStoreErrorKind* = enum
     rseNotLeader     ## This node is not the Raft leader for the shard
-    rseRangeNotFound ## No Raft group for the requested shard/range
+    rseGroupNotFound ## No Raft group for the requested shard/group
     rseTimeout       ## proposeAndWait timed out
     rseInternal      ## Unexpected error
 
@@ -131,7 +131,7 @@ proc decodeIntentUserKey*(k: string): string {.inline.} =
   k[INTENT_PREFIX.len + 8 ..< k.len]
 
 # ---------------------------------------------------------------------------
-# Unified key → RangeID routing
+# Unified key → GroupID routing
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -155,11 +155,11 @@ proc newRaftKVStore*(coord: MultiRaftCoordinator,
   result.nextVersion.store(1)
 
 # ---------------------------------------------------------------------------
-# Internal: get KVStateMachine for a RangeID
+# Internal: get KVStateMachine for a GroupID
 # ---------------------------------------------------------------------------
 
 proc getKVSM(store: RaftKVStore,
-    rangeId: RangeID): Option[KVStateMachine] {.gcsafe, raises: [].} =
+    groupId: GroupID): Option[KVStateMachine] {.gcsafe, raises: [].} =
   ## Retrieve the KVStateMachine from the coordinator's state machine registry.
   ## In the current MultiRaftCoordinator implementation the state machine is
   ## tracked inside the coordinator.  We expose it via a helper stored in the
@@ -167,7 +167,7 @@ proc getKVSM(store: RaftKVStore,
   ##
   ## Note: The upstream MultiRaftCoordinator does not yet maintain a separate
   ## state machine registry.  We keep our own stateMachines table (one per
-  ## RangeID) inside RaftKVStore and apply committed entries there.
+  ## GroupID) inside RaftKVStore and apply committed entries there.
   none(KVStateMachine) # See stateMachines below
 
 # ---------------------------------------------------------------------------
@@ -189,10 +189,10 @@ type
     spaceId*: int
     name*: string
     replicas*: int        ## 0 = ALL nodes
-    rangeIds*: seq[uint64]
+    groupIds*: seq[uint64]
 
   RaftKVStoreExt* = ref object of RaftKVStore
-    stateMachines*: Table[RangeID, KVStateMachine]
+    stateMachines*: Table[GroupID, KVStateMachine]
     smMu*: Lock
     spaces*: Table[int, SpaceInfo]  ## spaceId → SpaceInfo
     tableSpaces*: Table[uint32, int] ## tableId → spaceId
@@ -206,7 +206,7 @@ proc newRaftKVStoreExt*(coord: MultiRaftCoordinator,
     coordinator: coord,
     proposeTimeout: proposeTimeoutMs,
     logger: newLogger("protocol.raft_store"),
-    stateMachines: initTable[RangeID, KVStateMachine](),
+    stateMachines: initTable[GroupID, KVStateMachine](),
     spaces: initTable[int, SpaceInfo](),
     tableSpaces: initTable[uint32, int](),
   )
@@ -214,29 +214,29 @@ proc newRaftKVStoreExt*(coord: MultiRaftCoordinator,
   initLock(result.spacesMu)
   result.nextVersion.store(1)
 
-proc resolveRangeId*(store: RaftKVStoreExt, key: string): Option[RangeID] {.gcsafe,
+proc resolveGroupId*(store: RaftKVStoreExt, key: string): Option[GroupID] {.gcsafe,
     raises: [].} =
-  ## Unified key → RangeID routing. Meta/system keys go to META_RANGE_ID,
-  ## everything else goes to DATA_RANGE_START_ID (the default data range).
+  ## Unified key → GroupID routing. Meta/system keys go to META_GROUP_ID,
+  ## everything else goes to DATA_GROUP_START_ID (the default data group).
   ## Space-routed keys bypass this via raftPutInSpace/raftGetInSpace/etc.
-  if isMetaRangeKey(key):
-    return some(META_RANGE_ID)
-  some(DATA_RANGE_START_ID)
+  if isMetaGroupKey(key):
+    return some(META_GROUP_ID)
+  some(DATA_GROUP_START_ID)
 
 proc getOrCreateSM*(store: RaftKVStoreExt,
-    rangeId: RangeID): KVStateMachine {.gcsafe, raises: [].} =
+    groupId: GroupID): KVStateMachine {.gcsafe, raises: [].} =
   acquire(store.smMu)
   defer: release(store.smMu)
-  if store.stateMachines.hasKey(rangeId):
-    return store.stateMachines.getOrDefault(rangeId)
+  if store.stateMachines.hasKey(groupId):
+    return store.stateMachines.getOrDefault(groupId)
   let sm = newKVStateMachine()
-  store.stateMachines[rangeId] = sm
+  store.stateMachines[groupId] = sm
   sm
 
-proc registerRange*(store: RaftKVStoreExt,
-    rangeId: RangeID) {.gcsafe, raises: [].} =
-  ## Pre-create a state machine for the given range.
-  discard store.getOrCreateSM(rangeId)
+proc registerGroup*(store: RaftKVStoreExt,
+    groupId: GroupID) {.gcsafe, raises: [].} =
+  ## Pre-create a state machine for the given group.
+  discard store.getOrCreateSM(groupId)
 
 # ---------------------------------------------------------------------------
 # Internal: propose a WriteBatch and apply to local state machine
@@ -258,7 +258,7 @@ proc fromBytes(b: seq[byte]): string {.inline.} =
 # Follower apply callback (called by coordinator on committed entries)
 # ---------------------------------------------------------------------------
 
-proc applyBatchToSM*(storePtr: pointer, rid: RangeID,
+proc applyBatchToSM*(storePtr: pointer, rid: GroupID,
     batch: WriteBatch) {.gcsafe, raises: [].} =
   ## Callback registered with the coordinator so that committed WriteBatch
   ## entries are applied to the local KVStateMachine and persisted to the
@@ -315,24 +315,24 @@ proc wireApplyCallback*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
   store.coordinator.kvStorePtr = cast[pointer](store)
 
 proc bootstrapStore*(store: RaftKVStoreExt,
-    rangeIds: seq[RangeID]) {.gcsafe, raises: [].} =
-  ## Pre-create state machines for the given ranges and wire the apply callback.
+    groupIds: seq[GroupID]) {.gcsafe, raises: [].} =
+  ## Pre-create state machines for the given groups and wire the apply callback.
   ## Call after coord.start() (or at least after the store is ready).
-  for rid in rangeIds:
+  for rid in groupIds:
     discard store.getOrCreateSM(rid)
   store.wireApplyCallback()
 
-proc proposeWrite(store: RaftKVStoreExt, rangeId: RangeID,
+proc proposeWrite(store: RaftKVStoreExt, groupId: GroupID,
     batch: WriteBatch): RSVoidResult {.gcsafe, raises: [].} =
   ## Propose a write batch to Raft and, on success, apply it locally.
   let cmd = RaftCommand(kind: ckWrite, writeBatch: batch)
-  let res = store.coordinator.proposeAndWait(rangeId, cmd,
+  let res = store.coordinator.proposeAndWait(groupId, cmd,
       store.proposeTimeout)
   if not res.success:
     if res.error == "Not the leader":
       return rsVErr(newRSE(rseNotLeader, res.error))
-    if res.error.len > 0 and res.error.contains("Range not found"):
-      return rsVErr(newRSE(rseRangeNotFound, res.error))
+    if res.error.len > 0 and res.error.contains("Group not found"):
+      return rsVErr(newRSE(rseGroupNotFound, res.error))
     if res.error.contains("Timeout"):
       return rsVErr(newRSE(rseTimeout, res.error))
     return rsVErr(newRSE(rseInternal, res.error))
@@ -351,9 +351,9 @@ proc raftGet*(store: RaftKVStoreExt,
     key: string): RSResult[Option[RaftKVEntry]] {.gcsafe, raises: [].} =
   ## Read the current value for `key` from the local state machine.
   ## Reads are served locally (leader / leaseholder read semantics).
-  let ridOpt = store.resolveRangeId(key)
+  let ridOpt = store.resolveGroupId(key)
   if ridOpt.isNone:
-    return rsErr[Option[RaftKVEntry]](newRSE(rseRangeNotFound,
+    return rsErr[Option[RaftKVEntry]](newRSE(rseGroupNotFound,
         &"no shard for key '{key}'"))
 
   let sm = store.getOrCreateSM(ridOpt.get())
@@ -378,9 +378,9 @@ proc raftGet*(store: RaftKVStoreExt,
 proc raftPut*(store: RaftKVStoreExt, key, value: string): RSResult[
     RaftKVEntry] {.gcsafe, raises: [].} =
   ## Write `value` under `key` through Raft consensus.
-  let ridOpt = store.resolveRangeId(key)
+  let ridOpt = store.resolveGroupId(key)
   if ridOpt.isNone:
-    return rsErr[RaftKVEntry](newRSE(rseRangeNotFound,
+    return rsErr[RaftKVEntry](newRSE(rseGroupNotFound,
         &"no shard for key '{key}'"))
 
   let batch = newWriteBatch()
@@ -397,9 +397,9 @@ proc raftPut*(store: RaftKVStoreExt, key, value: string): RSResult[
 proc raftDelete*(store: RaftKVStoreExt,
     key: string): RSResult[Option[RaftKVEntry]] {.gcsafe, raises: [].} =
   ## Delete `key` through Raft consensus.
-  let ridOpt = store.resolveRangeId(key)
+  let ridOpt = store.resolveGroupId(key)
   if ridOpt.isNone:
-    return rsErr[Option[RaftKVEntry]](newRSE(rseRangeNotFound,
+    return rsErr[Option[RaftKVEntry]](newRSE(rseGroupNotFound,
         &"no shard for key '{key}'"))
 
   # Capture previous value first (under smMu)
@@ -427,13 +427,13 @@ proc raftScan*(store: RaftKVStoreExt, startKey, endKey: string,
     limit: uint32,
     includeSystemKeys: bool = false): RSResult[seq[(string, RaftKVEntry)]] {.gcsafe, raises: [].} =
   ## Scan keys in [startKey, endKey) up to `limit` results.
-  ## Aggregates across all shards whose ranges overlap the query span.
+  ## Aggregates across all shards whose groups overlap the query span.
   ## By default, system table keys (/t/0000000001/... through /t/0000000099/...)
   ## are excluded from results. Set includeSystemKeys=true to include them.
   var pairs: seq[(string, RaftKVEntry)] = @[]
 
   acquire(store.smMu)
-  var smCopy: seq[(RangeID, KVStateMachine)] = @[]
+  var smCopy: seq[(GroupID, KVStateMachine)] = @[]
   for rid, sm in store.stateMachines:
     smCopy.add((rid, sm))
   release(store.smMu)
@@ -458,7 +458,7 @@ proc raftScan*(store: RaftKVStoreExt, startKey, endKey: string,
   rsOk[seq[(string, RaftKVEntry)]](pairs)
 
 proc shardCount*(store: RaftKVStoreExt): int {.gcsafe, raises: [].} =
-  ## Returns the number of registered state machines (ranges).
+  ## Returns the number of registered state machines (groups).
   acquire(store.smMu)
   defer: release(store.smMu)
   store.stateMachines.len
@@ -490,9 +490,9 @@ proc raftBufferIntent*(store: RaftKVStoreExt, txnId: uint64, key,
   ## The commit path (raftResolveIntent) writes the real key through Raft
   ## with fdatasync, which is the only fsync this transaction requires.
   let intentKey = encodeIntentKey(txnId, key)
-  let ridOpt = store.resolveRangeId(key)
+  let ridOpt = store.resolveGroupId(key)
   if ridOpt.isNone:
-    return rsVErr(newRSE(rseRangeNotFound, &"no shard for key '{key}'"))
+    return rsVErr(newRSE(rseGroupNotFound, &"no shard for key '{key}'"))
 
   let backend = store.coordinator.store
   if backend != nil and backend.isOpen:
@@ -512,9 +512,9 @@ proc raftDeleteIntent*(store: RaftKVStoreExt, txnId: uint64,
     key: string): RSVoidResult {.gcsafe, raises: [].} =
   ## Remove the intent (used during rollback or abort) — also no fsync needed.
   let intentKey = encodeIntentKey(txnId, key)
-  let ridOpt = store.resolveRangeId(key)
+  let ridOpt = store.resolveGroupId(key)
   if ridOpt.isNone:
-    return rsVErr(newRSE(rseRangeNotFound, &"no shard for key '{key}'"))
+    return rsVErr(newRSE(rseGroupNotFound, &"no shard for key '{key}'"))
 
   let backend = store.coordinator.store
   if backend != nil and backend.isOpen:
@@ -537,7 +537,7 @@ proc raftCommitTxn*(store: RaftKVStoreExt, txnId: uint64,
     writeSet: seq[string]): RSVoidResult {.gcsafe, raises: [].} =
   ## Commit a transaction by resolving all intents across one or more shards.
   ##
-  ## Keys are grouped by their RangeID so that each shard receives exactly one
+  ## Keys are grouped by their GroupID so that each shard receives exactly one
   ## Raft WriteBatch proposal (one fdatasync per shard).  For each key:
   ##   - read the intent value from the in-memory state machine
   ##   - add (realKey → value) and delete (intentKey) to that shard's batch
@@ -545,27 +545,27 @@ proc raftCommitTxn*(store: RaftKVStoreExt, txnId: uint64,
   if writeSet.len == 0:
     return rsVOk()
 
-  # --- Group keys by RangeID ---
-  var batches: Table[RangeID, WriteBatch]
+  # --- Group keys by GroupID ---
+  var batches: Table[GroupID, WriteBatch]
   for key in writeSet:
-    let ridOpt = store.resolveRangeId(key)
+    let ridOpt = store.resolveGroupId(key)
     if ridOpt.isNone:
-      return rsVErr(newRSE(rseRangeNotFound, &"no shard for key '{key}'"))
+      return rsVErr(newRSE(rseGroupNotFound, &"no shard for key '{key}'"))
     let rid = ridOpt.get()
     if not batches.hasKey(rid):
       batches[rid] = newWriteBatch()
 
   # --- Fill each per-shard batch from the in-memory state machine ---
-  # Iterate over a copy of the RangeIDs so we can index batches safely via
+  # Iterate over a copy of the GroupIDs so we can index batches safely via
   # mgetOrPut (avoids KeyError in raises:[] context).
-  var rids: seq[RangeID] = @[]
+  var rids: seq[GroupID] = @[]
   for rid in batches.keys: rids.add(rid)
 
   for rid in rids:
     let sm = store.getOrCreateSM(rid)
     acquire(store.smMu)
     for key in writeSet:
-      let keyRidOpt = store.resolveRangeId(key)
+      let keyRidOpt = store.resolveGroupId(key)
       if keyRidOpt.isNone or keyRidOpt.get() != rid: continue
       let intentKey = encodeIntentKey(txnId, key)
       if sm.kvStore.hasKey(intentKey):
@@ -598,7 +598,7 @@ proc raftCommitTxnPipelined*(store: RaftKVStoreExt, txnId: uint64,
   ## concurrently — the same technique as pipelining AppendEntries in Raft.
   ##
   ## The implementation:
-  ##   1. Group write-set keys by RangeID (same as raftCommitTxn).
+  ##   1. Group write-set keys by GroupID (same as raftCommitTxn).
   ##   2. Fill per-shard WriteBatches from the in-memory state machine.
   ##   3. Call coordinator.proposeParallel() with all non-empty batches.
   ##   4. Return the first error (if any); all shards that succeeded have
@@ -607,18 +607,18 @@ proc raftCommitTxnPipelined*(store: RaftKVStoreExt, txnId: uint64,
   if writeSet.len == 0:
     return rsVOk()
 
-  # --- Step 1: group keys by RangeID ---
-  var batches: Table[RangeID, WriteBatch]
+  # --- Step 1: group keys by GroupID ---
+  var batches: Table[GroupID, WriteBatch]
   for key in writeSet:
-    let ridOpt = store.resolveRangeId(key)
+    let ridOpt = store.resolveGroupId(key)
     if ridOpt.isNone:
-      return rsVErr(newRSE(rseRangeNotFound, "no shard for key '" & key & "'"))
+      return rsVErr(newRSE(rseGroupNotFound, "no shard for key '" & key & "'"))
     let rid = ridOpt.get()
     if not batches.hasKey(rid):
       batches[rid] = newWriteBatch()
 
-  # Collect the RangeIDs so we can iterate without Table invalidation.
-  var rids: seq[RangeID] = @[]
+  # Collect the GroupIDs so we can iterate without Table invalidation.
+  var rids: seq[GroupID] = @[]
   for rid in batches.keys: rids.add(rid)
 
   # --- Step 2: fill per-shard WriteBatches ---
@@ -626,7 +626,7 @@ proc raftCommitTxnPipelined*(store: RaftKVStoreExt, txnId: uint64,
     let sm = store.getOrCreateSM(rid)
     acquire(store.smMu)
     for key in writeSet:
-      let keyRidOpt = store.resolveRangeId(key)
+      let keyRidOpt = store.resolveGroupId(key)
       if keyRidOpt.isNone or keyRidOpt.get() != rid: continue
       let intentKey = encodeIntentKey(txnId, key)
       if sm.kvStore.hasKey(intentKey):
@@ -637,12 +637,12 @@ proc raftCommitTxnPipelined*(store: RaftKVStoreExt, txnId: uint64,
     release(store.smMu)
 
   # --- Step 3: build the parallel proposal list ---
-  var proposals: seq[tuple[rangeId: RangeID, command: RaftCommand]] = @[]
+  var proposals: seq[tuple[groupId: GroupID, command: RaftCommand]] = @[]
   for rid in rids:
     {.cast(raises: []).}:
       let batch = batches[rid]
       if not batch.isEmpty:
-        proposals.add((rangeId: rid,
+        proposals.add((groupId: rid,
                         command: RaftCommand(kind: ckWrite, writeBatch: batch)))
 
   if proposals.len == 0:
@@ -656,8 +656,8 @@ proc raftCommitTxnPipelined*(store: RaftKVStoreExt, txnId: uint64,
     if not r.success:
       if r.error == "Not the leader":
         return rsVErr(newRSE(rseNotLeader, r.error))
-      if r.error.contains("Range not found"):
-        return rsVErr(newRSE(rseRangeNotFound, r.error))
+      if r.error.contains("Group not found"):
+        return rsVErr(newRSE(rseGroupNotFound, r.error))
       if r.error.contains("Timeout"):
         return rsVErr(newRSE(rseTimeout, r.error))
       return rsVErr(newRSE(rseInternal, r.error))
@@ -673,9 +673,9 @@ proc raftGetForTxn*(store: RaftKVStoreExt, txnId: uint64,
   ## The lookup order is:
   ##   1. Intent key  ("\x00INTENT\x00<txnId8be><key>") in the local SM
   ##   2. Committed key (same as raftGet)
-  let ridOpt = store.resolveRangeId(key)
+  let ridOpt = store.resolveGroupId(key)
   if ridOpt.isNone:
-    return rsErr[Option[RaftKVEntry]](newRSE(rseRangeNotFound,
+    return rsErr[Option[RaftKVEntry]](newRSE(rseGroupNotFound,
         &"no shard for key '{key}'"))
 
   let sm = store.getOrCreateSM(ridOpt.get())
@@ -710,9 +710,9 @@ proc raftResolveIntent*(store: RaftKVStoreExt, txnId: uint64,
   ## On commit: move the intent to the committed slot.
   ## On abort:  delete the intent.
   let intentKey = encodeIntentKey(txnId, key)
-  let ridOpt = store.resolveRangeId(key)
+  let ridOpt = store.resolveGroupId(key)
   if ridOpt.isNone:
-    return rsVErr(newRSE(rseRangeNotFound, &"no shard for key '{key}'"))
+    return rsVErr(newRSE(rseGroupNotFound, &"no shard for key '{key}'"))
 
   let batch = newWriteBatch()
   if commit:
@@ -729,11 +729,11 @@ proc raftResolveIntent*(store: RaftKVStoreExt, txnId: uint64,
 
 proc raftWriteCoordRecord*(store: RaftKVStoreExt, txnId: uint64,
     payload: string): RSVoidResult {.gcsafe, raises: [].} =
-  ## Write a durable 2PC coordinator record to the meta range.
+  ## Write a durable 2PC coordinator record to the meta group.
   let coordKey = encodeCoordKey(txnId)
   let batch = newWriteBatch()
   batch.put(toBytes(coordKey), toBytes(payload))
-  proposeWrite(store, META_RANGE_ID, batch)
+  proposeWrite(store, META_GROUP_ID, batch)
 
 proc raftDeleteCoordRecord*(store: RaftKVStoreExt,
     txnId: uint64): RSVoidResult {.gcsafe, raises: [].} =
@@ -741,13 +741,13 @@ proc raftDeleteCoordRecord*(store: RaftKVStoreExt,
   let coordKey = encodeCoordKey(txnId)
   let batch = newWriteBatch()
   batch.delete(toBytes(coordKey))
-  proposeWrite(store, META_RANGE_ID, batch)
+  proposeWrite(store, META_GROUP_ID, batch)
 
 proc raftReadCoordRecord*(store: RaftKVStoreExt,
     txnId: uint64): Option[string] {.gcsafe, raises: [].} =
   ## Read back a coordinator record (for recovery).
   let coordKey = encodeCoordKey(txnId)
-  let sm = store.getOrCreateSM(META_RANGE_ID)
+  let sm = store.getOrCreateSM(META_GROUP_ID)
   acquire(store.smMu)
   defer: release(store.smMu)
   if sm.kvStore.hasKey(coordKey):
@@ -763,7 +763,7 @@ proc loadSpaces*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
   ## Call after bootstrap/recovery when the state machine is populated.
   let startKey = "/t/" & align($SYS_SPACES_TABLE_ID, 10, '0') & "/"
   let endKey = "/t/" & align($(SYS_SPACES_TABLE_ID + 1), 10, '0') & "/"
-  let sm = store.getOrCreateSM(META_RANGE_ID)
+  let sm = store.getOrCreateSM(META_GROUP_ID)
   acquire(store.smMu)
   var entries: seq[(string, string)] = @[]
   for k, v in sm.kvStore:
@@ -782,9 +782,9 @@ proc loadSpaces*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
           name: j["name"].getStr(),
           replicas: j["replicas"].getInt(),
         )
-        if j.hasKey("rangeIds"):
-          for r in j["rangeIds"]:
-            info.rangeIds.add(uint64(r.getInt()))
+        if j.hasKey("groupIds"):
+          for r in j["groupIds"]:
+            info.groupIds.add(uint64(r.getInt()))
         store.spaces[info.spaceId] = info
       except:
         discard
@@ -794,7 +794,7 @@ proc loadTableSpaces*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
   ## Scan sys.tables and populate the tableId → spaceId mapping.
   let startKey = "/t/" & align($SYS_TABLES_TABLE_ID, 10, '0') & "/"
   let endKey = "/t/" & align($(SYS_TABLES_TABLE_ID + 1), 10, '0') & "/"
-  let sm = store.getOrCreateSM(META_RANGE_ID)
+  let sm = store.getOrCreateSM(META_GROUP_ID)
   acquire(store.smMu)
   var entries: seq[(string, string)] = @[]
   for k, v in sm.kvStore:
@@ -815,15 +815,15 @@ proc loadTableSpaces*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
         discard
   release(store.spacesMu)
 
-proc routeToGroup*(primaryKey: string, rangeIds: seq[uint64]): RangeID {.inline.} =
-  ## Hash-route a primary key to one of the space's range groups.
-  if rangeIds.len == 0:
-    return META_RANGE_ID
-  if rangeIds.len == 1:
-    return RangeID(rangeIds[0])
+proc routeToGroup*(primaryKey: string, groupIds: seq[uint64]): GroupID {.inline.} =
+  ## Hash-route a primary key to one of the space's groups.
+  if groupIds.len == 0:
+    return META_GROUP_ID
+  if groupIds.len == 1:
+    return GroupID(groupIds[0])
   let h = hash(primaryKey)
-  let idx = abs(h) mod rangeIds.len
-  RangeID(rangeIds[idx])
+  let idx = abs(h) mod groupIds.len
+  GroupID(groupIds[idx])
 
 proc getSpaceForTable*(store: RaftKVStoreExt,
     tableId: uint32): Option[SpaceInfo] {.gcsafe, raises: [].} =
@@ -837,14 +837,14 @@ proc getSpaceForTable*(store: RaftKVStoreExt,
 # ---------------------------------------------------------------------------
 # Space-aware KV operations
 # ---------------------------------------------------------------------------
-# These bypass resolveRangeId() and route directly to a space's Raft group
+# These bypass resolveGroupId() and route directly to a space's Raft group
 # using hash(primaryKey) mod numGroups.
 
 proc raftPutInSpace*(store: RaftKVStoreExt, key, value: string,
     space: SpaceInfo, primaryKey: string): RSResult[RaftKVEntry] {.gcsafe, raises: [].} =
   ## Write `value` under `key` through Raft consensus, routing to the
   ## correct group in the space via hash(primaryKey).
-  let rid = routeToGroup(primaryKey, space.rangeIds)
+  let rid = routeToGroup(primaryKey, space.groupIds)
   let batch = newWriteBatch()
   batch.put(toBytes(key), toBytes(value))
   let vr = proposeWrite(store, rid, batch)
@@ -857,7 +857,7 @@ proc raftPutInSpace*(store: RaftKVStoreExt, key, value: string,
 proc raftGetInSpace*(store: RaftKVStoreExt, key: string,
     space: SpaceInfo, primaryKey: string): RSResult[Option[RaftKVEntry]] {.gcsafe, raises: [].} =
   ## Read the current value for `key` from the space group owning `primaryKey`.
-  let rid = routeToGroup(primaryKey, space.rangeIds)
+  let rid = routeToGroup(primaryKey, space.groupIds)
   let sm = store.getOrCreateSM(rid)
   acquire(store.smMu)
   defer: release(store.smMu)
@@ -874,7 +874,7 @@ proc raftGetInSpace*(store: RaftKVStoreExt, key: string,
 proc raftDeleteInSpace*(store: RaftKVStoreExt, key: string,
     space: SpaceInfo, primaryKey: string): RSResult[Option[RaftKVEntry]] {.gcsafe, raises: [].} =
   ## Delete `key` through Raft consensus, routing to the correct space group.
-  let rid = routeToGroup(primaryKey, space.rangeIds)
+  let rid = routeToGroup(primaryKey, space.groupIds)
   # Capture previous value
   var prevEntry: Option[RaftKVEntry]
   let sm = store.getOrCreateSM(rid)
@@ -902,8 +902,8 @@ proc raftScanSpace*(store: RaftKVStoreExt, startKey, endKey: string,
 
   # Phase 1: collect sorted results per group
   var groupResults: seq[seq[(string, RaftKVEntry)]] = @[]
-  for rid64 in space.rangeIds:
-    let rid = RangeID(rid64)
+  for rid64 in space.groupIds:
+    let rid = GroupID(rid64)
     let sm = store.getOrCreateSM(rid)
     var pairs: seq[(string, RaftKVEntry)] = @[]
     acquire(store.smMu)

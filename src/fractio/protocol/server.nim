@@ -33,7 +33,7 @@ import ../distributed/sharedtimer
 import ../distributed/raft/multigroup_coordinator
 import ../distributed/raft/multigroup_transport
 import ../distributed/raft/multigroup_types
-import ../distributed/range/types as rangeTypes
+import ../distributed/raft/group_types as rangeTypes
 import ../distributed/sharedtimer/udptransport as udpXport
 import ../distributed/meta/system_tables
 import std/json
@@ -1441,7 +1441,7 @@ proc addPeerToRaft*(server: ProtocolServer, peerNodeId: uint32,
   ## Called when a new node joins the cluster.
   if server.raftTransport.isNil: return
 
-  let rangeNodeId = rangeTypes.RangeNodeID(peerNodeId)
+  let rangeNodeId = rangeTypes.NodeID(peerNodeId)
 
   # Add to transport layer (connection manager + peer list)
   server.raftTransport.addPeer(rangeNodeId, host, raftPort)
@@ -1450,7 +1450,7 @@ proc addPeerToRaft*(server: ProtocolServer, peerNodeId: uint32,
   let coord = server.raftCoord
   if coord.isNil: return
   withLock coord.groupsLock:
-    for rangeId, group in coord.groups:
+    for groupId, group in coord.groups:
       discard group.descriptor.addReplica(rangeNodeId, rangeTypes.rtVoter)
 
   # Persist membership so restarts can rejoin without --join
@@ -1463,7 +1463,7 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
   ## rawPeers: each entry "ID:HOST:RAFT_PORT", empty = single-node mode.
   ## startAsLeader: when true and no peers, immediately become leader.
 
-  let nodeId = rangeTypes.RangeNodeID(uint32(server.config.serverId))
+  let nodeId = rangeTypes.NodeID(uint32(server.config.serverId))
   let raftDir = server.config.dataDir / "raft"
 
   # When joining with --join, clear Raft state so the leader's log
@@ -1483,7 +1483,7 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
     if parts.len < 3: continue
     try:
       peers.add(PeerAddr(
-        nodeId: rangeTypes.RangeNodeID(uint32(parseInt(parts[0]))),
+        nodeId: rangeTypes.NodeID(uint32(parseInt(parts[0]))),
         host: parts[1],
         raftPort: parseInt(parts[2]),
       ))
@@ -1506,7 +1506,7 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
           let pRaftPort = p.getOrDefault("raftPort").getInt(0)
           if pNodeId > 0 and pHost != "" and pRaftPort > 0:
             peers.add(PeerAddr(
-              nodeId: rangeTypes.RangeNodeID(pNodeId),
+              nodeId: rangeTypes.NodeID(pNodeId),
               host: pHost,
               raftPort: pRaftPort,
             ))
@@ -1530,9 +1530,9 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
   ))
   server.raftCoord = coord
 
-  # Raft groups: meta range (Range 1) and data range (Range 2)
-  for rangeId in [META_RANGE_ID, DATA_RANGE_START_ID]:
-    var desc = rangeTypes.newRangeDescriptor(rangeId, @[], @[])
+  # Raft groups: meta group (Group 1) and data group (Group 2)
+  for groupId in [META_GROUP_ID, DATA_GROUP_START_ID]:
+    var desc = rangeTypes.newGroupDescriptor(groupId)
     let myReplica = desc.addReplica(nodeId, rangeTypes.rtVoter)
     for p in peers:
       discard desc.addReplica(p.nodeId, rangeTypes.rtVoter)
@@ -1541,36 +1541,36 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
 
   # Become leader only for a truly fresh single-node cluster (no saved peers)
   if peers.len == 0 and startAsLeader and not isRejoining:
-    for rangeId in [META_RANGE_ID, DATA_RANGE_START_ID]:
-      let g = coord.getGroup(rangeId)
+    for groupId in [META_GROUP_ID, DATA_GROUP_START_ID]:
+      let g = coord.getGroup(groupId)
       if g.isSome:
         g.get().becomeLeader()
 
   # KV store
   let store = newRaftKVStoreExt(coord)
-  store.bootstrapStore(@[META_RANGE_ID, DATA_RANGE_START_ID])
+  store.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
   server.raftStore = store
 
   # Recovery: replay committed Raft log entries to rebuild in-memory state machine.
   # On a fresh start lastApplied=0 so this is a no-op. On restart after a kill,
   # we need to re-apply entries 1..lastApplied because the in-memory KVStateMachine
   # is empty (only WiscKey has the data on disk, but reads go through the in-memory SM).
-  for rangeId in [META_RANGE_ID, DATA_RANGE_START_ID]:
-    let groupOpt = coord.getGroup(rangeId)
+  for groupId in [META_GROUP_ID, DATA_GROUP_START_ID]:
+    let groupOpt = coord.getGroup(groupId)
     if groupOpt.isSome:
       let group = groupOpt.get()
       let lastApplied = group.lastApplied.load()
       if lastApplied > 0:
-        echo "replaying " & $lastApplied & " committed log entries for range " & $rangeId.uint64 & "..."
+        echo "replaying " & $lastApplied & " committed log entries for group " & $groupId.uint64 & "..."
         group.lastApplied.store(0)
-        coord.applyUpTo(rangeId, group, lastApplied)
+        coord.applyUpTo(groupId, group, lastApplied)
         echo "state machine recovery complete (applied up to " & $group.lastApplied.load() & ")"
 
   # Load space caches from recovered state machine
   store.loadSpaces()
   store.loadTableSpaces()
 
-  # Seed system tables: sys.nodes (table 5) and sys.ranges (table 4)
+  # Seed system tables: sys.nodes (table 5) and sys.groups (table 4)
   # Only seed when starting as fresh leader (not rejoining and not joining)
   if startAsLeader and not isRejoining:
     let nodeKey = encodeTableKey(SYS_NODES_TABLE_ID, $server.config.serverId)
@@ -1584,15 +1584,13 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
     }
     discard store.raftPut(nodeKey, nodeVal)
 
-    for rid in [META_RANGE_ID, DATA_RANGE_START_ID]:
-      let rangeKey = encodeTableKey(SYS_RANGES_TABLE_ID, $rid.uint64)
-      let rangeVal = $ %* {
-        "rangeId": rid.uint64.int,
-        "startKey": "",
-        "endKey": "",
+    for gid in [META_GROUP_ID, DATA_GROUP_START_ID]:
+      let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
+      let groupVal = $ %* {
+        "groupId": gid.uint64.int,
         "replicas": [{"nodeId": server.config.serverId.int, "type": "voter"}],
       }
-      discard store.raftPut(rangeKey, rangeVal)
+      discard store.raftPut(groupKey, groupVal)
 
     for p in peers:
       let peerKey = encodeTableKey(SYS_NODES_TABLE_ID, $p.nodeId.uint32)
@@ -1614,14 +1612,14 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
       "name": "public", "database": "default",
     })
 
-    # Seed default space (replicas=0 means ALL, single group = Range 1)
+    # Seed default space (replicas=0 means ALL, single group = Group 1)
     let spaceKey = encodeTableKey(SYS_SPACES_TABLE_ID, "1")
     discard store.raftPut(spaceKey, $ %* {
       "spaceId": 1,
       "name": "default",
       "replicas": 0,
       "groupCount": 1,
-      "rangeIds": [1],
+      "groupIds": [1],
       "createdAt": $now(),
     })
 

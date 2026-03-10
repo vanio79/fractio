@@ -23,7 +23,7 @@ import fractio/protocol/raft_store
 import fractio/distributed/raft/multigroup_coordinator
 import fractio/distributed/raft/multigroup_transport
 import fractio/distributed/raft/multigroup_types
-import fractio/distributed/range/types as rangeTypes
+import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
 
 # ---------------------------------------------------------------------------
@@ -43,16 +43,16 @@ type
 
 proc makeNode(nodeNum: int, basePort: int,
               peerNums: seq[int],
-              rid: RangeID,
-              desc: RangeDescriptor,
+              rid: GroupID,
+              desc: GroupDescriptor,
               numWorkers: int = 1): NodeSetup =
-  let nodeId = RangeNodeID(uint32(nodeNum))
+  let nodeId = NodeID(uint32(nodeNum))
   let port = basePort + (nodeNum - 1) * 10
 
   var peers: seq[PeerAddr]
   for pn in peerNums:
     peers.add(PeerAddr(
-      nodeId: RangeNodeID(uint32(pn)),
+      nodeId: NodeID(uint32(pn)),
       host: "127.0.0.1",
       raftPort: basePort + (pn - 1) * 10,
     ))
@@ -91,7 +91,7 @@ proc stopNode(ns: NodeSetup) =
   sleep(500) # Let TCP connections drain before removing storage
   cleanDir(ns.storagePath)
 
-proc electLeader(nodes: seq[NodeSetup], rid: RangeID, leaderIdx: int) =
+proc electLeader(nodes: seq[NodeSetup], rid: GroupID, leaderIdx: int) =
   ## Force node at leaderIdx to become leader, wait for heartbeats.
   let grp = nodes[leaderIdx].coord.getGroup(rid)
   doAssert grp.isSome
@@ -104,13 +104,13 @@ proc electLeader(nodes: seq[NodeSetup], rid: RangeID, leaderIdx: int) =
 # Cluster factories
 # ---------------------------------------------------------------------------
 
-proc make3NodeCluster(basePort: int): (seq[NodeSetup], RangeID) =
+proc make3NodeCluster(basePort: int): (seq[NodeSetup], GroupID) =
   ## 3 nodes: node 1 & 2 are voters, node 3 is non-voter.
-  let rid = DATA_RANGE_START_ID
-  let desc = newRangeDescriptor(rid, @[], @[])
-  discard desc.addReplica(RangeNodeID(1), rtVoter)
-  discard desc.addReplica(RangeNodeID(2), rtVoter)
-  discard desc.addReplica(RangeNodeID(3), rtNonVoter)
+  let rid = DATA_GROUP_START_ID
+  let desc = newGroupDescriptor(rid)
+  discard desc.addReplica(NodeID(1), rtVoter)
+  discard desc.addReplica(NodeID(2), rtVoter)
+  discard desc.addReplica(NodeID(3), rtNonVoter)
 
   let nodes = @[
     makeNode(1, basePort, @[2, 3], rid, desc),
@@ -119,16 +119,16 @@ proc make3NodeCluster(basePort: int): (seq[NodeSetup], RangeID) =
   ]
   (nodes, rid)
 
-proc make5NodeCluster(basePort: int): (seq[NodeSetup], RangeID) =
+proc make5NodeCluster(basePort: int): (seq[NodeSetup], GroupID) =
   ## 5 nodes: nodes 1, 2, 3 are voters, nodes 4, 5 are non-voters.
   ## Uses 2 coordinator workers per node to handle the higher fan-out.
-  let rid = DATA_RANGE_START_ID
-  let desc = newRangeDescriptor(rid, @[], @[])
-  discard desc.addReplica(RangeNodeID(1), rtVoter)
-  discard desc.addReplica(RangeNodeID(2), rtVoter)
-  discard desc.addReplica(RangeNodeID(3), rtVoter)
-  discard desc.addReplica(RangeNodeID(4), rtNonVoter)
-  discard desc.addReplica(RangeNodeID(5), rtNonVoter)
+  let rid = DATA_GROUP_START_ID
+  let desc = newGroupDescriptor(rid)
+  discard desc.addReplica(NodeID(1), rtVoter)
+  discard desc.addReplica(NodeID(2), rtVoter)
+  discard desc.addReplica(NodeID(3), rtVoter)
+  discard desc.addReplica(NodeID(4), rtNonVoter)
+  discard desc.addReplica(NodeID(5), rtNonVoter)
 
   let nodes = @[
     makeNode(1, basePort, @[2, 3, 4, 5], rid, desc, numWorkers = 2),

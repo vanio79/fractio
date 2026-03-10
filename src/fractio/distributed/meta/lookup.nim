@@ -7,7 +7,7 @@ import std/options
 import std/tables
 import std/locks
 
-import fractio/distributed/range/types
+import fractio/distributed/raft/group_types
 import fractio/distributed/meta/types
 
 # ============================================================================
@@ -35,10 +35,10 @@ type
   LookupError* = object of CatchableError
     ## Base error for lookup operations
 
-  RangeNotFoundError* = object of LookupError
+  GroupNotFoundError* = object of LookupError
     ## Range not found in meta ranges
 
-  MetaRangeUnavailableError* = object of LookupError
+  MetaGroupUnavailableError* = object of LookupError
     ## Meta range is unavailable
 
   LeaseholderNotFoundError* = object of LookupError
@@ -60,9 +60,9 @@ type
 
   LookupResponse* = object
     ## Response from a range lookup
-    descriptor*: RangeDescriptor
+    descriptor*: GroupDescriptor
       ## The range descriptor
-    leaseholder*: RangeNodeID
+    leaseholder*: NodeID
       ## Current leaseholder (if known)
     found*: bool
       ## Whether the range was found
@@ -76,8 +76,8 @@ proc newLookupRequest*(key: seq[byte], readAtNs: int64,
     maxStalenessNs: maxStalenessNs
   )
 
-proc newLookupResponse*(desc: RangeDescriptor,
-                        leaseholder: RangeNodeID = RangeNodeID(0)): LookupResponse =
+proc newLookupResponse*(desc: GroupDescriptor,
+                        leaseholder: NodeID = NodeID(0)): LookupResponse =
   ## Create a successful lookup response
   result = LookupResponse(
     descriptor: desc,
@@ -89,7 +89,7 @@ proc notFoundResponse*(): LookupResponse =
   ## Create a not-found response
   result = LookupResponse(
     descriptor: nil,
-    leaseholder: RangeNodeID(0),
+    leaseholder: NodeID(0),
     found: false
   )
 
@@ -98,70 +98,57 @@ proc notFoundResponse*(): LookupResponse =
 # ============================================================================
 
 type
-  RangeLookup* = ref object
+  GroupLookup* = ref object
     ## Handles range lookups using the two-level meta index
-    cache*: RangeCache
-    meta1Descriptor*: Option[RangeDescriptor]
-    meta2Descriptors*: Table[RangeID, RangeDescriptor]
+    cache*: GroupCache
+    meta1Descriptor*: Option[GroupDescriptor]
+    meta2Descriptors*: Table[GroupID, GroupDescriptor]
     lock*: Lock
 
-proc newRangeLookup*(cache: RangeCache): RangeLookup =
+proc newGroupLookup*(cache: GroupCache): GroupLookup =
   ## Create a new range lookup handler
   new(result)
   result.cache = cache
-  result.meta2Descriptors = initTable[RangeID, RangeDescriptor]()
+  result.meta2Descriptors = initTable[GroupID, GroupDescriptor]()
   initLock(result.lock)
 
-proc destroy*(lookup: RangeLookup) =
+proc destroy*(lookup: GroupLookup) =
   ## Clean up resources
   deinitLock(lookup.lock)
 
-proc setMeta1Descriptor*(lookup: RangeLookup, desc: RangeDescriptor) =
+proc setMeta1Descriptor*(lookup: GroupLookup, desc: GroupDescriptor) =
   ## Set the meta1 range descriptor
   withLock lookup.lock:
     lookup.meta1Descriptor = some(desc)
 
-proc setMeta2Descriptor*(lookup: RangeLookup, rangeId: RangeID,
-                         desc: RangeDescriptor) =
+proc setMeta2Descriptor*(lookup: GroupLookup, groupId: GroupID,
+                         desc: GroupDescriptor) =
   ## Set a meta2 range descriptor
   withLock lookup.lock:
-    lookup.meta2Descriptors[rangeId] = desc
+    lookup.meta2Descriptors[groupId] = desc
 
-proc findContainingRange*(lookup: RangeLookup, key: seq[byte],
-                          nowNs: int64): Option[RangeDescriptor] =
-  ## Find the range containing a key using cached descriptors
-  ## First checks the cache, then falls back to meta ranges
+proc findContainingGroup*(lookup: GroupLookup, key: seq[byte],
+                          nowNs: int64): Option[GroupDescriptor] =
+  ## Find the group for a key using cached descriptors.
+  ## With hash-based spaces, key-range containment is not used;
+  ## routing is done via resolveGroupId in raft_store.
+  return none(GroupDescriptor)
 
-  # Check cache first
-  let cached = lookup.cache.getByKey(key, nowNs)
-  if cached.isSome:
-    return cached
-
-  # Need to do a full lookup through meta ranges
-  return none(RangeDescriptor)
-
-proc lookupMeta1*(lookup: RangeLookup, key: seq[byte],
-                  nowNs: int64): Option[RangeDescriptor] =
+proc lookupMeta1*(lookup: GroupLookup, key: seq[byte],
+                  nowNs: int64): Option[GroupDescriptor] =
   ## Look up which meta2 range contains a key
   ## Returns the meta2 range descriptor
 
   withLock lookup.lock:
     if lookup.meta1Descriptor.isSome:
-      let meta1 = lookup.meta1Descriptor.get
+      # With hash-based spaces, meta2 lookup by key range is unused.
+      # Routing is done via resolveGroupId in raft_store.
+      discard
 
-      # Meta1 maps key prefixes to meta2 ranges
-      # For now, we assume a simple single meta2 range
-      # In production, this would scan meta1 entries
+  return none(GroupDescriptor)
 
-      # Check if we have any meta2 ranges
-      for rangeId, meta2 in lookup.meta2Descriptors:
-        if key >= meta2.startKey and (meta2.endKey.len == 0 or key < meta2.endKey):
-          return some(meta2)
-
-  return none(RangeDescriptor)
-
-proc lookupMeta2*(lookup: RangeLookup, meta2RangeId: RangeID,
-                  key: seq[byte], nowNs: int64): Option[RangeDescriptor] =
+proc lookupMeta2*(lookup: GroupLookup, meta2RangeId: GroupID,
+                  key: seq[byte], nowNs: int64): Option[GroupDescriptor] =
   ## Look up which data range contains a key in a meta2 range
   ## Returns the data range descriptor
 
@@ -179,11 +166,11 @@ proc lookupMeta2*(lookup: RangeLookup, meta2RangeId: RangeID,
       # For now, we return the cached range if it contains the key
       # This is a simplified implementation
 
-      return none(RangeDescriptor)
+      return none(GroupDescriptor)
 
-  return none(RangeDescriptor)
+  return none(GroupDescriptor)
 
-proc fullLookup*(lookup: RangeLookup, key: seq[byte],
+proc fullLookup*(lookup: GroupLookup, key: seq[byte],
                  nowNs: int64): LookupResponse =
   ## Perform a full lookup through the meta range hierarchy
   ## 1. Check cache
@@ -191,10 +178,9 @@ proc fullLookup*(lookup: RangeLookup, key: seq[byte],
   ## 3. Look up data range in meta2
   ## 4. Cache result
 
-  # Step 1: Check cache
-  let cached = lookup.cache.getByKey(key, nowNs)
-  if cached.isSome:
-    return newLookupResponse(cached.get)
+  # Step 1: Check cache (key-range lookup removed; hash-based routing
+  # is handled by resolveGroupId in raft_store)
+  discard
 
   # Step 2: Find meta2 range
   let meta2Opt = lookup.lookupMeta1(key, nowNs)
@@ -204,7 +190,7 @@ proc fullLookup*(lookup: RangeLookup, key: seq[byte],
   let meta2 = meta2Opt.get
 
   # Step 3: Find data range in meta2
-  let dataOpt = lookup.lookupMeta2(meta2.rangeId, key, nowNs)
+  let dataOpt = lookup.lookupMeta2(meta2.groupId, key, nowNs)
   if dataOpt.isNone:
     return notFoundResponse()
 
@@ -215,28 +201,28 @@ proc fullLookup*(lookup: RangeLookup, key: seq[byte],
 
   return newLookupResponse(data)
 
-proc getLeaseholder*(lookup: RangeLookup, rangeId: RangeID,
-                     nowNs: int64): Option[RangeNodeID] =
+proc getLeaseholder*(lookup: GroupLookup, groupId: GroupID,
+                     nowNs: int64): Option[NodeID] =
   ## Get the current leaseholder for a range
   ## Returns the first voter replica (simplified)
 
-  let descOpt = lookup.cache.get(rangeId, nowNs)
+  let descOpt = lookup.cache.get(groupId, nowNs)
   if descOpt.isSome:
     let desc = descOpt.get
     let voters = desc.getVoters()
     if voters.len > 0:
       return some(voters[0].nodeId)
 
-  return none(RangeNodeID)
+  return none(NodeID)
 
-proc updateDescriptor*(lookup: RangeLookup, desc: RangeDescriptor,
+proc updateDescriptor*(lookup: GroupLookup, desc: GroupDescriptor,
                        nowNs: int64) =
   ## Update a range descriptor in the cache
   lookup.cache.put(desc, nowNs)
 
-proc invalidateRange*(lookup: RangeLookup, rangeId: RangeID) =
+proc invalidateGroup*(lookup: GroupLookup, groupId: GroupID) =
   ## Invalidate a cached range descriptor
-  lookup.cache.invalidate(rangeId)
+  lookup.cache.invalidate(groupId)
 
 # ============================================================================
 # Key Range Utilities

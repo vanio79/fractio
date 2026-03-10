@@ -13,7 +13,7 @@ import std/locks
 import std/sequtils
 import std/algorithm
 
-import fractio/distributed/range/types
+import fractio/distributed/raft/group_types
 
 # ============================================================================
 # Constants
@@ -48,7 +48,7 @@ const
 type
   StoreStats* = object
     ## Statistics for a single store
-    nodeId*: RangeNodeID
+    nodeId*: NodeID
     replicaCount*: int
       ## Number of replicas on this store
     leaderCount*: int
@@ -68,7 +68,7 @@ type
     locality*: seq[tuple[key, value: string]]
       ## Locality tags
 
-proc newStoreStats*(nodeId: RangeNodeID): StoreStats =
+proc newStoreStats*(nodeId: NodeID): StoreStats =
   ## Create new store statistics
   result = StoreStats(
     nodeId: nodeId,
@@ -126,13 +126,13 @@ proc localityMatch*(stats: StoreStats, other: StoreStats): int =
 type
   StorePool* = ref object
     ## Pool of stores for allocation decisions
-    stores*: Table[RangeNodeID, StoreStats]
+    stores*: Table[NodeID, StoreStats]
     lock*: Lock
 
 proc newStorePool*(): StorePool =
   ## Create a new store pool
   new(result)
-  result.stores = initTable[RangeNodeID, StoreStats]()
+  result.stores = initTable[NodeID, StoreStats]()
   initLock(result.lock)
 
 proc destroy*(pool: StorePool) =
@@ -144,12 +144,12 @@ proc addStore*(pool: StorePool, stats: StoreStats) =
   withLock pool.lock:
     pool.stores[stats.nodeId] = stats
 
-proc removeStore*(pool: StorePool, nodeId: RangeNodeID) =
+proc removeStore*(pool: StorePool, nodeId: NodeID) =
   ## Remove a store from the pool
   withLock pool.lock:
     pool.stores.del(nodeId)
 
-proc getStore*(pool: StorePool, nodeId: RangeNodeID): Option[StoreStats] =
+proc getStore*(pool: StorePool, nodeId: NodeID): Option[StoreStats] =
   ## Get store statistics
   withLock pool.lock:
     if pool.stores.contains(nodeId):
@@ -205,9 +205,9 @@ type
       ## Maximum number of replicas
     requiredLocalities*: seq[tuple[key, value: string]]
       ## Required locality constraints
-    forbiddenNodes*: seq[RangeNodeID]
+    forbiddenNodes*: seq[NodeID]
       ## Nodes that cannot be used
-    preferredNodes*: seq[RangeNodeID]
+    preferredNodes*: seq[NodeID]
       ## Nodes that are preferred (e.g., for lease transfer)
 
 proc defaultConstraints*(): AllocationConstraint =
@@ -231,13 +231,13 @@ proc withMaxReplicas*(c: AllocationConstraint, n: int): AllocationConstraint =
   result.maxReplicas = n
 
 proc withForbiddenNodes*(c: AllocationConstraint, nodes: seq[
-    RangeNodeID]): AllocationConstraint =
+    NodeID]): AllocationConstraint =
   ## Set forbidden nodes
   result = c
   result.forbiddenNodes = nodes
 
 proc withPreferredNodes*(c: AllocationConstraint, nodes: seq[
-    RangeNodeID]): AllocationConstraint =
+    NodeID]): AllocationConstraint =
   ## Set preferred nodes
   result = c
   result.preferredNodes = nodes
@@ -258,15 +258,15 @@ type
     ## A single allocation decision
     case kind*: AllocationDecisionKind
     of adkAddReplica:
-      addTarget*: RangeNodeID
-      addRangeId*: RangeID
+      addTarget*: NodeID
+      addGroupId*: GroupID
     of adkRemoveReplica:
-      removeTarget*: RangeNodeID
-      removeRangeId*: RangeID
+      removeTarget*: NodeID
+      removeGroupId*: GroupID
     of adkTransferLease:
-      transferFrom*: RangeNodeID
-      transferTo*: RangeNodeID
-      transferRangeId*: RangeID
+      transferFrom*: NodeID
+      transferTo*: NodeID
+      transferGroupId*: GroupID
     of adkNoAction:
       discard
 
@@ -275,30 +275,30 @@ type
     reason*: string
       ## Human-readable reason for this decision
 
-proc newAddReplicaDecision*(rangeId: RangeID, target: RangeNodeID,
+proc newAddReplicaDecision*(groupId: GroupID, target: NodeID,
                             priority: int, reason: string): AllocationDecision =
   ## Create an add replica decision
   result = AllocationDecision(
     kind: adkAddReplica,
     addTarget: target,
-    addRangeId: rangeId,
+    addGroupId: groupId,
     priority: priority,
     reason: reason
   )
 
-proc newRemoveReplicaDecision*(rangeId: RangeID, target: RangeNodeID,
+proc newRemoveReplicaDecision*(groupId: GroupID, target: NodeID,
                                priority: int,
                                    reason: string): AllocationDecision =
   ## Create a remove replica decision
   result = AllocationDecision(
     kind: adkRemoveReplica,
     removeTarget: target,
-    removeRangeId: rangeId,
+    removeGroupId: groupId,
     priority: priority,
     reason: reason
   )
 
-proc newTransferLeaseDecision*(rangeId: RangeID, source, target: RangeNodeID,
+proc newTransferLeaseDecision*(groupId: GroupID, source, target: NodeID,
                                priority: int,
                                    reason: string): AllocationDecision =
   ## Create a transfer lease decision
@@ -306,7 +306,7 @@ proc newTransferLeaseDecision*(rangeId: RangeID, source, target: RangeNodeID,
     kind: adkTransferLease,
     transferFrom: source,
     transferTo: target,
-    transferRangeId: rangeId,
+    transferGroupId: groupId,
     priority: priority,
     reason: reason
   )
@@ -345,14 +345,14 @@ proc destroy*(alloc: Allocator) =
   deinitLock(alloc.lock)
 
 proc selectStoreForReplica*(alloc: Allocator,
-                            existingReplicas: seq[RangeNodeID],
-                            constraints: AllocationConstraint): Option[RangeNodeID] =
+                            existingReplicas: seq[NodeID],
+                            constraints: AllocationConstraint): Option[NodeID] =
   ## Select the best store for a new replica
   ## Considers load balance, locality, and constraints
 
   let stores = alloc.pool.getAliveStores()
   if stores.len == 0:
-    return none(RangeNodeID)
+    return none(NodeID)
 
   # Filter out forbidden nodes and existing replicas
   var candidates: seq[StoreStats] = @[]
@@ -364,7 +364,7 @@ proc selectStoreForReplica*(alloc: Allocator,
     candidates.add(stats)
 
   if candidates.len == 0:
-    return none(RangeNodeID)
+    return none(NodeID)
 
   # Check preferred nodes first
   for prefNode in constraints.preferredNodes:
@@ -380,13 +380,13 @@ proc selectStoreForReplica*(alloc: Allocator,
   return some(candidates[0].nodeId)
 
 proc selectStoreForRemoval*(alloc: Allocator,
-                            existingReplicas: seq[RangeNodeID]): Option[RangeNodeID] =
+                            existingReplicas: seq[NodeID]): Option[NodeID] =
   ## Select the best replica to remove
   ## Prefers to remove from overloaded stores
 
   let stores = alloc.pool.getAliveStores()
   if existingReplicas.len == 0:
-    return none(RangeNodeID)
+    return none(NodeID)
 
   # Get stats for existing replicas
   var replicaStats: seq[StoreStats] = @[]
@@ -406,12 +406,12 @@ proc selectStoreForRemoval*(alloc: Allocator,
 
 proc selectLeaseholder*(alloc: Allocator,
                         replicas: seq[ReplicaDescriptor],
-                        currentLeaseholder: RangeNodeID): Option[RangeNodeID] =
+                        currentLeaseholder: NodeID): Option[NodeID] =
   ## Select the best replica to hold the lease
   ## Prefers underloaded stores
 
   if replicas.len == 0:
-    return none(RangeNodeID)
+    return none(NodeID)
 
   # Get stats for all replicas
   var replicaStats: seq[tuple[rep: ReplicaDescriptor, stats: StoreStats]] = @[]
@@ -439,9 +439,9 @@ proc selectLeaseholder*(alloc: Allocator,
   # Return the least loaded store
   return some(replicaStats[0].rep.nodeId)
 
-proc shouldRebalance*(alloc: Allocator, rangeId: RangeID,
+proc shouldRebalance*(alloc: Allocator, groupId: GroupID,
                       replicas: seq[ReplicaDescriptor],
-                      leaseholder: RangeNodeID): seq[AllocationDecision] =
+                      leaseholder: NodeID): seq[AllocationDecision] =
   ## Check if a range needs rebalancing
   ## Returns a list of decisions to make
 
@@ -456,7 +456,7 @@ proc shouldRebalance*(alloc: Allocator, rangeId: RangeID,
 
     if target.isSome:
       result.add(newAddReplicaDecision(
-        rangeId, target.get, 10,
+        groupId, target.get, 10,
         "Range needs more replicas (" & $replicas.len & "/" &
         $alloc.replicationFactor & ")"
       ))
@@ -468,7 +468,7 @@ proc shouldRebalance*(alloc: Allocator, rangeId: RangeID,
 
     if target.isSome:
       result.add(newRemoveReplicaDecision(
-        rangeId, target.get, 5,
+        groupId, target.get, 5,
         "Range has too many replicas (" & $replicas.len & "/" &
         $alloc.replicationFactor & ")"
       ))
@@ -487,18 +487,18 @@ proc shouldRebalance*(alloc: Allocator, rangeId: RangeID,
 
         if newLeaseholder.isSome and newLeaseholder.get != leaseholder:
           result.add(newTransferLeaseDecision(
-            rangeId, leaseholder, newLeaseholder.get, 3,
+            groupId, leaseholder, newLeaseholder.get, 3,
             "Leaseholder overloaded (load: " & $stats.loadScore() & ", avg: " &
                 $avgLoad & ")"
           ))
 
-proc allocateNewRange*(alloc: Allocator,
-                       constraints: AllocationConstraint): seq[RangeNodeID] =
+proc allocateNewGroup*(alloc: Allocator,
+                       constraints: AllocationConstraint): seq[NodeID] =
   ## Allocate replicas for a new range
   ## Returns the list of nodes to place replicas on
 
   result = @[]
-  var existing: seq[RangeNodeID] = @[]
+  var existing: seq[NodeID] = @[]
 
   for i in 0..<constraints.minReplicas:
     let target = alloc.selectStoreForReplica(existing, constraints)
@@ -508,7 +508,7 @@ proc allocateNewRange*(alloc: Allocator,
     else:
       break
 
-proc isStoreOverloaded*(alloc: Allocator, nodeId: RangeNodeID): bool =
+proc isStoreOverloaded*(alloc: Allocator, nodeId: NodeID): bool =
   ## Check if a store is overloaded
   let statsOpt = alloc.pool.getStore(nodeId)
   if statsOpt.isNone:
@@ -519,7 +519,7 @@ proc isStoreOverloaded*(alloc: Allocator, nodeId: RangeNodeID): bool =
 
   return stats.loadScore() > avgLoad * OVERLOAD_THRESHOLD
 
-proc isStoreUnderloaded*(alloc: Allocator, nodeId: RangeNodeID): bool =
+proc isStoreUnderloaded*(alloc: Allocator, nodeId: NodeID): bool =
   ## Check if a store is underloaded
   let statsOpt = alloc.pool.getStore(nodeId)
   if statsOpt.isNone:
@@ -530,7 +530,7 @@ proc isStoreUnderloaded*(alloc: Allocator, nodeId: RangeNodeID): bool =
 
   return stats.loadScore() < avgLoad * UNDERLOAD_THRESHOLD
 
-proc getOverloadedStores*(alloc: Allocator): seq[RangeNodeID] =
+proc getOverloadedStores*(alloc: Allocator): seq[NodeID] =
   ## Get all overloaded stores
   let stores = alloc.pool.getAliveStores()
   let avgLoad = alloc.pool.averageLoad()
@@ -539,7 +539,7 @@ proc getOverloadedStores*(alloc: Allocator): seq[RangeNodeID] =
     if stats.loadScore() > avgLoad * OVERLOAD_THRESHOLD:
       result.add(stats.nodeId)
 
-proc getUnderloadedStores*(alloc: Allocator): seq[RangeNodeID] =
+proc getUnderloadedStores*(alloc: Allocator): seq[NodeID] =
   ## Get all underloaded stores
   let stores = alloc.pool.getAliveStores()
   let avgLoad = alloc.pool.averageLoad()

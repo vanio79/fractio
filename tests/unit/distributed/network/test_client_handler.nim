@@ -107,7 +107,7 @@ suite "Client Handler Tests":
     msg.header = newMessageHeader(uint16(cmtBatchRequest), 1, toNodeID(2),
         toNodeID(1))
     msg.requestId = 123
-    msg.rangeId = 1
+    msg.groupId = 1
 
     let encoded = encodeBatchRequestMsg(msg)
     let response = handler.handleBatchRequest(encoded)
@@ -139,7 +139,7 @@ suite "Client Handler Tests":
     msg.header = newMessageHeader(uint16(cmtBatchRequest), 1, toNodeID(2),
         toNodeID(1))
     msg.requestId = 456
-    msg.rangeId = 1
+    msg.groupId = 1
 
     let encoded = encodeBatchRequestMsg(msg)
     let response = handler.handleBatchRequest(encoded)
@@ -170,7 +170,7 @@ suite "Client Handler Tests":
     msg.header = newMessageHeader(uint16(cmtScanRequest), 1, toNodeID(2),
         toNodeID(1))
     msg.requestId = 789
-    msg.rangeId = 1
+    msg.groupId = 1
     msg.startKey = "a"
     msg.endKey = "z"
     msg.limit = 100

@@ -13,7 +13,7 @@ import std/sequtils
 import std/algorithm
 import std/times
 
-import fractio/distributed/range/types
+import fractio/distributed/raft/group_types
 import fractio/distributed/rebalance/allocator
 
 # ============================================================================
@@ -333,14 +333,14 @@ proc processBatch*(scheduler: RebalanceScheduler, nowNs: int64): int =
 
   result = processed
 
-proc checkRangeForRebalance*(scheduler: RebalanceScheduler,
-                              rangeId: RangeID,
+proc checkGroupForRebalance*(scheduler: RebalanceScheduler,
+                              groupId: GroupID,
                               replicas: seq[ReplicaDescriptor],
-                              leaseholder: RangeNodeID,
+                              leaseholder: NodeID,
                               nowNs: int64): seq[RebalanceOp] =
   ## Check a range for rebalancing and add decisions to queue
 
-  let decisions = scheduler.allocator.shouldRebalance(rangeId, replicas, leaseholder)
+  let decisions = scheduler.allocator.shouldRebalance(groupId, replicas, leaseholder)
   result = scheduler.addDecisions(decisions, nowNs)
 
 proc getStats*(scheduler: RebalanceScheduler): tuple[
@@ -401,7 +401,7 @@ type
       ## Maximum concurrent lease transfers
     minIntervalNs*: int64
       ## Minimum interval between operations on same range
-    forbiddenRanges*: seq[RangeID]
+    forbiddenGroups*: seq[GroupID]
       ## Ranges that cannot be rebalanced
 
 proc defaultRebalanceConstraints*(): RebalanceConstraints =
@@ -410,16 +410,16 @@ proc defaultRebalanceConstraints*(): RebalanceConstraints =
     maxConcurrentMoves: 5,
     maxConcurrentTransfers: 10,
     minIntervalNs: 10_000_000_000'i64, # 10 seconds
-    forbiddenRanges: @[]
+    forbiddenGroups: @[]
   )
 
 proc canRebalance*(constraints: RebalanceConstraints,
-                   rangeId: RangeID): bool =
+                   groupId: GroupID): bool =
   ## Check if a range can be rebalanced
-  result = rangeId notin constraints.forbiddenRanges
+  result = groupId notin constraints.forbiddenGroups
 
-proc withForbiddenRanges*(c: RebalanceConstraints,
-                          ranges: seq[RangeID]): RebalanceConstraints =
+proc withForbiddenGroups*(c: RebalanceConstraints,
+                          ranges: seq[GroupID]): RebalanceConstraints =
   ## Set forbidden ranges
   result = c
-  result.forbiddenRanges = ranges
+  result.forbiddenGroups = ranges

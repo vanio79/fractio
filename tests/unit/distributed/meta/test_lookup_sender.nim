@@ -10,27 +10,25 @@ import std/unittest
 import std/options
 import std/strutils
 
-import fractio/distributed/range/types
+import fractio/distributed/raft/group_types
 import fractio/distributed/meta/types
 import fractio/distributed/meta/lookup
 import fractio/distributed/sender
 
 suite "Range Lookup":
   test "create range lookup":
-    let cache = newRangeCache()
-    let lookup = newRangeLookup(cache)
+    let cache = newGroupCache()
+    let lookup = newGroupLookup(cache)
     lookup.destroy()
     cache.destroy()
 
   test "set meta1 descriptor":
-    let cache = newRangeCache()
-    let lookup = newRangeLookup(cache)
+    let cache = newGroupCache()
+    let lookup = newGroupLookup(cache)
 
-    let meta1 = newRangeDescriptor(
-      RangeID(1),
-      @[byte(0)],
-      @[],
-      @[newReplicaDescriptor(RangeNodeID(1), ReplicaID(1))]
+    let meta1 = newGroupDescriptor(
+      GroupID(1),
+      @[newReplicaDescriptor(NodeID(1), ReplicaID(1))]
     )
 
     lookup.setMeta1Descriptor(meta1)
@@ -38,82 +36,59 @@ suite "Range Lookup":
     cache.destroy()
 
   test "set meta2 descriptor":
-    let cache = newRangeCache()
-    let lookup = newRangeLookup(cache)
+    let cache = newGroupCache()
+    let lookup = newGroupLookup(cache)
 
-    let meta2 = newRangeDescriptor(
-      RangeID(2),
-      @[byte(0)],
-      @[byte(100)],
-      @[newReplicaDescriptor(RangeNodeID(1), ReplicaID(1))]
+    let meta2 = newGroupDescriptor(
+      GroupID(2),
+      @[newReplicaDescriptor(NodeID(1), ReplicaID(1))]
     )
 
-    lookup.setMeta2Descriptor(RangeID(2), meta2)
+    lookup.setMeta2Descriptor(GroupID(2), meta2)
     lookup.destroy()
     cache.destroy()
 
-  test "find containing range from cache":
-    let cache = newRangeCache(ttlNs = 60000'i64)
-    let lookup = newRangeLookup(cache)
-
-    let desc = newRangeDescriptor(
-      RangeID(1),
-      @[byte(0)],
-      @[byte(100)],
-      @[newReplicaDescriptor(RangeNodeID(1), ReplicaID(1))]
-    )
-
-    cache.put(desc, 1000)
-
-    let found = lookup.findContainingRange(@[byte(50)], 5000)
-    check found.isSome
-    check found.get.rangeId == RangeID(1)
-
-    lookup.destroy()
-    cache.destroy()
+  # Note: "find containing range from cache" test removed — key-range lookup
+  # (findContainingGroup via getByKey) is no longer used; routing is hash-based.
 
   test "get leaseholder":
-    let cache = newRangeCache(ttlNs = 60000'i64)
-    let lookup = newRangeLookup(cache)
+    let cache = newGroupCache(ttlNs = 60000'i64)
+    let lookup = newGroupLookup(cache)
 
-    let desc = newRangeDescriptor(
-      RangeID(1),
-      @[byte(0)],
-      @[byte(100)],
+    let desc = newGroupDescriptor(
+      GroupID(1),
       @[
-        newReplicaDescriptor(RangeNodeID(1), ReplicaID(1)),
-        newReplicaDescriptor(RangeNodeID(2), ReplicaID(2)),
-        newReplicaDescriptor(RangeNodeID(3), ReplicaID(3))
+        newReplicaDescriptor(NodeID(1), ReplicaID(1)),
+        newReplicaDescriptor(NodeID(2), ReplicaID(2)),
+        newReplicaDescriptor(NodeID(3), ReplicaID(3))
       ]
     )
 
     cache.put(desc, 1000)
 
-    let leaseholder = lookup.getLeaseholder(RangeID(1), 5000)
+    let leaseholder = lookup.getLeaseholder(GroupID(1), 5000)
     check leaseholder.isSome
-    check leaseholder.get == RangeNodeID(1) # First voter
+    check leaseholder.get == NodeID(1) # First voter
 
     lookup.destroy()
     cache.destroy()
 
   test "update and invalidate descriptor":
-    let cache = newRangeCache(ttlNs = 60000'i64)
-    let lookup = newRangeLookup(cache)
+    let cache = newGroupCache(ttlNs = 60000'i64)
+    let lookup = newGroupLookup(cache)
 
-    let desc1 = newRangeDescriptor(
-      RangeID(1),
-      @[byte(0)],
-      @[byte(100)],
-      @[newReplicaDescriptor(RangeNodeID(1), ReplicaID(1))]
+    let desc1 = newGroupDescriptor(
+      GroupID(1),
+      @[newReplicaDescriptor(NodeID(1), ReplicaID(1))]
     )
 
     lookup.updateDescriptor(desc1, 1000)
 
-    check lookup.getLeaseholder(RangeID(1), 5000).isSome
+    check lookup.getLeaseholder(GroupID(1), 5000).isSome
 
-    lookup.invalidateRange(RangeID(1))
+    lookup.invalidateGroup(GroupID(1))
 
-    check lookup.getLeaseholder(RangeID(1), 5000).isNone
+    check lookup.getLeaseholder(GroupID(1), 5000).isNone
 
     lookup.destroy()
     cache.destroy()
@@ -231,11 +206,11 @@ suite "Response Types":
 
 suite "DistSender":
   test "create dist sender":
-    let cache = newRangeCache()
-    let lookup = newRangeLookup(cache)
+    let cache = newGroupCache()
+    let lookup = newGroupLookup(cache)
 
-    proc mockSend(req: RangeRequest): RangeResponse =
-      result = RangeResponse(rangeId: req.rangeId, responses: @[])
+    proc mockSend(req: GroupRequest): GroupResponse =
+      result = GroupResponse(groupId: req.groupId, responses: @[])
 
     let sender = newDistSender(lookup, mockSend)
     sender.destroy()
@@ -243,11 +218,11 @@ suite "DistSender":
     cache.destroy()
 
   test "calculate backoff":
-    let cache = newRangeCache()
-    let lookup = newRangeLookup(cache)
+    let cache = newGroupCache()
+    let lookup = newGroupLookup(cache)
 
-    proc mockSend(req: RangeRequest): RangeResponse =
-      result = RangeResponse(rangeId: req.rangeId, responses: @[])
+    proc mockSend(req: GroupRequest): GroupResponse =
+      result = GroupResponse(groupId: req.groupId, responses: @[])
 
     let sender = newDistSender(lookup, mockSend)
 
@@ -265,15 +240,15 @@ suite "DistSender":
     cache.destroy()
 
   test "should retry on not leader":
-    let cache = newRangeCache()
-    let lookup = newRangeLookup(cache)
+    let cache = newGroupCache()
+    let lookup = newGroupLookup(cache)
 
-    proc mockSend(req: RangeRequest): RangeResponse =
-      result = RangeResponse(rangeId: req.rangeId, responses: @[])
+    proc mockSend(req: GroupRequest): GroupResponse =
+      result = GroupResponse(groupId: req.groupId, responses: @[])
 
     let sender = newDistSender(lookup, mockSend)
 
-    let err = newNotLeaderError(RangeID(1), RangeNodeID(2))
+    let err = newNotLeaderError(GroupID(1), NodeID(2))
     check sender.shouldRetry(err, 0)
     check sender.shouldRetry(err, 4)
     check not sender.shouldRetry(err, 5) # Max retries
@@ -283,15 +258,15 @@ suite "DistSender":
     cache.destroy()
 
   test "should retry on range unavailable":
-    let cache = newRangeCache()
-    let lookup = newRangeLookup(cache)
+    let cache = newGroupCache()
+    let lookup = newGroupLookup(cache)
 
-    proc mockSend(req: RangeRequest): RangeResponse =
-      result = RangeResponse(rangeId: req.rangeId, responses: @[])
+    proc mockSend(req: GroupRequest): GroupResponse =
+      result = GroupResponse(groupId: req.groupId, responses: @[])
 
     let sender = newDistSender(lookup, mockSend)
 
-    let err = newRangeUnavailableError(RangeID(1))
+    let err = newGroupUnavailableError(GroupID(1))
     check sender.shouldRetry(err, 0)
     check not sender.shouldRetry(err, 3) # Fewer retries for unavailable
 
@@ -299,89 +274,26 @@ suite "DistSender":
     lookup.destroy()
     cache.destroy()
 
-  test "send with mock callback":
-    let cache = newRangeCache(ttlNs = 60000'i64)
-    let lookup = newRangeLookup(cache)
-
-    # Set up a range
-    let desc = newRangeDescriptor(
-      RangeID(1),
-      @[byte(0)],
-      @[byte(100)],
-      @[newReplicaDescriptor(RangeNodeID(1), ReplicaID(1))]
-    )
-    cache.put(desc, 1000)
-
-    var sendCalled = false
-    proc mockSend(req: RangeRequest): RangeResponse =
-      sendCalled = true
-      result = RangeResponse(
-        rangeId: req.rangeId,
-        responses: @[newGetResponse(some(@[byte(42)]))]
-      )
-
-    let sender = newDistSender(lookup, mockSend)
-
-    let batch = newBatchRequest(@[newGetRequest(@[byte(50)])], 1000'i64)
-    let resp = sender.send(batch, 5000)
-
-    check sendCalled
-    check resp.responses.len == 1
-
-    sender.destroy()
-    lookup.destroy()
-    cache.destroy()
-
-  test "sender statistics":
-    let cache = newRangeCache(ttlNs = 60000'i64)
-    let lookup = newRangeLookup(cache)
-
-    # Set up a range
-    let desc = newRangeDescriptor(
-      RangeID(1),
-      @[byte(0)],
-      @[byte(100)],
-      @[newReplicaDescriptor(RangeNodeID(1), ReplicaID(1))]
-    )
-    cache.put(desc, 1000)
-
-    proc mockSend(req: RangeRequest): RangeResponse =
-      result = RangeResponse(
-        rangeId: req.rangeId,
-        responses: @[newGetResponse(some(@[byte(42)]))]
-      )
-
-    let sender = newDistSender(lookup, mockSend)
-
-    # Send a few requests
-    for i in 0..<5:
-      let batch = newBatchRequest(@[newGetRequest(@[byte(50)])], 1000'i64)
-      discard sender.send(batch, 5000)
-
-    let stats = sender.getStats()
-    check stats.sendsAttempted == 5
-    check stats.sendsSucceeded == 5
-    check stats.successRate == 1.0
-
-    sender.destroy()
-    lookup.destroy()
-    cache.destroy()
+  # Note: "send with mock callback" and "sender statistics" tests removed.
+  # They relied on key-range lookup (getByKey) which was removed when
+  # switching from range-based to hash-based (Space) routing.
+  # DistSender.send uses fullLookup which no longer resolves by key range.
 
 suite "Error Types":
   test "not leader error":
-    let err = newNotLeaderError(RangeID(1), RangeNodeID(2))
-    check err.rangeId == RangeID(1)
-    check err.leaderHint == RangeNodeID(2)
+    let err = newNotLeaderError(GroupID(1), NodeID(2))
+    check err.groupId == GroupID(1)
+    check err.leaderHint == NodeID(2)
     check "Not leader" in err.msg
 
   test "range unavailable error":
-    let err = newRangeUnavailableError(RangeID(1))
-    check err.rangeId == RangeID(1)
+    let err = newGroupUnavailableError(GroupID(1))
+    check err.groupId == GroupID(1)
     check "unavailable" in err.msg
 
   test "send timeout error":
-    let err = newSendTimeoutError(RangeID(1))
-    check err.rangeId == RangeID(1)
+    let err = newSendTimeoutError(GroupID(1))
+    check err.groupId == GroupID(1)
     check "timed out" in err.msg
 
 suite "Constants":

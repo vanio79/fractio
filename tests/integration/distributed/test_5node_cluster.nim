@@ -61,14 +61,14 @@ suite "5-Node Cluster Integration Tests":
 
     # Create a range
     let rangeInfo = createRange(cluster, "a", "z", 3)
-    check rangeInfo.rangeId == 1
+    check rangeInfo.groupId == 1
     check rangeInfo.startKey == "a"
     check rangeInfo.endKey == "z"
     check rangeInfo.replicaNodes.len == 3
 
     # Create default range
     let defaultRange = createDefaultRange(cluster)
-    check defaultRange.rangeId == 2
+    check defaultRange.groupId == 2
 
     check cluster.ranges.len == 2
 

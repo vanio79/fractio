@@ -15,7 +15,7 @@ import fractio/distributed/meta/system_tables
 import fractio/protocol/raft_store
 import fractio/distributed/raft/multigroup_coordinator
 import fractio/distributed/raft/multigroup_types
-import fractio/distributed/range/types as rangeTypes
+import fractio/distributed/raft/group_types as rangeTypes
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -23,7 +23,7 @@ import fractio/distributed/range/types as rangeTypes
 
 proc createTestStore(testDir: string): RaftKVStoreExt =
   createDir(testDir)
-  let nodeId = RangeNodeID(1)
+  let nodeId = NodeID(1)
   let coord = newMultiRaftCoordinator(CoordinatorConfig(
     nodeId: nodeId,
     numWorkers: 1,
@@ -32,14 +32,14 @@ proc createTestStore(testDir: string): RaftKVStoreExt =
     storagePath: testDir,
     proposeTimeoutMs: 5000,
   ))
-  for rangeId in [META_RANGE_ID, DATA_RANGE_START_ID]:
-    var desc = newRangeDescriptor(rangeId, @[], @[])
+  for groupId in [META_GROUP_ID, DATA_GROUP_START_ID]:
+    var desc = newGroupDescriptor(groupId)
     let myReplica = desc.addReplica(nodeId, rtVoter)
     let group = coord.createGroup(desc, myReplica.replicaId)
     group.becomeLeader()
   coord.start()
   result = newRaftKVStoreExt(coord)
-  result.bootstrapStore(@[META_RANGE_ID, DATA_RANGE_START_ID])
+  result.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
 
 proc cleanupTestDir(testDir: string) =
   if dirExists(testDir):

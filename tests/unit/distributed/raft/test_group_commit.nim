@@ -10,7 +10,7 @@ import std/[unittest, os, times, options, locks, tables, atomics, typedthreads]
 import fractio/distributed/raft/group_commit
 import fractio/distributed/raft/multigroup_coordinator
 import fractio/distributed/raft/multigroup_types
-import fractio/distributed/range/types as rangeTypes
+import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
 import fractio/protocol/raft_store
 
@@ -26,10 +26,10 @@ proc makeStore(storagePath: string,
     groupCommitEnabled: bool = false,
     gcMaxBatch: int = 0,
     gcMaxDelayNs: int64 = 0): tuple[
-    coord: MultiRaftCoordinator, store: RaftKVStoreExt, rid: RangeID] =
+    coord: MultiRaftCoordinator, store: RaftKVStoreExt, rid: GroupID] =
   cleanDir(storagePath)
   let cfg = CoordinatorConfig(
-    nodeId: RangeNodeID(1),
+    nodeId: NodeID(1),
     numWorkers: 1,
     electionTimeoutNs: DEFAULT_ELECTION_TIMEOUT_NS,
     heartbeatIntervalNs: DEFAULT_HEARTBEAT_INTERVAL_NS,
@@ -39,15 +39,15 @@ proc makeStore(storagePath: string,
     groupCommitMaxDelayNs: gcMaxDelayNs,
   )
   let coord = newMultiRaftCoordinator(cfg)
-  for rid in [META_RANGE_ID, DATA_RANGE_START_ID]:
-    let desc = newRangeDescriptor(rid, @[], @[])
-    let rep = desc.addReplica(RangeNodeID(1))
+  for rid in [META_GROUP_ID, DATA_GROUP_START_ID]:
+    let desc = newGroupDescriptor(rid)
+    let rep = desc.addReplica(NodeID(1))
     let group = coord.createGroup(desc, rep.replicaId)
     group.becomeLeader()
   let store = newRaftKVStoreExt(coord, proposeTimeoutMs = 2000)
   coord.start()
-  store.bootstrapStore(@[META_RANGE_ID, DATA_RANGE_START_ID])
-  (coord, store, DATA_RANGE_START_ID)
+  store.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
+  (coord, store, DATA_GROUP_START_ID)
 
 proc teardownStore(coord: MultiRaftCoordinator, storagePath: string) =
   coord.stop()
@@ -94,7 +94,7 @@ suite "GroupCommitBatcher - unit":
     let wb = newWriteBatch()
     wb.put(@[byte(1)], @[byte(2)])
     let cmd = RaftCommand(kind: ckWrite, writeBatch: wb)
-    enqueue(b, RangeID(1), cmd, prc)
+    enqueue(b, GroupID(1), cmd, prc)
 
     # Wait for the flush thread to process (max ~50ms)
     var gotResult = false
@@ -148,7 +148,7 @@ suite "GroupCommitBatcher - unit":
     flushedCount.store(0)
     let counterPtr = addr flushedCount
 
-    proc testFlush(rangeId: RangeID, batch: WriteBatch,
+    proc testFlush(groupId: GroupID, batch: WriteBatch,
         items: seq[ptr ProposalResultChannel]) {.gcsafe, raises: [].} =
       {.cast(gcsafe).}:
         counterPtr[].atomicInc(items.len)
@@ -169,7 +169,7 @@ suite "GroupCommitBatcher - unit":
       let wb = newWriteBatch()
       wb.put(@[byte(i)], @[byte(i)])
       let cmd = RaftCommand(kind: ckWrite, writeBatch: wb)
-      enqueue(b, RangeID(1), cmd, prcs[i])
+      enqueue(b, GroupID(1), cmd, prcs[i])
 
     # Wait for all results
     for i in 0 ..< 3:
@@ -192,7 +192,7 @@ suite "GroupCommitBatcher - unit":
     deinitGroupCommitBatcher(b)
     deallocShared(b)
 
-  test "batching merges WriteBatches for same RangeID":
+  test "batching merges WriteBatches for same GroupID":
     let b = cast[ptr GroupCommitBatcher](
       allocShared0(sizeof(GroupCommitBatcher)))
     # Large delay so items accumulate before flush
@@ -202,7 +202,7 @@ suite "GroupCommitBatcher - unit":
     receivedPuts.store(0)
     let putsPtr = addr receivedPuts
 
-    proc mergeFlush(rangeId: RangeID, batch: WriteBatch,
+    proc mergeFlush(groupId: GroupID, batch: WriteBatch,
         items: seq[ptr ProposalResultChannel]) {.gcsafe, raises: [].} =
       # Count total puts in the merged batch
       {.cast(gcsafe).}:
@@ -215,7 +215,7 @@ suite "GroupCommitBatcher - unit":
     b[].flushFn = mergeFlush
     startBatcher(b)
 
-    # Rapidly enqueue 5 items for the same RangeID
+    # Rapidly enqueue 5 items for the same GroupID
     var prcs: array[5, ptr ProposalResultChannel]
     for i in 0 ..< 5:
       prcs[i] = cast[ptr ProposalResultChannel](
@@ -224,7 +224,7 @@ suite "GroupCommitBatcher - unit":
       let wb = newWriteBatch()
       wb.put(@[byte(i)], @[byte(i + 10)])
       let cmd = RaftCommand(kind: ckWrite, writeBatch: wb)
-      enqueue(b, RangeID(1), cmd, prcs[i])
+      enqueue(b, GroupID(1), cmd, prcs[i])
 
     # Wait for all results
     for i in 0 ..< 5:
@@ -249,7 +249,7 @@ suite "GroupCommitBatcher - unit":
     deallocShared(b)
 
 
-  test "items for different RangeIDs are grouped separately":
+  test "items for different GroupIDs are grouped separately":
     let b = cast[ptr GroupCommitBatcher](
       allocShared0(sizeof(GroupCommitBatcher)))
     initGroupCommitBatcher(b, 256, 50_000_000'i64) # 50ms
@@ -258,9 +258,9 @@ suite "GroupCommitBatcher - unit":
     rangeCount.store(0)
     let rcPtr = addr rangeCount
 
-    proc groupFlush(rangeId: RangeID, batch: WriteBatch,
+    proc groupFlush(groupId: GroupID, batch: WriteBatch,
         items: seq[ptr ProposalResultChannel]) {.gcsafe, raises: [].} =
-      # Each call is for one RangeID
+      # Each call is for one GroupID
       {.cast(gcsafe).}:
         rcPtr[].atomicInc(1)
       let res = RaftResult(success: true, index: 1)
@@ -271,7 +271,7 @@ suite "GroupCommitBatcher - unit":
     b[].flushFn = groupFlush
     startBatcher(b)
 
-    # Enqueue 2 items for RangeID(1) and 2 for RangeID(2)
+    # Enqueue 2 items for GroupID(1) and 2 for GroupID(2)
     var prcs: array[4, ptr ProposalResultChannel]
     for i in 0 ..< 4:
       prcs[i] = cast[ptr ProposalResultChannel](
@@ -280,7 +280,7 @@ suite "GroupCommitBatcher - unit":
       let wb = newWriteBatch()
       wb.put(@[byte(i)], @[byte(i)])
       let cmd = RaftCommand(kind: ckWrite, writeBatch: wb)
-      let rid = if i < 2: RangeID(1) else: RangeID(2)
+      let rid = if i < 2: GroupID(1) else: GroupID(2)
       enqueue(b, rid, cmd, prcs[i])
 
     # Wait for all results
@@ -295,7 +295,7 @@ suite "GroupCommitBatcher - unit":
         sleep(1)
       check got == true
 
-    # At least 2 separate flushFn calls (one per RangeID per batch window)
+    # At least 2 separate flushFn calls (one per GroupID per batch window)
     check rangeCount.load() >= 2
 
     stopBatcher(b)
@@ -310,7 +310,7 @@ suite "GroupCommitBatcher - unit":
       allocShared0(sizeof(GroupCommitBatcher)))
     initGroupCommitBatcher(b, 16, 500_000'i64)
 
-    proc noopFlush(rangeId: RangeID, batch: WriteBatch,
+    proc noopFlush(groupId: GroupID, batch: WriteBatch,
         items: seq[ptr ProposalResultChannel]) {.gcsafe, raises: [].} =
       let res = RaftResult(success: true, index: 1)
       for rp in items:
@@ -325,7 +325,7 @@ suite "GroupCommitBatcher - unit":
     prc[].ch.open(1)
 
     let cmd = RaftCommand(kind: ckNoop)
-    enqueue(b, RangeID(1), cmd, prc)
+    enqueue(b, GroupID(1), cmd, prc)
 
     var got = false
     for _ in 0 ..< 200:
@@ -352,7 +352,7 @@ suite "GroupCommit - coordinator integration":
   test "coordinator allocates batcher when groupCommitEnabled":
     cleanDir("/tmp/fractio_gc_t10")
     let cfg = CoordinatorConfig(
-      nodeId: RangeNodeID(1),
+      nodeId: NodeID(1),
       numWorkers: 1,
       electionTimeoutNs: DEFAULT_ELECTION_TIMEOUT_NS,
       heartbeatIntervalNs: DEFAULT_HEARTBEAT_INTERVAL_NS,
@@ -373,7 +373,7 @@ suite "GroupCommit - coordinator integration":
   test "coordinator does NOT allocate batcher when disabled":
     cleanDir("/tmp/fractio_gc_t11")
     let cfg = CoordinatorConfig(
-      nodeId: RangeNodeID(1),
+      nodeId: NodeID(1),
       numWorkers: 1,
       electionTimeoutNs: DEFAULT_ELECTION_TIMEOUT_NS,
       heartbeatIntervalNs: DEFAULT_HEARTBEAT_INTERVAL_NS,
@@ -626,7 +626,7 @@ suite "GroupCommit - configuration":
   test "custom maxBatch is respected":
     cleanDir("/tmp/fractio_gc_t40")
     let cfg = CoordinatorConfig(
-      nodeId: RangeNodeID(1),
+      nodeId: NodeID(1),
       numWorkers: 1,
       electionTimeoutNs: DEFAULT_ELECTION_TIMEOUT_NS,
       heartbeatIntervalNs: DEFAULT_HEARTBEAT_INTERVAL_NS,
@@ -647,7 +647,7 @@ suite "GroupCommit - configuration":
   test "custom maxDelayNs is respected":
     cleanDir("/tmp/fractio_gc_t41")
     let cfg = CoordinatorConfig(
-      nodeId: RangeNodeID(1),
+      nodeId: NodeID(1),
       numWorkers: 1,
       electionTimeoutNs: DEFAULT_ELECTION_TIMEOUT_NS,
       heartbeatIntervalNs: DEFAULT_HEARTBEAT_INTERVAL_NS,
@@ -668,7 +668,7 @@ suite "GroupCommit - configuration":
   test "zero maxBatch falls back to default":
     cleanDir("/tmp/fractio_gc_t42")
     let cfg = CoordinatorConfig(
-      nodeId: RangeNodeID(1),
+      nodeId: NodeID(1),
       numWorkers: 1,
       electionTimeoutNs: DEFAULT_ELECTION_TIMEOUT_NS,
       heartbeatIntervalNs: DEFAULT_HEARTBEAT_INTERVAL_NS,

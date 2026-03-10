@@ -1,7 +1,7 @@
 # Multi-Group Raft Types
 #
 # This module extends the basic Raft types for multi-group support.
-# Each range has its own independent Raft group.
+# Each group has its own independent Raft group.
 
 import std/atomics
 import std/locks
@@ -10,7 +10,7 @@ import std/tables
 import std/times
 import std/sets
 
-import fractio/distributed/range/types
+import fractio/distributed/raft/group_types
 
 # ============================================================================
 # Raft State
@@ -32,8 +32,8 @@ type
     ## Types of commands in Raft log
     ckNoop           ## No-op (heartbeat)
     ckWrite          ## Write batch
-    ckSplit          ## Split range
-    ckMerge          ## Merge ranges
+    ckSplit          ## Split group
+    ckMerge          ## Merge groups
     ckChangeReplicas ## Add/remove replica
     ckTransferLease  ## Transfer lease to another node
     ckAcquireLease   ## Acquire lease
@@ -52,14 +52,14 @@ type
       writeBatch*: WriteBatch
     of ckSplit:
       splitKey*: seq[byte]
-      newRangeId*: RangeID
+      newRangeId*: GroupID
     of ckMerge:
-      otherRangeId*: RangeID
+      otherRangeId*: GroupID
     of ckChangeReplicas:
       changeType*: ReplicaChangeType
       replica*: ReplicaDescriptor
     of ckTransferLease:
-      targetNode*: RangeNodeID
+      targetNode*: NodeID
     of ckAcquireLease:
       leaseStart*: int64
       leaseExpiration*: int64
@@ -97,9 +97,9 @@ type
 
 type
   RaftGroup* = ref object
-    ## A single Raft group (one per range)
-    rangeId*: RangeID
-    nodeId*: RangeNodeID
+    ## A single Raft group (one per group)
+    groupId*: GroupID
+    nodeId*: NodeID
     replicaId*: ReplicaID
 
     # Persistent state (stored in WiscKey)
@@ -123,7 +123,7 @@ type
     lock*: Lock
 
     # Configuration
-    descriptor*: RangeDescriptor
+    descriptor*: GroupDescriptor
 
 # ============================================================================
 # Lease State
@@ -131,8 +131,8 @@ type
 
 type
   Lease* = object
-    ## Leader lease for a range
-    leaseholder*: RangeNodeID
+    ## Leader lease for a group
+    leaseholder*: NodeID
     startTs*: int64      # nanoseconds
     expirationTs*: int64 # nanoseconds
     epoch*: uint64       # For compatibility, deprecated
@@ -150,8 +150,8 @@ type
 
 type
   Snapshot* = ref object
-    ## Snapshot of range state
-    rangeId*: RangeID
+    ## Snapshot of group state
+    groupId*: GroupID
     raftSnap*: RaftSnapshotMeta
     stateMachineSnap*: seq[byte]
 
@@ -179,7 +179,7 @@ type
 
   Proposal* = ref object
     ## A pending proposal to a Raft group.
-    rangeId*: RangeID
+    groupId*: GroupID
     command*: RaftCommand
     ## Raw pointer to the caller's heap-allocated ProposalResultChannel.
     ## The worker sends into ch; the caller receives from ch.
@@ -196,11 +196,11 @@ type
 
   NotLeaderError* = object of MultiRaftError
     ## Current node is not the leader
-    leaderHint*: Option[RangeNodeID]
+    leaderHint*: Option[NodeID]
 
-  RangeNotFoundError* = object of MultiRaftError
-    ## Range not found on this node
-    rangeId*: RangeID
+  GroupNotFoundError* = object of MultiRaftError
+    ## Group not found on this node
+    groupId*: GroupID
 
   LeaseExpiredError* = object of MultiRaftError
     ## Lease has expired
@@ -224,12 +224,12 @@ proc nowNs*(): int64 {.inline.} =
 # Raft Group Operations
 # ============================================================================
 
-proc newRaftGroup*(rangeId: RangeID, nodeId: RangeNodeID,
+proc newRaftGroup*(groupId: GroupID, nodeId: NodeID,
                    replicaId: ReplicaID,
-                   descriptor: RangeDescriptor): RaftGroup =
-  ## Create a new Raft group for a range
+                   descriptor: GroupDescriptor): RaftGroup =
+  ## Create a new Raft group
   new(result)
-  result.rangeId = rangeId
+  result.groupId = groupId
   result.nodeId = nodeId
   result.replicaId = replicaId
   result.descriptor = descriptor

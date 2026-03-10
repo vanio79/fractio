@@ -3,14 +3,14 @@
 # Tests:
 # - Table key encoding/decoding
 # - Lexicographic ordering of encoded keys
-# - Key classification (isSystemKey, isMetaRangeKey, isUserTableKey)
+# - Key classification (isSystemKey, isMetaGroupKey, isUserTableKey)
 # - User table data row and index key encoding
 # - findRangeId routing with meta range awareness
 
 import std/[unittest, algorithm]
 
 import fractio/distributed/meta/system_tables
-import fractio/distributed/range/types
+import fractio/distributed/raft/group_types
 
 suite "Table Key Encoding":
   test "encodeTableKey basic":
@@ -90,14 +90,14 @@ suite "Lexicographic Ordering":
     check k2 < k3
 
   test "meta range end key sorts correctly":
-    # All meta range table keys (1-7) must sort before META_RANGE_END_KEY
-    for id in 1'u32 .. MAX_META_RANGE_TABLE_ID:
+    # All meta range table keys (1-7) must sort before META_GROUP_END_KEY
+    for id in 1'u32 .. MAX_META_GROUP_TABLE_ID:
       let key = encodeTableKey(id, "\xFF\xFF\xFF\xFF") # worst case primary key
-      check key < META_RANGE_END_KEY
+      check key < META_GROUP_END_KEY
 
-    # Table 8 onwards should sort >= META_RANGE_END_KEY
-    let key8 = encodeTableKey(MAX_META_RANGE_TABLE_ID + 1, "")
-    check key8 >= META_RANGE_END_KEY
+    # Table 8 onwards should sort >= META_GROUP_END_KEY
+    let key8 = encodeTableKey(MAX_META_GROUP_TABLE_ID + 1, "")
+    check key8 >= META_GROUP_END_KEY
 
 suite "Key Classification":
   test "isTableKey":
@@ -114,18 +114,18 @@ suite "Key Classification":
     check not isSystemKey("/sys/meta1/foo")
     check not isSystemKey("plain_key")
 
-  test "isMetaRangeKey for table keys":
-    check isMetaRangeKey(encodeTableKey(1, "db"))
-    check isMetaRangeKey(encodeTableKey(6, "setting"))
-    check isMetaRangeKey(encodeTableKey(7, "space"))  # SYS_SPACES_TABLE_ID
-    check not isMetaRangeKey(encodeTableKey(8, "x"))
-    check not isMetaRangeKey(encodeTableKey(10, "metric"))
-    check not isMetaRangeKey(encodeTableKey(100, "user"))
+  test "isMetaGroupKey for table keys":
+    check isMetaGroupKey(encodeTableKey(1, "db"))
+    check isMetaGroupKey(encodeTableKey(6, "setting"))
+    check isMetaGroupKey(encodeTableKey(7, "space"))  # SYS_SPACES_TABLE_ID
+    check not isMetaGroupKey(encodeTableKey(8, "x"))
+    check not isMetaGroupKey(encodeTableKey(10, "metric"))
+    check not isMetaGroupKey(encodeTableKey(100, "user"))
 
-  test "isMetaRangeKey for meta keys":
-    check isMetaRangeKey("/sys/meta1/something")
-    check isMetaRangeKey("/sys/meta2/something")
-    check not isMetaRangeKey("/sys/liveness/node1")
+  test "isMetaGroupKey for meta keys":
+    check isMetaGroupKey("/sys/meta1/something")
+    check isMetaGroupKey("/sys/meta2/something")
+    check not isMetaGroupKey("/sys/liveness/node1")
 
   test "isUserTableKey":
     check isUserTableKey(encodeTableKey(100, "row1"))
@@ -155,34 +155,34 @@ suite "User Table Key Helpers":
     let indexKey = encodeIndexKey(100, 1, "alice@example.com", "alice")
     check dataKey < indexKey  # "d/" < "i/"
 
-suite "RangeDescriptor.isMetaRange":
+suite "GroupDescriptor.isMetaGroup":
   test "Range 1 is meta range":
-    let desc = newRangeDescriptor(RangeID(1), @[], @[])
-    check desc.isMetaRange
+    let desc = newGroupDescriptor(GroupID(1))
+    check desc.isMetaGroup
 
   test "Range 2 is not meta range":
-    let desc = newRangeDescriptor(RangeID(2), @[], @[])
-    check not desc.isMetaRange
+    let desc = newGroupDescriptor(GroupID(2))
+    check not desc.isMetaGroup
 
   test "Range 100 is not meta range":
-    let desc = newRangeDescriptor(RangeID(100), @[], @[])
-    check not desc.isMetaRange
+    let desc = newGroupDescriptor(GroupID(100))
+    check not desc.isMetaGroup
 
 suite "Constants":
-  test "META_RANGE_ID is 1":
-    check META_RANGE_ID == RangeID(1)
+  test "META_GROUP_ID is 1":
+    check META_GROUP_ID == GroupID(1)
 
-  test "DATA_RANGE_START_ID is 2":
-    check DATA_RANGE_START_ID == RangeID(2)
+  test "DATA_GROUP_START_ID is 2":
+    check DATA_GROUP_START_ID == GroupID(2)
 
   test "system table IDs":
     check SYS_DATABASES_TABLE_ID == 1'u32
     check SYS_SCHEMAS_TABLE_ID == 2'u32
     check SYS_TABLES_TABLE_ID == 3'u32
-    check SYS_RANGES_TABLE_ID == 4'u32
+    check SYS_GROUPS_TABLE_ID == 4'u32
     check SYS_NODES_TABLE_ID == 5'u32
     check SYS_SETTINGS_TABLE_ID == 6'u32
     check SYS_NODE_METRICS_ID == 10'u32
-    check SYS_RANGE_METRICS_ID == 11'u32
+    check SYS_GROUP_METRICS_ID == 11'u32
     check SYS_EVENTS_TABLE_ID == 12'u32
     check FIRST_USER_TABLE_ID == 100'u32

@@ -27,7 +27,7 @@ import fractio/protocol/messages/kv
 import fractio/protocol/messages/txn as txnMsgs
 import fractio/distributed/raft/multigroup_coordinator
 import fractio/distributed/raft/multigroup_types
-import fractio/distributed/range/types as rangeTypes
+import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
 import fractio/distributed/raft/state_machine
 
@@ -40,37 +40,37 @@ proc cleanDir(path: string) =
   try: createDir(path) except CatchableError: discard
 
 proc makeStore(storagePath: string): tuple[
-    coord: MultiRaftCoordinator, store: RaftKVStoreExt, rid: RangeID] =
+    coord: MultiRaftCoordinator, store: RaftKVStoreExt, rid: GroupID] =
   cleanDir(storagePath)
   let cfg = CoordinatorConfig(
-    nodeId: RangeNodeID(1),
+    nodeId: NodeID(1),
     numWorkers: 1,
     electionTimeoutNs: DEFAULT_ELECTION_TIMEOUT_NS,
     heartbeatIntervalNs: DEFAULT_HEARTBEAT_INTERVAL_NS,
     storagePath: storagePath,
   )
   let coord = newMultiRaftCoordinator(cfg)
-  for rid in [META_RANGE_ID, DATA_RANGE_START_ID]:
-    let desc = newRangeDescriptor(rid, @[], @[])
-    let rep = desc.addReplica(RangeNodeID(1))
+  for rid in [META_GROUP_ID, DATA_GROUP_START_ID]:
+    let desc = newGroupDescriptor(rid)
+    let rep = desc.addReplica(NodeID(1))
     let group = coord.createGroup(desc, rep.replicaId)
     group.becomeLeader()
   coord.start()
   let store = newRaftKVStoreExt(coord, proposeTimeoutMs = 3000)
-  store.bootstrapStore(@[META_RANGE_ID, DATA_RANGE_START_ID])
-  (coord, store, DATA_RANGE_START_ID)
+  store.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
+  (coord, store, DATA_GROUP_START_ID)
 
 proc teardownStore(coord: MultiRaftCoordinator, storagePath: string) =
   coord.stop()
   try: removeDir(storagePath) except CatchableError: discard
 
-proc smHasKey(store: RaftKVStoreExt, rid: RangeID, key: string): bool =
+proc smHasKey(store: RaftKVStoreExt, rid: GroupID, key: string): bool =
   let sm = store.getOrCreateSM(rid)
   acquire(store.smMu)
   result = sm.kvStore.hasKey(key)
   release(store.smMu)
 
-proc smGetVal(store: RaftKVStoreExt, rid: RangeID, key: string): string =
+proc smGetVal(store: RaftKVStoreExt, rid: GroupID, key: string): string =
   let sm = store.getOrCreateSM(rid)
   acquire(store.smMu)
   result = sm.kvStore.getOrDefault(key)
@@ -78,21 +78,21 @@ proc smGetVal(store: RaftKVStoreExt, rid: RangeID, key: string): string =
 
 proc makeRaftServer(port: int, storagePath: string): ProtocolServer =
   let coordCfg = CoordinatorConfig(
-    nodeId: RangeNodeID(1),
+    nodeId: NodeID(1),
     numWorkers: 1,
     electionTimeoutNs: DEFAULT_ELECTION_TIMEOUT_NS,
     heartbeatIntervalNs: DEFAULT_HEARTBEAT_INTERVAL_NS,
     storagePath: storagePath,
   )
   let coord = newMultiRaftCoordinator(coordCfg)
-  for rid in [META_RANGE_ID, DATA_RANGE_START_ID]:
-    let desc = newRangeDescriptor(rid, @[], @[])
-    let rep = desc.addReplica(RangeNodeID(1))
+  for rid in [META_GROUP_ID, DATA_GROUP_START_ID]:
+    let desc = newGroupDescriptor(rid)
+    let rep = desc.addReplica(NodeID(1))
     let group = coord.createGroup(desc, rep.replicaId)
     group.becomeLeader()
   coord.start()
   let raftSt = newRaftKVStoreExt(coord, proposeTimeoutMs = 3000)
-  raftSt.bootstrapStore(@[META_RANGE_ID, DATA_RANGE_START_ID])
+  raftSt.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
   var cfg = defaultServerConfig()
   cfg.host = "127.0.0.1"
   cfg.port = port

@@ -1,7 +1,7 @@
 # Raft-backed 2PC transaction coordinator — Phase 5.
 #
 # This module implements the **cross-shard two-phase commit (2PC) protocol**
-# for transactions that touch keys in more than one shard range.
+# for transactions that touch keys in more than one shard group.
 #
 # Single-shard transactions are committed directly through the shard's
 # RaftKVStoreExt (via raftResolveIntent) — no coordinator needed.
@@ -106,7 +106,7 @@ proc commitSingleShard*(coord: RaftTxnCoordinator, txnId: uint64,
     # internally; acquiring smMu first would deadlock (Lock is non-reentrant).
     var intentValue = ""
     let intentKey = encodeIntentKey(txnId, key)
-    let ridOpt = coord.store.resolveRangeId(key)
+    let ridOpt = coord.store.resolveGroupId(key)
     if ridOpt.isSome:
       let sm = coord.store.getOrCreateSM(ridOpt.get()) # acquires+releases smMu
       acquire(coord.store.smMu)
@@ -157,7 +157,7 @@ proc coordinateCrossShardCommit*(coord: RaftTxnCoordinator, txnId: uint64,
   for key in writeSet:
     # Validate the intent still exists (not expired / already resolved)
     let intentKey = encodeIntentKey(txnId, key)
-    let ridOpt = coord.store.resolveRangeId(key)
+    let ridOpt = coord.store.resolveGroupId(key)
     var intentExists = false
     if ridOpt.isSome:
       let sm = coord.store.getOrCreateSM(ridOpt.get()) # acquires+releases smMu

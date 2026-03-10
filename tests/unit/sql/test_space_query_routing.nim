@@ -13,7 +13,7 @@ import fractio/distributed/meta/system_tables
 import fractio/protocol/raft_store
 import fractio/distributed/raft/multigroup_coordinator
 import fractio/distributed/raft/multigroup_types
-import fractio/distributed/range/types as rangeTypes
+import fractio/distributed/raft/group_types as rangeTypes
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -27,7 +27,7 @@ proc createMultiGroupTestStore(testDir: string, groupCount: int): RaftKVStoreExt
   ## Create a store with 1 meta range + N space groups.
   ## Seeds sys.spaces and sys.tables so the executor can resolve space routing.
   cleanDir(testDir)
-  let nodeId = RangeNodeID(1)
+  let nodeId = NodeID(1)
   let coord = newMultiRaftCoordinator(CoordinatorConfig(
     nodeId: nodeId,
     numWorkers: 1,
@@ -38,25 +38,25 @@ proc createMultiGroupTestStore(testDir: string, groupCount: int): RaftKVStoreExt
   ))
 
   # Meta range (Range 1)
-  let metaRid = RangeID(1)
-  let metaDesc = newRangeDescriptor(metaRid, @[], @[])
+  let metaRid = GroupID(1)
+  let metaDesc = newGroupDescriptor(metaRid)
   let metaRep = metaDesc.addReplica(nodeId)
   let metaGroup = coord.createGroup(metaDesc, metaRep.replicaId)
   metaGroup.becomeLeader()
 
   # Data range (Range 2) — for non-space tables
-  let dataRid = RangeID(2)
-  let dataDesc = newRangeDescriptor(dataRid, @[], @[])
+  let dataRid = GroupID(2)
+  let dataDesc = newGroupDescriptor(dataRid)
   let dataRep = dataDesc.addReplica(nodeId)
   let dataGroup = coord.createGroup(dataDesc, dataRep.replicaId)
   dataGroup.becomeLeader()
 
   # Space groups (Range 10..10+N-1)
-  var rangeIds: seq[int] = @[]
+  var groupIds: seq[int] = @[]
   for i in 0 ..< groupCount:
-    let rid = RangeID(uint64(10 + i))
-    rangeIds.add(10 + i)
-    let desc = newRangeDescriptor(rid, @[], @[])
+    let rid = GroupID(uint64(10 + i))
+    groupIds.add(10 + i)
+    let desc = newGroupDescriptor(rid)
     let rep = desc.addReplica(nodeId)
     let group = coord.createGroup(desc, rep.replicaId)
     group.becomeLeader()
@@ -64,11 +64,11 @@ proc createMultiGroupTestStore(testDir: string, groupCount: int): RaftKVStoreExt
   coord.start()
 
   result = newRaftKVStoreExt(coord, proposeTimeoutMs = 5000)
-  result.bootstrapStore(@[META_RANGE_ID, DATA_RANGE_START_ID])
+  result.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
 
   # Pre-create SMs for space groups
   for i in 0 ..< groupCount:
-    discard result.getOrCreateSM(RangeID(uint64(10 + i)))
+    discard result.getOrCreateSM(GroupID(uint64(10 + i)))
 
   # Seed space record
   let spaceKey = encodeSpaceKey(2)
@@ -77,7 +77,7 @@ proc createMultiGroupTestStore(testDir: string, groupCount: int): RaftKVStoreExt
     "name": "testspace",
     "replicas": 1,
     "groupCount": groupCount,
-    "rangeIds": rangeIds,
+    "groupIds": groupIds,
   }
   discard result.raftPut(spaceKey, spaceVal)
 

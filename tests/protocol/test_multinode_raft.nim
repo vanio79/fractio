@@ -22,7 +22,7 @@ import std/[unittest, os, times, options, tables]
 import fractio/distributed/raft/multigroup_coordinator
 import fractio/distributed/raft/multigroup_transport
 import fractio/distributed/raft/multigroup_types
-import fractio/distributed/range/types as rangeTypes
+import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
 import fractio/protocol/raft_store
 
@@ -47,16 +47,16 @@ proc cleanDir(p: string) =
 
 proc makeNode(nodeNum: int, ## 1, 2, or 3
               peerNums: seq[int], ## other node numbers
-              rid: RangeID,
-              desc: RangeDescriptor): NodeSetup =
-  let nodeId = rangeTypes.RangeNodeID(uint32(nodeNum))
+              rid: GroupID,
+              desc: GroupDescriptor): NodeSetup =
+  let nodeId = rangeTypes.NodeID(uint32(nodeNum))
   let port = BASE_PORT + (nodeNum - 1) * 10       # 20200 / 20210 / 20220
 
   # Build peer list (all nodes except self)
   var peers: seq[PeerAddr]
   for pn in peerNums:
     peers.add(PeerAddr(
-      nodeId: rangeTypes.RangeNodeID(uint32(pn)),
+      nodeId: rangeTypes.NodeID(uint32(pn)),
       host: "127.0.0.1",
       raftPort: BASE_PORT + (pn - 1) * 10,
     ))
@@ -100,7 +100,7 @@ proc stopNode(ns: NodeSetup) =
 proc findLeader(nodes: seq[NodeSetup]): int =
   ## Return index of the node that believes itself to be leader, or -1.
   for i, ns in nodes:
-    let grpOpt = ns.coord.getGroup(DATA_RANGE_START_ID)
+    let grpOpt = ns.coord.getGroup(DATA_GROUP_START_ID)
     if grpOpt.isSome and grpOpt.get.isLeader():
       return i
   -1
@@ -109,13 +109,13 @@ proc findLeader(nodes: seq[NodeSetup]): int =
 # Shared cluster fixture
 # ---------------------------------------------------------------------------
 
-proc makeCluster(): (seq[NodeSetup], RangeID, RangeDescriptor) =
-  let rid = DATA_RANGE_START_ID
-  let desc = newRangeDescriptor(rid, @[], @[])
+proc makeCluster(): (seq[NodeSetup], GroupID, GroupDescriptor) =
+  let rid = DATA_GROUP_START_ID
+  let desc = newGroupDescriptor(rid)
   # Pre-add all 3 replicas so every node knows the quorum configuration
-  discard desc.addReplica(rangeTypes.RangeNodeID(1))
-  discard desc.addReplica(rangeTypes.RangeNodeID(2))
-  discard desc.addReplica(rangeTypes.RangeNodeID(3))
+  discard desc.addReplica(rangeTypes.NodeID(1))
+  discard desc.addReplica(rangeTypes.NodeID(2))
+  discard desc.addReplica(rangeTypes.NodeID(3))
 
   let nodes = @[
     makeNode(1, @[2, 3], rid, desc),

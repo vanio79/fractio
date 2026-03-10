@@ -7,7 +7,7 @@ import ./network/network_raft_node
 import ./network/client_handler
 import ./network/raft_transport
 import ./raft/types as raft_types
-import ./range/types as rangeTypes
+import ./raft/group_types as rangeTypes
 import ./meta/system_tables
 import ../utils/logging
 
@@ -39,7 +39,7 @@ type
 
   SimpleRange* = object
     ## Simplified range info for cluster management
-    rangeId*: int32
+    groupId*: int32
     startKey*: string
     endKey*: string
     replicaNodes*: seq[int32] # Server IDs of replicas
@@ -242,7 +242,7 @@ proc createRange*(cluster: Cluster, startKey, endKey: string,
     return
 
   result = SimpleRange(
-    rangeId: int32(cluster.ranges.len + 1),
+    groupId: int32(cluster.ranges.len + 1),
     startKey: startKey,
     endKey: endKey
   )
@@ -254,7 +254,7 @@ proc createRange*(cluster: Cluster, startKey, endKey: string,
   cluster.ranges.add(result)
 
   var fields = initTable[string, string]()
-  fields["rangeId"] = $result.rangeId
+  fields["groupId"] = $result.groupId
   fields["replicas"] = $numReplicas
   info("Range created", fields)
 
@@ -370,32 +370,21 @@ proc waitForReplication*(cluster: Cluster, timeoutMs: int = 10000): bool =
 # Meta Range Bootstrap
 # =============================================================================
 
-proc createMetaRangeDescriptor*(cluster: Cluster): RangeDescriptor =
-  ## Create the RangeDescriptor for Range 1 (the meta range).
-  ## The meta range covers ["", META_RANGE_END_KEY) and has a replica on
-  ## every node in the cluster.
-  var startKey: seq[byte] = @[]  # "" — beginning of keyspace
-  var endKey: seq[byte] = @[]
-  for c in META_RANGE_END_KEY:
-    endKey.add(byte(c))
-
-  result = newRangeDescriptor(META_RANGE_ID, startKey, endKey)
+proc createMetaGroupDescriptor*(cluster: Cluster): GroupDescriptor =
+  ## Create the GroupDescriptor for Group 1 (the meta group).
+  ## The meta group has a replica on every node in the cluster.
+  result = newGroupDescriptor(META_GROUP_ID)
   for node in cluster.nodes:
-    discard result.addReplica(RangeNodeID(node.config.serverId.uint32))
+    discard result.addReplica(NodeID(node.config.serverId.uint32))
 
-proc createDataRangeDescriptor*(cluster: Cluster,
-    numReplicas: int = 3): RangeDescriptor =
-  ## Create the RangeDescriptor for Range 2 (first data range).
-  ## Covers [META_RANGE_END_KEY, "") with standard replication factor.
-  var startKey: seq[byte] = @[]
-  for c in META_RANGE_END_KEY:
-    startKey.add(byte(c))
-  var endKey: seq[byte] = @[]  # "" — end of keyspace
-
-  result = newRangeDescriptor(DATA_RANGE_START_ID, startKey, endKey)
+proc createDataGroupDescriptor*(cluster: Cluster,
+    numReplicas: int = 3): GroupDescriptor =
+  ## Create the GroupDescriptor for Group 2 (first data group).
+  ## Uses standard replication factor.
+  result = newGroupDescriptor(DATA_GROUP_START_ID)
   let n = min(numReplicas, cluster.nodes.len)
   for i in 0 ..< n:
-    discard result.addReplica(RangeNodeID(cluster.nodes[i].config.serverId.uint32))
+    discard result.addReplica(NodeID(cluster.nodes[i].config.serverId.uint32))
 
 proc buildInitialCatalog*(nodeConfigs: seq[NodeConfig]): seq[
     tuple[key, value: string]] =

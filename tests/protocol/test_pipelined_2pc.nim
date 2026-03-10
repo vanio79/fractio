@@ -21,7 +21,7 @@ import fractio/protocol/raft_txn
 import fractio/protocol/txn_manager
 import fractio/distributed/raft/multigroup_coordinator
 import fractio/distributed/raft/multigroup_types
-import fractio/distributed/range/types as rangeTypes
+import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
 import fractio/distributed/sharedtimer/mock
 
@@ -40,10 +40,10 @@ proc cleanDir(path: string) =
 proc makeMultiShardStore(storagePath: string): tuple[
     coord: MultiRaftCoordinator,
     store: RaftKVStoreExt,
-    rid1: RangeID, rid2: RangeID, rid3: RangeID] =
+    rid1: GroupID, rid2: GroupID, rid3: GroupID] =
   cleanDir(storagePath)
   let cfg = CoordinatorConfig(
-    nodeId: RangeNodeID(1),
+    nodeId: NodeID(1),
     numWorkers: 4,
     electionTimeoutNs: DEFAULT_ELECTION_TIMEOUT_NS,
     heartbeatIntervalNs: DEFAULT_HEARTBEAT_INTERVAL_NS,
@@ -51,13 +51,13 @@ proc makeMultiShardStore(storagePath: string): tuple[
   )
   let coord = newMultiRaftCoordinator(cfg)
 
-  let rid1 = META_RANGE_ID         # RangeID(1) — for coord records / system keys
-  let rid2 = DATA_RANGE_START_ID   # RangeID(2) — where resolveRangeId routes data keys
-  let rid3 = RangeID(3)
+  let rid1 = META_GROUP_ID         # GroupID(1) — for coord records / system keys
+  let rid2 = DATA_GROUP_START_ID   # GroupID(2) — where resolveGroupId routes data keys
+  let rid3 = GroupID(3)
 
   for rid in [rid1, rid2, rid3]:
-    let desc = newRangeDescriptor(rid, @[], @[])
-    let rep = desc.addReplica(RangeNodeID(1))
+    let desc = newGroupDescriptor(rid)
+    let rep = desc.addReplica(NodeID(1))
     let grp = coord.createGroup(desc, rep.replicaId)
     grp.becomeLeader()
 
@@ -89,7 +89,7 @@ suite "proposeParallel - basic":
     defer: teardown(coord, "/tmp/fractio_pipe2pc_02")
     let batch = newWriteBatch()
     batch.put(@[byte('k')], @[byte('v')])
-    let proposals = @[(rangeId: rid1,
+    let proposals = @[(groupId: rid1,
                        command: RaftCommand(kind: ckWrite, writeBatch: batch))]
     let results = coord.proposeParallel(proposals, 2000)
     check results.len == 1
@@ -103,8 +103,8 @@ suite "proposeParallel - basic":
     let b2 = newWriteBatch()
     b2.put(@[byte('n')], @[byte('2')]) # 'n' >= 'm', lands in rid2
     let proposals = @[
-      (rangeId: rid1, command: RaftCommand(kind: ckWrite, writeBatch: b1)),
-      (rangeId: rid2, command: RaftCommand(kind: ckWrite, writeBatch: b2)),
+      (groupId: rid1, command: RaftCommand(kind: ckWrite, writeBatch: b1)),
+      (groupId: rid2, command: RaftCommand(kind: ckWrite, writeBatch: b2)),
     ]
     let results = coord.proposeParallel(proposals, 2000)
     check results.len == 2
@@ -121,9 +121,9 @@ suite "proposeParallel - basic":
     let b3 = newWriteBatch()
     b3.put(@[byte('t')], @[byte('3')]) # 't' >= 's', lands in rid3
     let proposals = @[
-      (rangeId: rid1, command: RaftCommand(kind: ckWrite, writeBatch: b1)),
-      (rangeId: rid2, command: RaftCommand(kind: ckWrite, writeBatch: b2)),
-      (rangeId: rid3, command: RaftCommand(kind: ckWrite, writeBatch: b3)),
+      (groupId: rid1, command: RaftCommand(kind: ckWrite, writeBatch: b1)),
+      (groupId: rid2, command: RaftCommand(kind: ckWrite, writeBatch: b2)),
+      (groupId: rid3, command: RaftCommand(kind: ckWrite, writeBatch: b3)),
     ]
     let results = coord.proposeParallel(proposals, 2000)
     check results.len == 3
@@ -158,7 +158,7 @@ suite "raftCommitTxnPipelined - correctness":
     check gr.value.get().value == "cider"
     # Intent key must be gone
     let intentKey = encodeIntentKey(txnId, "apple")
-    let sm = store.getOrCreateSM(RangeID(1))
+    let sm = store.getOrCreateSM(GroupID(1))
     acquire(store.smMu)
     let intentGone = not sm.kvStore.hasKey(intentKey)
     release(store.smMu)
@@ -207,8 +207,8 @@ suite "raftCommitTxnPipelined - correctness":
   test "pipelined commit to unregistered range returns error":
     let (coord, store, _, _, _) = makeMultiShardStore("/tmp/fractio_pipe2pc_15")
     defer: teardown(coord, "/tmp/fractio_pipe2pc_15")
-    # resolveRangeId always returns a RangeID (META_RANGE_ID or
-    # DATA_RANGE_START_ID), so "range not found" only happens when the
+    # resolveGroupId always returns a GroupID (META_GROUP_ID or
+    # DATA_GROUP_START_ID), so "range not found" only happens when the
     # Raft group for that range doesn't exist.  With a properly set up
     # store, all writes succeed.  Verify that pipelined commit with
     # an empty write-set is still OK.

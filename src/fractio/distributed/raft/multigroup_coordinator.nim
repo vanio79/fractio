@@ -22,7 +22,7 @@ import std/typedthreads
 import std/options
 import os
 
-import fractio/distributed/range/types
+import fractio/distributed/raft/group_types
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/multigroup_log
 import fractio/distributed/raft/group_commit
@@ -50,17 +50,17 @@ type
   # MultiRaftTransport — vtable interface (no concrete type imported here).
   # multigroup_transport.nim implements this and injects via attachTransport().
   # This decouples coordinator.nim from network/types.nim, preventing the
-  # Nim 2.2.8 C-codegen RangeNodeID distinct-type collision.
+  # Nim 2.2.8 C-codegen NodeID distinct-type collision.
   # -------------------------------------------------------------------------
 
   ## Callbacks handed to the transport so it can read coordinator state
   ## without a circular import (mirrors CoordAccessors in multigroup_transport).
   TransportCoordAccessors* = object
-    getGroup*: proc(rid: RangeID): Option[RaftGroup] {.gcsafe, raises: [].}
-    getLog*: proc(rid: RangeID): Option[RaftLog] {.gcsafe, raises: [].}
-    applyUpTo*: proc(rid: RangeID, g: RaftGroup,
+    getGroup*: proc(rid: GroupID): Option[RaftGroup] {.gcsafe, raises: [].}
+    getLog*: proc(rid: GroupID): Option[RaftLog] {.gcsafe, raises: [].}
+    applyUpTo*: proc(rid: GroupID, g: RaftGroup,
         idx: uint64) {.gcsafe, raises: [].}
-    saveState*: proc(rid: RangeID, g: RaftGroup,
+    saveState*: proc(rid: GroupID, g: RaftGroup,
         log: RaftLog) {.gcsafe, raises: [].}
 
   ## Abstract transport vtable — filled in by multigroup_transport after create.
@@ -77,11 +77,11 @@ type
     electionFn*: proc(group: RaftGroup,
         log: RaftLog): bool {.gcsafe, raises: [].}
     ## Send empty AppendEntries (heartbeat) to all followers of leader groups.
-    heartbeatFn*: proc(groups: Table[RangeID, RaftGroup],
-        logs: Table[RangeID, RaftLog]) {.gcsafe, raises: [].}
+    heartbeatFn*: proc(groups: Table[GroupID, RaftGroup],
+        logs: Table[GroupID, RaftLog]) {.gcsafe, raises: [].}
 
   CoordinatorConfig* = object
-    nodeId*: RangeNodeID
+    nodeId*: NodeID
     numWorkers*: int
     electionTimeoutNs*: int64
     heartbeatIntervalNs*: int64
@@ -104,7 +104,7 @@ type
     workerId: int
 
   ## Per-shard worker state — heap-allocated (ptr) so it can be passed to
-  ## a Thread without ORC cross-thread cycle tracking.  Each RangeID that is
+  ## a Thread without ORC cross-thread cycle tracking.  Each GroupID that is
   ## registered via createGroup gets one of these.  The hot path (append +
   ## fdatasync) reads `group` and `log` directly without acquiring groupsLock.
   ShardWorkerState* = object
@@ -113,16 +113,16 @@ type
     running*: Atomic[bool]
     group*: RaftGroup                     ## direct ref — no lock needed
     log*: RaftLog                         ## direct ref — no lock needed
-    rangeId*: RangeID
+    groupId*: GroupID
     coordPtr*: pointer                    ## raw ptr → MultiRaftCoordinator
 
   MultiRaftCoordinator* {.acyclic.} = ref object
-    nodeId*: RangeNodeID
+    nodeId*: NodeID
     config*: CoordinatorConfig
 
     # Group management
-    groups*: Table[RangeID, RaftGroup]
-    logs*: Table[RangeID, RaftLog]
+    groups*: Table[GroupID, RaftGroup]
+    logs*: Table[GroupID, RaftLog]
     groupsLock*: Lock
 
     # Storage
@@ -139,7 +139,7 @@ type
 
     # Per-shard worker pool (Phase 17 — single-node, non-group-commit path).
     # Populated by createGroup; workers started by start().
-    shardWorkers*: Table[RangeID, ptr ShardWorkerState]
+    shardWorkers*: Table[GroupID, ptr ShardWorkerState]
     shardWorkersMu*: Lock
 
     # Timer thread (election + heartbeat) — only active when transport != nil
@@ -171,17 +171,17 @@ type
 proc workerProc(ctx: WorkerContext) {.thread.}
 proc timerProc(ctx: TimerContext) {.thread.}
 proc shardWorkerProc(statePtr: ptr ShardWorkerState) {.thread.}
-proc getGroup*(c: MultiRaftCoordinator, rangeId: RangeID): Option[
+proc getGroup*(c: MultiRaftCoordinator, groupId: GroupID): Option[
     RaftGroup] {.gcsafe.}
 
 # ============================================================================
 # Internal helpers
 # ============================================================================
 
-proc getLog*(c: MultiRaftCoordinator, rangeId: RangeID): Option[RaftLog] =
+proc getLog*(c: MultiRaftCoordinator, groupId: GroupID): Option[RaftLog] =
   withLock c.groupsLock:
-    if c.logs.hasKey(rangeId):
-      result = some(c.logs[rangeId])
+    if c.logs.hasKey(groupId):
+      result = some(c.logs[groupId])
 
 proc saveGroupState(c: MultiRaftCoordinator, group: RaftGroup,
     log: RaftLog) {.gcsafe.} =
@@ -197,10 +197,10 @@ proc saveGroupState(c: MultiRaftCoordinator, group: RaftGroup,
 
 # Module-level callback set once by raft_store after bootstrapping.
 # Breaks the coordinator → raft_store → coordinator circular import.
-var applyBatchCallback*: proc(storePtr: pointer, rid: RangeID,
+var applyBatchCallback*: proc(storePtr: pointer, rid: GroupID,
     batch: WriteBatch) {.gcsafe, raises: [].} = nil
 
-proc applyUpTo*(c: MultiRaftCoordinator, rangeId: RangeID,
+proc applyUpTo*(c: MultiRaftCoordinator, groupId: GroupID,
     group: RaftGroup, upToIndex: uint64) {.gcsafe.} =
   ## Apply all log entries from lastApplied+1 through upToIndex to the KV SM.
   ## Calls back into raft_store via the kvStorePtr function pointer to avoid
@@ -208,7 +208,7 @@ proc applyUpTo*(c: MultiRaftCoordinator, rangeId: RangeID,
   let startIdx = group.lastApplied.load() + 1
   if startIdx > upToIndex: return
 
-  let logOpt = c.getLog(rangeId)
+  let logOpt = c.getLog(groupId)
   if logOpt.isNone: return
   let log = logOpt.get
 
@@ -218,11 +218,11 @@ proc applyUpTo*(c: MultiRaftCoordinator, rangeId: RangeID,
     let entry = entryOpt.get
 
     # Apply write batches to the KV state machine via the back-pointer.
-    # The function signature is:  applyBatchCallback(kvStorePtr, rangeId, batch)
+    # The function signature is:  applyBatchCallback(kvStorePtr, groupId, batch)
     # We cast and call it only when the pointer is set.
     if c.kvStorePtr != nil and entry.command.kind == ckWrite:
       {.cast(gcsafe).}:
-        applyBatchCallback(c.kvStorePtr, rangeId, entry.command.writeBatch)
+        applyBatchCallback(c.kvStorePtr, groupId, entry.command.writeBatch)
 
     group.lastApplied.store(idx)
 
@@ -249,15 +249,15 @@ proc newMultiRaftCoordinator*(config: CoordinatorConfig): MultiRaftCoordinator =
       path: config.storagePath, createIfMissing: true, syncWrites: true)):
     raise newException(MultiRaftError, "Failed to open storage backend")
 
-  result.groups = initTable[RangeID, RaftGroup]()
-  result.logs = initTable[RangeID, RaftLog]()
+  result.groups = initTable[GroupID, RaftGroup]()
+  result.logs = initTable[GroupID, RaftLog]()
   result.pendingProposals = initTable[uint64, Proposal]()
   result.proposalIdCounter.store(0)
 
   initLock(result.groupsLock)
   result.proposalCh.open(MAX_PROPOSAL_QUEUE_SIZE)
 
-  result.shardWorkers = initTable[RangeID, ptr ShardWorkerState]()
+  result.shardWorkers = initTable[GroupID, ptr ShardWorkerState]()
   initLock(result.shardWorkersMu)
 
   result.workers = newSeq[Thread[WorkerContext]](config.numWorkers)
@@ -286,9 +286,9 @@ proc start*(c: MultiRaftCoordinator) =
   # so callers that use proposeGroupCommit can enqueue immediately.
   if c.groupCommitEnabled and c.groupCommitBatcherPtr != nil:
     let cPtr = cast[pointer](c)
-    proc gcFlush(rangeId: RangeID, batch: WriteBatch,
+    proc gcFlush(groupId: GroupID, batch: WriteBatch,
         resultPtrs: seq[ptr ProposalResultChannel]) {.gcsafe, raises: [].} =
-      ## Flush a coalesced WriteBatch for one RangeID.
+      ## Flush a coalesced WriteBatch for one GroupID.
       ##
       ## Phase 17 routing: instead of calling putEntryAndState directly in this
       ## batcher thread (which held groupsLock during fdatasync, serialising all
@@ -297,14 +297,14 @@ proc start*(c: MultiRaftCoordinator) =
       ## holding groupsLock, so concurrent gcFlush calls for different shards
       ## run their fsyncs in parallel.
       ##
-      ## If the shard worker is not available (not yet started, or the rangeId
+      ## If the shard worker is not available (not yet started, or the groupId
       ## is unknown) we fall back to the old direct-write path so the batcher
       ## continues to work during coordinator startup and in edge cases.
       let coord = cast[MultiRaftCoordinator](cPtr)
 
       # --- Try the per-shard worker path (fast, lock-free fdatasync) ---
       acquire(coord.shardWorkersMu)
-      let swPtr = coord.shardWorkers.getOrDefault(rangeId, nil)
+      let swPtr = coord.shardWorkers.getOrDefault(groupId, nil)
       release(coord.shardWorkersMu)
 
       if swPtr != nil and swPtr[].running.load:
@@ -313,7 +313,7 @@ proc start*(c: MultiRaftCoordinator) =
           allocShared0(sizeof(ProposalResultChannel)))
         prc[].ch.open(1)
         swPtr[].ch.send(Proposal(
-          rangeId: rangeId,
+          groupId: groupId,
           command: RaftCommand(kind: ckWrite, writeBatch: batch),
           resultPtr: prc,
         ))
@@ -328,12 +328,12 @@ proc start*(c: MultiRaftCoordinator) =
 
       # --- Fallback: direct write path (startup / no shard worker) ---
       var groupOpt: Option[RaftGroup]
-      {.cast(raises: []).}: groupOpt = coord.getGroup(rangeId)
+      {.cast(raises: []).}: groupOpt = coord.getGroup(groupId)
       if groupOpt.isNone:
         for rp in resultPtrs:
           if rp != nil:
             rp[].ch.send(RaftResult(success: false,
-                error: "Range not found: " & $rangeId))
+                error: "Group not found: " & $groupId))
         return
       let group = groupOpt.get
       if not group.isLeader():
@@ -345,7 +345,7 @@ proc start*(c: MultiRaftCoordinator) =
       var index: uint64
       {.cast(raises: []).}:
         acquire(coord.groupsLock)
-        let log = coord.logs.getOrDefault(rangeId)
+        let log = coord.logs.getOrDefault(groupId)
         let term = group.getTerm()
         let idx = log.lastIndex.load + 1
         let cmd = RaftCommand(kind: ckWrite, writeBatch: batch)
@@ -360,7 +360,7 @@ proc start*(c: MultiRaftCoordinator) =
         log.putEntryAndState(e, state)
         index = idx
       group.commitIndex.store(index)
-      {.cast(raises: []).}: coord.applyUpTo(rangeId, group, index)
+      {.cast(raises: []).}: coord.applyUpTo(groupId, group, index)
       let res = RaftResult(success: true, index: index)
       for rp in resultPtrs:
         if rp != nil: rp[].ch.send(res)
@@ -393,7 +393,7 @@ proc start*(c: MultiRaftCoordinator) =
     # Safety: the transport is stopped (handlers cleared) before `c` is freed.
     let cPtr = cast[pointer](c)
 
-    proc coordGetGroup(rid: RangeID): Option[RaftGroup] {.gcsafe, raises: [].} =
+    proc coordGetGroup(rid: GroupID): Option[RaftGroup] {.gcsafe, raises: [].} =
       let coord = cast[MultiRaftCoordinator](cPtr)
       acquire(coord.groupsLock)
       defer: release(coord.groupsLock)
@@ -401,7 +401,7 @@ proc start*(c: MultiRaftCoordinator) =
       if g != nil: result = some(g)
       else: result = none(RaftGroup)
 
-    proc coordGetLog(rid: RangeID): Option[RaftLog] {.gcsafe, raises: [].} =
+    proc coordGetLog(rid: GroupID): Option[RaftLog] {.gcsafe, raises: [].} =
       let coord = cast[MultiRaftCoordinator](cPtr)
       acquire(coord.groupsLock)
       defer: release(coord.groupsLock)
@@ -409,12 +409,12 @@ proc start*(c: MultiRaftCoordinator) =
       if l != nil: result = some(l)
       else: result = none(RaftLog)
 
-    proc coordApplyUpTo(rid: RangeID, g: RaftGroup,
+    proc coordApplyUpTo(rid: GroupID, g: RaftGroup,
         idx: uint64) {.gcsafe, raises: [].} =
       {.cast(raises: []).}:
         cast[MultiRaftCoordinator](cPtr).applyUpTo(rid, g, idx)
 
-    proc coordSaveState(rid: RangeID, g: RaftGroup,
+    proc coordSaveState(rid: GroupID, g: RaftGroup,
         log: RaftLog) {.gcsafe, raises: [].} =
       {.cast(raises: []).}:
         cast[MultiRaftCoordinator](cPtr).saveGroupState(g, log)
@@ -468,7 +468,7 @@ proc stop*(c: MultiRaftCoordinator) =
   for rid, sw in c.shardWorkers.mpairs:
     sw[].running.store(false)
     sw[].ch.send(Proposal(
-      rangeId: RangeID(0),
+      groupId: GroupID(0),
       command: RaftCommand(kind: ckNoop),
       resultPtr: nil,
     ))
@@ -483,10 +483,10 @@ proc stop*(c: MultiRaftCoordinator) =
   c.shardWorkers.clear()
   release(c.shardWorkersMu)
 
-  # Shutdown sentinel per global worker (rangeId == 0)
+  # Shutdown sentinel per global worker (groupId == 0)
   for _ in 0..<c.workers.len:
     c.proposalCh.send(Proposal(
-      rangeId: RangeID(0),
+      groupId: GroupID(0),
       command: RaftCommand(kind: ckNoop),
       resultPtr: nil,
     ))
@@ -519,19 +519,19 @@ proc stop*(c: MultiRaftCoordinator) =
 # Group Management
 # ============================================================================
 
-proc createGroup*(c: MultiRaftCoordinator, descriptor: RangeDescriptor,
+proc createGroup*(c: MultiRaftCoordinator, descriptor: GroupDescriptor,
     replicaId: ReplicaID): RaftGroup =
   withLock c.groupsLock:
-    if c.groups.hasKey(descriptor.rangeId):
+    if c.groups.hasKey(descriptor.groupId):
       raise newException(MultiRaftError,
-          "Group already exists: " & $descriptor.rangeId)
+          "Group already exists: " & $descriptor.groupId)
 
-    let log = newRaftLog(descriptor.rangeId, c.store)
+    let log = newRaftLog(descriptor.groupId, c.store)
     log.recoverLog()
-    c.logs[descriptor.rangeId] = log
+    c.logs[descriptor.groupId] = log
 
-    let group = newRaftGroup(descriptor.rangeId, c.nodeId, replicaId, descriptor)
-    c.groups[descriptor.rangeId] = group
+    let group = newRaftGroup(descriptor.groupId, c.nodeId, replicaId, descriptor)
+    c.groups[descriptor.groupId] = group
 
     let state = log.loadState()
     if state.isSome:
@@ -544,7 +544,7 @@ proc createGroup*(c: MultiRaftCoordinator, descriptor: RangeDescriptor,
     # The worker is NOT started here — start() launches it after all
     # coordinator fields are fully initialised.
     let sw = cast[ptr ShardWorkerState](allocShared0(sizeof(ShardWorkerState)))
-    sw[].rangeId = descriptor.rangeId
+    sw[].groupId = descriptor.groupId
     sw[].group = group
     sw[].log = log
     sw[].coordPtr = cast[pointer](c)
@@ -552,29 +552,29 @@ proc createGroup*(c: MultiRaftCoordinator, descriptor: RangeDescriptor,
     sw[].ch.open(MAX_PROPOSAL_QUEUE_SIZE)
 
     acquire(c.shardWorkersMu)
-    c.shardWorkers[descriptor.rangeId] = sw
+    c.shardWorkers[descriptor.groupId] = sw
     release(c.shardWorkersMu)
 
     {.cast(gcsafe).}:
       var fields = initTable[string, string]()
-      fields["rangeId"] = $descriptor.rangeId
+      fields["groupId"] = $descriptor.groupId
       fields["replicaId"] = $replicaId
       info("Created Raft group", fields)
 
     result = group
 
-proc removeGroup*(c: MultiRaftCoordinator, rangeId: RangeID) =
+proc removeGroup*(c: MultiRaftCoordinator, groupId: GroupID) =
   # Stop and free the per-shard worker for this group (if running).
   acquire(c.shardWorkersMu)
-  let sw = c.shardWorkers.getOrDefault(rangeId, nil)
+  let sw = c.shardWorkers.getOrDefault(groupId, nil)
   if sw != nil:
     sw[].running.store(false)
     sw[].ch.send(Proposal(
-      rangeId: RangeID(0),
+      groupId: GroupID(0),
       command: RaftCommand(kind: ckNoop),
       resultPtr: nil,
     ))
-    c.shardWorkers.del(rangeId)
+    c.shardWorkers.del(groupId)
   release(c.shardWorkersMu)
 
   if sw != nil:
@@ -583,28 +583,28 @@ proc removeGroup*(c: MultiRaftCoordinator, rangeId: RangeID) =
     deallocShared(sw)
 
   withLock c.groupsLock:
-    if c.groups.hasKey(rangeId):
-      c.groups[rangeId].close()
-      c.groups.del(rangeId)
-      c.logs[rangeId].close()
-      c.logs.del(rangeId)
+    if c.groups.hasKey(groupId):
+      c.groups[groupId].close()
+      c.groups.del(groupId)
+      c.logs[groupId].close()
+      c.logs.del(groupId)
 
-proc getGroup*(c: MultiRaftCoordinator, rangeId: RangeID): Option[
+proc getGroup*(c: MultiRaftCoordinator, groupId: GroupID): Option[
     RaftGroup] {.gcsafe.} =
   withLock c.groupsLock:
-    if c.groups.hasKey(rangeId):
-      result = some(c.groups[rangeId])
+    if c.groups.hasKey(groupId):
+      result = some(c.groups[groupId])
 
-proc hasGroup*(c: MultiRaftCoordinator, rangeId: RangeID): bool =
+proc hasGroup*(c: MultiRaftCoordinator, groupId: GroupID): bool =
   withLock c.groupsLock:
-    result = c.groups.hasKey(rangeId)
+    result = c.groups.hasKey(groupId)
 
 # ============================================================================
 # Proposal Handling
 # ============================================================================
 
 proc proposeParallel*(c: MultiRaftCoordinator,
-    proposals: seq[tuple[rangeId: RangeID, command: RaftCommand]],
+    proposals: seq[tuple[groupId: GroupID, command: RaftCommand]],
     timeoutMs: int = 5000): seq[RaftResult] =
   ## Submit N proposals to N different Raft groups simultaneously and wait for
   ## all of them to commit.  Returns one RaftResult per input proposal.
@@ -644,25 +644,25 @@ proc proposeParallel*(c: MultiRaftCoordinator,
       # Per-shard worker path: each proposal goes to its shard's dedicated
       # thread so all N fdatasyncs run truly in parallel.
       acquire(c.shardWorkersMu)
-      let swPtr = c.shardWorkers.getOrDefault(p.rangeId, nil)
+      let swPtr = c.shardWorkers.getOrDefault(p.groupId, nil)
       release(c.shardWorkersMu)
       if swPtr != nil and swPtr[].running.load:
         swPtr[].ch.send(Proposal(
-          rangeId: p.rangeId,
+          groupId: p.groupId,
           command: p.command,
           resultPtr: prcPtrs[i],
         ))
       else:
         # Fallback: shard worker not available → global pool.
         c.proposalCh.send(Proposal(
-          rangeId: p.rangeId,
+          groupId: p.groupId,
           command: p.command,
           resultPtr: prcPtrs[i],
         ))
     else:
       # Multi-node transport path: global worker pool handles replication.
       c.proposalCh.send(Proposal(
-        rangeId: p.rangeId,
+        groupId: p.groupId,
         command: p.command,
         resultPtr: prcPtrs[i],
       ))
@@ -674,7 +674,7 @@ proc proposeParallel*(c: MultiRaftCoordinator,
     prcPtrs[i][].ch.close()
     deallocShared(prcPtrs[i])
 
-proc proposeAndWait*(c: MultiRaftCoordinator, rangeId: RangeID,
+proc proposeAndWait*(c: MultiRaftCoordinator, groupId: GroupID,
     command: RaftCommand, timeoutMs: int = 5000): RaftResult =
   ## Propose a command and block until committed (or timeout).
   ## When group commit is enabled (single-node only), delegates to the
@@ -693,30 +693,30 @@ proc proposeAndWait*(c: MultiRaftCoordinator, rangeId: RangeID,
   if c.groupCommitEnabled and c.groupCommitBatcherPtr != nil and
       c.transport == nil and command.kind == ckWrite:
     # Group commit path: enqueue and block on the result channel.
-    enqueue(c.groupCommitBatcherPtr, rangeId, command, prc)
+    enqueue(c.groupCommitBatcherPtr, groupId, command, prc)
   elif c.transport == nil:
     # Per-shard worker path (Phase 17): route directly to the shard's channel
     # so its fdatasync runs in parallel with other shards.
     acquire(c.shardWorkersMu)
-    let swPtr = c.shardWorkers.getOrDefault(rangeId, nil)
+    let swPtr = c.shardWorkers.getOrDefault(groupId, nil)
     release(c.shardWorkersMu)
     if swPtr != nil and swPtr[].running.load:
       swPtr[].ch.send(Proposal(
-        rangeId: rangeId,
+        groupId: groupId,
         command: command,
         resultPtr: prc,
       ))
     else:
       # Fallback: shard worker not yet started or missing — use global pool.
       c.proposalCh.send(Proposal(
-        rangeId: rangeId,
+        groupId: groupId,
         command: command,
         resultPtr: prc,
       ))
   else:
     # Multi-node transport path: send to global worker pool.
     c.proposalCh.send(Proposal(
-      rangeId: rangeId,
+      groupId: groupId,
       command: command,
       resultPtr: prc,
     ))
@@ -768,14 +768,14 @@ proc workerProc(ctx: WorkerContext) {.thread.} =
 
   while c.running.load:
     let proposal = c.proposalCh.recv()
-    if proposal.rangeId.uint64 == 0:
+    if proposal.groupId.uint64 == 0:
       break # Shutdown sentinel
 
     try:
-      let groupOpt = c.getGroup(proposal.rangeId)
+      let groupOpt = c.getGroup(proposal.groupId)
       if groupOpt.isNone:
         sendResult(proposal.resultPtr, RaftResult(
-          success: false, error: "Range not found: " & $proposal.rangeId))
+          success: false, error: "Group not found: " & $proposal.groupId))
         continue
 
       let group = groupOpt.get
@@ -791,7 +791,7 @@ proc workerProc(ctx: WorkerContext) {.thread.} =
       block appendBlock:
         acquire(c.groupsLock)
         defer: release(c.groupsLock) # always released, even on exception
-        let log = c.logs.getOrDefault(proposal.rangeId)
+        let log = c.logs.getOrDefault(proposal.groupId)
         let term = group.getTerm()
         let idx = log.lastIndex.load + 1
         let e = newLogEntry(term, idx, proposal.command)
@@ -812,7 +812,7 @@ proc workerProc(ctx: WorkerContext) {.thread.} =
 
       if useTransport:
         # Multi-node: fan-out AppendEntries and wait for quorum
-        let logOpt = c.getLog(proposal.rangeId)
+        let logOpt = c.getLog(proposal.groupId)
         if logOpt.isNone:
           sendResult(proposal.resultPtr, RaftResult(
             success: false, error: "Log not found"))
@@ -830,9 +830,9 @@ proc workerProc(ctx: WorkerContext) {.thread.} =
         let newCommit = computeNewCommitIndex(group, index)
         if newCommit > group.commitIndex.load():
           group.commitIndex.store(newCommit)
-          c.applyUpTo(proposal.rangeId, group, newCommit)
+          c.applyUpTo(proposal.groupId, group, newCommit)
           # getLog acquires groupsLock — call it without holding the lock
-          let logOpt2 = c.getLog(proposal.rangeId)
+          let logOpt2 = c.getLog(proposal.groupId)
           if logOpt2.isSome:
             c.saveGroupState(group, logOpt2.get)
 
@@ -842,7 +842,7 @@ proc workerProc(ctx: WorkerContext) {.thread.} =
       else:
         # Single-node (existing behaviour): commit immediately
         group.commitIndex.store(index)
-        c.applyUpTo(proposal.rangeId, group, index)
+        c.applyUpTo(proposal.groupId, group, index)
         sendResult(proposal.resultPtr, RaftResult(
           success: true, index: index))
 
@@ -857,7 +857,7 @@ proc workerProc(ctx: WorkerContext) {.thread.} =
 # ============================================================================
 
 proc shardWorkerProc(statePtr: ptr ShardWorkerState) {.thread.} =
-  ## Dedicated worker for a single RangeID.
+  ## Dedicated worker for a single GroupID.
   ## Uses captured `group` and `log` refs directly — no groupsLock in the hot
   ## path.  Each shard's fdatasync runs concurrently with every other shard's
   ## fdatasync, eliminating the Phase 15/16 serialisation bottleneck.
@@ -866,7 +866,7 @@ proc shardWorkerProc(statePtr: ptr ShardWorkerState) {.thread.} =
 
   while s[].running.load:
     let proposal = s[].ch.recv()
-    if proposal.rangeId.uint64 == 0:
+    if proposal.groupId.uint64 == 0:
       break # Shutdown sentinel
 
     let group = s[].group
@@ -893,7 +893,7 @@ proc shardWorkerProc(statePtr: ptr ShardWorkerState) {.thread.} =
 
       # Single-node path: commit immediately, apply to KV state machine.
       group.commitIndex.store(idx)
-      {.cast(raises: []).}: c.applyUpTo(proposal.rangeId, group, idx)
+      {.cast(raises: []).}: c.applyUpTo(proposal.groupId, group, idx)
       sendResult(proposal.resultPtr, RaftResult(success: true, index: idx))
 
     except CatchableError as ex:
@@ -916,7 +916,7 @@ proc timerProc(ctx: TimerContext) {.thread.} =
     sleep(10)
 
     # Snapshot group/log tables under the lock, then iterate without it
-    var groupSnap: seq[(RangeID, RaftGroup)]
+    var groupSnap: seq[(GroupID, RaftGroup)]
     withLock c.groupsLock:
       for rid, g in c.groups:
         groupSnap.add((rid, g))
@@ -929,8 +929,8 @@ proc timerProc(ctx: TimerContext) {.thread.} =
       case group.state.load()
       of rsLeader:
         if group.timeSinceHeartbeat() >= c.heartbeatIntervalNs:
-          var groupsCopy: Table[RangeID, RaftGroup]
-          var logsCopy: Table[RangeID, RaftLog]
+          var groupsCopy: Table[GroupID, RaftGroup]
+          var logsCopy: Table[GroupID, RaftLog]
           withLock c.groupsLock:
             groupsCopy = c.groups
             logsCopy = c.logs
@@ -939,19 +939,19 @@ proc timerProc(ctx: TimerContext) {.thread.} =
       of rsFollower, rsCandidate:
         let elapsed = group.timeSinceHeartbeat()
         # Deterministic jitter to spread election timeouts and avoid split votes.
-        # Uses a multiplicative hash of nodeId and rangeId to produce a value in
-        # [0, electionTimeoutNs).  For nodes 1..5 with rangeId 1 this gives
+        # Uses a multiplicative hash of nodeId and groupId to produce a value in
+        # [0, electionTimeoutNs).  For nodes 1..5 with groupId 1 this gives
         # spreads of hundreds of milliseconds, unlike the previous XOR approach
         # which gave 0-3 nanoseconds for small IDs.
         let hashVal = (group.nodeId.uint64 * 2654435761'u64 +
-                       group.rangeId.uint64 * 2246822519'u64) and 0xFFFF_FFFF'u64
+                       group.groupId.uint64 * 2246822519'u64) and 0xFFFF_FFFF'u64
         let jitterNs = int64(hashVal mod uint64(c.electionTimeoutNs))
         let effectiveTimeout = c.electionTimeoutNs + jitterNs
 
         if elapsed >= effectiveTimeout:
           {.cast(gcsafe).}:
             var fields = initTable[string, string]()
-            fields["rangeId"] = $rid
+            fields["groupId"] = $rid
             fields["term"] = $group.getTerm()
             info("Starting election", fields)
 
@@ -959,13 +959,13 @@ proc timerProc(ctx: TimerContext) {.thread.} =
           if won:
             {.cast(gcsafe).}:
               var fields = initTable[string, string]()
-              fields["rangeId"] = $rid
+              fields["groupId"] = $rid
               fields["term"] = $group.getTerm()
               info("Won election, became leader", fields)
             c.saveGroupState(group, log)
             # Send immediate no-op heartbeat to establish leadership
-            var groupsCopy: Table[RangeID, RaftGroup]
-            var logsCopy: Table[RangeID, RaftLog]
+            var groupsCopy: Table[GroupID, RaftGroup]
+            var logsCopy: Table[GroupID, RaftLog]
             withLock c.groupsLock:
               groupsCopy = c.groups
               logsCopy = c.logs

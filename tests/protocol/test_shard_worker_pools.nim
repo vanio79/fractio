@@ -11,7 +11,7 @@
 #   8.  stop() joins all shard threads cleanly (no leak / no deadlock).
 #   9.  removeGroup stops and frees shard worker; subsequent propose falls back.
 #  10.  group-commit path still works (shardWorkerProc not used when GC enabled).
-#  11.  Worker falls back to global proposalCh for unknown RangeID.
+#  11.  Worker falls back to global proposalCh for unknown GroupID.
 #  12.  Re-start after stop is NOT supported (running guard); verify idempotent.
 #
 # No TCP / no ProtocolServer — pure in-process MultiRaftCoordinator.
@@ -22,7 +22,7 @@ import std/[unittest, os, options, tables, atomics, typedthreads, locks, strutil
 import fractio/protocol/raft_store
 import fractio/distributed/raft/multigroup_coordinator
 import fractio/distributed/raft/multigroup_types
-import fractio/distributed/range/types as rangeTypes
+import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
 
 # ---------------------------------------------------------------------------
@@ -39,7 +39,7 @@ proc makeCoord(n: int, groupCommit = false): MultiRaftCoordinator =
   let path = BASE_DIR & $n
   cleanDir(path)
   let cfg = CoordinatorConfig(
-    nodeId: RangeNodeID(1),
+    nodeId: NodeID(1),
     numWorkers: 4,
     electionTimeoutNs: DEFAULT_ELECTION_TIMEOUT_NS,
     heartbeatIntervalNs: DEFAULT_HEARTBEAT_INTERVAL_NS,
@@ -48,9 +48,9 @@ proc makeCoord(n: int, groupCommit = false): MultiRaftCoordinator =
   )
   newMultiRaftCoordinator(cfg)
 
-proc addLeaderGroup(c: MultiRaftCoordinator, rid: RangeID): RaftGroup =
-  let desc = newRangeDescriptor(rid, @[], @[])
-  let rep = desc.addReplica(RangeNodeID(1))
+proc addLeaderGroup(c: MultiRaftCoordinator, rid: GroupID): RaftGroup =
+  let desc = newGroupDescriptor(rid)
+  let rep = desc.addReplica(NodeID(1))
   result = c.createGroup(desc, rep.replicaId)
   result.becomeLeader()
 
@@ -74,7 +74,7 @@ suite "Phase17 ShardWorkerPool lifecycle":
 
   test "shardWorkers table populated after createGroup":
     let c = makeCoord(640)
-    let rid = DATA_RANGE_START_ID
+    let rid = DATA_GROUP_START_ID
     discard addLeaderGroup(c, rid)
     # Before start, shard worker exists but is not running
     acquire(c.shardWorkersMu)
@@ -86,7 +86,7 @@ suite "Phase17 ShardWorkerPool lifecycle":
 
   test "shard worker running after start()":
     let c = makeCoord(641)
-    let rid = DATA_RANGE_START_ID
+    let rid = DATA_GROUP_START_ID
     discard addLeaderGroup(c, rid)
     c.start()
     acquire(c.shardWorkersMu)
@@ -98,7 +98,7 @@ suite "Phase17 ShardWorkerPool lifecycle":
 
   test "stop() cleans up shard worker table":
     let c = makeCoord(642)
-    discard addLeaderGroup(c, DATA_RANGE_START_ID)
+    discard addLeaderGroup(c, DATA_GROUP_START_ID)
     c.start()
     c.stop()
     acquire(c.shardWorkersMu)
@@ -109,7 +109,7 @@ suite "Phase17 ShardWorkerPool lifecycle":
   test "multiple groups each get their own shard worker":
     let c = makeCoord(643)
     for i in [2, 3, 4]:
-      discard addLeaderGroup(c, RangeID(i))
+      discard addLeaderGroup(c, GroupID(i))
     c.start()
     acquire(c.shardWorkersMu)
     let cnt = c.shardWorkers.len
@@ -125,20 +125,20 @@ suite "Phase17 ShardWorkerPool single-shard correctness":
 
   test "write and read back via shard worker":
     let c = makeCoord(644)
-    discard addLeaderGroup(c, DATA_RANGE_START_ID)
+    discard addLeaderGroup(c, DATA_GROUP_START_ID)
     c.start()
     let store = newRaftKVStoreExt(c, proposeTimeoutMs = 5000)
-    store.bootstrapStore(@[DATA_RANGE_START_ID])
+    store.bootstrapStore(@[DATA_GROUP_START_ID])
     check writeKV(store, "hello", "world")
     check readKV(store, "hello") == "world"
     teardown(c, 644)
 
   test "multiple sequential writes accumulate":
     let c = makeCoord(645)
-    discard addLeaderGroup(c, DATA_RANGE_START_ID)
+    discard addLeaderGroup(c, DATA_GROUP_START_ID)
     c.start()
     let store = newRaftKVStoreExt(c, proposeTimeoutMs = 5000)
-    store.bootstrapStore(@[DATA_RANGE_START_ID])
+    store.bootstrapStore(@[DATA_GROUP_START_ID])
     for i in 0..<20:
       check writeKV(store, "k" & $i, "v" & $i)
     for i in 0..<20:
@@ -147,12 +147,12 @@ suite "Phase17 ShardWorkerPool single-shard correctness":
 
   test "not-the-leader returns error":
     let c = makeCoord(646)
-    let desc = newRangeDescriptor(DATA_RANGE_START_ID, @[], @[])
-    let rep = desc.addReplica(RangeNodeID(1))
+    let desc = newGroupDescriptor(DATA_GROUP_START_ID)
+    let rep = desc.addReplica(NodeID(1))
     let grp = c.createGroup(desc, rep.replicaId)
     # Do NOT call becomeLeader — stays follower
     c.start()
-    let res = c.proposeAndWait(DATA_RANGE_START_ID,
+    let res = c.proposeAndWait(DATA_GROUP_START_ID,
       RaftCommand(kind: ckWrite, writeBatch: newWriteBatch()), 1000)
     check not res.success
     check res.error.len > 0
@@ -166,11 +166,11 @@ suite "Phase17 ShardWorkerPool multi-shard routing":
 
   test "two shards each served by independent worker":
     let c = makeCoord(647)
-    discard addLeaderGroup(c, DATA_RANGE_START_ID)
-    discard addLeaderGroup(c, RangeID(3))
+    discard addLeaderGroup(c, DATA_GROUP_START_ID)
+    discard addLeaderGroup(c, GroupID(3))
     c.start()
     let store = newRaftKVStoreExt(c, proposeTimeoutMs = 5000)
-    store.bootstrapStore(@[DATA_RANGE_START_ID, RangeID(3)])
+    store.bootstrapStore(@[DATA_GROUP_START_ID, GroupID(3)])
     # Keys routed to shard 1
     check writeKV(store, "apple", "1")
     check writeKV(store, "banana", "2")
@@ -183,8 +183,8 @@ suite "Phase17 ShardWorkerPool multi-shard routing":
 
   test "proposeParallel commits to both shards simultaneously":
     let c = makeCoord(648)
-    discard addLeaderGroup(c, DATA_RANGE_START_ID)
-    discard addLeaderGroup(c, RangeID(3))
+    discard addLeaderGroup(c, DATA_GROUP_START_ID)
+    discard addLeaderGroup(c, GroupID(3))
     c.start()
 
     let b1 = newWriteBatch()
@@ -193,9 +193,9 @@ suite "Phase17 ShardWorkerPool multi-shard routing":
     b2.put(@(cast[seq[byte]](@[byte 'z'])), @(cast[seq[byte]](@[byte '2'])))
 
     let proposals = @[
-      (rangeId: DATA_RANGE_START_ID, command: RaftCommand(kind: ckWrite,
+      (groupId: DATA_GROUP_START_ID, command: RaftCommand(kind: ckWrite,
           writeBatch: b1)),
-      (rangeId: RangeID(3), command: RaftCommand(kind: ckWrite,
+      (groupId: GroupID(3), command: RaftCommand(kind: ckWrite,
           writeBatch: b2)),
     ]
     let results = c.proposeParallel(proposals, 5000)
@@ -207,14 +207,14 @@ suite "Phase17 ShardWorkerPool multi-shard routing":
   test "three-shard parallel all succeed":
     let c = makeCoord(649)
     for i in [2, 3, 4]:
-      discard addLeaderGroup(c, RangeID(i))
+      discard addLeaderGroup(c, GroupID(i))
     c.start()
 
-    var props: seq[tuple[rangeId: RangeID, command: RaftCommand]] = @[]
+    var props: seq[tuple[groupId: GroupID, command: RaftCommand]] = @[]
     for i in [2, 3, 4]:
       let b = newWriteBatch()
       b.put(@[byte i], @[byte i])
-      props.add((RangeID(i), RaftCommand(kind: ckWrite, writeBatch: b)))
+      props.add((GroupID(i), RaftCommand(kind: ckWrite, writeBatch: b)))
 
     let results = c.proposeParallel(props, 5000)
     check results.len == 3
@@ -234,12 +234,12 @@ suite "Phase17 ShardWorkerPool concurrency":
       OPS_PER_THREAD = 50
 
     let c = makeCoord(650)
-    discard addLeaderGroup(c, DATA_RANGE_START_ID)
-    discard addLeaderGroup(c, RangeID(3))
-    discard addLeaderGroup(c, RangeID(4))
+    discard addLeaderGroup(c, DATA_GROUP_START_ID)
+    discard addLeaderGroup(c, GroupID(3))
+    discard addLeaderGroup(c, GroupID(4))
     c.start()
     let store = newRaftKVStoreExt(c, proposeTimeoutMs = 10000)
-    store.bootstrapStore(@[DATA_RANGE_START_ID, RangeID(3), RangeID(4)])
+    store.bootstrapStore(@[DATA_GROUP_START_ID, GroupID(3), GroupID(4)])
 
     var errors: Atomic[int]
     errors.store(0)
@@ -289,10 +289,10 @@ suite "Phase17 ShardWorkerPool removeGroup and group-commit":
 
   test "removeGroup stops shard worker; worker table shrinks":
     let c = makeCoord(651)
-    discard addLeaderGroup(c, DATA_RANGE_START_ID)
-    discard addLeaderGroup(c, RangeID(3))
+    discard addLeaderGroup(c, DATA_GROUP_START_ID)
+    discard addLeaderGroup(c, GroupID(3))
     c.start()
-    c.removeGroup(RangeID(3))
+    c.removeGroup(GroupID(3))
     acquire(c.shardWorkersMu)
     let cnt = c.shardWorkers.len
     release(c.shardWorkersMu)
@@ -301,10 +301,10 @@ suite "Phase17 ShardWorkerPool removeGroup and group-commit":
 
   test "group-commit enabled: shard worker path bypassed, batcher used":
     let c = makeCoord(652, groupCommit = true)
-    discard addLeaderGroup(c, DATA_RANGE_START_ID)
+    discard addLeaderGroup(c, DATA_GROUP_START_ID)
     c.start()
     let store = newRaftKVStoreExt(c, proposeTimeoutMs = 5000)
-    store.bootstrapStore(@[DATA_RANGE_START_ID])
+    store.bootstrapStore(@[DATA_GROUP_START_ID])
     # With group commit, shard worker is created but proposal goes to batcher.
     # Verify correctness: writes still committed and readable.
     check writeKV(store, "gc_key", "gc_val")
@@ -313,7 +313,7 @@ suite "Phase17 ShardWorkerPool removeGroup and group-commit":
 
   test "proposeParallel empty input returns empty seq":
     let c = makeCoord(653)
-    discard addLeaderGroup(c, DATA_RANGE_START_ID)
+    discard addLeaderGroup(c, DATA_GROUP_START_ID)
     c.start()
     let results = c.proposeParallel(@[], 5000)
     check results.len == 0

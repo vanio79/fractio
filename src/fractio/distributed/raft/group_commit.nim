@@ -36,8 +36,8 @@
 # Thread safety
 # -------------
 # `pendingCh` is a buffered Nim Channel — thread-safe by design.
-# The flush thread is the sole writer of log entries for a given RangeID
-# (within the single-node path).  GroupCommitBatcher is per-RangeID when
+# The flush thread is the sole writer of log entries for a given GroupID
+# (within the single-node path).  GroupCommitBatcher is per-GroupID when
 # multiple shards exist; the coordinator holds one batcher per group.
 #
 # Nim 2.2.8 notes
@@ -51,7 +51,7 @@ import std/atomics
 import std/times
 import std/typedthreads
 
-import fractio/distributed/range/types
+import fractio/distributed/raft/group_types
 import fractio/distributed/raft/multigroup_types
 
 # ---------------------------------------------------------------------------
@@ -70,7 +70,7 @@ const
 type
   GroupCommitItem* = object
     ## One proposal deposited by a calling thread.
-    rangeId*: RangeID
+    groupId*: GroupID
     command*: RaftCommand
     resultPtr*: ptr ProposalResultChannel ## raw ptr — caller owns lifetime
 
@@ -84,7 +84,7 @@ type
 
 type
   GCAppendAndApplyFn* = proc(
-    rangeId: RangeID,
+    groupId: GroupID,
     command: RaftCommand,
     resultPtr: ptr ProposalResultChannel,
   ) {.gcsafe, raises: [].}
@@ -93,7 +93,7 @@ type
   ## then send result to resultPtr.
 
   GCFlushBatchFn* = proc(
-    rangeId: RangeID,
+    groupId: GroupID,
     batch: WriteBatch,
     items: seq[ptr ProposalResultChannel],
   ) {.gcsafe, raises: [].}
@@ -139,19 +139,19 @@ proc deinitGroupCommitBatcher*(b: ptr GroupCommitBatcher) =
 
 proc flushProc(bPtr: ptr GroupCommitBatcher) {.thread.} =
   ## Background flush loop.
-  ## Drains pendingCh, merges WriteBatches per RangeID, calls flushFn once
-  ## per RangeID per batch window.
+  ## Drains pendingCh, merges WriteBatches per GroupID, calls flushFn once
+  ## per GroupID per batch window.
   let b = bPtr
 
   while b[].running.load():
     # Block-recv first item so we don't busy-spin when idle.
-    # stopBatcher() sends a sentinel (rangeId == 0) to unblock this recv().
+    # stopBatcher() sends a sentinel (groupId == 0) to unblock this recv().
     let first = b[].pendingCh.recv()
-    if first.rangeId.uint64 == 0:
+    if first.groupId.uint64 == 0:
       break # Shutdown sentinel
 
     # Collect items for this batch window.
-    # We coalesce ALL pending items (regardless of RangeID) into one pass.
+    # We coalesce ALL pending items (regardless of GroupID) into one pass.
     var items: seq[GroupCommitItem] = @[first]
     let windowStart = block:
       let t = getTime()
@@ -174,21 +174,21 @@ proc flushProc(bPtr: ptr GroupCommitBatcher) {.thread.} =
       if not ok: break
       items.add(item)
 
-    # Group by RangeID and merge WriteBatches.
+    # Group by GroupID and merge WriteBatches.
     # For simplicity (single-shard common case) we use a small seq scan.
     # With many shards this would be a Table; single shard is the benchmark case.
-    type RangeGroup = object
-      rangeId: RangeID
+    type BatchGroup = object
+      groupId: GroupID
       combined: WriteBatch
       resultPtrs: seq[ptr ProposalResultChannel]
 
-    var groups: seq[RangeGroup] = @[]
+    var groups: seq[BatchGroup] = @[]
 
     for item in items:
-      # Find existing group for this rangeId
+      # Find existing group for this groupId
       var found = false
       for i in 0 ..< groups.len:
-        if groups[i].rangeId == item.rangeId:
+        if groups[i].groupId == item.groupId:
           # Merge into existing combined batch
           if item.command.kind == ckWrite:
             let wb = item.command.writeBatch
@@ -201,7 +201,7 @@ proc flushProc(bPtr: ptr GroupCommitBatcher) {.thread.} =
           found = true
           break
       if not found:
-        # New range group
+        # New batch group
         let combined = newWriteBatch()
         if item.command.kind == ckWrite:
           let wb = item.command.writeBatch
@@ -210,17 +210,17 @@ proc flushProc(bPtr: ptr GroupCommitBatcher) {.thread.} =
               combined.puts.add((k, v))
             for k in wb.deletes:
               combined.deletes.add(k)
-        groups.add(RangeGroup(
-          rangeId: item.rangeId,
+        groups.add(BatchGroup(
+          groupId: item.groupId,
           combined: combined,
           resultPtrs: @[item.resultPtr],
         ))
 
-    # Flush each range group via the injected callback.
+    # Flush each batch group via the injected callback.
     if b[].flushFn != nil:
       for grp in groups:
         {.cast(gcsafe).}:
-          b[].flushFn(grp.rangeId, grp.combined, grp.resultPtrs)
+          b[].flushFn(grp.groupId, grp.combined, grp.resultPtrs)
     else:
       # flushFn not wired — signal all callers with error
       for grp in groups:
@@ -246,10 +246,10 @@ proc stopBatcher*(b: ptr GroupCommitBatcher) =
   var expected = true
   if not b[].running.compareExchange(expected, false):
     return # already stopped or never started
-  # Send shutdown sentinel (rangeId == 0) to unblock the blocking recv()
+  # Send shutdown sentinel (groupId == 0) to unblock the blocking recv()
   # in flushProc. resultPtr is nil since no one waits for this result.
   b[].pendingCh.send(GroupCommitItem(
-    rangeId: RangeID(0),
+    groupId: GroupID(0),
     command: RaftCommand(kind: ckNoop),
     resultPtr: nil,
   ))
@@ -259,13 +259,13 @@ proc stopBatcher*(b: ptr GroupCommitBatcher) =
 # Caller-side enqueue
 # ---------------------------------------------------------------------------
 
-proc enqueue*(b: ptr GroupCommitBatcher, rangeId: RangeID,
+proc enqueue*(b: ptr GroupCommitBatcher, groupId: GroupID,
     command: RaftCommand,
     resultPtr: ptr ProposalResultChannel) {.gcsafe, raises: [].} =
   ## Deposit a proposal into the batcher.  Returns immediately; the caller
   ## blocks on resultPtr[].ch.recv() to wait for the commit result.
   b[].pendingCh.send(GroupCommitItem(
-    rangeId: rangeId,
+    groupId: groupId,
     command: command,
     resultPtr: resultPtr,
   ))
