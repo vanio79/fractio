@@ -3,7 +3,7 @@
 # Executes a Plan against a RaftKVStoreExt, returning results.
 # Each PlanOp maps directly to KV operations on the raft store.
 
-import std/[options, json, strutils, strformat, tables]
+import std/[options, json, strutils, strformat, tables, times, hashes, algorithm]
 import ./ast
 import ./parser
 import ./planner
@@ -299,7 +299,35 @@ proc execCreateTable(op: PlanOp, store: RaftKVStoreExt): ExecResult =
       return okResult("table already exists (IF NOT EXISTS)")
     return errorResult(&"table '{op.ctName}' already exists")
 
-  let res = store.raftPut(key, op.ctValue)
+  # Resolve space name to spaceId
+  var tableValue = op.ctValue
+  if op.ctSpaceName.isSome:
+    let spaceName = op.ctSpaceName.get()
+    # Scan sys.spaces for the named space
+    let sStart = encodeTableKey(SYS_SPACES_TABLE_ID, "")
+    let sEnd = encodeTableKey(SYS_SPACES_TABLE_ID + 1, "")
+    let sScan = store.raftScan(sStart, sEnd, 0, includeSystemKeys = true)
+    var spaceId = -1
+    if sScan.isOk:
+      for (sk, se) in sScan.value:
+        try:
+          let sj = parseJson(se.value)
+          if sj["name"].getStr() == spaceName:
+            spaceId = sj["spaceId"].getInt()
+            break
+        except JsonParsingError:
+          discard
+    if spaceId < 0:
+      return errorResult(&"space '{spaceName}' does not exist")
+    # Inject spaceId into the table descriptor JSON
+    try:
+      var j = parseJson(tableValue)
+      j["spaceId"] = %spaceId
+      tableValue = $j
+    except JsonParsingError:
+      discard
+
+  let res = store.raftPut(key, tableValue)
   if not res.isOk:
     return errorResult(&"failed to create table: {res.error.msg}")
   okResult("CREATE TABLE")
@@ -505,6 +533,185 @@ proc execShowTables(op: PlanOp, store: RaftKVStoreExt): ExecResult =
   rowsResult(@["table_name"], resultRows)
 
 # ---------------------------------------------------------------------------
+# Space executors
+# ---------------------------------------------------------------------------
+
+proc nextSpaceId(store: RaftKVStoreExt): int =
+  ## Allocate the next available space ID by scanning sys.spaces.
+  let startKey = encodeTableKey(SYS_SPACES_TABLE_ID, "")
+  let endKey = encodeTableKey(SYS_SPACES_TABLE_ID + 1, "")
+  let res = store.raftScan(startKey, endKey, 0, includeSystemKeys = true)
+  var maxId = 0
+  if res.isOk:
+    for (key, entry) in res.value:
+      try:
+        let j = parseJson(entry.value)
+        let sid = j["spaceId"].getInt()
+        if sid > maxId: maxId = sid
+      except JsonParsingError:
+        discard
+  maxId + 1
+
+proc execCreateSpace(op: PlanOp, store: RaftKVStoreExt): ExecResult =
+  ## Execute CREATE SPACE: allocate spaceId, compute group placement,
+  ## create Raft groups, write space record.
+  # Check for duplicate by name
+  let startKey = encodeTableKey(SYS_SPACES_TABLE_ID, "")
+  let endKey = encodeTableKey(SYS_SPACES_TABLE_ID + 1, "")
+  let scanRes = store.raftScan(startKey, endKey, 0, includeSystemKeys = true)
+  if scanRes.isOk:
+    for (key, entry) in scanRes.value:
+      try:
+        let j = parseJson(entry.value)
+        if j["name"].getStr() == op.cspName:
+          return errorResult(&"space '{op.cspName}' already exists")
+      except JsonParsingError:
+        discard
+
+  # Count nodes in the cluster
+  let nodesStart = encodeTableKey(SYS_NODES_TABLE_ID, "")
+  let nodesEnd = encodeTableKey(SYS_NODES_TABLE_ID + 1, "")
+  let nodesRes = store.raftScan(nodesStart, nodesEnd, 0, includeSystemKeys = true)
+  var nodeCount = 0
+  var nodeIds: seq[int] = @[]
+  if nodesRes.isOk:
+    for (key, entry) in nodesRes.value:
+      try:
+        let j = parseJson(entry.value)
+        nodeIds.add(j["nodeId"].getInt())
+        inc nodeCount
+      except JsonParsingError:
+        discard
+
+  if nodeCount == 0:
+    return errorResult("no nodes in cluster")
+
+  let replicas = if op.cspReplicas == 0: nodeCount else: op.cspReplicas
+  if replicas > nodeCount:
+    return errorResult(&"REPLICAS ({replicas}) exceeds node count ({nodeCount})")
+
+  # Compute group count and placement
+  # For R replicas on N nodes → N groups
+  let groupCount = nodeCount
+  nodeIds.sort()
+
+  # Allocate space ID
+  let spaceId = nextSpaceId(store)
+
+  # Find max existing rangeId to allocate new ones
+  let rangesStart = encodeTableKey(SYS_RANGES_TABLE_ID, "")
+  let rangesEnd = encodeTableKey(SYS_RANGES_TABLE_ID + 1, "")
+  let rangesRes = store.raftScan(rangesStart, rangesEnd, 0, includeSystemKeys = true)
+  var maxRangeId: uint64 = 1
+  if rangesRes.isOk:
+    for (key, entry) in rangesRes.value:
+      try:
+        let j = parseJson(entry.value)
+        let rid = uint64(j["rangeId"].getInt())
+        if rid > maxRangeId: maxRangeId = rid
+      except JsonParsingError:
+        discard
+
+  var rangeIds: seq[int] = @[]
+  for g in 0 ..< groupCount:
+    let rangeId = int(maxRangeId) + 1 + g
+    rangeIds.add(rangeId)
+
+    # Compute group members using ring algorithm
+    var members: seq[int] = @[]
+    for j in 0 ..< replicas:
+      members.add(nodeIds[(g + j) mod nodeCount])
+
+    # Write range descriptor to sys.ranges
+    var replicasJson = newJArray()
+    for m in members:
+      replicasJson.add(%*{"nodeId": m, "type": "voter"})
+    let rangeKey = encodeTableKey(SYS_RANGES_TABLE_ID, $rangeId)
+    let rangeVal = $ %*{
+      "rangeId": rangeId,
+      "spaceId": spaceId,
+      "startKey": "",
+      "endKey": "",
+      "replicas": replicasJson,
+      "preferredLeader": members[0],
+    }
+    let putRes = store.raftPut(rangeKey, rangeVal)
+    if not putRes.isOk:
+      return errorResult(&"failed to create range {rangeId}: {putRes.error.msg}")
+
+  # Write space record
+  let spaceKey = encodeSpaceKey(spaceId)
+  let spaceVal = $ %*{
+    "spaceId": spaceId,
+    "name": op.cspName,
+    "replicas": op.cspReplicas,
+    "groupCount": groupCount,
+    "rangeIds": rangeIds,
+    "createdAt": $now(),
+  }
+  let putRes = store.raftPut(spaceKey, spaceVal)
+  if not putRes.isOk:
+    return errorResult(&"failed to write space record: {putRes.error.msg}")
+
+  okResult(&"CREATE SPACE ({groupCount} groups)")
+
+proc execDropSpace(op: PlanOp, store: RaftKVStoreExt): ExecResult =
+  if op.dspName == "default":
+    return errorResult("cannot drop the default space")
+
+  # Find space by name
+  let startKey = encodeTableKey(SYS_SPACES_TABLE_ID, "")
+  let endKey = encodeTableKey(SYS_SPACES_TABLE_ID + 1, "")
+  let scanRes = store.raftScan(startKey, endKey, 0, includeSystemKeys = true)
+  var foundKey = ""
+  if scanRes.isOk:
+    for (key, entry) in scanRes.value:
+      try:
+        let j = parseJson(entry.value)
+        if j["name"].getStr() == op.dspName:
+          foundKey = key
+          break
+      except JsonParsingError:
+        discard
+
+  if foundKey == "":
+    return errorResult(&"space '{op.dspName}' does not exist")
+
+  let delRes = store.raftDelete(foundKey)
+  if not delRes.isOk:
+    return errorResult(&"failed to drop space: {delRes.error.msg}")
+
+  okResult("DROP SPACE")
+
+proc execShowSpaces(op: PlanOp, store: RaftKVStoreExt): ExecResult =
+  let startKey = encodeTableKey(SYS_SPACES_TABLE_ID, "")
+  let endKey = encodeTableKey(SYS_SPACES_TABLE_ID + 1, "")
+  let res = store.raftScan(startKey, endKey, 0, includeSystemKeys = true)
+  if not res.isOk:
+    return errorResult(&"failed to scan spaces: {res.error.msg}")
+
+  var resultRows: seq[seq[string]]
+  for (key, entry) in res.value:
+    try:
+      let j = parseJson(entry.value)
+      let name = j["name"].getStr()
+      let replicas = j["replicas"].getInt()
+      let replicasStr = if replicas == 0: "ALL" else: $replicas
+      let groupCount = j["groupCount"].getInt()
+      let rangeIds = if j.hasKey("rangeIds"):
+                       var ids: seq[string]
+                       for r in j["rangeIds"]: ids.add($r.getInt())
+                       ids.join(",")
+                     else: ""
+      resultRows.add(@[$j["spaceId"].getInt(), name, replicasStr,
+                        $groupCount, rangeIds])
+    except JsonParsingError:
+      discard
+
+  rowsResult(@["space_id", "name", "replicas", "group_count", "range_ids"],
+             resultRows)
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -531,6 +738,9 @@ proc execute*(plan: Plan, store: RaftKVStoreExt,
     of poShowDatabases:  execShowDatabases(op, store)
     of poShowSchemas:    execShowSchemas(op, store)
     of poShowTables:     execShowTables(op, store)
+    of poShowSpaces:     execShowSpaces(op, store)
+    of poCreateSpace:    execCreateSpace(op, store)
+    of poDropSpace:      execDropSpace(op, store)
     of poUseDatabase:    execUseDatabase(op, store)
     of poUseSchema:      execUseSchema(op, store, database)
     of poBeginTxn:       okResult("BEGIN")

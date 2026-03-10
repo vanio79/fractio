@@ -198,6 +198,23 @@ proc triggerLoadSystemTableData*(tableId: int, tableName: string): int =
   jsSetTimeout(proc() = discard doLoadSystemTableData(tid, tn), 0)
   0
 
+var
+  fetchingSpaces {.global.}: bool = false
+  loadedSpaces* {.global.}: bool = false
+
+proc doLoadSpaces*() {.async.} =
+  let resp = await fetchJson("/api/spaces")
+  fetchingSpaces = false
+  loadedSpaces = true
+  gSpaces.set(resp)
+
+proc triggerLoadSpaces*(): int =
+  if loadedSpaces or fetchingSpaces:
+    return 0
+  fetchingSpaces = true
+  jsSetTimeout(proc() = discard doLoadSpaces(), 0)
+  0
+
 proc connectDriftWs*() =
   let host = jsLocation()
   let url  = cstring("ws://") & host & cstring("/ws/drift")

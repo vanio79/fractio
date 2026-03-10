@@ -29,7 +29,7 @@
 #   - Intent keys:  "\x00INTENT\x00<txnId8be><userKey>"  (for mvcc intents)
 #   - 2PC records:  "\x00COORD\x00<txnId8be>"            (coordinator records)
 
-import std/[tables, locks, options, algorithm, atomics, times, strformat, strutils]
+import std/[tables, locks, options, algorithm, atomics, times, strformat, strutils, json, hashes]
 import fractio/distributed/raft/multigroup_coordinator
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/range/types as rangeTypes
@@ -234,9 +234,18 @@ proc getKVSM(store: RaftKVStore,
 # This is safe for single-node because there is only one writer.
 
 type
+  SpaceInfo* = object
+    spaceId*: int
+    name*: string
+    replicas*: int        ## 0 = ALL nodes
+    rangeIds*: seq[uint64]
+
   RaftKVStoreExt* = ref object of RaftKVStore
     stateMachines*: Table[RangeID, KVStateMachine]
     smMu*: Lock
+    spaces*: Table[int, SpaceInfo]  ## spaceId → SpaceInfo
+    tableSpaces*: Table[uint32, int] ## tableId → spaceId
+    spacesMu*: Lock
 
 
 
@@ -248,9 +257,12 @@ proc newRaftKVStoreExt*(coord: MultiRaftCoordinator,
     proposeTimeout: proposeTimeoutMs,
     logger: newLogger("protocol.raft_store"),
     stateMachines: initTable[RangeID, KVStateMachine](),
+    spaces: initTable[int, SpaceInfo](),
+    tableSpaces: initTable[uint32, int](),
   )
   initLock(result.shardsMu)
   initLock(result.smMu)
+  initLock(result.spacesMu)
   result.nextVersion.store(1)
 
 proc getOrCreateSM*(store: RaftKVStoreExt,
@@ -814,7 +826,7 @@ proc raftReadCoordRecord*(store: RaftKVStoreExt,
 proc bootstrapWithMetaRange*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
   ## Bootstrap the store with a two-range layout:
   ##   Range 1 (meta range): covers ["", META_RANGE_END_KEY)
-  ##     — system tables 1-6, /sys/meta1/*, /sys/meta2/*
+  ##     — system tables 1-7, /sys/meta1/*, /sys/meta2/*
   ##   Range 2 (first data range): covers [META_RANGE_END_KEY, "")
   ##     — user tables, metrics, events, all other data
   ##
@@ -822,3 +834,83 @@ proc bootstrapWithMetaRange*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
   store.addShardExt("", META_RANGE_END_KEY, META_RANGE_ID)
   store.addShardExt(META_RANGE_END_KEY, "", DATA_RANGE_START_ID)
   store.wireApplyCallback()
+
+# ---------------------------------------------------------------------------
+# Space-aware routing
+# ---------------------------------------------------------------------------
+
+proc loadSpaces*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
+  ## Scan sys.spaces and populate the in-memory spaces table.
+  ## Call after bootstrap/recovery when the state machine is populated.
+  let startKey = "/t/" & align($SYS_SPACES_TABLE_ID, 10, '0') & "/"
+  let endKey = "/t/" & align($(SYS_SPACES_TABLE_ID + 1), 10, '0') & "/"
+  let sm = store.getOrCreateSM(META_RANGE_ID)
+  acquire(store.smMu)
+  var entries: seq[(string, string)] = @[]
+  for k, v in sm.kvStore:
+    if k >= startKey and k < endKey:
+      entries.add((k, v))
+  release(store.smMu)
+
+  acquire(store.spacesMu)
+  store.spaces.clear()
+  for (k, v) in entries:
+    {.cast(raises: []).}:
+      try:
+        let j = parseJson(v)
+        var info = SpaceInfo(
+          spaceId: j["spaceId"].getInt(),
+          name: j["name"].getStr(),
+          replicas: j["replicas"].getInt(),
+        )
+        if j.hasKey("rangeIds"):
+          for r in j["rangeIds"]:
+            info.rangeIds.add(uint64(r.getInt()))
+        store.spaces[info.spaceId] = info
+      except:
+        discard
+  release(store.spacesMu)
+
+proc loadTableSpaces*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
+  ## Scan sys.tables and populate the tableId → spaceId mapping.
+  let startKey = "/t/" & align($SYS_TABLES_TABLE_ID, 10, '0') & "/"
+  let endKey = "/t/" & align($(SYS_TABLES_TABLE_ID + 1), 10, '0') & "/"
+  let sm = store.getOrCreateSM(META_RANGE_ID)
+  acquire(store.smMu)
+  var entries: seq[(string, string)] = @[]
+  for k, v in sm.kvStore:
+    if k >= startKey and k < endKey:
+      entries.add((k, v))
+  release(store.smMu)
+
+  acquire(store.spacesMu)
+  store.tableSpaces.clear()
+  for (k, v) in entries:
+    {.cast(raises: []).}:
+      try:
+        let j = parseJson(v)
+        let tid = uint32(j["tableId"].getInt())
+        let sid = j.getOrDefault("spaceId").getInt(1) # default = 1 (default space)
+        store.tableSpaces[tid] = sid
+      except:
+        discard
+  release(store.spacesMu)
+
+proc routeToGroup*(primaryKey: string, rangeIds: seq[uint64]): RangeID {.inline.} =
+  ## Hash-route a primary key to one of the space's range groups.
+  if rangeIds.len == 0:
+    return META_RANGE_ID
+  if rangeIds.len == 1:
+    return RangeID(rangeIds[0])
+  let h = hash(primaryKey)
+  let idx = abs(h) mod rangeIds.len
+  RangeID(rangeIds[idx])
+
+proc getSpaceForTable*(store: RaftKVStoreExt,
+    tableId: uint32): Option[SpaceInfo] {.gcsafe, raises: [].} =
+  acquire(store.spacesMu)
+  defer: release(store.spacesMu)
+  let sid = store.tableSpaces.getOrDefault(tableId, 1)
+  if store.spaces.hasKey(sid):
+    return some(store.spaces.getOrDefault(sid))
+  none(SpaceInfo)

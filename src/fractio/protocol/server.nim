@@ -1603,6 +1603,17 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
       "name": "public", "database": "default",
     })
 
+    # Seed default space (replicas=0 means ALL, single group = Range 1)
+    let spaceKey = encodeTableKey(SYS_SPACES_TABLE_ID, "1")
+    discard store.raftPut(spaceKey, $ %* {
+      "spaceId": 1,
+      "name": "default",
+      "replicas": 0,
+      "groupCount": 1,
+      "rangeIds": [1],
+      "createdAt": $now(),
+    })
+
   # SharedTimer: enable when we have peers and timer not yet configured
   if peers.len > 0 and server.sharedTimer.isNil:
     var timerPeers: seq[PeerConfig] = @[]

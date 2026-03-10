@@ -23,6 +23,9 @@ var
   gSysTables*:    State[JsObject] = remember newJsObject()
   gSysTableData*: State[JsObject] = remember newJsObject()
 
+  # Spaces state
+  gSpaces*: State[JsObject] = remember newJsObject()
+
   # Clock drift: plain globals — updated directly via jsSetInnerHtml,
   # NOT via State, so they don't trigger HappyX re-renders.
   gDriftSamples*: seq[float] = @[]

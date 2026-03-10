@@ -45,6 +45,10 @@ const
     ## Cluster-wide configuration: /t/0000000006/<settingKey>
     ## Value: string
 
+  SYS_SPACES_TABLE_ID* = 7'u32
+    ## Space catalog: /t/0000000007/<spaceId>
+    ## Value: JSON {spaceId, name, replicas, groupCount, rangeIds, createdAt}
+
   SYS_NODE_METRICS_ID* = 10'u32
     ## Per-node performance metrics: /t/0000000010/<nodeId>/<metricName>
     ## Value: numeric string
@@ -64,8 +68,8 @@ const
     ## System tables occupy IDs 1..99
 
   # Tier 1 system tables (replicated on all nodes via meta range)
-  MAX_META_RANGE_TABLE_ID* = 6'u32
-    ## Tables 1-6 live in the meta range (Range 1)
+  MAX_META_RANGE_TABLE_ID* = 7'u32
+    ## Tables 1-7 live in the meta range (Range 1)
 
   META_RANGE_ID* = RangeID(1)
     ## The meta range is always Range 1, replicated on every node
@@ -85,8 +89,8 @@ const
     ## Width of zero-padded tableID in the key
 
   # Pre-computed boundary key: one past the last meta range table
-  # /t/0000000007 — first key NOT in the meta range
-  META_RANGE_END_KEY* = "/t/0000000007"
+  # /t/0000000008 — first key NOT in the meta range
+  META_RANGE_END_KEY* = "/t/0000000008"
     ## Exclusive upper bound for meta range table keys
 
 # ============================================================================
@@ -192,3 +196,7 @@ proc encodeIndexKey*(tableId: uint32, indexId: uint32,
   ## /t/<tableID>/i/<indexID>/<indexKey>/<primaryKey>
   encodeTableKey(tableId, "i/" & formatTableId(indexId) & "/" &
                  indexKey & "/" & primaryKey)
+
+proc encodeSpaceKey*(spaceId: int): string =
+  ## Encode a space catalog key: /t/<SYS_SPACES_TABLE_ID>/<spaceId>
+  encodeTableKey(SYS_SPACES_TABLE_ID, $spaceId)

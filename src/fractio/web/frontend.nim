@@ -38,6 +38,7 @@ appRoutes "app":
         tA(href = "/#/nodes",   style = "{navStyle(false)}"): "Nodes"
         tA(href = "/#/metrics", style = "{navStyle(false)}"): "Metrics"
         tA(href = "/#/clock",   style = "{navStyle(false)}"): "Clock"
+        tA(href = "/#/spaces", style = "{navStyle(false)}"): "Spaces"
         tA(href = "/#/data",   style = "{navStyle(false)}"): "Data"
       tMain(style = "flex:1;padding:1.75rem;max-width:1260px;width:100%"):
         let nid  = $safeIntStr(gInfo.get(), "nodeId")
@@ -205,6 +206,7 @@ appRoutes "app":
         tA(href = "/#/nodes",   style = "{navStyle(false)}"): "Nodes"
         tA(href = "/#/metrics", style = "{navStyle(false)}"): "Metrics"
         tA(href = "/#/clock",   style = "{navStyle(true)}"):  "Clock"
+        tA(href = "/#/spaces", style = "{navStyle(false)}"): "Spaces"
         tA(href = "/#/data",    style = "{navStyle(false)}"): "Data"
       tMain(style = "flex:1;padding:1.75rem;max-width:1260px;width:100%"):
 
@@ -252,6 +254,57 @@ appRoutes "app":
       tFooter(style = "padding:.75rem 1.75rem;background:#2d2d2d;color:#999;font-size:.75rem;text-align:center"):
         "Fractio Management Console · SharedTimer drift stream"
 
+  # ---- Spaces ----
+  "/spaces":
+    let hs5 = healthStr(safeInt(gHealth.get(), "status") + triggerLoadSpaces())
+    let hc5 = healthColor(safeInt(gHealth.get(), "status"))
+    tDiv(style = "display:flex;flex-direction:column;min-height:100vh"):
+      tHeader(style = "display:flex;align-items:center;gap:1rem;padding:0 1.75rem;height:60px;background:#e81c1c;box-shadow:0 2px 8px rgba(0,0,0,.18);position:sticky;top:0;z-index:100"):
+        tDiv(style = "font-size:1.1rem;font-weight:800;color:#fff;letter-spacing:.1em"): "⬡ FRACTIO"
+        tDiv(style = "flex:1")
+        tSpan(style = "background:{hc5};color:#fff;padding:.25rem .75rem;border-radius:999px;font-size:.8rem;font-weight:700"): "{hs5}"
+      tNav(style = "background:#2d2d2d;display:flex;padding:0 1.25rem"):
+        tA(href = "/#/",        style = "{navStyle(false)}"): "Dashboard"
+        tA(href = "/#/nodes",   style = "{navStyle(false)}"): "Nodes"
+        tA(href = "/#/metrics", style = "{navStyle(false)}"): "Metrics"
+        tA(href = "/#/clock",   style = "{navStyle(false)}"): "Clock"
+        tA(href = "/#/spaces",  style = "{navStyle(true)}"):  "Spaces"
+        tA(href = "/#/data",    style = "{navStyle(false)}"): "Data"
+      tMain(style = "flex:1;padding:1.75rem;max-width:1260px;width:100%"):
+        tDiv(style = "display:flex;align-items:center;gap:.75rem;margin-bottom:1rem"):
+          tH2(style = "font-size:1.05rem;font-weight:700;color:#111;margin:0"): "Spaces"
+        let spacesArr = gSpaces.get()
+        let spacesLen = jsArrayLen(spacesArr)
+        if spacesLen == 0 and loadedSpaces:
+          tDiv(style = "color:#888;font-size:.85rem;padding:1rem"): "No spaces found."
+        elif spacesLen == 0:
+          tDiv(style = "color:#888;font-size:.85rem;padding:1rem"): "Loading spaces..."
+        else:
+          tDiv(style = "overflow-x:auto;margin-bottom:1.25rem"):
+            tTable(style = "width:100%;border-collapse:collapse;font-size:.875rem;background:#fff;border:1px solid #e0e0e0;border-radius:6px;overflow:hidden"):
+              tThead:
+                tTr:
+                  for h in ["ID", "Name", "Replicas", "Groups", "Range IDs"]:
+                    tTh(style = "background:#3a3a3a;color:#fff;padding:.55rem .85rem;text-align:left;font-size:.7rem;text-transform:uppercase;letter-spacing:.07em;font-weight:600"):
+                      "{h}"
+              tTbody:
+                for si in 0 ..< spacesLen:
+                  let sp = spacesArr[si]
+                  let sid = $safeIntStr(sp, "spaceId")
+                  let sname = $safeStr(sp, "name")
+                  let srep = safeInt(sp, "replicas")
+                  let srepStr = if srep == 0: "ALL" else: $safeIntStr(sp, "replicas")
+                  let sgc = $safeIntStr(sp, "groupCount")
+                  let sranges = $safeStr(sp, "rangeIds")
+                  tTr:
+                    tTd(style = "padding:.55rem .85rem;border-bottom:1px solid #eee"): "{sid}"
+                    tTd(style = "padding:.55rem .85rem;border-bottom:1px solid #eee;font-weight:600"): "{sname}"
+                    tTd(style = "padding:.55rem .85rem;border-bottom:1px solid #eee"): "{srepStr}"
+                    tTd(style = "padding:.55rem .85rem;border-bottom:1px solid #eee"): "{sgc}"
+                    tTd(style = "padding:.55rem .85rem;border-bottom:1px solid #eee;font-family:monospace;font-size:.82rem"): "{sranges}"
+      tFooter(style = "padding:.75rem 1.75rem;background:#2d2d2d;color:#999;font-size:.75rem;text-align:center"):
+        "Fractio Management Console · Spaces"
+
   # ===========================================================================
   # Data Browser — URL-routed
   # ===========================================================================
@@ -270,6 +323,7 @@ appRoutes "app":
         tA(href = "/#/nodes",   style = "{navStyle(false)}"): "Nodes"
         tA(href = "/#/metrics", style = "{navStyle(false)}"): "Metrics"
         tA(href = "/#/clock",   style = "{navStyle(false)}"): "Clock"
+        tA(href = "/#/spaces", style = "{navStyle(false)}"): "Spaces"
         tA(href = "/#/data",    style = "{navStyle(true)}"):  "Data"
       tMain(style = "flex:1;padding:1.75rem;max-width:1260px;width:100%"):
         # Breadcrumb
@@ -311,6 +365,7 @@ appRoutes "app":
         tA(href = "/#/nodes",   style = "{navStyle(false)}"): "Nodes"
         tA(href = "/#/metrics", style = "{navStyle(false)}"): "Metrics"
         tA(href = "/#/clock",   style = "{navStyle(false)}"): "Clock"
+        tA(href = "/#/spaces", style = "{navStyle(false)}"): "Spaces"
         tA(href = "/#/data",    style = "{navStyle(true)}"):  "Data"
       tMain(style = "flex:1;padding:1.75rem;max-width:1260px;width:100%"):
         # Breadcrumb
@@ -358,6 +413,7 @@ appRoutes "app":
         tA(href = "/#/nodes",   style = "{navStyle(false)}"): "Nodes"
         tA(href = "/#/metrics", style = "{navStyle(false)}"): "Metrics"
         tA(href = "/#/clock",   style = "{navStyle(false)}"): "Clock"
+        tA(href = "/#/spaces", style = "{navStyle(false)}"): "Spaces"
         tA(href = "/#/data",    style = "{navStyle(true)}"):  "Data"
       tMain(style = "flex:1;padding:1.75rem;max-width:1260px;width:100%"):
         # Breadcrumb
@@ -432,6 +488,7 @@ appRoutes "app":
         tA(href = "/#/nodes",   style = "{navStyle(false)}"): "Nodes"
         tA(href = "/#/metrics", style = "{navStyle(false)}"): "Metrics"
         tA(href = "/#/clock",   style = "{navStyle(false)}"): "Clock"
+        tA(href = "/#/spaces", style = "{navStyle(false)}"): "Spaces"
         tA(href = "/#/data",    style = "{navStyle(true)}"):  "Data"
       tMain(style = "flex:1;padding:1.75rem;max-width:1260px;width:100%"):
         # Breadcrumb

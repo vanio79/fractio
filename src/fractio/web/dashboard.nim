@@ -438,6 +438,27 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
           statusCode = 404
           return %* {"success": false, "message": "node " & $id & " not found"}
 
+      # ---- REST: spaces ----
+      get "/api/spaces":
+        let srv = getSrv()
+        if srv.isNil or srv.raftStore.isNil:
+          statusCode = 503
+          return %* {"error": "server not ready"}
+        let startKey = encodeTableKey(SYS_SPACES_TABLE_ID, "")
+        let endKey = encodeTableKey(SYS_SPACES_TABLE_ID + 1, "")
+        var arr = newJArray()
+        {.cast(gcsafe).}:
+          let sr = srv.raftStore.raftScan(startKey, endKey, 0,
+              includeSystemKeys = true)
+          if sr.isOk:
+            for (key, entry) in sr.value:
+              try:
+                let j = parseJson(entry.value)
+                arr.add(j)
+              except JsonParsingError:
+                discard
+        return arr
+
       # ---- REST: SQL query ----
       post "/api/sql":
         let srv = getSrv()
@@ -551,6 +572,7 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
           (id: SYS_RANGES_TABLE_ID, name: "sys.ranges", desc: "Range map"),
           (id: SYS_NODES_TABLE_ID, name: "sys.nodes", desc: "Node registry"),
           (id: SYS_SETTINGS_TABLE_ID, name: "sys.settings", desc: "Cluster settings"),
+          (id: SYS_SPACES_TABLE_ID, name: "sys.spaces", desc: "Space catalog"),
           (id: SYS_NODE_METRICS_ID, name: "sys.node_metrics", desc: "Node metrics"),
           (id: SYS_RANGE_METRICS_ID, name: "sys.range_metrics", desc: "Range metrics"),
           (id: SYS_EVENTS_TABLE_ID, name: "sys.events", desc: "Cluster events"),

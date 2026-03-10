@@ -78,6 +78,7 @@ proc expectIdent(p: var Parser): string =
      tkBetween, tkLike, tkLimit, tkOffset, tkOrder, tkBy, tkAsc, tkDesc,
      tkAll, tkDistinct, tkBegin, tkCommit, tkRollback, tkTransaction, tkWork,
      tkWith, tkShow, tkUse, tkDatabases, tkSchemas, tkTables,
+     tkSpace, tkSpaces,
      tkTkInt, tkTkFloat, tkTkText, tkTkBool, tkTkDate, tkTkDateTime, tkTkBytes:
     discard p.advance
     t.value
@@ -115,6 +116,9 @@ proc parseDropDatabase(p: var Parser): Stmt
 proc parseCreateSchema(p: var Parser): Stmt
 proc parseDropSchema(p: var Parser): Stmt
 proc parseWithReplicas(p: var Parser): Option[int]
+proc parseCreateSpace(p: var Parser): Stmt
+proc parseDropSpace(p: var Parser): Stmt
+proc parseInSpace(p: var Parser): Option[string]
 
 # ---------------------------------------------------------------------------
 # Expression parsing — Pratt/precedence-climbing
@@ -181,6 +185,7 @@ proc parsePrimary(p: var Parser): Expr =
      tkLimit, tkOffset, tkOrder, tkBy, tkAsc, tkDesc, tkAll, tkDistinct,
      tkBegin, tkCommit, tkRollback, tkTransaction, tkWork, tkWith,
      tkShow, tkDatabases, tkSchemas, tkTables,
+     tkSpace, tkSpaces,
      tkTkInt, tkTkFloat, tkTkText, tkTkBool, tkTkDate, tkTkDateTime, tkTkBytes:
     let name = t.value
     discard p.advance
@@ -339,9 +344,11 @@ proc parseCreateTable(p: var Parser): Stmt =
 
   discard p.expect(tkRParen)
   let replicas = p.parseWithReplicas
+  let spaceName = p.parseInSpace
   result = Stmt(kind: stmtCreateTable, ctTable: tableName,
                 ctIfNotExists: ifNotExists, ctColumns: cols,
-                ctPrimaryKey: tablePK, ctReplicas: replicas)
+                ctPrimaryKey: tablePK, ctReplicas: replicas,
+                ctSpaceName: spaceName)
 
 # ---------------------------------------------------------------------------
 # DROP TABLE
@@ -574,6 +581,48 @@ proc parseDropSchema(p: var Parser): Stmt =
   Stmt(kind: stmtDropSchema, dsName: name, dsIfExists: ie)
 
 # ---------------------------------------------------------------------------
+# CREATE / DROP SPACE
+# ---------------------------------------------------------------------------
+
+proc parseCreateSpace(p: var Parser): Stmt =
+  ## Called after CREATE SPACE has been consumed.
+  let name = p.expectIdent
+  discard p.expect(tkWith)
+  let kw = p.expectIdent
+  if kw.toUpperAscii != "REPLICAS":
+    raise parseError("expected REPLICAS after WITH but got '" & kw & "'", p.peek)
+  discard p.expect(tkEq)
+  let tok = p.peek
+  var replicas: int
+  if tok.kind == tkInt:
+    discard p.advance
+    replicas = parseInt(tok.value)
+    if replicas < 1:
+      raise parseError("REPLICAS must be >= 1, got " & $replicas, tok)
+  elif tok.kind == tkAll:
+    discard p.advance
+    replicas = 0  # 0 means ALL
+  else:
+    raise parseError("expected integer or ALL for REPLICAS but got '" & tok.value & "'", tok)
+  Stmt(kind: stmtCreateSpace, csSpaceName: name, csSpaceReplicas: replicas)
+
+proc parseDropSpace(p: var Parser): Stmt =
+  ## Called after DROP SPACE has been consumed.
+  let name = p.expectIdent
+  Stmt(kind: stmtDropSpace, dsSpaceName: name)
+
+proc parseInSpace(p: var Parser): Option[string] =
+  ## Parse optional IN SPACE <name> clause.
+  if p.peekKind != tkIn:
+    return none(string)
+  discard p.advance  # consume IN
+  if p.peekKind != tkSpace:
+    raise parseError("expected SPACE after IN but got '" & p.peek.value & "'", p.peek)
+  discard p.advance  # consume SPACE
+  let name = p.expectIdent
+  some(name)
+
+# ---------------------------------------------------------------------------
 # Transaction statements
 # ---------------------------------------------------------------------------
 
@@ -601,8 +650,11 @@ proc parseOne*(p: var Parser): Stmt =
     of tkSchema:
       discard p.advance
       return p.parseCreateSchema
+    of tkSpace:
+      discard p.advance
+      return p.parseCreateSpace
     else:
-      raise parseError(&"expected TABLE, DATABASE, or SCHEMA after CREATE but got '{p.peek.value}'", p.peek)
+      raise parseError(&"expected TABLE, DATABASE, SCHEMA, or SPACE after CREATE but got '{p.peek.value}'", p.peek)
   of tkDrop:
     discard p.advance
     case p.peekKind
@@ -615,8 +667,11 @@ proc parseOne*(p: var Parser): Stmt =
     of tkSchema:
       discard p.advance
       return p.parseDropSchema
+    of tkSpace:
+      discard p.advance
+      return p.parseDropSpace
     else:
-      raise parseError(&"expected TABLE, DATABASE, or SCHEMA after DROP but got '{p.peek.value}'", p.peek)
+      raise parseError(&"expected TABLE, DATABASE, SCHEMA, or SPACE after DROP but got '{p.peek.value}'", p.peek)
   of tkSelect:
     discard p.advance
     return p.parseSelect
@@ -679,8 +734,11 @@ proc parseOne*(p: var Parser): Stmt =
           schema = first
       return Stmt(kind: stmtShowTables, showTablesDb: db,
                   showTablesSchema: schema)
+    of tkSpaces:
+      discard p.advance
+      return Stmt(kind: stmtShowSpaces)
     else:
-      raise parseError(&"expected DATABASES, SCHEMAS, or TABLES after SHOW but got '{p.peek.value}'", p.peek)
+      raise parseError(&"expected DATABASES, SCHEMAS, TABLES, or SPACES after SHOW but got '{p.peek.value}'", p.peek)
   of tkUse:
     discard p.advance
     case p.peekKind

@@ -30,6 +30,9 @@ type
     poShowDatabases
     poShowSchemas
     poShowTables
+    poShowSpaces
+    poCreateSpace
+    poDropSpace
     poUseDatabase
     poUseSchema
     poBeginTxn
@@ -66,6 +69,7 @@ type
       ctValue*: string  # JSON table descriptor
       ctSchema*: string
       ctDatabase*: string
+      ctSpaceName*: Option[string]  # IN SPACE <name>
 
     of poDropTable:
       dtName*: string
@@ -119,6 +123,17 @@ type
     of poShowTables:
       stDatabase*: string  # filter by database (empty = current)
       stSchema*: string    # filter by schema (empty = current)
+
+    of poShowSpaces:
+      discard
+
+    of poCreateSpace:
+      cspName*: string
+      cspReplicas*: int     # 0 = ALL
+      cspValue*: string     # JSON value to store
+
+    of poDropSpace:
+      dspName*: string
 
     of poUseDatabase:
       udName*: string
@@ -365,12 +380,17 @@ proc planCreateTable(stmt: Stmt, store: RaftKVStoreExt,
     "replicas": if stmt.ctReplicas.isSome: %stmt.ctReplicas.get else: newJNull(),
   }
 
+  # Store spaceId if IN SPACE specified (resolved at execution time)
+  if stmt.ctSpaceName.isSome:
+    value["spaceName"] = %stmt.ctSpaceName.get()
+
   plan.add(PlanOp(kind: poCreateTable,
     ctName: stmt.ctTable,
     ctIfNotExists: stmt.ctIfNotExists,
     ctValue: $value,
     ctSchema: schema,
     ctDatabase: database,
+    ctSpaceName: stmt.ctSpaceName,
   ))
   plan
 
@@ -502,6 +522,28 @@ proc planDelete(stmt: Stmt, store: RaftKVStoreExt,
   plan
 
 # ---------------------------------------------------------------------------
+# Space planners
+# ---------------------------------------------------------------------------
+
+proc planCreateSpace(stmt: Stmt): Plan =
+  let plan = newPlan()
+  let value = %*{
+    "name": stmt.csSpaceName,
+    "replicas": stmt.csSpaceReplicas,
+  }
+  plan.add(PlanOp(kind: poCreateSpace,
+    cspName: stmt.csSpaceName,
+    cspReplicas: stmt.csSpaceReplicas,
+    cspValue: $value,
+  ))
+  plan
+
+proc planDropSpace(stmt: Stmt): Plan =
+  let plan = newPlan()
+  plan.add(PlanOp(kind: poDropSpace, dspName: stmt.dsSpaceName))
+  plan
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -542,6 +584,12 @@ proc planStatement*(stmt: Stmt, store: RaftKVStoreExt,
     let db = if stmt.showTablesDb.len > 0: stmt.showTablesDb else: database
     let sc = if stmt.showTablesSchema.len > 0: stmt.showTablesSchema else: schema
     plan.add(PlanOp(kind: poShowTables, stDatabase: db, stSchema: sc))
+    plan
+  of stmtCreateSpace: planCreateSpace(stmt)
+  of stmtDropSpace:   planDropSpace(stmt)
+  of stmtShowSpaces:
+    let plan = newPlan()
+    plan.add(PlanOp(kind: poShowSpaces))
     plan
   of stmtUseDatabase:
     let plan = newPlan()

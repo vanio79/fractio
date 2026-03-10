@@ -130,6 +130,9 @@ type
     stmtShowTables
     stmtUseDatabase
     stmtUseSchema
+    stmtCreateSpace
+    stmtDropSpace
+    stmtShowSpaces
     stmtBegin
     stmtCommit
     stmtRollback
@@ -144,6 +147,7 @@ type
       ctColumns*:     seq[ColDef]
       ctPrimaryKey*:  seq[string]  ## multi-column PK from table constraint
       ctReplicas*:    Option[int]  ## WITH REPLICAS = N; none → inherit from schema
+      ctSpaceName*:   Option[string]  ## IN SPACE <name>; none → default space
 
     # ---- DROP TABLE ----
     of stmtDropTable:
@@ -201,6 +205,15 @@ type
       delTable*:   string
       delAlias*:   string
       delWhere*:   Option[Expr]
+
+    # ---- SPACE ----
+    of stmtCreateSpace:
+      csSpaceName*: string
+      csSpaceReplicas*: int  ## 0 = ALL nodes
+    of stmtDropSpace:
+      dsSpaceName*: string
+    of stmtShowSpaces:
+      discard
 
     # ---- SHOW ----
     of stmtShowDatabases:

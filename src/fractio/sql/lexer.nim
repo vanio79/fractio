@@ -71,6 +71,8 @@ type
 
     # Storage / replication keywords
     tkWith       ## WITH
+    tkSpace      ## SPACE
+    tkSpaces     ## SPACES
 
     # Data type keywords
     tkTkInt      ## INT / INTEGER / BIGINT
@@ -162,6 +164,8 @@ const keywords = {
   "DATABASES":   tkDatabases,
   "SCHEMAS":     tkSchemas,
   "TABLES":      tkTables,
+  "SPACE":       tkSpace,
+  "SPACES":      tkSpaces,
   # Type aliases
   "INT":         tkTkInt,
   "INTEGER":     tkTkInt,
