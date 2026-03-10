@@ -97,6 +97,10 @@ type
     groupCommitMaxDelayNs*: int64 ## 0 → use GC_DEFAULT_MAX_DELAY_NS  (2 ms)
     writeBufferSize*: int  ## LevelDB write buffer in bytes; 0 = default (4 MB)
     blockCacheSize*: int  ## LevelDB block cache in bytes; 0 = LevelDB default (8 MB)
+    vlogMaxSize*: int64 ## Max vlog file size in bytes; 0 = default (1 GB)
+    vlogCleanThreshold*: int64 ## Garbage records to trigger vlog GC; 0 = default (100000)
+    vlogMinCleanThreshold*: int64 ## Min garbage records for manual cleanup; 0 = default (1000)
+    vlogCleanBufferSize*: int64 ## Write buffer for vlog GC in bytes; 0 = default (64 MB)
 
   TimerContext = object
     coordinator: MultiRaftCoordinator
@@ -263,7 +267,11 @@ proc newMultiRaftCoordinator*(config: CoordinatorConfig): MultiRaftCoordinator =
   let bcs = config.blockCacheSize  # 0 = use LevelDB default (8 MB)
   let storeCfg = StorageConfig(
     path: config.storagePath, createIfMissing: true, syncWrites: true,
-    writeBufferSize: wbs, blockCacheSize: bcs)
+    writeBufferSize: wbs, blockCacheSize: bcs,
+    vlogMaxSize: config.vlogMaxSize,
+    vlogCleanThreshold: config.vlogCleanThreshold,
+    vlogMinCleanThreshold: config.vlogMinCleanThreshold,
+    vlogCleanBufferSize: config.vlogCleanBufferSize)
   result.store = newWiscKeyBackend(storeCfg)
 
   if not result.store.open(storeCfg):

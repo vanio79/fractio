@@ -9,3 +9,7 @@ web-port = 9876
 [storage]
 write-buffer-size-mb = 4
 block-cache-size-mb = 8
+vlog-max-size-mb = 1024
+vlog-clean-threshold = 100000
+vlog-min-clean-threshold = 1000
+vlog-clean-buffer-size-mb = 64

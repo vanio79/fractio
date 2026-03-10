@@ -81,6 +81,10 @@ type
     webPort*: int   ## port for the HTTP management dashboard; 0 = disabled
     writeBufferSize*: int ## LevelDB write buffer in bytes; 0 = default (4 MB)
     blockCacheSize*: int ## LevelDB block cache in bytes; 0 = LevelDB default (8 MB)
+    vlogMaxSize*: int64 ## Max vlog file size in bytes; 0 = default (1 GB)
+    vlogCleanThreshold*: int64 ## Garbage records to trigger vlog GC; 0 = default (100000)
+    vlogMinCleanThreshold*: int64 ## Minimum garbage records for manual cleanup; 0 = default (1000)
+    vlogCleanBufferSize*: int64 ## Write buffer for vlog GC in bytes; 0 = default (64 MB)
 
 proc defaultServerConfig*(): ServerConfig =
   ServerConfig(
@@ -1518,6 +1522,10 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
     proposeTimeoutMs: 5000,
     writeBufferSize: server.config.writeBufferSize,
     blockCacheSize: server.config.blockCacheSize,
+    vlogMaxSize: server.config.vlogMaxSize,
+    vlogCleanThreshold: server.config.vlogCleanThreshold,
+    vlogMinCleanThreshold: server.config.vlogMinCleanThreshold,
+    vlogCleanBufferSize: server.config.vlogCleanBufferSize,
   ))
   server.raftCoord = coord
 

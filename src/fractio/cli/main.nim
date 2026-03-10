@@ -135,6 +135,10 @@ proc cmdStart(flags: Table[string, string]) =
   cfg.webPort = conf.webPort
   cfg.writeBufferSize = conf.writeBufferSizeMB * 1024 * 1024
   cfg.blockCacheSize = conf.blockCacheSizeMB * 1024 * 1024
+  cfg.vlogMaxSize = int64(conf.vlogMaxSizeMB) * 1024 * 1024
+  cfg.vlogCleanThreshold = int64(conf.vlogCleanThreshold)
+  cfg.vlogMinCleanThreshold = int64(conf.vlogMinCleanThreshold)
+  cfg.vlogCleanBufferSize = int64(conf.vlogCleanBufferSizeMB) * 1024 * 1024
   cfg.idleTimeoutSecs = 120
 
   let server = newProtocolServer(cfg)
