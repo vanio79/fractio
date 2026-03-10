@@ -199,6 +199,7 @@ type
     spacesMu*: Lock
     peerStores*: Table[uint32, RaftKVStoreExt]  ## nodeId → peer store for forwarding
     groupMembers*: Table[GroupID, seq[uint32]]   ## groupId → member nodeIds
+    preferredLeaders*: Table[GroupID, uint32]     ## groupId → preferred leader nodeId
 
 
 
@@ -213,6 +214,7 @@ proc newRaftKVStoreExt*(coord: MultiRaftCoordinator,
     tableSpaces: initTable[uint32, int](),
     peerStores: initTable[uint32, RaftKVStoreExt](),
     groupMembers: initTable[GroupID, seq[uint32]](),
+    preferredLeaders: initTable[GroupID, uint32](),
   )
   initLock(result.smMu)
   initLock(result.spacesMu)
@@ -261,6 +263,7 @@ proc loadGroupMembers*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
   release(store.smMu)
 
   store.groupMembers.clear()
+  store.preferredLeaders.clear()
   for (k, v) in entries:
     {.cast(raises: []).}:
       try:
@@ -271,6 +274,10 @@ proc loadGroupMembers*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
           for r in j["replicas"]:
             members.add(uint32(r["nodeId"].getInt()))
         store.groupMembers[gid] = members
+        if j.hasKey("preferredLeader"):
+          let pl = uint32(j["preferredLeader"].getInt())
+          if pl > 0:
+            store.preferredLeaders[gid] = pl
       except:
         discard
 
@@ -372,6 +379,15 @@ proc wireApplyCallback*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
   ## on the cast-from-pointer local, since the cast does not transfer ownership.
   {.cast(gcsafe).}: {.cast(raises: []).}:
     multigroup_coordinator.applyBatchCallback = applyBatchToSM
+    multigroup_coordinator.getPreferredLeaderCallback = proc(
+        storePtr: pointer,
+        groupId: GroupID): Option[NodeID] {.gcsafe, raises: [].} =
+      let s = cast[RaftKVStoreExt](storePtr)
+      let pl = s.preferredLeaders.getOrDefault(groupId, 0'u32)
+      if pl > 0:
+        result = some(NodeID(pl))
+      else:
+        result = none(NodeID)
   store.coordinator.kvStorePtr = cast[pointer](store)
 
 proc bootstrapStore*(store: RaftKVStoreExt,

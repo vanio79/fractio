@@ -119,6 +119,11 @@ type
     votesGranted*: HashSet[ReplicaID]
     lastHeartbeat*: Atomic[int64] # nanoseconds
 
+    # Preferred leader rebalancing cooldown (nanoseconds since epoch).
+    # Prevents step-down → re-election cycling when preferred leader keeps
+    # losing elections.
+    lastPreferredLeaderStepdownNs*: Atomic[int64]
+
     # Thread safety
     lock*: Lock
 
@@ -244,6 +249,7 @@ proc newRaftGroup*(groupId: GroupID, nodeId: NodeID,
   # A follower that just joined needs a full electionTimeout before it starts
   # its first election, giving the existing leader time to send a heartbeat.
   result.lastHeartbeat.store(nowNs())
+  result.lastPreferredLeaderStepdownNs.store(0)
 
   # Initialize leader state
   for rep in descriptor.replicas:

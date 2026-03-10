@@ -173,6 +173,8 @@ proc timerProc(ctx: TimerContext) {.thread.}
 proc shardWorkerProc(statePtr: ptr ShardWorkerState) {.thread.}
 proc getGroup*(c: MultiRaftCoordinator, groupId: GroupID): Option[
     RaftGroup] {.gcsafe.}
+proc transferLeadership*(c: MultiRaftCoordinator, groupId: GroupID,
+    targetNodeId: NodeID): bool
 
 # ============================================================================
 # Internal helpers
@@ -199,6 +201,13 @@ proc saveGroupState(c: MultiRaftCoordinator, group: RaftGroup,
 # Breaks the coordinator → raft_store → coordinator circular import.
 var applyBatchCallback*: proc(storePtr: pointer, rid: GroupID,
     batch: WriteBatch) {.gcsafe, raises: [].} = nil
+
+# Module-level callback set by raft_store to look up preferred leaders.
+# Breaks the coordinator → raft_store → coordinator circular import.
+var getPreferredLeaderCallback*: proc(storePtr: pointer,
+    groupId: GroupID): Option[NodeID] {.gcsafe, raises: [].} = nil
+
+const PREFERRED_LEADER_STEPDOWN_COOLDOWN_NS* = 10_000_000_000'i64 # 10 seconds
 
 proc applyUpTo*(c: MultiRaftCoordinator, groupId: GroupID,
     group: RaftGroup, upToIndex: uint64) {.gcsafe.} =
@@ -950,6 +959,19 @@ proc timerProc(ctx: TimerContext) {.thread.} =
             logsCopy = c.logs
           c.transport.heartbeatFn(groupsCopy, logsCopy)
 
+        # Preferred leader rebalancing: if we're leader but not the preferred
+        # leader, and the cooldown has elapsed, step down so the preferred
+        # leader can win the next election.
+        {.cast(gcsafe).}:
+          if c.kvStorePtr != nil and getPreferredLeaderCallback != nil:
+            let prefOpt = getPreferredLeaderCallback(c.kvStorePtr, rid)
+            if prefOpt.isSome:
+              let prefNodeId = prefOpt.get
+              if prefNodeId != group.nodeId:
+                let sinceStepdown = nowNs() - group.lastPreferredLeaderStepdownNs.load()
+                if sinceStepdown >= PREFERRED_LEADER_STEPDOWN_COOLDOWN_NS:
+                  discard c.transferLeadership(rid, prefNodeId)
+
       of rsFollower, rsCandidate:
         let elapsed = group.timeSinceHeartbeat()
         # Deterministic jitter to spread election timeouts and avoid split votes.
@@ -960,7 +982,18 @@ proc timerProc(ctx: TimerContext) {.thread.} =
         let hashVal = (group.nodeId.uint64 * 2654435761'u64 +
                        group.groupId.uint64 * 2246822519'u64) and 0xFFFF_FFFF'u64
         let jitterNs = int64(hashVal mod uint64(c.electionTimeoutNs))
-        let effectiveTimeout = c.electionTimeoutNs + jitterNs
+
+        # Preferred leaders get shorter election timeout to win elections faster
+        var isPreferredLeader = false
+        {.cast(gcsafe).}:
+          if c.kvStorePtr != nil and getPreferredLeaderCallback != nil:
+            let prefOpt = getPreferredLeaderCallback(c.kvStorePtr, rid)
+            if prefOpt.isSome and prefOpt.get == group.nodeId:
+              isPreferredLeader = true
+
+        var effectiveTimeout = c.electionTimeoutNs + jitterNs
+        if isPreferredLeader:
+          effectiveTimeout = effectiveTimeout div 2
 
         if elapsed >= effectiveTimeout:
           {.cast(gcsafe).}:
@@ -1022,3 +1055,31 @@ proc getLeaderCount*(c: MultiRaftCoordinator): int =
 proc getGroupCount*(c: MultiRaftCoordinator): int =
   withLock c.groupsLock:
     result = c.groups.len
+
+proc transferLeadership*(c: MultiRaftCoordinator, groupId: GroupID,
+    targetNodeId: NodeID): bool =
+  ## If the local node is leader for `groupId` and `targetNodeId` is a
+  ## different node in the group's replicas, step down so the target can
+  ## win the subsequent election.  Returns true if the step-down was performed.
+  let groupOpt = c.getGroup(groupId)
+  if groupOpt.isNone: return false
+  let group = groupOpt.get
+  if not group.isLeader(): return false
+  if group.nodeId == targetNodeId: return false
+
+  # Verify target is a member
+  var targetIsMember = false
+  for rep in group.descriptor.replicas:
+    if rep.nodeId == targetNodeId:
+      targetIsMember = true
+      break
+  if not targetIsMember: return false
+
+  group.becomeFollower(group.getTerm())
+  group.lastPreferredLeaderStepdownNs.store(nowNs())
+  {.cast(gcsafe).}:
+    var fields = initTable[string, string]()
+    fields["groupId"] = $groupId
+    fields["targetNodeId"] = $targetNodeId
+    info("Stepped down for preferred leader", fields)
+  true
