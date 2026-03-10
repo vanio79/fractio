@@ -90,14 +90,14 @@ suite "Lexicographic Ordering":
     check k2 < k3
 
   test "meta range end key sorts correctly":
-    # All system table keys (1-6) must sort before META_RANGE_END_KEY
+    # All meta range table keys (1-7) must sort before META_RANGE_END_KEY
     for id in 1'u32 .. MAX_META_RANGE_TABLE_ID:
       let key = encodeTableKey(id, "\xFF\xFF\xFF\xFF") # worst case primary key
       check key < META_RANGE_END_KEY
 
-    # Table 7 onwards should sort >= META_RANGE_END_KEY
-    let key7 = encodeTableKey(7, "")
-    check key7 >= META_RANGE_END_KEY
+    # Table 8 onwards should sort >= META_RANGE_END_KEY
+    let key8 = encodeTableKey(MAX_META_RANGE_TABLE_ID + 1, "")
+    check key8 >= META_RANGE_END_KEY
 
 suite "Key Classification":
   test "isTableKey":
@@ -117,7 +117,8 @@ suite "Key Classification":
   test "isMetaRangeKey for table keys":
     check isMetaRangeKey(encodeTableKey(1, "db"))
     check isMetaRangeKey(encodeTableKey(6, "setting"))
-    check not isMetaRangeKey(encodeTableKey(7, "x"))
+    check isMetaRangeKey(encodeTableKey(7, "space"))  # SYS_SPACES_TABLE_ID
+    check not isMetaRangeKey(encodeTableKey(8, "x"))
     check not isMetaRangeKey(encodeTableKey(10, "metric"))
     check not isMetaRangeKey(encodeTableKey(100, "user"))
 
