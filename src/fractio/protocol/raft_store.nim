@@ -344,10 +344,17 @@ proc raftPut*(store: RaftKVStoreExt, key, value: string): RSResult[
     RaftKVEntry] {.gcsafe, raises: [].}
 proc lookupNodeInfo*(store: RaftKVStoreExt,
     nodeId: uint32): Option[NodeInfo] {.gcsafe, raises: [].}
+proc loadSpaces*(store: RaftKVStoreExt) {.gcsafe, raises: [].}
+proc loadTableSpaces*(store: RaftKVStoreExt) {.gcsafe, raises: [].}
 
 # ---------------------------------------------------------------------------
 # Follower apply callback (called by coordinator on committed entries)
 # ---------------------------------------------------------------------------
+
+# Module-level callback for refreshing space/table caches when metadata
+# changes replicate.  Set in wireApplyCallback to avoid forward-reference
+# issues (loadSpaces/loadTableSpaces are defined later in this file).
+var onSpaceMetadataChanged*: proc(storePtr: pointer) {.gcsafe, raises: [].}
 
 proc applyBatchToSM*(storePtr: pointer, rid: GroupID,
     batch: WriteBatch) {.gcsafe, raises: [].} =
@@ -386,12 +393,28 @@ proc applyBatchToSM*(storePtr: pointer, rid: GroupID,
 
   # --- Notify on sys.groups metadata changes (peer group creation) ---
   let groupsPrefix = "/t/" & align($SYS_GROUPS_TABLE_ID, 10, '0') & "/"
+  let spacesPrefix = "/t/" & align($SYS_SPACES_TABLE_ID, 10, '0') & "/"
+  let tablesPrefix = "/t/" & align($SYS_TABLES_TABLE_ID, 10, '0') & "/"
+  var refreshSpaceCache = false
   for (k, v) in batch.puts:
     let key = fromBytes(k)
     if key.startsWith(groupsPrefix):
       {.cast(gcsafe).}:
         if onGroupMetadataApplied != nil:
           onGroupMetadataApplied(storePtr, key, fromBytes(v))
+      refreshSpaceCache = true
+    elif key.startsWith(spacesPrefix) or key.startsWith(tablesPrefix):
+      refreshSpaceCache = true
+  # Refresh space/table/leader caches when metadata changes replicate
+  if refreshSpaceCache and storePtr != nil:
+    let s = cast[RaftKVStoreExt](storePtr)
+    # loadGroupMembers is defined before applyBatchToSM, so call it directly.
+    s.loadGroupMembers()
+    # loadSpaces/loadTableSpaces are defined later; use onSpaceMetadataChanged
+    # callback (set in wireApplyCallback) to avoid forward-reference issues.
+    {.cast(gcsafe).}:
+      if onSpaceMetadataChanged != nil:
+        onSpaceMetadataChanged(storePtr)
 
 proc wireApplyCallback*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
   ## Wire the applyBatchToSM callback into the coordinator so that committed
@@ -458,6 +481,13 @@ proc wireApplyCallback*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
                 s.preferredLeaders[gid] = pl
         except:
           discard
+
+    # --- Refresh space/table caches when metadata replicates ---
+    onSpaceMetadataChanged = proc(storePtr: pointer) {.gcsafe, raises: [].} =
+      if storePtr == nil: return
+      let s = cast[RaftKVStoreExt](storePtr)
+      s.loadSpaces()
+      s.loadTableSpaces()
 
     # --- Track data group leader from AE heartbeats ---
     multigroup_transport.onDataGroupLeaderSeen = proc(
