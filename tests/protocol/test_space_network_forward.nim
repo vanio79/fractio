@@ -19,6 +19,7 @@ import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
 import fractio/protocol/raft_store
+import fractio/protocol/server
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -30,6 +31,8 @@ const
   NODE_COUNT = 3
   SPACE_GROUP_START = 10'u64  # space groups 10, 11, 12
 
+var nextClientPort = 9100  ## incremented per node to avoid port conflicts between tests
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -37,6 +40,8 @@ const
 type
   TestNode = object
     id*: int
+    clientPort*: int
+    server*: ProtocolServer
     coord*: MultiRaftCoordinator
     store*: RaftKVStoreExt
     rgt*: RaftGroupTransport
@@ -103,23 +108,36 @@ proc makeNode(nodeNum: int, peerNums: seq[int]): TestNode =
   for i in 0 ..< NODE_COUNT:
     discard store.getOrCreateSM(GroupID(SPACE_GROUP_START + uint64(i)))
 
+  let cPort = nextClientPort
+  nextClientPort += 1
+
+  var cfg = defaultServerConfig()
+  cfg.host = "127.0.0.1"
+  cfg.port = cPort
+  cfg.serverId = uint16(nodeNum)
+  cfg.dataDir = storagePath
+  let srv = newProtocolServer(cfg)
+  srv.raftStore = store
+  srv.raftCoord = coord
+  srv.raftTransport = rgt
+
   TestNode(
-    id: nodeNum, coord: coord, store: store,
+    id: nodeNum, clientPort: cPort, server: srv, coord: coord, store: store,
     rgt: rgt, storagePath: storagePath,
   )
 
-proc seedSysNodes(leaderStore: RaftKVStoreExt, nodeNums: seq[int]) =
-  for num in nodeNums:
-    let key = encodeTableKey(SYS_NODES_TABLE_ID, $num)
+proc seedSysNodes(leaderStore: RaftKVStoreExt, nodes: seq[TestNode]) =
+  for n in nodes:
+    let key = encodeTableKey(SYS_NODES_TABLE_ID, $n.id)
     let val = $ %*{
-      "nodeId": num,
+      "nodeId": n.id,
       "host": "127.0.0.1",
-      "raftPort": raftPort(num),
-      "clientPort": 9000 + num,
+      "raftPort": raftPort(n.id),
+      "clientPort": n.clientPort,
       "status": 1,
     }
     let r = leaderStore.raftPut(key, val)
-    doAssert r.isOk, "failed to seed sys.nodes for node " & $num
+    doAssert r.isOk, "failed to seed sys.nodes for node " & $n.id
 
 proc seedSysGroups(leaderStore: RaftKVStoreExt, nodeNums: seq[int]) =
   for gid in [META_GROUP_ID, DATA_GROUP_START_ID]:
@@ -163,12 +181,6 @@ proc seedSpaceAndTable(store: RaftKVStoreExt, spaceId: int, tableId: uint32) =
   store.loadSpaces()
   store.loadTableSpaces()
 
-proc wirePeerStores(nodes: seq[TestNode]) =
-  for i in 0 ..< nodes.len:
-    for j in 0 ..< nodes.len:
-      if i != j:
-        nodes[i].store.addPeerStore(uint32(nodes[j].id), nodes[j].store)
-
 proc makeCluster3(): seq[TestNode] =
   let allNums = @[1, 2, 3]
   var nodes: seq[TestNode]
@@ -180,6 +192,7 @@ proc makeCluster3(): seq[TestNode] =
 
   for n in nodes:
     n.coord.start()
+    n.server.start()
 
   # Force node 1 as leader for meta + data groups
   for groupId in [META_GROUP_ID, DATA_GROUP_START_ID]:
@@ -197,7 +210,7 @@ proc makeCluster3(): seq[TestNode] =
 
   sleep(400)
 
-  seedSysNodes(nodes[0].store, allNums)
+  seedSysNodes(nodes[0].store, nodes)
   seedSysGroups(nodes[0].store, allNums)
   seedSpaceAndTable(nodes[0].store, 2, 100)
   sleep(200)
@@ -207,13 +220,14 @@ proc makeCluster3(): seq[TestNode] =
     n.store.loadSpaces()
     n.store.loadTableSpaces()
 
-  wirePeerStores(nodes)
   nodes
 
 proc stopCluster(nodes: seq[TestNode]) =
-  for n in nodes:
-    n.coord.stop()
-    cleanDir(n.storagePath)
+  # Stop in reverse order to minimize heartbeat timeouts to dead peers.
+  for i in countdown(nodes.high, 0):
+    nodes[i].server.stop()
+    nodes[i].coord.stop()
+    cleanDir(nodes[i].storagePath)
 
 proc spaceInfo(): SpaceInfo =
   let groupIds = @[SPACE_GROUP_START, SPACE_GROUP_START + 1, SPACE_GROUP_START + 2]

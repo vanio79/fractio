@@ -62,6 +62,7 @@ type
         idx: uint64) {.gcsafe, raises: [].}
     saveState*: proc(rid: GroupID, g: RaftGroup,
         log: RaftLog) {.gcsafe, raises: [].}
+    getKvStorePtr*: proc(): pointer {.gcsafe, raises: [].}  ## live back-reference
 
   ## Abstract transport vtable — filled in by multigroup_transport after create.
   MultiRaftTransport* = ref object
@@ -217,6 +218,11 @@ var getPreferredLeaderCallback*: proc(storePtr: pointer,
 # Allows peer nodes to create Raft groups at runtime when metadata replicates.
 var onGroupMetadataApplied*: proc(storePtr: pointer,
     groupKey: string, groupValue: string) {.gcsafe, raises: [].} = nil
+
+# Module-level callback fired when a node wins an election (becomes leader).
+# Used by raft_store to persist the leader in sys.groups.
+var onLeaderChanged*: proc(storePtr: pointer, groupId: GroupID,
+    leaderNodeId: NodeID) {.gcsafe, raises: [].} = nil
 
 const PREFERRED_LEADER_STEPDOWN_COOLDOWN_NS* = 10_000_000_000'i64 # 10 seconds
 
@@ -452,6 +458,8 @@ proc start*(c: MultiRaftCoordinator) =
       getLog: coordGetLog,
       applyUpTo: coordApplyUpTo,
       saveState: coordSaveState,
+      getKvStorePtr: proc(): pointer {.gcsafe, raises: [].} =
+        cast[MultiRaftCoordinator](cPtr).kvStorePtr,
     )
     c.transport.startFn(acc)
 
@@ -525,8 +533,8 @@ proc stop*(c: MultiRaftCoordinator) =
   c.proposalCh.close()
 
   if c.transport != nil:
-    # Join timer thread BEFORE stopping transports so the timer thread can
-    # finish its current election/heartbeat cycle without hitting closed sockets.
+    # The timer thread checks c.running (set to false above) and bails early
+    # from sendHeartbeats/elections. Join it, then stop the transport.
     if c.timerRunning.load():
       joinThread(c.timerThread)
       c.timerRunning.store(false)
@@ -964,6 +972,7 @@ proc timerProc(ctx: TimerContext) {.thread.} =
         groupSnap.add((rid, g))
 
     for (rid, group) in groupSnap:
+      if not c.running.load: break  # bail during shutdown
       let logOpt = c.getLog(rid)
       if logOpt.isNone: continue
       let log = logOpt.get
@@ -1010,9 +1019,23 @@ proc timerProc(ctx: TimerContext) {.thread.} =
             if prefOpt.isSome and prefOpt.get == group.nodeId:
               isPreferredLeader = true
 
+        # Preferred leaders get shorter election timeout (half) to win faster.
+        # Non-preferred nodes get 5x timeout to avoid competing with the
+        # preferred leader.  If the preferred leader is truly dead, the
+        # non-preferred node will still eventually time out and run.
+        var hasPreferredLeader = false
+        {.cast(gcsafe).}:
+          if c.kvStorePtr != nil and getPreferredLeaderCallback != nil:
+            let prefOpt = getPreferredLeaderCallback(c.kvStorePtr, rid)
+            if prefOpt.isSome:
+              hasPreferredLeader = true
+
         var effectiveTimeout = c.electionTimeoutNs + jitterNs
         if isPreferredLeader:
           effectiveTimeout = effectiveTimeout div 2
+        elif hasPreferredLeader:
+          # A different node is preferred for this group — back off heavily.
+          effectiveTimeout = effectiveTimeout * 5
 
         if elapsed >= effectiveTimeout:
           {.cast(gcsafe).}:
@@ -1029,6 +1052,10 @@ proc timerProc(ctx: TimerContext) {.thread.} =
               fields["term"] = $group.getTerm()
               info("Won election, became leader", fields)
             c.saveGroupState(group, log)
+            # Notify raft_store that this node became leader for this group
+            {.cast(gcsafe).}:
+              if c.kvStorePtr != nil and onLeaderChanged != nil:
+                onLeaderChanged(c.kvStorePtr, rid, group.nodeId)
             # Send immediate no-op heartbeat to establish leadership
             var groupsCopy: Table[GroupID, RaftGroup]
             var logsCopy: Table[GroupID, RaftLog]
@@ -1095,6 +1122,9 @@ proc transferLeadership*(c: MultiRaftCoordinator, groupId: GroupID,
   if not targetIsMember: return false
 
   group.becomeFollower(group.getTerm())
+  # Reset heartbeat timer so we don't immediately start a new election.
+  # This gives the preferred leader time to win with its shorter timeout.
+  group.updateHeartbeat()
   group.lastPreferredLeaderStepdownNs.store(nowNs())
   {.cast(gcsafe).}:
     var fields = initTable[string, string]()

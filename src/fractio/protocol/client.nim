@@ -351,6 +351,45 @@ proc kvDelete*(client: ProtocolClient, key: string,
   if r.isErr: return peErr(r.error)
   decodeDeleteResponse(r.value.payload)
 
+proc kvGetInGroup*(client: ProtocolClient, key: string,
+    groupId: uint64,
+    flags: uint8 = 0, txnId: uint64 = 0,
+    readTimestamp: uint64 = 0): Result[GetResponse, ProtocolError] {.gcsafe,
+    raises: [].} =
+  ## Send a Get request routed to a specific Raft group.
+  let req = GetRequest(flags: flags, txnId: txnId,
+                       readTimestamp: readTimestamp, key: key,
+                       groupId: groupId)
+  let r = client.send(encodeGetRequest(req))
+  if r.isErr: return peErr(r.error)
+  decodeGetResponse(r.value.payload)
+
+proc kvPutInGroup*(client: ProtocolClient, key: string, value: string,
+    groupId: uint64,
+    flags: uint8 = 0, txnId: uint64 = 0,
+    expectedVersion: uint64 = 0): Result[PutResponse, ProtocolError] {.gcsafe,
+    raises: [].} =
+  ## Send a Put request routed to a specific Raft group.
+  let req = PutRequest(flags: flags, txnId: txnId,
+                       expectedVersion: expectedVersion,
+                       key: key, value: value,
+                       groupId: groupId)
+  let r = client.send(encodePutRequest(req))
+  if r.isErr: return peErr(r.error)
+  decodePutResponse(r.value.payload)
+
+proc kvDeleteInGroup*(client: ProtocolClient, key: string,
+    groupId: uint64,
+    flags: uint8 = 0,
+    txnId: uint64 = 0): Result[DeleteResponse, ProtocolError] {.gcsafe,
+    raises: [].} =
+  ## Send a Delete request routed to a specific Raft group.
+  let req = DeleteRequest(flags: flags, txnId: txnId, key: key,
+                          groupId: groupId)
+  let r = client.send(encodeDeleteRequest(req))
+  if r.isErr: return peErr(r.error)
+  decodeDeleteResponse(r.value.payload)
+
 proc kvBatch*(client: ProtocolClient,
     req: BatchRequest): Result[BatchResponse, ProtocolError] {.gcsafe,
     raises: [].} =

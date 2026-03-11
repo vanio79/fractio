@@ -34,7 +34,14 @@ import fractio/distributed/network/connection_manager
 import fractio/distributed/network/network_raft_node
 import fractio/distributed/network/raft_transport
 import fractio/distributed/network/serialization
+import fractio/distributed/meta/system_tables
 import fractio/core/types as coreTypes
+
+# Module-level callback fired when a follower sees the data group leader
+# via AppendEntries heartbeats. Used by raft_store to track the data group
+# leader nodeId for forwarding leader-change writes.
+var onDataGroupLeaderSeen*: proc(storePtr: pointer,
+    leaderNodeId: uint32) {.gcsafe, raises: [].} = nil
 
 # ============================================================================
 # NodeID translation
@@ -46,9 +53,13 @@ proc toNetNodeID*(id: rangeTypes.NodeID): coreTypes.NodeID {.inline.} =
 
 proc toNodeID*(id: coreTypes.NodeID): rangeTypes.NodeID {.inline.} =
   ## core/types.NodeID (distinct string) → group_types.NodeID (distinct uint32)
+  ## Handles both "rn_N" (multigroup layer) and "raft_N" (network layer) formats.
   let s = string(id)
   if s.startsWith("rn_"):
     try: return rangeTypes.NodeID(uint32(parseInt(s[3..^1])))
+    except: discard
+  elif s.startsWith("raft_"):
+    try: return rangeTypes.NodeID(uint32(parseInt(s[5..^1])))
     except: discard
   rangeTypes.NodeID(0)
 
@@ -105,7 +116,7 @@ proc newRaftGroupTransport*(localNodeId: rangeTypes.NodeID,
   # the coordinator worker thread is saturated and responses are delayed.
   # 800ms was too aggressive — caused intermittent quorum failures under load.
   netCfg.tcpConnectTimeoutMs = 300
-  netCfg.tcpReadTimeoutMs = 5000
+  netCfg.tcpReadTimeoutMs = 2000
   netCfg.tcpWriteTimeoutMs = 500
 
   # Register peers in the NetworkConfig so the connection manager knows them.
@@ -502,6 +513,11 @@ proc sendHeartbeats*(t: RaftGroupTransport,
   ## to each peer replica. Uses per-peer nextIndex to include missing
   ## entries so lagging followers catch up during heartbeats.
   for groupId, group in groups:
+    # Check if the coordinator is shutting down — bail early to avoid
+    # blocking on dead-peer heartbeats during stop().
+    if t.coordinator != nil:
+      let coord = cast[MultiRaftCoordinator](t.coordinator)
+      if not coord.running.load(): return
     if not group.isLeader(): continue
 
     let rawTerm = group.currentTerm.load()
@@ -514,6 +530,9 @@ proc sendHeartbeats*(t: RaftGroupTransport,
 
     let voters = group.descriptor.getVoters()
     for rep in voters:
+      if t.coordinator != nil:
+        let coord = cast[MultiRaftCoordinator](t.coordinator)
+        if not coord.running.load(): return
       if rep.nodeId == t.localNodeId: continue
       let tid = int32(rep.nodeId.uint32)
 
@@ -623,8 +642,33 @@ proc setupIncomingHandlers*(t: RaftGroupTransport,
       withLock group.lock:
         let myTerm = group.currentTerm.load()
 
-        # Step down on higher term
-        if term > myTerm:
+        let candidateId = toNodeID(msg.candidateId)
+        let candidateRepId = block:
+          var rid2 = rangeTypes.ReplicaID(0)
+          for rep in group.descriptor.replicas:
+            if rep.nodeId == candidateId:
+              rid2 = rep.replicaId
+              break
+          rid2
+
+        # Preferred leader protection: if a preferred leader is configured
+        # for this group and the candidate is NOT the preferred leader,
+        # refuse the vote AND don't step down.  Without this, a non-preferred
+        # node's higher-term RV would force the preferred leader to step down,
+        # causing needless re-elections and term inflation.
+        var preferredBlock = false
+        {.cast(gcsafe).}:
+          let storePtr = acc.getKvStorePtr()
+          if storePtr != nil and getPreferredLeaderCallback != nil:
+            let prefOpt = getPreferredLeaderCallback(storePtr, rid)
+            if prefOpt.isSome and prefOpt.get != candidateId:
+              preferredBlock = true
+
+        # Step down on higher term — but only if not blocked by preferred
+        # leader protection.  This is safe because the non-preferred node
+        # can never win elections (all voters block it), so there's no
+        # split-brain risk from ignoring its higher term.
+        if term > myTerm and not preferredBlock:
           group.state.store(rsFollower)
           group.currentTerm.store(term)
           group.votedFor.store(rangeTypes.ReplicaID(0))
@@ -638,22 +682,13 @@ proc setupIncomingHandlers*(t: RaftGroupTransport,
             let e = log.getEntry(myLastIdx)
             if e.isSome: e.get.term else: 0'u64
 
-        let candidateId = toNodeID(msg.candidateId)
-        let candidateRepId = block:
-          var rid2 = rangeTypes.ReplicaID(0)
-          for rep in group.descriptor.replicas:
-            if rep.nodeId == candidateId:
-              rid2 = rep.replicaId
-              break
-          rid2
-
         let logOK = (msg.lastLogTerm > myLastTerm) or
                     (msg.lastLogTerm == myLastTerm and
                      msg.lastLogIndex >= myLastIdx)
-        let voteOK = term >= curTerm and
-                     (votedFor.uint32 == 0 or
-                      votedFor == candidateRepId) and
-                     logOK
+        let termOK = term >= curTerm
+        let voteAvail = votedFor.uint32 == 0 or votedFor == candidateRepId
+
+        let voteOK = termOK and voteAvail and logOK and not preferredBlock
 
         if voteOK:
           group.votedFor.store(candidateRepId)
@@ -709,6 +744,24 @@ proc setupIncomingHandlers*(t: RaftGroupTransport,
           group.votedFor.store(rangeTypes.ReplicaID(0))
         group.state.store(rsFollower)
         group.updateHeartbeat()
+
+        # Track data group leader from AE heartbeats
+        if rid == DATA_GROUP_START_ID:
+          # msg.header.sourceNodeId is a coreTypes.NodeID ("raft_<N>")
+          # Parse the numeric suffix directly to get the uint32 nodeId
+          let srcStr = string(msg.header.sourceNodeId)
+          var leaderNid: uint32 = 0
+          if srcStr.startsWith("raft_"):
+            try: leaderNid = uint32(parseInt(srcStr[5..^1]))
+            except: discard
+          elif srcStr.startsWith("rn_"):
+            try: leaderNid = uint32(parseInt(srcStr[3..^1]))
+            except: discard
+          if leaderNid > 0:
+            {.cast(gcsafe).}:
+              let storePtr = acc.getKvStorePtr()
+              if onDataGroupLeaderSeen != nil and storePtr != nil:
+                onDataGroupLeaderSeen(storePtr, leaderNid)
 
         let curTerm = group.currentTerm.load()
 

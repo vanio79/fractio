@@ -573,31 +573,18 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
                     var members = newJArray()
                     if groupDescs.hasKey(gid):
                       let desc = groupDescs[gid]
+                      # Read persisted leader from sys.groups record
+                      let leaderNid = desc.getOrDefault("leader").getInt(0)
                       if desc.hasKey("replicas"):
                         for rep in desc["replicas"]:
                           let nid = rep.getOrDefault("nodeId").getInt(0)
-                          # Determine role: check local raft group state
-                          var role = "follower"
-                          let grpOpt = srv.raftStore.coordinator.getGroup(GroupID(gid))
-                          if grpOpt.isSome:
-                            let grp = grpOpt.get
-                            if grp.isLeader():
-                              # This node is the leader — mark it
-                              if nid == srv.config.serverId.int:
-                                role = "leader"
-                              else:
-                                role = "follower"
-                            else:
-                              # Not leader locally — use first replica as heuristic
-                              if desc["replicas"].len > 0 and
-                                  desc["replicas"][0].getOrDefault("nodeId").getInt(0) == nid:
-                                role = "leader"
-                              else:
-                                role = "follower"
-                          else:
-                            # Group not local — first replica is likely the leader
-                            if desc["replicas"].len > 0 and
-                                desc["replicas"][0].getOrDefault("nodeId").getInt(0) == nid:
+                          var role = if nid == leaderNid and leaderNid > 0: "leader"
+                                     else: "follower"
+                          # Fallback: if no persisted leader, check local Raft state
+                          if leaderNid == 0:
+                            let grpOpt = srv.raftStore.coordinator.getGroup(GroupID(gid))
+                            if grpOpt.isSome and grpOpt.get.isLeader() and
+                                nid == srv.config.serverId.int:
                               role = "leader"
                           members.add(%* {"nodeId": nid, "role": role})
                     groupObj["members"] = members

@@ -782,7 +782,11 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
       if (req.flags and PutFlagReturnPrev) != 0:
         let pr = server.raftStore.raftGet(req.key)
         if pr.isOk: prevEntry = pr.value
-      let wr = server.raftStore.raftPut(req.key, req.value)
+      let wr = if req.groupId != 0:
+                 server.raftStore.raftPutInGroup(req.key, req.value,
+                     GroupID(req.groupId))
+               else:
+                 server.raftStore.raftPut(req.key, req.value)
       if not wr.isOk:
         if wr.error.kind == rseNotLeader:
           sendError(conn, requestId, ErrNotLeader, ErrCatKV,
@@ -854,7 +858,11 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
           status: DelStatusDeleted)), requestId)
         return
       # Non-transactional delete
-      let dr = server.raftStore.raftDelete(req.key)
+      let dr = if req.groupId != 0:
+                 server.raftStore.raftDeleteInGroupExplicit(req.key,
+                     GroupID(req.groupId))
+               else:
+                 server.raftStore.raftDelete(req.key)
       if not dr.isOk:
         if dr.error.kind == rseNotLeader:
           sendError(conn, requestId, ErrNotLeader, ErrCatKV,

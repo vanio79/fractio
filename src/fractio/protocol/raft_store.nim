@@ -35,8 +35,10 @@ import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/raft/state_machine
 import fractio/distributed/meta/system_tables
+import fractio/distributed/raft/multigroup_transport
 import fractio/storage/wisckey_backend
 import fractio/storage/backend
+import fractio/protocol/client
 import ../utils/logging
 
 # ---------------------------------------------------------------------------
@@ -198,10 +200,11 @@ type
     spaces*: Table[int, SpaceInfo]  ## spaceId → SpaceInfo
     tableSpaces*: Table[uint32, int] ## tableId → spaceId
     spacesMu*: Lock
-    peerStores*: Table[uint32, RaftKVStoreExt]  ## nodeId → peer store for forwarding
     groupMembers*: Table[GroupID, seq[uint32]]   ## groupId → member nodeIds
     preferredLeaders*: Table[GroupID, uint32]     ## groupId → preferred leader nodeId
     nodeInfoCache*: Table[uint32, NodeInfo]       ## nodeId → (host, clientPort) for forwarding
+    dataGroupLeaderNodeId*: Atomic[uint32]         ## tracked from AE heartbeats for forwarding
+    groupLeaders*: Table[GroupID, uint32]           ## groupId → leader nodeId from sys.groups
 
 
 
@@ -214,10 +217,10 @@ proc newRaftKVStoreExt*(coord: MultiRaftCoordinator,
     stateMachines: initTable[GroupID, KVStateMachine](),
     spaces: initTable[int, SpaceInfo](),
     tableSpaces: initTable[uint32, int](),
-    peerStores: initTable[uint32, RaftKVStoreExt](),
     groupMembers: initTable[GroupID, seq[uint32]](),
     preferredLeaders: initTable[GroupID, uint32](),
     nodeInfoCache: initTable[uint32, NodeInfo](),
+    groupLeaders: initTable[GroupID, uint32](),
   )
   initLock(result.smMu)
   initLock(result.spacesMu)
@@ -279,12 +282,6 @@ proc registerGroup*(store: RaftKVStoreExt,
   ## Pre-create a state machine for the given group.
   discard store.getOrCreateSM(groupId)
 
-proc addPeerStore*(store: RaftKVStoreExt, nodeId: uint32,
-    peer: RaftKVStoreExt) {.gcsafe, raises: [].} =
-  ## Register a peer node's store for forwarding writes/reads to groups
-  ## that this node doesn't own.
-  store.peerStores[nodeId] = peer
-
 proc getBackend*(store: RaftKVStoreExt): WiscKeyBackend {.inline.} =
   ## Return the WiscKey backend from the coordinator's store.
   store.coordinator.store
@@ -301,6 +298,7 @@ proc loadGroupMembers*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
 
   store.groupMembers.clear()
   store.preferredLeaders.clear()
+  store.groupLeaders.clear()
   for (k, v) in entries:
     {.cast(raises: []).}:
       try:
@@ -315,32 +313,12 @@ proc loadGroupMembers*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
           let pl = uint32(j["preferredLeader"].getInt())
           if pl > 0:
             store.preferredLeaders[gid] = pl
+        if j.hasKey("leader"):
+          let ldr = uint32(j["leader"].getInt())
+          if ldr > 0:
+            store.groupLeaders[gid] = ldr
       except:
         discard
-
-proc findPeerForGroup(store: RaftKVStoreExt,
-    groupId: GroupID): Option[RaftKVStoreExt] {.gcsafe, raises: [].} =
-  ## Find a peer store that owns the given group.
-  ## Prefers a peer whose coordinator has the group and is leader.
-  if not store.groupMembers.hasKey(groupId):
-    return none(RaftKVStoreExt)
-  let members = store.groupMembers.getOrDefault(groupId)
-  {.cast(raises: []).}:
-    # First pass: find a peer that is the leader for this group
-    for nid in members:
-      if store.peerStores.hasKey(nid):
-        let peer = store.peerStores.getOrDefault(nid)
-        if peer.coordinator.hasGroup(groupId):
-          let g = peer.coordinator.getGroup(groupId)
-          if g.isSome and g.get.isLeader():
-            return some(peer)
-    # Second pass: find any peer that has the group
-    for nid in members:
-      if store.peerStores.hasKey(nid):
-        let peer = store.peerStores.getOrDefault(nid)
-        if peer.coordinator.hasGroup(groupId):
-          return some(peer)
-  none(RaftKVStoreExt)
 
 # ---------------------------------------------------------------------------
 # Internal: propose a WriteBatch and apply to local state machine
@@ -357,6 +335,12 @@ proc fromBytes(b: seq[byte]): string {.inline.} =
   result = newString(b.len)
   for i in 0 ..< b.len:
     result[i] = char(b[i])
+
+# Forward declarations
+proc raftPut*(store: RaftKVStoreExt, key, value: string): RSResult[
+    RaftKVEntry] {.gcsafe, raises: [].}
+proc lookupNodeInfo*(store: RaftKVStoreExt,
+    nodeId: uint32): Option[NodeInfo] {.gcsafe, raises: [].}
 
 # ---------------------------------------------------------------------------
 # Follower apply callback (called by coordinator on committed entries)
@@ -471,6 +455,59 @@ proc wireApplyCallback*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
                 s.preferredLeaders[gid] = pl
         except:
           discard
+
+    # --- Track data group leader from AE heartbeats ---
+    multigroup_transport.onDataGroupLeaderSeen = proc(
+        storePtr: pointer, leaderNodeId: uint32) {.gcsafe, raises: [].} =
+      if storePtr == nil: return
+      let s = cast[RaftKVStoreExt](storePtr)
+      s.dataGroupLeaderNodeId.store(leaderNodeId)
+
+    # --- Persist leader in sys.groups when a node wins election ---
+    multigroup_coordinator.onLeaderChanged = proc(
+        storePtr: pointer, groupId: GroupID,
+        leaderNodeId: NodeID) {.gcsafe, raises: [].} =
+      if storePtr == nil: return
+      # Skip meta and data groups to avoid write loops
+      if groupId == META_GROUP_ID or groupId == DATA_GROUP_START_ID: return
+      let s = cast[RaftKVStoreExt](storePtr)
+      GC_ref(s)
+      defer: GC_unref(s)
+      {.cast(raises: []).}:
+        try:
+          let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID,
+              $uint64(groupId))
+          let backend = s.getBackend()
+          if backend == nil or not backend.isOpen: return
+          let valOpt = backend.get(groupKey)
+          if valOpt.isNone: return
+          var j = parseJson(valOpt.get())
+          j["leader"] = newJInt(int(uint32(leaderNodeId)))
+          let updated = $j
+
+          # Try local raftPut (routes to DATA_GROUP_START_ID)
+          let res = s.raftPut(groupKey, updated)
+          if res.isOk: return
+          if not res.isOk and res.error.kind == rseNotLeader:
+            # Forward to data group leader via ProtocolClient
+            let dgLeader = s.dataGroupLeaderNodeId.load()
+            if dgLeader == 0: return
+            let infoOpt = s.lookupNodeInfo(dgLeader)
+            if infoOpt.isNone: return
+            let info = infoOpt.get()
+            let cfg = ClientConfig(
+              host: info.host,
+              port: info.clientPort,
+              timeoutMs: 3000,
+            )
+            let pc = newProtocolClient(cfg)
+            let cr = pc.connect()
+            if cr.isOk:
+              discard pc.kvPut(groupKey, updated)
+              pc.disconnect()
+        except CatchableError:
+          discard
+
   store.coordinator.kvStorePtr = cast[pointer](store)
 
 proc bootstrapStore*(store: RaftKVStoreExt,
@@ -580,6 +617,41 @@ proc raftDelete*(store: RaftKVStoreExt,
   if not vr.isOk:
     return rsErr[Option[RaftKVEntry]](vr.error)
 
+  rsOk[Option[RaftKVEntry]](prevEntry)
+
+proc raftPutInGroup*(store: RaftKVStoreExt, key, value: string,
+    groupId: GroupID): RSResult[RaftKVEntry] {.gcsafe, raises: [].} =
+  ## Write `value` under `key` through Raft consensus, routed to a specific group.
+  ## Used by the protocol server for group-routed forwarded requests.
+  let batch = newWriteBatch()
+  batch.put(toBytes(key), toBytes(value))
+  let vr = proposeWrite(store, groupId, batch)
+  if not vr.isOk:
+    return rsErr[RaftKVEntry](vr.error)
+  let ver = store.nextVersion.fetchAdd(1)
+  let ts = uint64(getTime().toUnixFloat() * 1_000_000_000)
+  rsOk[RaftKVEntry](RaftKVEntry(value: value, version: ver, timestamp: ts))
+
+proc raftDeleteInGroupExplicit*(store: RaftKVStoreExt, key: string,
+    groupId: GroupID): RSResult[Option[RaftKVEntry]] {.gcsafe, raises: [].} =
+  ## Delete `key` from a specific Raft group. Used by the protocol server for
+  ## group-routed forwarded requests.
+  var prevEntry: Option[RaftKVEntry]
+  let backend = store.getBackend()
+  if backend != nil and backend.isOpen:
+    {.cast(raises: []).}:
+      let valOpt = backend.get(key)
+      if valOpt.isSome:
+        prevEntry = some(RaftKVEntry(
+          value: valOpt.get(),
+          version: 1'u64,
+          timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
+        ))
+  let batch = newWriteBatch()
+  batch.delete(toBytes(key))
+  let vr = proposeWrite(store, groupId, batch)
+  if not vr.isOk:
+    return rsErr[Option[RaftKVEntry]](vr.error)
   rsOk[Option[RaftKVEntry]](prevEntry)
 
 proc raftScan*(store: RaftKVStoreExt, startKey, endKey: string,
@@ -975,26 +1047,6 @@ proc getSpaceForTable*(store: RaftKVStoreExt,
 # These bypass resolveGroupId() and route directly to a space's Raft group
 # using hash(primaryKey) mod numGroups.
 
-proc findAllPeersForGroup(store: RaftKVStoreExt,
-    groupId: GroupID): seq[RaftKVStoreExt] {.gcsafe, raises: [].} =
-  ## Return all peer stores that own the given group, leader first.
-  if not store.groupMembers.hasKey(groupId):
-    return @[]
-  let members = store.groupMembers.getOrDefault(groupId)
-  var leader: seq[RaftKVStoreExt] = @[]
-  var others: seq[RaftKVStoreExt] = @[]
-  {.cast(raises: []).}:
-    for nid in members:
-      if store.peerStores.hasKey(nid):
-        let peer = store.peerStores.getOrDefault(nid)
-        if peer.coordinator.hasGroup(groupId):
-          let g = peer.coordinator.getGroup(groupId)
-          if g.isSome and g.get.isLeader():
-            leader.add(peer)
-          else:
-            others.add(peer)
-  leader & others
-
 proc lookupNodeInfo*(store: RaftKVStoreExt,
     nodeId: uint32): Option[NodeInfo] {.gcsafe, raises: [].} =
   ## Look up a node's host and clientPort, using a cache to avoid repeated
@@ -1020,26 +1072,50 @@ proc lookupNodeInfo*(store: RaftKVStoreExt,
       discard
   none(NodeInfo)
 
+proc forwardPutViaNetwork(store: RaftKVStoreExt, rid: GroupID,
+    key, value: string): RSResult[RaftKVEntry] {.gcsafe, raises: [].} =
+  ## Forward a write to the group leader over the network using ProtocolClient.
+  ## Tries the known leader from groupLeaders table, then falls back to trying
+  ## all group members.
+  {.cast(raises: []).}:
+    try:
+      # Collect candidate nodeIds: known leader first, then all members
+      var candidates: seq[uint32]
+      if store.groupLeaders.hasKey(rid):
+        candidates.add(store.groupLeaders[rid])
+      if store.groupMembers.hasKey(rid):
+        for nid in store.groupMembers[rid]:
+          if nid notin candidates:
+            candidates.add(nid)
+
+      for nid in candidates:
+        let infoOpt = store.lookupNodeInfo(nid)
+        if infoOpt.isNone: continue
+        let info = infoOpt.get()
+        let cfg = ClientConfig(
+          host: info.host,
+          port: info.clientPort,
+          timeoutMs: 5000,
+        )
+        let pc = newProtocolClient(cfg)
+        let cr = pc.connect()
+        if not cr.isOk: continue
+        let pr = pc.kvPutInGroup(key, value, rid.uint64)
+        pc.disconnect()
+        if pr.isOk:
+          let ver = store.nextVersion.fetchAdd(1)
+          let ts = uint64(getTime().toUnixFloat() * 1_000_000_000)
+          return rsOk[RaftKVEntry](RaftKVEntry(value: value, version: ver,
+              timestamp: ts))
+    except CatchableError:
+      discard
+  rsErr[RaftKVEntry](newRSE(rseNotLeader,
+      "failed to forward to leader for group " & $rid.uint64))
+
 proc forwardPutToLeader(store: RaftKVStoreExt, rid: GroupID,
     key, value: string): RSResult[RaftKVEntry] {.gcsafe, raises: [].} =
-  ## Try all peers that own `rid` until one succeeds (leader found).
-  ## Calls proposeWrite directly on the peer (no recursion).
-  let peers = store.findAllPeersForGroup(rid)
-  let batch = newWriteBatch()
-  batch.put(toBytes(key), toBytes(value))
-  for peer in peers:
-    let vr = proposeWrite(peer, rid, batch)
-    if vr.isOk:
-      let ver = peer.nextVersion.fetchAdd(1)
-      let ts = uint64(getTime().toUnixFloat() * 1_000_000_000)
-      return rsOk[RaftKVEntry](RaftKVEntry(value: value, version: ver, timestamp: ts))
-    if vr.error.kind != rseNotLeader:
-      return rsErr[RaftKVEntry](vr.error)
-  if peers.len > 0:
-    return rsErr[RaftKVEntry](newRSE(rseNotLeader,
-        "no leader found for group " & $rid.uint64))
-  rsErr[RaftKVEntry](newRSE(rseGroupNotFound,
-      "no local or peer store for group " & $rid.uint64))
+  ## Forward a write to the group leader via network.
+  store.forwardPutViaNetwork(rid, key, value)
 
 proc raftPutInSpace*(store: RaftKVStoreExt, key, value: string,
     space: SpaceInfo, primaryKey: string): RSResult[RaftKVEntry] {.gcsafe, raises: [].} =
@@ -1054,7 +1130,7 @@ proc raftPutInSpace*(store: RaftKVStoreExt, key, value: string,
   batch.put(toBytes(key), toBytes(value))
   let vr = proposeWrite(store, rid, batch)
   if not vr.isOk:
-    if vr.error.kind == rseNotLeader and store.peerStores.len > 0:
+    if vr.error.kind == rseNotLeader:
       return store.forwardPutToLeader(rid, key, value)
     return rsErr[RaftKVEntry](vr.error)
   let ver = store.nextVersion.fetchAdd(1)
@@ -1064,20 +1140,13 @@ proc raftPutInSpace*(store: RaftKVStoreExt, key, value: string,
 proc raftGetInSpaceFromGroup(store: RaftKVStoreExt, key: string,
     rid: GroupID): RSResult[Option[RaftKVEntry]] {.gcsafe, raises: [].} =
   ## Internal helper: read `key` from a specific group.
-  if not store.coordinator.hasGroup(rid):
-    let peerOpt = store.findPeerForGroup(rid)
-    if peerOpt.isSome:
-      return peerOpt.get().raftGetInSpaceFromGroup(key, rid)
-    return rsErr[Option[RaftKVEntry]](newRSE(rseGroupNotFound,
-        "no local or peer store for group " & $rid.uint64))
-  var isLocalLeader = false
-  {.cast(raises: []).}:
-    let localGroup = store.coordinator.getGroup(rid)
-    isLocalLeader = localGroup.isSome and localGroup.get.isLeader()
-
-  if isLocalLeader or store.peerStores.len == 0:
-    let backend = store.getBackend()
-    if backend != nil and backend.isOpen:
+  ## If this node is the leader of the group, read from local backend.
+  ## If this node is a follower, try local backend first (may have data
+  ## from replication), then fall through to network if not found.
+  ## If this node is NOT a member, forward the GET via network.
+  let backend = store.getBackend()
+  if backend != nil and backend.isOpen:
+    if store.coordinator.hasGroup(rid):
       {.cast(raises: []).}:
         let valOpt = backend.get(key)
         if valOpt.isSome:
@@ -1087,23 +1156,40 @@ proc raftGetInSpaceFromGroup(store: RaftKVStoreExt, key: string,
             timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
           )
           return rsOk[Option[RaftKVEntry]](some(entry))
-    return rsOk[Option[RaftKVEntry]](none(RaftKVEntry))
-  else:
-    let peerOpt = store.findPeerForGroup(rid)
-    if peerOpt.isSome:
-      return peerOpt.get().raftGetInSpaceFromGroup(key, rid)
-    let backend = store.getBackend()
-    if backend != nil and backend.isOpen:
-      {.cast(raises: []).}:
-        let valOpt = backend.get(key)
-        if valOpt.isSome:
-          let entry = RaftKVEntry(
-            value: valOpt.get(),
-            version: 1'u64,
-            timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
-          )
-          return rsOk[Option[RaftKVEntry]](some(entry))
-    return rsOk[Option[RaftKVEntry]](none(RaftKVEntry))
+        # Data not found locally. If we're the leader, it's a true miss.
+        let gOpt = store.coordinator.getGroup(rid)
+        if gOpt.isSome and gOpt.get.isLeader():
+          return rsOk[Option[RaftKVEntry]](none(RaftKVEntry))
+        # We're a follower — data might not be applied yet, fall through
+        # to network forwarding below.
+  # Not a member or follower without data — forward GET to a member node
+  if store.groupMembers.hasKey(rid):
+    {.cast(raises: []).}:
+      try:
+        for nid in store.groupMembers[rid]:
+          let infoOpt = store.lookupNodeInfo(nid)
+          if infoOpt.isNone: continue
+          let info = infoOpt.get()
+          let cfg = ClientConfig(host: info.host, port: info.clientPort,
+                                 timeoutMs: 5000)
+          let pc = newProtocolClient(cfg)
+          let cr = pc.connect()
+          if not cr.isOk: continue
+          let gr = pc.kvGetInGroup(key, rid.uint64)
+          pc.disconnect()
+          if gr.isOk:
+            let resp = gr.val
+            if not resp.found:
+              return rsOk[Option[RaftKVEntry]](none(RaftKVEntry))
+            let entry = RaftKVEntry(
+              value: resp.value,
+              version: resp.version,
+              timestamp: resp.timestamp,
+            )
+            return rsOk[Option[RaftKVEntry]](some(entry))
+      except CatchableError:
+        discard
+  rsOk[Option[RaftKVEntry]](none(RaftKVEntry))
 
 proc raftGetInSpace*(store: RaftKVStoreExt, key: string,
     space: SpaceInfo, primaryKey: string): RSResult[Option[RaftKVEntry]] {.gcsafe, raises: [].} =
@@ -1124,35 +1210,51 @@ proc raftGetInSpace*(store: RaftKVStoreExt, key: string,
       return store.raftGetInSpaceFromGroup(key, oldRid)
   res
 
+proc forwardDeleteViaNetwork(store: RaftKVStoreExt, rid: GroupID,
+    key: string): RSResult[Option[RaftKVEntry]] {.gcsafe, raises: [].} =
+  ## Forward a delete to the group leader over the network using ProtocolClient.
+  {.cast(raises: []).}:
+    try:
+      var candidates: seq[uint32]
+      if store.groupLeaders.hasKey(rid):
+        candidates.add(store.groupLeaders[rid])
+      if store.groupMembers.hasKey(rid):
+        for nid in store.groupMembers[rid]:
+          if nid notin candidates:
+            candidates.add(nid)
+
+      for nid in candidates:
+        let infoOpt = store.lookupNodeInfo(nid)
+        if infoOpt.isNone: continue
+        let info = infoOpt.get()
+        let cfg = ClientConfig(
+          host: info.host,
+          port: info.clientPort,
+          timeoutMs: 5000,
+        )
+        let pc = newProtocolClient(cfg)
+        let cr = pc.connect()
+        if not cr.isOk: continue
+        let dr = pc.kvDeleteInGroup(key, rid.uint64)
+        pc.disconnect()
+        if dr.isOk:
+          if dr.val.status == 0x00'u8 and dr.val.hasPreviousValue:  # DelStatusDeleted
+            let entry = RaftKVEntry(
+              value: dr.val.previousValue,
+              version: 1'u64,
+              timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
+            )
+            return rsOk[Option[RaftKVEntry]](some(entry))
+          return rsOk[Option[RaftKVEntry]](none(RaftKVEntry))
+    except CatchableError:
+      discard
+  rsErr[Option[RaftKVEntry]](newRSE(rseNotLeader,
+      "failed to forward delete to leader for group " & $rid.uint64))
+
 proc forwardDeleteToLeader(store: RaftKVStoreExt, rid: GroupID,
     key: string): RSResult[Option[RaftKVEntry]] {.gcsafe, raises: [].} =
-  ## Try all peers that own `rid` until one succeeds (leader found).
-  let peers = store.findAllPeersForGroup(rid)
-  let batch = newWriteBatch()
-  batch.delete(toBytes(key))
-  for peer in peers:
-    # Capture previous value from peer's backend
-    var prevEntry: Option[RaftKVEntry]
-    let peerBackend = peer.getBackend()
-    if peerBackend != nil and peerBackend.isOpen:
-      {.cast(raises: []).}:
-        let valOpt = peerBackend.get(key)
-        if valOpt.isSome:
-          prevEntry = some(RaftKVEntry(
-            value: valOpt.get(),
-            version: 1'u64,
-            timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
-          ))
-    let vr = proposeWrite(peer, rid, batch)
-    if vr.isOk:
-      return rsOk[Option[RaftKVEntry]](prevEntry)
-    if vr.error.kind != rseNotLeader:
-      return rsErr[Option[RaftKVEntry]](vr.error)
-  if peers.len > 0:
-    return rsErr[Option[RaftKVEntry]](newRSE(rseNotLeader,
-        "no leader found for group " & $rid.uint64))
-  rsErr[Option[RaftKVEntry]](newRSE(rseGroupNotFound,
-      "no local or peer store for group " & $rid.uint64))
+  ## Forward a delete to the group leader via network.
+  store.forwardDeleteViaNetwork(rid, key)
 
 proc raftDeleteInSpace*(store: RaftKVStoreExt, key: string,
     space: SpaceInfo, primaryKey: string): RSResult[Option[RaftKVEntry]] {.gcsafe, raises: [].} =
@@ -1177,7 +1279,7 @@ proc raftDeleteInSpace*(store: RaftKVStoreExt, key: string,
   batch.delete(toBytes(key))
   let vr = proposeWrite(store, rid, batch)
   if not vr.isOk:
-    if vr.error.kind == rseNotLeader and store.peerStores.len > 0:
+    if vr.error.kind == rseNotLeader:
       return store.forwardDeleteToLeader(rid, key)
     return rsErr[Option[RaftKVEntry]](vr.error)
   rsOk[Option[RaftKVEntry]](prevEntry)
@@ -1192,113 +1294,103 @@ proc raftDeleteInGroup*(store: RaftKVStoreExt, key: string,
   batch.delete(toBytes(key))
   let vr = proposeWrite(store, groupId, batch)
   if not vr.isOk:
-    if vr.error.kind == rseNotLeader and store.peerStores.len > 0:
+    if vr.error.kind == rseNotLeader:
       return store.forwardDeleteToLeader(groupId, key)
     return rsErr[Option[RaftKVEntry]](vr.error)
   rsOk[Option[RaftKVEntry]](none(RaftKVEntry))
 
-proc scanLocalGroup(store: RaftKVStoreExt, rid: GroupID,
-    startKey, endKey: string,
-    includeSystemKeys: bool): seq[(string, RaftKVEntry)] {.gcsafe, raises: [].} =
-  ## Scan the WiscKey backend for matching keys in the given range.
-  ## Note: with a single shared backend, `rid` is informational only; the
-  ## backend stores all groups' data in one LevelDB instance.
-  var pairs: seq[(string, RaftKVEntry)] = @[]
-  let backend = store.getBackend()
-  if backend == nil or not backend.isOpen:
-    return pairs
-  {.cast(raises: []).}:
-    let raw = backend.scan(startKey, endKey)
-    let ts = uint64(getTime().toUnixFloat() * 1_000_000_000)
-    for (k, v) in raw:
-      if isIntentKey(k) or isCoordKey(k): continue
-      if k.startsWith("/raft/"): continue
-      if not includeSystemKeys and isSystemKey(k): continue
-      pairs.add((k, RaftKVEntry(value: v, version: 1'u64, timestamp: ts)))
-  pairs
-
 proc raftScanSpace*(store: RaftKVStoreExt, startKey, endKey: string,
     space: SpaceInfo, limit: uint32 = 0,
     includeSystemKeys: bool = false): RSResult[seq[(string, RaftKVEntry)]] {.gcsafe, raises: [].} =
-  ## Scan keys in the space's key range.
-  ## With a shared WiscKey backend, all groups share the same store, so we
-  ## do a single backend scan (no per-group fan-out needed). For multi-node
-  ## clusters where peers may own different groups, we prefer scanning from
-  ## a leader node that has up-to-date data.
+  ## Scan keys across all groups in the space.
   ##
-  ## For multi-node: if any of the space's groups are not locally owned,
-  ## forward to a peer that is the leader for that group and merge results.
-  ## For single-node: just scan the local backend directly.
+  ## For each group, we need to read from the **leader** to guarantee
+  ## we see committed data (followers may lag). Strategy:
+  ## - If this node is the leader of a group, data is in the local backend.
+  ## - Otherwise, scan the group's leader (or any member as fallback) over
+  ##   the network.
+  ##
+  ## Since all groups on a node share the same WiscKey backend, we coalesce:
+  ## one scan per distinct remote node is sufficient.
 
-  if store.peerStores.len == 0:
-    # Single-node fast path: scan directly from the local backend
-    return store.raftScan(startKey, endKey, limit,
-        includeSystemKeys = includeSystemKeys)
+  # First, determine which groups this node leads vs which need remote scan.
+  # A group is "locally covered" if this node is leader for it.
+  var localNodeId = store.coordinator.nodeId.uint32
+  var remoteNodes: seq[uint32]  # nodes we need to scan
+  var allGroupsCoveredLocally = true
+  {.cast(raises: []).}:
+    for gid in space.groupIds:
+      let groupId = GroupID(gid)
+      # Check if this node is leader for this group
+      if store.coordinator.hasGroup(groupId):
+        let gOpt = store.coordinator.getGroup(groupId)
+        if gOpt.isSome and gOpt.get.isLeader():
+          continue  # leader — data is definitely in local backend
+      allGroupsCoveredLocally = false
+      # Need to scan a remote node for this group.
+      # Prefer the known leader, fall back to any member.
+      var targetNode: uint32 = 0
+      if store.groupLeaders.hasKey(groupId):
+        targetNode = store.groupLeaders[groupId]
+      if targetNode == 0 or targetNode == localNodeId:
+        let members = store.groupMembers.getOrDefault(groupId, @[])
+        for nid in members:
+          if nid != localNodeId:
+            targetNode = nid
+            break
+      if targetNode != 0 and targetNode != localNodeId and
+          targetNode notin remoteNodes:
+        remoteNodes.add(targetNode)
 
-  # Multi-node: fan-out to group leaders.
-  # Since all groups on the same node share one backend, we track which
-  # stores we've already scanned to avoid duplicate results.
-  # During rebalancing, scan both new and old group sets.
-  var scannedStores: seq[pointer] = @[]
-  var allPairs: seq[(string, RaftKVEntry)] = @[]
+  # Always start with local scan (covers groups we lead + follower data)
+  let localResult = store.raftScan(startKey, endKey, limit,
+      includeSystemKeys = includeSystemKeys)
+  if not localResult.isOk:
+    return localResult
 
-  var allGroupIds = space.groupIds
-  if space.rebalancing:
-    for oid in space.oldGroupIds:
-      var found = false
-      for nid in allGroupIds:
-        if nid == oid:
-          found = true
-          break
-      if not found:
-        allGroupIds.add(oid)
+  if remoteNodes.len == 0:
+    return localResult
 
-  for rid64 in allGroupIds:
-    let rid = GroupID(rid64)
-    var scanStore = store
-    if not store.coordinator.hasGroup(rid):
-      let peerOpt = store.findPeerForGroup(rid)
-      if peerOpt.isSome:
-        scanStore = peerOpt.get()
-      else:
-        continue
-    else:
-      {.cast(raises: []).}:
-        let localGroup = store.coordinator.getGroup(rid)
-        let isLocalLeader = localGroup.isSome and localGroup.get.isLeader()
-        if not isLocalLeader and store.peerStores.len > 0:
-          let peerOpt = store.findPeerForGroup(rid)
-          if peerOpt.isSome:
-            scanStore = peerOpt.get()
+  # Fan out scan to remote nodes and merge results
+  var allKeys: seq[string]
+  var resultMap: Table[string, RaftKVEntry]
+  for (k, entry) in localResult.value:
+    if k notin allKeys:
+      allKeys.add(k)
+      resultMap[k] = entry
 
-    # Skip if we've already scanned this store's backend
-    let storePtr = cast[pointer](scanStore)
-    var alreadyScanned = false
-    for s in scannedStores:
-      if s == storePtr:
-        alreadyScanned = true
-        break
-    if alreadyScanned: continue
-    scannedStores.add(storePtr)
+  {.cast(raises: []).}:
+    try:
+      for nid in remoteNodes:
+        let infoOpt = store.lookupNodeInfo(nid)
+        if infoOpt.isNone: continue
+        let info = infoOpt.get()
+        let cfg = ClientConfig(host: info.host, port: info.clientPort,
+                               timeoutMs: 5000)
+        let pc = newProtocolClient(cfg)
+        let cr = pc.connect()
+        if not cr.isOk: continue
+        let sr = pc.kvScan(startKey, endKey, limit)
+        pc.disconnect()
+        if sr.isOk:
+          for pair in sr.val.pairs:
+            if pair.key notin resultMap:
+              allKeys.add(pair.key)
+              resultMap[pair.key] = RaftKVEntry(
+                value: pair.value, version: 1'u64,
+                timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
+              )
+    except CatchableError:
+      discard
 
-    let pairs = scanStore.scanLocalGroup(rid, startKey, endKey, includeSystemKeys)
-    for p in pairs:
-      allPairs.add(p)
-
-  # Sort and deduplicate
-  allPairs.sort(proc(a, b: (string, RaftKVEntry)): int = cmp(a[0], b[0]))
-  # Deduplicate by key (same key from different node scans)
-  var deduped: seq[(string, RaftKVEntry)] = @[]
-  var lastKey = ""
-  for p in allPairs:
-    if p[0] != lastKey:
-      deduped.add(p)
-      lastKey = p[0]
-
-  if limit > 0 and deduped.len > int(limit):
-    deduped.setLen(int(limit))
-
-  rsOk[seq[(string, RaftKVEntry)]](deduped)
+  # Sort by key and build result
+  allKeys.sort()
+  var finalResult: seq[(string, RaftKVEntry)]
+  for k in allKeys:
+    finalResult.add((k, resultMap.getOrDefault(k)))
+  if limit > 0 and uint32(finalResult.len) > limit:
+    finalResult = finalResult[0 ..< int(limit)]
+  rsOk[seq[(string, RaftKVEntry)]](finalResult)
 
 # ---------------------------------------------------------------------------
 # Space rebalancing
@@ -1423,8 +1515,8 @@ proc rebalanceSpaces*(store: RaftKVStoreExt) {.raises: [].} =
             if myReplicaId != rangeTypes.ReplicaID(0):
               let newGroup = coord.createAndStartGroup(desc, myReplicaId)
               store.registerGroup(gid)
-              # Single-node: become leader immediately
-              if store.peerStores.len == 0:
+              # Single-node: become leader immediately if group has only 1 member
+              if members.len == 1:
                 newGroup.becomeLeader()
 
         # Read current groupIds

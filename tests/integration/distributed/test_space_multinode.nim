@@ -35,6 +35,8 @@ const
   BASE_PORT = 21500
   TMP_DIR = "/tmp/fractio_space_mn_"
 
+var nextClientPort = 19200  ## incremented per node to avoid port conflicts between tests
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -42,6 +44,7 @@ const
 type
   TestNode = object
     id*: int                       ## 1-based node number
+    clientPort*: int
     server*: ProtocolServer
     coord*: MultiRaftCoordinator
     store*: RaftKVStoreExt
@@ -95,9 +98,12 @@ proc makeNode(nodeNum: int, peerNums: seq[int]): TestNode =
   let store = newRaftKVStoreExt(coord, proposeTimeoutMs = 6000)
   store.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
 
+  let cPort = nextClientPort
+  nextClientPort += 1
+
   var cfg = defaultServerConfig()
   cfg.host = "127.0.0.1"
-  cfg.port = 19000 + nodeNum
+  cfg.port = cPort
   cfg.serverId = uint16(nodeNum)
   cfg.dataDir = storagePath
   let srv = newProtocolServer(cfg)
@@ -106,29 +112,31 @@ proc makeNode(nodeNum: int, peerNums: seq[int]): TestNode =
   srv.raftTransport = rgt
 
   TestNode(
-    id: nodeNum, server: srv, coord: coord, store: store,
+    id: nodeNum, clientPort: cPort, server: srv, coord: coord, store: store,
     rgt: rgt, storagePath: storagePath,
   )
 
 proc startNode(n: TestNode) =
   n.coord.start()
+  n.server.start()
 
 proc stopNode(n: TestNode) =
+  n.server.stop()
   n.coord.stop()
   cleanDir(n.storagePath)
 
-proc seedSysNodes(leaderStore: RaftKVStoreExt, nodeNums: seq[int]) =
-  for num in nodeNums:
-    let key = encodeTableKey(SYS_NODES_TABLE_ID, $num)
+proc seedSysNodes(leaderStore: RaftKVStoreExt, nodes: seq[TestNode]) =
+  for n in nodes:
+    let key = encodeTableKey(SYS_NODES_TABLE_ID, $n.id)
     let val = $ %*{
-      "nodeId": num,
+      "nodeId": n.id,
       "host": "127.0.0.1",
-      "raftPort": raftPort(num),
-      "clientPort": 19000 + num,
+      "raftPort": raftPort(n.id),
+      "clientPort": n.clientPort,
       "status": 1,
     }
     let r = leaderStore.raftPut(key, val)
-    doAssert r.isOk, "failed to seed sys.nodes for node " & $num
+    doAssert r.isOk, "failed to seed sys.nodes for node " & $n.id
 
 proc seedSysGroups(leaderStore: RaftKVStoreExt, nodeNums: seq[int]) =
   for gid in [META_GROUP_ID, DATA_GROUP_START_ID]:
@@ -144,13 +152,6 @@ proc seedDefaults(leaderStore: RaftKVStoreExt) =
   discard leaderStore.raftPut(dbKey, $ %*{"name": "default"})
   let scKey = encodeTableKey(SYS_SCHEMAS_TABLE_ID, "default.public")
   discard leaderStore.raftPut(scKey, $ %*{"name": "public", "database": "default"})
-
-proc wirePeerStores(nodes: seq[TestNode]) =
-  ## Register every node's store as a peer of every other node.
-  for i in 0 ..< nodes.len:
-    for j in 0 ..< nodes.len:
-      if i != j:
-        nodes[i].store.addPeerStore(uint32(nodes[j].id), nodes[j].store)
 
 proc waitForAutoDistribution(nodes: seq[TestNode], expectedGroupIds: seq[uint64],
     replicaCount: int, maxWaitMs: int = 3000) =
@@ -269,18 +270,15 @@ proc makeCluster5(): seq[TestNode] =
   sleep(400)
 
   # Seed system tables on the leader
-  seedSysNodes(nodes[0].store, allNums)
+  seedSysNodes(nodes[0].store, nodes)
   seedSysGroups(nodes[0].store, allNums)
   seedDefaults(nodes[0].store)
   sleep(400)
 
-  # Wire peer stores so nodes can forward to groups they don't own
-  wirePeerStores(nodes)
-
   nodes
 
 proc stopCluster(nodes: seq[TestNode]) =
-  for n in nodes: stopNode(n)
+  for i in countdown(nodes.high, 0): stopNode(nodes[i])
 
 # ---------------------------------------------------------------------------
 # Test suites

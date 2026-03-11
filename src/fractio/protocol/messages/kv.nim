@@ -31,6 +31,7 @@ import ../codec
 const
   GetFlagIncludeTimestamp* = 0x01'u8
   GetFlagIncludeVersion* = 0x02'u8
+  GetFlagGroupRouted* = 0x10'u8  ## groupId appended after key
 
   GetRespFlagFound* = 0x01'u8
   GetRespFlagHasTimestamp* = 0x02'u8
@@ -42,6 +43,7 @@ type
     txnId*: uint64
     readTimestamp*: uint64
     key*: string
+    groupId*: uint64  ## non-zero when GroupRouted flag is set
 
   GetResponse* = object
     found*: bool
@@ -54,10 +56,14 @@ type
 proc encodeGetRequest*(req: GetRequest): string =
   var buf = ""
   buf.writeUint16BE(uint16(mtGet))
-  buf.writeUint8(req.flags)
+  var flags = req.flags
+  if req.groupId != 0: flags = flags or GetFlagGroupRouted
+  buf.writeUint8(flags)
   buf.writeUint64BE(req.txnId)
   buf.writeUint64BE(req.readTimestamp)
   buf.writeBytes(req.key)
+  if req.groupId != 0:
+    buf.writeUint64BE(req.groupId)
   buf
 
 proc decodeGetRequest*(payload: string): Result[GetRequest, ProtocolError] =
@@ -78,6 +84,11 @@ proc decodeGetRequest*(payload: string): Result[GetRequest, ProtocolError] =
   let keyR = readBytes(payload, pos)
   if keyR.isErr: return peErr(keyR.error)
   req.key = keyR.value
+
+  if (req.flags and GetFlagGroupRouted) != 0:
+    let gidR = readUint64BE(payload, pos)
+    if gidR.isErr: return peErr(gidR.error)
+    req.groupId = gidR.value
 
   peOk(req)
 
@@ -148,6 +159,7 @@ const
   PutFlagReturnPrev* = 0x01'u8
   PutFlagSyncWrite* = 0x02'u8
   PutFlagCAS* = 0x04'u8
+  PutFlagGroupRouted* = 0x10'u8  ## groupId appended after value
 
   PutStatusOK* = 0x00'u8
   PutStatusCASFailed* = 0x01'u8
@@ -160,6 +172,7 @@ type
     expectedVersion*: uint64
     key*: string
     value*: string
+    groupId*: uint64  ## non-zero when GroupRouted flag is set
 
   PutResponse* = object
     status*: uint8
@@ -171,11 +184,15 @@ type
 proc encodePutRequest*(req: PutRequest): string =
   var buf = ""
   buf.writeUint16BE(uint16(mtPut))
-  buf.writeUint8(req.flags)
+  var flags = req.flags
+  if req.groupId != 0: flags = flags or PutFlagGroupRouted
+  buf.writeUint8(flags)
   buf.writeUint64BE(req.txnId)
   buf.writeUint64BE(req.expectedVersion)
   buf.writeBytes(req.key)
   buf.writeBytes(req.value)
+  if req.groupId != 0:
+    buf.writeUint64BE(req.groupId)
   buf
 
 proc decodePutRequest*(payload: string): Result[PutRequest, ProtocolError] =
@@ -200,6 +217,11 @@ proc decodePutRequest*(payload: string): Result[PutRequest, ProtocolError] =
   let valR = readBytes(payload, pos)
   if valR.isErr: return peErr(valR.error)
   req.value = valR.value
+
+  if (req.flags and PutFlagGroupRouted) != 0:
+    let gidR = readUint64BE(payload, pos)
+    if gidR.isErr: return peErr(gidR.error)
+    req.groupId = gidR.value
 
   peOk(req)
 
@@ -256,6 +278,7 @@ const
   DelFlagReturnPrev* = 0x01'u8
   DelFlagSyncWrite* = 0x02'u8
   DelFlagOnlyIfExists* = 0x04'u8
+  DelFlagGroupRouted* = 0x10'u8  ## groupId appended after key
 
   DelStatusDeleted* = 0x00'u8
   DelStatusNotFound* = 0x01'u8
@@ -266,6 +289,7 @@ type
     flags*: uint8
     txnId*: uint64
     key*: string
+    groupId*: uint64  ## non-zero when GroupRouted flag is set
 
   DeleteResponse* = object
     status*: uint8
@@ -275,9 +299,13 @@ type
 proc encodeDeleteRequest*(req: DeleteRequest): string =
   var buf = ""
   buf.writeUint16BE(uint16(mtDelete))
-  buf.writeUint8(req.flags)
+  var flags = req.flags
+  if req.groupId != 0: flags = flags or DelFlagGroupRouted
+  buf.writeUint8(flags)
   buf.writeUint64BE(req.txnId)
   buf.writeBytes(req.key)
+  if req.groupId != 0:
+    buf.writeUint64BE(req.groupId)
   buf
 
 proc decodeDeleteRequest*(payload: string): Result[DeleteRequest,
@@ -295,6 +323,11 @@ proc decodeDeleteRequest*(payload: string): Result[DeleteRequest,
   let keyR = readBytes(payload, pos)
   if keyR.isErr: return peErr(keyR.error)
   req.key = keyR.value
+
+  if (req.flags and DelFlagGroupRouted) != 0:
+    let gidR = readUint64BE(payload, pos)
+    if gidR.isErr: return peErr(gidR.error)
+    req.groupId = gidR.value
 
   peOk(req)
 

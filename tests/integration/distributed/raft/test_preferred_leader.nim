@@ -123,12 +123,6 @@ proc seedSysGroups(leaderStore: RaftKVStoreExt, nodeNums: seq[int]) =
                     "preferredLeader": nodeNums[0]}
     discard leaderStore.raftPut(key, val)
 
-proc wirePeerStores(nodes: seq[TestNode]) =
-  for i in 0 ..< nodes.len:
-    for j in 0 ..< nodes.len:
-      if i != j:
-        nodes[i].store.addPeerStore(uint32(nodes[j].id), nodes[j].store)
-
 proc makeCluster3(): seq[TestNode] =
   let allNums = @[1, 2, 3]
   var nodes: seq[TestNode]
@@ -153,11 +147,10 @@ proc makeCluster3(): seq[TestNode] =
   seedSysGroups(nodes[0].store, allNums)
   sleep(400)
 
-  wirePeerStores(nodes)
   nodes
 
 proc stopCluster(nodes: seq[TestNode]) =
-  for n in nodes: stopNode(n)
+  for i in countdown(nodes.high, 0): stopNode(nodes[i])
 
 proc findLeader(nodes: seq[TestNode], gid: GroupID): int =
   ## Return the index of the leader node for the given group, or -1.
@@ -262,3 +255,142 @@ suite "Preferred leader rebalancing — 3-node cluster":
     let after = g.get.lastPreferredLeaderStepdownNs.load()
     check after > before
     check after > 0
+
+  test "preferred leader wins via network election (no election storm)":
+    ## Regression test for the NodeID format mismatch bug where handleRV
+    ## converted "raft_N" candidateId to NodeID(0), causing candidateRepId
+    ## to be ReplicaID(0). This meant votedFor was stored as 0, so every
+    ## candidate received votes from all nodes, causing dual-leader storms.
+    ##
+    ## With the fix, toNodeID handles both "raft_N" and "rn_N" formats,
+    ## so node 1 only votes once per term and the preferred leader wins.
+    var nodes = makeCluster3()
+    defer: stopCluster(nodes)
+
+    # Load preferred leaders on all nodes
+    for node in nodes:
+      node.store.loadGroupMembers()
+
+    # Create a space group (gid=100) with preferredLeader = node 2
+    let testGid = GroupID(100)
+
+    # Write sys.groups record with preferredLeader = 2
+    let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $testGid.uint64)
+    var replicas = newJArray()
+    for n in 1..3:
+      replicas.add(%*{"nodeId": n, "type": "voter"})
+    let groupVal = $ %*{
+      "groupId": testGid.uint64.int,
+      "replicas": replicas,
+      "preferredLeader": 2,
+    }
+    discard nodes[0].store.raftPut(groupKey, groupVal)
+    sleep(300)
+
+    # Reload preferredLeaders on all nodes
+    for node in nodes:
+      node.store.loadGroupMembers()
+
+    # Verify preferredLeader is set to 2
+    check nodes[0].store.preferredLeaders[testGid] == 2'u32
+
+    # Create the group on all nodes (skip if already auto-created by onGroupMetadataApplied)
+    for i, node in nodes:
+      if not node.coord.hasGroup(testGid):
+        var desc = rangeTypes.newGroupDescriptor(testGid)
+        for n in 1..3:
+          discard desc.addReplica(rangeTypes.NodeID(uint32(n)), rangeTypes.rtVoter)
+        let rep = desc.getReplica(rangeTypes.NodeID(uint32(node.id)))
+        doAssert rep.isSome
+        discard node.coord.createAndStartGroup(desc, rep.get.replicaId)
+
+    # Let an initial election happen naturally via the network
+    sleep(3000)
+
+    # By now some node should be leader. If it's not node 2 (the preferred
+    # leader), the timerProc will step the current leader down.
+    # Wait up to 15 seconds for node 2 to become the stable leader.
+    var preferredWon = false
+    for attempt in 0 ..< 150:  # 150 × 100ms = 15s
+      sleep(100)
+      let leaderIdx = findLeader(nodes, testGid)
+      if leaderIdx == 1:  # node 2 is index 1
+        # Verify it stays leader for at least 3 seconds (no storm)
+        var stable = true
+        for _ in 0 ..< 30:
+          sleep(100)
+          if findLeader(nodes, testGid) != 1:
+            stable = false
+            break
+        if stable:
+          preferredWon = true
+          break
+
+    check preferredWon
+
+  test "non-preferred leader is replaced exactly once (no repeated stepdowns)":
+    ## Verifies that once the preferred leader takes over, there are no
+    ## further elections (the stepdown-election cycle is broken).
+    var nodes = makeCluster3()
+    defer: stopCluster(nodes)
+
+    for node in nodes:
+      node.store.loadGroupMembers()
+
+    # Create group 101 with preferredLeader = node 3
+    let testGid = GroupID(101)
+    let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $testGid.uint64)
+    var replicas = newJArray()
+    for n in 1..3:
+      replicas.add(%*{"nodeId": n, "type": "voter"})
+    discard nodes[0].store.raftPut(groupKey,
+      $ %*{"groupId": testGid.uint64.int, "replicas": replicas,
+           "preferredLeader": 3})
+    sleep(300)
+    for node in nodes:
+      node.store.loadGroupMembers()
+
+    # Create group on all nodes (skip if already auto-created)
+    for i, node in nodes:
+      if not node.coord.hasGroup(testGid):
+        var desc = rangeTypes.newGroupDescriptor(testGid)
+        for n in 1..3:
+          discard desc.addReplica(rangeTypes.NodeID(uint32(n)), rangeTypes.rtVoter)
+        let rep = desc.getReplica(rangeTypes.NodeID(uint32(node.id)))
+        doAssert rep.isSome
+        discard node.coord.createAndStartGroup(desc, rep.get.replicaId)
+
+    # Force node 1 to be the initial leader (not preferred)
+    sleep(500)
+    let g1 = nodes[0].coord.getGroup(testGid)
+    check g1.isSome
+    g1.get.becomeLeader()
+    sleep(200)
+
+    # Count how many times the leader changes. In a healthy cluster,
+    # node 1 steps down once and node 3 (preferred) takes over permanently.
+    var leaderChanges = 0
+    var lastLeader = findLeader(nodes, testGid)
+    for _ in 0 ..< 200:  # 200 × 100ms = 20s
+      sleep(100)
+      let cur = findLeader(nodes, testGid)
+      if cur != lastLeader and cur >= 0:
+        inc leaderChanges
+        lastLeader = cur
+      # Once preferred leader (node 3, index 2) is stable, verify
+      if cur == 2 and leaderChanges >= 1:
+        # Let it run a bit more to ensure no further changes
+        var extraChanges = 0
+        for _ in 0 ..< 50:  # 5 more seconds
+          sleep(100)
+          let c2 = findLeader(nodes, testGid)
+          if c2 != 2 and c2 >= 0:
+            inc extraChanges
+        # Should be 0 extra changes after preferred leader wins
+        check extraChanges == 0
+        break
+
+    # Preferred leader (node 3) should be the final leader
+    check lastLeader == 2  # index 2 = node 3
+    # Should have at most 2-3 leader changes, not hundreds
+    check leaderChanges <= 5
