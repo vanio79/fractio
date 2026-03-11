@@ -154,7 +154,8 @@ proc seedSysGroups(leaderStore: RaftKVStoreExt, nodeNums: seq[int]) =
     var replicas = newJArray()
     for num in nodeNums:
       replicas.add(%*{"nodeId": num, "type": "voter"})
-    let val = $ %*{"groupId": int(gid), "replicas": replicas}
+    # Leader for group 10+i is node i+1
+    let val = $ %*{"groupId": int(gid), "replicas": replicas, "leader": i + 1}
     discard leaderStore.raftPut(key, val)
 
 proc seedSpaceAndTable(store: RaftKVStoreExt, spaceId: int, tableId: uint32) =
@@ -343,7 +344,7 @@ suite "Multi-node — peer store forwarding for space-routed keys":
     check not dr.isOk
     check dr.error.kind == rseNotLeader
 
-  test "raftPutInSpace from non-leader returns not-leader":
+  test "raftPutInSpace from non-leader forwards to leader":
     var nodes = makeCluster3()
     defer: stopCluster(nodes)
 
@@ -352,12 +353,21 @@ suite "Multi-node — peer store forwarding for space-routed keys":
     let key = encodeDataRowKey(100, pk)
     let val = """{"space_forward":1}"""
 
-    # Write from node 1 for a key owned by node 3 — should return not-leader
+    # Write from node 1 for a key owned by node 3 — should succeed via forwarding
     let wr = nodes[0].store.raftPutInSpace(key, val, space, pk)
-    check not wr.isOk
-    check wr.error.kind == rseNotLeader
+    check wr.isOk
+    if wr.isOk:
+      check wr.value.value == val
 
-  test "raftDeleteInSpace from non-leader returns not-leader":
+    # Verify the data is readable from the owning leader (node 3)
+    let gr = nodes[2].store.raftGetInSpaceFromGroup(key, GroupID(SPACE_GROUP_START + 2))
+    check gr.isOk
+    if gr.isOk:
+      check gr.value.isSome
+      if gr.value.isSome:
+        check gr.value.get().value == val
+
+  test "raftDeleteInSpace from non-leader forwards to leader":
     var nodes = makeCluster3()
     defer: stopCluster(nodes)
 
@@ -366,10 +376,82 @@ suite "Multi-node — peer store forwarding for space-routed keys":
     let key = encodeDataRowKey(100, pk)
     discard nodes[2].store.raftPutInSpace(key, "to_del", space, pk)
 
-    # Delete from node 1 for a key owned by node 3 — should return not-leader
+    # Delete from node 1 for a key owned by node 3 — should succeed via forwarding
     let dr = nodes[0].store.raftDeleteInSpace(key, space, pk)
+    check dr.isOk
+
+    # Verify the key is gone from the owning leader (node 3)
+    let gr = nodes[2].store.raftGetInSpaceFromGroup(key, GroupID(SPACE_GROUP_START + 2))
+    check gr.isOk
+    if gr.isOk:
+      check gr.value.isNone
+
+  test "raftGetInSpace from non-leader forwards to leader":
+    var nodes = makeCluster3()
+    defer: stopCluster(nodes)
+
+    let space = spaceInfo()
+    let pk = findKeyForNode(1, space)  # owned by node 2
+    let key = encodeDataRowKey(100, pk)
+    let val = """{"get_forward":true}"""
+
+    # Write on the owning leader (node 2)
+    let wr = nodes[1].store.raftPutInSpace(key, val, space, pk)
+    check wr.isOk
+
+    # Read from node 1 (not the leader) — should forward to node 2
+    let gr = nodes[0].store.raftGetInSpace(key, space, pk)
+    check gr.isOk
+    if gr.isOk:
+      check gr.value.isSome
+      if gr.value.isSome:
+        check gr.value.get().value == val
+
+# ---------------------------------------------------------------------------
+# Suite: routing validation
+# ---------------------------------------------------------------------------
+
+suite "Multi-node — routing validation for group-routed requests":
+
+  test "raftPutInGroup rejects key routed to wrong group":
+    var nodes = makeCluster3()
+    defer: stopCluster(nodes)
+
+    let space = spaceInfo()
+    # Find a key that routes to group 10 (node 1's group)
+    let pk = findKeyForNode(0, space)
+    let key = encodeDataRowKey(100, pk)
+
+    # Try to put it in group 11 (wrong group) — should fail with rseBadRouting
+    let wr = nodes[1].store.raftPutInGroup(key, "bad", GroupID(SPACE_GROUP_START + 1))
+    check not wr.isOk
+    check wr.error.kind == rseBadRouting
+
+  test "raftDeleteInGroupExplicit rejects key routed to wrong group":
+    var nodes = makeCluster3()
+    defer: stopCluster(nodes)
+
+    let space = spaceInfo()
+    let pk = findKeyForNode(0, space)
+    let key = encodeDataRowKey(100, pk)
+
+    # Try to delete from group 11 (wrong group) — should fail with rseBadRouting
+    let dr = nodes[1].store.raftDeleteInGroupExplicit(key, GroupID(SPACE_GROUP_START + 1))
     check not dr.isOk
-    check dr.error.kind == rseNotLeader
+    check dr.error.kind == rseBadRouting
+
+  test "raftGetInGroup rejects key routed to wrong group":
+    var nodes = makeCluster3()
+    defer: stopCluster(nodes)
+
+    let space = spaceInfo()
+    let pk = findKeyForNode(0, space)
+    let key = encodeDataRowKey(100, pk)
+
+    # Try to get from group 11 (wrong group) — should fail with rseBadRouting
+    let gr = nodes[1].store.raftGetInGroup(key, GroupID(SPACE_GROUP_START + 1))
+    check not gr.isOk
+    check gr.error.kind == rseBadRouting
 
 # ---------------------------------------------------------------------------
 # Suite: nodeInfoCache

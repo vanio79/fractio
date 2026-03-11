@@ -118,6 +118,7 @@ const
   ErrClusterDown* = 0x07000002'u32
   ErrOverloaded* = 0x07000003'u32
   ErrInternal* = 0x07000004'u32 ## Phase 5: internal/unexpected server error
+  ErrBadRouting* = 0x07000005'u32 ## Key does not hash to the specified group
 
 # Wire-level error categories
 const

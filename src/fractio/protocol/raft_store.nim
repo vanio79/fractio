@@ -38,7 +38,9 @@ import fractio/distributed/meta/system_tables
 import fractio/distributed/raft/multigroup_transport
 import fractio/storage/wisckey_backend
 import fractio/storage/backend
+import fractio/protocol/types as protoTypes
 import fractio/protocol/client
+import fractio/protocol/messages/kv
 import ../utils/logging
 
 # ---------------------------------------------------------------------------
@@ -51,6 +53,7 @@ type
     rseGroupNotFound ## No Raft group for the requested shard/group
     rseTimeout       ## proposeAndWait timed out
     rseInternal      ## Unexpected error
+    rseBadRouting    ## Key does not hash to the specified group
 
   RaftStoreError* = object
     kind*: RaftStoreErrorKind
@@ -619,10 +622,46 @@ proc raftDelete*(store: RaftKVStoreExt,
 
   rsOk[Option[RaftKVEntry]](prevEntry)
 
+proc validateKeyRouting(store: RaftKVStoreExt, key: string,
+    groupId: GroupID): Option[RaftStoreError] {.gcsafe, raises: [].} =
+  ## Validate that `key` actually routes to `groupId`. Returns an error if the
+  ## key is a data row key and hashes to a different group. Non-data keys
+  ## (system keys, etc.) skip validation.
+  if not isTableKey(key):
+    return none(RaftStoreError)
+  {.cast(raises: []).}:
+    try:
+      let (tableId, primaryKey) = decodeTableKey(key)
+      if tableId < FIRST_USER_TABLE_ID:
+        return none(RaftStoreError)
+      acquire(store.spacesMu)
+      let sid = store.tableSpaces.getOrDefault(tableId, 0)
+      if sid > 1 and store.spaces.hasKey(sid):
+        let space = store.spaces.getOrDefault(sid)
+        release(store.spacesMu)
+        let pk = if primaryKey.startsWith("d/"):
+                   primaryKey[2 .. ^1]
+                 else:
+                   primaryKey
+        let expected = routeToGroup(pk, space.groupIds)
+        if expected != groupId:
+          return some(newRSE(rseBadRouting,
+              "key routes to group " & $expected.uint64 &
+              " not " & $groupId.uint64))
+      else:
+        release(store.spacesMu)
+    except:
+      discard
+  none(RaftStoreError)
+
 proc raftPutInGroup*(store: RaftKVStoreExt, key, value: string,
     groupId: GroupID): RSResult[RaftKVEntry] {.gcsafe, raises: [].} =
   ## Write `value` under `key` through Raft consensus, routed to a specific group.
   ## Used by the protocol server for group-routed forwarded requests.
+  ## Validates that the key routes to this group and that this node is the leader.
+  let routeErr = store.validateKeyRouting(key, groupId)
+  if routeErr.isSome:
+    return rsErr[RaftKVEntry](routeErr.get())
   let batch = newWriteBatch()
   batch.put(toBytes(key), toBytes(value))
   let vr = proposeWrite(store, groupId, batch)
@@ -636,6 +675,10 @@ proc raftDeleteInGroupExplicit*(store: RaftKVStoreExt, key: string,
     groupId: GroupID): RSResult[Option[RaftKVEntry]] {.gcsafe, raises: [].} =
   ## Delete `key` from a specific Raft group. Used by the protocol server for
   ## group-routed forwarded requests.
+  ## Validates that the key routes to this group and that this node is the leader.
+  let routeErr = store.validateKeyRouting(key, groupId)
+  if routeErr.isSome:
+    return rsErr[Option[RaftKVEntry]](routeErr.get())
   var prevEntry: Option[RaftKVEntry]
   let backend = store.getBackend()
   if backend != nil and backend.isOpen:
@@ -653,6 +696,31 @@ proc raftDeleteInGroupExplicit*(store: RaftKVStoreExt, key: string,
   if not vr.isOk:
     return rsErr[Option[RaftKVEntry]](vr.error)
   rsOk[Option[RaftKVEntry]](prevEntry)
+
+proc raftGetInGroup*(store: RaftKVStoreExt, key: string,
+    groupId: GroupID): RSResult[Option[RaftKVEntry]] {.gcsafe, raises: [].} =
+  ## Read `key` from a specific Raft group. Used by the protocol server for
+  ## group-routed forwarded requests.
+  ## Validates that the key routes to this group and that this node is the leader.
+  let routeErr = store.validateKeyRouting(key, groupId)
+  if routeErr.isSome:
+    return rsErr[Option[RaftKVEntry]](routeErr.get())
+  {.cast(raises: []).}:
+    let gOpt = store.coordinator.getGroup(groupId)
+    if gOpt.isNone or not gOpt.get.isLeader():
+      return rsErr[Option[RaftKVEntry]](newRSE(rseNotLeader,
+          "not leader for group " & $groupId.uint64))
+    let backend = store.getBackend()
+    if backend != nil and backend.isOpen:
+      let valOpt = backend.get(key)
+      if valOpt.isSome:
+        let entry = RaftKVEntry(
+          value: valOpt.get(),
+          version: 1'u64,
+          timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
+        )
+        return rsOk[Option[RaftKVEntry]](some(entry))
+    return rsOk[Option[RaftKVEntry]](none(RaftKVEntry))
 
 proc raftScan*(store: RaftKVStoreExt, startKey, endKey: string,
     limit: uint32,
@@ -1042,6 +1110,132 @@ proc getSpaceForTable*(store: RaftKVStoreExt,
   none(SpaceInfo)
 
 # ---------------------------------------------------------------------------
+# Network forwarding helpers
+# ---------------------------------------------------------------------------
+# Forward a request to the group leader over the network when this node is
+# not the leader for the target group.
+
+proc findLeaderForGroup(store: RaftKVStoreExt,
+    groupId: GroupID): Option[NodeInfo] {.gcsafe, raises: [].} =
+  ## Look up network address for the leader of `groupId`.
+  ## Tries groupLeaders first, then falls back to groupMembers.
+  let localNodeId = store.coordinator.nodeId.uint32
+  var targetNode: uint32 = 0
+  targetNode = store.groupLeaders.getOrDefault(groupId, 0)
+  if targetNode == 0 or targetNode == localNodeId:
+    let members = store.groupMembers.getOrDefault(groupId, @[])
+    for nid in members:
+      if nid != localNodeId:
+        targetNode = nid
+        break
+  if targetNode == 0 or targetNode == localNodeId:
+    return none(NodeInfo)
+  store.lookupNodeInfo(targetNode)
+
+proc forwardPutToLeader(store: RaftKVStoreExt, groupId: GroupID,
+    key, value: string): RSResult[RaftKVEntry] {.gcsafe, raises: [].} =
+  ## Forward a PUT to the leader of `groupId` via the wire protocol.
+  let infoOpt = store.findLeaderForGroup(groupId)
+  if infoOpt.isNone:
+    return rsErr[RaftKVEntry](newRSE(rseNotLeader,
+        "no reachable leader for group " & $groupId.uint64))
+  let info = infoOpt.get()
+  {.cast(raises: []).}:
+    try:
+      let cfg = ClientConfig(host: info.host, port: info.clientPort,
+                             timeoutMs: 5000)
+      let pc = newProtocolClient(cfg)
+      let cr = pc.connect()
+      if not cr.isOk:
+        return rsErr[RaftKVEntry](newRSE(rseNotLeader,
+            "failed to connect to leader: " & $cr.err))
+      defer: pc.disconnect()
+      let pr = pc.kvPutInGroup(key, value, groupId.uint64)
+      if not pr.isOk:
+        if pr.err.kind == peNotLeader:
+          return rsErr[RaftKVEntry](newRSE(rseNotLeader, pr.err.msg))
+        return rsErr[RaftKVEntry](newRSE(rseInternal, pr.err.msg))
+      let resp = pr.val
+      if resp.status != PutStatusOK:
+        return rsErr[RaftKVEntry](newRSE(rseInternal,
+            "remote PUT failed with status " & $resp.status))
+      return rsOk[RaftKVEntry](RaftKVEntry(
+        value: value, version: resp.version, timestamp: resp.timestamp))
+    except CatchableError as e:
+      return rsErr[RaftKVEntry](newRSE(rseInternal,
+          "forward PUT exception: " & e.msg))
+
+proc forwardDeleteToLeader(store: RaftKVStoreExt, groupId: GroupID,
+    key: string): RSResult[Option[RaftKVEntry]] {.gcsafe, raises: [].} =
+  ## Forward a DELETE to the leader of `groupId` via the wire protocol.
+  let infoOpt = store.findLeaderForGroup(groupId)
+  if infoOpt.isNone:
+    return rsErr[Option[RaftKVEntry]](newRSE(rseNotLeader,
+        "no reachable leader for group " & $groupId.uint64))
+  let info = infoOpt.get()
+  {.cast(raises: []).}:
+    try:
+      let cfg = ClientConfig(host: info.host, port: info.clientPort,
+                             timeoutMs: 5000)
+      let pc = newProtocolClient(cfg)
+      let cr = pc.connect()
+      if not cr.isOk:
+        return rsErr[Option[RaftKVEntry]](newRSE(rseNotLeader,
+            "failed to connect to leader: " & $cr.err))
+      defer: pc.disconnect()
+      let dr = pc.kvDeleteInGroup(key, groupId.uint64)
+      if not dr.isOk:
+        if dr.err.kind == peNotLeader:
+          return rsErr[Option[RaftKVEntry]](newRSE(rseNotLeader, dr.err.msg))
+        return rsErr[Option[RaftKVEntry]](newRSE(rseInternal, dr.err.msg))
+      let resp = dr.val
+      if resp.status == DelStatusDeleted:
+        if resp.hasPreviousValue:
+          return rsOk[Option[RaftKVEntry]](some(RaftKVEntry(
+            value: resp.previousValue, version: 1'u64,
+            timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000))))
+        return rsOk[Option[RaftKVEntry]](some(RaftKVEntry(
+          value: "", version: 1'u64,
+          timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000))))
+      return rsOk[Option[RaftKVEntry]](none(RaftKVEntry))
+    except CatchableError as e:
+      return rsErr[Option[RaftKVEntry]](newRSE(rseInternal,
+          "forward DELETE exception: " & e.msg))
+
+proc forwardGetToLeader(store: RaftKVStoreExt, groupId: GroupID,
+    key: string): RSResult[Option[RaftKVEntry]] {.gcsafe, raises: [].} =
+  ## Forward a GET to the leader of `groupId` via the wire protocol.
+  let infoOpt = store.findLeaderForGroup(groupId)
+  if infoOpt.isNone:
+    return rsErr[Option[RaftKVEntry]](newRSE(rseNotLeader,
+        "no reachable leader for group " & $groupId.uint64))
+  let info = infoOpt.get()
+  {.cast(raises: []).}:
+    try:
+      let cfg = ClientConfig(host: info.host, port: info.clientPort,
+                             timeoutMs: 5000)
+      let pc = newProtocolClient(cfg)
+      let cr = pc.connect()
+      if not cr.isOk:
+        return rsErr[Option[RaftKVEntry]](newRSE(rseNotLeader,
+            "failed to connect to leader: " & $cr.err))
+      defer: pc.disconnect()
+      let gr = pc.kvGetInGroup(key, groupId.uint64)
+      if not gr.isOk:
+        if gr.err.kind == peNotLeader:
+          return rsErr[Option[RaftKVEntry]](newRSE(rseNotLeader, gr.err.msg))
+        return rsErr[Option[RaftKVEntry]](newRSE(rseInternal, gr.err.msg))
+      let resp = gr.val
+      if resp.found:
+        return rsOk[Option[RaftKVEntry]](some(RaftKVEntry(
+          value: resp.value, version: resp.version,
+          timestamp: resp.timestamp)))
+      return rsOk[Option[RaftKVEntry]](none(RaftKVEntry))
+    except CatchableError as e:
+      return rsErr[Option[RaftKVEntry]](newRSE(rseInternal,
+          "forward GET exception: " & e.msg))
+
+# ---------------------------------------------------------------------------
 # Space-aware KV operations
 # ---------------------------------------------------------------------------
 # These bypass resolveGroupId() and route directly to a space's Raft group
@@ -1077,41 +1271,47 @@ proc raftPutInSpace*(store: RaftKVStoreExt, key, value: string,
     space: SpaceInfo, primaryKey: string): RSResult[RaftKVEntry] {.gcsafe, raises: [].} =
   ## Write `value` under `key` through Raft consensus, routing to the
   ## correct group in the space via hash(primaryKey).
-  ## Returns rseNotLeader if this node is not the leader for the target group.
+  ## Forwards to the group leader over the network if this node is not the leader.
   let rid = routeToGroup(primaryKey, space.groupIds)
-  if not store.coordinator.hasGroup(rid):
-    return rsErr[RaftKVEntry](newRSE(rseNotLeader,
-        "not leader for group " & $rid.uint64))
-  let batch = newWriteBatch()
-  batch.put(toBytes(key), toBytes(value))
-  let vr = proposeWrite(store, rid, batch)
-  if not vr.isOk:
-    return rsErr[RaftKVEntry](vr.error)
-  let ver = store.nextVersion.fetchAdd(1)
-  let ts = uint64(getTime().toUnixFloat() * 1_000_000_000)
-  rsOk[RaftKVEntry](RaftKVEntry(value: value, version: ver, timestamp: ts))
+  # Try local first
+  {.cast(raises: []).}:
+    if store.coordinator.hasGroup(rid):
+      let gOpt = store.coordinator.getGroup(rid)
+      if gOpt.isSome and gOpt.get.isLeader():
+        let batch = newWriteBatch()
+        batch.put(toBytes(key), toBytes(value))
+        let vr = proposeWrite(store, rid, batch)
+        if vr.isOk:
+          let ver = store.nextVersion.fetchAdd(1)
+          let ts = uint64(getTime().toUnixFloat() * 1_000_000_000)
+          return rsOk[RaftKVEntry](RaftKVEntry(value: value, version: ver, timestamp: ts))
+        if vr.error.kind != rseNotLeader:
+          return rsErr[RaftKVEntry](vr.error)
+        # Fall through to network forwarding if we lost leadership
+  # Forward to group leader via network
+  store.forwardPutToLeader(rid, key, value)
 
-proc raftGetInSpaceFromGroup(store: RaftKVStoreExt, key: string,
+proc raftGetInSpaceFromGroup*(store: RaftKVStoreExt, key: string,
     rid: GroupID): RSResult[Option[RaftKVEntry]] {.gcsafe, raises: [].} =
   ## Internal helper: read `key` from a specific group.
-  ## Returns the value if this node is the leader for the group.
-  ## Returns rseNotLeader if this node is not the leader.
+  ## If this node is the leader, reads locally.
+  ## Otherwise, forwards to the group leader over the network.
   {.cast(raises: []).}:
     let gOpt = store.coordinator.getGroup(rid)
-    if gOpt.isNone or not gOpt.get.isLeader():
-      return rsErr[Option[RaftKVEntry]](newRSE(rseNotLeader,
-          "not leader for group " & $rid.uint64))
-    let backend = store.getBackend()
-    if backend != nil and backend.isOpen:
-      let valOpt = backend.get(key)
-      if valOpt.isSome:
-        let entry = RaftKVEntry(
-          value: valOpt.get(),
-          version: 1'u64,
-          timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
-        )
-        return rsOk[Option[RaftKVEntry]](some(entry))
-    return rsOk[Option[RaftKVEntry]](none(RaftKVEntry))
+    if gOpt.isSome and gOpt.get.isLeader():
+      let backend = store.getBackend()
+      if backend != nil and backend.isOpen:
+        let valOpt = backend.get(key)
+        if valOpt.isSome:
+          let entry = RaftKVEntry(
+            value: valOpt.get(),
+            version: 1'u64,
+            timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
+          )
+          return rsOk[Option[RaftKVEntry]](some(entry))
+      return rsOk[Option[RaftKVEntry]](none(RaftKVEntry))
+    # Not leader — forward to the group leader via network
+    return store.forwardGetToLeader(rid, key)
 
 proc raftGetInSpace*(store: RaftKVStoreExt, key: string,
     space: SpaceInfo, primaryKey: string): RSResult[Option[RaftKVEntry]] {.gcsafe, raises: [].} =
@@ -1136,29 +1336,33 @@ proc raftGetInSpace*(store: RaftKVStoreExt, key: string,
 proc raftDeleteInSpace*(store: RaftKVStoreExt, key: string,
     space: SpaceInfo, primaryKey: string): RSResult[Option[RaftKVEntry]] {.gcsafe, raises: [].} =
   ## Delete `key` through Raft consensus, routing to the correct space group.
-  ## Returns rseNotLeader if this node is not the leader for the target group.
+  ## Forwards to the group leader over the network if this node is not the leader.
   let rid = routeToGroup(primaryKey, space.groupIds)
-  if not store.coordinator.hasGroup(rid):
-    return rsErr[Option[RaftKVEntry]](newRSE(rseNotLeader,
-        "not leader for group " & $rid.uint64))
-  # Capture previous value from backend
-  var prevEntry: Option[RaftKVEntry]
-  let backend = store.getBackend()
-  if backend != nil and backend.isOpen:
-    {.cast(raises: []).}:
-      let valOpt = backend.get(key)
-      if valOpt.isSome:
-        prevEntry = some(RaftKVEntry(
-          value: valOpt.get(),
-          version: 1'u64,
-          timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
-        ))
-  let batch = newWriteBatch()
-  batch.delete(toBytes(key))
-  let vr = proposeWrite(store, rid, batch)
-  if not vr.isOk:
-    return rsErr[Option[RaftKVEntry]](vr.error)
-  rsOk[Option[RaftKVEntry]](prevEntry)
+  # Try local first
+  {.cast(raises: []).}:
+    if store.coordinator.hasGroup(rid):
+      let gOpt = store.coordinator.getGroup(rid)
+      if gOpt.isSome and gOpt.get.isLeader():
+        var prevEntry: Option[RaftKVEntry]
+        let backend = store.getBackend()
+        if backend != nil and backend.isOpen:
+          let valOpt = backend.get(key)
+          if valOpt.isSome:
+            prevEntry = some(RaftKVEntry(
+              value: valOpt.get(),
+              version: 1'u64,
+              timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
+            ))
+        let batch = newWriteBatch()
+        batch.delete(toBytes(key))
+        let vr = proposeWrite(store, rid, batch)
+        if vr.isOk:
+          return rsOk[Option[RaftKVEntry]](prevEntry)
+        if vr.error.kind != rseNotLeader:
+          return rsErr[Option[RaftKVEntry]](vr.error)
+        # Fall through to network forwarding if we lost leadership
+  # Forward to group leader via network
+  store.forwardDeleteToLeader(rid, key)
 
 proc raftDeleteInGroup*(store: RaftKVStoreExt, key: string,
     groupId: GroupID): RSResult[Option[RaftKVEntry]] {.gcsafe, raises: [].} =

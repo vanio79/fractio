@@ -693,12 +693,17 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
       # writes buffered as intents by this txn are visible (reads-your-own-writes).
       let rr = if req.txnId != 0:
                  server.raftStore.raftGetForTxn(req.txnId, req.key)
+               elif req.groupId != 0:
+                 server.raftStore.raftGetInGroup(req.key,
+                     GroupID(req.groupId))
                else:
                  server.raftStore.raftGet(req.key)
       if not rr.isOk:
         if rr.error.kind == rseNotLeader:
           sendError(conn, requestId, ErrNotLeader, ErrCatKV,
             "not the leader for key: " & req.key)
+        elif rr.error.kind == rseBadRouting:
+          sendError(conn, requestId, ErrBadRouting, ErrCatKV, rr.error.msg)
         else:
           sendError(conn, requestId, ErrInternal, ErrCatKV, rr.error.msg)
         return
@@ -791,6 +796,8 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
         if wr.error.kind == rseNotLeader:
           sendError(conn, requestId, ErrNotLeader, ErrCatKV,
             "not the leader for key: " & req.key)
+        elif wr.error.kind == rseBadRouting:
+          sendError(conn, requestId, ErrBadRouting, ErrCatKV, wr.error.msg)
         else:
           sendError(conn, requestId, ErrInternal, ErrCatKV, wr.error.msg)
         return
@@ -867,6 +874,8 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
         if dr.error.kind == rseNotLeader:
           sendError(conn, requestId, ErrNotLeader, ErrCatKV,
             "not the leader for key: " & req.key)
+        elif dr.error.kind == rseBadRouting:
+          sendError(conn, requestId, ErrBadRouting, ErrCatKV, dr.error.msg)
         else:
           sendError(conn, requestId, ErrInternal, ErrCatKV, dr.error.msg)
         return
