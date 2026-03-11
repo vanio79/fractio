@@ -11,7 +11,6 @@ const navItems* = [
   ("/#/nodes",   "Nodes"),
   ("/#/metrics", "Metrics"),
   ("/#/clock",   "Clock"),
-  ("/#/spaces",  "Spaces"),
   ("/#/storage", "Storage"),
   ("/#/data",    "Data"),
 ]

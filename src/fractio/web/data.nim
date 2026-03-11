@@ -8,6 +8,10 @@ import ./state
 
 var gDriftWs* {.global.}: JsObject = nil
 
+var
+  fetchingSpaces {.global.}: bool = false
+  loadedSpaces* {.global.}: bool = false
+
 proc doRefresh*() {.async.} =
   try:
     gInfo.set(await fetchJson("/api/info"))
@@ -15,6 +19,8 @@ proc doRefresh*() {.async.} =
     gMetrics.set(await fetchJson("/api/metrics"))
     gNodes.set(await fetchJson("/api/nodes"))
     gStorage.set(await fetchJson("/api/storage"))
+    gSpaces.set(await fetchJson("/api/spaces"))
+    loadedSpaces = true
     # Re-inject clock DOM after HappyX re-renders wipe #drift-chart
     jsSetTimeout(proc() = injectClockDom(), 0)
   except:
@@ -199,10 +205,6 @@ proc triggerLoadSystemTableData*(tableId: int, tableName: string): int =
   jsSetTimeout(proc() = discard doLoadSystemTableData(tid, tn), 0)
   0
 
-var
-  fetchingSpaces {.global.}: bool = false
-  loadedSpaces* {.global.}: bool = false
-
 proc doLoadSpaces*() {.async.} =
   let resp = await fetchJson("/api/spaces")
   fetchingSpaces = false
@@ -224,6 +226,15 @@ proc toggleNodeExpanded*(nodeId: int) =
   else:
     cur.add(nodeId)
   gExpandedNodes.set(cur)
+
+proc toggleSpaceExpanded*(spaceId: int) =
+  var cur = gExpandedSpaces.get()
+  let idx = cur.find(spaceId)
+  if idx >= 0:
+    cur.delete(idx)
+  else:
+    cur.add(spaceId)
+  gExpandedSpaces.set(cur)
 
 proc connectDriftWs*() =
   let host = jsLocation()

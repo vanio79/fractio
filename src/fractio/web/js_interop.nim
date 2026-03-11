@@ -117,6 +117,21 @@ proc installNodeClickHandler*(cb: proc(nid: int)) =
   });
   """.}
 
+# Delegated click handler for expandable space rows (id="space-row-<N>").
+proc installSpaceClickHandler*(cb: proc(sid: int)) =
+  {.emit: """
+  document.addEventListener('click', function(e) {
+    var el = e.target;
+    while (el && el !== document.body) {
+      if (el.id && el.id.substring(0, 10) === 'space-row-') {
+        var sid = parseInt(el.id.substring(10), 10);
+        if (!isNaN(sid)) { `cb`(sid); return; }
+      }
+      el = el.parentElement;
+    }
+  });
+  """.}
+
 # Intercept clicks on internal hash links (/#/...) to use HappyX's route()
 # instead of default browser navigation.  This avoids double history entries
 # (one from the href change, one from HappyX's hashchange → pushState).

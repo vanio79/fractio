@@ -8,7 +8,7 @@
 # Call launchWebDashboard(server) after server.start() to activate the dashboard.
 
 import happyx
-import std/[json, strutils, times, os, atomics, random, asyncdispatch, httpclient]
+import std/[json, strutils, times, os, atomics, random, asyncdispatch, httpclient, tables]
 import zippy
 import ../protocol/server as pserver
 import ../protocol/messages/cluster as clusterMsgs
@@ -535,6 +535,24 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
         if srv.isNil or srv.raftStore.isNil:
           statusCode = 503
           return %* {"error": "server not ready"}
+
+        # Build groups lookup from sys.groups
+        var groupDescs = initTable[uint64, JsonNode]()
+        {.cast(gcsafe).}:
+          let gStartKey = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
+          let gEndKey = encodeTableKey(SYS_GROUPS_TABLE_ID + 1, "")
+          let gsr = srv.raftStore.raftScan(gStartKey, gEndKey, 0,
+              includeSystemKeys = true)
+          if gsr.isOk:
+            for (key, entry) in gsr.value:
+              try:
+                let gj = parseJson(entry.value)
+                let gid = uint64(gj.getOrDefault("groupId").getInt(0))
+                if gid > 0:
+                  groupDescs[gid] = gj
+              except JsonParsingError:
+                discard
+
         let startKey = encodeTableKey(SYS_SPACES_TABLE_ID, "")
         let endKey = encodeTableKey(SYS_SPACES_TABLE_ID + 1, "")
         var arr = newJArray()
@@ -545,6 +563,64 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
             for (key, entry) in sr.value:
               try:
                 let j = parseJson(entry.value)
+
+                # Enrich with group member details
+                var groupsArr = newJArray()
+                if j.hasKey("groupIds"):
+                  for gidNode in j["groupIds"]:
+                    let gid = uint64(gidNode.getInt(0))
+                    var groupObj = %* {"groupId": gid}
+                    var members = newJArray()
+                    if groupDescs.hasKey(gid):
+                      let desc = groupDescs[gid]
+                      if desc.hasKey("replicas"):
+                        for rep in desc["replicas"]:
+                          let nid = rep.getOrDefault("nodeId").getInt(0)
+                          # Determine role: check local raft group state
+                          var role = "follower"
+                          let grpOpt = srv.raftStore.coordinator.getGroup(GroupID(gid))
+                          if grpOpt.isSome:
+                            let grp = grpOpt.get
+                            if grp.isLeader():
+                              # This node is the leader — mark it
+                              if nid == srv.config.serverId.int:
+                                role = "leader"
+                              else:
+                                role = "follower"
+                            else:
+                              # Not leader locally — use first replica as heuristic
+                              if desc["replicas"].len > 0 and
+                                  desc["replicas"][0].getOrDefault("nodeId").getInt(0) == nid:
+                                role = "leader"
+                              else:
+                                role = "follower"
+                          else:
+                            # Group not local — first replica is likely the leader
+                            if desc["replicas"].len > 0 and
+                                desc["replicas"][0].getOrDefault("nodeId").getInt(0) == nid:
+                              role = "leader"
+                          members.add(%* {"nodeId": nid, "role": role})
+                    groupObj["members"] = members
+                    groupsArr.add(groupObj)
+                j["groups"] = groupsArr
+
+                # Enrich old groups (during rebalancing)
+                var oldGroupsArr = newJArray()
+                if j.hasKey("oldGroupIds"):
+                  for gidNode in j["oldGroupIds"]:
+                    let gid = uint64(gidNode.getInt(0))
+                    var groupObj = %* {"groupId": gid}
+                    var members = newJArray()
+                    if groupDescs.hasKey(gid):
+                      let desc = groupDescs[gid]
+                      if desc.hasKey("replicas"):
+                        for rep in desc["replicas"]:
+                          let nid = rep.getOrDefault("nodeId").getInt(0)
+                          members.add(%* {"nodeId": nid, "role": "follower"})
+                    groupObj["members"] = members
+                    oldGroupsArr.add(groupObj)
+                j["oldGroups"] = oldGroupsArr
+
                 arr.add(j)
               except JsonParsingError:
                 discard

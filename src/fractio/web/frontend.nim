@@ -125,6 +125,101 @@ appRoutes "app":
                           tTd(style = "padding:.35rem .7rem;border-bottom:1px solid #eee;font-family:monospace;background:{rowBg}"): "{sizeMB}"
                 else:
                   tDiv(style = "color:#999;font-size:.82rem"): "No storage data"
+
+        # ---- Spaces list (clickable, expandable with group details) ----
+        let spacesArr = gSpaces.get()
+        let spacesLenStr = jsLen(spacesArr)
+        let spacesLen = jsParseInt(spacesLenStr)
+        let expandedSpaces = gExpandedSpaces.get()
+        let spaceCount = $spacesLenStr & (if spacesLen != 1: " spaces" else: " space")
+        tDiv(style = "display:flex;align-items:center;gap:.75rem;margin-bottom:.75rem"):
+          tH2(style = "font-size:1.05rem;font-weight:700;color:#111;margin:0"): "Spaces"
+          tSpan(style = "background:#eee;color:#444;padding:.2rem .6rem;border-radius:999px;font-size:.8rem"):
+            "{spaceCount}"
+        if spacesLen == 0 and loadedSpaces:
+          tDiv(style = "color:#888;font-size:.85rem;padding:1rem;margin-bottom:1.25rem"): "No spaces found."
+        elif spacesLen == 0:
+          tDiv(style = "color:#888;font-size:.85rem;padding:1rem;margin-bottom:1.25rem"): "Loading spaces..."
+        else:
+          tDiv(style = "display:flex;flex-direction:column;gap:0;margin-bottom:1.25rem"):
+            for si in 0 ..< spacesLen:
+              let sp = spacesArr[si]
+              let sid = safeInt(sp, "spaceId")
+              let sidStr = $safeIntStr(sp, "spaceId")
+              let sname = $safeStr(sp, "name")
+              let srep = safeInt(sp, "replicas")
+              let srepStr = if srep == 0: "ALL" else: $safeIntStr(sp, "replicas")
+              let sgc = $safeIntStr(sp, "groupCount")
+              let isRebalancing = safeBool(sp, "rebalancing")
+              let isSpaceExpanded = sid in expandedSpaces
+              let schevron = if isSpaceExpanded: "▾" else: "▸"
+              let sborderBot = if isSpaceExpanded: "none" else: "1px solid #e0e0e0"
+              let sborderRad = if isSpaceExpanded: "6px 6px 0 0" else: "6px"
+              # Space header row (clickable)
+              tDiv(id = "space-row-" & sidStr, style = "background:#fff;border:1px solid #e0e0e0;border-bottom:{sborderBot};border-radius:{sborderRad};padding:.65rem 1rem;cursor:pointer;display:flex;align-items:center;gap:.75rem"):
+                tSpan(style = "color:#888;font-size:.85rem;width:1rem;text-align:center"): "{schevron}"
+                tSpan(style = "font-weight:700;font-size:.9rem"): "{sname}"
+                tSpan(style = "background:#eee;color:#444;padding:.15rem .5rem;border-radius:999px;font-size:.75rem"):
+                  "{srepStr} replicas"
+                tSpan(style = "background:#eee;color:#444;padding:.15rem .5rem;border-radius:999px;font-size:.75rem"):
+                  "{sgc} groups"
+                if isRebalancing:
+                  tSpan(style = "background:#b45309;color:#fff;padding:.15rem .5rem;border-radius:999px;font-size:.75rem;font-weight:600"):
+                    "rebalancing"
+              # Expanded group details
+              if isSpaceExpanded:
+                tDiv(style = "background:#fafafa;border:1px solid #e0e0e0;border-top:none;border-radius:0 0 6px 6px;padding:1rem"):
+                  # Current groups
+                  let groups = sp.groups
+                  let groupsLen = jsArrayLen(groups)
+                  tDiv(style = "font-size:.82rem;font-weight:600;color:#444;margin-bottom:.65rem"): "Current Groups"
+                  if groupsLen > 0:
+                    tDiv(style = "display:flex;flex-direction:column;gap:.5rem"):
+                      for gi in 0 ..< groupsLen:
+                        let grp = groups[gi]
+                        let gid = $safeIntStr(grp, "groupId")
+                        let members = grp.members
+                        let membersLen = jsArrayLen(members)
+                        tDiv(style = "background:#fff;border:1px solid #e8e8e8;border-radius:4px;padding:.5rem .75rem"):
+                          tDiv(style = "display:flex;align-items:center;gap:.5rem;flex-wrap:wrap"):
+                            tSpan(style = "font-weight:600;font-size:.82rem;color:#555"): "Group {gid}"
+                            for mi in 0 ..< membersLen:
+                              let member = members[mi]
+                              let mnid = $safeIntStr(member, "nodeId")
+                              let mrole = $safeStr(member, "role")
+                              let mcolor = if mrole == "leader": "#1a7f37" else: "#2563eb"
+                              tSpan(style = "display:inline-flex;align-items:center;gap:.25rem;font-size:.78rem"):
+                                tSpan(style = "color:#666"): "n{mnid}"
+                                tSpan(style = "color:{mcolor};font-weight:600;font-size:.72rem;background:#f0f0f0;padding:.1rem .4rem;border-radius:999px"):
+                                  "{mrole}"
+                  else:
+                    tDiv(style = "color:#999;font-size:.82rem"): "No group data"
+                  # Old groups (only when rebalancing)
+                  if isRebalancing:
+                    let oldGroups = sp.oldGroups
+                    let oldGroupsLen = jsArrayLen(oldGroups)
+                    tDiv(style = "font-size:.82rem;font-weight:600;color:#444;margin-top:1rem;margin-bottom:.65rem"): "Old Groups (rebalancing)"
+                    if oldGroupsLen > 0:
+                      tDiv(style = "display:flex;flex-direction:column;gap:.5rem"):
+                        for gi in 0 ..< oldGroupsLen:
+                          let grp = oldGroups[gi]
+                          let gid = $safeIntStr(grp, "groupId")
+                          let members = grp.members
+                          let membersLen = jsArrayLen(members)
+                          tDiv(style = "background:#fff;border:1px solid #e8e8e8;border-left:3px solid #b45309;border-radius:4px;padding:.5rem .75rem"):
+                            tDiv(style = "display:flex;align-items:center;gap:.5rem;flex-wrap:wrap"):
+                              tSpan(style = "font-weight:600;font-size:.82rem;color:#555"): "Group {gid}"
+                              for mi in 0 ..< membersLen:
+                                let member = members[mi]
+                                let mnid = $safeIntStr(member, "nodeId")
+                                let mrole = $safeStr(member, "role")
+                                tSpan(style = "display:inline-flex;align-items:center;gap:.25rem;font-size:.78rem"):
+                                  tSpan(style = "color:#666"): "n{mnid}"
+                                  tSpan(style = "color:#888;font-weight:600;font-size:.72rem;background:#f0f0f0;padding:.1rem .4rem;border-radius:999px"):
+                                    "{mrole}"
+                    else:
+                      tDiv(style = "color:#999;font-size:.82rem"): "No old group data"
+
       tFooter(style = footerStyle):
         "Fractio Management Console · Auto-refresh every 5s"
 
@@ -267,53 +362,6 @@ appRoutes "app":
 
       tFooter(style = footerStyle):
         "Fractio Management Console · SharedTimer drift stream"
-
-  # ---- Spaces ----
-  "/spaces":
-    let hs5 = healthStr(safeInt(gHealth.get(), "status") + triggerLoadSpaces())
-    let hc5 = healthColor(safeInt(gHealth.get(), "status"))
-    tDiv(style = shellStyle):
-      tHeader(style = headerStyle):
-        tDiv(style = logoStyle): "⬡ FRACTIO"
-        tDiv(style = "flex:1")
-        tSpan(style = "{badgeStyle(hc5)}"): "{hs5}"
-      tNav(style = navBarStyle):
-        for (href, label) in navItems:
-          tA(href = href, style = "{navStyle(label == \"Spaces\")}"): "{label}"
-      tMain(style = mainStyle):
-        tDiv(style = "display:flex;align-items:center;gap:.75rem;margin-bottom:1rem"):
-          tH2(style = "font-size:1.05rem;font-weight:700;color:#111;margin:0"): "Spaces"
-        let spacesArr = gSpaces.get()
-        let spacesLen = jsArrayLen(spacesArr)
-        if spacesLen == 0 and loadedSpaces:
-          tDiv(style = "color:#888;font-size:.85rem;padding:1rem"): "No spaces found."
-        elif spacesLen == 0:
-          tDiv(style = "color:#888;font-size:.85rem;padding:1rem"): "Loading spaces..."
-        else:
-          tDiv(style = "overflow-x:auto;margin-bottom:1.25rem"):
-            tTable(style = "width:100%;border-collapse:collapse;font-size:.875rem;background:#fff;border:1px solid #e0e0e0;border-radius:6px;overflow:hidden"):
-              tThead:
-                tTr:
-                  for h in ["ID", "Name", "Replicas", "Groups", "Group IDs"]:
-                    tTh(style = "background:#3a3a3a;color:#fff;padding:.55rem .85rem;text-align:left;font-size:.7rem;text-transform:uppercase;letter-spacing:.07em;font-weight:600"):
-                      "{h}"
-              tTbody:
-                for si in 0 ..< spacesLen:
-                  let sp = spacesArr[si]
-                  let sid = $safeIntStr(sp, "spaceId")
-                  let sname = $safeStr(sp, "name")
-                  let srep = safeInt(sp, "replicas")
-                  let srepStr = if srep == 0: "ALL" else: $safeIntStr(sp, "replicas")
-                  let sgc = $safeIntStr(sp, "groupCount")
-                  let sranges = $safeStr(sp, "groupIds")
-                  tTr:
-                    tTd(style = "padding:.55rem .85rem;border-bottom:1px solid #eee"): "{sid}"
-                    tTd(style = "padding:.55rem .85rem;border-bottom:1px solid #eee;font-weight:600"): "{sname}"
-                    tTd(style = "padding:.55rem .85rem;border-bottom:1px solid #eee"): "{srepStr}"
-                    tTd(style = "padding:.55rem .85rem;border-bottom:1px solid #eee"): "{sgc}"
-                    tTd(style = "padding:.55rem .85rem;border-bottom:1px solid #eee;font-family:monospace;font-size:.82rem"): "{sranges}"
-      tFooter(style = footerStyle):
-        "Fractio Management Console · Spaces"
 
   # ---- Storage ----
   "/storage":
@@ -624,6 +672,7 @@ appRoutes "app":
 when isMainModule:
   installLinkInterceptor()
   installNodeClickHandler(proc(nid: int) = toggleNodeExpanded(nid))
+  installSpaceClickHandler(proc(sid: int) = toggleSpaceExpanded(sid))
   discard doRefresh()
   jsSetInterval(proc() = discard doRefresh(), 5000)
   connectDriftWs()
