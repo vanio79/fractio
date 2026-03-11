@@ -1697,6 +1697,47 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
     server.sharedTimer = timer
     server.txnMgr.setTimeProvider(timer)
 
+  # Start rebalance monitor thread
+  block:
+    var gRebalStorePtr {.global.}: pointer
+    gRebalStorePtr = cast[pointer](store)
+
+    proc rebalanceMonitorThread(_: int) {.thread, gcsafe.} =
+      {.cast(gcsafe).}:
+        let rstoreRef = cast[RaftKVStoreExt](gRebalStorePtr)
+        const checkIntervalSecs = 10
+        const staleHeartbeatSecs = 30
+        while true:
+          sleep(checkIntervalSecs * 1000)
+          try:
+            rstoreRef.loadSpaces()
+            acquire(rstoreRef.spacesMu)
+            var rebalSpaces: seq[SpaceInfo] = @[]
+            for sid, sp in rstoreRef.spaces:
+              if sp.rebalancing:
+                rebalSpaces.add(sp)
+            release(rstoreRef.spacesMu)
+
+            let nowSecs = getTime().toUnix()
+            let myNodeId = int(rstoreRef.coordinator.nodeId)
+            for sp in rebalSpaces:
+              let heartbeatAge = nowSecs - sp.rebalanceHeartbeat
+              if sp.rebalanceWorker == myNodeId:
+                # We are the worker — continue migration
+                rstoreRef.runRebalanceMigration(sp.spaceId)
+              elif sp.rebalanceWorker == 0 or heartbeatAge > staleHeartbeatSecs:
+                # No worker or stale heartbeat — claim and run
+                rstoreRef.runRebalanceMigration(sp.spaceId)
+          except:
+            discard
+
+    var gRebalThread {.global.}: ref Thread[int]
+    try:
+      gRebalThread = new Thread[int]
+      createThread(gRebalThread[], rebalanceMonitorThread, 0)
+    except CatchableError:
+      discard
+
   # Persist cluster membership for restart recovery
   if peers.len > 0:
     server.saveClusterState()

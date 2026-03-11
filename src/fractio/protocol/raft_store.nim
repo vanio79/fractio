@@ -184,6 +184,11 @@ type
     name*: string
     replicas*: int        ## 0 = ALL nodes
     groupIds*: seq[uint64]
+    oldGroupIds*: seq[uint64]      ## previous groups during rebalance
+    rebalancing*: bool             ## true while migration is in progress
+    rebalanceWorker*: int          ## nodeId of the migrating worker
+    rebalanceHeartbeat*: int64     ## unix epoch seconds of last worker heartbeat
+    rebalanceCursor*: string       ## last key migrated (resume point)
 
   RaftKVStoreExt* = ref object of RaftKVStore
     stateMachines*: Table[GroupID, KVStateMachine]  ## lightweight index tracking only
@@ -880,6 +885,13 @@ proc loadSpaces*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
         if j.hasKey("groupIds"):
           for r in j["groupIds"]:
             info.groupIds.add(uint64(r.getInt()))
+        if j.hasKey("oldGroupIds"):
+          for r in j["oldGroupIds"]:
+            info.oldGroupIds.add(uint64(r.getInt()))
+        info.rebalancing = j.getOrDefault("rebalancing").getBool(false)
+        info.rebalanceWorker = j.getOrDefault("rebalanceWorker").getInt(0)
+        info.rebalanceHeartbeat = j.getOrDefault("rebalanceHeartbeat").getBiggestInt(0)
+        info.rebalanceCursor = j.getOrDefault("rebalanceCursor").getStr("")
         store.spaces[info.spaceId] = info
       except:
         discard
@@ -994,26 +1006,21 @@ proc raftPutInSpace*(store: RaftKVStoreExt, key, value: string,
   let ts = uint64(getTime().toUnixFloat() * 1_000_000_000)
   rsOk[RaftKVEntry](RaftKVEntry(value: value, version: ver, timestamp: ts))
 
-proc raftGetInSpace*(store: RaftKVStoreExt, key: string,
-    space: SpaceInfo, primaryKey: string): RSResult[Option[RaftKVEntry]] {.gcsafe, raises: [].} =
-  ## Read the current value for `key` from the space group owning `primaryKey`.
-  ## If the local coordinator doesn't own the target group, forward to a peer
-  ## that does (preferring the leader for read consistency).
-  let rid = routeToGroup(primaryKey, space.groupIds)
+proc raftGetInSpaceFromGroup(store: RaftKVStoreExt, key: string,
+    rid: GroupID): RSResult[Option[RaftKVEntry]] {.gcsafe, raises: [].} =
+  ## Internal helper: read `key` from a specific group.
   if not store.coordinator.hasGroup(rid):
     let peerOpt = store.findPeerForGroup(rid)
     if peerOpt.isSome:
-      return peerOpt.get().raftGetInSpace(key, space, primaryKey)
+      return peerOpt.get().raftGetInSpaceFromGroup(key, rid)
     return rsErr[Option[RaftKVEntry]](newRSE(rseGroupNotFound,
         "no local or peer store for group " & $rid.uint64))
-  # Check if we're the leader for this group
   var isLocalLeader = false
   {.cast(raises: []).}:
     let localGroup = store.coordinator.getGroup(rid)
     isLocalLeader = localGroup.isSome and localGroup.get.isLeader()
 
   if isLocalLeader or store.peerStores.len == 0:
-    # We're the leader — read from our local backend
     let backend = store.getBackend()
     if backend != nil and backend.isOpen:
       {.cast(raises: []).}:
@@ -1027,11 +1034,9 @@ proc raftGetInSpace*(store: RaftKVStoreExt, key: string,
           return rsOk[Option[RaftKVEntry]](some(entry))
     return rsOk[Option[RaftKVEntry]](none(RaftKVEntry))
   else:
-    # Not the leader — forward to the leader for consistent reads
     let peerOpt = store.findPeerForGroup(rid)
     if peerOpt.isSome:
-      return peerOpt.get().raftGetInSpace(key, space, primaryKey)
-    # Fallback: read from local backend even though we're not leader
+      return peerOpt.get().raftGetInSpaceFromGroup(key, rid)
     let backend = store.getBackend()
     if backend != nil and backend.isOpen:
       {.cast(raises: []).}:
@@ -1044,6 +1049,25 @@ proc raftGetInSpace*(store: RaftKVStoreExt, key: string,
           )
           return rsOk[Option[RaftKVEntry]](some(entry))
     return rsOk[Option[RaftKVEntry]](none(RaftKVEntry))
+
+proc raftGetInSpace*(store: RaftKVStoreExt, key: string,
+    space: SpaceInfo, primaryKey: string): RSResult[Option[RaftKVEntry]] {.gcsafe, raises: [].} =
+  ## Read the current value for `key` from the space group owning `primaryKey`.
+  ## During rebalancing, if the key is not found in the new group, falls back
+  ## to the old group.
+  let rid = routeToGroup(primaryKey, space.groupIds)
+  let res = store.raftGetInSpaceFromGroup(key, rid)
+  if not res.isOk:
+    return res
+  # If found, return it
+  if res.value.isSome:
+    return res
+  # Not found in new group — fall back to old group during rebalance
+  if space.rebalancing and space.oldGroupIds.len > 0:
+    let oldRid = routeToGroup(primaryKey, space.oldGroupIds)
+    if oldRid != rid:
+      return store.raftGetInSpaceFromGroup(key, oldRid)
+  res
 
 proc forwardDeleteToLeader(store: RaftKVStoreExt, rid: GroupID,
     key: string): RSResult[Option[RaftKVEntry]] {.gcsafe, raises: [].} =
@@ -1103,6 +1127,21 @@ proc raftDeleteInSpace*(store: RaftKVStoreExt, key: string,
     return rsErr[Option[RaftKVEntry]](vr.error)
   rsOk[Option[RaftKVEntry]](prevEntry)
 
+proc raftDeleteInGroup*(store: RaftKVStoreExt, key: string,
+    groupId: GroupID): RSResult[Option[RaftKVEntry]] {.gcsafe, raises: [].} =
+  ## Delete `key` from a specific group (used during rebalance migration
+  ## to remove a key from its old group after copying to the new one).
+  if not store.coordinator.hasGroup(groupId):
+    return store.forwardDeleteToLeader(groupId, key)
+  let batch = newWriteBatch()
+  batch.delete(toBytes(key))
+  let vr = proposeWrite(store, groupId, batch)
+  if not vr.isOk:
+    if vr.error.kind == rseNotLeader and store.peerStores.len > 0:
+      return store.forwardDeleteToLeader(groupId, key)
+    return rsErr[Option[RaftKVEntry]](vr.error)
+  rsOk[Option[RaftKVEntry]](none(RaftKVEntry))
+
 proc scanLocalGroup(store: RaftKVStoreExt, rid: GroupID,
     startKey, endKey: string,
     includeSystemKeys: bool): seq[(string, RaftKVEntry)] {.gcsafe, raises: [].} =
@@ -1143,10 +1182,22 @@ proc raftScanSpace*(store: RaftKVStoreExt, startKey, endKey: string,
   # Multi-node: fan-out to group leaders.
   # Since all groups on the same node share one backend, we track which
   # stores we've already scanned to avoid duplicate results.
+  # During rebalancing, scan both new and old group sets.
   var scannedStores: seq[pointer] = @[]
   var allPairs: seq[(string, RaftKVEntry)] = @[]
 
-  for rid64 in space.groupIds:
+  var allGroupIds = space.groupIds
+  if space.rebalancing:
+    for oid in space.oldGroupIds:
+      var found = false
+      for nid in allGroupIds:
+        if nid == oid:
+          found = true
+          break
+      if not found:
+        allGroupIds.add(oid)
+
+  for rid64 in allGroupIds:
     let rid = GroupID(rid64)
     var scanStore = store
     if not store.coordinator.hasGroup(rid):
@@ -1192,3 +1243,282 @@ proc raftScanSpace*(store: RaftKVStoreExt, startKey, endKey: string,
     deduped.setLen(int(limit))
 
   rsOk[seq[(string, RaftKVEntry)]](deduped)
+
+# ---------------------------------------------------------------------------
+# Space rebalancing
+# ---------------------------------------------------------------------------
+
+proc updateSpaceRecord*(store: RaftKVStoreExt, space: SpaceInfo) {.gcsafe, raises: [].} =
+  ## Write the space record back to sys.spaces via Raft.
+  let spaceKey = encodeSpaceKey(space.spaceId)
+  var groupIdsJ = newJArray()
+  for g in space.groupIds:
+    groupIdsJ.add(newJInt(int(g)))
+  var oldGroupIdsJ = newJArray()
+  for g in space.oldGroupIds:
+    oldGroupIdsJ.add(newJInt(int(g)))
+  let spaceVal = $ %*{
+    "spaceId": space.spaceId,
+    "name": space.name,
+    "replicas": space.replicas,
+    "groupCount": space.groupIds.len,
+    "groupIds": groupIdsJ,
+    "oldGroupIds": oldGroupIdsJ,
+    "rebalancing": space.rebalancing,
+    "rebalanceWorker": space.rebalanceWorker,
+    "rebalanceHeartbeat": space.rebalanceHeartbeat,
+    "rebalanceCursor": space.rebalanceCursor,
+  }
+  discard store.raftPut(spaceKey, spaceVal)
+
+proc rebalanceSpaces*(store: RaftKVStoreExt) {.raises: [].} =
+  ## Check all spaces and initiate rebalancing for any space whose group count
+  ## doesn't match the current node count. Creates new groups and sets up
+  ## dual-read mode.
+  {.cast(raises: []).}:
+    # Count nodes
+    let nodesStart = encodeTableKey(SYS_NODES_TABLE_ID, "")
+    let nodesEnd = encodeTableKey(SYS_NODES_TABLE_ID + 1, "")
+    let nodesRes = store.raftScan(nodesStart, nodesEnd, 0, includeSystemKeys = true)
+    var nodeIds: seq[int] = @[]
+    if nodesRes.isOk:
+      for (key, entry) in nodesRes.value:
+        try:
+          let j = parseJson(entry.value)
+          nodeIds.add(j["nodeId"].getInt())
+        except: discard
+    if nodeIds.len == 0: return
+    nodeIds.sort()
+    let nodeCount = nodeIds.len
+
+    # Scan spaces
+    let spacesStart = encodeTableKey(SYS_SPACES_TABLE_ID, "")
+    let spacesEnd = encodeTableKey(SYS_SPACES_TABLE_ID + 1, "")
+    let spacesRes = store.raftScan(spacesStart, spacesEnd, 0, includeSystemKeys = true)
+    if not spacesRes.isOk: return
+
+    for (key, entry) in spacesRes.value:
+      try:
+        let j = parseJson(entry.value)
+        let spaceId = j["spaceId"].getInt()
+        let currentGroupCount = j.getOrDefault("groupIds").len
+        let isRebalancing = j.getOrDefault("rebalancing").getBool(false)
+
+        # Skip if already rebalancing or group count matches
+        if isRebalancing or currentGroupCount == nodeCount:
+          continue
+
+        let replicas = j["replicas"].getInt()
+        # Skip the default space (replicas=0 means "all nodes", uses meta group)
+        if replicas == 0:
+          continue
+        let effectiveReplicas = replicas
+        if effectiveReplicas > nodeCount:
+          continue
+
+        # Find max existing groupId
+        let grpStart = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
+        let grpEnd = encodeTableKey(SYS_GROUPS_TABLE_ID + 1, "")
+        let grpRes = store.raftScan(grpStart, grpEnd, 0, includeSystemKeys = true)
+        var maxGroupId: uint64 = 1
+        if grpRes.isOk:
+          for (gk, ge) in grpRes.value:
+            try:
+              let gj = parseJson(ge.value)
+              let gid = uint64(gj["groupId"].getInt())
+              if gid > maxGroupId: maxGroupId = gid
+            except: discard
+
+        # Create new groups with ring placement
+        var newGroupIds: seq[uint64] = @[]
+        let coord = store.coordinator
+        for g in 0 ..< nodeCount:
+          let groupId = maxGroupId + 1 + uint64(g)
+          newGroupIds.add(groupId)
+
+          var members: seq[int] = @[]
+          for r in 0 ..< effectiveReplicas:
+            members.add(nodeIds[(g + r) mod nodeCount])
+
+          # Write group descriptor
+          var replicasJson = newJArray()
+          for m in members:
+            replicasJson.add(%*{"nodeId": m, "type": "voter"})
+          let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupId)
+          let groupVal = $ %*{
+            "groupId": int(groupId),
+            "spaceId": spaceId,
+            "replicas": replicasJson,
+            "preferredLeader": members[0],
+          }
+          discard store.raftPut(groupKey, groupVal)
+
+          # Create Raft group in coordinator
+          let gid = GroupID(groupId)
+          if not coord.hasGroup(gid):
+            var desc = rangeTypes.newGroupDescriptor(gid)
+            for m in members:
+              discard desc.addReplica(rangeTypes.NodeID(uint32(m)), rangeTypes.rtVoter)
+            var myReplicaId = rangeTypes.ReplicaID(0)
+            for rep in desc.replicas:
+              if rep.nodeId == coord.nodeId:
+                myReplicaId = rep.replicaId
+                break
+            if myReplicaId != rangeTypes.ReplicaID(0):
+              let newGroup = coord.createAndStartGroup(desc, myReplicaId)
+              store.registerGroup(gid)
+              # Single-node: become leader immediately
+              if store.peerStores.len == 0:
+                newGroup.becomeLeader()
+
+        # Read current groupIds
+        var oldGroupIds: seq[uint64] = @[]
+        if j.hasKey("groupIds"):
+          for r in j["groupIds"]:
+            oldGroupIds.add(uint64(r.getInt()))
+
+        # Update space record with rebalance state
+        var space = SpaceInfo(
+          spaceId: spaceId,
+          name: j["name"].getStr(),
+          replicas: j["replicas"].getInt(),
+          groupIds: newGroupIds,
+          oldGroupIds: oldGroupIds,
+          rebalancing: true,
+          rebalanceWorker: 0,
+          rebalanceHeartbeat: 0,
+          rebalanceCursor: "",
+        )
+        store.updateSpaceRecord(space)
+      except:
+        discard
+
+    # Reload caches
+    store.loadSpaces()
+    store.loadGroupMembers()
+
+proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: int) {.raises: [].} =
+  ## Migrate data from old groups to new groups for a rebalancing space.
+  ## Claims worker role, scans tables, moves keys, and completes cutover.
+  {.cast(raises: []).}:
+    # Read current space state
+    acquire(store.spacesMu)
+    var space: SpaceInfo
+    var found = false
+    if store.spaces.hasKey(spaceId):
+      space = store.spaces[spaceId]
+      found = true
+    release(store.spacesMu)
+    if not found or not space.rebalancing: return
+
+    let myNodeId = int(store.coordinator.nodeId)
+
+    # Claim worker role
+    let nowSecs = getTime().toUnix()
+    space.rebalanceWorker = myNodeId
+    space.rebalanceHeartbeat = nowSecs
+    store.updateSpaceRecord(space)
+    store.loadSpaces()
+
+    # Find all tables in this space
+    let tablesStart = encodeTableKey(SYS_TABLES_TABLE_ID, "")
+    let tablesEnd = encodeTableKey(SYS_TABLES_TABLE_ID + 1, "")
+    let tablesRes = store.raftScan(tablesStart, tablesEnd, 0, includeSystemKeys = true)
+    var tableIds: seq[uint32] = @[]
+    if tablesRes.isOk:
+      for (key, entry) in tablesRes.value:
+        try:
+          let j = parseJson(entry.value)
+          let sid = j.getOrDefault("spaceId").getInt(1)
+          if sid == spaceId:
+            tableIds.add(uint32(j["tableId"].getInt()))
+        except: discard
+
+    let newGroupIds = space.groupIds
+    let oldGroupIds = space.oldGroupIds
+    let newCount = newGroupIds.len
+    let oldCount = oldGroupIds.len
+    if newCount == 0 or oldCount == 0: return
+
+    var keysMigrated = 0
+    var lastHeartbeat = nowSecs
+
+    # Migrate each table
+    for tableId in tableIds:
+      let startKey = encodeTableKey(tableId, "d/")
+      let endKey = encodeTableKey(tableId, "e")  # just past "d/" range
+
+      # Scan from old groups: use backend scan (all groups share one backend)
+      let backend = store.getBackend()
+      if backend == nil or not backend.isOpen: continue
+
+      var entries: seq[KeyValuePair] = @[]
+      entries = backend.scan(
+        if space.rebalanceCursor != "": space.rebalanceCursor
+        else: startKey,
+        endKey)
+
+      for (k, v) in entries:
+        # Extract primary key from the LevelDB key: /t/<tableId>/d/<pk>
+        try:
+          let decoded = decodeTableKey(k)
+          if decoded.tableId != tableId: continue
+          let afterD = decoded.primaryKey
+          if not afterD.startsWith("d/"): continue
+          let pk = afterD[2..^1]
+
+          # Check if key needs to move
+          let oldGroup = routeToGroup(pk, oldGroupIds)
+          let newGroup = routeToGroup(pk, newGroupIds)
+          if oldGroup != newGroup:
+            # Write to new group via Raft consensus
+            discard store.raftPutInSpace(k, v, space, pk)
+            # Note: we do NOT delete from the old group here because all
+            # groups on a node share one LevelDB backend — the LevelDB key
+            # is the same regardless of routing group. Deleting from the
+            # old group would remove the data we just wrote. Cleanup
+            # happens at cutover when old Raft groups are removed.
+
+          inc keysMigrated
+
+          # Update cursor and heartbeat periodically
+          if keysMigrated mod 100 == 0:
+            let curNow = getTime().toUnix()
+            # Re-read space to check if we're still the worker
+            acquire(store.spacesMu)
+            if store.spaces.hasKey(spaceId):
+              let curSpace = store.spaces[spaceId]
+              if curSpace.rebalanceWorker != myNodeId:
+                release(store.spacesMu)
+                return  # Another node took over
+            release(store.spacesMu)
+
+            space.rebalanceCursor = k
+            space.rebalanceHeartbeat = curNow
+            store.updateSpaceRecord(space)
+            store.loadSpaces()
+            lastHeartbeat = curNow
+        except:
+          continue
+
+    # Phase 3: Cutover — migration complete
+    # Remove old groups
+    let coord = store.coordinator
+    for oldGid64 in oldGroupIds:
+      let oldGid = GroupID(oldGid64)
+      # Delete from sys.groups
+      let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $oldGid64)
+      discard store.raftDelete(groupKey)
+      # Remove from coordinator
+      if coord.hasGroup(oldGid):
+        coord.removeGroup(oldGid)
+
+    # Clear rebalance state
+    space.oldGroupIds = @[]
+    space.rebalancing = false
+    space.rebalanceWorker = 0
+    space.rebalanceHeartbeat = 0
+    space.rebalanceCursor = ""
+    store.updateSpaceRecord(space)
+    store.loadSpaces()
+    store.loadGroupMembers()

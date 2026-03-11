@@ -490,7 +490,22 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
                 except JsonParsingError:
                   discard
 
+        # Trigger space rebalancing in background after join
+        if not srv.raftStore.isNil:
+          {.cast(gcsafe).}:
+            srv.raftStore.rebalanceSpaces()
+
         return %* {"success": true, "members": members}
+
+      # ---- REST: rebalance (manual trigger) ----
+      post "/api/rebalance":
+        let srv = getSrv()
+        if srv.isNil or srv.raftStore.isNil:
+          statusCode = 503
+          return %* {"success": false, "error": "server not ready"}
+        {.cast(gcsafe).}:
+          srv.raftStore.rebalanceSpaces()
+        return %* {"success": true, "message": "rebalance initiated"}
 
       # ---- REST: nodes DELETE ----
       delete "/api/nodes/{id:int}":
