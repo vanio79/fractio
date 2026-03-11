@@ -34,6 +34,21 @@ type
 proc nodeDataDir(id: int): string =
   "/tmp/fractio-rejoin-test-node" & $id
 
+proc writeNodeConfig(id: int; raftPort, clientPort, webPort: int;
+                     dataDir: string): string =
+  ## Write a TOML config file for a node and return its path.
+  let configPath = dataDir / "fractio.toml"
+  createDir(dataDir)
+  writeFile(configPath, &"""[node]
+id = {id}
+host = "{TestHost}"
+raft-port = {raftPort}
+client-port = {clientPort}
+web-port = {webPort}
+data-dir = "{dataDir}"
+""")
+  configPath
+
 proc startNode(id: int; join = ""): TestNode =
   ## Start a fractio_web node as a background process.
   result.id = id
@@ -42,14 +57,12 @@ proc startNode(id: int; join = ""): TestNode =
   result.webPort = BaseWebPort + (id - 1)
   result.dataDir = nodeDataDir(id)
 
+  let configPath = writeNodeConfig(id, result.raftPort, result.clientPort,
+                                   result.webPort, result.dataDir)
+
   var args = @[
     "start",
-    &"--id={id}",
-    &"--host={TestHost}",
-    &"--raft-port={result.raftPort}",
-    &"--client-port={result.clientPort}",
-    &"--web-port={result.webPort}",
-    &"--data-dir={result.dataDir}",
+    &"--config={configPath}",
   ]
   if join != "":
     args.add(&"--join={join}")
@@ -137,18 +150,23 @@ proc waitForData(node: TestNode; sql: string; expectedRows: int;
   raise newException(IOError,
     &"node {node.id} did not reach {expectedRows} rows within {timeoutMs}ms")
 
-proc tryInsert(nodes: openArray[TestNode]; sql: string): JsonNode =
+proc tryInsert(nodes: openArray[TestNode]; sql: string;
+               timeoutMs = 10_000): JsonNode =
   ## Try inserting on each node until one succeeds (finds the leader).
-  for node in nodes:
-    try:
-      let res = sqlQuery(node, sql)
-      if res.getOrDefault("kind").getStr("") != "error":
-        return res
-      let err = res.getOrDefault("error").getStr("")
-      if "leader" notin err.toLowerAscii:
-        return res  # A real error, not just "not the leader"
-    except CatchableError:
-      continue
+  ## Retries with a timeout to handle elections that are still in progress.
+  let deadline = epochTime() + timeoutMs.float / 1000.0
+  while epochTime() < deadline:
+    for node in nodes:
+      try:
+        let res = sqlQuery(node, sql)
+        if res.getOrDefault("kind").getStr("") != "error":
+          return res
+        let err = res.getOrDefault("error").getStr("")
+        if "leader" notin err.toLowerAscii:
+          return res  # A real error, not just "not the leader"
+      except CatchableError:
+        continue
+    sleep(500)
   raise newException(IOError, "no node accepted the insert: " & sql)
 
 

@@ -227,8 +227,9 @@ proc writeFrame*(socket: Socket, payload: string,
 
 proc connectToNode*(t: TCPTransport, nodeId: NodeID, host: string,
     port: int): Option[Connection] =
+  var socket: Socket
   try:
-    let socket = newSocket()
+    socket = newSocket()
     # NOTE: OptNoDelay (TCP_NODELAY) must NOT be set before connect() on Linux.
     # Setting TCP_NODELAY on a non-blocking socket before connect() causes the
     # kernel to return EPERM ("Permission denied") via select() instead of the
@@ -258,6 +259,9 @@ proc connectToNode*(t: TCPTransport, nodeId: NodeID, host: string,
     return some(conn)
 
   except CatchableError as e:
+    # Close the socket to avoid leaking the file descriptor.
+    if socket != nil:
+      try: socket.close() except CatchableError: discard
     var fields = tables.initTable[string, string]()
     fields["nodeId"] = string(nodeId)
     fields["error"] = e.msg

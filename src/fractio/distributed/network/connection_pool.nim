@@ -28,6 +28,12 @@ type
     pool*: tables.Table[string, Deque[PooledConnection]]
     poolLock*: Lock
 
+    # Backoff: nodeId -> epoch-ms of last failed connect attempt.
+    # getOrCreateConnection skips new connections to a node if the last
+    # failure was less than connectBackoffMs ago.
+    lastFailure*: tables.Table[string, int64]
+    connectBackoffMs*: int64 ## cooldown between retries (default 1000ms)
+
     # Statistics
     totalCreated*: int64
     totalReused*: int64
@@ -53,6 +59,8 @@ proc newConnectionPool*(config: NetworkConfig, role: string): ConnectionPool =
     config: config,
     role: role,
     pool: tables.initTable[string, Deque[PooledConnection]](),
+    lastFailure: tables.initTable[string, int64](),
+    connectBackoffMs: 1000, # 1 second cooldown after failed connect
     totalCreated: 0,
     totalReused: 0,
     totalClosed: 0
@@ -116,9 +124,20 @@ proc getOrCreateConnection*(pool: ConnectionPool, transport: TCPTransport,
           pool.totalReused += 1
           return some(pc.conn)
 
+  # Backoff: skip if we recently failed to connect to this node
+  let now2 = int64(times.getTime().toUnix() * 1000)
+  withLock pool.poolLock:
+    if key in pool.lastFailure:
+      let lastFail = pool.lastFailure[key]
+      if (now2 - lastFail) < pool.connectBackoffMs:
+        return none(Connection)
+
   # Need to create a new connection
   let connOpt = transport.connectToNode(nodeId, host, port)
   if connOpt.isNone:
+    # Record failure time for backoff
+    withLock pool.poolLock:
+      pool.lastFailure[key] = int64(times.getTime().toUnix() * 1000)
     return none(Connection)
 
   let conn = connOpt.get()
@@ -130,6 +149,8 @@ proc getOrCreateConnection*(pool: ConnectionPool, transport: TCPTransport,
       pool.pool[key] = initDeque[PooledConnection]()
     pool.pool[key].addLast(pc)
     pool.totalCreated += 1
+    # Clear backoff on successful connection
+    pool.lastFailure.del(key)
 
   return some(conn)
 

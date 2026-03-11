@@ -210,12 +210,19 @@ proc start*(cm: ConnectionManager): bool =
   return true
 
 proc stop*(cm: ConnectionManager) =
-  ## Stop all transports
+  ## Stop all transports and close outbound connection pools.
   cm.running.store(false)
 
   cm.raftTransport.stopServer()
   cm.clientTransport.stopServer()
   cm.adminTransport.stopServer()
+
+  # Close outbound connection pools so sockets are released.
+  # Without this, pooled connections leak file descriptors across tests.
+  cm.raftPool.close()
+  cm.raftFireForgetPool.close()
+  cm.clientPool.close()
+  cm.adminPool.close()
 
   var fields = tables.initTable[string, string]()
   fields["nodeId"] = string(cm.config.nodeId)

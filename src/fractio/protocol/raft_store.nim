@@ -190,6 +190,8 @@ type
     rebalanceHeartbeat*: int64     ## unix epoch seconds of last worker heartbeat
     rebalanceCursor*: string       ## last key migrated (resume point)
 
+  NodeInfo* = tuple[host: string, clientPort: int]
+
   RaftKVStoreExt* = ref object of RaftKVStore
     stateMachines*: Table[GroupID, KVStateMachine]  ## lightweight index tracking only
     smMu*: Lock  ## guards stateMachines table
@@ -199,6 +201,7 @@ type
     peerStores*: Table[uint32, RaftKVStoreExt]  ## nodeId → peer store for forwarding
     groupMembers*: Table[GroupID, seq[uint32]]   ## groupId → member nodeIds
     preferredLeaders*: Table[GroupID, uint32]     ## groupId → preferred leader nodeId
+    nodeInfoCache*: Table[uint32, NodeInfo]       ## nodeId → (host, clientPort) for forwarding
 
 
 
@@ -214,18 +217,51 @@ proc newRaftKVStoreExt*(coord: MultiRaftCoordinator,
     peerStores: initTable[uint32, RaftKVStoreExt](),
     groupMembers: initTable[GroupID, seq[uint32]](),
     preferredLeaders: initTable[GroupID, uint32](),
+    nodeInfoCache: initTable[uint32, NodeInfo](),
   )
   initLock(result.smMu)
   initLock(result.spacesMu)
   result.nextVersion.store(1)
 
+proc routeToGroup*(primaryKey: string, groupIds: seq[uint64]): GroupID {.inline.} =
+  ## Hash-route a primary key to one of the space's groups.
+  if groupIds.len == 0:
+    return META_GROUP_ID
+  if groupIds.len == 1:
+    return GroupID(groupIds[0])
+  let h = hash(primaryKey)
+  let idx = abs(h) mod groupIds.len
+  GroupID(groupIds[idx])
+
 proc resolveGroupId*(store: RaftKVStoreExt, key: string): Option[GroupID] {.gcsafe,
     raises: [].} =
   ## Unified key → GroupID routing. Meta/system keys go to META_GROUP_ID,
-  ## everything else goes to DATA_GROUP_START_ID (the default data group).
-  ## Space-routed keys bypass this via raftPutInSpace/raftGetInSpace/etc.
+  ## user-table data keys in a space route to the space's Raft group via
+  ## hash(primaryKey), and everything else goes to DATA_GROUP_START_ID.
   if isMetaGroupKey(key):
     return some(META_GROUP_ID)
+  # Check if this is a user-table data key that belongs to a space
+  if isTableKey(key):
+    {.cast(raises: []).}:
+      try:
+        let (tableId, primaryKey) = decodeTableKey(key)
+        if tableId >= FIRST_USER_TABLE_ID:
+          acquire(store.spacesMu)
+          let sid = store.tableSpaces.getOrDefault(tableId, 0)
+          if sid > 1 and store.spaces.hasKey(sid):
+            let space = store.spaces.getOrDefault(sid)
+            release(store.spacesMu)
+            # decodeTableKey returns "d/<pk>" for data rows; strip the
+            # "d/" prefix so we hash the same bare PK that raftPutInSpace
+            # and the SQL executor use.
+            let pk = if primaryKey.startsWith("d/"):
+                       primaryKey[2 .. ^1]
+                     else:
+                       primaryKey
+            return some(routeToGroup(pk, space.groupIds))
+          release(store.spacesMu)
+      except:
+        discard
   some(DATA_GROUP_START_ID)
 
 proc getOrCreateSM*(store: RaftKVStoreExt,
@@ -564,6 +600,7 @@ proc raftScan*(store: RaftKVStoreExt, startKey, endKey: string,
     let ts = uint64(getTime().toUnixFloat() * 1_000_000_000)
     for (k, v) in raw:
       if isIntentKey(k) or isCoordKey(k): continue
+      if k.startsWith("/raft/"): continue
       if not includeSystemKeys and isSystemKey(k): continue
       pairs.add((k, RaftKVEntry(value: v, version: 1'u64, timestamp: ts)))
       if limit > 0 and pairs.len >= int(limit):
@@ -578,7 +615,8 @@ proc shardCount*(store: RaftKVStoreExt): int {.gcsafe, raises: [].} =
   store.stateMachines.len
 
 proc raftLen*(store: RaftKVStoreExt): int {.gcsafe, raises: [].} =
-  ## Count all user keys (excluding intents and coord records) via backend scan.
+  ## Count all user keys (excluding intents, coord records, and Raft
+  ## internal keys like /raft/*/log/* and /raft/*/state) via backend scan.
   var total = 0
   let backend = store.getBackend()
   if backend == nil or not backend.isOpen:
@@ -586,7 +624,9 @@ proc raftLen*(store: RaftKVStoreExt): int {.gcsafe, raises: [].} =
   {.cast(raises: []).}:
     let raw = backend.scan("", "")
     for (k, _) in raw:
-      if not isIntentKey(k) and not isCoordKey(k): inc total
+      if isIntentKey(k) or isCoordKey(k): continue
+      if k.startsWith("/raft/"): continue
+      inc total
   total
 
 # ---------------------------------------------------------------------------
@@ -920,16 +960,6 @@ proc loadTableSpaces*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
         discard
   release(store.spacesMu)
 
-proc routeToGroup*(primaryKey: string, groupIds: seq[uint64]): GroupID {.inline.} =
-  ## Hash-route a primary key to one of the space's groups.
-  if groupIds.len == 0:
-    return META_GROUP_ID
-  if groupIds.len == 1:
-    return GroupID(groupIds[0])
-  let h = hash(primaryKey)
-  let idx = abs(h) mod groupIds.len
-  GroupID(groupIds[idx])
-
 proc getSpaceForTable*(store: RaftKVStoreExt,
     tableId: uint32): Option[SpaceInfo] {.gcsafe, raises: [].} =
   acquire(store.spacesMu)
@@ -964,6 +994,31 @@ proc findAllPeersForGroup(store: RaftKVStoreExt,
           else:
             others.add(peer)
   leader & others
+
+proc lookupNodeInfo*(store: RaftKVStoreExt,
+    nodeId: uint32): Option[NodeInfo] {.gcsafe, raises: [].} =
+  ## Look up a node's host and clientPort, using a cache to avoid repeated
+  ## backend reads. Falls back to scanning sys.nodes in the local backend.
+  if store.nodeInfoCache.hasKey(nodeId):
+    return some(store.nodeInfoCache.getOrDefault(nodeId))
+  let backend = store.getBackend()
+  if backend == nil or not backend.isOpen:
+    return none(NodeInfo)
+  {.cast(raises: []).}:
+    try:
+      let nodeKey = encodeTableKey(SYS_NODES_TABLE_ID, $nodeId)
+      let valOpt = backend.get(nodeKey)
+      if valOpt.isSome:
+        let j = parseJson(valOpt.get())
+        let host = j.getOrDefault("host").getStr("")
+        let port = j.getOrDefault("clientPort").getInt(0)
+        if host != "" and port > 0:
+          let info: NodeInfo = (host: host, clientPort: port)
+          store.nodeInfoCache[nodeId] = info
+          return some(info)
+    except:
+      discard
+  none(NodeInfo)
 
 proc forwardPutToLeader(store: RaftKVStoreExt, rid: GroupID,
     key, value: string): RSResult[RaftKVEntry] {.gcsafe, raises: [].} =
@@ -1157,6 +1212,7 @@ proc scanLocalGroup(store: RaftKVStoreExt, rid: GroupID,
     let ts = uint64(getTime().toUnixFloat() * 1_000_000_000)
     for (k, v) in raw:
       if isIntentKey(k) or isCoordKey(k): continue
+      if k.startsWith("/raft/"): continue
       if not includeSystemKeys and isSystemKey(k): continue
       pairs.add((k, RaftKVEntry(value: v, version: 1'u64, timestamp: ts)))
   pairs
