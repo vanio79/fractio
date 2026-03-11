@@ -25,6 +25,7 @@ import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
 import fractio/protocol/raft_store
 import fractio/protocol/server
+import fractio/storage/wisckey_backend
 import fractio/sql/executor
 
 # ---------------------------------------------------------------------------
@@ -154,7 +155,7 @@ proc seedDefaults(leaderStore: RaftKVStoreExt) =
   discard leaderStore.raftPut(scKey, $ %*{"name": "public", "database": "default"})
 
 proc waitForAutoDistribution(nodes: seq[TestNode], expectedGroupIds: seq[uint64],
-    replicaCount: int, maxWaitMs: int = 3000) =
+    replicaCount: int, maxWaitMs: int = 5000) =
   ## Wait for the onGroupMetadataApplied callback to create space groups on
   ## all peer nodes. Polls until the expected total membership count is reached
   ## or the timeout expires.
@@ -173,8 +174,8 @@ proc waitForAutoDistribution(nodes: seq[TestNode], expectedGroupIds: seq[uint64]
     waited += stepMs
 
 proc electSpaceLeaders(nodes: seq[TestNode]) =
-  ## Force-elect a leader for each space group (the first member node).
-  ## Used for deterministic tests after automatic group distribution.
+  ## Force-elect a leader for each space group (the preferred leader / first
+  ## replica).
   let store = nodes[0].store
   let grpStart = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
   let grpEnd = encodeTableKey(SYS_GROUPS_TABLE_ID + 1, "")
@@ -185,7 +186,6 @@ proc electSpaceLeaders(nodes: seq[TestNode]) =
         let j = parseJson(entry.value)
         let gid = GroupID(uint64(j["groupId"].getInt()))
         if gid == META_GROUP_ID or gid == DATA_GROUP_START_ID: continue
-        # Use the first replica's nodeId as the leader
         if j.hasKey("replicas") and j["replicas"].len > 0:
           let leaderNodeId = j["replicas"][0]["nodeId"].getInt()
           for node in nodes:
@@ -197,11 +197,12 @@ proc electSpaceLeaders(nodes: seq[TestNode]) =
       except: discard
   sleep(300)
 
-proc distributeSpaceGroups(nodes: seq[TestNode]) =
+proc distributeSpaceGroups(nodes: seq[TestNode], replicaCount: int = 3) =
   ## After CREATE SPACE on the leader: wait for the onGroupMetadataApplied
   ## callback to create space groups on peer nodes, then force-elect leaders.
-  waitForAutoDistribution(nodes, @[3'u64, 4, 5, 6, 7], 3)
+  waitForAutoDistribution(nodes, @[3'u64, 4, 5, 6, 7], replicaCount)
   electSpaceLeaders(nodes)
+
 
 proc reelectLeaders(nodes: seq[TestNode], deadNodeIds: seq[int]) =
   ## After killing nodes, find groups with no leader among surviving nodes
@@ -245,6 +246,47 @@ proc reelectLeaders(nodes: seq[TestNode], deadNodeIds: seq[int]) =
 
 proc exec(store: RaftKVStoreExt, sql: string): ExecResult =
   executeSQL(sql, store, "default", "public")
+
+proc loadMetadataOnAllNodes(nodes: seq[TestNode]) =
+  ## Load space, table, and group membership metadata on all nodes.
+  ## Since the test nodes have independent backends (no real Raft log
+  ## replication between them), we first copy sys.tables, sys.spaces,
+  ## and sys.groups data from the leader (node 0) to all other nodes'
+  ## backends, then load the in-memory caches.
+  let leader = nodes[0].store
+  let leaderBackend = leader.getBackend()
+  # System tables to replicate to all nodes
+  for sysTableId in [SYS_TABLES_TABLE_ID, SYS_SPACES_TABLE_ID,
+                      SYS_GROUPS_TABLE_ID, SYS_NODES_TABLE_ID]:
+    let startKey = encodeTableKey(sysTableId, "")
+    let endKey = encodeTableKey(sysTableId + 1, "")
+    let pairs = leaderBackend.scan(startKey, endKey)
+    for (k, v) in pairs:
+      for i in 1 ..< nodes.len:
+        let peerBackend = nodes[i].store.getBackend()
+        if peerBackend != nil and peerBackend.isOpen:
+          discard peerBackend.put(k, v)
+  # Now load the in-memory caches on all nodes
+  for node in nodes:
+    node.store.loadSpaces()
+    node.store.loadGroupMembers()
+    node.store.loadTableSpaces()
+
+proc execOnLeader(nodes: seq[TestNode], sql: string): ExecResult =
+  ## Try executing SQL on each node until one succeeds. This simulates
+  ## client-side retry for leader-only operations — nodes that aren't the
+  ## leader for the relevant group will return an error, and the client
+  ## retries on the next node.
+  for node in nodes:
+    let r = exec(node.store, sql)
+    if r.kind != erkError:
+      return r
+    # If it's a not-leader error, try next node
+    if "not leader" in r.error.toLower() or "Not the leader" in r.error:
+      continue
+    return r  # non-retryable error
+  # All nodes failed — return last error
+  exec(nodes[^1].store, sql)
 
 # ---------------------------------------------------------------------------
 # Cluster fixture: 5 nodes, node 1 = leader
@@ -345,30 +387,29 @@ suite "Space multinode — data operations through space groups":
 
     discard exec(nodes[0].store, "CREATE SPACE testspace WITH REPLICAS = 3")
     distributeSpaceGroups(nodes)
-    nodes[0].store.loadSpaces()
-    nodes[0].store.loadGroupMembers()
 
     discard exec(nodes[0].store,
         "CREATE TABLE t1 (id INT PRIMARY KEY, name TEXT) IN SPACE testspace")
-    nodes[0].store.loadTableSpaces()
+    loadMetadataOnAllNodes(nodes)
 
-    let ins1 = exec(nodes[0].store, "INSERT INTO t1 VALUES (1, 'alice')")
+    let ins1 = execOnLeader(nodes, "INSERT INTO t1 VALUES (1, 'alice')")
     if ins1.kind == erkError:
       echo "  INSERT 1 error: " & ins1.error
     check ins1.kind == erkModified
     if ins1.kind == erkModified:
       check ins1.count == 1
 
-    let ins2 = exec(nodes[0].store, "INSERT INTO t1 VALUES (2, 'bob')")
+    let ins2 = execOnLeader(nodes, "INSERT INTO t1 VALUES (2, 'bob')")
     if ins2.kind == erkError:
       echo "  INSERT 2 error: " & ins2.error
     check ins2.kind == erkModified
 
-    let ins3 = exec(nodes[0].store, "INSERT INTO t1 VALUES (3, 'carol')")
+    let ins3 = execOnLeader(nodes, "INSERT INTO t1 VALUES (3, 'carol')")
     if ins3.kind == erkError:
       echo "  INSERT 3 error: " & ins3.error
     check ins3.kind == erkModified
 
+    # SELECT fans out via raftScanSpace (uses network to reach remote leaders)
     let sel = exec(nodes[0].store, "SELECT * FROM t1")
     check sel.kind == erkRows
     if sel.kind == erkRows:
@@ -380,29 +421,27 @@ suite "Space multinode — data operations through space groups":
 
     discard exec(nodes[0].store, "CREATE SPACE myspace WITH REPLICAS = 3")
     distributeSpaceGroups(nodes)
-    nodes[0].store.loadSpaces()
-    nodes[0].store.loadGroupMembers()
 
     discard exec(nodes[0].store,
         "CREATE TABLE users (id INT PRIMARY KEY, email TEXT) IN SPACE myspace")
-    nodes[0].store.loadTableSpaces()
+    loadMetadataOnAllNodes(nodes)
 
     for i in 1 .. 10:
-      let r = exec(nodes[0].store,
+      let r = execOnLeader(nodes,
           "INSERT INTO users VALUES (" & $i & ", 'user" & $i & "@test.com')")
       if r.kind == erkError:
         echo "  INSERT " & $i & " error: " & r.error
       check r.kind == erkModified
 
-    # Point lookup
-    let sel = exec(nodes[0].store, "SELECT * FROM users WHERE id = 5")
+    # Point lookup — try each node (key may hash to any group's leader)
+    let sel = execOnLeader(nodes, "SELECT * FROM users WHERE id = 5")
     check sel.kind == erkRows
     if sel.kind == erkRows:
       check sel.rows.len == 1
       if sel.rows.len > 0:
         check sel.rows[0][1] == "user5@test.com"
 
-    # Full scan
+    # Full scan (raftScanSpace fans out to remote leaders)
     let all = exec(nodes[0].store, "SELECT * FROM users")
     check all.kind == erkRows
     if all.kind == erkRows:
@@ -417,14 +456,12 @@ suite "Space multinode — resilience after adding a node":
 
     discard exec(nodes[0].store, "CREATE SPACE testspace WITH REPLICAS = 3")
     distributeSpaceGroups(nodes)
-    nodes[0].store.loadSpaces()
-    nodes[0].store.loadGroupMembers()
 
     discard exec(nodes[0].store,
         "CREATE TABLE t1 (id INT PRIMARY KEY, val TEXT) IN SPACE testspace")
-    nodes[0].store.loadTableSpaces()
+    loadMetadataOnAllNodes(nodes)
 
-    let ins1 = exec(nodes[0].store, "INSERT INTO t1 VALUES (1, 'before-add')")
+    let ins1 = execOnLeader(nodes, "INSERT INTO t1 VALUES (1, 'before-add')")
     check ins1.kind == erkModified
 
     # Add node 6
@@ -445,8 +482,8 @@ suite "Space multinode — resilience after adding a node":
     discard nodes[0].store.raftPut(nodeKey, nodeVal)
     sleep(500)
 
-    # Verify space still works — insert and select on original leader
-    let ins2 = exec(nodes[0].store, "INSERT INTO t1 VALUES (2, 'after-add')")
+    # Verify space still works — insert via client-side retry
+    let ins2 = execOnLeader(nodes, "INSERT INTO t1 VALUES (2, 'after-add')")
     if ins2.kind == erkError:
       echo "  INSERT after add error: " & ins2.error
     check ins2.kind == erkModified
@@ -467,14 +504,12 @@ suite "Space multinode — resilience after killing a node":
 
     discard exec(nodes[0].store, "CREATE SPACE testspace WITH REPLICAS = 3")
     distributeSpaceGroups(nodes)
-    nodes[0].store.loadSpaces()
-    nodes[0].store.loadGroupMembers()
 
     discard exec(nodes[0].store,
         "CREATE TABLE t1 (id INT PRIMARY KEY, val TEXT) IN SPACE testspace")
-    nodes[0].store.loadTableSpaces()
+    loadMetadataOnAllNodes(nodes)
 
-    let ins1 = exec(nodes[0].store, "INSERT INTO t1 VALUES (1, 'before-kill')")
+    let ins1 = execOnLeader(nodes, "INSERT INTO t1 VALUES (1, 'before-kill')")
     check ins1.kind == erkModified
 
     sleep(400)
@@ -490,10 +525,11 @@ suite "Space multinode — resilience after killing a node":
     # leader whose SM may not have data written through the old leader (no
     # real Raft log replication in the test).  Verify the system continues
     # to accept new writes after the kill.
+    let aliveNodes = nodes[0 ..< 4]  # nodes 1-4 (node 5 is dead)
     var postKillSuccess = 0
-    let ins2 = exec(nodes[0].store, "INSERT INTO t1 VALUES (2, 'after-kill')")
+    let ins2 = execOnLeader(aliveNodes, "INSERT INTO t1 VALUES (2, 'after-kill')")
     if ins2.kind == erkModified: inc postKillSuccess
-    let ins3 = exec(nodes[0].store, "INSERT INTO t1 VALUES (3, 'also-after-kill')")
+    let ins3 = execOnLeader(aliveNodes, "INSERT INTO t1 VALUES (3, 'also-after-kill')")
     if ins3.kind == erkModified: inc postKillSuccess
 
     check postKillSuccess >= 1  # at least one post-kill insert works
@@ -501,8 +537,6 @@ suite "Space multinode — resilience after killing a node":
     let sel = exec(nodes[0].store, "SELECT * FROM t1")
     check sel.kind == erkRows
     if sel.kind == erkRows:
-      # Pre-kill row may or may not survive (depends on which group's leader died).
-      # At minimum we should see the successful post-kill inserts.
       check sel.rows.len >= postKillSuccess
 
   test "space works after killing two non-leader nodes (minority failure)":
@@ -514,14 +548,12 @@ suite "Space multinode — resilience after killing a node":
 
     discard exec(nodes[0].store, "CREATE SPACE testspace WITH REPLICAS = 3")
     distributeSpaceGroups(nodes)
-    nodes[0].store.loadSpaces()
-    nodes[0].store.loadGroupMembers()
 
     discard exec(nodes[0].store,
         "CREATE TABLE t1 (id INT PRIMARY KEY, val TEXT) IN SPACE testspace")
-    nodes[0].store.loadTableSpaces()
+    loadMetadataOnAllNodes(nodes)
 
-    let ins1 = exec(nodes[0].store, "INSERT INTO t1 VALUES (1, 'initial')")
+    let ins1 = execOnLeader(nodes, "INSERT INTO t1 VALUES (1, 'initial')")
     check ins1.kind == erkModified
 
     sleep(400)
@@ -540,9 +572,10 @@ suite "Space multinode — resilience after killing a node":
     # With 2 of 5 nodes dead and RF=3, some groups lose quorum (groups where
     # 2 of 3 members were on the dead nodes).  At least some inserts should
     # work (groups whose majority is still alive among nodes 1-3).
+    let aliveNodes = nodes[0 ..< 3]  # nodes 1-3 (nodes 4+5 are dead)
     var successCount = 0
     for i in 2 .. 6:
-      let r = exec(nodes[0].store,
+      let r = execOnLeader(aliveNodes,
           "INSERT INTO t1 VALUES (" & $i & ", 'post-kill-" & $i & "')")
       if r.kind == erkModified:
         inc successCount

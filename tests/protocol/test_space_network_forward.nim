@@ -343,7 +343,7 @@ suite "Multi-node — peer store forwarding for space-routed keys":
     check not dr.isOk
     check dr.error.kind == rseNotLeader
 
-  test "raftPutInSpace from non-leader forwards via peer store":
+  test "raftPutInSpace from non-leader returns not-leader":
     var nodes = makeCluster3()
     defer: stopCluster(nodes)
 
@@ -352,17 +352,12 @@ suite "Multi-node — peer store forwarding for space-routed keys":
     let key = encodeDataRowKey(100, pk)
     let val = """{"space_forward":1}"""
 
-    # Write from node 1, should forward to node 3
+    # Write from node 1 for a key owned by node 3 — should return not-leader
     let wr = nodes[0].store.raftPutInSpace(key, val, space, pk)
-    check wr.isOk
+    check not wr.isOk
+    check wr.error.kind == rseNotLeader
 
-    let gr = nodes[2].store.raftGetInSpace(key, space, pk)
-    check gr.isOk
-    check gr.value.isSome
-    if gr.value.isSome:
-      check gr.value.get().value == val
-
-  test "raftDeleteInSpace from non-leader forwards via peer store":
+  test "raftDeleteInSpace from non-leader returns not-leader":
     var nodes = makeCluster3()
     defer: stopCluster(nodes)
 
@@ -371,12 +366,10 @@ suite "Multi-node — peer store forwarding for space-routed keys":
     let key = encodeDataRowKey(100, pk)
     discard nodes[2].store.raftPutInSpace(key, "to_del", space, pk)
 
+    # Delete from node 1 for a key owned by node 3 — should return not-leader
     let dr = nodes[0].store.raftDeleteInSpace(key, space, pk)
-    check dr.isOk
-
-    let gr = nodes[2].store.raftGetInSpace(key, space, pk)
-    check gr.isOk
-    check gr.value.isNone
+    check not dr.isOk
+    check dr.error.kind == rseNotLeader
 
 # ---------------------------------------------------------------------------
 # Suite: nodeInfoCache

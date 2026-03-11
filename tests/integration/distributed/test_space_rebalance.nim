@@ -18,6 +18,7 @@ import fractio/distributed/raft/multigroup_transport
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
+import fractio/storage/wisckey_backend
 import fractio/sql/executor
 
 # ---------------------------------------------------------------------------
@@ -306,10 +307,40 @@ proc createSpace(leaderStore: RaftKVStoreExt, spaceName: string,
 
   findSpaceId(leaderStore, spaceName)
 
-proc insertRows(leaderStore: RaftKVStoreExt, spaceName: string, rowCount: int) =
-  ## Insert rows into <spaceName>_t.
+proc execOnLeader(nodes: seq[TestNode], sql: string): ExecResult =
+  ## Try executing SQL on each node until one succeeds (client-side retry).
+  for node in nodes:
+    let r = exec(node.store, sql)
+    if r.kind != erkError:
+      return r
+    if "not leader" in r.error.toLower() or "Not the leader" in r.error:
+      continue
+    return r
+  exec(nodes[^1].store, sql)
+
+proc replicateMetadata(nodes: seq[TestNode]) =
+  ## Copy system table data from the leader's backend to all other nodes'
+  ## backends, then load in-memory caches on all nodes.
+  let leaderBackend = nodes[0].store.getBackend()
+  for sysTableId in [SYS_TABLES_TABLE_ID, SYS_SPACES_TABLE_ID,
+                      SYS_GROUPS_TABLE_ID, SYS_NODES_TABLE_ID]:
+    let startKey = encodeTableKey(sysTableId, "")
+    let endKey = encodeTableKey(sysTableId + 1, "")
+    let pairs = leaderBackend.scan(startKey, endKey)
+    for (k, v) in pairs:
+      for i in 1 ..< nodes.len:
+        let peerBackend = nodes[i].store.getBackend()
+        if peerBackend != nil and peerBackend.isOpen:
+          discard peerBackend.put(k, v)
+  for node in nodes:
+    node.store.loadSpaces()
+    node.store.loadGroupMembers()
+    node.store.loadTableSpaces()
+
+proc insertRows(nodes: seq[TestNode], spaceName: string, rowCount: int) =
+  ## Insert rows into <spaceName>_t, retrying on different nodes.
   for i in 1 .. rowCount:
-    let insRes = exec(leaderStore,
+    let insRes = execOnLeader(nodes,
       "INSERT INTO " & spaceName & "_t (id, val) VALUES (" & $i & ", 'v" & $i & "')")
     doAssert insRes.kind == erkModified,
       "INSERT failed row " & $i & ": " & (if insRes.kind == erkError: insRes.error else: "?")
@@ -323,12 +354,9 @@ proc setupSpaceWithData(nodes: seq[TestNode], spaceName: string,
 
   waitForAutoDistribution(nodes, gids, replicas)
   electSpaceLeaders(nodes)
-  for n in nodes:
-    n.store.loadSpaces()
-    n.store.loadTableSpaces()
-    n.store.loadGroupMembers()
+  replicateMetadata(nodes)
 
-  insertRows(leaderStore, spaceName, rowCount)
+  insertRows(nodes, spaceName, rowCount)
   spaceId
 
 # ---------------------------------------------------------------------------
@@ -428,9 +456,7 @@ suite "Space rebalance integration — reads during migration":
     release(leaderStore.spacesMu)
     waitForAutoDistribution(nodes, newGids, 2, 3000)
     electSpaceLeaders(nodes)
-    for n in nodes:
-      n.store.loadSpaces()
-      n.store.loadGroupMembers()
+    replicateMetadata(nodes)
 
     # All 20 rows still readable (dual-read fallback to old groups)
     let sel2 = exec(leaderStore, "SELECT * FROM items_t")
@@ -451,12 +477,10 @@ suite "Space rebalance integration — reads during migration":
     release(leaderStore.spacesMu)
     waitForAutoDistribution(nodes, newGids, 2, 3000)
     electSpaceLeaders(nodes)
-    for n in nodes:
-      n.store.loadSpaces()
-      n.store.loadGroupMembers()
+    replicateMetadata(nodes)
 
     for i in 1 .. 10:
-      let sel = exec(leaderStore, "SELECT * FROM users_t WHERE id = " & $i)
+      let sel = execOnLeader(nodes, "SELECT * FROM users_t WHERE id = " & $i)
       check sel.kind == erkRows
       check sel.rows.len == 1
       check sel.rows[0][0] == $i
@@ -476,10 +500,7 @@ proc triggerRebalanceAndSetup(nodes: var seq[TestNode], leaderStore: RaftKVStore
   release(leaderStore.spacesMu)
   waitForAutoDistribution(nodes, newGids, 2, 5000)
   electSpaceLeaders(nodes)
-  for n in nodes:
-    n.store.loadSpaces()
-    n.store.loadTableSpaces()
-    n.store.loadGroupMembers()
+  replicateMetadata(nodes)
 
 suite "Space rebalance integration — full migration":
   test "runRebalanceMigration completes and clears rebalance state":
@@ -524,8 +545,24 @@ suite "Space rebalance integration — full migration":
     leaderStore.runRebalanceMigration(spaceId)
     leaderStore.loadSpaces()
 
+    # Replicate ALL data across backends since these tests don't have real
+    # Raft log replication. After migration + group restructuring, the new
+    # group leaders need the data in their local backends.
+    replicateMetadata(nodes)
+    # Sync all data from each node to all other nodes
+    for srcIdx in 0 ..< nodes.len:
+      let srcBackend = nodes[srcIdx].store.getBackend()
+      if srcBackend == nil or not srcBackend.isOpen: continue
+      let allPairs = srcBackend.scan("/t/", "/u")  # covers all /t/ keys
+      for (k, v) in allPairs:
+        for dstIdx in 0 ..< nodes.len:
+          if dstIdx == srcIdx: continue
+          let dstBackend = nodes[dstIdx].store.getBackend()
+          if dstBackend != nil and dstBackend.isOpen:
+            discard dstBackend.put(k, v)
+
     for i in 1 .. 20:
-      let sel = exec(leaderStore, "SELECT * FROM fullmig_t WHERE id = " & $i)
+      let sel = execOnLeader(nodes, "SELECT * FROM fullmig_t WHERE id = " & $i)
       check sel.kind == erkRows
       check sel.rows.len == 1
       check sel.rows[0][1] == "v" & $i
@@ -548,10 +585,7 @@ suite "Space rebalance integration — full migration":
 
     waitForAutoDistribution(nodes, newGids, 2, 5000)
     electSpaceLeaders(nodes)
-    for n in nodes:
-      n.store.loadSpaces()
-      n.store.loadTableSpaces()
-      n.store.loadGroupMembers()
+    replicateMetadata(nodes)
 
     leaderStore.runRebalanceMigration(spaceId)
 
