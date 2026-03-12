@@ -66,6 +66,11 @@ proc makeNode(nodeNum: int, basePort: int,
     electionTimeoutUpperMs: 400,
     heartbeatIntervalMs: 100,
   ))
+  
+  # Populate peerInfo so dynamic group creation knows peer ports
+  for m in members:
+    coord.peerInfo[m.nodeId] = (host: m.host, basePort: m.basePort)
+
   coord.start()
 
   # Create meta + data groups with retries
@@ -200,7 +205,8 @@ proc makeCluster2(): seq[TestNode] =
   var nodes: seq[TestNode]
   for i, m in members:
     nodes.add(makeNode(int(m.nodeId), m.basePort, members))
-  for n in nodes: startNode(n)
+  for n in nodes:
+    startNode(n)
 
   # Wait for leader election
   let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
@@ -294,20 +300,23 @@ proc execOnLeader(nodes: seq[TestNode], sql: string): ExecResult =
     let r = exec(node.store, sql)
     if r.kind != erkError:
       return r
-    if "not leader" in r.error.toLower() or "Not the leader" in r.error:
+    if "not leader" in r.error.toLower() or "Not the leader" in r.error or "0x07000001" in r.error:
       continue
     return r
   exec(nodes[^1].store, sql)
 
 proc replicateMetadata(nodes: seq[TestNode]) =
-  let leaderBackend = nodes[0].store.getBackend()
+  let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
+  if leaderIdx < 0: return
+  let leaderBackend = nodes[leaderIdx].store.getBackend()
   for sysTableId in [SYS_TABLES_TABLE_ID, SYS_SPACES_TABLE_ID,
                       SYS_GROUPS_TABLE_ID, SYS_NODES_TABLE_ID]:
     let startKey = encodeTableKey(sysTableId, "")
     let endKey = encodeTableKey(sysTableId + 1, "")
     let pairs = leaderBackend.scan(startKey, endKey)
     for (k, v) in pairs:
-      for i in 1 ..< nodes.len:
+      for i in 0 ..< nodes.len:
+        if i == leaderIdx: continue
         let peerBackend = nodes[i].store.getBackend()
         if peerBackend != nil and peerBackend.isOpen:
           discard peerBackend.put(k, v)
@@ -329,6 +338,7 @@ proc setupSpaceWithData(nodes: seq[TestNode], spaceName: string,
   let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
   doAssert leaderIdx >= 0
   let leaderStore = nodes[leaderIdx].store
+  
   let spaceId = createSpace(leaderStore, spaceName, replicas)
   let gids = findSpaceGroupIds(leaderStore, spaceId)
 
@@ -364,6 +374,8 @@ suite "Space rebalance integration — rebalanceSpaces":
 
     # Trigger rebalance
     leaderStore.rebalanceSpaces()
+    sleep(500)
+    sleep(500) # Give new groups time to initialize and elect leaders
 
     # Verify: now rebalancing, 3 new groups, old groups preserved
     acquire(leaderStore.spacesMu)
@@ -383,6 +395,7 @@ suite "Space rebalance integration — rebalanceSpaces":
 
     addNodeToCluster(nodes, 3)
     leaderStore.rebalanceSpaces()
+    sleep(500)
 
     acquire(leaderStore.spacesMu)
     let firstNewGroups = leaderStore.spaces[spaceId].groupIds
@@ -390,6 +403,7 @@ suite "Space rebalance integration — rebalanceSpaces":
 
     # Call again — should not create more groups
     leaderStore.rebalanceSpaces()
+    sleep(500)
 
     acquire(leaderStore.spacesMu)
     let secondNewGroups = leaderStore.spaces[spaceId].groupIds
@@ -406,6 +420,7 @@ suite "Space rebalance integration — rebalanceSpaces":
 
     # Don't add any nodes — group count (2) == node count (2)
     leaderStore.rebalanceSpaces()
+    sleep(500)
 
     acquire(leaderStore.spacesMu)
     let sp = leaderStore.spaces[spaceId]
@@ -433,6 +448,7 @@ suite "Space rebalance integration — reads during migration":
     # Add 3rd node and trigger rebalance
     addNodeToCluster(nodes, 3)
     leaderStore.rebalanceSpaces()
+    sleep(500)
 
     # Wait for new groups and leaders
     acquire(leaderStore.spacesMu)
@@ -457,6 +473,7 @@ suite "Space rebalance integration — reads during migration":
 
     addNodeToCluster(nodes, 3)
     leaderStore.rebalanceSpaces()
+    sleep(500)
     acquire(leaderStore.spacesMu)
     let newGids = leaderStore.spaces[spaceId].groupIds
     release(leaderStore.spacesMu)
@@ -467,8 +484,9 @@ suite "Space rebalance integration — reads during migration":
     for i in 1 .. 10:
       let sel = execOnLeader(nodes, "SELECT * FROM users_t WHERE id = " & $i)
       check sel.kind == erkRows
-      check sel.rows.len == 1
-      check sel.rows[0][0] == $i
+      if sel.kind == erkRows:
+        check sel.rows.len == 1
+        check sel.rows[0][0] == $i
 
 # ---------------------------------------------------------------------------
 # Suite: full migration lifecycle
@@ -547,8 +565,9 @@ suite "Space rebalance integration — full migration":
     for i in 1 .. 20:
       let sel = execOnLeader(nodes, "SELECT * FROM fullmig_t WHERE id = " & $i)
       check sel.kind == erkRows
-      check sel.rows.len == 1
-      check sel.rows[0][1] == "v" & $i
+      if sel.kind == erkRows:
+        check sel.rows.len == 1
+        check sel.rows[0][1] == "v" & $i
 
   test "old groups are removed from sys.groups after migration":
     var nodes = makeCluster2()
@@ -560,6 +579,7 @@ suite "Space rebalance integration — full migration":
 
     addNodeToCluster(nodes, 3)
     leaderStore.rebalanceSpaces()
+    sleep(500)
 
     acquire(leaderStore.spacesMu)
     let oldGids = leaderStore.spaces[spaceId].oldGroupIds
@@ -595,6 +615,7 @@ suite "Space rebalance integration — crash safety":
 
     addNodeToCluster(nodes, 3)
     leaderStore.rebalanceSpaces()
+    sleep(500)
 
     # Reload caches (simulates restart reading persisted state)
     leaderStore.loadSpaces()

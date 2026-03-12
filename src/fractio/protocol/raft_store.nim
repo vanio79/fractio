@@ -1416,59 +1416,72 @@ proc raftScanSpace*(store: RaftKVStoreExt, startKey, endKey: string,
   ## Scan keys across all groups in the space.
   ##
   ## For each group, we need to read from the **leader** to guarantee
-  ## we see committed data (followers may lag). Strategy:
-  ## - If this node is the leader of a group, data is in the local backend.
-  ## - Otherwise, scan the group's leader (or any member as fallback) over
-  ##   the network.
-  ##
-  ## Since all groups on a node share the same WiscKey backend, we coalesce:
-  ## one scan per distinct remote node is sufficient.
-
-  # First, determine which groups this node leads vs which need remote scan.
-  # A group is "locally covered" if this node is leader for it.
+  ## we see committed data (followers may lag).
+  
   var localNodeId = store.coordinator.nodeId.uint32
   var remoteNodes: seq[uint32]  # nodes we need to scan
-  var allGroupsCoveredLocally = true
+  
+  # Determine which groups we lead vs which need remote scan.
+  # During rebalancing, we must scan BOTH old and new groups.
+  var allGidsToScan = space.groupIds
+  if space.rebalancing:
+    for ogid in space.oldGroupIds:
+      if ogid notin allGidsToScan:
+        allGidsToScan.add(ogid)
+
+  var localMemberGroups: seq[GroupID] = @[]
   {.cast(raises: []).}:
-    for gid in space.groupIds:
-      let groupId = GroupID(gid)
-      # Check if this node is leader for this group
-      if store.coordinator.isLeader(groupId):
-          continue  # leader — data is definitely in local backend
-      allGroupsCoveredLocally = false
-      # Need to scan a remote node for this group.
-      # Prefer the known leader, fall back to any member.
+    for gid64 in allGidsToScan:
+      let gid = GroupID(gid64)
+      var isMember = store.coordinator.hasGroup(gid)
       var targetNode: uint32 = 0
-      withLock store.groupMu:
-        if store.groupLeaders.hasKey(groupId):
-          targetNode = store.groupLeaders[groupId]
-        if targetNode == 0 or targetNode == localNodeId:
-          let members = store.groupMembers.getOrDefault(groupId, @[])
-          for nid in members:
-            if nid != localNodeId:
-              targetNode = nid
-              break
-      if targetNode != 0 and targetNode != localNodeId and
-          targetNode notin remoteNodes:
+      
+      if not isMember:
+        withLock store.groupMu:
+          targetNode = store.groupLeaders.getOrDefault(gid, 0)
+          if targetNode == 0:
+            let members = store.groupMembers.getOrDefault(gid, @[])
+            if members.len > 0:
+              targetNode = members[0]
+            
+      if isMember:
+        localMemberGroups.add(gid)
+      elif targetNode != 0 and targetNode notin remoteNodes:
         remoteNodes.add(targetNode)
 
-  # Always start with local scan (covers groups we lead + follower data)
-  let localResult = store.raftScan(startKey, endKey, limit,
+  # Start with local scan
+  let localScanResult = store.raftScan(startKey, endKey, 0,
       includeSystemKeys = includeSystemKeys)
-  if not localResult.isOk:
-    return localResult
+  if not localScanResult.isOk:
+    return localScanResult
 
-  if remoteNodes.len == 0:
-    return localResult
+  var resultMap: Table[string, RaftKVEntry]
+  var allKeys: seq[string]
+
+  # Filter local results: only keep keys that route to a group we lead
+  for (k, entry) in localScanResult.value:
+    try:
+      let (tableId, primaryKey) = decodeTableKey(k)
+      let pk = if primaryKey.startsWith("d/"): primaryKey[2 .. ^1] else: primaryKey
+      
+      # During rebalance, a key might be in an old group or a new group.
+      # If we are a member of either one, we can serve it from the local backend.
+      let rid = routeToGroup(pk, space.groupIds)
+      var shouldInclude = (rid in localMemberGroups)
+      
+      if not shouldInclude and space.rebalancing:
+        let oldRid = routeToGroup(pk, space.oldGroupIds)
+        if oldRid in localMemberGroups:
+          shouldInclude = true
+          
+      if shouldInclude:
+        if k notin resultMap:
+          allKeys.add(k)
+          resultMap[k] = entry
+    except:
+      discard
 
   # Fan out scan to remote nodes and merge results
-  var allKeys: seq[string]
-  var resultMap: Table[string, RaftKVEntry]
-  for (k, entry) in localResult.value:
-    if k notin allKeys:
-      allKeys.add(k)
-      resultMap[k] = entry
-
   {.cast(raises: []).}:
     try:
       for nid in remoteNodes:
@@ -1480,17 +1493,18 @@ proc raftScanSpace*(store: RaftKVStoreExt, startKey, endKey: string,
         let pc = newProtocolClient(cfg)
         let cr = pc.connect()
         if not cr.isOk: continue
-        let sr = pc.kvScan(startKey, endKey, limit)
+        let sr = pc.kvScan(startKey, endKey, 0)
         pc.disconnect()
         if sr.isOk:
+          let ts = uint64(getTime().toUnixFloat() * 1_000_000_000)
           for pair in sr.val.pairs:
             if pair.key notin resultMap:
               allKeys.add(pair.key)
               resultMap[pair.key] = RaftKVEntry(
                 value: pair.value, version: 1'u64,
-                timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
+                timestamp: ts,
               )
-    except CatchableError:
+    except:
       discard
 
   # Sort by key and build result
@@ -1498,8 +1512,8 @@ proc raftScanSpace*(store: RaftKVStoreExt, startKey, endKey: string,
   var finalResult: seq[(string, RaftKVEntry)]
   for k in allKeys:
     finalResult.add((k, resultMap.getOrDefault(k)))
-  if limit > 0 and uint32(finalResult.len) > limit:
-    finalResult = finalResult[0 ..< int(limit)]
+    if limit > 0 and uint32(finalResult.len) >= limit:
+      break
   rsOk[seq[(string, RaftKVEntry)]](finalResult)
 
 # ---------------------------------------------------------------------------
@@ -1724,21 +1738,34 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: int) {.raises: [].} 
           let oldGroup = routeToGroup(pk, oldGroupIds)
           let newGroup = routeToGroup(pk, newGroupIds)
           if oldGroup != newGroup:
-            # Write to new group via Raft consensus.
-            # Use proposeWrite directly (not raftPutInSpace) since this node
-            # may not be the leader for the new group — proposeWrite will
-            # return rseNotLeader which we skip (the leader for that group
-            # must run its own migration).
+            # If the new group is local, we don't need to write to Raft
+            # because all groups on this node share the same backend.
+            # We only need to propose to Raft if the new group is NOT local
+            # or if we want to ensure it's replicated to other nodes in the
+            # new group.
             let newRid = GroupID(newGroup)
             if store.coordinator.hasGroup(newRid):
-              let batch = newWriteBatch()
-              batch.put(toBytes(k), toBytes(v))
-              discard proposeWrite(store, newRid, batch)
-            # Note: we do NOT delete from the old group here because all
-            # groups on a node share one LevelDB backend — the LevelDB key
-            # is the same regardless of routing group. Deleting from the
-            # old group would remove the data we just wrote. Cleanup
-            # happens at cutover when old Raft groups are removed.
+              if store.coordinator.isLeader(newRid):
+                # We are leader for the new group, data is already in backend.
+                # In a real system we might still want to propose a no-op
+                # or metadata update to ensure replication, but for this
+                # implementation, the fact that it's in the backend is enough
+                # for local reads. 
+                # To ensure full replication, we SHOULD propose it.
+                let batch = newWriteBatch()
+                batch.put(toBytes(k), toBytes(v))
+                discard proposeWrite(store, newRid, batch)
+              else:
+                # We have the group but are not leader. 
+                # The leader will handle migration for its own groups.
+                discard
+            else:
+              # New group is not on this node at all.
+              # In this case, we don't do anything; the node that HAS
+              # the new group will eventually run its own migration or
+              # we could forward the write here.
+              # For now, we assume every node runs runRebalanceMigration.
+              discard
 
           inc keysMigrated
 
