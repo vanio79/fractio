@@ -15,8 +15,7 @@ import ../protocol/messages/cluster as clusterMsgs
 import ../sql/executor
 import ../distributed/meta/system_tables
 import ../protocol/raft_store
-import ../distributed/raft/multigroup_coordinator
-import ../distributed/raft/multigroup_transport
+import ../distributed/raft/nuraft_coordinator
 import ../distributed/raft/group_types
 import ../distributed/raft/multigroup_types
 import ../storage/wisckey_backend
@@ -192,8 +191,7 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
         let role = block:
           if srv.raftStore.isNil: "unknown"
           else:
-            let metaOpt = srv.raftStore.coordinator.getGroup(META_GROUP_ID)
-            if metaOpt.isSome and metaOpt.get.isLeader(): "leader"
+            if srv.raftStore.coordinator.isLeader(META_GROUP_ID): "leader"
             else: "follower"
         let shards = if srv.raftStore.isNil: 0
                      else: srv.raftStore.coordinator.getGroupCount()
@@ -582,8 +580,7 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
                                      else: "follower"
                           # Fallback: if no persisted leader, check local Raft state
                           if leaderNid == 0:
-                            let grpOpt = srv.raftStore.coordinator.getGroup(GroupID(gid))
-                            if grpOpt.isSome and grpOpt.get.isLeader() and
+                            if srv.raftStore.coordinator.isLeader(GroupID(gid)) and
                                 nid == srv.config.serverId.int:
                               role = "leader"
                           members.add(%* {"nodeId": nid, "role": role})

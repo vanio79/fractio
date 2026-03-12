@@ -1,6 +1,6 @@
 # Raft-backed KV store for the Fractio protocol layer — Phase 5.
 #
-# RaftKVStore wraps MultiRaftCoordinator and provides the same interface as
+# RaftKVStore wraps NuRaftCoordinator and provides the same interface as
 # the in-memory KVStore so that server.nim can switch between them with zero
 # handler changes.
 #
@@ -16,7 +16,7 @@
 # Thread safety:
 #   - All public procs are {.gcsafe, raises:[].} and safe to call from
 #     any clientLoop thread.
-#   - The MultiRaftCoordinator itself protects its state via groupsLock.
+#   - The NuRaftCoordinator protects its state via groupsLock.
 #   - Each RaftKVStore has its own versionMu Lock for the version counter.
 #
 # NOT_LEADER handling:
@@ -30,12 +30,11 @@
 #   - 2PC records:  "\x00COORD\x00<txnId8be>"            (coordinator records)
 
 import std/[tables, locks, options, algorithm, atomics, times, strformat, strutils, json, hashes]
-import fractio/distributed/raft/multigroup_coordinator
+import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/raft/state_machine
 import fractio/distributed/meta/system_tables
-import fractio/distributed/raft/multigroup_transport
 import fractio/storage/wisckey_backend
 import fractio/storage/backend
 import fractio/protocol/types as protoTypes
@@ -145,12 +144,12 @@ proc decodeIntentUserKey*(k: string): string {.inline.} =
 
 type
   RaftKVStore* {.acyclic.} = ref object of RootObj
-    coordinator*: MultiRaftCoordinator
+    coordinator*: NuRaftCoordinator
     nextVersion*: Atomic[uint64]
     proposeTimeout*: int     ## ms; default 5000
     logger*: Logger
 
-proc newRaftKVStore*(coord: MultiRaftCoordinator,
+proc newRaftKVStore*(coord: NuRaftCoordinator,
     proposeTimeoutMs: int = 5000): RaftKVStore =
   result = RaftKVStore(
     coordinator: coord,
@@ -172,7 +171,7 @@ proc getKVSM(store: RaftKVStore,
 # ---------------------------------------------------------------------------
 # State machine registry (owned by RaftKVStore)
 # ---------------------------------------------------------------------------
-# The MultiRaftCoordinator worker thread commits log entries via the group's
+# The NuRaftCoordinator worker thread commits log entries via the group's
 # commitIndex.  To keep Phase 5 self-contained we maintain a parallel
 # KVStateMachine per shard here, and apply WriteBatch proposals to it after
 # proposeAndWait succeeds.
@@ -211,7 +210,7 @@ type
 
 
 
-proc newRaftKVStoreExt*(coord: MultiRaftCoordinator,
+proc newRaftKVStoreExt*(coord: NuRaftCoordinator,
     proposeTimeoutMs: int = 5000): RaftKVStoreExt =
   result = RaftKVStoreExt(
     coordinator: coord,
@@ -427,8 +426,8 @@ proc wireApplyCallback*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
   ## In the callback, wasMoved() prevents ORC from decrementing the refcount
   ## on the cast-from-pointer local, since the cast does not transfer ownership.
   {.cast(gcsafe).}: {.cast(raises: []).}:
-    multigroup_coordinator.applyBatchCallback = applyBatchToSM
-    multigroup_coordinator.getPreferredLeaderCallback = proc(
+    nuraft_coordinator.applyBatchCallback = applyBatchToSM
+    nuraft_coordinator.getPreferredLeaderCallback = proc(
         storePtr: pointer,
         groupId: GroupID): Option[NodeID] {.gcsafe, raises: [].} =
       let s = cast[RaftKVStoreExt](storePtr)
@@ -437,7 +436,7 @@ proc wireApplyCallback*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
         result = some(NodeID(pl))
       else:
         result = none(NodeID)
-    multigroup_coordinator.onGroupMetadataApplied = proc(
+    nuraft_coordinator.onGroupMetadataApplied = proc(
         storePtr: pointer,
         groupKey: string, groupValue: string) {.gcsafe, raises: [].} =
       ## When sys.groups metadata replicates via Raft, create the local Raft
@@ -454,50 +453,48 @@ proc wireApplyCallback*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
           if gid == META_GROUP_ID or gid == DATA_GROUP_START_ID: return
           if coord.hasGroup(gid): return
 
-          var desc = rangeTypes.newGroupDescriptor(gid)
+          # Build member list from replicas for NuRaft createAndStartGroup
+          var members: seq[tuple[nodeId: uint32, host: string, basePort: int]] = @[]
           if j.hasKey("replicas"):
             for r in j["replicas"]:
-              discard desc.addReplica(
-                rangeTypes.NodeID(uint32(r["nodeId"].getInt())),
-                rangeTypes.rtVoter)
+              let nid = uint32(r["nodeId"].getInt())
+              let peerInfo = coord.peerInfo.getOrDefault(nid,
+                  (host: coord.host, basePort: coord.basePort))
+              members.add((nodeId: nid, host: peerInfo.host,
+                  basePort: peerInfo.basePort))
 
-          var myReplicaId = rangeTypes.ReplicaID(0)
-          for r in desc.replicas:
-            if r.nodeId == coord.nodeId:
-              myReplicaId = r.replicaId
+          # Check this node is a member
+          var isMember = false
+          for m in members:
+            if m.nodeId == coord.nodeId.uint32:
+              isMember = true
               break
 
-          if myReplicaId != rangeTypes.ReplicaID(0):
-            discard coord.createAndStartGroup(desc, myReplicaId)
+          if isMember:
+            var preferredLeader: uint32 = 0
+            if j.hasKey("preferredLeader"):
+              preferredLeader = uint32(j["preferredLeader"].getInt())
+            discard coord.createAndStartGroup(gid, members, preferredLeader)
             s.registerGroup(gid)
             # Update group membership cache
-            var members: seq[uint32] = @[]
-            for r in desc.replicas:
-              members.add(uint32(r.nodeId))
-            s.groupMembers[gid] = members
-            if j.hasKey("preferredLeader"):
-              let pl = uint32(j["preferredLeader"].getInt())
-              if pl > 0:
-                s.preferredLeaders[gid] = pl
+            var memberIds: seq[uint32] = @[]
+            for m in members:
+              memberIds.add(m.nodeId)
+            s.groupMembers[gid] = memberIds
+            if preferredLeader > 0:
+              s.preferredLeaders[gid] = preferredLeader
         except:
           discard
 
     # --- Refresh space/table caches when metadata replicates ---
-    onSpaceMetadataChanged = proc(storePtr: pointer) {.gcsafe, raises: [].} =
+    raft_store.onSpaceMetadataChanged = proc(storePtr: pointer) {.gcsafe, raises: [].} =
       if storePtr == nil: return
       let s = cast[RaftKVStoreExt](storePtr)
       s.loadSpaces()
       s.loadTableSpaces()
 
-    # --- Track data group leader from AE heartbeats ---
-    multigroup_transport.onDataGroupLeaderSeen = proc(
-        storePtr: pointer, leaderNodeId: uint32) {.gcsafe, raises: [].} =
-      if storePtr == nil: return
-      let s = cast[RaftKVStoreExt](storePtr)
-      s.dataGroupLeaderNodeId.store(leaderNodeId)
-
     # --- Persist leader in sys.groups when a node wins election ---
-    multigroup_coordinator.onLeaderChanged = proc(
+    nuraft_coordinator.onLeaderChanged = proc(
         storePtr: pointer, groupId: GroupID,
         leaderNodeId: NodeID) {.gcsafe, raises: [].} =
       if storePtr == nil: return
@@ -566,8 +563,8 @@ proc proposeWrite(store: RaftKVStoreExt, groupId: GroupID,
       return rsVErr(newRSE(rseTimeout, res.error))
     return rsVErr(newRSE(rseInternal, res.error))
 
-  # The SM was already updated by applyBatchToSM (called inside applyUpTo,
-  # which fires before proposeAndWait returns on the single-node path).
+  # The SM was already updated by applyBatchToSM (called from NuRaft's
+  # commit callback, which fires before proposeAndWait returns).
   # A second apply here would be a duplicate write — removed to avoid
   # double-apply data corruption and unnecessary smMu contention.
   rsVOk()
@@ -736,8 +733,7 @@ proc raftGetInGroup*(store: RaftKVStoreExt, key: string,
   if routeErr.isSome:
     return rsErr[Option[RaftKVEntry]](routeErr.get())
   {.cast(raises: []).}:
-    let gOpt = store.coordinator.getGroup(groupId)
-    if gOpt.isNone or not gOpt.get.isLeader():
+    if not store.coordinator.isLeader(groupId):
       return rsErr[Option[RaftKVEntry]](newRSE(rseNotLeader,
           "not leader for group " & $groupId.uint64))
     let backend = store.getBackend()
@@ -1306,8 +1302,7 @@ proc raftPutInSpace*(store: RaftKVStoreExt, key, value: string,
   # Try local first
   {.cast(raises: []).}:
     if store.coordinator.hasGroup(rid):
-      let gOpt = store.coordinator.getGroup(rid)
-      if gOpt.isSome and gOpt.get.isLeader():
+      if store.coordinator.isLeader(rid):
         let batch = newWriteBatch()
         batch.put(toBytes(key), toBytes(value))
         let vr = proposeWrite(store, rid, batch)
@@ -1327,8 +1322,7 @@ proc raftGetInSpaceFromGroup*(store: RaftKVStoreExt, key: string,
   ## If this node is the leader, reads locally.
   ## Otherwise, forwards to the group leader over the network.
   {.cast(raises: []).}:
-    let gOpt = store.coordinator.getGroup(rid)
-    if gOpt.isSome and gOpt.get.isLeader():
+    if store.coordinator.isLeader(rid):
       let backend = store.getBackend()
       if backend != nil and backend.isOpen:
         let valOpt = backend.get(key)
@@ -1371,8 +1365,7 @@ proc raftDeleteInSpace*(store: RaftKVStoreExt, key: string,
   # Try local first
   {.cast(raises: []).}:
     if store.coordinator.hasGroup(rid):
-      let gOpt = store.coordinator.getGroup(rid)
-      if gOpt.isSome and gOpt.get.isLeader():
+      if store.coordinator.isLeader(rid):
         var prevEntry: Option[RaftKVEntry]
         let backend = store.getBackend()
         if backend != nil and backend.isOpen:
@@ -1432,9 +1425,7 @@ proc raftScanSpace*(store: RaftKVStoreExt, startKey, endKey: string,
     for gid in space.groupIds:
       let groupId = GroupID(gid)
       # Check if this node is leader for this group
-      if store.coordinator.hasGroup(groupId):
-        let gOpt = store.coordinator.getGroup(groupId)
-        if gOpt.isSome and gOpt.get.isLeader():
+      if store.coordinator.isLeader(groupId):
           continue  # leader — data is definitely in local backend
       allGroupsCoveredLocally = false
       # Need to scan a remote node for this group.
@@ -1614,20 +1605,15 @@ proc rebalanceSpaces*(store: RaftKVStoreExt) {.raises: [].} =
           # Create Raft group in coordinator
           let gid = GroupID(groupId)
           if not coord.hasGroup(gid):
-            var desc = rangeTypes.newGroupDescriptor(gid)
+            var nuraftMembers: seq[tuple[nodeId: uint32, host: string, basePort: int]] = @[]
             for m in members:
-              discard desc.addReplica(rangeTypes.NodeID(uint32(m)), rangeTypes.rtVoter)
-            var myReplicaId = rangeTypes.ReplicaID(0)
-            for rep in desc.replicas:
-              if rep.nodeId == coord.nodeId:
-                myReplicaId = rep.replicaId
-                break
-            if myReplicaId != rangeTypes.ReplicaID(0):
-              let newGroup = coord.createAndStartGroup(desc, myReplicaId)
-              store.registerGroup(gid)
-              # Single-node: become leader immediately if group has only 1 member
-              if members.len == 1:
-                newGroup.becomeLeader()
+              let peerInfo = coord.peerInfo.getOrDefault(uint32(m),
+                  (host: coord.host, basePort: coord.basePort))
+              nuraftMembers.add((nodeId: uint32(m), host: peerInfo.host,
+                  basePort: peerInfo.basePort))
+            let preferredLeader = uint32(members[0])
+            discard coord.createAndStartGroup(gid, nuraftMembers, preferredLeader)
+            store.registerGroup(gid)
 
         # Read current groupIds
         var oldGroupIds: seq[uint64] = @[]

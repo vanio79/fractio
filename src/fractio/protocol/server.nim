@@ -30,8 +30,7 @@ import ./txn_manager
 import ./raft_store
 import ../utils/logging
 import ../distributed/sharedtimer
-import ../distributed/raft/multigroup_coordinator
-import ../distributed/raft/multigroup_transport
+import ../distributed/raft/nuraft_coordinator
 import ../distributed/raft/multigroup_types
 import ../distributed/raft/group_types as rangeTypes
 import ../distributed/sharedtimer/udptransport as udpXport
@@ -400,8 +399,7 @@ type
     authenticator*: Authenticator ## Phase 4: auth validator
     sharedTimer*: SharedTimer     ## Phase 7: P2P clock sync (nil when disabled)
     nodeRegistry*: NodeRegistry   ## Phase 8: in-memory cluster node registry
-    raftCoord*: MultiRaftCoordinator  ## lifecycle owner; nil until setupRaftNode
-    raftTransport*: RaftGroupTransport ## kept alive for ORC safety; nil in single-node
+    raftCoord*: NuRaftCoordinator  ## lifecycle owner; nil until setupRaftNode
 
 # ---------------------------------------------------------------------------
 # Thread argument types — defined after ProtocolServer to avoid forward refs
@@ -1404,39 +1402,23 @@ proc saveClusterState*(server: ProtocolServer) =
   ## Persist current cluster membership to disk so a restarted node can
   ## rejoin as a follower without requiring --join.
   if server.config.dataDir == "": return
-  if server.raftTransport.isNil: return
-
-  var members: seq[ClusterMember] = @[]
-  for p in server.raftTransport.peers:
-    members.add(ClusterMember(
-      nodeId: p.nodeId.uint32,
-      host: p.host,
-      raftPort: p.raftPort,
-    ))
-
-  # Also include self so we know our own identity
-  let selfEntry = ClusterMember(
-    nodeId: uint32(server.config.serverId),
-    host: server.config.host,
-    raftPort: 0, # filled by caller if needed
-    clientPort: server.config.port,
-    webPort: server.config.webPort,
-  )
+  let coord = server.raftCoord
+  if coord.isNil: return
 
   var peersArr = newJArray()
-  for m in members:
+  for nid, info in coord.peerInfo:
     peersArr.add(%* {
-      "nodeId": m.nodeId.int,
-      "host": m.host,
-      "raftPort": m.raftPort,
+      "nodeId": nid.int,
+      "host": info.host,
+      "raftPort": info.basePort,
     })
 
   let j = %* {
     "self": {
-      "nodeId": selfEntry.nodeId.int,
-      "host": selfEntry.host,
-      "clientPort": selfEntry.clientPort,
-      "webPort": selfEntry.webPort,
+      "nodeId": server.config.serverId.int,
+      "host": server.config.host,
+      "clientPort": server.config.port,
+      "webPort": server.config.webPort,
     },
     "peers": peersArr,
   }
@@ -1460,50 +1442,40 @@ proc loadClusterState(dataDir: string): Option[JsonNode] =
 
 proc addPeerToRaft*(server: ProtocolServer, peerNodeId: uint32,
                      host: string, raftPort: int) =
-  ## Dynamically add a peer to the Raft transport and all group descriptors.
+  ## Dynamically add a peer to the NuRaft coordinator and all existing groups.
   ## Called when a new node joins the cluster.
-  if server.raftTransport.isNil: return
-
-  let rangeNodeId = rangeTypes.NodeID(peerNodeId)
-
-  # Add to transport layer (connection manager + peer list)
-  server.raftTransport.addPeer(rangeNodeId, host, raftPort)
-
-  # Add replica to all Raft groups
   let coord = server.raftCoord
   if coord.isNil: return
+
+  # Register peer info for future group creation
+  coord.peerInfo[peerNodeId] = (host: host, basePort: raftPort)
+
+  # Add the peer as a server to all existing NuRaft groups
   withLock coord.groupsLock:
-    for groupId, group in coord.groups:
-      discard group.descriptor.addReplica(rangeNodeId, rangeTypes.rtVoter)
+    for groupId, inst in coord.groups:
+      discard coord.addServerToGroup(groupId, peerNodeId, host, raftPort)
 
   # Persist membership so restarts can rejoin without --join
   server.saveClusterState()
 
 proc setupRaftNode*(server: ProtocolServer, raftPort: int,
                     startAsLeader: bool = true) {.raises: [Exception].} =
-  ## Wire a real Raft + WiscKey stack into the server.
-  ## startAsLeader: when true and no peers, immediately become leader.
+  ## Wire a NuRaft + WiscKey stack into the server.
+  ## raftPort is the base port for NuRaft ASIO (group ports = raftPort + groupId).
+  ## startAsLeader: when true and no peers, this is a fresh single-node cluster.
 
   let nodeId = rangeTypes.NodeID(uint32(server.config.serverId))
   let raftDir = server.config.dataDir / "raft"
 
-  # When joining with --join, clear Raft state so the leader's log
-  # replays from scratch. This avoids stale entries from a previous
-  # cluster incarnation sharing term numbers with new entries.
-  # A killed node that simply restarts (without --join) keeps its log
-  # and catches up incrementally via the leader's heartbeats.
-  if not startAsLeader:
-    removeDir(raftDir)
-
   createDir(raftDir)
 
-  var peers: seq[PeerAddr] = @[]
+  # Peer info: (nodeId, host, basePort) tuples
+  type PeerInfo = tuple[nodeId: uint32, host: string, basePort: int]
+  var peers: seq[PeerInfo] = @[]
 
   # Check for saved cluster state (from a previous run as part of a cluster).
-  # If found and no explicit peers/join, load peers from disk and start as
-  # follower so the existing leader's heartbeats catch us up incrementally.
   var isRejoining = false
-  if peers.len == 0 and startAsLeader:
+  if startAsLeader:
     let saved = loadClusterState(server.config.dataDir)
     if saved.isSome:
       let sj = saved.get
@@ -1515,28 +1487,19 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
           let pHost = p.getOrDefault("host").getStr("")
           let pRaftPort = p.getOrDefault("raftPort").getInt(0)
           if pNodeId > 0 and pHost != "" and pRaftPort > 0:
-            peers.add(PeerAddr(
-              nodeId: rangeTypes.NodeID(pNodeId),
-              host: pHost,
-              raftPort: pRaftPort,
-            ))
+            peers.add((nodeId: pNodeId, host: pHost, basePort: pRaftPort))
         if peers.len > 0:
           echo "recovered cluster membership from disk: " & $peers.len & " peers"
 
-  # Always create transport (even for single-node) so joining nodes can connect
-  let rgt = newRaftGroupTransport(nodeId, server.config.host, raftPort, peers)
-  server.raftTransport = rgt
-  let transport = newMultiRaftTransport(rgt)
-
-  # Coordinator
-  let coord = newMultiRaftCoordinator(CoordinatorConfig(
+  # NuRaft Coordinator
+  let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
     nodeId: nodeId,
-    numWorkers: DEFAULT_NUM_WORKERS,
-    electionTimeoutNs: DEFAULT_ELECTION_TIMEOUT_NS,
-    heartbeatIntervalNs: DEFAULT_HEARTBEAT_INTERVAL_NS,
-    storagePath: raftDir,
-    transport: transport,
-    proposeTimeoutMs: 5000,
+    basePort: raftPort,
+    host: server.config.host,
+    dataDir: raftDir,
+    electionTimeoutLowerMs: 200,
+    electionTimeoutUpperMs: 400,
+    heartbeatIntervalMs: 100,
     writeBufferSize: server.config.writeBufferSize,
     blockCacheSize: server.config.blockCacheSize,
     vlogMaxSize: server.config.vlogMaxSize,
@@ -1546,47 +1509,36 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
   ))
   server.raftCoord = coord
 
-  # Raft groups: meta group (Group 1) and data group (Group 2)
-  for groupId in [META_GROUP_ID, DATA_GROUP_START_ID]:
-    var desc = rangeTypes.newGroupDescriptor(groupId)
-    let myReplica = desc.addReplica(nodeId, rangeTypes.rtVoter)
-    for p in peers:
-      discard desc.addReplica(p.nodeId, rangeTypes.rtVoter)
-    discard coord.createGroup(desc, myReplica.replicaId)
-  coord.start()
+  # Register peer info in coordinator
+  for p in peers:
+    coord.peerInfo[p.nodeId] = (host: p.host, basePort: p.basePort)
 
-  # Become leader only for a truly fresh single-node cluster (no saved peers)
-  if peers.len == 0 and startAsLeader and not isRejoining:
-    withLock coord.groupsLock:
-      for groupId, group in coord.groups:
-        group.becomeLeader()
+  # Build member lists for the initial Raft groups
+  # Each group includes self + all known peers
+  var initialMembers: seq[tuple[nodeId: uint32, host: string, basePort: int]] = @[]
+  initialMembers.add((nodeId: nodeId.uint32, host: server.config.host,
+      basePort: raftPort))
+  for p in peers:
+    initialMembers.add((nodeId: p.nodeId, host: p.host, basePort: p.basePort))
+
+  # Create NuRaft groups: meta group (Group 1) and data group (Group 2)
+  for groupId in [META_GROUP_ID, DATA_GROUP_START_ID]:
+    discard coord.createAndStartGroup(groupId, initialMembers)
+  coord.start()
 
   # KV store
   let store = newRaftKVStoreExt(coord)
   store.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
   server.raftStore = store
 
-  # Recovery: replay committed Raft log entries to ensure WiscKey backend is up-to-date.
-  # On a fresh start lastApplied=0 so this is a no-op. On restart after a crash,
-  # entries committed to the Raft log but not yet written to WiscKey are re-applied.
-  # On a clean shutdown all data is already in WiscKey, so replay is fast (no-op writes).
-  for groupId in [META_GROUP_ID, DATA_GROUP_START_ID]:
-    let groupOpt = coord.getGroup(groupId)
-    if groupOpt.isSome:
-      let group = groupOpt.get()
-      let lastApplied = group.lastApplied.load()
-      if lastApplied > 0:
-        echo "replaying " & $lastApplied & " committed log entries for group " & $groupId.uint64 & "..."
-        group.lastApplied.store(0)
-        coord.applyUpTo(groupId, group, lastApplied)
-        echo "state machine recovery complete (applied up to " & $group.lastApplied.load() & ")"
+  # NuRaft handles log replay internally — no manual applyUpTo needed.
 
   # Load space caches from recovered state machine
   store.loadSpaces()
   store.loadTableSpaces()
   store.loadGroupMembers()
 
-  # Recovery: re-create Raft groups for spaces from sys.groups metadata
+  # Recovery: re-create NuRaft groups for spaces from sys.groups metadata
   block spaceGroupRecovery:
     let grpStart = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
     let grpEnd = encodeTableKey(SYS_GROUPS_TABLE_ID + 1, "")
@@ -1599,35 +1551,28 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
           if gid == META_GROUP_ID or gid == DATA_GROUP_START_ID: continue
           if coord.hasGroup(gid): continue
 
-          var desc = rangeTypes.newGroupDescriptor(gid)
+          # Build member list from replicas
+          var members: seq[tuple[nodeId: uint32, host: string, basePort: int]] = @[]
           if j.hasKey("replicas"):
             for r in j["replicas"]:
-              discard desc.addReplica(
-                rangeTypes.NodeID(uint32(r["nodeId"].getInt())),
-                rangeTypes.rtVoter)
+              let nid = uint32(r["nodeId"].getInt())
+              let peerInfo = coord.peerInfo.getOrDefault(nid,
+                  (host: coord.host, basePort: coord.basePort))
+              members.add((nodeId: nid, host: peerInfo.host,
+                  basePort: peerInfo.basePort))
 
-          var myReplicaId = rangeTypes.ReplicaID(0)
-          for r in desc.replicas:
-            if r.nodeId == nodeId:
-              myReplicaId = r.replicaId
+          var isMember = false
+          for m in members:
+            if m.nodeId == nodeId.uint32:
+              isMember = true
               break
 
-          if myReplicaId != rangeTypes.ReplicaID(0):
-            discard coord.createAndStartGroup(desc, myReplicaId)
+          if isMember:
+            var preferredLeader: uint32 = 0
+            if j.hasKey("preferredLeader"):
+              preferredLeader = uint32(j["preferredLeader"].getInt())
+            discard coord.createAndStartGroup(gid, members, preferredLeader)
             store.registerGroup(gid)
-            # Replay committed log entries for this space group
-            let groupOpt = coord.getGroup(gid)
-            if groupOpt.isSome:
-              let group = groupOpt.get()
-              let lastApplied = group.lastApplied.load()
-              if lastApplied > 0:
-                echo "replaying " & $lastApplied & " committed log entries for space group " & $gid.uint64 & "..."
-                group.lastApplied.store(0)
-                coord.applyUpTo(gid, group, lastApplied)
-                echo "space group " & $gid.uint64 & " recovery complete (applied up to " & $group.lastApplied.load() & ")"
-              # Single-node: become leader for recovered space groups
-              if peers.len == 0 and startAsLeader and not isRejoining:
-                group.becomeLeader()
         except:
           discard
 
@@ -1657,11 +1602,11 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
       discard store.raftPut(groupKey, groupVal)
 
     for p in peers:
-      let peerKey = encodeTableKey(SYS_NODES_TABLE_ID, $p.nodeId.uint32)
+      let peerKey = encodeTableKey(SYS_NODES_TABLE_ID, $p.nodeId)
       let peerVal = $ %* {
-        "nodeId": p.nodeId.uint32.int,
+        "nodeId": p.nodeId.int,
         "host": p.host,
-        "raftPort": p.raftPort.int,
+        "raftPort": p.basePort,
         "clientPort": 0,
         "status": 1,
       }
@@ -1697,9 +1642,9 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
     var timerPeers: seq[PeerConfig] = @[]
     for p in peers:
       timerPeers.add(PeerConfig(
-        peerId: $p.nodeId.uint32,
+        peerId: $p.nodeId,
         address: p.host,
-        port: uint16(p.raftPort + 1),
+        port: uint16(p.basePort + 1),
         weight: 1.0,
       ))
     let selfTimerPort = uint16(raftPort + 1)

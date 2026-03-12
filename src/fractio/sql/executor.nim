@@ -10,7 +10,7 @@ import ./planner
 import ../distributed/meta/system_tables
 import ../protocol/raft_store
 import ../core/types as coreTypes
-import ../distributed/raft/multigroup_coordinator
+import ../distributed/raft/nuraft_coordinator
 import ../distributed/raft/group_types as rangeTypes
 import ../distributed/raft/multigroup_types
 
@@ -695,17 +695,14 @@ proc execCreateSpace(op: PlanOp, store: RaftKVStoreExt): ExecResult =
     let coord = store.coordinator
     let gid = GroupID(uint64(groupId))
     if not coord.hasGroup(gid):
-      var desc = rangeTypes.newGroupDescriptor(gid)
+      var nuraftMembers: seq[tuple[nodeId: uint32, host: string, basePort: int]] = @[]
       for m in members:
-        discard desc.addReplica(rangeTypes.NodeID(uint32(m)), rangeTypes.rtVoter)
-      var myReplicaId = rangeTypes.ReplicaID(0)
-      for r in desc.replicas:
-        if r.nodeId == coord.nodeId:
-          myReplicaId = r.replicaId
-          break
-      if myReplicaId != rangeTypes.ReplicaID(0):
-        discard coord.createAndStartGroup(desc, myReplicaId)
-        store.registerGroup(gid)
+        let peerInfo = coord.peerInfo.getOrDefault(uint32(m),
+            (host: coord.host, basePort: coord.basePort))
+        nuraftMembers.add((nodeId: uint32(m), host: peerInfo.host,
+            basePort: peerInfo.basePort))
+      discard coord.createAndStartGroup(gid, nuraftMembers)
+      store.registerGroup(gid)
 
   # Write space record
   let spaceKey = encodeSpaceKey(spaceId)
