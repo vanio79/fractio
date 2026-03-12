@@ -16,7 +16,7 @@
 # Port allocation: 27000–27499 (NuRaft ASIO, basePort per node spaced by 100)
 # Temp storage: /tmp/fractio_space_mn_<nodeId>/ (cleaned up per test)
 
-import std/[unittest, os, options, json, strutils]
+import std/[unittest, os, options, json, strutils, tables]
 
 import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
@@ -56,7 +56,11 @@ proc cleanDir(p: string) =
 proc makeNode(nodeNum: int, basePort: int,
     members: seq[tuple[nodeId: uint32, host: string, basePort: int]]): TestNode =
   let nodeId = rangeTypes.NodeID(uint32(nodeNum))
-  let storagePath = TMP_DIR & $nodeNum
+  let cPort = nextClientPort
+  nextClientPort += 1
+
+  # Isolate LevelDB storage per instance to avoid LOCK contention
+  let storagePath = TMP_DIR & $nodeNum & "_" & $cPort
   cleanDir(storagePath)
   createDir(storagePath)
 
@@ -69,17 +73,24 @@ proc makeNode(nodeNum: int, basePort: int,
     electionTimeoutUpperMs: 400,
     heartbeatIntervalMs: 100,
   ))
+  
+  for m in members:
+    coord.peerInfo[m.nodeId] = (host: m.host, basePort: m.basePort)
+
   coord.start()
 
   # Create meta + data groups
-  doAssert coord.createAndStartGroup(META_GROUP_ID, members)
-  doAssert coord.createAndStartGroup(DATA_GROUP_START_ID, members)
+  for gid in [META_GROUP_ID, DATA_GROUP_START_ID]:
+    var success = false
+    for attempt in 0 ..< 5:
+      if coord.createAndStartGroup(gid, members):
+        success = true
+        break
+      sleep(200)
+    doAssert success, "failed to create group " & $gid.uint64
 
   let store = newRaftKVStoreExt(coord, proposeTimeoutMs = 6000)
   store.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
-
-  let cPort = nextClientPort
-  nextClientPort += 1
 
   var cfg = defaultServerConfig()
   cfg.host = "127.0.0.1"
@@ -199,7 +210,9 @@ proc exec(store: RaftKVStoreExt, sql: string): ExecResult =
 
 proc loadMetadataOnAllNodes(nodes: seq[TestNode]) =
   ## Load space, table, and group membership metadata on all nodes.
-  let leader = nodes[0].store
+  let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
+  if leaderIdx < 0: return
+  let leader = nodes[leaderIdx].store
   let leaderBackend = leader.getBackend()
   for sysTableId in [SYS_TABLES_TABLE_ID, SYS_SPACES_TABLE_ID,
                       SYS_GROUPS_TABLE_ID, SYS_NODES_TABLE_ID]:
@@ -207,7 +220,8 @@ proc loadMetadataOnAllNodes(nodes: seq[TestNode]) =
     let endKey = encodeTableKey(sysTableId + 1, "")
     let pairs = leaderBackend.scan(startKey, endKey)
     for (k, v) in pairs:
-      for i in 1 ..< nodes.len:
+      for i in 0 ..< nodes.len:
+        if i == leaderIdx: continue
         let peerBackend = nodes[i].store.getBackend()
         if peerBackend != nil and peerBackend.isOpen:
           discard peerBackend.put(k, v)
@@ -222,7 +236,7 @@ proc execOnLeader(nodes: seq[TestNode], sql: string): ExecResult =
     let r = exec(node.store, sql)
     if r.kind != erkError:
       return r
-    if "not leader" in r.error.toLower() or "Not the leader" in r.error:
+    if "not leader" in r.error.toLower() or "Not the leader" in r.error or "0x07000001" in r.error:
       continue
     return r
   exec(nodes[^1].store, sql)
@@ -234,10 +248,10 @@ proc execOnLeader(nodes: seq[TestNode], sql: string): ExecResult =
 proc makeCluster5(): seq[TestNode] =
   let members = @[
     (nodeId: 1'u32, host: "127.0.0.1", basePort: 27000),
-    (nodeId: 2'u32, host: "127.0.0.1", basePort: 27100),
-    (nodeId: 3'u32, host: "127.0.0.1", basePort: 27200),
-    (nodeId: 4'u32, host: "127.0.0.1", basePort: 27300),
-    (nodeId: 5'u32, host: "127.0.0.1", basePort: 27400),
+    (nodeId: 2'u32, host: "127.0.0.1", basePort: 28000),
+    (nodeId: 3'u32, host: "127.0.0.1", basePort: 29000),
+    (nodeId: 4'u32, host: "127.0.0.1", basePort: 30000),
+    (nodeId: 5'u32, host: "127.0.0.1", basePort: 31000),
   ]
 
   var nodes: seq[TestNode]
@@ -408,25 +422,25 @@ suite "Space multinode — resilience after adding a node":
     # Add node 6
     let node6Members = @[
       (nodeId: 1'u32, host: "127.0.0.1", basePort: 27000),
-      (nodeId: 2'u32, host: "127.0.0.1", basePort: 27100),
-      (nodeId: 3'u32, host: "127.0.0.1", basePort: 27200),
-      (nodeId: 4'u32, host: "127.0.0.1", basePort: 27300),
-      (nodeId: 5'u32, host: "127.0.0.1", basePort: 27400),
-      (nodeId: 6'u32, host: "127.0.0.1", basePort: 27500),
+      (nodeId: 2'u32, host: "127.0.0.1", basePort: 28000),
+      (nodeId: 3'u32, host: "127.0.0.1", basePort: 29000),
+      (nodeId: 4'u32, host: "127.0.0.1", basePort: 30000),
+      (nodeId: 5'u32, host: "127.0.0.1", basePort: 31000),
+      (nodeId: 6'u32, host: "127.0.0.1", basePort: 32000),
     ]
-    let node6 = makeNode(6, 27500, node6Members)
+    let node6 = makeNode(6, 32000, node6Members)
     startNode(node6)
     nodes.add(node6)
 
     # Register node 6 with existing nodes' NuRaft groups
     for i in 0 ..< 5:
-      nodes[i].server.addPeerToRaft(6, "127.0.0.1", 27500)
+      nodes[i].server.addPeerToRaft(6, "127.0.0.1", 32000)
 
     # Seed node 6 into sys.nodes
     let nodeKey = encodeTableKey(SYS_NODES_TABLE_ID, "6")
     let nodeVal = $ %*{
       "nodeId": 6, "host": "127.0.0.1",
-      "raftPort": 27500, "clientPort": node6.clientPort, "status": 1,
+      "raftPort": 32000, "clientPort": node6.clientPort, "status": 1,
     }
     discard nodes[leaderIdx].store.raftPut(nodeKey, nodeVal)
     sleep(500)
