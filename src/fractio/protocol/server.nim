@@ -1526,15 +1526,18 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
   for p in peers:
     initialMembers.add((nodeId: p.nodeId, host: p.host, basePort: p.basePort))
 
+  # KV store MUST be created before groups start, otherwise log replay from
+  # leader will be dropped by nuraftCommitCb because kvStorePtr is nil!
+  let store = newRaftKVStoreExt(coord)
+  server.raftStore = store
+
+  # Wire callbacks and pre-create state machines before starting NuRaft
+  store.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
+
   # Create NuRaft groups: meta group (Group 1) and data group (Group 2)
   for groupId in [META_GROUP_ID, DATA_GROUP_START_ID]:
     discard coord.createAndStartGroup(groupId, initialMembers)
   coord.start()
-
-  # KV store
-  let store = newRaftKVStoreExt(coord)
-  store.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
-  server.raftStore = store
 
   # NuRaft handles log replay internally — no manual applyUpTo needed.
 

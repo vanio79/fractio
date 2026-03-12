@@ -162,7 +162,9 @@ proc tryInsert(nodes: openArray[TestNode]; sql: string;
         if res.getOrDefault("kind").getStr("") != "error":
           return res
         let err = res.getOrDefault("error").getStr("")
-        if "leader" notin err.toLowerAscii:
+        let errLower = err.toLowerAscii
+        if "leader" notin errLower and "0x07000001" notin errLower and "code -3" notin errLower:
+          echo "tryInsert encountered real error: ", err
           return res  # A real error, not just "not the leader"
       except CatchableError:
         continue
