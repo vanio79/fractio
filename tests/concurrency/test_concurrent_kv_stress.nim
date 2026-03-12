@@ -22,7 +22,7 @@ import fractio/protocol/raft_store
 import fractio/protocol/txn_manager
 import fractio/protocol/messages/kv
 import fractio/protocol/messages/txn as txnMsgs
-import fractio/distributed/raft/multigroup_coordinator
+import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
@@ -31,28 +31,31 @@ import fractio/distributed/meta/system_tables
 # Helpers
 # ---------------------------------------------------------------------------
 
+var testBasePort {.global.} = 22000
+
+proc nextBasePort(): int =
+  result = testBasePort
+  testBasePort += 100
+
 proc cleanDir(path: string) =
   try: removeDir(path) except CatchableError: discard
   try: createDir(path) except CatchableError: discard
 
-proc makeStressServer(port: int, storagePath: string,
-    numWorkers: int = 4): ProtocolServer =
+proc makeStressServer(port: int, storagePath: string): ProtocolServer =
   cleanDir(storagePath)
-  let coordCfg = CoordinatorConfig(
-    nodeId: NodeID(1),
-    numWorkers: numWorkers,
-    electionTimeoutNs: DEFAULT_ELECTION_TIMEOUT_NS,
-    heartbeatIntervalNs: DEFAULT_HEARTBEAT_INTERVAL_NS,
-    storagePath: storagePath,
-    proposeTimeoutMs: 10_000,
-  )
-  let coord = newMultiRaftCoordinator(coordCfg)
-  for rid in [META_GROUP_ID, DATA_GROUP_START_ID]:
-    let desc = newGroupDescriptor(rid)
-    let rep = desc.addReplica(NodeID(1))
-    let group = coord.createGroup(desc, rep.replicaId)
-    group.becomeLeader()
+  let nodeId = NodeID(1)
+  let basePort = nextBasePort()
+  let members = @[(nodeId: 1'u32, host: "127.0.0.1", basePort: basePort)]
+  let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
+    nodeId: nodeId, basePort: basePort, host: "127.0.0.1", dataDir: storagePath,
+    electionTimeoutLowerMs: 200, electionTimeoutUpperMs: 400, heartbeatIntervalMs: 100,
+  ))
   coord.start()
+  for rid in [META_GROUP_ID, DATA_GROUP_START_ID]:
+    doAssert coord.createAndStartGroup(rid, members)
+  for attempt in 0 ..< 50:
+    if coord.isLeader(GroupID(1)) and coord.isLeader(GroupID(2)): break
+    os.sleep(100)
   let raftSt = newRaftKVStoreExt(coord, proposeTimeoutMs = 10_000)
   raftSt.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
   var cfg = defaultServerConfig()
@@ -61,6 +64,7 @@ proc makeStressServer(port: int, storagePath: string,
   cfg.idleTimeoutSecs = 300
   let srv = newProtocolServer(cfg)
   srv.raftStore = raftSt
+  srv.raftCoord = coord
   srv.start()
   sleep(100)
   srv
@@ -367,7 +371,7 @@ suite "Concurrent KV stress tests":
     const numKeys = 200
     const port = 20624
     const storagePath = "/tmp/fractio_stress_20624"
-    let srv = makeStressServer(port, storagePath, numWorkers = 4)
+    let srv = makeStressServer(port, storagePath)
     defer:
       srv.stop()
       sleep(80)

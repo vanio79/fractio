@@ -8,6 +8,7 @@ import ./serialization
 import ./config
 import ../../core/types as coretypes
 import ../../utils/logging
+import ../../utils/socket_utils
 
 when defined(posix):
   import std/posix
@@ -235,7 +236,7 @@ proc connectToNode*(t: TCPTransport, nodeId: NodeID, host: string,
     # kernel to return EPERM ("Permission denied") via select() instead of the
     # expected ECONNREFUSED when the remote port is closed.
     # We set it AFTER a successful connect() instead.
-    socket.setSockOpt(OptReuseAddr, true)
+    socket.setLingerZero()
     socket.setSockOpt(OptKeepAlive, t.config.tcpKeepAlive)
 
     let remoteAddr = host & ":" & $port
@@ -470,7 +471,7 @@ proc acceptLoopWrapper(t: TCPTransport) {.thread.} =
 proc startServer*(t: TCPTransport): bool =
   try:
     t.serverSocket = newSocket()
-    t.serverSocket.setSockOpt(OptReuseAddr, true)
+    t.serverSocket.setLingerZero()
     t.serverSocket.bindAddr(Port(t.port), t.config.bindAddress)
     t.serverSocket.listen()
 

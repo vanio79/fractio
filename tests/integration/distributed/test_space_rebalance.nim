@@ -6,15 +6,14 @@
 #   3. Verify dual-read works during migration
 #   4. Run migration, verify cutover
 #
-# Cluster topology: in-process coordinators with RaftGroupTransport
-# Port allocation: 22500–22599 (Raft TCP ports)
+# Cluster topology: in-process NuRaftCoordinators with ASIO networking
+# Port allocation: 28000–28299 (NuRaft ASIO, basePort per node spaced by 100)
 # Temp storage: /tmp/fractio_rebal_<nodeId>/ (cleaned up per test)
 
 import std/[unittest, os, options, json, strutils, tables, hashes, algorithm, times, locks]
 import fractio/protocol/raft_store
 import fractio/protocol/server
-import fractio/distributed/raft/multigroup_coordinator
-import fractio/distributed/raft/multigroup_transport
+import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
@@ -26,7 +25,6 @@ import fractio/sql/executor
 # ---------------------------------------------------------------------------
 
 const
-  BASE_PORT = 22500
   TMP_DIR = "/tmp/fractio_rebal_"
 
 var nextClientPort = 19100  ## incremented per node to avoid port conflicts between tests
@@ -38,62 +36,51 @@ var nextClientPort = 19100  ## incremented per node to avoid port conflicts betw
 type
   TestNode = object
     id*: int
+    basePort*: int
     clientPort*: int
     server*: ProtocolServer
-    coord*: MultiRaftCoordinator
+    coord*: NuRaftCoordinator
     store*: RaftKVStoreExt
-    rgt*: RaftGroupTransport
     storagePath*: string
 
 proc cleanDir(p: string) =
   try: removeDir(p) except CatchableError: discard
 
-proc raftPort(nodeNum: int): int = BASE_PORT + (nodeNum - 1) * 10
-
-proc makeNode(nodeNum: int, peerNums: seq[int]): TestNode =
+proc makeNode(nodeNum: int, basePort: int,
+    members: seq[tuple[nodeId: uint32, host: string, basePort: int]]): TestNode =
   let nodeId = rangeTypes.NodeID(uint32(nodeNum))
-  let port = raftPort(nodeNum)
+  let cPort = nextClientPort
+  nextClientPort += 1
 
-  var peers: seq[PeerAddr]
-  for pn in peerNums:
-    peers.add(PeerAddr(
-      nodeId: rangeTypes.NodeID(uint32(pn)),
-      host: "127.0.0.1",
-      raftPort: raftPort(pn),
-    ))
-
-  let rgt = newRaftGroupTransport(nodeId, "127.0.0.1", port, peers)
-  let transport = newMultiRaftTransport(rgt)
-
-  let storagePath = TMP_DIR & $nodeNum
+  # Use unique storage path for each node + test run instance to avoid LOCK contention
+  let storagePath = TMP_DIR & $nodeNum & "_" & $cPort
   cleanDir(storagePath)
   createDir(storagePath)
 
-  let coord = newMultiRaftCoordinator(CoordinatorConfig(
+  let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
     nodeId: nodeId,
-    numWorkers: 1,
-    electionTimeoutNs: 800_000_000'i64,
-    heartbeatIntervalNs: 50_000_000'i64,
-    storagePath: storagePath / "raft",
-    proposeTimeoutMs: 6000,
-    transport: transport,
+    basePort: basePort,
+    host: "127.0.0.1",
+    dataDir: storagePath,
+    electionTimeoutLowerMs: 200,
+    electionTimeoutUpperMs: 400,
+    heartbeatIntervalMs: 100,
   ))
+  coord.start()
 
-  # Create meta + data groups with all peers as voters
-  for groupId in [META_GROUP_ID, DATA_GROUP_START_ID]:
-    var desc = rangeTypes.newGroupDescriptor(groupId)
-    discard desc.addReplica(nodeId, rangeTypes.rtVoter)
-    for pn in peerNums:
-      discard desc.addReplica(rangeTypes.NodeID(uint32(pn)), rangeTypes.rtVoter)
-    let rep = desc.getReplica(nodeId)
-    doAssert rep.isSome
-    discard coord.createGroup(desc, rep.get.replicaId)
+  # Create meta + data groups with retries
+  for gid in [META_GROUP_ID, DATA_GROUP_START_ID]:
+    var success = false
+    for attempt in 0 ..< 5:
+      if coord.createAndStartGroup(gid, members):
+        success = true
+        break
+      sleep(200)
+    if not success:
+      raise newException(AssertionDefect, "Failed to create group " & $gid & " for node " & $nodeNum)
 
   let store = newRaftKVStoreExt(coord, proposeTimeoutMs = 6000)
   store.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
-
-  let cPort = nextClientPort
-  nextClientPort += 1
 
   var cfg = defaultServerConfig()
   cfg.host = "127.0.0.1"
@@ -103,28 +90,36 @@ proc makeNode(nodeNum: int, peerNums: seq[int]): TestNode =
   let srv = newProtocolServer(cfg)
   srv.raftStore = store
   srv.raftCoord = coord
-  srv.raftTransport = rgt
 
   TestNode(
-    id: nodeNum, clientPort: cPort, server: srv, coord: coord, store: store,
-    rgt: rgt, storagePath: storagePath,
+    id: nodeNum, basePort: basePort, clientPort: cPort, server: srv,
+    coord: coord, store: store, storagePath: storagePath,
   )
 
 proc startNode(n: TestNode) =
-  n.coord.start()
   n.server.start()
 
-proc stopNode(n: TestNode) =
+proc stopNode*(n: TestNode) =
   n.server.stop()
   n.coord.stop()
+  sleep(100) # Give LevelDB a moment to release its lock
   cleanDir(n.storagePath)
+
+proc waitForLeaderOnGroup(nodes: seq[TestNode], gid: GroupID,
+    maxAttempts: int = 50): int =
+  for attempt in 0 ..< maxAttempts:
+    for i, n in nodes:
+      if n.coord.isLeader(gid):
+        return i
+    sleep(100)
+  -1
 
 proc seedSysNodes(leaderStore: RaftKVStoreExt, nodes: seq[TestNode]) =
   for n in nodes:
     let key = encodeTableKey(SYS_NODES_TABLE_ID, $n.id)
     let val = $ %*{
       "nodeId": n.id, "host": "127.0.0.1",
-      "raftPort": raftPort(n.id), "clientPort": n.clientPort, "status": 1,
+      "raftPort": n.basePort, "clientPort": n.clientPort, "status": 1,
     }
     let r = leaderStore.raftPut(key, val)
     doAssert r.isOk, "failed to seed sys.nodes for node " & $n.id
@@ -167,7 +162,7 @@ proc waitForAutoDistribution(nodes: seq[TestNode], expectedGroupIds: seq[uint64]
     sleep(stepMs)
     waited += stepMs
 
-proc electSpaceLeaders(nodes: seq[TestNode]) =
+proc waitForSpaceLeaders(nodes: seq[TestNode]) =
   let store = nodes[0].store
   let grpStart = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
   let grpEnd = encodeTableKey(SYS_GROUPS_TABLE_ID + 1, "")
@@ -178,16 +173,15 @@ proc electSpaceLeaders(nodes: seq[TestNode]) =
         let j = parseJson(entry.value)
         let gid = GroupID(uint64(j["groupId"].getInt()))
         if gid == META_GROUP_ID or gid == DATA_GROUP_START_ID: continue
-        if j.hasKey("replicas") and j["replicas"].len > 0:
-          let leaderNodeId = j["replicas"][0]["nodeId"].getInt()
+        for attempt in 0 ..< 50:
+          var hasLeader = false
           for node in nodes:
-            if node.id == leaderNodeId:
-              let g = node.coord.getGroup(gid)
-              if g.isSome:
-                g.get.becomeLeader()
+            if node.coord.isLeader(gid):
+              hasLeader = true
               break
+          if hasLeader: break
+          sleep(100)
       except: discard
-  sleep(300)
 
 proc exec(store: RaftKVStoreExt, sql: string): ExecResult =
   executeSQL(sql, store, "default", "public")
@@ -197,26 +191,26 @@ proc exec(store: RaftKVStoreExt, sql: string): ExecResult =
 # ---------------------------------------------------------------------------
 
 proc makeCluster2(): seq[TestNode] =
-  ## 2-node cluster, node 1 = leader.
-  let allNums = @[1, 2]
+  ## 2-node cluster.
+  let members = @[
+    (nodeId: 1'u32, host: "127.0.0.1", basePort: 28000),
+    (nodeId: 2'u32, host: "127.0.0.1", basePort: 29000),
+  ]
+
   var nodes: seq[TestNode]
-  for n in allNums:
-    var peers: seq[int]
-    for p in allNums:
-      if p != n: peers.add(p)
-    nodes.add(makeNode(n, peers))
+  for i, m in members:
+    nodes.add(makeNode(int(m.nodeId), m.basePort, members))
   for n in nodes: startNode(n)
 
-  # Force node 1 to be leader
-  for groupId in [META_GROUP_ID, DATA_GROUP_START_ID]:
-    let g = nodes[0].coord.getGroup(groupId)
-    doAssert g.isSome
-    g.get.becomeLeader()
-  sleep(400)
+  # Wait for leader election
+  let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
+  doAssert leaderIdx >= 0
+  sleep(200)
 
-  seedSysNodes(nodes[0].store, nodes)
-  seedSysGroups(nodes[0].store, allNums)
-  seedDefaults(nodes[0].store)
+  let allNums = @[1, 2]
+  seedSysNodes(nodes[leaderIdx].store, nodes)
+  seedSysGroups(nodes[leaderIdx].store, allNums)
+  seedDefaults(nodes[leaderIdx].store)
   sleep(400)
 
   # Load space caches
@@ -228,50 +222,41 @@ proc makeCluster2(): seq[TestNode] =
   nodes
 
 proc addNodeToCluster(nodes: var seq[TestNode], newNodeNum: int) =
-  ## Add a new node to the cluster: create it, start its protocol server,
-  ## register in sys.nodes.
-  var allNums: seq[int]
-  for n in nodes: allNums.add(n.id)
-  allNums.add(newNodeNum)
+  ## Add a new node to the cluster.
+  let newBasePort = 28000 + (newNodeNum - 1) * 1000
 
-  # Create the new node with all existing nodes as peers
-  var peerNums: seq[int]
-  for n in nodes: peerNums.add(n.id)
-  let newNode = makeNode(newNodeNum, peerNums)
+  # Build members list including all existing + new
+  var allMembers: seq[tuple[nodeId: uint32, host: string, basePort: int]]
+  for n in nodes:
+    allMembers.add((nodeId: uint32(n.id), host: "127.0.0.1", basePort: n.basePort))
+  allMembers.add((nodeId: uint32(newNodeNum), host: "127.0.0.1", basePort: newBasePort))
+
+  let newNode = makeNode(newNodeNum, newBasePort, allMembers)
   startNode(newNode)
 
-  # Add new node as peer to existing nodes' transports
+  # Add new node to existing nodes' NuRaft groups
   for n in nodes:
-    n.rgt.addPeer(rangeTypes.NodeID(uint32(newNodeNum)),
-        "127.0.0.1", raftPort(newNodeNum))
-
-  # Add new node as peer replica to existing Raft groups
-  for n in nodes:
-    withLock n.coord.groupsLock:
-      for groupId, group in n.coord.groups:
-        discard group.descriptor.addReplica(
-          rangeTypes.NodeID(uint32(newNodeNum)), rangeTypes.rtVoter)
+    n.server.addPeerToRaft(uint32(newNodeNum), "127.0.0.1", newBasePort)
 
   nodes.add(newNode)
 
   # Register in sys.nodes via leader
-  let nodeKey = encodeTableKey(SYS_NODES_TABLE_ID, $newNodeNum)
-  let nodeVal = $ %*{
-    "nodeId": newNodeNum, "host": "127.0.0.1",
-    "raftPort": raftPort(newNodeNum), "clientPort": newNode.clientPort,
-    "status": 1,
-  }
-  discard nodes[0].store.raftPut(nodeKey, nodeVal)
+  let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
+  if leaderIdx >= 0:
+    let nodeKey = encodeTableKey(SYS_NODES_TABLE_ID, $newNodeNum)
+    let nodeVal = $ %*{
+      "nodeId": newNodeNum, "host": "127.0.0.1",
+      "raftPort": newBasePort, "clientPort": newNode.clientPort,
+      "status": 1,
+    }
+    discard nodes[leaderIdx].store.raftPut(nodeKey, nodeVal)
   sleep(200)
 
 proc stopCluster(nodes: seq[TestNode]) =
-  # Stop in reverse order: later nodes first, so earlier nodes' heartbeats
-  # still have live peers and complete quickly (avoiding 5s TCP read timeouts).
   for i in countdown(nodes.high, 0):
     stopNode(nodes[i])
 
 proc findSpaceId(leaderStore: RaftKVStoreExt, spaceName: string): int =
-  ## Look up a space's ID by name from sys.spaces.
   let spacesStart = encodeTableKey(SYS_SPACES_TABLE_ID, "")
   let spacesEnd = encodeTableKey(SYS_SPACES_TABLE_ID + 1, "")
   let sr = leaderStore.raftScan(spacesStart, spacesEnd, 0, includeSystemKeys = true)
@@ -285,7 +270,6 @@ proc findSpaceId(leaderStore: RaftKVStoreExt, spaceName: string): int =
   doAssert false, "space '" & spaceName & "' not found"
 
 proc findSpaceGroupIds(leaderStore: RaftKVStoreExt, spaceId: int): seq[uint64] =
-  ## Look up group IDs for a space.
   leaderStore.loadSpaces()
   acquire(leaderStore.spacesMu)
   result = leaderStore.spaces[spaceId].groupIds
@@ -293,8 +277,6 @@ proc findSpaceGroupIds(leaderStore: RaftKVStoreExt, spaceId: int): seq[uint64] =
 
 proc createSpace(leaderStore: RaftKVStoreExt, spaceName: string,
     replicas: int): int =
-  ## Create a space and table. Returns spaceId.
-  ## Caller must distribute groups + elect leaders before inserting data.
   let csRes = exec(leaderStore,
     "CREATE SPACE " & spaceName & " WITH REPLICAS = " & $replicas)
   doAssert csRes.kind == erkOk, "CREATE SPACE failed: " &
@@ -308,7 +290,6 @@ proc createSpace(leaderStore: RaftKVStoreExt, spaceName: string,
   findSpaceId(leaderStore, spaceName)
 
 proc execOnLeader(nodes: seq[TestNode], sql: string): ExecResult =
-  ## Try executing SQL on each node until one succeeds (client-side retry).
   for node in nodes:
     let r = exec(node.store, sql)
     if r.kind != erkError:
@@ -319,8 +300,6 @@ proc execOnLeader(nodes: seq[TestNode], sql: string): ExecResult =
   exec(nodes[^1].store, sql)
 
 proc replicateMetadata(nodes: seq[TestNode]) =
-  ## Copy system table data from the leader's backend to all other nodes'
-  ## backends, then load in-memory caches on all nodes.
   let leaderBackend = nodes[0].store.getBackend()
   for sysTableId in [SYS_TABLES_TABLE_ID, SYS_SPACES_TABLE_ID,
                       SYS_GROUPS_TABLE_ID, SYS_NODES_TABLE_ID]:
@@ -338,7 +317,6 @@ proc replicateMetadata(nodes: seq[TestNode]) =
     node.store.loadTableSpaces()
 
 proc insertRows(nodes: seq[TestNode], spaceName: string, rowCount: int) =
-  ## Insert rows into <spaceName>_t, retrying on different nodes.
   for i in 1 .. rowCount:
     let insRes = execOnLeader(nodes,
       "INSERT INTO " & spaceName & "_t (id, val) VALUES (" & $i & ", 'v" & $i & "')")
@@ -348,12 +326,14 @@ proc insertRows(nodes: seq[TestNode], spaceName: string, rowCount: int) =
 proc setupSpaceWithData(nodes: seq[TestNode], spaceName: string,
     replicas: int, rowCount: int): int =
   ## Full setup: create space, distribute groups, elect leaders, insert data.
-  let leaderStore = nodes[0].store
+  let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
+  doAssert leaderIdx >= 0
+  let leaderStore = nodes[leaderIdx].store
   let spaceId = createSpace(leaderStore, spaceName, replicas)
   let gids = findSpaceGroupIds(leaderStore, spaceId)
 
   waitForAutoDistribution(nodes, gids, replicas)
-  electSpaceLeaders(nodes)
+  waitForSpaceLeaders(nodes)
   replicateMetadata(nodes)
 
   insertRows(nodes, spaceName, rowCount)
@@ -368,7 +348,8 @@ suite "Space rebalance integration — rebalanceSpaces":
     var nodes = makeCluster2()
     defer: stopCluster(nodes)
 
-    let leaderStore = nodes[0].store
+    let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
+    let leaderStore = nodes[leaderIdx].store
     let spaceId = setupSpaceWithData(nodes, "orders", 2, 10)
 
     # Verify: 2 groups, not rebalancing
@@ -389,14 +370,15 @@ suite "Space rebalance integration — rebalanceSpaces":
     let sp2 = leaderStore.spaces[spaceId]
     release(leaderStore.spacesMu)
     check sp2.rebalancing == true
-    check sp2.groupIds.len == 3  # 3 nodes → 3 new groups
+    check sp2.groupIds.len == 3  # 3 nodes -> 3 new groups
     check sp2.oldGroupIds.len == 2  # original 2 groups
 
   test "is idempotent — does not re-trigger while rebalancing":
     var nodes = makeCluster2()
     defer: stopCluster(nodes)
 
-    let leaderStore = nodes[0].store
+    let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
+    let leaderStore = nodes[leaderIdx].store
     let spaceId = setupSpaceWithData(nodes, "products", 2, 5)
 
     addNodeToCluster(nodes, 3)
@@ -418,7 +400,8 @@ suite "Space rebalance integration — rebalanceSpaces":
     var nodes = makeCluster2()
     defer: stopCluster(nodes)
 
-    let leaderStore = nodes[0].store
+    let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
+    let leaderStore = nodes[leaderIdx].store
     let spaceId = setupSpaceWithData(nodes, "stable", 2, 3)
 
     # Don't add any nodes — group count (2) == node count (2)
@@ -438,7 +421,8 @@ suite "Space rebalance integration — reads during migration":
     var nodes = makeCluster2()
     defer: stopCluster(nodes)
 
-    let leaderStore = nodes[0].store
+    let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
+    let leaderStore = nodes[leaderIdx].store
     let spaceId = setupSpaceWithData(nodes, "items", 2, 20)
 
     # Verify all rows readable before rebalance
@@ -450,12 +434,12 @@ suite "Space rebalance integration — reads during migration":
     addNodeToCluster(nodes, 3)
     leaderStore.rebalanceSpaces()
 
-    # Wait for new groups and elect leaders
+    # Wait for new groups and leaders
     acquire(leaderStore.spacesMu)
     let newGids = leaderStore.spaces[spaceId].groupIds
     release(leaderStore.spacesMu)
     waitForAutoDistribution(nodes, newGids, 2, 3000)
-    electSpaceLeaders(nodes)
+    waitForSpaceLeaders(nodes)
     replicateMetadata(nodes)
 
     # All 20 rows still readable (dual-read fallback to old groups)
@@ -467,7 +451,8 @@ suite "Space rebalance integration — reads during migration":
     var nodes = makeCluster2()
     defer: stopCluster(nodes)
 
-    let leaderStore = nodes[0].store
+    let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
+    let leaderStore = nodes[leaderIdx].store
     let spaceId = setupSpaceWithData(nodes, "users", 2, 10)
 
     addNodeToCluster(nodes, 3)
@@ -476,7 +461,7 @@ suite "Space rebalance integration — reads during migration":
     let newGids = leaderStore.spaces[spaceId].groupIds
     release(leaderStore.spacesMu)
     waitForAutoDistribution(nodes, newGids, 2, 3000)
-    electSpaceLeaders(nodes)
+    waitForSpaceLeaders(nodes)
     replicateMetadata(nodes)
 
     for i in 1 .. 10:
@@ -491,7 +476,6 @@ suite "Space rebalance integration — reads during migration":
 
 proc triggerRebalanceAndSetup(nodes: var seq[TestNode], leaderStore: RaftKVStoreExt,
     spaceId: int) =
-  ## Add 3rd node, trigger rebalance, wait for new groups, elect leaders.
   addNodeToCluster(nodes, 3)
   leaderStore.rebalanceSpaces()
 
@@ -499,7 +483,7 @@ proc triggerRebalanceAndSetup(nodes: var seq[TestNode], leaderStore: RaftKVStore
   let newGids = leaderStore.spaces[spaceId].groupIds
   release(leaderStore.spacesMu)
   waitForAutoDistribution(nodes, newGids, 2, 5000)
-  electSpaceLeaders(nodes)
+  waitForSpaceLeaders(nodes)
   replicateMetadata(nodes)
 
 suite "Space rebalance integration — full migration":
@@ -507,7 +491,8 @@ suite "Space rebalance integration — full migration":
     var nodes = makeCluster2()
     defer: stopCluster(nodes)
 
-    let leaderStore = nodes[0].store
+    let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
+    let leaderStore = nodes[leaderIdx].store
     let spaceId = setupSpaceWithData(nodes, "migrate", 2, 30)
     triggerRebalanceAndSetup(nodes, leaderStore, spaceId)
 
@@ -538,22 +523,20 @@ suite "Space rebalance integration — full migration":
     var nodes = makeCluster2()
     defer: stopCluster(nodes)
 
-    let leaderStore = nodes[0].store
+    let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
+    let leaderStore = nodes[leaderIdx].store
     let spaceId = setupSpaceWithData(nodes, "fullmig", 2, 20)
     triggerRebalanceAndSetup(nodes, leaderStore, spaceId)
 
     leaderStore.runRebalanceMigration(spaceId)
     leaderStore.loadSpaces()
 
-    # Replicate ALL data across backends since these tests don't have real
-    # Raft log replication. After migration + group restructuring, the new
-    # group leaders need the data in their local backends.
     replicateMetadata(nodes)
     # Sync all data from each node to all other nodes
     for srcIdx in 0 ..< nodes.len:
       let srcBackend = nodes[srcIdx].store.getBackend()
       if srcBackend == nil or not srcBackend.isOpen: continue
-      let allPairs = srcBackend.scan("/t/", "/u")  # covers all /t/ keys
+      let allPairs = srcBackend.scan("/t/", "/u")
       for (k, v) in allPairs:
         for dstIdx in 0 ..< nodes.len:
           if dstIdx == srcIdx: continue
@@ -571,7 +554,8 @@ suite "Space rebalance integration — full migration":
     var nodes = makeCluster2()
     defer: stopCluster(nodes)
 
-    let leaderStore = nodes[0].store
+    let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
+    let leaderStore = nodes[leaderIdx].store
     let spaceId = setupSpaceWithData(nodes, "cleanup", 2, 5)
 
     addNodeToCluster(nodes, 3)
@@ -584,7 +568,7 @@ suite "Space rebalance integration — full migration":
     check oldGids.len > 0
 
     waitForAutoDistribution(nodes, newGids, 2, 5000)
-    electSpaceLeaders(nodes)
+    waitForSpaceLeaders(nodes)
     replicateMetadata(nodes)
 
     leaderStore.runRebalanceMigration(spaceId)
@@ -605,7 +589,8 @@ suite "Space rebalance integration — crash safety":
     var nodes = makeCluster2()
     defer: stopCluster(nodes)
 
-    let leaderStore = nodes[0].store
+    let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
+    let leaderStore = nodes[leaderIdx].store
     let spaceId = setupSpaceWithData(nodes, "crash", 2, 10)
 
     addNodeToCluster(nodes, 3)
@@ -625,7 +610,8 @@ suite "Space rebalance integration — crash safety":
     var nodes = makeCluster2()
     defer: stopCluster(nodes)
 
-    let leaderStore = nodes[0].store
+    let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
+    let leaderStore = nodes[leaderIdx].store
     let spaceId = setupSpaceWithData(nodes, "idem", 2, 10)
     triggerRebalanceAndSetup(nodes, leaderStore, spaceId)
 

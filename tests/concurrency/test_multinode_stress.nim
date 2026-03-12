@@ -1,10 +1,10 @@
 # Multi-node concurrency stress tests — Phase 14b
 #
 # Exercises concurrent reads and writes through the full Raft + WiscKey stack
-# on real multi-node clusters with TCP-based replication:
+# on real multi-node clusters with NuRaft ASIO networking:
 #
-#   Cluster A: 3 nodes, 2 voters + 1 non-voter  (quorum = 2)
-#   Cluster B: 5 nodes, 3 voters + 2 non-voters (quorum = 2)
+#   Cluster A: 3 nodes (all voters, NuRaft manages quorum)
+#   Cluster B: 5 nodes (all voters, NuRaft manages quorum)
 #
 # Scenarios per cluster:
 #   1. 8 writers, distinct keys — all committed via quorum
@@ -12,16 +12,12 @@
 #   3. Concurrent puts then verify replication to all voters
 #   4. High-volume mixed load (8×200 ops)
 #
-# Port range: 20640–20979
-#   3-node tests: 20640, 20670, 20700, 20730 (each node gets 10 ports: base+(n-1)*10)
-#   5-node tests: 20780, 20830, 20880, 20930 (each node gets 10 ports: base+(n-1)*10)
-#
-# Temp storage: /tmp/fractio_mn_stress_<port>/
+# Port allocation: 25000–25499 (NuRaft ASIO, basePort per node spaced by 100)
+# Temp storage: /tmp/fractio_mn_stress_<basePort>/
 
 import std/[unittest, os, times, atomics, options]
 import fractio/protocol/raft_store
-import fractio/distributed/raft/multigroup_coordinator
-import fractio/distributed/raft/multigroup_transport
+import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
@@ -36,106 +32,87 @@ proc cleanDir(path: string) =
 
 type
   NodeSetup = object
-    coord*: MultiRaftCoordinator
+    coord*: NuRaftCoordinator
     store*: RaftKVStoreExt
     storagePath*: string
-    rgt*: RaftGroupTransport ## GC root — keeps transport alive
 
 proc makeNode(nodeNum: int, basePort: int,
-              peerNums: seq[int],
-              rid: GroupID,
-              desc: GroupDescriptor,
-              numWorkers: int = 1): NodeSetup =
+              members: seq[tuple[nodeId: uint32, host: string, basePort: int]],
+              groupId: GroupID): NodeSetup =
   let nodeId = NodeID(uint32(nodeNum))
-  let port = basePort + (nodeNum - 1) * 10
-
-  var peers: seq[PeerAddr]
-  for pn in peerNums:
-    peers.add(PeerAddr(
-      nodeId: NodeID(uint32(pn)),
-      host: "127.0.0.1",
-      raftPort: basePort + (pn - 1) * 10,
-    ))
-
-  let rgt = newRaftGroupTransport(nodeId, "127.0.0.1", port, peers)
-  let transport = newMultiRaftTransport(rgt)
-
-  let storagePath = "/tmp/fractio_mn_stress_" & $port
+  let storagePath = "/tmp/fractio_mn_stress_" & $basePort
   cleanDir(storagePath)
 
-  let cfg = CoordinatorConfig(
+  let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
     nodeId: nodeId,
-    numWorkers: numWorkers,
-    electionTimeoutNs: 300_000_000_000'i64, # 300s — prevent elections during test
-    heartbeatIntervalNs: 50_000_000'i64,
-    storagePath: storagePath,
-    proposeTimeoutMs: 30_000,
-    transport: transport,
-  )
-  let coord = newMultiRaftCoordinator(cfg)
+    basePort: basePort,
+    host: "127.0.0.1",
+    dataDir: storagePath,
+    electionTimeoutLowerMs: 200,
+    electionTimeoutUpperMs: 400,
+    heartbeatIntervalMs: 100,
+  ))
+  coord.start()
 
-  let rep = desc.getReplica(nodeId)
-  doAssert rep.isSome, "replica not found for node " & $nodeNum
-  discard coord.createGroup(desc, rep.get.replicaId)
+  doAssert coord.createAndStartGroup(groupId, members)
 
   let store = newRaftKVStoreExt(coord, proposeTimeoutMs = 30_000)
-  store.bootstrapStore(@[rid])
+  store.bootstrapStore(@[groupId])
 
-  NodeSetup(coord: coord, store: store, storagePath: storagePath, rgt: rgt)
-
-proc startNode(ns: NodeSetup) =
-  ns.coord.start()
+  NodeSetup(coord: coord, store: store, storagePath: storagePath)
 
 proc stopNode(ns: NodeSetup) =
   ns.coord.stop()
-  sleep(500) # Let TCP connections drain before removing storage
+  sleep(500) # Let connections drain before removing storage
   cleanDir(ns.storagePath)
 
-proc electLeader(nodes: seq[NodeSetup], rid: GroupID, leaderIdx: int) =
-  ## Force node at leaderIdx to become leader, wait for heartbeats.
-  let grp = nodes[leaderIdx].coord.getGroup(rid)
-  doAssert grp.isSome
-  # Bump term so heartbeats are accepted by followers at term 0
-  grp.get.becomeCandidate()
-  grp.get.becomeLeader()
-  sleep(500)
+proc waitForLeader(nodes: seq[NodeSetup], groupId: GroupID,
+    maxAttempts: int = 50): int =
+  ## Wait for a leader to be elected. Returns leader index or -1.
+  for attempt in 0 ..< maxAttempts:
+    for i, ns in nodes:
+      if ns.coord.isLeader(groupId):
+        return i
+    sleep(100)
+  -1
 
 # ---------------------------------------------------------------------------
 # Cluster factories
 # ---------------------------------------------------------------------------
 
 proc make3NodeCluster(basePort: int): (seq[NodeSetup], GroupID) =
-  ## 3 nodes: node 1 & 2 are voters, node 3 is non-voter.
+  ## 3-node cluster — NuRaft handles quorum automatically.
   let rid = DATA_GROUP_START_ID
-  let desc = newGroupDescriptor(rid)
-  discard desc.addReplica(NodeID(1), rtVoter)
-  discard desc.addReplica(NodeID(2), rtVoter)
-  discard desc.addReplica(NodeID(3), rtNonVoter)
+  let members = @[
+    (nodeId: 1'u32, host: "127.0.0.1", basePort: basePort),
+    (nodeId: 2'u32, host: "127.0.0.1", basePort: basePort + 100),
+    (nodeId: 3'u32, host: "127.0.0.1", basePort: basePort + 200),
+  ]
 
   let nodes = @[
-    makeNode(1, basePort, @[2, 3], rid, desc),
-    makeNode(2, basePort, @[1, 3], rid, desc),
-    makeNode(3, basePort, @[1, 2], rid, desc),
+    makeNode(1, basePort, members, rid),
+    makeNode(2, basePort + 100, members, rid),
+    makeNode(3, basePort + 200, members, rid),
   ]
   (nodes, rid)
 
 proc make5NodeCluster(basePort: int): (seq[NodeSetup], GroupID) =
-  ## 5 nodes: nodes 1, 2, 3 are voters, nodes 4, 5 are non-voters.
-  ## Uses 2 coordinator workers per node to handle the higher fan-out.
+  ## 5-node cluster — NuRaft handles quorum automatically.
   let rid = DATA_GROUP_START_ID
-  let desc = newGroupDescriptor(rid)
-  discard desc.addReplica(NodeID(1), rtVoter)
-  discard desc.addReplica(NodeID(2), rtVoter)
-  discard desc.addReplica(NodeID(3), rtVoter)
-  discard desc.addReplica(NodeID(4), rtNonVoter)
-  discard desc.addReplica(NodeID(5), rtNonVoter)
+  let members = @[
+    (nodeId: 1'u32, host: "127.0.0.1", basePort: basePort),
+    (nodeId: 2'u32, host: "127.0.0.1", basePort: basePort + 100),
+    (nodeId: 3'u32, host: "127.0.0.1", basePort: basePort + 200),
+    (nodeId: 4'u32, host: "127.0.0.1", basePort: basePort + 300),
+    (nodeId: 5'u32, host: "127.0.0.1", basePort: basePort + 400),
+  ]
 
   let nodes = @[
-    makeNode(1, basePort, @[2, 3, 4, 5], rid, desc, numWorkers = 2),
-    makeNode(2, basePort, @[1, 3, 4, 5], rid, desc, numWorkers = 2),
-    makeNode(3, basePort, @[1, 2, 4, 5], rid, desc, numWorkers = 2),
-    makeNode(4, basePort, @[1, 2, 3, 5], rid, desc, numWorkers = 2),
-    makeNode(5, basePort, @[1, 2, 3, 4], rid, desc, numWorkers = 2),
+    makeNode(1, basePort, members, rid),
+    makeNode(2, basePort + 100, members, rid),
+    makeNode(3, basePort + 200, members, rid),
+    makeNode(4, basePort + 300, members, rid),
+    makeNode(5, basePort + 400, members, rid),
   ]
   (nodes, rid)
 
@@ -220,18 +197,17 @@ proc waitCompleted(completed: ptr Atomic[int], total: int,
   true
 
 # ===========================================================================
-# 3-node cluster stress tests (2 voters + 1 non-voter, quorum = 2)
+# 3-node cluster stress tests
 # ===========================================================================
 
-suite "MultiNode stress — 3-node cluster (2 voters)":
+suite "MultiNode stress — 3-node cluster":
 
   test "8 writers, distinct keys — quorum-committed":
     const numThreads = 8
     const numOps = 100
-    const basePort = 20640
-    let (nodes, rid) = make3NodeCluster(basePort)
-    for ns in nodes: startNode(ns)
-    electLeader(nodes, rid, 0)
+    let (nodes, rid) = make3NodeCluster(25000)
+    let leaderIdx = waitForLeader(nodes, rid)
+    doAssert leaderIdx >= 0
     defer:
       for ns in nodes: stopNode(ns)
 
@@ -245,7 +221,7 @@ suite "MultiNode stress — 3-node cluster (2 voters)":
     var threads: array[numThreads, Thread[WriteWorkerArgs]]
     for i in 0 ..< numThreads:
       let args = WriteWorkerArgs(
-        store: addr nodes[0].store,
+        store: addr nodes[leaderIdx].store,
         threadId: i, numOps: numOps,
         startLatch: addr latch, errors: addr errors,
         completed: addr completed)
@@ -260,10 +236,9 @@ suite "MultiNode stress — 3-node cluster (2 voters)":
     const numThreads = 8
     const numOps = 150
     const numKeys = 50
-    const basePort = 20670
-    let (nodes, rid) = make3NodeCluster(basePort)
-    for ns in nodes: startNode(ns)
-    electLeader(nodes, rid, 0)
+    let (nodes, rid) = make3NodeCluster(25000)
+    let leaderIdx = waitForLeader(nodes, rid)
+    doAssert leaderIdx >= 0
     defer:
       for ns in nodes: stopNode(ns)
 
@@ -277,7 +252,7 @@ suite "MultiNode stress — 3-node cluster (2 voters)":
     var threads: array[numThreads, Thread[ReadWriteWorkerArgs]]
     for i in 0 ..< numThreads:
       let args = ReadWriteWorkerArgs(
-        store: addr nodes[0].store,
+        store: addr nodes[leaderIdx].store,
         threadId: i, numOps: numOps, numKeys: numKeys,
         startLatch: addr latch, errors: addr errors,
         completed: addr completed)
@@ -291,10 +266,9 @@ suite "MultiNode stress — 3-node cluster (2 voters)":
   test "concurrent puts then verify replication to voter":
     const numThreads = 4
     const numOps = 50
-    const basePort = 20700
-    let (nodes, rid) = make3NodeCluster(basePort)
-    for ns in nodes: startNode(ns)
-    electLeader(nodes, rid, 0)
+    let (nodes, rid) = make3NodeCluster(25000)
+    let leaderIdx = waitForLeader(nodes, rid)
+    doAssert leaderIdx >= 0
     defer:
       for ns in nodes: stopNode(ns)
 
@@ -308,7 +282,7 @@ suite "MultiNode stress — 3-node cluster (2 voters)":
     var threads: array[numThreads, Thread[WriteWorkerArgs]]
     for i in 0 ..< numThreads:
       let args = WriteWorkerArgs(
-        store: addr nodes[0].store,
+        store: addr nodes[leaderIdx].store,
         threadId: i, numOps: numOps,
         startLatch: addr latch, errors: addr errors,
         completed: addr completed)
@@ -319,7 +293,10 @@ suite "MultiNode stress — 3-node cluster (2 voters)":
       joinThread(threads[i])
     check errors.load() == 0
 
-    # Poll for replication to voter node 1 — retry up to 15s
+    # Pick a follower to check replication
+    let followerIdx = (leaderIdx + 1) mod 3
+
+    # Poll for replication to follower — retry up to 15s
     let replDeadline = epochTime() + 15.0
     var missing = numThreads * numOps
     while missing > 0 and epochTime() < replDeadline:
@@ -327,7 +304,7 @@ suite "MultiNode stress — 3-node cluster (2 voters)":
       for t in 0 ..< numThreads:
         for i in 0 ..< numOps:
           let key = "t" & $t & "_k" & $i
-          let r = nodes[1].store.raftGet(key)
+          let r = nodes[followerIdx].store.raftGet(key)
           if not r.isOk or r.value.isNone:
             inc missing
       if missing > 0:
@@ -338,10 +315,9 @@ suite "MultiNode stress — 3-node cluster (2 voters)":
     const numThreads = 8
     const numOps = 200
     const numKeys = 100
-    const basePort = 20730
-    let (nodes, rid) = make3NodeCluster(basePort)
-    for ns in nodes: startNode(ns)
-    electLeader(nodes, rid, 0)
+    let (nodes, rid) = make3NodeCluster(25000)
+    let leaderIdx = waitForLeader(nodes, rid)
+    doAssert leaderIdx >= 0
     defer:
       for ns in nodes: stopNode(ns)
 
@@ -355,7 +331,7 @@ suite "MultiNode stress — 3-node cluster (2 voters)":
     var threads: array[numThreads, Thread[ReadWriteWorkerArgs]]
     for i in 0 ..< numThreads:
       let args = ReadWriteWorkerArgs(
-        store: addr nodes[0].store,
+        store: addr nodes[leaderIdx].store,
         threadId: i, numOps: numOps, numKeys: numKeys,
         startLatch: addr latch, errors: addr errors,
         completed: addr completed)
@@ -372,18 +348,17 @@ when true:
   sleep(2000)
 
 # ===========================================================================
-# 5-node cluster stress tests (3 voters + 2 non-voters, quorum = 2)
+# 5-node cluster stress tests
 # ===========================================================================
 
-suite "MultiNode stress — 5-node cluster (3 voters)":
+suite "MultiNode stress — 5-node cluster":
 
   test "8 writers, distinct keys — quorum-committed":
     const numThreads = 8
     const numOps = 100
-    const basePort = 20780
-    let (nodes, rid) = make5NodeCluster(basePort)
-    for ns in nodes: startNode(ns)
-    electLeader(nodes, rid, 0)
+    let (nodes, rid) = make5NodeCluster(25000)
+    let leaderIdx = waitForLeader(nodes, rid)
+    doAssert leaderIdx >= 0
     defer:
       for ns in nodes: stopNode(ns)
 
@@ -397,7 +372,7 @@ suite "MultiNode stress — 5-node cluster (3 voters)":
     var threads: array[numThreads, Thread[WriteWorkerArgs]]
     for i in 0 ..< numThreads:
       let args = WriteWorkerArgs(
-        store: addr nodes[0].store,
+        store: addr nodes[leaderIdx].store,
         threadId: i, numOps: numOps,
         startLatch: addr latch, errors: addr errors,
         completed: addr completed)
@@ -412,10 +387,9 @@ suite "MultiNode stress — 5-node cluster (3 voters)":
     const numThreads = 8
     const numOps = 150
     const numKeys = 50
-    const basePort = 20830
-    let (nodes, rid) = make5NodeCluster(basePort)
-    for ns in nodes: startNode(ns)
-    electLeader(nodes, rid, 0)
+    let (nodes, rid) = make5NodeCluster(25000)
+    let leaderIdx = waitForLeader(nodes, rid)
+    doAssert leaderIdx >= 0
     defer:
       for ns in nodes: stopNode(ns)
 
@@ -429,7 +403,7 @@ suite "MultiNode stress — 5-node cluster (3 voters)":
     var threads: array[numThreads, Thread[ReadWriteWorkerArgs]]
     for i in 0 ..< numThreads:
       let args = ReadWriteWorkerArgs(
-        store: addr nodes[0].store,
+        store: addr nodes[leaderIdx].store,
         threadId: i, numOps: numOps, numKeys: numKeys,
         startLatch: addr latch, errors: addr errors,
         completed: addr completed)
@@ -443,10 +417,9 @@ suite "MultiNode stress — 5-node cluster (3 voters)":
   test "concurrent puts then verify replication to all voters":
     const numThreads = 4
     const numOps = 50
-    const basePort = 20880
-    let (nodes, rid) = make5NodeCluster(basePort)
-    for ns in nodes: startNode(ns)
-    electLeader(nodes, rid, 0)
+    let (nodes, rid) = make5NodeCluster(25000)
+    let leaderIdx = waitForLeader(nodes, rid)
+    doAssert leaderIdx >= 0
     defer:
       for ns in nodes: stopNode(ns)
 
@@ -460,7 +433,7 @@ suite "MultiNode stress — 5-node cluster (3 voters)":
     var threads: array[numThreads, Thread[WriteWorkerArgs]]
     for i in 0 ..< numThreads:
       let args = WriteWorkerArgs(
-        store: addr nodes[0].store,
+        store: addr nodes[leaderIdx].store,
         threadId: i, numOps: numOps,
         startLatch: addr latch, errors: addr errors,
         completed: addr completed)
@@ -471,9 +444,10 @@ suite "MultiNode stress — 5-node cluster (3 voters)":
       joinThread(threads[i])
     check errors.load() == 0
 
-    # Poll for replication to voter nodes 1 and 2 — retry up to 15s
+    # Poll for replication to other nodes — retry up to 15s
     let replDeadline = epochTime() + 15.0
-    for voterIdx in 1 .. 2:
+    for voterIdx in 0 ..< 5:
+      if voterIdx == leaderIdx: continue
       var missing = numThreads * numOps # start high
       while missing > 0 and epochTime() < replDeadline:
         missing = 0
@@ -491,10 +465,9 @@ suite "MultiNode stress — 5-node cluster (3 voters)":
     const numThreads = 8
     const numOps = 200
     const numKeys = 100
-    const basePort = 20930
-    let (nodes, rid) = make5NodeCluster(basePort)
-    for ns in nodes: startNode(ns)
-    electLeader(nodes, rid, 0)
+    let (nodes, rid) = make5NodeCluster(25000)
+    let leaderIdx = waitForLeader(nodes, rid)
+    doAssert leaderIdx >= 0
     defer:
       for ns in nodes: stopNode(ns)
 
@@ -508,7 +481,7 @@ suite "MultiNode stress — 5-node cluster (3 voters)":
     var threads: array[numThreads, Thread[ReadWriteWorkerArgs]]
     for i in 0 ..< numThreads:
       let args = ReadWriteWorkerArgs(
-        store: addr nodes[0].store,
+        store: addr nodes[leaderIdx].store,
         threadId: i, numOps: numOps, numKeys: numKeys,
         startLatch: addr latch, errors: addr errors,
         completed: addr completed)

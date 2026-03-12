@@ -7,9 +7,10 @@
 # - raftDeleteInGroup targeted deletion
 # - updateSpaceRecord persistence
 
-import std/[unittest, os, options, tables, algorithm, hashes, json, strutils, locks]
+import std/[unittest, os, options, tables, algorithm, hashes, json, strutils, locks,
+            sequtils]
 import fractio/protocol/raft_store
-import fractio/distributed/raft/multigroup_coordinator
+import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
@@ -19,45 +20,55 @@ import fractio/storage/wisckey_backend
 # Helpers
 # ---------------------------------------------------------------------------
 
+var testBasePort {.global.} = 19500
+
+proc nextBasePort(): int =
+  result = testBasePort
+  testBasePort += 100
+
 proc cleanDir(path: string) =
   try: removeDir(path) except CatchableError: discard
   try: createDir(path) except CatchableError: discard
 
 proc makeStore(storagePath: string, groupIds: seq[uint64]): tuple[
-    coord: MultiRaftCoordinator, store: RaftKVStoreExt] =
-  ## Create a store with meta group + the specified groups.
+    coord: NuRaftCoordinator, store: RaftKVStoreExt] =
+  ## Create a store with meta group + data group + the specified groups.
   cleanDir(storagePath)
   let nodeId = NodeID(1)
-  let coord = newMultiRaftCoordinator(CoordinatorConfig(
+  let basePort = nextBasePort()
+  let members = @[(nodeId: 1'u32, host: "127.0.0.1", basePort: basePort)]
+
+  let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
     nodeId: nodeId,
-    numWorkers: 1,
-    electionTimeoutNs: DEFAULT_ELECTION_TIMEOUT_NS,
-    heartbeatIntervalNs: DEFAULT_HEARTBEAT_INTERVAL_NS,
-    storagePath: storagePath,
-    proposeTimeoutMs: 5000,
+    basePort: basePort,
+    host: "127.0.0.1",
+    dataDir: storagePath,
+    electionTimeoutLowerMs: 200,
+    electionTimeoutUpperMs: 400,
+    heartbeatIntervalMs: 100,
   ))
+  coord.start()
 
-  # Meta group
-  let metaDesc = newGroupDescriptor(META_GROUP_ID)
-  let metaRep = metaDesc.addReplica(nodeId)
-  let metaGroup = coord.createGroup(metaDesc, metaRep.replicaId)
-  metaGroup.becomeLeader()
-
-  # Data group
-  let dataDesc = newGroupDescriptor(DATA_GROUP_START_ID)
-  let dataRep = dataDesc.addReplica(nodeId)
-  let dataGroup = coord.createGroup(dataDesc, dataRep.replicaId)
-  dataGroup.becomeLeader()
+  # Meta group and data group
+  for rid in [META_GROUP_ID, DATA_GROUP_START_ID]:
+    doAssert coord.createAndStartGroup(rid, members)
 
   # Additional groups
   for gid in groupIds:
-    let rid = GroupID(gid)
-    let desc = newGroupDescriptor(rid)
-    let rep = desc.addReplica(nodeId)
-    let group = coord.createGroup(desc, rep.replicaId)
-    group.becomeLeader()
+    doAssert coord.createAndStartGroup(GroupID(gid), members)
 
-  coord.start()
+  # Wait for all groups to elect leaders
+  let allGroupIds = @[GroupID(1), GroupID(2)] &
+    groupIds.mapIt(GroupID(it))
+  for attempt in 0 ..< 50:
+    var allLeaders = true
+    for gid in allGroupIds:
+      if not coord.isLeader(gid):
+        allLeaders = false
+        break
+    if allLeaders:
+      break
+    os.sleep(100)
 
   let store = newRaftKVStoreExt(coord, proposeTimeoutMs = 2000)
   store.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
@@ -67,7 +78,7 @@ proc makeStore(storagePath: string, groupIds: seq[uint64]): tuple[
 
   (coord, store)
 
-proc teardown(coord: MultiRaftCoordinator, storagePath: string) =
+proc teardown(coord: NuRaftCoordinator, storagePath: string) =
   coord.stop()
   try: removeDir(storagePath) except CatchableError: discard
 

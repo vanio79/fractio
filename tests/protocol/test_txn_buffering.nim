@@ -25,7 +25,7 @@ import fractio/protocol/raft_store
 import fractio/protocol/txn_manager
 import fractio/protocol/messages/kv
 import fractio/protocol/messages/txn as txnMsgs
-import fractio/distributed/raft/multigroup_coordinator
+import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
@@ -39,28 +39,43 @@ proc cleanDir(path: string) =
   try: removeDir(path) except CatchableError: discard
   try: createDir(path) except CatchableError: discard
 
+var testBasePort {.global.} = 20000
+
+proc nextBasePort(): int =
+  result = testBasePort
+  testBasePort += 100
+
 proc makeStore(storagePath: string): tuple[
-    coord: MultiRaftCoordinator, store: RaftKVStoreExt, rid: GroupID] =
+    coord: NuRaftCoordinator, store: RaftKVStoreExt, rid: GroupID] =
   cleanDir(storagePath)
-  let cfg = CoordinatorConfig(
-    nodeId: NodeID(1),
-    numWorkers: 1,
-    electionTimeoutNs: DEFAULT_ELECTION_TIMEOUT_NS,
-    heartbeatIntervalNs: DEFAULT_HEARTBEAT_INTERVAL_NS,
-    storagePath: storagePath,
-  )
-  let coord = newMultiRaftCoordinator(cfg)
-  for rid in [META_GROUP_ID, DATA_GROUP_START_ID]:
-    let desc = newGroupDescriptor(rid)
-    let rep = desc.addReplica(NodeID(1))
-    let group = coord.createGroup(desc, rep.replicaId)
-    group.becomeLeader()
+  let nodeId = NodeID(1)
+  let basePort = nextBasePort()
+  let members = @[(nodeId: 1'u32, host: "127.0.0.1", basePort: basePort)]
+
+  let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
+    nodeId: nodeId,
+    basePort: basePort,
+    host: "127.0.0.1",
+    dataDir: storagePath,
+    electionTimeoutLowerMs: 200,
+    electionTimeoutUpperMs: 400,
+    heartbeatIntervalMs: 100,
+  ))
   coord.start()
+
+  for rid in [META_GROUP_ID, DATA_GROUP_START_ID]:
+    doAssert coord.createAndStartGroup(rid, members)
+
+  for attempt in 0 ..< 50:
+    if coord.isLeader(GroupID(1)) and coord.isLeader(GroupID(2)):
+      break
+    os.sleep(100)
+
   let store = newRaftKVStoreExt(coord, proposeTimeoutMs = 3000)
   store.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
   (coord, store, DATA_GROUP_START_ID)
 
-proc teardownStore(coord: MultiRaftCoordinator, storagePath: string) =
+proc teardownStore(coord: NuRaftCoordinator, storagePath: string) =
   coord.stop()
   try: removeDir(storagePath) except CatchableError: discard
 
@@ -79,20 +94,29 @@ proc smGetVal(store: RaftKVStoreExt, rid: GroupID, key: string): string =
   ""
 
 proc makeRaftServer(port: int, storagePath: string): ProtocolServer =
-  let coordCfg = CoordinatorConfig(
-    nodeId: NodeID(1),
-    numWorkers: 1,
-    electionTimeoutNs: DEFAULT_ELECTION_TIMEOUT_NS,
-    heartbeatIntervalNs: DEFAULT_HEARTBEAT_INTERVAL_NS,
-    storagePath: storagePath,
-  )
-  let coord = newMultiRaftCoordinator(coordCfg)
-  for rid in [META_GROUP_ID, DATA_GROUP_START_ID]:
-    let desc = newGroupDescriptor(rid)
-    let rep = desc.addReplica(NodeID(1))
-    let group = coord.createGroup(desc, rep.replicaId)
-    group.becomeLeader()
+  let nodeId = NodeID(1)
+  let basePort = nextBasePort()
+  let members = @[(nodeId: 1'u32, host: "127.0.0.1", basePort: basePort)]
+
+  let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
+    nodeId: nodeId,
+    basePort: basePort,
+    host: "127.0.0.1",
+    dataDir: storagePath,
+    electionTimeoutLowerMs: 200,
+    electionTimeoutUpperMs: 400,
+    heartbeatIntervalMs: 100,
+  ))
   coord.start()
+
+  for rid in [META_GROUP_ID, DATA_GROUP_START_ID]:
+    doAssert coord.createAndStartGroup(rid, members)
+
+  for attempt in 0 ..< 50:
+    if coord.isLeader(GroupID(1)) and coord.isLeader(GroupID(2)):
+      break
+    os.sleep(100)
+
   let raftSt = newRaftKVStoreExt(coord, proposeTimeoutMs = 3000)
   raftSt.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
   var cfg = defaultServerConfig()
@@ -112,9 +136,13 @@ proc connectClient(port: int): ProtocolClient =
   let r = result.connect()
   doAssert r.isOk, "client connect failed: " & $r.err
 
-template withRaftServer(port: int, storagePath: string,
+var nextServerPort {.global.} = 25000
+
+template withRaftServer(storagePath: string,
     body: untyped) =
   block:
+    let port = nextServerPort
+    nextServerPort += 1
     cleanDir(storagePath)
     let srv {.inject.} = makeRaftServer(port, storagePath)
     let cli {.inject.} = connectClient(port)
@@ -123,7 +151,7 @@ template withRaftServer(port: int, storagePath: string,
     finally:
       cli.disconnect()
       srv.stop()
-      sleep(60)
+      sleep(100)
       try: removeDir(storagePath) except CatchableError: discard
 
 # ---------------------------------------------------------------------------
@@ -274,7 +302,7 @@ suite "RaftKVStore - intent buffering (unit)":
 suite "TxnBuffering E2E - commit path":
 
   test "txn Put then Commit makes value readable":
-    withRaftServer(20600, "/tmp/fractio_txnbuf_e01"):
+    withRaftServer("/tmp/fractio_txnbuf_e01"):
       let beginR = cli.beginTxn()
       check beginR.isOk
       let txnId = beginR.value.txnId
@@ -299,7 +327,7 @@ suite "TxnBuffering E2E - commit path":
       check getAfterCommit.value.value == "hello"
 
   test "txn Put then Rollback leaves value absent":
-    withRaftServer(20601, "/tmp/fractio_txnbuf_e02"):
+    withRaftServer("/tmp/fractio_txnbuf_e02"):
       let beginR = cli.beginTxn()
       check beginR.isOk
       let txnId = beginR.value.txnId
@@ -317,7 +345,7 @@ suite "TxnBuffering E2E - commit path":
       check not getAfterRollback.value.found
 
   test "non-txn Put is immediately visible (no buffering)":
-    withRaftServer(20602, "/tmp/fractio_txnbuf_e03"):
+    withRaftServer("/tmp/fractio_txnbuf_e03"):
       let putR = cli.kvPut("e2e:key3", "direct")
       check putR.isOk
       check putR.value.status == PutStatusOK
@@ -328,7 +356,7 @@ suite "TxnBuffering E2E - commit path":
       check getR.value.value == "direct"
 
   test "multiple keys in one txn all committed atomically":
-    withRaftServer(20603, "/tmp/fractio_txnbuf_e04"):
+    withRaftServer("/tmp/fractio_txnbuf_e04"):
       let beginR = cli.beginTxn()
       check beginR.isOk
       let txnId = beginR.value.txnId
@@ -348,7 +376,7 @@ suite "TxnBuffering E2E - commit path":
         check getR.value.value == "v" & $i
 
   test "sequential txns do not interfere":
-    withRaftServer(20604, "/tmp/fractio_txnbuf_e05"):
+    withRaftServer("/tmp/fractio_txnbuf_e05"):
       # Txn A: write and commit
       let beginA = cli.beginTxn()
       check beginA.isOk

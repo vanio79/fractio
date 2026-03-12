@@ -9,34 +9,47 @@ import fractio/sql/ast
 import fractio/sql/planner
 import fractio/distributed/meta/system_tables
 import fractio/protocol/raft_store
-import fractio/distributed/raft/multigroup_coordinator
+import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
-import fractio/distributed/raft/group_types as rangeTypes
+import fractio/distributed/raft/group_types
 
 # ---------------------------------------------------------------------------
 # Test helper: create a single-node RaftKVStoreExt
 # ---------------------------------------------------------------------------
 
+var testBasePort {.global.} = 17000
+
+proc nextBasePort(): int =
+  result = testBasePort
+  testBasePort += 100
+
 proc createTestStore(testDir: string): RaftKVStoreExt =
+  if dirExists(testDir): removeDir(testDir)
   createDir(testDir)
   let nodeId = NodeID(1)
-  let coord = newMultiRaftCoordinator(CoordinatorConfig(
-    nodeId: nodeId,
-    numWorkers: 1,
-    electionTimeoutNs: 5_000_000_000'i64,
-    heartbeatIntervalNs: 1_000_000_000'i64,
-    storagePath: testDir,
-    proposeTimeoutMs: 5000,
-  ))
+  let basePort = nextBasePort()
+  let members = @[(nodeId: 1'u32, host: "127.0.0.1", basePort: basePort)]
 
-  for groupId in [META_GROUP_ID, DATA_GROUP_START_ID]:
-    var desc = newGroupDescriptor(groupId)
-    let myReplica = desc.addReplica(nodeId, rtVoter)
-    let group = coord.createGroup(desc, myReplica.replicaId)
-    group.becomeLeader()
+  let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
+    nodeId: nodeId,
+    basePort: basePort,
+    host: "127.0.0.1",
+    dataDir: testDir,
+    electionTimeoutLowerMs: 200,
+    electionTimeoutUpperMs: 400,
+    heartbeatIntervalMs: 100,
+  ))
   coord.start()
 
-  result = newRaftKVStoreExt(coord)
+  doAssert coord.createAndStartGroup(GroupID(1), members)
+  doAssert coord.createAndStartGroup(GroupID(2), members)
+
+  for attempt in 0 ..< 50:
+    if coord.isLeader(GroupID(1)) and coord.isLeader(GroupID(2)):
+      break
+    os.sleep(100)
+
+  result = newRaftKVStoreExt(coord, proposeTimeoutMs = 5000)
   result.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
 
 proc cleanupTestDir(testDir: string) =

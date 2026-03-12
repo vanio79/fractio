@@ -12,6 +12,7 @@
 
 import std/[net, strformat, atomics, locks]
 import posix
+import ../utils/socket_utils
 import ./types
 import ./codec
 import ./frame
@@ -142,6 +143,7 @@ proc connect*(client: ProtocolClient): PResult {.raises: [].} =
   try:
     client.socket = newSocket()
     client.socket.connect(client.config.host, Port(client.config.port))
+    client.socket.setLingerZero()
   except CatchableError as e:
     return pErr(newProtocolError(peInternal, "connect failed: " & e.msg))
 

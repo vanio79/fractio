@@ -10,6 +10,7 @@ import std/atomics
 import std/json
 import std/locks
 import std/options
+import std/os
 import std/strutils
 import std/tables
 import std/logging
@@ -25,7 +26,7 @@ import fractio/storage/wisckey_backend
 # ============================================================================
 
 type
-  NuRaftGroupInstance* = ref object
+  NuRaftGroupInstance* = object
     groupId*: GroupID
     launcher*: NuRaftLauncher
     server*: NuRaftServer
@@ -34,13 +35,17 @@ type
     port*: int
     ## Back-reference to coordinator (raw pointer to break cycles)
     coordPtr*: pointer
+    ## Set to true during shutdown to prevent callbacks from accessing freed memory
+    stopped*: bool
+
+  NuRaftGroupInstancePtr* = ptr NuRaftGroupInstance
 
   NuRaftCoordinator* = ref object
     nodeId*: NodeID
     basePort*: int
     host*: string
     dataDir*: string
-    groups*: Table[GroupID, NuRaftGroupInstance]
+    groups*: Table[GroupID, NuRaftGroupInstancePtr]
     groupsLock*: Lock
     running*: Atomic[bool]
 
@@ -58,6 +63,21 @@ type
     ## Peer info cache: nodeId → (host, basePort)
     ## Updated when nodes join/leave.
     peerInfo*: Table[uint32, tuple[host: string, basePort: int]]
+
+# Use C malloc/free to avoid atomicArc cross-thread dealloc crashes.
+# NuRaftGroupInstance may be allocated on NuRaft ASIO threads (via
+# onGroupMetadataApplied callback), and Nim's allocator crashes in
+# addToSharedFreeList when freeing cross-thread allocations.
+proc c_malloc(size: csize_t): pointer {.importc: "malloc", header: "<stdlib.h>".}
+proc c_free(p: pointer) {.importc: "free", header: "<stdlib.h>".}
+
+proc allocInstance(): NuRaftGroupInstancePtr =
+  result = cast[NuRaftGroupInstancePtr](c_malloc(csize_t(sizeof(NuRaftGroupInstance))))
+  zeroMem(result, sizeof(NuRaftGroupInstance))
+
+proc freeInstance(p: NuRaftGroupInstancePtr) =
+  if p != nil:
+    c_free(p)
 
 # ============================================================================
 # Module-level callbacks (same pattern as old coordinator)
@@ -130,7 +150,8 @@ proc nuraftCommitCb(ctx: pointer, logIdx: uint64,
   if ctx == nil or data == nil or len == 0: return
 
   {.cast(gcsafe).}:
-    let inst = cast[NuRaftGroupInstance](ctx)
+    let inst = cast[NuRaftGroupInstancePtr](ctx)
+    if inst.stopped: return
     let coord = cast[NuRaftCoordinator](inst.coordPtr)
     if coord == nil or coord.kvStorePtr == nil: return
 
@@ -158,7 +179,8 @@ proc nuraftEventCb(ctx: pointer, eventType: int32,
   if ctx == nil: return
 
   {.cast(gcsafe).}:
-    let inst = cast[NuRaftGroupInstance](ctx)
+    let inst = cast[NuRaftGroupInstancePtr](ctx)
+    if inst.stopped: return
     let coord = cast[NuRaftCoordinator](inst.coordPtr)
     if coord == nil: return
 
@@ -218,16 +240,46 @@ proc start*(c: NuRaftCoordinator) =
   ## Start the coordinator. Groups are started individually via createAndStartGroup.
   c.running.store(true)
 
+proc shutdownGroupInstance(inst: NuRaftGroupInstancePtr) {.thread.} =
+  discard nuraftLauncherShutdown(inst.launcher, 3)
+
 proc stop*(c: NuRaftCoordinator) =
-  ## Stop all NuRaft instances.
+  ## Stop all NuRaft instances and close the storage backend.
   if not c.running.load: return
   c.running.store(false)
 
+  # Mark all instances as stopped to prevent callbacks from accessing
+  # freed coordinator memory.
   withLock c.groupsLock:
     for gid, inst in c.groups:
-      discard nuraftLauncherShutdown(inst.launcher, 5)
+      inst.stopped = true
+  sleep(100) # Give C++ threads a moment to observe the stopped flag
+
+  # Shutdown all launchers in parallel to avoid sequential blocking.
+  # Each group shutdown can block for up to 3 seconds if the ASIO service
+  # has active workers. Running them in parallel bounds total time.
+  var threads: seq[Thread[NuRaftGroupInstancePtr]]
+  withLock c.groupsLock:
+    threads.setLen(c.groups.len)
+    var i = 0
+    for gid, inst in c.groups:
+      createThread(threads[i], shutdownGroupInstance, inst)
+      inc i
+
+  for t in threads.mitems:
+    joinThread(t)
+
+  # Destroy C++ resources and free the raw ptrs
+  withLock c.groupsLock:
+    for gid, inst in c.groups:
       nuraftLauncherDestroy(inst.launcher)
+      nuraftSmDestroy(inst.sm)
+      nuraftSmgrDestroy(inst.smgr)
+      freeInstance(inst)
     c.groups.clear()
+
+  if c.store != nil:
+    c.store.close()
 
 # ============================================================================
 # Group Management
@@ -265,11 +317,11 @@ proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
   if myEndpoint == "":
     return false # This node is not a member
 
-  # Create the group instance
-  let inst = NuRaftGroupInstance(
-    groupId: groupId,
-    port: myPort,
-  )
+  # Create the group instance using raw alloc (not ref) to avoid
+  # atomicArc cross-thread deallocation issues.
+  let inst = allocInstance()
+  inst.groupId = groupId
+  inst.port = myPort
   inst.coordPtr = cast[pointer](c)
 
   # Create state machine with commit callback
@@ -311,21 +363,26 @@ proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
     nuraftLauncherDestroy(inst.launcher)
     nuraftSmDestroy(inst.sm)
     nuraftSmgrDestroy(inst.smgr)
+    freeInstance(inst)
     return false
 
-  # Wait for initialization
-  let initialized = nuraftLauncherWaitInit(inst.launcher, 5000)
-  if not initialized:
+  # Wait for initialization. In multi-node clusters, peers may not have
+  # started yet, so we use a short timeout — that's OK, the server is
+  # still valid and will initialize when peers connect.
+  let initTimeoutMs = if members.len == 1: 5000'i32 else: 500'i32
+  discard nuraftLauncherWaitInit(inst.launcher, initTimeoutMs)
+
+  inst.server = nuraftLauncherGetServer(inst.launcher)
+  if inst.server == nil:
     discard nuraftLauncherShutdown(inst.launcher, 3)
     nuraftLauncherDestroy(inst.launcher)
     nuraftSmDestroy(inst.sm)
     nuraftSmgrDestroy(inst.smgr)
+    freeInstance(inst)
     return false
 
-  inst.server = nuraftLauncherGetServer(inst.launcher)
-
   # Set priority for preferred leader
-  if preferredLeader > 0 and inst.server != nil:
+  if preferredLeader > 0:
     for m in members:
       if m.nodeId == preferredLeader:
         discard nuraftServerSetPriority(inst.server, int32(m.nodeId), 100)
@@ -335,32 +392,33 @@ proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
   withLock c.groupsLock:
     c.groups[groupId] = inst
 
-  {.cast(gcsafe).}:
-    var fields = initTable[string, string]()
-    fields["groupId"] = $groupId
-    fields["port"] = $myPort
-    fields["members"] = $members.len
-    info("Started NuRaft group", fields)
+  info("Started NuRaft group",
+       "groupId", $groupId, "port", $myPort, "members", $members.len)
 
   return true
 
 proc removeGroup*(c: NuRaftCoordinator, groupId: GroupID) =
   ## Stop and remove a NuRaft group instance.
-  var inst: NuRaftGroupInstance
+  var inst: NuRaftGroupInstancePtr
   withLock c.groupsLock:
     if not c.groups.hasKey(groupId): return
     inst = c.groups[groupId]
     c.groups.del(groupId)
 
-  discard nuraftLauncherShutdown(inst.launcher, 5)
+  inst.stopped = true
+  discard nuraftLauncherShutdown(inst.launcher, 2)
+  sleep(50)
   nuraftLauncherDestroy(inst.launcher)
+  nuraftSmDestroy(inst.sm)
+  nuraftSmgrDestroy(inst.smgr)
+  freeInstance(inst)
 
 proc hasGroup*(c: NuRaftCoordinator, groupId: GroupID): bool =
   withLock c.groupsLock:
     result = c.groups.hasKey(groupId)
 
 proc getGroupInstance*(c: NuRaftCoordinator,
-    groupId: GroupID): Option[NuRaftGroupInstance] =
+    groupId: GroupID): Option[NuRaftGroupInstancePtr] =
   withLock c.groupsLock:
     if c.groups.hasKey(groupId):
       result = some(c.groups[groupId])
@@ -402,7 +460,7 @@ proc proposeAndWait*(c: NuRaftCoordinator, groupId: GroupID,
   if command.kind != ckWrite:
     return RaftResult(success: false, error: "Only write commands supported")
 
-  var inst: NuRaftGroupInstance
+  var inst: NuRaftGroupInstancePtr
   withLock c.groupsLock:
     if not c.groups.hasKey(groupId):
       return RaftResult(success: false,
@@ -474,7 +532,7 @@ proc transferLeadership*(c: NuRaftCoordinator, groupId: GroupID,
     targetNodeId: NodeID): bool =
   ## Transfer leadership to the target node.
   ## Sets the target's priority high and yields.
-  var inst: NuRaftGroupInstance
+  var inst: NuRaftGroupInstancePtr
   withLock c.groupsLock:
     if not c.groups.hasKey(groupId): return false
     inst = c.groups[groupId]
@@ -491,7 +549,7 @@ proc addServerToGroup*(c: NuRaftCoordinator, groupId: GroupID,
     nodeId: uint32, host: string, basePort: int): int32 =
   ## Add a new server to an existing Raft group (membership change).
   ## Only the leader can do this.
-  var inst: NuRaftGroupInstance
+  var inst: NuRaftGroupInstancePtr
   withLock c.groupsLock:
     if not c.groups.hasKey(groupId): return -1
     inst = c.groups[groupId]
@@ -505,7 +563,7 @@ proc addServerToGroup*(c: NuRaftCoordinator, groupId: GroupID,
 proc removeServerFromGroup*(c: NuRaftCoordinator, groupId: GroupID,
     nodeId: uint32): int32 =
   ## Remove a server from an existing Raft group.
-  var inst: NuRaftGroupInstance
+  var inst: NuRaftGroupInstancePtr
   withLock c.groupsLock:
     if not c.groups.hasKey(groupId): return -1
     inst = c.groups[groupId]

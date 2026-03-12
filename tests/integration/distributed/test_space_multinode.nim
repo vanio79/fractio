@@ -4,22 +4,21 @@
 # and that the space continues to function after adding and killing nodes.
 #
 # Cluster topology:
-#   Nodes 1–5, each with its own MultiRaftCoordinator + RaftGroupTransport.
-#   Node 1 is forced to be the initial leader for determinism.
+#   Nodes 1–5, each with its own NuRaftCoordinator + ASIO networking.
+#   NuRaft handles leader election automatically.
 #   A space with REPLICAS 3 is created via executeSQL on the leader.
 #
 # After CREATE SPACE, the onGroupMetadataApplied callback automatically
 # creates space groups on peer nodes as sys.groups entries replicate via
-# Raft. Tests wait for replication and then force-elect leaders for
+# Raft. Tests wait for replication and then use transferLeadership for
 # determinism.
 #
-# Port allocation: 21500–21599 (Raft TCP ports)
+# Port allocation: 27000–27499 (NuRaft ASIO, basePort per node spaced by 100)
 # Temp storage: /tmp/fractio_space_mn_<nodeId>/ (cleaned up per test)
 
 import std/[unittest, os, options, json, strutils]
 
-import fractio/distributed/raft/multigroup_coordinator
-import fractio/distributed/raft/multigroup_transport
+import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
@@ -33,7 +32,6 @@ import fractio/sql/executor
 # ---------------------------------------------------------------------------
 
 const
-  BASE_PORT = 21500
   TMP_DIR = "/tmp/fractio_space_mn_"
 
 var nextClientPort = 19200  ## incremented per node to avoid port conflicts between tests
@@ -45,56 +43,37 @@ var nextClientPort = 19200  ## incremented per node to avoid port conflicts betw
 type
   TestNode = object
     id*: int                       ## 1-based node number
+    basePort*: int
     clientPort*: int
     server*: ProtocolServer
-    coord*: MultiRaftCoordinator
+    coord*: NuRaftCoordinator
     store*: RaftKVStoreExt
-    rgt*: RaftGroupTransport
     storagePath*: string
 
 proc cleanDir(p: string) =
   try: removeDir(p) except CatchableError: discard
 
-proc raftPort(nodeNum: int): int = BASE_PORT + (nodeNum - 1) * 10
-
-proc makeNode(nodeNum: int, peerNums: seq[int]): TestNode =
+proc makeNode(nodeNum: int, basePort: int,
+    members: seq[tuple[nodeId: uint32, host: string, basePort: int]]): TestNode =
   let nodeId = rangeTypes.NodeID(uint32(nodeNum))
-  let port = raftPort(nodeNum)
-
-  var peers: seq[PeerAddr]
-  for pn in peerNums:
-    peers.add(PeerAddr(
-      nodeId: rangeTypes.NodeID(uint32(pn)),
-      host: "127.0.0.1",
-      raftPort: raftPort(pn),
-    ))
-
-  let rgt = newRaftGroupTransport(nodeId, "127.0.0.1", port, peers)
-  let transport = newMultiRaftTransport(rgt)
-
   let storagePath = TMP_DIR & $nodeNum
   cleanDir(storagePath)
   createDir(storagePath)
 
-  let coord = newMultiRaftCoordinator(CoordinatorConfig(
+  let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
     nodeId: nodeId,
-    numWorkers: 1,
-    electionTimeoutNs: 800_000_000'i64,    # 800 ms
-    heartbeatIntervalNs: 50_000_000'i64,   # 50 ms
-    storagePath: storagePath / "raft",
-    proposeTimeoutMs: 6000,
-    transport: transport,
+    basePort: basePort,
+    host: "127.0.0.1",
+    dataDir: storagePath,
+    electionTimeoutLowerMs: 200,
+    electionTimeoutUpperMs: 400,
+    heartbeatIntervalMs: 100,
   ))
+  coord.start()
 
-  # Create meta + data groups with all peers as voters
-  for groupId in [META_GROUP_ID, DATA_GROUP_START_ID]:
-    var desc = rangeTypes.newGroupDescriptor(groupId)
-    discard desc.addReplica(nodeId, rangeTypes.rtVoter)
-    for pn in peerNums:
-      discard desc.addReplica(rangeTypes.NodeID(uint32(pn)), rangeTypes.rtVoter)
-    let rep = desc.getReplica(nodeId)
-    doAssert rep.isSome, "replica not found for node " & $nodeNum
-    discard coord.createGroup(desc, rep.get.replicaId)
+  # Create meta + data groups
+  doAssert coord.createAndStartGroup(META_GROUP_ID, members)
+  doAssert coord.createAndStartGroup(DATA_GROUP_START_ID, members)
 
   let store = newRaftKVStoreExt(coord, proposeTimeoutMs = 6000)
   store.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
@@ -110,15 +89,13 @@ proc makeNode(nodeNum: int, peerNums: seq[int]): TestNode =
   let srv = newProtocolServer(cfg)
   srv.raftStore = store
   srv.raftCoord = coord
-  srv.raftTransport = rgt
 
   TestNode(
-    id: nodeNum, clientPort: cPort, server: srv, coord: coord, store: store,
-    rgt: rgt, storagePath: storagePath,
+    id: nodeNum, basePort: basePort, clientPort: cPort, server: srv,
+    coord: coord, store: store, storagePath: storagePath,
   )
 
 proc startNode(n: TestNode) =
-  n.coord.start()
   n.server.start()
 
 proc stopNode(n: TestNode) =
@@ -126,13 +103,23 @@ proc stopNode(n: TestNode) =
   n.coord.stop()
   cleanDir(n.storagePath)
 
+proc waitForLeaderOnGroup(nodes: seq[TestNode], gid: GroupID,
+    maxAttempts: int = 50): int =
+  ## Wait for a leader to be elected for a group. Returns leader node index or -1.
+  for attempt in 0 ..< maxAttempts:
+    for i, n in nodes:
+      if n.coord.isLeader(gid):
+        return i
+    sleep(100)
+  -1
+
 proc seedSysNodes(leaderStore: RaftKVStoreExt, nodes: seq[TestNode]) =
   for n in nodes:
     let key = encodeTableKey(SYS_NODES_TABLE_ID, $n.id)
     let val = $ %*{
       "nodeId": n.id,
       "host": "127.0.0.1",
-      "raftPort": raftPort(n.id),
+      "raftPort": n.basePort,
       "clientPort": n.clientPort,
       "status": 1,
     }
@@ -173,9 +160,8 @@ proc waitForAutoDistribution(nodes: seq[TestNode], expectedGroupIds: seq[uint64]
     sleep(stepMs)
     waited += stepMs
 
-proc electSpaceLeaders(nodes: seq[TestNode]) =
-  ## Force-elect a leader for each space group (the preferred leader / first
-  ## replica).
+proc waitForSpaceLeaders(nodes: seq[TestNode]) =
+  ## Wait for all space groups to have elected leaders.
   let store = nodes[0].store
   let grpStart = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
   let grpEnd = encodeTableKey(SYS_GROUPS_TABLE_ID + 1, "")
@@ -186,76 +172,35 @@ proc electSpaceLeaders(nodes: seq[TestNode]) =
         let j = parseJson(entry.value)
         let gid = GroupID(uint64(j["groupId"].getInt()))
         if gid == META_GROUP_ID or gid == DATA_GROUP_START_ID: continue
-        if j.hasKey("replicas") and j["replicas"].len > 0:
-          let leaderNodeId = j["replicas"][0]["nodeId"].getInt()
+        # Wait for this group to have a leader
+        for attempt in 0 ..< 50:
+          var hasLeader = false
           for node in nodes:
-            if node.id == leaderNodeId:
-              let g = node.coord.getGroup(gid)
-              if g.isSome:
-                g.get.becomeLeader()
+            if node.coord.isLeader(gid):
+              hasLeader = true
               break
+          if hasLeader: break
+          sleep(100)
       except: discard
-  sleep(300)
 
 proc distributeSpaceGroups(nodes: seq[TestNode], replicaCount: int = 3) =
   ## After CREATE SPACE on the leader: wait for the onGroupMetadataApplied
-  ## callback to create space groups on peer nodes, then force-elect leaders.
+  ## callback to create space groups on peer nodes, then wait for leaders.
   waitForAutoDistribution(nodes, @[3'u64, 4, 5, 6, 7], replicaCount)
-  electSpaceLeaders(nodes)
-
+  waitForSpaceLeaders(nodes)
 
 proc reelectLeaders(nodes: seq[TestNode], deadNodeIds: seq[int]) =
-  ## After killing nodes, find groups with no leader among surviving nodes
-  ## and elect a new leader on the first surviving member.
-  let store = nodes[0].store
-  let grpStart = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
-  let grpEnd = encodeTableKey(SYS_GROUPS_TABLE_ID + 1, "")
-  let grpScan = store.raftScan(grpStart, grpEnd, 0, includeSystemKeys = true)
-  if grpScan.isOk:
-    for (key, entry) in grpScan.value:
-      try:
-        let j = parseJson(entry.value)
-        let gid = GroupID(uint64(j["groupId"].getInt()))
-        if gid == META_GROUP_ID or gid == DATA_GROUP_START_ID: continue
-
-        # Check if any surviving node is already leader
-        var hasLeader = false
-        for node in nodes:
-          if node.id in deadNodeIds: continue
-          if node.coord.hasGroup(gid):
-            let g = node.coord.getGroup(gid)
-            if g.isSome and g.get.isLeader():
-              hasLeader = true
-              break
-
-        if not hasLeader:
-          # Elect the first surviving member as leader
-          if j.hasKey("replicas"):
-            for r in j["replicas"]:
-              let nid = r["nodeId"].getInt()
-              if nid in deadNodeIds: continue
-              for node in nodes:
-                if node.id == nid and node.coord.hasGroup(gid):
-                  let g = node.coord.getGroup(gid)
-                  if g.isSome:
-                    g.get.becomeLeader()
-                  break
-              break  # only need one new leader
-      except: discard
-  sleep(300)
+  ## After killing nodes, wait for NuRaft to re-elect leaders on surviving nodes.
+  ## NuRaft handles this automatically, but we may need to wait for timeouts.
+  sleep(1000)  # Allow NuRaft election timeouts to fire
 
 proc exec(store: RaftKVStoreExt, sql: string): ExecResult =
   executeSQL(sql, store, "default", "public")
 
 proc loadMetadataOnAllNodes(nodes: seq[TestNode]) =
   ## Load space, table, and group membership metadata on all nodes.
-  ## Since the test nodes have independent backends (no real Raft log
-  ## replication between them), we first copy sys.tables, sys.spaces,
-  ## and sys.groups data from the leader (node 0) to all other nodes'
-  ## backends, then load the in-memory caches.
   let leader = nodes[0].store
   let leaderBackend = leader.getBackend()
-  # System tables to replicate to all nodes
   for sysTableId in [SYS_TABLES_TABLE_ID, SYS_SPACES_TABLE_ID,
                       SYS_GROUPS_TABLE_ID, SYS_NODES_TABLE_ID]:
     let startKey = encodeTableKey(sysTableId, "")
@@ -266,55 +211,53 @@ proc loadMetadataOnAllNodes(nodes: seq[TestNode]) =
         let peerBackend = nodes[i].store.getBackend()
         if peerBackend != nil and peerBackend.isOpen:
           discard peerBackend.put(k, v)
-  # Now load the in-memory caches on all nodes
   for node in nodes:
     node.store.loadSpaces()
     node.store.loadGroupMembers()
     node.store.loadTableSpaces()
 
 proc execOnLeader(nodes: seq[TestNode], sql: string): ExecResult =
-  ## Try executing SQL on each node until one succeeds. This simulates
-  ## client-side retry for leader-only operations — nodes that aren't the
-  ## leader for the relevant group will return an error, and the client
-  ## retries on the next node.
+  ## Try executing SQL on each node until one succeeds.
   for node in nodes:
     let r = exec(node.store, sql)
     if r.kind != erkError:
       return r
-    # If it's a not-leader error, try next node
     if "not leader" in r.error.toLower() or "Not the leader" in r.error:
       continue
-    return r  # non-retryable error
-  # All nodes failed — return last error
+    return r
   exec(nodes[^1].store, sql)
 
 # ---------------------------------------------------------------------------
-# Cluster fixture: 5 nodes, node 1 = leader
+# Cluster fixture: 5 nodes
 # ---------------------------------------------------------------------------
 
 proc makeCluster5(): seq[TestNode] =
-  let allNums = @[1, 2, 3, 4, 5]
+  let members = @[
+    (nodeId: 1'u32, host: "127.0.0.1", basePort: 27000),
+    (nodeId: 2'u32, host: "127.0.0.1", basePort: 27100),
+    (nodeId: 3'u32, host: "127.0.0.1", basePort: 27200),
+    (nodeId: 4'u32, host: "127.0.0.1", basePort: 27300),
+    (nodeId: 5'u32, host: "127.0.0.1", basePort: 27400),
+  ]
+
   var nodes: seq[TestNode]
-  for n in allNums:
-    var peers: seq[int]
-    for p in allNums:
-      if p != n: peers.add(p)
-    nodes.add(makeNode(n, peers))
+  for i, m in members:
+    nodes.add(makeNode(int(m.nodeId), m.basePort, members))
 
   for n in nodes: startNode(n)
 
-  # Force node 1 to be leader for meta + data groups
-  for groupId in [META_GROUP_ID, DATA_GROUP_START_ID]:
-    let g = nodes[0].coord.getGroup(groupId)
-    doAssert g.isSome
-    g.get.becomeLeader()
+  # Wait for leader election on meta + data groups
+  discard waitForLeaderOnGroup(nodes, META_GROUP_ID)
+  discard waitForLeaderOnGroup(nodes, DATA_GROUP_START_ID)
 
-  sleep(400)
+  # Find the meta leader and seed system tables
+  let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
+  doAssert leaderIdx >= 0
 
-  # Seed system tables on the leader
-  seedSysNodes(nodes[0].store, nodes)
-  seedSysGroups(nodes[0].store, allNums)
-  seedDefaults(nodes[0].store)
+  let allNums = @[1, 2, 3, 4, 5]
+  seedSysNodes(nodes[leaderIdx].store, nodes)
+  seedSysGroups(nodes[leaderIdx].store, allNums)
+  seedDefaults(nodes[leaderIdx].store)
   sleep(400)
 
   nodes
@@ -332,7 +275,8 @@ suite "Space multinode — CREATE SPACE creates real Raft groups":
     var nodes = makeCluster5()
     defer: stopCluster(nodes)
 
-    let res = exec(nodes[0].store, "CREATE SPACE testspace WITH REPLICAS = 3")
+    let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
+    let res = exec(nodes[leaderIdx].store, "CREATE SPACE testspace WITH REPLICAS = 3")
     if res.kind == erkError:
       echo "  CREATE SPACE error: " & res.error
     check res.kind == erkOk
@@ -340,25 +284,21 @@ suite "Space multinode — CREATE SPACE creates real Raft groups":
       check "5 groups" in res.okMessage
 
     # With RF=3, the leader (node 1) has groups it's a member of.
-    # With ring placement, node 1 is in at least some groups.
     var leaderGroupCount = 0
     for gid in 3'u64 .. 7'u64:
-      if nodes[0].coord.hasGroup(GroupID(gid)):
+      if nodes[leaderIdx].coord.hasGroup(GroupID(gid)):
         inc leaderGroupCount
-    check leaderGroupCount >= 3  # node 1 is in at least 3 of 5 groups
+    check leaderGroupCount >= 3
 
   test "onGroupMetadataApplied creates groups on all member nodes":
     var nodes = makeCluster5()
     defer: stopCluster(nodes)
 
-    discard exec(nodes[0].store, "CREATE SPACE testspace WITH REPLICAS = 3")
+    let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
+    discard exec(nodes[leaderIdx].store, "CREATE SPACE testspace WITH REPLICAS = 3")
 
-    # Wait for the callback to automatically create groups on peer nodes.
-    # No manual createSpaceGroupsOnNode — the callback does it.
     waitForAutoDistribution(nodes, @[3'u64, 4, 5, 6, 7], 3)
 
-    # With RF=3, each group is on exactly 3 nodes. Count total group
-    # memberships: 5 groups × 3 replicas = 15 total memberships.
     var totalMemberships = 0
     for i in 0 ..< 5:
       for gid in 3'u64 .. 7'u64:
@@ -370,12 +310,13 @@ suite "Space multinode — CREATE SPACE creates real Raft groups":
     var nodes = makeCluster5()
     defer: stopCluster(nodes)
 
-    discard exec(nodes[0].store, "CREATE SPACE testspace WITH REPLICAS = 3")
+    let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
+    discard exec(nodes[leaderIdx].store, "CREATE SPACE testspace WITH REPLICAS = 3")
     distributeSpaceGroups(nodes)
-    nodes[0].store.loadSpaces()
-    nodes[0].store.loadGroupMembers()
+    nodes[leaderIdx].store.loadSpaces()
+    nodes[leaderIdx].store.loadGroupMembers()
 
-    let ctRes = exec(nodes[0].store,
+    let ctRes = exec(nodes[leaderIdx].store,
         "CREATE TABLE t1 (id INT PRIMARY KEY, name TEXT) IN SPACE testspace")
     check ctRes.kind == erkOk
 
@@ -385,10 +326,11 @@ suite "Space multinode — data operations through space groups":
     var nodes = makeCluster5()
     defer: stopCluster(nodes)
 
-    discard exec(nodes[0].store, "CREATE SPACE testspace WITH REPLICAS = 3")
+    let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
+    discard exec(nodes[leaderIdx].store, "CREATE SPACE testspace WITH REPLICAS = 3")
     distributeSpaceGroups(nodes)
 
-    discard exec(nodes[0].store,
+    discard exec(nodes[leaderIdx].store,
         "CREATE TABLE t1 (id INT PRIMARY KEY, name TEXT) IN SPACE testspace")
     loadMetadataOnAllNodes(nodes)
 
@@ -409,8 +351,7 @@ suite "Space multinode — data operations through space groups":
       echo "  INSERT 3 error: " & ins3.error
     check ins3.kind == erkModified
 
-    # SELECT fans out via raftScanSpace (uses network to reach remote leaders)
-    let sel = exec(nodes[0].store, "SELECT * FROM t1")
+    let sel = exec(nodes[leaderIdx].store, "SELECT * FROM t1")
     check sel.kind == erkRows
     if sel.kind == erkRows:
       check sel.rows.len == 3
@@ -419,10 +360,11 @@ suite "Space multinode — data operations through space groups":
     var nodes = makeCluster5()
     defer: stopCluster(nodes)
 
-    discard exec(nodes[0].store, "CREATE SPACE myspace WITH REPLICAS = 3")
+    let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
+    discard exec(nodes[leaderIdx].store, "CREATE SPACE myspace WITH REPLICAS = 3")
     distributeSpaceGroups(nodes)
 
-    discard exec(nodes[0].store,
+    discard exec(nodes[leaderIdx].store,
         "CREATE TABLE users (id INT PRIMARY KEY, email TEXT) IN SPACE myspace")
     loadMetadataOnAllNodes(nodes)
 
@@ -433,7 +375,6 @@ suite "Space multinode — data operations through space groups":
         echo "  INSERT " & $i & " error: " & r.error
       check r.kind == erkModified
 
-    # Point lookup — try each node (key may hash to any group's leader)
     let sel = execOnLeader(nodes, "SELECT * FROM users WHERE id = 5")
     check sel.kind == erkRows
     if sel.kind == erkRows:
@@ -441,8 +382,7 @@ suite "Space multinode — data operations through space groups":
       if sel.rows.len > 0:
         check sel.rows[0][1] == "user5@test.com"
 
-    # Full scan (raftScanSpace fans out to remote leaders)
-    let all = exec(nodes[0].store, "SELECT * FROM users")
+    let all = exec(nodes[leaderIdx].store, "SELECT * FROM users")
     check all.kind == erkRows
     if all.kind == erkRows:
       check all.rows.len == 10
@@ -454,10 +394,11 @@ suite "Space multinode — resilience after adding a node":
     defer:
       for n in nodes: stopNode(n)
 
-    discard exec(nodes[0].store, "CREATE SPACE testspace WITH REPLICAS = 3")
+    let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
+    discard exec(nodes[leaderIdx].store, "CREATE SPACE testspace WITH REPLICAS = 3")
     distributeSpaceGroups(nodes)
 
-    discard exec(nodes[0].store,
+    discard exec(nodes[leaderIdx].store,
         "CREATE TABLE t1 (id INT PRIMARY KEY, val TEXT) IN SPACE testspace")
     loadMetadataOnAllNodes(nodes)
 
@@ -465,21 +406,29 @@ suite "Space multinode — resilience after adding a node":
     check ins1.kind == erkModified
 
     # Add node 6
-    let node6 = makeNode(6, @[1, 2, 3, 4, 5])
+    let node6Members = @[
+      (nodeId: 1'u32, host: "127.0.0.1", basePort: 27000),
+      (nodeId: 2'u32, host: "127.0.0.1", basePort: 27100),
+      (nodeId: 3'u32, host: "127.0.0.1", basePort: 27200),
+      (nodeId: 4'u32, host: "127.0.0.1", basePort: 27300),
+      (nodeId: 5'u32, host: "127.0.0.1", basePort: 27400),
+      (nodeId: 6'u32, host: "127.0.0.1", basePort: 27500),
+    ]
+    let node6 = makeNode(6, 27500, node6Members)
     startNode(node6)
     nodes.add(node6)
 
-    # Register node 6 with existing nodes' transports and group descriptors
+    # Register node 6 with existing nodes' NuRaft groups
     for i in 0 ..< 5:
-      nodes[i].server.addPeerToRaft(6, "127.0.0.1", raftPort(6))
+      nodes[i].server.addPeerToRaft(6, "127.0.0.1", 27500)
 
     # Seed node 6 into sys.nodes
     let nodeKey = encodeTableKey(SYS_NODES_TABLE_ID, "6")
     let nodeVal = $ %*{
       "nodeId": 6, "host": "127.0.0.1",
-      "raftPort": raftPort(6), "clientPort": 19006, "status": 1,
+      "raftPort": 27500, "clientPort": node6.clientPort, "status": 1,
     }
-    discard nodes[0].store.raftPut(nodeKey, nodeVal)
+    discard nodes[leaderIdx].store.raftPut(nodeKey, nodeVal)
     sleep(500)
 
     # Verify space still works — insert via client-side retry
@@ -488,7 +437,7 @@ suite "Space multinode — resilience after adding a node":
       echo "  INSERT after add error: " & ins2.error
     check ins2.kind == erkModified
 
-    let sel = exec(nodes[0].store, "SELECT * FROM t1")
+    let sel = exec(nodes[leaderIdx].store, "SELECT * FROM t1")
     check sel.kind == erkRows
     if sel.kind == erkRows:
       check sel.rows.len == 2
@@ -502,10 +451,11 @@ suite "Space multinode — resilience after killing a node":
         try: stopNode(n)
         except: discard
 
-    discard exec(nodes[0].store, "CREATE SPACE testspace WITH REPLICAS = 3")
+    let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
+    discard exec(nodes[leaderIdx].store, "CREATE SPACE testspace WITH REPLICAS = 3")
     distributeSpaceGroups(nodes)
 
-    discard exec(nodes[0].store,
+    discard exec(nodes[leaderIdx].store,
         "CREATE TABLE t1 (id INT PRIMARY KEY, val TEXT) IN SPACE testspace")
     loadMetadataOnAllNodes(nodes)
 
@@ -518,23 +468,19 @@ suite "Space multinode — resilience after killing a node":
     nodes[4].coord.stop()
     sleep(300)
 
-    # Re-elect leaders for groups that had node 5 as leader
+    # NuRaft handles re-election automatically
     reelectLeaders(nodes, @[5])
 
-    # After killing node 5, groups that had node 5 as leader now have a new
-    # leader whose SM may not have data written through the old leader (no
-    # real Raft log replication in the test).  Verify the system continues
-    # to accept new writes after the kill.
-    let aliveNodes = nodes[0 ..< 4]  # nodes 1-4 (node 5 is dead)
+    let aliveNodes = nodes[0 ..< 4]
     var postKillSuccess = 0
     let ins2 = execOnLeader(aliveNodes, "INSERT INTO t1 VALUES (2, 'after-kill')")
     if ins2.kind == erkModified: inc postKillSuccess
     let ins3 = execOnLeader(aliveNodes, "INSERT INTO t1 VALUES (3, 'also-after-kill')")
     if ins3.kind == erkModified: inc postKillSuccess
 
-    check postKillSuccess >= 1  # at least one post-kill insert works
+    check postKillSuccess >= 1
 
-    let sel = exec(nodes[0].store, "SELECT * FROM t1")
+    let sel = exec(nodes[leaderIdx].store, "SELECT * FROM t1")
     check sel.kind == erkRows
     if sel.kind == erkRows:
       check sel.rows.len >= postKillSuccess
@@ -546,10 +492,11 @@ suite "Space multinode — resilience after killing a node":
         try: stopNode(n)
         except: discard
 
-    discard exec(nodes[0].store, "CREATE SPACE testspace WITH REPLICAS = 3")
+    let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
+    discard exec(nodes[leaderIdx].store, "CREATE SPACE testspace WITH REPLICAS = 3")
     distributeSpaceGroups(nodes)
 
-    discard exec(nodes[0].store,
+    discard exec(nodes[leaderIdx].store,
         "CREATE TABLE t1 (id INT PRIMARY KEY, val TEXT) IN SPACE testspace")
     loadMetadataOnAllNodes(nodes)
 
@@ -558,21 +505,15 @@ suite "Space multinode — resilience after killing a node":
 
     sleep(400)
 
-    # Kill nodes 4 and 5. Groups with all 3 replicas on nodes 1-3 still
-    # have full quorum. Groups that had a replica on 4 or 5 lose one voter
-    # but 2/3 quorum is maintained as long as the other 2 replicas are
-    # among nodes 1-3.
+    # Kill nodes 4 and 5
     nodes[3].coord.stop()
     nodes[4].coord.stop()
     sleep(300)
 
-    # Re-elect leaders for groups that lost their leader
+    # NuRaft handles re-election automatically
     reelectLeaders(nodes, @[4, 5])
 
-    # With 2 of 5 nodes dead and RF=3, some groups lose quorum (groups where
-    # 2 of 3 members were on the dead nodes).  At least some inserts should
-    # work (groups whose majority is still alive among nodes 1-3).
-    let aliveNodes = nodes[0 ..< 3]  # nodes 1-3 (nodes 4+5 are dead)
+    let aliveNodes = nodes[0 ..< 3]
     var successCount = 0
     for i in 2 .. 6:
       let r = execOnLeader(aliveNodes,
@@ -582,9 +523,7 @@ suite "Space multinode — resilience after killing a node":
 
     check successCount > 0
 
-    let sel = exec(nodes[0].store, "SELECT * FROM t1")
+    let sel = exec(nodes[leaderIdx].store, "SELECT * FROM t1")
     check sel.kind == erkRows
     if sel.kind == erkRows:
-      # Rows include post-kill successes plus any pre-kill data that survived
-      # (only data on leaders that are still alive).
       check sel.rows.len >= successCount

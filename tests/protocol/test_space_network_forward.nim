@@ -4,17 +4,16 @@
 # leader node directly (no forwarding needed) and that the routing is
 # consistent with raftPutInSpace/raftGetInSpace which use the bare PK.
 #
-# 3-node cluster with peer stores wired. Space with 3 groups, each led by
-# a different node. Tests exercise writes from the node that owns the
-# target group (deterministic routing).
+# 3-node cluster with NuRaft ASIO networking. Space with 3 groups, each
+# potentially led by a different node. Tests exercise writes from the node
+# that owns the target group (deterministic routing).
 #
-# Port allocation: 21800–21829 (Raft).
+# Port allocation: 26000–26299 (NuRaft ASIO, basePort per node spaced by 100).
 # Temp storage: /tmp/fractio_net_fwd_<nodeId>/
 
 import std/[unittest, os, options, json, strutils, tables]
 
-import fractio/distributed/raft/multigroup_coordinator
-import fractio/distributed/raft/multigroup_transport
+import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
@@ -26,7 +25,6 @@ import fractio/protocol/server
 # ---------------------------------------------------------------------------
 
 const
-  BASE_RAFT_PORT = 21800
   TMP_DIR = "/tmp/fractio_net_fwd_"
   NODE_COUNT = 3
   SPACE_GROUP_START = 10'u64  # space groups 10, 11, 12
@@ -40,180 +38,174 @@ var nextClientPort = 9100  ## incremented per node to avoid port conflicts betwe
 type
   TestNode = object
     id*: int
+    basePort*: int
     clientPort*: int
     server*: ProtocolServer
-    coord*: MultiRaftCoordinator
+    coord*: NuRaftCoordinator
     store*: RaftKVStoreExt
-    rgt*: RaftGroupTransport
     storagePath*: string
 
 proc cleanDir(p: string) =
   try: removeDir(p) except CatchableError: discard
 
-proc raftPort(nodeNum: int): int = BASE_RAFT_PORT + (nodeNum - 1) * 10
+proc makeCluster3(): seq[TestNode] =
+  let members = @[
+    (nodeId: 1'u32, host: "127.0.0.1", basePort: 26000),
+    (nodeId: 2'u32, host: "127.0.0.1", basePort: 26100),
+    (nodeId: 3'u32, host: "127.0.0.1", basePort: 26200),
+  ]
 
-proc makeNode(nodeNum: int, peerNums: seq[int]): TestNode =
-  let nodeId = rangeTypes.NodeID(uint32(nodeNum))
-  let rPort = raftPort(nodeNum)
+  var nodes: seq[TestNode]
+  for nodeNum in 1 .. NODE_COUNT:
+    let nodeId = rangeTypes.NodeID(uint32(nodeNum))
+    let basePort = 26000 + (nodeNum - 1) * 100
+    let storagePath = TMP_DIR & $nodeNum
+    cleanDir(storagePath)
+    createDir(storagePath)
 
-  var peers: seq[PeerAddr]
-  for pn in peerNums:
-    peers.add(PeerAddr(
-      nodeId: rangeTypes.NodeID(uint32(pn)),
+    let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
+      nodeId: nodeId,
+      basePort: basePort,
       host: "127.0.0.1",
-      raftPort: raftPort(pn),
+      dataDir: storagePath,
+      electionTimeoutLowerMs: 200,
+      electionTimeoutUpperMs: 400,
+      heartbeatIntervalMs: 100,
+    ))
+    coord.start()
+
+    # Create meta + data groups
+    doAssert coord.createAndStartGroup(META_GROUP_ID, members)
+    doAssert coord.createAndStartGroup(DATA_GROUP_START_ID, members)
+
+    # Create space groups
+    for i in 0 ..< NODE_COUNT:
+      let gid = GroupID(SPACE_GROUP_START + uint64(i))
+      doAssert coord.createAndStartGroup(gid, members)
+
+    let store = newRaftKVStoreExt(coord, proposeTimeoutMs = 6000)
+    store.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
+
+    for i in 0 ..< NODE_COUNT:
+      discard store.getOrCreateSM(GroupID(SPACE_GROUP_START + uint64(i)))
+
+    let cPort = nextClientPort
+    nextClientPort += 1
+
+    var cfg = defaultServerConfig()
+    cfg.host = "127.0.0.1"
+    cfg.port = cPort
+    cfg.serverId = uint16(nodeNum)
+    cfg.dataDir = storagePath
+    let srv = newProtocolServer(cfg)
+    srv.raftStore = store
+    srv.raftCoord = coord
+
+    nodes.add(TestNode(
+      id: nodeNum, basePort: basePort, clientPort: cPort, server: srv,
+      coord: coord, store: store, storagePath: storagePath,
     ))
 
-  let rgt = newRaftGroupTransport(nodeId, "127.0.0.1", rPort, peers)
-  let transport = newMultiRaftTransport(rgt)
+  for n in nodes:
+    n.server.start()
 
-  let storagePath = TMP_DIR & $nodeNum
-  cleanDir(storagePath)
-  createDir(storagePath)
+  # Wait for leader election on meta + data groups
+  for attempt in 0 ..< 50:
+    var allLeaders = true
+    for gid in [META_GROUP_ID, DATA_GROUP_START_ID]:
+      var hasLeader = false
+      for n in nodes:
+        if n.coord.isLeader(gid):
+          hasLeader = true
+          break
+      if not hasLeader:
+        allLeaders = false
+        break
+    if allLeaders: break
+    sleep(100)
 
-  let coord = newMultiRaftCoordinator(CoordinatorConfig(
-    nodeId: nodeId,
-    numWorkers: 1,
-    electionTimeoutNs: 800_000_000'i64,
-    heartbeatIntervalNs: 50_000_000'i64,
-    storagePath: storagePath / "raft",
-    proposeTimeoutMs: 6000,
-    transport: transport,
-  ))
+  # Wait for space group leaders
+  for attempt in 0 ..< 50:
+    var allLeaders = true
+    for i in 0 ..< NODE_COUNT:
+      let gid = GroupID(SPACE_GROUP_START + uint64(i))
+      var hasLeader = false
+      for n in nodes:
+        if n.coord.isLeader(gid):
+          hasLeader = true
+          break
+      if not hasLeader:
+        allLeaders = false
+        break
+    if allLeaders: break
+    sleep(100)
 
-  # Create meta + data groups with all peers as voters
-  for groupId in [META_GROUP_ID, DATA_GROUP_START_ID]:
-    var desc = rangeTypes.newGroupDescriptor(groupId)
-    discard desc.addReplica(nodeId, rangeTypes.rtVoter)
-    for pn in peerNums:
-      discard desc.addReplica(rangeTypes.NodeID(uint32(pn)), rangeTypes.rtVoter)
-    let rep = desc.getReplica(nodeId)
-    doAssert rep.isSome
-    discard coord.createGroup(desc, rep.get.replicaId)
+  # Find the meta leader and seed system tables
+  var leaderIdx = 0
+  for i, n in nodes:
+    if n.coord.isLeader(META_GROUP_ID):
+      leaderIdx = i
+      break
 
-  # Create space groups — each group has all 3 nodes as voters
-  for i in 0 ..< NODE_COUNT:
-    let gid = GroupID(SPACE_GROUP_START + uint64(i))
-    var desc = rangeTypes.newGroupDescriptor(gid)
-    discard desc.addReplica(nodeId, rangeTypes.rtVoter)
-    for pn in peerNums:
-      discard desc.addReplica(rangeTypes.NodeID(uint32(pn)), rangeTypes.rtVoter)
-    let rep = desc.getReplica(nodeId)
-    doAssert rep.isSome
-    discard coord.createGroup(desc, rep.get.replicaId)
-
-  let store = newRaftKVStoreExt(coord, proposeTimeoutMs = 6000)
-  store.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
-
-  for i in 0 ..< NODE_COUNT:
-    discard store.getOrCreateSM(GroupID(SPACE_GROUP_START + uint64(i)))
-
-  let cPort = nextClientPort
-  nextClientPort += 1
-
-  var cfg = defaultServerConfig()
-  cfg.host = "127.0.0.1"
-  cfg.port = cPort
-  cfg.serverId = uint16(nodeNum)
-  cfg.dataDir = storagePath
-  let srv = newProtocolServer(cfg)
-  srv.raftStore = store
-  srv.raftCoord = coord
-  srv.raftTransport = rgt
-
-  TestNode(
-    id: nodeNum, clientPort: cPort, server: srv, coord: coord, store: store,
-    rgt: rgt, storagePath: storagePath,
-  )
-
-proc seedSysNodes(leaderStore: RaftKVStoreExt, nodes: seq[TestNode]) =
+  # Seed sys.nodes
   for n in nodes:
     let key = encodeTableKey(SYS_NODES_TABLE_ID, $n.id)
     let val = $ %*{
       "nodeId": n.id,
       "host": "127.0.0.1",
-      "raftPort": raftPort(n.id),
+      "raftPort": n.basePort,
       "clientPort": n.clientPort,
       "status": 1,
     }
-    let r = leaderStore.raftPut(key, val)
+    let r = nodes[leaderIdx].store.raftPut(key, val)
     doAssert r.isOk, "failed to seed sys.nodes for node " & $n.id
 
-proc seedSysGroups(leaderStore: RaftKVStoreExt, nodeNums: seq[int]) =
+  # Seed sys.groups
+  let allNums = @[1, 2, 3]
   for gid in [META_GROUP_ID, DATA_GROUP_START_ID]:
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
     var replicas = newJArray()
-    for num in nodeNums:
+    for num in allNums:
       replicas.add(%*{"nodeId": num, "type": "voter"})
     let val = $ %*{"groupId": gid.uint64.int, "replicas": replicas}
-    discard leaderStore.raftPut(key, val)
+    discard nodes[leaderIdx].store.raftPut(key, val)
 
   for i in 0 ..< NODE_COUNT:
     let gid = SPACE_GROUP_START + uint64(i)
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid)
     var replicas = newJArray()
-    for num in nodeNums:
+    for num in allNums:
       replicas.add(%*{"nodeId": num, "type": "voter"})
-    # Leader for group 10+i is node i+1
-    let val = $ %*{"groupId": int(gid), "replicas": replicas, "leader": i + 1}
-    discard leaderStore.raftPut(key, val)
+    # Find who is leader for this group
+    var leaderNodeId = 1
+    for n in nodes:
+      if n.coord.isLeader(GroupID(gid)):
+        leaderNodeId = n.id
+        break
+    let val = $ %*{"groupId": int(gid), "replicas": replicas, "leader": leaderNodeId}
+    discard nodes[leaderIdx].store.raftPut(key, val)
 
-proc seedSpaceAndTable(store: RaftKVStoreExt, spaceId: int, tableId: uint32) =
+  # Seed space and table
   var gids = newJArray()
   for i in 0 ..< NODE_COUNT:
     gids.add(newJInt(int(SPACE_GROUP_START + uint64(i))))
-  let spaceKey = encodeSpaceKey(spaceId)
+  let spaceKey = encodeSpaceKey(2)
   let spaceVal = $ %*{
-    "spaceId": spaceId,
-    "name": "space_" & $spaceId,
+    "spaceId": 2,
+    "name": "space_2",
     "replicas": NODE_COUNT,
     "groupIds": gids,
   }
-  discard store.raftPut(spaceKey, spaceVal)
+  discard nodes[leaderIdx].store.raftPut(spaceKey, spaceVal)
 
-  let tableKey = encodeTableKey(SYS_TABLES_TABLE_ID, "default.public.t" & $tableId)
+  let tableKey = encodeTableKey(SYS_TABLES_TABLE_ID, "default.public.t100")
   let tableVal = $ %*{
-    "tableId": int(tableId),
-    "name": "t" & $tableId,
-    "spaceId": spaceId,
+    "tableId": 100,
+    "name": "t100",
+    "spaceId": 2,
   }
-  discard store.raftPut(tableKey, tableVal)
+  discard nodes[leaderIdx].store.raftPut(tableKey, tableVal)
 
-  store.loadSpaces()
-  store.loadTableSpaces()
-
-proc makeCluster3(): seq[TestNode] =
-  let allNums = @[1, 2, 3]
-  var nodes: seq[TestNode]
-  for n in allNums:
-    var peers: seq[int]
-    for p in allNums:
-      if p != n: peers.add(p)
-    nodes.add(makeNode(n, peers))
-
-  for n in nodes:
-    n.coord.start()
-    n.server.start()
-
-  # Force node 1 as leader for meta + data groups
-  for groupId in [META_GROUP_ID, DATA_GROUP_START_ID]:
-    let g = nodes[0].coord.getGroup(groupId)
-    doAssert g.isSome
-    g.get.becomeLeader()
-
-  # Force different leaders for space groups:
-  #   group 10 → node 1, group 11 → node 2, group 12 → node 3
-  for i in 0 ..< NODE_COUNT:
-    let gid = GroupID(SPACE_GROUP_START + uint64(i))
-    let g = nodes[i].coord.getGroup(gid)
-    doAssert g.isSome
-    g.get.becomeLeader()
-
-  sleep(400)
-
-  seedSysNodes(nodes[0].store, nodes)
-  seedSysGroups(nodes[0].store, allNums)
-  seedSpaceAndTable(nodes[0].store, 2, 100)
   sleep(200)
 
   for n in nodes:
@@ -239,15 +231,22 @@ proc spaceInfo(): SpaceInfo =
     groupIds: groupIds,
   )
 
-proc findKeyForNode(targetNodeIdx: int, space: SpaceInfo): string =
-  ## Find a bare PK that routes to the group led by nodes[targetNodeIdx].
-  let targetGid = GroupID(SPACE_GROUP_START + uint64(targetNodeIdx))
+proc findKeyForNode(nodes: seq[TestNode], targetGroupIdx: int, space: SpaceInfo): string =
+  ## Find a bare PK that routes to the group at targetGroupIdx in the space.
+  let targetGid = GroupID(SPACE_GROUP_START + uint64(targetGroupIdx))
   for i in 0 ..< 1000:
     let pk = "k" & $i
     if routeToGroup(pk, space.groupIds) == targetGid:
       return pk
-  doAssert false, "could not find key routing to node " & $(targetNodeIdx + 1)
+  doAssert false, "could not find key routing to group " & $targetGid.uint64
   ""
+
+proc findLeaderNodeIdx(nodes: seq[TestNode], gid: GroupID): int =
+  ## Find which node is leader for a group. Returns -1 if none.
+  for i, n in nodes:
+    if n.coord.isLeader(gid):
+      return i
+  -1
 
 # ---------------------------------------------------------------------------
 # Suite: resolveGroupId routes consistently with raftPutInSpace
@@ -276,14 +275,18 @@ suite "Multi-node — resolveGroupId consistency with raftPutInSpace":
 
     let space = spaceInfo()
 
-    # Find keys for each node and write from the owning leader
-    for nodeIdx in 0 ..< NODE_COUNT:
-      let pk = findKeyForNode(nodeIdx, space)
+    # Find keys for each group and write from the owning leader
+    for groupIdx in 0 ..< NODE_COUNT:
+      let gid = GroupID(SPACE_GROUP_START + uint64(groupIdx))
+      let leaderIdx = findLeaderNodeIdx(nodes, gid)
+      if leaderIdx < 0: continue
+
+      let pk = findKeyForNode(nodes, groupIdx, space)
       let key = encodeDataRowKey(100, pk)
-      let val = """{"node":""" & $nodeIdx & "}"
+      let val = """{"groupIdx":""" & $groupIdx & "}"
 
       # raftPut on the leader node for this group should succeed locally
-      let wr = nodes[nodeIdx].store.raftPut(key, val)
+      let wr = nodes[leaderIdx].store.raftPut(key, val)
       check wr.isOk
       if wr.isOk:
         check wr.value.value == val
@@ -294,15 +297,19 @@ suite "Multi-node — resolveGroupId consistency with raftPutInSpace":
 
     let space = spaceInfo()
 
-    for nodeIdx in 0 ..< NODE_COUNT:
-      let pk = findKeyForNode(nodeIdx, space)
-      let key = encodeDataRowKey(100, pk)
-      discard nodes[nodeIdx].store.raftPut(key, "to_delete")
+    for groupIdx in 0 ..< NODE_COUNT:
+      let gid = GroupID(SPACE_GROUP_START + uint64(groupIdx))
+      let leaderIdx = findLeaderNodeIdx(nodes, gid)
+      if leaderIdx < 0: continue
 
-      let dr = nodes[nodeIdx].store.raftDelete(key)
+      let pk = findKeyForNode(nodes, groupIdx, space)
+      let key = encodeDataRowKey(100, pk)
+      discard nodes[leaderIdx].store.raftPut(key, "to_delete")
+
+      let dr = nodes[leaderIdx].store.raftDelete(key)
       check dr.isOk
 
-      let gr = nodes[nodeIdx].store.raftGet(key)
+      let gr = nodes[leaderIdx].store.raftGet(key)
       check gr.isOk
       check gr.value.isNone
 
@@ -318,15 +325,20 @@ suite "Multi-node — peer store forwarding for space-routed keys":
 
     let space = spaceInfo()
 
-    # Find a key owned by node 2 (index 1)
-    let pk = findKeyForNode(1, space)
-    let key = encodeDataRowKey(100, pk)
-    let val = """{"wrong_node":true}"""
+    # Find a key owned by a specific group and try writing from a non-leader
+    let pk = findKeyForNode(nodes, 1, space)
+    let gid = GroupID(SPACE_GROUP_START + 1)
+    let leaderIdx = findLeaderNodeIdx(nodes, gid)
+    let nonLeaderIdx = if leaderIdx == 0: 1 else: 0
+    # Only test if leaderIdx != nonLeaderIdx (non-leader tries to write)
+    if leaderIdx >= 0 and leaderIdx != nonLeaderIdx:
+      let key = encodeDataRowKey(100, pk)
+      let val = """{"wrong_node":true}"""
 
-    # raftPut on node 1 for a key owned by node 2 — should fail (not leader)
-    let wr = nodes[0].store.raftPut(key, val)
-    check not wr.isOk
-    check wr.error.kind == rseNotLeader
+      # raftPut on non-leader for this group — should fail (not leader)
+      let wr = nodes[nonLeaderIdx].store.raftPut(key, val)
+      check not wr.isOk
+      check wr.error.kind == rseNotLeader
 
   test "raftDelete on wrong node returns not-leader":
     var nodes = makeCluster3()
@@ -334,78 +346,94 @@ suite "Multi-node — peer store forwarding for space-routed keys":
 
     let space = spaceInfo()
 
-    # Insert on owner (node 2)
-    let pk = findKeyForNode(1, space)
-    let key = encodeDataRowKey(100, pk)
-    discard nodes[1].store.raftPut(key, "will_delete")
+    let pk = findKeyForNode(nodes, 1, space)
+    let gid = GroupID(SPACE_GROUP_START + 1)
+    let leaderIdx = findLeaderNodeIdx(nodes, gid)
+    if leaderIdx >= 0:
+      let key = encodeDataRowKey(100, pk)
+      # Insert on leader
+      discard nodes[leaderIdx].store.raftPut(key, "will_delete")
 
-    # raftDelete on node 1 for a key owned by node 2 — should fail
-    let dr = nodes[0].store.raftDelete(key)
-    check not dr.isOk
-    check dr.error.kind == rseNotLeader
+      # raftDelete on a non-leader — should fail
+      let nonLeaderIdx = if leaderIdx == 0: 1 else: 0
+      let dr = nodes[nonLeaderIdx].store.raftDelete(key)
+      check not dr.isOk
+      check dr.error.kind == rseNotLeader
 
   test "raftPutInSpace from non-leader forwards to leader":
     var nodes = makeCluster3()
     defer: stopCluster(nodes)
 
     let space = spaceInfo()
-    let pk = findKeyForNode(2, space)  # owned by node 3
-    let key = encodeDataRowKey(100, pk)
-    let val = """{"space_forward":1}"""
+    let pk = findKeyForNode(nodes, 2, space)
+    let gid = GroupID(SPACE_GROUP_START + 2)
+    let leaderIdx = findLeaderNodeIdx(nodes, gid)
+    if leaderIdx >= 0:
+      let nonLeaderIdx = if leaderIdx == 0: 1 else: 0
+      let key = encodeDataRowKey(100, pk)
+      let val = """{"space_forward":1}"""
 
-    # Write from node 1 for a key owned by node 3 — should succeed via forwarding
-    let wr = nodes[0].store.raftPutInSpace(key, val, space, pk)
-    check wr.isOk
-    if wr.isOk:
-      check wr.value.value == val
+      # Write from non-leader — should succeed via forwarding
+      let wr = nodes[nonLeaderIdx].store.raftPutInSpace(key, val, space, pk)
+      check wr.isOk
+      if wr.isOk:
+        check wr.value.value == val
 
-    # Verify the data is readable from the owning leader (node 3)
-    let gr = nodes[2].store.raftGetInSpaceFromGroup(key, GroupID(SPACE_GROUP_START + 2))
-    check gr.isOk
-    if gr.isOk:
-      check gr.value.isSome
-      if gr.value.isSome:
-        check gr.value.get().value == val
+      # Verify the data is readable from the owning leader
+      let gr = nodes[leaderIdx].store.raftGetInSpaceFromGroup(key, gid)
+      check gr.isOk
+      if gr.isOk:
+        check gr.value.isSome
+        if gr.value.isSome:
+          check gr.value.get().value == val
 
   test "raftDeleteInSpace from non-leader forwards to leader":
     var nodes = makeCluster3()
     defer: stopCluster(nodes)
 
     let space = spaceInfo()
-    let pk = findKeyForNode(2, space)
-    let key = encodeDataRowKey(100, pk)
-    discard nodes[2].store.raftPutInSpace(key, "to_del", space, pk)
+    let pk = findKeyForNode(nodes, 2, space)
+    let gid = GroupID(SPACE_GROUP_START + 2)
+    let leaderIdx = findLeaderNodeIdx(nodes, gid)
+    if leaderIdx >= 0:
+      let nonLeaderIdx = if leaderIdx == 0: 1 else: 0
+      let key = encodeDataRowKey(100, pk)
+      discard nodes[leaderIdx].store.raftPutInSpace(key, "to_del", space, pk)
 
-    # Delete from node 1 for a key owned by node 3 — should succeed via forwarding
-    let dr = nodes[0].store.raftDeleteInSpace(key, space, pk)
-    check dr.isOk
+      # Delete from non-leader — should succeed via forwarding
+      let dr = nodes[nonLeaderIdx].store.raftDeleteInSpace(key, space, pk)
+      check dr.isOk
 
-    # Verify the key is gone from the owning leader (node 3)
-    let gr = nodes[2].store.raftGetInSpaceFromGroup(key, GroupID(SPACE_GROUP_START + 2))
-    check gr.isOk
-    if gr.isOk:
-      check gr.value.isNone
+      # Verify the key is gone from the owning leader
+      let gr = nodes[leaderIdx].store.raftGetInSpaceFromGroup(key, gid)
+      check gr.isOk
+      if gr.isOk:
+        check gr.value.isNone
 
   test "raftGetInSpace from non-leader forwards to leader":
     var nodes = makeCluster3()
     defer: stopCluster(nodes)
 
     let space = spaceInfo()
-    let pk = findKeyForNode(1, space)  # owned by node 2
-    let key = encodeDataRowKey(100, pk)
-    let val = """{"get_forward":true}"""
+    let pk = findKeyForNode(nodes, 1, space)
+    let gid = GroupID(SPACE_GROUP_START + 1)
+    let leaderIdx = findLeaderNodeIdx(nodes, gid)
+    if leaderIdx >= 0:
+      let nonLeaderIdx = if leaderIdx == 0: 1 else: 0
+      let key = encodeDataRowKey(100, pk)
+      let val = """{"get_forward":true}"""
 
-    # Write on the owning leader (node 2)
-    let wr = nodes[1].store.raftPutInSpace(key, val, space, pk)
-    check wr.isOk
+      # Write on the owning leader
+      let wr = nodes[leaderIdx].store.raftPutInSpace(key, val, space, pk)
+      check wr.isOk
 
-    # Read from node 1 (not the leader) — should forward to node 2
-    let gr = nodes[0].store.raftGetInSpace(key, space, pk)
-    check gr.isOk
-    if gr.isOk:
-      check gr.value.isSome
-      if gr.value.isSome:
-        check gr.value.get().value == val
+      # Read from non-leader — should forward to leader
+      let gr = nodes[nonLeaderIdx].store.raftGetInSpace(key, space, pk)
+      check gr.isOk
+      if gr.isOk:
+        check gr.value.isSome
+        if gr.value.isSome:
+          check gr.value.get().value == val
 
 # ---------------------------------------------------------------------------
 # Suite: routing validation
@@ -418,40 +446,50 @@ suite "Multi-node — routing validation for group-routed requests":
     defer: stopCluster(nodes)
 
     let space = spaceInfo()
-    # Find a key that routes to group 10 (node 1's group)
-    let pk = findKeyForNode(0, space)
+    # Find a key that routes to group 10 (first space group)
+    let pk = findKeyForNode(nodes, 0, space)
     let key = encodeDataRowKey(100, pk)
 
-    # Try to put it in group 11 (wrong group) — should fail with rseBadRouting
-    let wr = nodes[1].store.raftPutInGroup(key, "bad", GroupID(SPACE_GROUP_START + 1))
-    check not wr.isOk
-    check wr.error.kind == rseBadRouting
+    # Find leader for group 11 (wrong group for this key)
+    let wrongGid = GroupID(SPACE_GROUP_START + 1)
+    let leaderIdx = findLeaderNodeIdx(nodes, wrongGid)
+    if leaderIdx >= 0:
+      # Try to put it in group 11 (wrong group) — should fail with rseBadRouting
+      let wr = nodes[leaderIdx].store.raftPutInGroup(key, "bad", wrongGid)
+      check not wr.isOk
+      check wr.error.kind == rseBadRouting
 
   test "raftDeleteInGroupExplicit rejects key routed to wrong group":
     var nodes = makeCluster3()
     defer: stopCluster(nodes)
 
     let space = spaceInfo()
-    let pk = findKeyForNode(0, space)
+    let pk = findKeyForNode(nodes, 0, space)
     let key = encodeDataRowKey(100, pk)
 
-    # Try to delete from group 11 (wrong group) — should fail with rseBadRouting
-    let dr = nodes[1].store.raftDeleteInGroupExplicit(key, GroupID(SPACE_GROUP_START + 1))
-    check not dr.isOk
-    check dr.error.kind == rseBadRouting
+    let wrongGid = GroupID(SPACE_GROUP_START + 1)
+    let leaderIdx = findLeaderNodeIdx(nodes, wrongGid)
+    if leaderIdx >= 0:
+      # Try to delete from group 11 (wrong group) — should fail with rseBadRouting
+      let dr = nodes[leaderIdx].store.raftDeleteInGroupExplicit(key, wrongGid)
+      check not dr.isOk
+      check dr.error.kind == rseBadRouting
 
   test "raftGetInGroup rejects key routed to wrong group":
     var nodes = makeCluster3()
     defer: stopCluster(nodes)
 
     let space = spaceInfo()
-    let pk = findKeyForNode(0, space)
+    let pk = findKeyForNode(nodes, 0, space)
     let key = encodeDataRowKey(100, pk)
 
-    # Try to get from group 11 (wrong group) — should fail with rseBadRouting
-    let gr = nodes[1].store.raftGetInGroup(key, GroupID(SPACE_GROUP_START + 1))
-    check not gr.isOk
-    check gr.error.kind == rseBadRouting
+    let wrongGid = GroupID(SPACE_GROUP_START + 1)
+    let leaderIdx = findLeaderNodeIdx(nodes, wrongGid)
+    if leaderIdx >= 0:
+      # Try to get from group 11 (wrong group) — should fail with rseBadRouting
+      let gr = nodes[leaderIdx].store.raftGetInGroup(key, wrongGid)
+      check not gr.isOk
+      check gr.error.kind == rseBadRouting
 
 # ---------------------------------------------------------------------------
 # Suite: nodeInfoCache

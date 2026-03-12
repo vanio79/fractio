@@ -1,12 +1,12 @@
 # Unit tests for resolveGroupId space-awareness and lookupNodeInfo.
 #
-# Single-node tests (no TCP). Uses makeMultiGroupStore pattern from
-# test_space_routing.nim — creates meta + data + N space groups, seeds
-# tableSpaces/spaces caches via loadSpaces()/loadTableSpaces().
+# Single-node tests (no TCP). Uses makeMultiGroupStore pattern —
+# creates meta + data + N space groups, seeds tableSpaces/spaces
+# caches via loadSpaces()/loadTableSpaces().
 
-import std/[unittest, os, options, tables, json]
+import std/[unittest, os, options, tables, json, sequtils]
 import fractio/protocol/raft_store
-import fractio/distributed/raft/multigroup_coordinator
+import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
@@ -16,51 +16,60 @@ import fractio/storage/wisckey_backend
 # Helpers
 # ---------------------------------------------------------------------------
 
+var testBasePort {.global.} = 18500
+
+proc nextBasePort(): int =
+  result = testBasePort
+  testBasePort += 100
+
 proc cleanDir(path: string) =
   try: removeDir(path) except CatchableError: discard
   try: createDir(path) except CatchableError: discard
 
 proc makeMultiGroupStore(storagePath: string, groupCount: int): tuple[
-    coord: MultiRaftCoordinator, store: RaftKVStoreExt,
+    coord: NuRaftCoordinator, store: RaftKVStoreExt,
     space: SpaceInfo] =
   ## Create a store with `groupCount` Raft groups (ranges 10..10+N-1).
   ## Returns a SpaceInfo whose groupIds point to those groups.
   cleanDir(storagePath)
   let nodeId = NodeID(1)
-  let cfg = CoordinatorConfig(
+  let basePort = nextBasePort()
+  let members = @[(nodeId: 1'u32, host: "127.0.0.1", basePort: basePort)]
+
+  let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
     nodeId: nodeId,
-    numWorkers: 1,
-    electionTimeoutNs: DEFAULT_ELECTION_TIMEOUT_NS,
-    heartbeatIntervalNs: DEFAULT_HEARTBEAT_INTERVAL_NS,
-    storagePath: storagePath,
-    proposeTimeoutMs: 5000,
-  )
-  let coord = newMultiRaftCoordinator(cfg)
+    basePort: basePort,
+    host: "127.0.0.1",
+    dataDir: storagePath,
+    electionTimeoutLowerMs: 200,
+    electionTimeoutUpperMs: 400,
+    heartbeatIntervalMs: 100,
+  ))
+  coord.start()
 
-  # Create the meta range (Range 1) for system keys
-  let metaRid = GroupID(1)
-  let metaDesc = newGroupDescriptor(metaRid)
-  let metaRep = metaDesc.addReplica(nodeId)
-  let metaGroup = coord.createGroup(metaDesc, metaRep.replicaId)
-  metaGroup.becomeLeader()
-
-  # Create data range (Range 2)
-  let dataDesc = newGroupDescriptor(DATA_GROUP_START_ID)
-  let dataRep = dataDesc.addReplica(nodeId)
-  let dataGroup = coord.createGroup(dataDesc, dataRep.replicaId)
-  dataGroup.becomeLeader()
+  # Create the meta range (Range 1) and data range (Range 2)
+  for rid in [META_GROUP_ID, DATA_GROUP_START_ID]:
+    doAssert coord.createAndStartGroup(rid, members)
 
   # Create N space groups starting at groupId 10
   var groupIds: seq[uint64] = @[]
   for i in 0 ..< groupCount:
     let rid = GroupID(uint64(10 + i))
     groupIds.add(rid.uint64)
-    let desc = newGroupDescriptor(rid)
-    let rep = desc.addReplica(nodeId)
-    let group = coord.createGroup(desc, rep.replicaId)
-    group.becomeLeader()
+    doAssert coord.createAndStartGroup(rid, members)
 
-  coord.start()
+  # Wait for all groups to elect leaders
+  let allGroupIds = @[GroupID(1), GroupID(2)] &
+    groupIds.mapIt(GroupID(it))
+  for attempt in 0 ..< 50:
+    var allLeaders = true
+    for gid in allGroupIds:
+      if not coord.isLeader(gid):
+        allLeaders = false
+        break
+    if allLeaders:
+      break
+    os.sleep(100)
 
   let store = newRaftKVStoreExt(coord, proposeTimeoutMs = 2000)
   store.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
@@ -78,7 +87,7 @@ proc makeMultiGroupStore(storagePath: string, groupCount: int): tuple[
 
   (coord, store, space)
 
-proc teardown(coord: MultiRaftCoordinator, storagePath: string) =
+proc teardown(coord: NuRaftCoordinator, storagePath: string) =
   coord.stop()
   try: removeDir(storagePath) except CatchableError: discard
 

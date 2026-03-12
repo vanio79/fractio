@@ -4,14 +4,14 @@
 # mapping, then runs INSERT/SELECT/UPDATE/DELETE SQL through the executor
 # to verify that data is correctly routed and merged across groups.
 
-import std/[unittest, options, json, os, strutils, tables, hashes, algorithm]
+import std/[unittest, options, json, os, strutils, tables, hashes, algorithm, sequtils]
 import fractio/sql/parser
 import fractio/sql/ast
 import fractio/sql/planner
 import fractio/sql/executor
 import fractio/distributed/meta/system_tables
 import fractio/protocol/raft_store
-import fractio/distributed/raft/multigroup_coordinator
+import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/group_types as rangeTypes
 
@@ -23,45 +23,56 @@ proc cleanDir(path: string) =
   try: removeDir(path) except CatchableError: discard
   try: createDir(path) except CatchableError: discard
 
+var testBasePort {.global.} = 17000
+
+proc nextBasePort(): int =
+  ## Return a fresh base port to avoid collisions between test runs.
+  result = testBasePort
+  testBasePort += 100
+
 proc createMultiGroupTestStore(testDir: string, groupCount: int): RaftKVStoreExt =
   ## Create a store with 1 meta range + N space groups.
   ## Seeds sys.spaces and sys.tables so the executor can resolve space routing.
   cleanDir(testDir)
   let nodeId = NodeID(1)
-  let coord = newMultiRaftCoordinator(CoordinatorConfig(
+  let basePort = nextBasePort()
+  let members = @[(nodeId: 1'u32, host: "127.0.0.1", basePort: basePort)]
+
+  let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
     nodeId: nodeId,
-    numWorkers: 1,
-    electionTimeoutNs: 5_000_000_000'i64,
-    heartbeatIntervalNs: 1_000_000_000'i64,
-    storagePath: testDir,
-    proposeTimeoutMs: 5000,
+    basePort: basePort,
+    host: "127.0.0.1",
+    dataDir: testDir,
+    electionTimeoutLowerMs: 200,
+    electionTimeoutUpperMs: 400,
+    heartbeatIntervalMs: 100,
   ))
+  coord.start()
 
-  # Meta range (Range 1)
-  let metaRid = GroupID(1)
-  let metaDesc = newGroupDescriptor(metaRid)
-  let metaRep = metaDesc.addReplica(nodeId)
-  let metaGroup = coord.createGroup(metaDesc, metaRep.replicaId)
-  metaGroup.becomeLeader()
+  # Meta group (Group 1)
+  doAssert coord.createAndStartGroup(GroupID(1), members)
 
-  # Data range (Range 2) — for non-space tables
-  let dataRid = GroupID(2)
-  let dataDesc = newGroupDescriptor(dataRid)
-  let dataRep = dataDesc.addReplica(nodeId)
-  let dataGroup = coord.createGroup(dataDesc, dataRep.replicaId)
-  dataGroup.becomeLeader()
+  # Data group (Group 2)
+  doAssert coord.createAndStartGroup(GroupID(2), members)
 
-  # Space groups (Range 10..10+N-1)
+  # Space groups (Group 10..10+N-1)
   var groupIds: seq[int] = @[]
   for i in 0 ..< groupCount:
-    let rid = GroupID(uint64(10 + i))
+    let gid = GroupID(uint64(10 + i))
     groupIds.add(10 + i)
-    let desc = newGroupDescriptor(rid)
-    let rep = desc.addReplica(nodeId)
-    let group = coord.createGroup(desc, rep.replicaId)
-    group.becomeLeader()
+    doAssert coord.createAndStartGroup(gid, members)
 
-  coord.start()
+  # Wait for all groups to elect a leader (single-node → self-election)
+  let allGroupIds = @[GroupID(1), GroupID(2)] &
+    (0 ..< groupCount).mapIt(GroupID(uint64(10 + it)))
+  for attempt in 0 ..< 50:  # up to 5 seconds
+    var allLeaders = true
+    for gid in allGroupIds:
+      if not coord.isLeader(gid):
+        allLeaders = false
+        break
+    if allLeaders: break
+    os.sleep(100)
 
   result = newRaftKVStoreExt(coord, proposeTimeoutMs = 5000)
   result.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])

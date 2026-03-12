@@ -1,9 +1,8 @@
 # Phase 5 — Unit tests for RaftKVStore and RaftTxnCoordinator.
 #
 # Tests the Raft-backed KV store in isolation (no TCP, no ProtocolServer).
-# Uses a single-node MultiRaftCoordinator with the node acting as leader.
+# Uses a single-node NuRaftCoordinator with the node acting as leader.
 #
-# No port usage — all purely in-memory/local.
 # Temp storage: /tmp/fractio_raft_test_<N>/ (cleaned up per suite invocation).
 
 import std/[unittest, os, times, sets, options, locks, tables]
@@ -11,7 +10,7 @@ import fractio/protocol/raft_store
 import fractio/protocol/raft_txn
 import fractio/protocol/txn_manager
 import fractio/protocol/router
-import fractio/distributed/raft/multigroup_coordinator
+import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
@@ -23,33 +22,47 @@ import fractio/storage/wisckey_backend
 # Helpers
 # ---------------------------------------------------------------------------
 
+var testBasePort {.global.} = 18000
+
+proc nextBasePort(): int =
+  result = testBasePort
+  testBasePort += 100
+
 proc cleanDir(path: string) =
   try: removeDir(path) except CatchableError: discard
   try: createDir(path) except CatchableError: discard
 
 proc makeStore(storagePath: string): tuple[
-    coord: MultiRaftCoordinator, store: RaftKVStoreExt, rid: GroupID] =
+    coord: NuRaftCoordinator, store: RaftKVStoreExt, rid: GroupID] =
   cleanDir(storagePath)
-  let cfg = CoordinatorConfig(
-    nodeId: NodeID(1),
-    numWorkers: 1,
-    electionTimeoutNs: DEFAULT_ELECTION_TIMEOUT_NS,
-    heartbeatIntervalNs: DEFAULT_HEARTBEAT_INTERVAL_NS,
-    storagePath: storagePath,
-  )
-  let coord = newMultiRaftCoordinator(cfg)
-  # Create Raft groups for both meta range (1) and data range (2)
-  for rid in [META_GROUP_ID, DATA_GROUP_START_ID]:
-    let desc = newGroupDescriptor(rid)
-    let rep = desc.addReplica(NodeID(1))
-    let group = coord.createGroup(desc, rep.replicaId)
-    group.becomeLeader()
+  let nodeId = NodeID(1)
+  let basePort = nextBasePort()
+  let members = @[(nodeId: 1'u32, host: "127.0.0.1", basePort: basePort)]
+
+  let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
+    nodeId: nodeId,
+    basePort: basePort,
+    host: "127.0.0.1",
+    dataDir: storagePath,
+    electionTimeoutLowerMs: 200,
+    electionTimeoutUpperMs: 400,
+    heartbeatIntervalMs: 100,
+  ))
   coord.start()
+
+  for rid in [META_GROUP_ID, DATA_GROUP_START_ID]:
+    doAssert coord.createAndStartGroup(rid, members)
+
+  for attempt in 0 ..< 50:
+    if coord.isLeader(GroupID(1)) and coord.isLeader(GroupID(2)):
+      break
+    os.sleep(100)
+
   let store = newRaftKVStoreExt(coord, proposeTimeoutMs = 2000)
   store.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
   (coord, store, DATA_GROUP_START_ID)
 
-proc teardownStore(coord: MultiRaftCoordinator, storagePath: string) =
+proc teardownStore(coord: NuRaftCoordinator, storagePath: string) =
   coord.stop()
   try: removeDir(storagePath) except CatchableError: discard
 

@@ -10,6 +10,7 @@ import ./types
 import ./timeprovider
 import ./monotonic
 import ../../utils/logging
+import ../../utils/socket_utils
 import ../../network/packetcodec
 
 type
@@ -126,7 +127,7 @@ method start*(self: UDPTransport) {.gcsafe.} =
 
   # Create and bind server socket
   self.serverSocket = newSocket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
-  self.serverSocket.setSockOpt(OptReuseAddr, true)
+  self.serverSocket.setLingerZero()
   try:
     self.serverSocket.bindAddr(Port(self.localPort))
   except:

@@ -16,9 +16,9 @@ const
   BinaryPath = "bin/fractio_web"
   TestHost = "127.0.0.1"
   # Use high port range to avoid conflicts with other tests.
-  # Each node needs 3 consecutive raft ports (raft, client-transport, admin-transport).
-  # Space them 10 apart to be safe.
-  BaseRaftPort = 17010
+  # Each node needs space for its raft groups.
+  # Space them 1000 apart to be safe.
+  BaseRaftPort = 27000
   BaseClientPort = 19001
   BaseWebPort = 19876
 
@@ -52,7 +52,7 @@ data-dir = "{dataDir}"
 proc startNode(id: int; join = ""): TestNode =
   ## Start a fractio_web node as a background process.
   result.id = id
-  result.raftPort = BaseRaftPort + (id - 1) * 10
+  result.raftPort = BaseRaftPort + (id - 1) * 1000
   result.clientPort = BaseClientPort + (id - 1)
   result.webPort = BaseWebPort + (id - 1)
   result.dataDir = nodeDataDir(id)

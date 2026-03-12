@@ -1,10 +1,10 @@
 # Phase 5 — End-to-end integration tests: Raft-backed ProtocolServer + client.
 #
 # These tests start a ProtocolServer with server.raftStore set to a
-# RaftKVStoreExt backed by a single-node MultiRaftCoordinator (leader forced).
+# RaftKVStoreExt backed by a single-node NuRaftCoordinator (leader elected).
 # The client speaks the full binary wire protocol over TCP.
 #
-# Port allocation: 20150–20199 (no overlap with Phase 1–4 test ports).
+# Port allocation: uses NuRaft base ports starting at 21000.
 # Temp storage: /tmp/fractio_raft_int_<port>/ (cleaned up per suite).
 
 import std/[unittest, os, times]
@@ -18,7 +18,7 @@ import fractio/protocol/txn_manager
 import fractio/protocol/messages/kv
 import fractio/protocol/messages/txn as txnMsgs
 import fractio/protocol/messages/admin as adminMsgs
-import fractio/distributed/raft/multigroup_coordinator
+import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
@@ -27,22 +27,32 @@ import fractio/distributed/meta/system_tables
 # Helpers
 # ---------------------------------------------------------------------------
 
+var testBasePort {.global.} = 21000
+
+proc nextBasePort(): int =
+  result = testBasePort
+  testBasePort += 100
+
+proc cleanDir(path: string) =
+  try: removeDir(path) except CatchableError: discard
+  try: createDir(path) except CatchableError: discard
+
 proc makeRaftServer(port: int, storagePath: string): ProtocolServer =
   ## Spin up a ProtocolServer with Raft-backed KV store.
-  let coordCfg = CoordinatorConfig(
-    nodeId: NodeID(1),
-    numWorkers: 1,
-    electionTimeoutNs: DEFAULT_ELECTION_TIMEOUT_NS,
-    heartbeatIntervalNs: DEFAULT_HEARTBEAT_INTERVAL_NS,
-    storagePath: storagePath,
-  )
-  let coord = newMultiRaftCoordinator(coordCfg)
-  for rid in [META_GROUP_ID, DATA_GROUP_START_ID]:
-    let desc = newGroupDescriptor(rid)
-    let rep = desc.addReplica(NodeID(1))
-    let group = coord.createGroup(desc, rep.replicaId)
-    group.becomeLeader()
+  cleanDir(storagePath)
+  let nodeId = NodeID(1)
+  let basePort = nextBasePort()
+  let members = @[(nodeId: 1'u32, host: "127.0.0.1", basePort: basePort)]
+  let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
+    nodeId: nodeId, basePort: basePort, host: "127.0.0.1", dataDir: storagePath,
+    electionTimeoutLowerMs: 200, electionTimeoutUpperMs: 400, heartbeatIntervalMs: 100,
+  ))
   coord.start()
+  for rid in [META_GROUP_ID, DATA_GROUP_START_ID]:
+    doAssert coord.createAndStartGroup(rid, members)
+  for attempt in 0 ..< 50:
+    if coord.isLeader(GroupID(1)) and coord.isLeader(GroupID(2)): break
+    os.sleep(100)
 
   let raftSt = newRaftKVStoreExt(coord, proposeTimeoutMs = 3000)
   raftSt.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
@@ -54,6 +64,7 @@ proc makeRaftServer(port: int, storagePath: string): ProtocolServer =
 
   let srv = newProtocolServer(cfg)
   srv.raftStore = raftSt
+  srv.raftCoord = coord
   srv.start()
   sleep(80)
   srv
@@ -275,7 +286,7 @@ suite "Raft integration - leader detection":
   test "put on leader node succeeds":
     withRaftServer(20165, "/tmp/fractio_raft_int_20165"):
       proc(srv: ProtocolServer, cli: ProtocolClient) =
-        # Node is leader (set up in makeRaftServer), so puts should succeed
+        # Node is leader (elected in makeRaftServer), so puts should succeed
         let pr = cli.kvPut("leader_key", "leader_val")
         check pr.isOk
         check pr.value.status == PutStatusOK

@@ -202,11 +202,12 @@ type
     spaces*: Table[int, SpaceInfo]  ## spaceId → SpaceInfo
     tableSpaces*: Table[uint32, int] ## tableId → spaceId
     spacesMu*: Lock
+    groupLeaders*: Table[GroupID, uint32]           ## groupId → leader nodeId from sys.groups
     groupMembers*: Table[GroupID, seq[uint32]]   ## groupId → member nodeIds
     preferredLeaders*: Table[GroupID, uint32]     ## groupId → preferred leader nodeId
     nodeInfoCache*: Table[uint32, NodeInfo]       ## nodeId → (host, clientPort) for forwarding
     dataGroupLeaderNodeId*: Atomic[uint32]         ## tracked from AE heartbeats for forwarding
-    groupLeaders*: Table[GroupID, uint32]           ## groupId → leader nodeId from sys.groups
+    groupMu*: Lock  ## guards groupMembers, preferredLeaders, groupLeaders, nodeInfoCache
 
 
 
@@ -226,6 +227,7 @@ proc newRaftKVStoreExt*(coord: NuRaftCoordinator,
   )
   initLock(result.smMu)
   initLock(result.spacesMu)
+  initLock(result.groupMu)
   result.nextVersion.store(1)
 
 proc routeToGroup*(primaryKey: string, groupIds: seq[uint64]): GroupID {.inline.} =
@@ -251,20 +253,18 @@ proc resolveGroupId*(store: RaftKVStoreExt, key: string): Option[GroupID] {.gcsa
       try:
         let (tableId, primaryKey) = decodeTableKey(key)
         if tableId >= FIRST_USER_TABLE_ID:
-          acquire(store.spacesMu)
-          let sid = store.tableSpaces.getOrDefault(tableId, 0)
-          if sid > 1 and store.spaces.hasKey(sid):
-            let space = store.spaces.getOrDefault(sid)
-            release(store.spacesMu)
-            # decodeTableKey returns "d/<pk>" for data rows; strip the
-            # "d/" prefix so we hash the same bare PK that raftPutInSpace
-            # and the SQL executor use.
-            let pk = if primaryKey.startsWith("d/"):
-                       primaryKey[2 .. ^1]
-                     else:
-                       primaryKey
-            return some(routeToGroup(pk, space.groupIds))
-          release(store.spacesMu)
+          withLock store.spacesMu:
+            let sid = store.tableSpaces.getOrDefault(tableId, 0)
+            if sid > 1 and store.spaces.hasKey(sid):
+              let space = store.spaces.getOrDefault(sid)
+              # decodeTableKey returns "d/<pk>" for data rows; strip the
+              # "d/" prefix so we hash the same bare PK that raftPutInSpace
+              # and the SQL executor use.
+              let pk = if primaryKey.startsWith("d/"):
+                         primaryKey[2 .. ^1]
+                       else:
+                         primaryKey
+              return some(routeToGroup(pk, space.groupIds))
       except:
         discard
   some(DATA_GROUP_START_ID)
@@ -298,9 +298,11 @@ proc loadGroupMembers*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
     {.cast(raises: []).}:
       entries = backend.scan(startKey, endKey)
 
-  store.groupMembers.clear()
-  store.preferredLeaders.clear()
-  store.groupLeaders.clear()
+  withLock store.groupMu:
+    store.groupMembers.clear()
+    store.preferredLeaders.clear()
+    store.groupLeaders.clear()
+
   for (k, v) in entries:
     {.cast(raises: []).}:
       try:
@@ -310,15 +312,17 @@ proc loadGroupMembers*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
         if j.hasKey("replicas"):
           for r in j["replicas"]:
             members.add(uint32(r["nodeId"].getInt()))
-        store.groupMembers[gid] = members
-        if j.hasKey("preferredLeader"):
-          let pl = uint32(j["preferredLeader"].getInt())
-          if pl > 0:
-            store.preferredLeaders[gid] = pl
-        if j.hasKey("leader"):
-          let ldr = uint32(j["leader"].getInt())
-          if ldr > 0:
-            store.groupLeaders[gid] = ldr
+        
+        withLock store.groupMu:
+          store.groupMembers[gid] = members
+          if j.hasKey("preferredLeader"):
+            let pl = uint32(j["preferredLeader"].getInt())
+            if pl > 0:
+              store.preferredLeaders[gid] = pl
+          if j.hasKey("leader"):
+            let ldr = uint32(j["leader"].getInt())
+            if ldr > 0:
+              store.groupLeaders[gid] = ldr
       except:
         discard
 
@@ -480,9 +484,10 @@ proc wireApplyCallback*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
             var memberIds: seq[uint32] = @[]
             for m in members:
               memberIds.add(m.nodeId)
-            s.groupMembers[gid] = memberIds
-            if preferredLeader > 0:
-              s.preferredLeaders[gid] = preferredLeader
+            withLock s.groupMu:
+              s.groupMembers[gid] = memberIds
+              if preferredLeader > 0:
+                s.preferredLeaders[gid] = preferredLeader
         except:
           discard
 
@@ -555,11 +560,11 @@ proc proposeWrite(store: RaftKVStoreExt, groupId: GroupID,
   let res = store.coordinator.proposeAndWait(groupId, cmd,
       store.proposeTimeout)
   if not res.success:
-    if res.error == "Not the leader":
+    if res.error == "Not the leader" or res.error.contains("code -3"):
       return rsVErr(newRSE(rseNotLeader, res.error))
     if res.error.len > 0 and res.error.contains("Group not found"):
       return rsVErr(newRSE(rseGroupNotFound, res.error))
-    if res.error.contains("Timeout"):
+    if res.error.contains("Timeout") or res.error.contains("code -2"):
       return rsVErr(newRSE(rseTimeout, res.error))
     return rsVErr(newRSE(rseInternal, res.error))
 
@@ -1147,13 +1152,14 @@ proc findLeaderForGroup(store: RaftKVStoreExt,
   ## Tries groupLeaders first, then falls back to groupMembers.
   let localNodeId = store.coordinator.nodeId.uint32
   var targetNode: uint32 = 0
-  targetNode = store.groupLeaders.getOrDefault(groupId, 0)
-  if targetNode == 0 or targetNode == localNodeId:
-    let members = store.groupMembers.getOrDefault(groupId, @[])
-    for nid in members:
-      if nid != localNodeId:
-        targetNode = nid
-        break
+  withLock store.groupMu:
+    targetNode = store.groupLeaders.getOrDefault(groupId, 0)
+    if targetNode == 0 or targetNode == localNodeId:
+      let members = store.groupMembers.getOrDefault(groupId, @[])
+      for nid in members:
+        if nid != localNodeId:
+          targetNode = nid
+          break
   if targetNode == 0 or targetNode == localNodeId:
     return none(NodeInfo)
   store.lookupNodeInfo(targetNode)
@@ -1271,8 +1277,9 @@ proc lookupNodeInfo*(store: RaftKVStoreExt,
     nodeId: uint32): Option[NodeInfo] {.gcsafe, raises: [].} =
   ## Look up a node's host and clientPort, using a cache to avoid repeated
   ## backend reads. Falls back to scanning sys.nodes in the local backend.
-  if store.nodeInfoCache.hasKey(nodeId):
-    return some(store.nodeInfoCache.getOrDefault(nodeId))
+  withLock store.groupMu:
+    if store.nodeInfoCache.hasKey(nodeId):
+      return some(store.nodeInfoCache.getOrDefault(nodeId))
   let backend = store.getBackend()
   if backend == nil or not backend.isOpen:
     return none(NodeInfo)
@@ -1286,7 +1293,8 @@ proc lookupNodeInfo*(store: RaftKVStoreExt,
         let port = j.getOrDefault("clientPort").getInt(0)
         if host != "" and port > 0:
           let info: NodeInfo = (host: host, clientPort: port)
-          store.nodeInfoCache[nodeId] = info
+          withLock store.groupMu:
+            store.nodeInfoCache[nodeId] = info
           return some(info)
     except:
       discard
@@ -1431,14 +1439,15 @@ proc raftScanSpace*(store: RaftKVStoreExt, startKey, endKey: string,
       # Need to scan a remote node for this group.
       # Prefer the known leader, fall back to any member.
       var targetNode: uint32 = 0
-      if store.groupLeaders.hasKey(groupId):
-        targetNode = store.groupLeaders[groupId]
-      if targetNode == 0 or targetNode == localNodeId:
-        let members = store.groupMembers.getOrDefault(groupId, @[])
-        for nid in members:
-          if nid != localNodeId:
-            targetNode = nid
-            break
+      withLock store.groupMu:
+        if store.groupLeaders.hasKey(groupId):
+          targetNode = store.groupLeaders[groupId]
+        if targetNode == 0 or targetNode == localNodeId:
+          let members = store.groupMembers.getOrDefault(groupId, @[])
+          for nid in members:
+            if nid != localNodeId:
+              targetNode = nid
+              break
       if targetNode != 0 and targetNode != localNodeId and
           targetNode notin remoteNodes:
         remoteNodes.add(targetNode)

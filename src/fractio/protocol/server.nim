@@ -29,6 +29,7 @@ import ./messages/cluster as clusterMsgs
 import ./txn_manager
 import ./raft_store
 import ../utils/logging
+import ../utils/socket_utils
 import ../distributed/sharedtimer
 import ../distributed/raft/nuraft_coordinator
 import ../distributed/raft/multigroup_types
@@ -1451,9 +1452,13 @@ proc addPeerToRaft*(server: ProtocolServer, peerNodeId: uint32,
   coord.peerInfo[peerNodeId] = (host: host, basePort: raftPort)
 
   # Add the peer as a server to all existing NuRaft groups
+  var gids: seq[GroupID]
   withLock coord.groupsLock:
-    for groupId, inst in coord.groups:
-      discard coord.addServerToGroup(groupId, peerNodeId, host, raftPort)
+    for gid in coord.groups.keys:
+      gids.add(gid)
+
+  for gid in gids:
+    discard coord.addServerToGroup(gid, peerNodeId, host, raftPort)
 
   # Persist membership so restarts can rejoin without --join
   server.saveClusterState()
@@ -1714,7 +1719,7 @@ proc start*(server: ProtocolServer) {.raises: [].} =
   var sock: Socket
   try:
     sock = newSocket()
-    sock.setSockOpt(OptReuseAddr, true)
+    sock.setLingerZero()
     sock.bindAddr(Port(server.config.port), server.config.host)
     sock.listen()
     server.logger.logInfo(
