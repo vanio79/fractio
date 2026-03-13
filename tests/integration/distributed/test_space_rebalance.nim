@@ -14,6 +14,7 @@ import std/[unittest, os, options, json, strutils, tables, hashes, algorithm,
     times, locks]
 import fractio/protocol/raft_store
 import fractio/protocol/server
+import fractio/protocol/types
 import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/group_types as rangeTypes
@@ -306,8 +307,7 @@ proc execOnLeader(nodes: seq[TestNode], sql: string): ExecResult =
     let r = exec(node.store, sql)
     if r.kind != erkError:
       return r
-    if "not leader" in r.error.toLower() or "Not the leader" in r.error or
-        "0x07000001" in r.error:
+    if isNotLeaderError(r.error):
       continue
     return r
   exec(nodes[^1].store, sql)

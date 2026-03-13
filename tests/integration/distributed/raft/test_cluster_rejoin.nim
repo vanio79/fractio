@@ -11,6 +11,7 @@
 
 import unittest
 import std/[os, osproc, strutils, json, httpclient, times, strformat, posix]
+import fractio/protocol/types
 
 const
   BinaryPath = "bin/fractio_web"
@@ -162,10 +163,9 @@ proc tryInsert(nodes: openArray[TestNode]; sql: string;
         if res.getOrDefault("kind").getStr("") != "error":
           return res
         let err = res.getOrDefault("error").getStr("")
-        let errLower = err.toLowerAscii
-        if "leader" notin errLower and "0x07000001" notin errLower and "code -3" notin errLower:
+        if not isNotLeaderError(err):
           echo "tryInsert encountered real error: ", err
-          return res  # A real error, not just "not the leader"
+          return res # A real error, not just "not the leader"
       except CatchableError:
         continue
     sleep(500)
@@ -359,13 +359,13 @@ suite "Cluster Dynamic Join and Node Restart":
     let j1 = parseJson(readFile(nodeDataDir(1) / "cluster.json"))
     let peers1 = j1["peers"]
     check peers1.kind == JArray
-    check peers1.len >= 1  # At least node 2
+    check peers1.len >= 1 # At least node 2
 
     # Verify cluster.json content for node 2
     let j2 = parseJson(readFile(nodeDataDir(2) / "cluster.json"))
     let peers2 = j2["peers"]
     check peers2.kind == JArray
-    check peers2.len >= 1  # At least node 1
+    check peers2.len >= 1 # At least node 1
 
   test "multiple kill-restart cycles":
     ## Verify a node can be killed and restarted multiple times.

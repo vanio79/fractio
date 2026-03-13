@@ -1,7 +1,7 @@
 # Protocol types, constants, and error definitions for Fractio client/server protocol.
 # All types here are value objects (no GC refs) so they can be safely shared across threads.
 
-import std/strformat
+import std/[strformat, strutils]
 
 # ---------------------------------------------------------------------------
 # Protocol version
@@ -117,8 +117,26 @@ const
   ErrNotLeader* = 0x07000001'u32
   ErrClusterDown* = 0x07000002'u32
   ErrOverloaded* = 0x07000003'u32
-  ErrInternal* = 0x07000004'u32 ## Phase 5: internal/unexpected server error
+  ErrInternal* = 0x07000004'u32   ## Phase 5: internal/unexpected server error
   ErrBadRouting* = 0x07000005'u32 ## Key does not hash to the specified group
+
+# ---------------------------------------------------------------------------
+# Error checking helpers
+# ---------------------------------------------------------------------------
+
+proc isNotLeaderError*(errorMsg: string): bool {.inline.} =
+  ## Check if an error message indicates a "not leader" error.
+  ## Handles wire error codes, string messages, and NuRaft internal codes.
+  let msgLower = errorMsg.toLowerAscii()
+  if "not leader" in msgLower or "not the leader" in msgLower:
+    return true
+  # Check wire error code format (e.g., "server error 0x07000001")
+  if "0x07000001" in errorMsg:
+    return true
+  # NuRaft internal error code
+  if "code -3" in errorMsg:
+    return true
+  false
 
 # Wire-level error categories
 const

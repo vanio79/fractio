@@ -24,6 +24,7 @@ import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
 import fractio/protocol/raft_store
 import fractio/protocol/server
+import fractio/protocol/types
 import fractio/storage/wisckey_backend
 import fractio/sql/executor
 
@@ -34,7 +35,7 @@ import fractio/sql/executor
 const
   TMP_DIR = "/tmp/fractio_space_mn_"
 
-var nextClientPort = 19200  ## incremented per node to avoid port conflicts between tests
+var nextClientPort = 19200 ## incremented per node to avoid port conflicts between tests
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -42,7 +43,7 @@ var nextClientPort = 19200  ## incremented per node to avoid port conflicts betw
 
 type
   TestNode = object
-    id*: int                       ## 1-based node number
+    id*: int ## 1-based node number
     basePort*: int
     clientPort*: int
     server*: ProtocolServer
@@ -54,7 +55,8 @@ proc cleanDir(p: string) =
   try: removeDir(p) except CatchableError: discard
 
 proc makeNode(nodeNum: int, basePort: int,
-    members: seq[tuple[nodeId: uint32, host: string, basePort: int]]): TestNode =
+    members: seq[tuple[nodeId: uint32, host: string,
+        basePort: int]]): TestNode =
   let nodeId = rangeTypes.NodeID(uint32(nodeNum))
   let cPort = nextClientPort
   nextClientPort += 1
@@ -73,7 +75,7 @@ proc makeNode(nodeNum: int, basePort: int,
     electionTimeoutUpperMs: 400,
     heartbeatIntervalMs: 100,
   ))
-  
+
   for m in members:
     coord.peerInfo[m.nodeId] = (host: m.host, basePort: m.basePort)
 
@@ -150,10 +152,11 @@ proc seedDefaults(leaderStore: RaftKVStoreExt) =
   let dbKey = encodeTableKey(SYS_DATABASES_TABLE_ID, "default")
   discard leaderStore.raftPut(dbKey, $ %*{"name": "default"})
   let scKey = encodeTableKey(SYS_SCHEMAS_TABLE_ID, "default.public")
-  discard leaderStore.raftPut(scKey, $ %*{"name": "public", "database": "default"})
+  discard leaderStore.raftPut(scKey, $ %*{"name": "public",
+      "database": "default"})
 
-proc waitForAutoDistribution(nodes: seq[TestNode], expectedGroupIds: seq[uint64],
-    replicaCount: int, maxWaitMs: int = 5000) =
+proc waitForAutoDistribution(nodes: seq[TestNode], expectedGroupIds: seq[
+    uint64], replicaCount: int, maxWaitMs: int = 5000) =
   ## Wait for the onGroupMetadataApplied callback to create space groups on
   ## all peer nodes. Polls until the expected total membership count is reached
   ## or the timeout expires.
@@ -203,7 +206,7 @@ proc distributeSpaceGroups(nodes: seq[TestNode], replicaCount: int = 3) =
 proc reelectLeaders(nodes: seq[TestNode], deadNodeIds: seq[int]) =
   ## After killing nodes, wait for NuRaft to re-elect leaders on surviving nodes.
   ## NuRaft handles this automatically, but we may need to wait for timeouts.
-  sleep(1000)  # Allow NuRaft election timeouts to fire
+  sleep(1000) # Allow NuRaft election timeouts to fire
 
 proc exec(store: RaftKVStoreExt, sql: string): ExecResult =
   executeSQL(sql, store, "default", "public")
@@ -236,7 +239,7 @@ proc execOnLeader(nodes: seq[TestNode], sql: string): ExecResult =
     let r = exec(node.store, sql)
     if r.kind != erkError:
       return r
-    if "not leader" in r.error.toLower() or "Not the leader" in r.error or "0x07000001" in r.error:
+    if isNotLeaderError(r.error):
       continue
     return r
   exec(nodes[^1].store, sql)
