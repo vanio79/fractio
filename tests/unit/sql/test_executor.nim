@@ -234,7 +234,7 @@ suite "SQL Executor — DML":
     let res = exec(store, "SELECT * FROM users WHERE id = 1")
     check res.kind == erkRows
     check res.rows.len == 1
-    check res.rows[0][1] == "Alice"  # name column
+    check res.rows[0][1] == "Alice" # name column
 
   test "SELECT with filter":
     discard exec(store,
@@ -246,7 +246,7 @@ suite "SQL Executor — DML":
 
     let res = exec(store, "SELECT * FROM users WHERE age > 28")
     check res.kind == erkRows
-    check res.rows.len == 2  # Alice (30) and Carol (35)
+    check res.rows.len == 2 # Alice (30) and Carol (35)
 
   test "SELECT with LIMIT":
     discard exec(store,
@@ -294,7 +294,7 @@ suite "SQL Executor — DML":
     # Verify the update
     let sel = exec(store, "SELECT * FROM users WHERE id = 1")
     check sel.kind == erkRows
-    check sel.rows[0][2] == "31"  # age column
+    check sel.rows[0][2] == "31" # age column
 
   test "UPDATE all rows (no WHERE)":
     discard exec(store,
@@ -350,17 +350,17 @@ suite "SQL Executor — Transactions":
   test "BEGIN returns OK":
     let res = exec(store, "BEGIN")
     check res.kind == erkOk
-    check res.okMessage == "BEGIN"
+    check res.okMessage == "BEGIN (auto-commit mode)"
 
   test "COMMIT returns OK":
     let res = exec(store, "COMMIT")
     check res.kind == erkOk
-    check res.okMessage == "COMMIT"
+    check res.okMessage == "COMMIT (auto-commit mode)"
 
   test "ROLLBACK returns OK":
     let res = exec(store, "ROLLBACK")
     check res.kind == erkOk
-    check res.okMessage == "ROLLBACK"
+    check res.okMessage == "ROLLBACK (auto-commit mode)"
 
 
 suite "SQL Executor — SHOW statements":
@@ -630,20 +630,20 @@ suite "SQL Executor — Expression evaluation":
     let res = exec(store,
         "SELECT * FROM items WHERE qty > 0 AND active = true")
     check res.kind == erkRows
-    check res.rows.len == 2  # apple and cherry
+    check res.rows.len == 2 # apple and cherry
 
   test "WHERE with OR":
     let res = exec(store,
         "SELECT * FROM items WHERE qty = 0 OR qty = 10")
     check res.kind == erkRows
-    check res.rows.len == 2  # apple and banana
+    check res.rows.len == 2 # apple and banana
 
   test "WHERE with comparison operators":
     var res = exec(store, "SELECT * FROM items WHERE qty >= 5")
-    check res.rows.len == 2  # apple (10) and cherry (5)
+    check res.rows.len == 2 # apple (10) and cherry (5)
 
     res = exec(store, "SELECT * FROM items WHERE qty <= 5")
-    check res.rows.len == 2  # banana (0) and cherry (5)
+    check res.rows.len == 2 # banana (0) and cherry (5)
 
 
 suite "SQL Executor — EXPLAIN":
