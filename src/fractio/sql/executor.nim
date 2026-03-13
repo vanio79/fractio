@@ -13,6 +13,7 @@ import ../core/types as coreTypes
 import ../distributed/raft/nuraft_coordinator
 import ../distributed/raft/group_types as rangeTypes
 import ../distributed/raft/multigroup_types
+import ../utils/logging
 
 # ---------------------------------------------------------------------------
 # Result types
@@ -20,18 +21,18 @@ import ../distributed/raft/multigroup_types
 
 type
   ExecResultKind* = enum
-    erkRows         ## SELECT results
-    erkModified     ## INSERT/UPDATE/DELETE affected rows
-    erkOk           ## DDL success
-    erkError        ## Error
-    erkUseDatabase  ## USE DATABASE — caller should update session context
-    erkUseSchema    ## USE SCHEMA — caller should update session context
+    erkRows        ## SELECT results
+    erkModified    ## INSERT/UPDATE/DELETE affected rows
+    erkOk          ## DDL success
+    erkError       ## Error
+    erkUseDatabase ## USE DATABASE — caller should update session context
+    erkUseSchema   ## USE SCHEMA — caller should update session context
 
   ExecResult* = ref object
     case kind*: ExecResultKind
     of erkRows:
       columns*: seq[string]
-      rows*: seq[seq[string]]  # each row is column values as strings
+      rows*: seq[seq[string]] # each row is column values as strings
     of erkModified:
       count*: int
       message*: string
@@ -428,7 +429,7 @@ proc execScan(op: PlanOp, store: RaftKVStoreExt): ExecResult =
         if op.scLimit > 0 and count >= int(op.scLimit):
           break
     except JsonParsingError:
-      discard  # skip malformed rows
+      discard # skip malformed rows
 
   rowsResult(op.scColumns, resultRows)
 
@@ -454,7 +455,8 @@ proc execUpdate(op: PlanOp, store: RaftKVStoreExt): ExecResult =
           updated[col] = evalExpr(valExpr, row)
         let pkVal = getPkValue(updated, op.upPkColumn)
         if spaceOpt.isSome and pkVal.len > 0:
-          let putRes = store.raftPutInSpace(key, $updated, spaceOpt.get(), pkVal)
+          # During rebalancing, write to BOTH old and new groups
+          let putRes = store.raftPutInSpaceBoth(key, $updated, spaceOpt.get(), pkVal)
           if not putRes.isOk:
             return errorResult(&"failed to update row: {putRes.error.msg}")
         else:
@@ -625,7 +627,8 @@ proc execCreateSpace(op: PlanOp, store: RaftKVStoreExt): ExecResult =
   # Count nodes in the cluster
   let nodesStart = encodeTableKey(SYS_NODES_TABLE_ID, "")
   let nodesEnd = encodeTableKey(SYS_NODES_TABLE_ID + 1, "")
-  let nodesRes = store.raftScan(nodesStart, nodesEnd, 0, includeSystemKeys = true)
+  let nodesRes = store.raftScan(nodesStart, nodesEnd, 0,
+      includeSystemKeys = true)
   var nodeCount = 0
   var nodeIds: seq[int] = @[]
   if nodesRes.isOk:
@@ -655,7 +658,8 @@ proc execCreateSpace(op: PlanOp, store: RaftKVStoreExt): ExecResult =
   # Find max existing groupId to allocate new ones
   let rangesStart = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
   let rangesEnd = encodeTableKey(SYS_GROUPS_TABLE_ID + 1, "")
-  let rangesRes = store.raftScan(rangesStart, rangesEnd, 0, includeSystemKeys = true)
+  let rangesRes = store.raftScan(rangesStart, rangesEnd, 0,
+      includeSystemKeys = true)
   var maxGroupId: uint64 = 1
   if rangesRes.isOk:
     for (key, entry) in rangesRes.value:
@@ -695,14 +699,24 @@ proc execCreateSpace(op: PlanOp, store: RaftKVStoreExt): ExecResult =
     let coord = store.coordinator
     let gid = GroupID(uint64(groupId))
     if not coord.hasGroup(gid):
-      var nuraftMembers: seq[tuple[nodeId: uint32, host: string, basePort: int]] = @[]
+      var nuraftMembers: seq[tuple[nodeId: uint32, host: string,
+          basePort: int]] = @[]
       for m in members:
         let peerInfo = coord.peerInfo.getOrDefault(uint32(m),
             (host: coord.host, basePort: coord.basePort))
         nuraftMembers.add((nodeId: uint32(m), host: peerInfo.host,
             basePort: peerInfo.basePort))
-      discard coord.createAndStartGroup(gid, nuraftMembers)
-      store.registerGroup(gid)
+      let ok = coord.createAndStartGroup(gid, nuraftMembers)
+      if ok:
+        store.registerGroup(gid)
+      else:
+        # Log but don't fail - peer nodes will create groups via callback
+        try:
+          {.cast(gcsafe).}:
+            warn("Failed to create local Raft group during CREATE SPACE",
+                 {"groupId": $groupId, "nodeId": $coord.nodeId.uint32}.toTable)
+        except:
+          discard
 
   # Write space record
   let spaceKey = encodeSpaceKey(spaceId)
@@ -794,27 +808,27 @@ proc execute*(plan: Plan, store: RaftKVStoreExt,
   for op in plan.ops:
     lastResult = case op.kind
     of poCreateDatabase: execCreateDatabase(op, store)
-    of poDropDatabase:   execDropDatabase(op, store)
-    of poCreateSchema:   execCreateSchema(op, store)
-    of poDropSchema:     execDropSchema(op, store)
-    of poCreateTable:    execCreateTable(op, store)
-    of poDropTable:      execDropTable(op, store)
-    of poInsert:         execInsert(op, store)
-    of poPointGet:       execPointGet(op, store)
-    of poScan:           execScan(op, store)
-    of poUpdate:         execUpdate(op, store)
-    of poDelete:         execDelete(op, store)
-    of poShowDatabases:  execShowDatabases(op, store)
-    of poShowSchemas:    execShowSchemas(op, store)
-    of poShowTables:     execShowTables(op, store)
-    of poShowSpaces:     execShowSpaces(op, store)
-    of poCreateSpace:    execCreateSpace(op, store)
-    of poDropSpace:      execDropSpace(op, store)
-    of poUseDatabase:    execUseDatabase(op, store)
-    of poUseSchema:      execUseSchema(op, store, database)
-    of poBeginTxn:       okResult("BEGIN")
-    of poCommitTxn:      okResult("COMMIT")
-    of poRollbackTxn:    okResult("ROLLBACK")
+    of poDropDatabase: execDropDatabase(op, store)
+    of poCreateSchema: execCreateSchema(op, store)
+    of poDropSchema: execDropSchema(op, store)
+    of poCreateTable: execCreateTable(op, store)
+    of poDropTable: execDropTable(op, store)
+    of poInsert: execInsert(op, store)
+    of poPointGet: execPointGet(op, store)
+    of poScan: execScan(op, store)
+    of poUpdate: execUpdate(op, store)
+    of poDelete: execDelete(op, store)
+    of poShowDatabases: execShowDatabases(op, store)
+    of poShowSchemas: execShowSchemas(op, store)
+    of poShowTables: execShowTables(op, store)
+    of poShowSpaces: execShowSpaces(op, store)
+    of poCreateSpace: execCreateSpace(op, store)
+    of poDropSpace: execDropSpace(op, store)
+    of poUseDatabase: execUseDatabase(op, store)
+    of poUseSchema: execUseSchema(op, store, database)
+    of poBeginTxn: okResult("BEGIN")
+    of poCommitTxn: okResult("COMMIT")
+    of poRollbackTxn: okResult("ROLLBACK")
     of poExplain:
       let text = formatPlan(op.exInnerPlan)
       var rows: seq[seq[string]]
