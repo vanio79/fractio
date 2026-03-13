@@ -710,10 +710,11 @@ proc execCreateSpace(op: PlanOp, store: RaftKVStoreExt): ExecResult =
       if ok:
         store.registerGroup(gid)
       else:
-        # Log but don't fail - peer nodes will create groups via callback
+        # This is expected when this node is not a member of the group.
+        # Peer nodes that ARE members will create the group via onGroupMetadataApplied callback.
         try:
           {.cast(gcsafe).}:
-            warn("Failed to create local Raft group during CREATE SPACE",
+            debug("Skipped creating group (not a member or already exists)",
                  {"groupId": $groupId, "nodeId": $coord.nodeId.uint32}.toTable)
         except:
           discard

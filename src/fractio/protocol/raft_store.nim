@@ -551,9 +551,10 @@ proc wireApplyCallback*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
               if ok:
                 s.registerGroup(gid)
               else:
+                # This is a real error - we ARE a member but couldn't create the group
                 try:
                   {.cast(gcsafe).}:
-                    error("Failed to create group via callback",
+                    error("Failed to create group (member node, possible port conflict)",
                           {"groupId": $gid.uint64,
                               "nodeId": $coord.nodeId.uint32}.toTable)
                 except:
