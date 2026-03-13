@@ -85,6 +85,8 @@ proc nuraftParamsSetAutoForwarding*(params: NuRaftParams,
     enabled: bool) {.importc: "nuraft_params_set_auto_forwarding".}
 proc nuraftParamsSetMaxAppendSize*(params: NuRaftParams,
     size: int32) {.importc: "nuraft_params_set_max_append_size".}
+proc nuraftParamsSetLeadershipTransferMinWaitTime*(params: NuRaftParams,
+    ms: int32) {.importc: "nuraft_params_set_leadership_transfer_min_wait_time".}
 
 # ============================================
 # State Machine
@@ -143,10 +145,15 @@ proc nuraftServerRemoveSrv*(server: NuRaftServer,
 proc nuraftServerSetPriority*(server: NuRaftServer, srvId: int32,
     priority: int32): int32 {.importc: "nuraft_server_set_priority".}
 proc nuraftServerYieldLeadership*(
-    server: NuRaftServer) {.importc: "nuraft_server_yield_leadership".}
+    server: NuRaftServer, immediateYield: bool, successorId: int32) {.importc: "nuraft_server_yield_leadership".}
 proc nuraftServerGetTerm*(
     server: NuRaftServer): uint64 {.importc: "nuraft_server_get_term".}
 proc nuraftServerGetCommittedLogIdx*(
     server: NuRaftServer): uint64 {.importc: "nuraft_server_get_committed_log_idx".}
+proc nuraftServerGetLastLogIdx*(
+    server: NuRaftServer): uint64 {.importc: "nuraft_server_get_last_log_idx".}
+proc nuraftServerGetSrvLastMatchIdx*(
+    server: NuRaftServer, srvId: int32): uint64 {.importc: "nuraft_server_get_srv_last_match_idx".}
 proc nuraftServerIsInitialized*(
+
     server: NuRaftServer): bool {.importc: "nuraft_server_is_initialized".}

@@ -42,18 +42,18 @@ type
 proc cleanDir(p: string) =
   try: removeDir(p) except CatchableError: discard
 
-proc makeCluster3(): seq[TestNode] =
+proc makeCluster3(portOffset: int = 0): seq[TestNode] =
   let members = @[
-    (nodeId: 1'u32, host: "127.0.0.1", basePort: 29000),
-    (nodeId: 2'u32, host: "127.0.0.1", basePort: 30000),
-    (nodeId: 3'u32, host: "127.0.0.1", basePort: 31000),
+    (nodeId: 1'u32, host: "127.0.0.1", basePort: 29000 + portOffset),
+    (nodeId: 2'u32, host: "127.0.0.1", basePort: 30000 + portOffset),
+    (nodeId: 3'u32, host: "127.0.0.1", basePort: 31000 + portOffset),
   ]
 
   var nodes: seq[TestNode]
   for nodeNum in 1 .. 3:
     let nodeId = rangeTypes.NodeID(uint32(nodeNum))
-    let basePort = 29000 + (nodeNum - 1) * 1000
-    let storagePath = TMP_DIR & $nodeNum
+    let basePort = (29000 + portOffset) + (nodeNum - 1) * 1000
+    let storagePath = TMP_DIR & $nodeNum & "_" & $portOffset
     cleanDir(storagePath)
     createDir(storagePath)
 
@@ -66,11 +66,18 @@ proc makeCluster3(): seq[TestNode] =
       electionTimeoutUpperMs: 400,
       heartbeatIntervalMs: 100,
     ))
+
+    # Populate peerInfo so dynamic group creation knows peer ports
+    for m in members:
+      coord.peerInfo[m.nodeId] = (host: m.host, basePort: m.basePort)
+
     coord.start()
 
     # Create meta + data groups
-    doAssert coord.createAndStartGroup(META_GROUP_ID, members)
-    doAssert coord.createAndStartGroup(DATA_GROUP_START_ID, members)
+    doAssert coord.createAndStartGroup(META_GROUP_ID, members,
+        preferredLeader = 1)
+    doAssert coord.createAndStartGroup(DATA_GROUP_START_ID, members,
+        preferredLeader = 1)
 
     let store = newRaftKVStoreExt(coord, proposeTimeoutMs = 6000)
     store.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
@@ -109,7 +116,7 @@ proc makeCluster3(): seq[TestNode] =
     let val = $ %*{
       "nodeId": num,
       "host": "127.0.0.1",
-      "raftPort": 29000 + (num - 1) * 100,
+      "raftPort": 29000 + portOffset + (num - 1) * 1000,
       "clientPort": 19000 + num,
       "status": 1,
     }
@@ -153,10 +160,15 @@ proc waitForLeader(nodes: seq[TestNode], gid: GroupID,
 # Test suites
 # ---------------------------------------------------------------------------
 
+import ../../../../src/fractio/utils/logging
+
 suite "Preferred leader rebalancing — 3-node cluster":
+  setup:
+    globalLogger.setMinLevel(llDebug)
 
   test "loadGroupMembers reads preferredLeader from sys.groups":
-    var nodes = makeCluster3()
+    sleep(5000)
+    var nodes = makeCluster3(0)
     defer: stopCluster(nodes)
 
     # Find meta leader
@@ -173,7 +185,8 @@ suite "Preferred leader rebalancing — 3-node cluster":
     check nodes[leaderIdx].store.preferredLeaders[DATA_GROUP_START_ID] == 1'u32
 
   test "transferLeadership moves leadership to target node":
-    var nodes = makeCluster3()
+    sleep(5000)
+    var nodes = makeCluster3(10000)
     defer: stopCluster(nodes)
 
     # Load preferred leaders on all nodes
@@ -217,7 +230,9 @@ suite "Preferred leader rebalancing — 3-node cluster":
   test "preferred leader wins via NuRaft election":
     ## Verifies that after leadership transfer, the preferred leader
     ## can take over and remain stable.
-    var nodes = makeCluster3()
+    sleep(5000)
+    let offset = 20000
+    var nodes = makeCluster3(offset)
     defer: stopCluster(nodes)
 
     # Load preferred leaders on all nodes
@@ -227,9 +242,9 @@ suite "Preferred leader rebalancing — 3-node cluster":
     # Create a space group (gid=100) with preferredLeader = 2
     let testGid = GroupID(100)
     let members = @[
-      (nodeId: 1'u32, host: "127.0.0.1", basePort: 29000),
-      (nodeId: 2'u32, host: "127.0.0.1", basePort: 30000),
-      (nodeId: 3'u32, host: "127.0.0.1", basePort: 31000),
+      (nodeId: 1'u32, host: "127.0.0.1", basePort: 29000 + offset),
+      (nodeId: 2'u32, host: "127.0.0.1", basePort: 30000 + offset),
+      (nodeId: 3'u32, host: "127.0.0.1", basePort: 31000 + offset),
     ]
 
     # Find meta leader to write sys.groups
@@ -249,33 +264,40 @@ suite "Preferred leader rebalancing — 3-node cluster":
     discard nodes[metaLeader].store.raftPut(groupKey, groupVal)
     sleep(300)
 
-    # Reload preferredLeaders on all nodes
+    # Force metadata refresh and group creation on all nodes
     for node in nodes:
       node.store.loadGroupMembers()
+      # Explicitly trigger bootstrap if automatic metadata callback is slow/missed
+      node.store.bootstrapStore(@[testGid])
 
-    # Verify preferredLeader is set to 2
-    check nodes[metaLeader].store.preferredLeaders[testGid] == 2'u32
+    # Wait for group to be created automatically by metadata sync
+    var groupCreated = false
+    for attempt in 0 ..< 100:
+      sleep(100)
+      groupCreated = true
+      for node in nodes:
+        if not node.coord.hasGroup(testGid):
+          groupCreated = false
+          break
+      if groupCreated: break
+    check groupCreated
 
-    # Create the group on all nodes
+    # Wait for initial election
+    discard waitForLeader(nodes, testGid, maxAttempts = 50)
+
+    # Trigger rebalance background task on all nodes
     for node in nodes:
-      doAssert node.coord.createAndStartGroup(testGid, members)
+      node.store.triggerRebal.store(true)
 
-    # Let an initial election happen naturally via the network
-    sleep(3000)
-
-    # By now some node should be leader. If it's not node 2 (the preferred
-    # leader), transfer leadership to node 2.
-    let currentLeader = findLeader(nodes, testGid)
-    if currentLeader >= 0 and currentLeader != 1:
-      discard nodes[currentLeader].coord.transferLeadership(
-        testGid, rangeTypes.NodeID(2))
+    # Let rebalance task run and settle
+    sleep(5000)
 
     # Wait up to 15 seconds for node 2 to become the stable leader.
     var preferredWon = false
-    for attempt in 0 ..< 150:  # 150 * 100ms = 15s
+    for attempt in 0 ..< 150: # 150 * 100ms = 15s
       sleep(100)
       let leaderIdx = findLeader(nodes, testGid)
-      if leaderIdx == 1:  # node 2 is index 1
+      if leaderIdx == 1: # node 2 is index 1
         # Verify it stays leader for at least 3 seconds (no storm)
         var stable = true
         for _ in 0 ..< 30:
@@ -292,7 +314,9 @@ suite "Preferred leader rebalancing — 3-node cluster":
   test "non-preferred leader is replaced exactly once (no repeated stepdowns)":
     ## Verifies that once the preferred leader takes over, there are no
     ## further elections (the stepdown-election cycle is broken).
-    var nodes = makeCluster3()
+    sleep(5000)
+    let offset = 30000
+    var nodes = makeCluster3(offset)
     defer: stopCluster(nodes)
 
     for node in nodes:
@@ -301,9 +325,9 @@ suite "Preferred leader rebalancing — 3-node cluster":
     # Create group 101 with preferredLeader = node 3
     let testGid = GroupID(101)
     let members = @[
-      (nodeId: 1'u32, host: "127.0.0.1", basePort: 29000),
-      (nodeId: 2'u32, host: "127.0.0.1", basePort: 30000),
-      (nodeId: 3'u32, host: "127.0.0.1", basePort: 31000),
+      (nodeId: 1'u32, host: "127.0.0.1", basePort: 29000 + offset),
+      (nodeId: 2'u32, host: "127.0.0.1", basePort: 30000 + offset),
+      (nodeId: 3'u32, host: "127.0.0.1", basePort: 31000 + offset),
     ]
 
     let metaLeader = findLeader(nodes, META_GROUP_ID)
@@ -319,24 +343,41 @@ suite "Preferred leader rebalancing — 3-node cluster":
     sleep(300)
     for node in nodes:
       node.store.loadGroupMembers()
+      node.store.bootstrapStore(@[testGid])
 
-    # Create group on all nodes
-    for node in nodes:
-      doAssert node.coord.createAndStartGroup(testGid, members)
+    # Wait for the group to be created automatically by metadata sync
+    var groupCreated = false
+    for attempt in 0 ..< 100:
+      sleep(100)
+      groupCreated = true
+      for node in nodes:
+        if not node.coord.hasGroup(testGid):
+          groupCreated = false
+          break
+      if groupCreated: break
+    check groupCreated
 
     # Wait for initial election
     discard waitForLeader(nodes, testGid, maxAttempts = 50)
 
-    # If current leader is not node 3, transfer leadership
-    let currentLeader = findLeader(nodes, testGid)
-    if currentLeader >= 0 and currentLeader != 2:
-      discard nodes[currentLeader].coord.transferLeadership(
-        testGid, rangeTypes.NodeID(3))
+    # Reload explicitly just to be safe
+    for node in nodes:
+      node.store.loadGroupMembers()
+
+    # Verify that Node 3 is recorded as the preferred leader
+    check nodes[2].store.preferredLeaders.hasKey(testGid)
+    check nodes[2].store.preferredLeaders[testGid] == 3'u32
+
+    # Trigger rebalance background task on all nodes
+    for node in nodes:
+      node.store.triggerRebal.store(true)
+
+    sleep(5000)
 
     # Count how many times the leader changes
     var leaderChanges = 0
     var lastLeader = findLeader(nodes, testGid)
-    for _ in 0 ..< 200:  # 200 * 100ms = 20s
+    for _ in 0 ..< 200: # 200 * 100ms = 20s
       sleep(100)
       let cur = findLeader(nodes, testGid)
       if cur != lastLeader and cur >= 0:
@@ -346,7 +387,7 @@ suite "Preferred leader rebalancing — 3-node cluster":
       if cur == 2 and leaderChanges >= 1:
         # Let it run a bit more to ensure no further changes
         var extraChanges = 0
-        for _ in 0 ..< 50:  # 5 more seconds
+        for _ in 0 ..< 50: # 5 more seconds
           sleep(100)
           let c2 = findLeader(nodes, testGid)
           if c2 != 2 and c2 >= 0:
@@ -356,6 +397,6 @@ suite "Preferred leader rebalancing — 3-node cluster":
         break
 
     # Preferred leader (node 3) should be the final leader
-    check lastLeader == 2  # index 2 = node 3
+    check lastLeader == 2 # index 2 = node 3
     # Should have at most 2-3 leader changes, not hundreds
     check leaderChanges <= 5

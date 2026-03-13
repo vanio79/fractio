@@ -10,7 +10,8 @@
 # Port allocation: 28000–28299 (NuRaft ASIO, basePort per node spaced by 100)
 # Temp storage: /tmp/fractio_rebal_<nodeId>/ (cleaned up per test)
 
-import std/[unittest, os, options, json, strutils, tables, hashes, algorithm, times, locks]
+import std/[unittest, os, options, json, strutils, tables, hashes, algorithm,
+    times, locks]
 import fractio/protocol/raft_store
 import fractio/protocol/server
 import fractio/distributed/raft/nuraft_coordinator
@@ -27,7 +28,7 @@ import fractio/sql/executor
 const
   TMP_DIR = "/tmp/fractio_rebal_"
 
-var nextClientPort = 19100  ## incremented per node to avoid port conflicts between tests
+var nextClientPort = 19100 ## incremented per node to avoid port conflicts between tests
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -47,7 +48,8 @@ proc cleanDir(p: string) =
   try: removeDir(p) except CatchableError: discard
 
 proc makeNode(nodeNum: int, basePort: int,
-    members: seq[tuple[nodeId: uint32, host: string, basePort: int]]): TestNode =
+    members: seq[tuple[nodeId: uint32, host: string,
+        basePort: int]]): TestNode =
   let nodeId = rangeTypes.NodeID(uint32(nodeNum))
   let cPort = nextClientPort
   nextClientPort += 1
@@ -66,7 +68,7 @@ proc makeNode(nodeNum: int, basePort: int,
     electionTimeoutUpperMs: 400,
     heartbeatIntervalMs: 100,
   ))
-  
+
   # Populate peerInfo so dynamic group creation knows peer ports
   for m in members:
     coord.peerInfo[m.nodeId] = (host: m.host, basePort: m.basePort)
@@ -82,7 +84,8 @@ proc makeNode(nodeNum: int, basePort: int,
         break
       sleep(200)
     if not success:
-      raise newException(AssertionDefect, "Failed to create group " & $gid & " for node " & $nodeNum)
+      raise newException(AssertionDefect, "Failed to create group " & $gid &
+          " for node " & $nodeNum)
 
   let store = newRaftKVStoreExt(coord, proposeTimeoutMs = 6000)
   store.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
@@ -151,8 +154,8 @@ proc seedDefaults(leaderStore: RaftKVStoreExt) =
     $ %*{"spaceId": 1, "name": "default", "replicas": 0,
          "groupCount": 1, "groupIds": [1]})
 
-proc waitForAutoDistribution(nodes: seq[TestNode], expectedGroupIds: seq[uint64],
-    replicaCount: int, maxWaitMs: int = 3000) =
+proc waitForAutoDistribution(nodes: seq[TestNode], expectedGroupIds: seq[
+    uint64], replicaCount: int, maxWaitMs: int = 3000) =
   let expectedTotal = expectedGroupIds.len * replicaCount
   let stepMs = 50
   var waited = 0
@@ -234,8 +237,10 @@ proc addNodeToCluster(nodes: var seq[TestNode], newNodeNum: int) =
   # Build members list including all existing + new
   var allMembers: seq[tuple[nodeId: uint32, host: string, basePort: int]]
   for n in nodes:
-    allMembers.add((nodeId: uint32(n.id), host: "127.0.0.1", basePort: n.basePort))
-  allMembers.add((nodeId: uint32(newNodeNum), host: "127.0.0.1", basePort: newBasePort))
+    allMembers.add((nodeId: uint32(n.id), host: "127.0.0.1",
+        basePort: n.basePort))
+  allMembers.add((nodeId: uint32(newNodeNum), host: "127.0.0.1",
+      basePort: newBasePort))
 
   let newNode = makeNode(newNodeNum, newBasePort, allMembers)
   startNode(newNode)
@@ -265,7 +270,8 @@ proc stopCluster(nodes: seq[TestNode]) =
 proc findSpaceId(leaderStore: RaftKVStoreExt, spaceName: string): int =
   let spacesStart = encodeTableKey(SYS_SPACES_TABLE_ID, "")
   let spacesEnd = encodeTableKey(SYS_SPACES_TABLE_ID + 1, "")
-  let sr = leaderStore.raftScan(spacesStart, spacesEnd, 0, includeSystemKeys = true)
+  let sr = leaderStore.raftScan(spacesStart, spacesEnd, 0,
+      includeSystemKeys = true)
   if sr.isOk:
     for (k, entry) in sr.value:
       try:
@@ -300,7 +306,8 @@ proc execOnLeader(nodes: seq[TestNode], sql: string): ExecResult =
     let r = exec(node.store, sql)
     if r.kind != erkError:
       return r
-    if "not leader" in r.error.toLower() or "Not the leader" in r.error or "0x07000001" in r.error:
+    if "not leader" in r.error.toLower() or "Not the leader" in r.error or
+        "0x07000001" in r.error:
       continue
     return r
   exec(nodes[^1].store, sql)
@@ -330,7 +337,8 @@ proc insertRows(nodes: seq[TestNode], spaceName: string, rowCount: int) =
     let insRes = execOnLeader(nodes,
       "INSERT INTO " & spaceName & "_t (id, val) VALUES (" & $i & ", 'v" & $i & "')")
     doAssert insRes.kind == erkModified,
-      "INSERT failed row " & $i & ": " & (if insRes.kind == erkError: insRes.error else: "?")
+      "INSERT failed row " & $i & ": " & (if insRes.kind ==
+          erkError: insRes.error else: "?")
 
 proc setupSpaceWithData(nodes: seq[TestNode], spaceName: string,
     replicas: int, rowCount: int): int =
@@ -338,7 +346,7 @@ proc setupSpaceWithData(nodes: seq[TestNode], spaceName: string,
   let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
   doAssert leaderIdx >= 0
   let leaderStore = nodes[leaderIdx].store
-  
+
   let spaceId = createSpace(leaderStore, spaceName, replicas)
   let gids = findSpaceGroupIds(leaderStore, spaceId)
 
@@ -382,8 +390,8 @@ suite "Space rebalance integration — rebalanceSpaces":
     let sp2 = leaderStore.spaces[spaceId]
     release(leaderStore.spacesMu)
     check sp2.rebalancing == true
-    check sp2.groupIds.len == 3  # 3 nodes -> 3 new groups
-    check sp2.oldGroupIds.len == 2  # original 2 groups
+    check sp2.groupIds.len == 3 # 3 nodes -> 3 new groups
+    check sp2.oldGroupIds.len == 2 # original 2 groups
 
   test "is idempotent — does not re-trigger while rebalancing":
     var nodes = makeCluster2()
@@ -483,6 +491,8 @@ suite "Space rebalance integration — reads during migration":
 
     for i in 1 .. 10:
       let sel = execOnLeader(nodes, "SELECT * FROM users_t WHERE id = " & $i)
+      if sel.kind != erkRows:
+        echo "DEBUG: SELECT failed for id=", i, " error: ", sel.error
       check sel.kind == erkRows
       if sel.kind == erkRows:
         check sel.rows.len == 1
@@ -492,8 +502,8 @@ suite "Space rebalance integration — reads during migration":
 # Suite: full migration lifecycle
 # ---------------------------------------------------------------------------
 
-proc triggerRebalanceAndSetup(nodes: var seq[TestNode], leaderStore: RaftKVStoreExt,
-    spaceId: int) =
+proc triggerRebalanceAndSetup(nodes: var seq[TestNode],
+    leaderStore: RaftKVStoreExt, spaceId: int) =
   addNodeToCluster(nodes, 3)
   leaderStore.rebalanceSpaces()
 

@@ -71,6 +71,8 @@ type
     replicas*: seq[ReplicaDescriptor] ## All replicas of this group
     nextReplicaId*: ReplicaID ## Next replica ID to allocate
     generation*: uint64 ## Incremented on every change
+    preferredLeader*: NodeID ## Optional: target node for leadership rebalancing
+    leader*: NodeID ## Last known leader node (updated via AE heartbeats or election)
 
 # ============================================================================
 # NodeID operations
@@ -302,18 +304,27 @@ proc toJson*(desc: GroupDescriptor): JsonNode =
     "nextReplicaId": desc.nextReplicaId.uint32,
     "generation": desc.generation
   }
+  if desc.preferredLeader.isValid:
+    result["preferredLeader"] = newJInt(int(desc.preferredLeader.uint32))
+  if desc.leader.isValid:
+    result["leader"] = newJInt(int(desc.leader.uint32))
 
 proc parseGroupDescriptor*(json: JsonNode): GroupDescriptor =
   ## Parse GroupDescriptor from JSON
   new(result)
-  result.groupId = GroupID(json["groupId"].getInt())
+  result.groupId = GroupID(json["groupId"].getBiggestInt().uint64)
 
   # Parse replicas
   for repJson in json["replicas"]:
     result.replicas.add(parseReplicaDescriptor(repJson))
 
   result.nextReplicaId = ReplicaID(json["nextReplicaId"].getInt())
-  result.generation = uint64(json["generation"].getInt())
+  result.generation = uint64(json["generation"].getBiggestInt())
+
+  if json.hasKey("preferredLeader"):
+    result.preferredLeader = NodeID(uint32(json["preferredLeader"].getInt()))
+  if json.hasKey("leader"):
+    result.leader = NodeID(uint32(json["leader"].getInt()))
 
 proc `$`*(desc: GroupDescriptor): string =
   ## String representation of GroupDescriptor

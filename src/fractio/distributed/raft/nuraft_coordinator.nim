@@ -99,9 +99,6 @@ var onLeaderChanged*: proc(storePtr: pointer, groupId: GroupID,
 var getPreferredLeaderCallback*: proc(storePtr: pointer,
     groupId: GroupID): Option[NodeID] {.gcsafe, raises: [].} = nil
 
-## Called when space metadata changes replicate.
-var onSpaceMetadataChanged*: proc(storePtr: pointer) {.gcsafe, raises: [].} = nil
-
 # ============================================================================
 # WriteBatch Serialization (JSON — same format as multigroup_log.nim)
 # ============================================================================
@@ -218,6 +215,9 @@ proc newNuRaftCoordinator*(config: CoordinatorConfig): NuRaftCoordinator =
   result.electionTimeoutLowerMs = config.electionTimeoutLowerMs
   result.electionTimeoutUpperMs = config.electionTimeoutUpperMs
   result.heartbeatIntervalMs = config.heartbeatIntervalMs
+  if result.electionTimeoutLowerMs == 0: result.electionTimeoutLowerMs = 1000
+  if result.electionTimeoutUpperMs == 0: result.electionTimeoutUpperMs = 2000
+  if result.heartbeatIntervalMs == 0: result.heartbeatIntervalMs = 500
   result.kvStorePtr = nil
   result.running.store(false)
   initLock(result.groupsLock)
@@ -326,6 +326,10 @@ proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
 
   # Create state machine with commit callback
   inst.sm = nuraftSmCreate(nuraftCommitCb, cast[pointer](inst))
+  if inst.sm.isNil:
+    error("Failed to create NuRaft SM", "groupId", $groupId)
+    freeInstance(inst)
+    return false
 
   # Create state manager
   var cServerIds = newSeq[int32](members.len)
@@ -341,6 +345,11 @@ proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
     int32(members.len),
     addr cServerIds[0],
     addr cEndpoints[0])
+  if inst.smgr.isNil:
+    error("Failed to create NuRaft SMgr", "groupId", $groupId)
+    nuraftSmDestroy(inst.sm)
+    freeInstance(inst)
+    return false
 
   # Create raft params
   let params = nuraftParamsCreate()
@@ -351,29 +360,39 @@ proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
   nuraftParamsSetSnapshotDistance(params, 0) # disabled
   nuraftParamsSetClientReqTimeout(params, 5000)
   nuraftParamsSetMaxAppendSize(params, 100)
+  # Enable NuRaft's internal automatic leadership rebalancing to prefer the highest priority node
+  nuraftParamsSetLeadershipTransferMinWaitTime(params, 1000)
 
-  # Create and init launcher
+  # Create and init launcher. Retry a few times in case of transient port
+  # bind failures (common in tests with high churn).
   inst.launcher = nuraftLauncherCreate()
-  let ok = nuraftLauncherInit(inst.launcher, inst.sm, inst.smgr,
-      int32(myPort), params, nuraftEventCb, cast[pointer](inst))
+  var ok = false
+  for attempt in 1 .. 5:
+    ok = nuraftLauncherInit(inst.launcher, inst.sm, inst.smgr,
+        int32(myPort), params, nuraftEventCb, cast[pointer](inst))
+    if ok: break
+    if attempt < 5:
+      warn("NuRaft launcher init failed, retrying...", "groupId", $groupId,
+           "port", $myPort, "attempt", $attempt)
+      sleep(200 * attempt) # Linear backoff
 
   nuraftParamsDestroy(params)
 
   if not ok:
+    error("Failed to initialize NuRaft launcher", "groupId", $groupId, "port", $myPort)
     nuraftLauncherDestroy(inst.launcher)
     nuraftSmDestroy(inst.sm)
     nuraftSmgrDestroy(inst.smgr)
     freeInstance(inst)
     return false
 
-  # Wait for initialization. In multi-node clusters, peers may not have
-  # started yet, so we use a short timeout — that's OK, the server is
-  # still valid and will initialize when peers connect.
-  let initTimeoutMs = if members.len == 1: 5000'i32 else: 500'i32
-  discard nuraftLauncherWaitInit(inst.launcher, initTimeoutMs)
+  # Wait for initialization so that launcher.get_server() is valid.
+  let waitMs = if members.len == 1: 5000'i32 else: 500'i32
+  discard nuraftLauncherWaitInit(inst.launcher, waitMs)
 
   inst.server = nuraftLauncherGetServer(inst.launcher)
   if inst.server == nil:
+    error("NuRaft launcher initialized but server is nil", "groupId", $groupId, "port", $myPort)
     discard nuraftLauncherShutdown(inst.launcher, 3)
     nuraftLauncherDestroy(inst.launcher)
     nuraftSmDestroy(inst.sm)
@@ -420,23 +439,25 @@ proc hasGroup*(c: NuRaftCoordinator, groupId: GroupID): bool =
 proc getGroupInstance*(c: NuRaftCoordinator,
     groupId: GroupID): Option[NuRaftGroupInstancePtr] =
   withLock c.groupsLock:
-    if c.groups.hasKey(groupId):
-      result = some(c.groups[groupId])
+    let inst = c.groups.getOrDefault(groupId, nil)
+    if inst != nil:
+      result = some(inst)
 
-proc isLeader*(c: NuRaftCoordinator, groupId: GroupID): bool =
+proc isLeader*(c: NuRaftCoordinator, groupId: GroupID): bool {.raises: [].} =
   withLock c.groupsLock:
-    if c.groups.hasKey(groupId):
-      let inst = c.groups[groupId]
-      if inst.server != nil:
-        result = nuraftServerIsLeader(inst.server)
+    let inst = c.groups.getOrDefault(groupId, nil)
+    if inst != nil and inst.server != nil:
+      result = nuraftServerIsLeader(inst.server)
+      if result:
+        {.cast(gcsafe).}: {.cast(raises: []).}:
+          debug("isLeader: true", {"groupId": $groupId, "nodeId": $c.nodeId.uint32}.toTable)
 
 proc getLeader*(c: NuRaftCoordinator, groupId: GroupID): int32 =
   ## Returns the leader's server ID, or -1 if unknown.
   withLock c.groupsLock:
-    if c.groups.hasKey(groupId):
-      let inst = c.groups[groupId]
-      if inst.server != nil:
-        return nuraftServerGetLeader(inst.server)
+    let inst = c.groups.getOrDefault(groupId, nil)
+    if inst != nil and inst.server != nil:
+      return nuraftServerGetLeader(inst.server)
   return -1
 
 proc getGroupCount*(c: NuRaftCoordinator): int =
@@ -528,23 +549,33 @@ proc proposeParallel*(c: NuRaftCoordinator,
 # Leadership Transfer
 # ============================================================================
 
-proc transferLeadership*(c: NuRaftCoordinator, groupId: GroupID,
-    targetNodeId: NodeID): bool =
-  ## Transfer leadership to the target node.
-  ## Sets the target's priority high and yields.
+proc setPriority*(c: NuRaftCoordinator, groupId: GroupID,
+    targetNodeId: NodeID, priority: int32): bool =
+  ## Set priority for a server in the group.
   var inst: NuRaftGroupInstancePtr
   withLock c.groupsLock:
-    if not c.groups.hasKey(groupId): return false
-    inst = c.groups[groupId]
+    inst = c.groups.getOrDefault(groupId, nil)
 
-  if inst.server == nil: return false
+  if inst == nil or inst.server == nil: return false
 
-  # Set target priority high
-  discard nuraftServerSetPriority(inst.server, int32(targetNodeId.uint32), 200)
-  # Yield leadership
-  nuraftServerYieldLeadership(inst.server)
+  let rc = nuraftServerSetPriority(inst.server, int32(targetNodeId.uint32), priority)
+  if rc != 0:
+    warn("Failed to set priority", "groupId", $groupId, "target", $targetNodeId.uint32, "rc", $rc)
+    return false
   return true
 
+proc transferLeadership*(c: NuRaftCoordinator, groupId: GroupID,
+    targetNodeId: NodeID): bool =
+  ## Transfer leadership to the target node by yielding.
+  var inst: NuRaftGroupInstancePtr
+  withLock c.groupsLock:
+    inst = c.groups.getOrDefault(groupId, nil)
+
+  if inst == nil or inst.server == nil: return false
+
+  # Yield leadership gracefully to the target
+  nuraftServerYieldLeadership(inst.server, false, int32(targetNodeId.uint32))
+  return true
 proc addServerToGroup*(c: NuRaftCoordinator, groupId: GroupID,
     nodeId: uint32, host: string, basePort: int): int32 =
   ## Add a new server to an existing Raft group (membership change).
