@@ -450,8 +450,8 @@ proc txnScan*(store: MvccTransactionStore, sessionId: uint64,
       kind: mseStorageError, msg: "Scan failed"))
 
   var keyVersions: tables.Table[string, tuple[value: string,
-      isDeleted: bool]] = initTable[string, tuple[value: string,
-      isDeleted: bool]]()
+      isDeleted: bool, timestamp: coreTypes.Timestamp]] = initTable[string,
+      tuple[value: string, isDeleted: bool, timestamp: coreTypes.Timestamp]]()
 
   for (k, entry) in scanRes.value:
     if isIntentKeyMvcc(k):
@@ -462,17 +462,29 @@ proc txnScan*(store: MvccTransactionStore, sessionId: uint64,
         let decoded = decodeVersionKey(k)
         if decoded.timestamp <= readTs:
           let mvccVal = decodeMVCCValue(entry.value)
+          # Only update if this version is newer than what we have
           if not keyVersions.hasKey(decoded.userKey):
-            keyVersions[decoded.userKey] = (mvccVal.data, mvccVal.isDeleted)
+            keyVersions[decoded.userKey] = (mvccVal.data, mvccVal.isDeleted,
+                decoded.timestamp)
+          else:
+            let existing = keyVersions[decoded.userKey]
+            if decoded.timestamp > existing.timestamp:
+              keyVersions[decoded.userKey] = (mvccVal.data, mvccVal.isDeleted,
+                  decoded.timestamp)
       except:
         discard
+    else:
+      # Non-MVCC key (regular key) - include as-is
+      # Only include if no MVCC version exists for this key
+      if not keyVersions.hasKey(k):
+        keyVersions[k] = (entry.value, false, coreTypes.Timestamp(0))
 
   for key, entry in localIntents.pairs:
     if key >= startKey and (endKey.len == 0 or key < endKey):
       if entry.isDelete:
         keyVersions.del(key)
       else:
-        keyVersions[key] = (entry.value, false)
+        keyVersions[key] = (entry.value, false, coreTypes.Timestamp(0))
 
   var results: seq[tuple[key: string, value: string]] = @[]
   var count = 0
@@ -492,6 +504,7 @@ proc txnScan*(store: MvccTransactionStore, sessionId: uint64,
 
 proc directGet*(store: MvccTransactionStore,
     key: string): MvccResult[Option[string]] {.gcsafe, raises: [].} =
+  # First, scan for MVCC-encoded versions
   let versionPrefix = key & VERSION_SEPARATOR
   let scanStart = versionPrefix
   let scanEnd = key & "\x00\x01"
@@ -517,10 +530,30 @@ proc directGet*(store: MvccTransactionStore,
     except:
       discard
 
-  if not foundVersion or latestVersion.isDeleted:
-    return mvccOk(none(string))
+  if foundVersion and not latestVersion.isDeleted:
+    return mvccOk(some(latestVersion.value))
 
-  return mvccOk(some(latestVersion.value))
+  # Fall back to direct key lookup for non-MVCC data (backward compatibility)
+  # This handles data written directly via raftPut() without MVCC encoding
+  let directRes = store.raftStore.raftGet(key)
+  if directRes.isOk and directRes.value.isSome:
+    let entry = directRes.value.get()
+    let rawValue = entry.value
+    # Check if this is MVCC-encoded data (starts with binary header, not '{')
+    if rawValue.len >= 17 and rawValue[0] != '{':
+      try:
+        let mvccVal = decodeMVCCValue(rawValue)
+        if not mvccVal.isDeleted:
+          return mvccOk(some(mvccVal.data))
+        else:
+          return mvccOk(none(string))
+      except:
+        discard
+    else:
+      # Raw JSON or plain text data
+      return mvccOk(some(rawValue))
+
+  return mvccOk(none(string))
 
 proc directPut*(store: MvccTransactionStore,
     key: string, value: string): MvccVoidResult {.gcsafe, raises: [].} =

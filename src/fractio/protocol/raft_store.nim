@@ -39,6 +39,7 @@ import fractio/distributed/raft/state_machine
 import fractio/distributed/meta/system_tables
 import fractio/storage/wisckey_backend
 import fractio/storage/backend
+import fractio/storage/mvcc/types as mvccTypes
 import fractio/protocol/types as protoTypes
 import fractio/protocol/client
 import fractio/protocol/messages/kv
@@ -299,6 +300,7 @@ proc getBackend*(store: RaftKVStoreExt): WiscKeyBackend {.inline.} =
 proc loadGroupMembers*(store: RaftKVStoreExt,
     waitForCatchUp: bool = false) {.gcsafe, raises: [].} =
   ## Scan sys.groups and populate the groupMembers table.
+  ## Handles both raw JSON values and MVCC-encoded values.
   ## If waitForCatchUp is true, we wait for the META group state machine
   ## to catch up to the latest known committed index.
   if waitForCatchUp:
@@ -321,14 +323,45 @@ proc loadGroupMembers*(store: RaftKVStoreExt,
     {.cast(raises: []).}:
       entries = backend.scan(startKey, endKey)
 
-  var newGroupMembers = initTable[GroupID, seq[uint32]]()
-  var newPreferredLeaders = initTable[GroupID, uint32]()
-  var newGroupLeaders = initTable[GroupID, uint32]()
+  # Group entries by user key, tracking latest version
+  var latestVersions: Table[string, tuple[value: string,
+      ts: int64]] = initTable[string, tuple[value: string, ts: int64]]()
 
   for (k, v) in entries:
     {.cast(raises: []).}:
       try:
-        let j = parseJson(v)
+        var userKey = k
+        var value = v
+        var ts: int64 = 0
+
+        # Check if this is an MVCC version key (ends with \x00\x00 + 8 bytes)
+        if k.len >= 10 and k[k.len - 10] == '\x00' and k[k.len - 9] == '\x00':
+          # MVCC-encoded key - extract user key
+          userKey = k[0 ..< k.len - 10]
+          # Decode MVCC value
+          if v.len >= 17:
+            let mvccVal = mvccTypes.decodeMVCCValue(v)
+            if mvccVal.isDeleted:
+              continue # Skip tombstones
+            value = mvccVal.data
+            ts = mvccVal.timestamp
+
+        # Keep only latest version for each user key
+        if not latestVersions.hasKey(userKey) or ts > latestVersions[userKey].ts:
+          latestVersions[userKey] = (value, ts)
+      except:
+        # If decoding fails, try as raw key-value
+        if not latestVersions.hasKey(k):
+          latestVersions[k] = (v, 0'i64)
+
+  var newGroupMembers = initTable[GroupID, seq[uint32]]()
+  var newPreferredLeaders = initTable[GroupID, uint32]()
+  var newGroupLeaders = initTable[GroupID, uint32]()
+
+  for (k, entry) in latestVersions.pairs:
+    {.cast(raises: []).}:
+      try:
+        let j = parseJson(entry.value)
         let gid = GroupID(uint64(j["groupId"].getInt()))
         var members: seq[uint32] = @[]
         if j.hasKey("replicas"):
@@ -377,6 +410,10 @@ proc loadSpaces*(store: RaftKVStoreExt) {.gcsafe, raises: [].}
 proc loadTableSpaces*(store: RaftKVStoreExt) {.gcsafe, raises: [].}
 proc proposeWrite(store: RaftKVStoreExt, groupId: GroupID,
     batch: WriteBatch): RSVoidResult {.gcsafe, raises: [].}
+proc updateSpaceCache*(store: RaftKVStoreExt, spaceKey: string,
+    jsonStr: string) {.gcsafe, raises: [].}
+proc updateTableSpaceCache*(store: RaftKVStoreExt, tableKey: string,
+    jsonStr: string) {.gcsafe, raises: [].}
 
 # ---------------------------------------------------------------------------
 # Follower apply callback (called by coordinator on committed entries)
@@ -418,18 +455,40 @@ proc applyBatchToSM*(storePtr: pointer, rid: GroupID,
   # No in-memory state machine to update — reads go through WiscKey directly.
 
   # --- Notify on sys.groups metadata changes (peer group creation) ---
+  # Also update in-memory caches directly for spaces and tables
   let groupsPrefix = "/t/" & align($SYS_GROUPS_TABLE_ID, 10, '0') & "/"
   let spacesPrefix = "/t/" & align($SYS_SPACES_TABLE_ID, 10, '0') & "/"
   let tablesPrefix = "/t/" & align($SYS_TABLES_TABLE_ID, 10, '0') & "/"
   var refreshSpaceCache = false
   for (k, v) in batch.puts:
     let key = fromBytes(k)
+    let value = fromBytes(v)
     if key.startsWith(groupsPrefix):
       {.cast(gcsafe).}:
         if onGroupMetadataApplied != nil:
-          onGroupMetadataApplied(storePtr, key, fromBytes(v))
+          # Decode MVCC-encoded value if needed
+          var groupValue = value
+          # Raw JSON starts with '{', MVCC-encoded has binary header
+          if groupValue.len >= 17 and groupValue[0] != '{':
+            try:
+              let mvccVal = mvccTypes.decodeMVCCValue(groupValue)
+              if not mvccVal.isDeleted:
+                groupValue = mvccVal.data
+              else:
+                # Skip deleted entries
+                refreshSpaceCache = true
+                return
+            except:
+              discard # Not MVCC-encoded, use as-is
+          onGroupMetadataApplied(storePtr, key, groupValue)
       refreshSpaceCache = true
-    elif key.startsWith(spacesPrefix) or key.startsWith(tablesPrefix):
+    elif key.startsWith(spacesPrefix):
+      # Update in-memory space cache directly when Raft commits
+      store.updateSpaceCache(key, value)
+      refreshSpaceCache = true
+    elif key.startsWith(tablesPrefix):
+      # Update in-memory tableSpace cache directly when Raft commits
+      store.updateTableSpaceCache(key, value)
       refreshSpaceCache = true
   # Trigger background refresh of space/table/leader caches when metadata changes replicate
   if refreshSpaceCache and storePtr != nil:
@@ -455,10 +514,10 @@ proc rebalanceLeadershipTask(s: RaftKVStoreExt) {.thread, gcsafe, raises: [].} =
     if not s.rebalRunning.load(): break
 
     if s.coordinator != nil and s.coordinator.running.load():
-      # Refresh metadata from storage
+      # Refresh group members from storage
+      # Note: We don't call loadSpaces/loadTableSpaces here anymore since
+      # applyBatchToSM updates those caches directly when Raft commits.
       s.loadGroupMembers(waitForCatchUp = true)
-      s.loadSpaces()
-      s.loadTableSpaces()
 
       var toYield: seq[tuple[gid: GroupID, preferred: uint32]] = @[]
       let now = epochTime()
@@ -1163,9 +1222,78 @@ proc raftReadCoordRecord*(store: RaftKVStoreExt,
 # Space-aware routing
 # ---------------------------------------------------------------------------
 
+proc parseSpaceInfoFromJson*(jsonStr: string): Option[SpaceInfo] {.gcsafe,
+    raises: [].} =
+  ## Parse a SpaceInfo from JSON string. Returns None on parse failure.
+  ## Handles both raw JSON and MVCC-encoded values.
+  {.cast(raises: []).}:
+    try:
+      var value = jsonStr
+      # Check for MVCC encoding - raw JSON starts with '{', MVCC has binary header
+      if jsonStr.len >= 17 and jsonStr[0] != '{':
+        let mvccVal = mvccTypes.decodeMVCCValue(jsonStr)
+        if mvccVal.isDeleted:
+          return none(SpaceInfo)
+        value = mvccVal.data
+
+      let j = parseJson(value)
+      var info = SpaceInfo(
+        spaceId: j["spaceId"].getInt(),
+        name: j["name"].getStr(),
+        replicas: j["replicas"].getInt(),
+      )
+      if j.hasKey("groupIds"):
+        for r in j["groupIds"]:
+          info.groupIds.add(uint64(r.getInt()))
+      if j.hasKey("oldGroupIds"):
+        for r in j["oldGroupIds"]:
+          info.oldGroupIds.add(uint64(r.getInt()))
+      info.rebalancing = j.getOrDefault("rebalancing").getBool(false)
+      info.rebalanceWorker = j.getOrDefault("rebalanceWorker").getInt(0)
+      info.rebalanceHeartbeat = j.getOrDefault(
+          "rebalanceHeartbeat").getBiggestInt(0)
+      info.rebalanceCursor = j.getOrDefault("rebalanceCursor").getStr("")
+      return some(info)
+    except:
+      return none(SpaceInfo)
+
+proc updateSpaceCache*(store: RaftKVStoreExt, spaceKey: string,
+    jsonStr: string) {.gcsafe, raises: [].} =
+  ## Update the in-memory space cache from a committed space record.
+  ## Called by applyBatchToSM when a space change is replicated via Raft.
+  let spaceInfoOpt = parseSpaceInfoFromJson(jsonStr)
+  if spaceInfoOpt.isSome:
+    let info = spaceInfoOpt.get()
+    withLock store.spacesMu:
+      store.spaces[info.spaceId] = info
+
+proc updateTableSpaceCache*(store: RaftKVStoreExt, tableKey: string,
+    jsonStr: string) {.gcsafe, raises: [].} =
+  ## Update the in-memory tableSpace cache from a committed table record.
+  ## Called by applyBatchToSM when a table change is replicated via Raft.
+  {.cast(raises: []).}:
+    try:
+      var value = jsonStr
+      # Check for MVCC encoding
+      if jsonStr.len >= 17 and jsonStr[0] != '{':
+        let mvccVal = mvccTypes.decodeMVCCValue(jsonStr)
+        if mvccVal.isDeleted:
+          return
+        value = mvccVal.data
+
+      let j = parseJson(value)
+      let tableId = uint32(j["tableId"].getInt())
+      let spaceId = j.getOrDefault("spaceId").getInt(1) # default to space 1
+      withLock store.spacesMu:
+        store.tableSpaces[tableId] = spaceId
+    except:
+      discard
+
 proc loadSpaces*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
   ## Scan sys.spaces and populate the in-memory spaces table.
   ## Call after bootstrap/recovery when the state machine is populated.
+  ## This is now a full reload from backend - no preservation needed since
+  ## in-memory cache is updated via applyBatchToSM when Raft commits changes.
   let startKey = "/t/" & align($SYS_SPACES_TABLE_ID, 10, '0') & "/"
   let endKey = "/t/" & align($(SYS_SPACES_TABLE_ID + 1), 10, '0') & "/"
   let backend = store.getBackend()
@@ -1174,36 +1302,59 @@ proc loadSpaces*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
     {.cast(raises: []).}:
       entries = backend.scan(startKey, endKey)
 
-  var newSpaces = initTable[int, SpaceInfo]()
+  # Group entries by user key, tracking latest version
+  var latestVersions: Table[string, tuple[value: string,
+      ts: int64]] = initTable[string, tuple[value: string, ts: int64]]()
+
   for (k, v) in entries:
     {.cast(raises: []).}:
       try:
-        let j = parseJson(v)
-        var info = SpaceInfo(
-          spaceId: j["spaceId"].getInt(),
-          name: j["name"].getStr(),
-          replicas: j["replicas"].getInt(),
-        )
-        if j.hasKey("groupIds"):
-          for r in j["groupIds"]:
-            info.groupIds.add(uint64(r.getInt()))
-        if j.hasKey("oldGroupIds"):
-          for r in j["oldGroupIds"]:
-            info.oldGroupIds.add(uint64(r.getInt()))
-        info.rebalancing = j.getOrDefault("rebalancing").getBool(false)
-        info.rebalanceWorker = j.getOrDefault("rebalanceWorker").getInt(0)
-        info.rebalanceHeartbeat = j.getOrDefault(
-            "rebalanceHeartbeat").getBiggestInt(0)
-        info.rebalanceCursor = j.getOrDefault("rebalanceCursor").getStr("")
-        newSpaces[info.spaceId] = info
+        var userKey = k
+        var value = v
+        var ts: int64 = 0
+
+        # Check if this is an MVCC version key (ends with \x00\x00 + 8 bytes)
+        if k.len >= 10 and k[k.len - 10] == '\x00' and k[k.len - 9] == '\x00':
+          # MVCC-encoded key - extract user key
+          userKey = k[0 ..< k.len - 10]
+          # Decode MVCC value
+          if v.len >= 17:
+            let mvccVal = mvccTypes.decodeMVCCValue(v)
+            if mvccVal.isDeleted:
+              continue # Skip tombstones
+            value = mvccVal.data
+            ts = mvccVal.timestamp
+        else:
+          # Raw key (non-MVCC) - check if value is MVCC-encoded
+          if v.len >= 17 and v[0] != '{':
+            try:
+              let mvccVal = mvccTypes.decodeMVCCValue(v)
+              if not mvccVal.isDeleted:
+                value = mvccVal.data
+                ts = mvccVal.timestamp
+            except:
+              discard
+
+        # Keep only latest version for each user key
+        if not latestVersions.hasKey(userKey) or ts > latestVersions[userKey].ts:
+          latestVersions[userKey] = (value, ts)
       except:
-        discard
+        # If decoding fails, try as raw key-value
+        if not latestVersions.hasKey(k):
+          latestVersions[k] = (v, 0'i64)
+
+  var newSpaces = initTable[int, SpaceInfo]()
+  for (k, entry) in latestVersions.pairs:
+    let infoOpt = parseSpaceInfoFromJson(entry.value)
+    if infoOpt.isSome:
+      newSpaces[infoOpt.get().spaceId] = infoOpt.get()
 
   withLock store.spacesMu:
     store.spaces = newSpaces
 
 proc loadTableSpaces*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
   ## Scan sys.tables and populate the tableId → spaceId mapping.
+  ## Handles both raw JSON values and MVCC-encoded values.
   let startKey = "/t/" & align($SYS_TABLES_TABLE_ID, 10, '0') & "/"
   let endKey = "/t/" & align($(SYS_TABLES_TABLE_ID + 1), 10, '0') & "/"
   let backend = store.getBackend()
@@ -1212,11 +1363,42 @@ proc loadTableSpaces*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
     {.cast(raises: []).}:
       entries = backend.scan(startKey, endKey)
 
-  var newTableSpaces = initTable[uint32, int]()
+  # Group entries by user key, tracking latest version
+  var latestVersions: Table[string, tuple[value: string,
+      ts: int64]] = initTable[string, tuple[value: string, ts: int64]]()
+
   for (k, v) in entries:
     {.cast(raises: []).}:
       try:
-        let j = parseJson(v)
+        var userKey = k
+        var value = v
+        var ts: int64 = 0
+
+        # Check if this is an MVCC version key (ends with \x00\x00 + 8 bytes)
+        if k.len >= 10 and k[k.len - 10] == '\x00' and k[k.len - 9] == '\x00':
+          # MVCC-encoded key - extract user key
+          userKey = k[0 ..< k.len - 10]
+          # Decode MVCC value
+          if v.len >= 17:
+            let mvccVal = mvccTypes.decodeMVCCValue(v)
+            if mvccVal.isDeleted:
+              continue # Skip tombstones
+            value = mvccVal.data
+            ts = mvccVal.timestamp
+
+        # Keep only latest version for each user key
+        if not latestVersions.hasKey(userKey) or ts > latestVersions[userKey].ts:
+          latestVersions[userKey] = (value, ts)
+      except:
+        # If decoding fails, try as raw key-value
+        if not latestVersions.hasKey(k):
+          latestVersions[k] = (v, 0'i64)
+
+  var newTableSpaces = initTable[uint32, int]()
+  for (k, entry) in latestVersions.pairs:
+    {.cast(raises: []).}:
+      try:
+        let j = parseJson(entry.value)
         let tid = uint32(j["tableId"].getInt())
         let sid = j.getOrDefault("spaceId").getInt(1) # default = 1 (default space)
         newTableSpaces[tid] = sid
@@ -1736,8 +1918,23 @@ proc raftScanSpace*(store: RaftKVStoreExt, startKey, endKey: string,
 
 proc updateSpaceRecord*(store: RaftKVStoreExt, space: SpaceInfo) {.gcsafe,
     raises: [].} =
-  ## Write the space record back to sys.spaces via Raft.
+  ## Write the space record to sys.spaces via Raft.
+  ## The in-memory cache is updated by applyBatchToSM when Raft commits the write.
   let spaceKey = encodeSpaceKey(space.spaceId)
+
+  # First, delete any MVCC versions of this key that may exist from DDL operations
+  # This ensures our raw write is the only entry for this space
+  let backend = store.getBackend()
+  if backend != nil and backend.isOpen:
+    {.cast(raises: []).}:
+      let prefix = spaceKey
+      let pairs = backend.scan(prefix, prefix & "\xff")
+      for (k, v) in pairs:
+        # Check if this is an MVCC version key (longer than the base key)
+        if k.len > spaceKey.len and k.len >= 10 and k[k.len - 10] == '\x00' and
+            k[k.len - 9] == '\x00':
+          discard store.raftDelete(k)
+
   var groupIdsJ = newJArray()
   for g in space.groupIds:
     groupIdsJ.add(newJInt(int(g)))
@@ -1772,10 +1969,24 @@ proc rebalanceSpaces*(store: RaftKVStoreExt) {.raises: [].} =
     if nodesRes.isOk:
       for (key, entry) in nodesRes.value:
         try:
-          let j = parseJson(entry.value)
+          # Decode MVCC-encoded value if needed
+          var jsonStr = entry.value
+          # Raw JSON starts with '{', MVCC-encoded data has binary header
+          if jsonStr.len >= 17 and jsonStr[0] != '{':
+            try:
+              let mvccVal = mvccTypes.decodeMVCCValue(jsonStr)
+              if not mvccVal.isDeleted:
+                jsonStr = mvccVal.data
+              else:
+                continue
+            except:
+              discard
+          let j = parseJson(jsonStr)
           nodeIds.add(j["nodeId"].getInt())
-        except: discard
-    if nodeIds.len == 0: return
+        except:
+          discard
+    if nodeIds.len == 0:
+      return
     nodeIds.sort()
     let nodeCount = nodeIds.len
 
@@ -1784,20 +1995,66 @@ proc rebalanceSpaces*(store: RaftKVStoreExt) {.raises: [].} =
     let spacesEnd = encodeTableKey(SYS_SPACES_TABLE_ID + 1, "")
     let spacesRes = store.raftScan(spacesStart, spacesEnd, 0,
         includeSystemKeys = true)
-    if not spacesRes.isOk: return
+    if not spacesRes.isOk:
+      return
 
+    # Group entries by user key, tracking latest version (same as loadSpaces)
+    var latestSpaces: Table[int, tuple[json: JsonNode, ts: int64]] = initTable[
+        int, tuple[json: JsonNode, ts: int64]]()
     for (key, entry) in spacesRes.value:
       try:
-        let j = parseJson(entry.value)
+        var userKey = key
+        var jsonStr = entry.value
+        var ts: int64 = 0
+
+        # Check if this is an MVCC version key (ends with \x00\x00 + 8 bytes)
+        if key.len >= 10 and key[key.len - 10] == '\x00' and key[key.len - 9] == '\x00':
+          userKey = key[0 ..< key.len - 10]
+          if jsonStr.len >= 17:
+            let mvccVal = mvccTypes.decodeMVCCValue(jsonStr)
+            if mvccVal.isDeleted:
+              continue
+            jsonStr = mvccVal.data
+            ts = mvccVal.timestamp
+        elif jsonStr.len >= 17 and jsonStr[0] != '{':
+          # MVCC-encoded value with non-MVCC key (shouldn't happen but handle it)
+          try:
+            let mvccVal = mvccTypes.decodeMVCCValue(jsonStr)
+            if not mvccVal.isDeleted:
+              jsonStr = mvccVal.data
+              ts = mvccVal.timestamp
+            else:
+              continue
+          except:
+            discard
+
+        let j = parseJson(jsonStr)
         let spaceId = j["spaceId"].getInt()
+
+        # Keep only latest version for each space
+        if not latestSpaces.hasKey(spaceId) or ts > latestSpaces[spaceId].ts:
+          latestSpaces[spaceId] = (json: j, ts: ts)
+      except:
+        discard
+
+    for spaceId, (j, ts) in latestSpaces.pairs:
+      try:
         let currentGroupCount = j.getOrDefault("groupIds").len
         let isRebalancing = j.getOrDefault("rebalancing").getBool(false)
+        let replicas = j["replicas"].getInt()
 
-        # Skip if already rebalancing or group count matches
-        if isRebalancing or currentGroupCount == nodeCount:
+        # Also check in-memory cache for rebalancing state
+        # (may have been set by a previous call but not yet persisted)
+        var inMemoryRebalancing = false
+        acquire(store.spacesMu)
+        if store.spaces.hasKey(spaceId) and store.spaces[spaceId].rebalancing:
+          inMemoryRebalancing = true
+        release(store.spacesMu)
+
+        # Skip if already rebalancing (either in-memory or persisted) or group count matches
+        if inMemoryRebalancing or isRebalancing or currentGroupCount == nodeCount:
           continue
 
-        let replicas = j["replicas"].getInt()
         # Skip the default space (replicas=0 means "all nodes", uses meta group)
         if replicas == 0:
           continue
@@ -1814,10 +2071,21 @@ proc rebalanceSpaces*(store: RaftKVStoreExt) {.raises: [].} =
         if grpRes.isOk:
           for (gk, ge) in grpRes.value:
             try:
-              let gj = parseJson(ge.value)
+              var grpJsonStr = ge.value
+              if grpJsonStr.len >= 17 and grpJsonStr[0] != '{':
+                try:
+                  let mvccVal = mvccTypes.decodeMVCCValue(grpJsonStr)
+                  if not mvccVal.isDeleted:
+                    grpJsonStr = mvccVal.data
+                  else:
+                    continue
+                except:
+                  discard
+              let gj = parseJson(grpJsonStr)
               let gid = uint64(gj["groupId"].getInt())
               if gid > maxGroupId: maxGroupId = gid
-            except: discard
+            except:
+              discard
 
         # Create new groups with ring placement
         var newGroupIds: seq[uint64] = @[]
@@ -1854,8 +2122,11 @@ proc rebalanceSpaces*(store: RaftKVStoreExt) {.raises: [].} =
               nuraftMembers.add((nodeId: uint32(m), host: peerInfo.host,
                   basePort: peerInfo.basePort))
             let preferredLeader = uint32(members[0])
-            discard coord.createAndStartGroup(gid, nuraftMembers, preferredLeader)
-            store.registerGroup(gid)
+            try:
+              discard coord.createAndStartGroup(gid, nuraftMembers, preferredLeader)
+              store.registerGroup(gid)
+            except:
+              discard
 
         # Read current groupIds
         var oldGroupIds: seq[uint64] = @[]
@@ -1879,8 +2150,7 @@ proc rebalanceSpaces*(store: RaftKVStoreExt) {.raises: [].} =
       except:
         discard
 
-    # Reload caches
-    store.loadSpaces()
+    # Reload group members (spaces cache is already updated by updateSpaceRecord)
     store.loadGroupMembers()
 
 proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: int) {.raises: [].} =
@@ -1915,13 +2185,16 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: int) {.raises: [].} 
     space.rebalanceWorker = myNodeId
     space.rebalanceHeartbeat = nowSecs
     store.updateSpaceRecord(space)
-    store.loadSpaces()
+    # Note: Don't call loadSpaces() here - it would read stale data from backend
+    # before raftPut completes. The in-memory cache is already updated by updateSpaceRecord.
 
     let newGroupIds = space.groupIds
     let oldGroupIds = space.oldGroupIds
     let newCount = newGroupIds.len
     let oldCount = oldGroupIds.len
-    if newCount == 0 or oldCount == 0: return
+
+    if newCount == 0 or oldCount == 0:
+      return
 
     # Find all tables in this space
     let tablesStart = encodeTableKey(SYS_TABLES_TABLE_ID, "")
@@ -1929,10 +2202,22 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: int) {.raises: [].} 
     let tablesRes = store.raftScan(tablesStart, tablesEnd, 0,
         includeSystemKeys = true)
     var tableIds: seq[uint32] = @[]
+
     if tablesRes.isOk:
       for (key, entry) in tablesRes.value:
         try:
-          let j = parseJson(entry.value)
+          var jsonStr = entry.value
+          # Check for MVCC encoding
+          if jsonStr.len >= 17 and jsonStr[0] != '{':
+            try:
+              let mvccVal = mvccTypes.decodeMVCCValue(jsonStr)
+              if not mvccVal.isDeleted:
+                jsonStr = mvccVal.data
+              else:
+                continue
+            except:
+              discard
+          let j = parseJson(jsonStr)
           let sid = j.getOrDefault("spaceId").getInt(1)
           if sid == spaceId:
             tableIds.add(uint32(j["tableId"].getInt()))
@@ -1973,11 +2258,18 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: int) {.raises: [].} 
 
             # Write to new group via Raft for replication
             # The data is in the shared backend, accessible by both old and new groups
-            if store.coordinator.hasGroup(newRid) and
-                store.coordinator.isLeader(newRid):
-              let batch = newWriteBatch()
-              batch.put(toBytes(k), toBytes(v))
-              discard proposeWrite(store, newRid, batch)
+            let hasGroup = store.coordinator.hasGroup(newRid)
+            let isLeaderForNew = store.coordinator.isLeader(newRid)
+
+            if hasGroup:
+              if isLeaderForNew:
+                # This node is the leader - write locally
+                let batch = newWriteBatch()
+                batch.put(toBytes(k), toBytes(v))
+                discard proposeWrite(store, newRid, batch)
+              else:
+                # Not the leader - forward to the group leader
+                discard store.forwardPutToLeader(newRid, k, v)
               # Note: We do NOT delete from old group here because:
               # 1. Both groups share the same backend
               # 2. Deleting would remove the data we just wrote
@@ -2000,7 +2292,7 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: int) {.raises: [].} 
             space.rebalanceCursor = k
             space.rebalanceHeartbeat = curNow
             store.updateSpaceRecord(space)
-            store.loadSpaces()
+            # Note: Don't call loadSpaces() here - it would read stale data
             lastHeartbeat = curNow
         except:
           continue
@@ -2023,5 +2315,5 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: int) {.raises: [].} 
     space.rebalanceHeartbeat = 0
     space.rebalanceCursor = ""
     store.updateSpaceRecord(space)
-    store.loadSpaces()
+    # The in-memory cache is updated by applyBatchToSM when Raft commits the write.
     store.loadGroupMembers()

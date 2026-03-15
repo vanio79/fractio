@@ -81,3 +81,5 @@ src/fractio/web/static/app.js
 # Playwright MCP
 .playwright-mcp/
 
+src/fractio/protocol/mvcc_store.nim
+.cgr-hash-cache.json

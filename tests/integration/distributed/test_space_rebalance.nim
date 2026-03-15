@@ -15,11 +15,17 @@ import std/[unittest, os, options, json, strutils, tables, hashes, algorithm,
 import fractio/protocol/raft_store
 import fractio/protocol/server
 import fractio/protocol/types
+import fractio/protocol/txn_manager
+import fractio/protocol/mvcc_store
 import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
+import fractio/distributed/sharedtimer/mock
+import fractio/distributed/sharedtimer/types as timerTypes
+import fractio/core/timestamp_provider
 import fractio/storage/wisckey_backend
+import fractio/storage/mvcc/types as mvccTypes
 import fractio/sql/executor
 
 # ---------------------------------------------------------------------------
@@ -43,6 +49,7 @@ type
     server*: ProtocolServer
     coord*: NuRaftCoordinator
     store*: RaftKVStoreExt
+    mvccStore*: MvccTransactionStore
     storagePath*: string
 
 proc cleanDir(p: string) =
@@ -91,6 +98,13 @@ proc makeNode(nodeNum: int, basePort: int,
   let store = newRaftKVStoreExt(coord, proposeTimeoutMs = 6000)
   store.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
 
+  # Create MVCC store for DDL operations
+  let txnMgr = newTransactionManager()
+  let mockTimer = MockTimeProvider(currentTime: timerTypes.Timestamp(1_000_000_000))
+  let tsProvider = newTimestampProvider(mockTimer, rangeTypes.NodeID(uint32(
+      nodeNum)).uint16)
+  let mvccStore = newMvccTransactionStore(store, txnMgr, tsProvider)
+
   var cfg = defaultServerConfig()
   cfg.host = "127.0.0.1"
   cfg.port = cPort
@@ -102,7 +116,7 @@ proc makeNode(nodeNum: int, basePort: int,
 
   TestNode(
     id: nodeNum, basePort: basePort, clientPort: cPort, server: srv,
-    coord: coord, store: store, storagePath: storagePath,
+    coord: coord, store: store, mvccStore: mvccStore, storagePath: storagePath,
   )
 
 proc startNode(n: TestNode) =
@@ -179,7 +193,18 @@ proc waitForSpaceLeaders(nodes: seq[TestNode]) =
   if grpScan.isOk:
     for (key, entry) in grpScan.value:
       try:
-        let j = parseJson(entry.value)
+        # Handle MVCC-encoded values
+        var jsonStr = entry.value
+        # Check if value is MVCC-encoded (starts with 17-byte header)
+        if jsonStr.len >= 17:
+          try:
+            let mvccVal = mvccTypes.decodeMVCCValue(jsonStr)
+            if not mvccVal.isDeleted:
+              jsonStr = mvccVal.data
+          except:
+            discard # Not MVCC-encoded, use as-is
+
+        let j = parseJson(jsonStr)
         let gid = GroupID(uint64(j["groupId"].getInt()))
         if gid == META_GROUP_ID or gid == DATA_GROUP_START_ID: continue
         for attempt in 0 ..< 50:
@@ -192,8 +217,12 @@ proc waitForSpaceLeaders(nodes: seq[TestNode]) =
           sleep(100)
       except: discard
 
-proc exec(store: RaftKVStoreExt, sql: string): ExecResult =
-  executeSQL(sql, store, "default", "public")
+proc exec(store: RaftKVStoreExt, mvccStore: MvccTransactionStore,
+    sql: string): ExecResult =
+  executeSQL(sql, store, mvccStore, database = "default", schema = "public")
+
+proc exec(node: TestNode, sql: string): ExecResult =
+  exec(node.store, node.mvccStore, sql)
 
 # ---------------------------------------------------------------------------
 # Cluster fixtures
@@ -231,6 +260,37 @@ proc makeCluster2(): seq[TestNode] =
 
   nodes
 
+proc waitForNodeInSysNodes(store: RaftKVStoreExt, nodeId: int,
+    maxAttempts: int = 50): bool =
+  ## Wait for a node to appear in sys.nodes via raftScan.
+  ## Returns true if found, false if timeout.
+  let nodesStart = encodeTableKey(SYS_NODES_TABLE_ID, "")
+  let nodesEnd = encodeTableKey(SYS_NODES_TABLE_ID + 1, "")
+  for attempt in 0 ..< maxAttempts:
+    let nodesRes = store.raftScan(nodesStart, nodesEnd, 0,
+        includeSystemKeys = true)
+    if nodesRes.isOk:
+      for (key, entry) in nodesRes.value:
+        try:
+          # Decode MVCC-encoded value if needed
+          var jsonStr = entry.value
+          if jsonStr.len >= 17 and jsonStr[0] != '{':
+            try:
+              let mvccVal = mvccTypes.decodeMVCCValue(jsonStr)
+              if not mvccVal.isDeleted:
+                jsonStr = mvccVal.data
+              else:
+                continue
+            except:
+              discard
+          let j = parseJson(jsonStr)
+          if j["nodeId"].getInt() == nodeId:
+            return true
+        except:
+          discard
+    sleep(100)
+  false
+
 proc addNodeToCluster(nodes: var seq[TestNode], newNodeNum: int) =
   ## Add a new node to the cluster.
   let newBasePort = 28000 + (newNodeNum - 1) * 1000
@@ -262,21 +322,25 @@ proc addNodeToCluster(nodes: var seq[TestNode], newNodeNum: int) =
       "status": 1,
     }
     discard nodes[leaderIdx].store.raftPut(nodeKey, nodeVal)
-  sleep(200)
+
+    # Wait for the node to be visible in sys.nodes before returning
+    # This ensures rebalanceSpaces() will see the new node
+    doAssert waitForNodeInSysNodes(nodes[leaderIdx].store, newNodeNum),
+      "Node " & $newNodeNum & " did not appear in sys.nodes within timeout"
 
 proc stopCluster(nodes: seq[TestNode]) =
   for i in countdown(nodes.high, 0):
     stopNode(nodes[i])
 
-proc findSpaceId(leaderStore: RaftKVStoreExt, spaceName: string): int =
+proc findSpaceId(leaderStore: RaftKVStoreExt,
+    leaderMvccStore: MvccTransactionStore, spaceName: string): int =
   let spacesStart = encodeTableKey(SYS_SPACES_TABLE_ID, "")
   let spacesEnd = encodeTableKey(SYS_SPACES_TABLE_ID + 1, "")
-  let sr = leaderStore.raftScan(spacesStart, spacesEnd, 0,
-      includeSystemKeys = true)
+  let sr = leaderMvccStore.directScan(spacesStart, spacesEnd, 0)
   if sr.isOk:
-    for (k, entry) in sr.value:
+    for (k, v) in sr.value:
       try:
-        let j = parseJson(entry.value)
+        let j = parseJson(v)
         if j["name"].getStr() == spaceName:
           return j["spaceId"].getInt()
       except: discard
@@ -288,49 +352,42 @@ proc findSpaceGroupIds(leaderStore: RaftKVStoreExt, spaceId: int): seq[uint64] =
   result = leaderStore.spaces[spaceId].groupIds
   release(leaderStore.spacesMu)
 
-proc createSpace(leaderStore: RaftKVStoreExt, spaceName: string,
-    replicas: int): int =
-  let csRes = exec(leaderStore,
+proc createSpace(leaderStore: RaftKVStoreExt,
+    leaderMvccStore: MvccTransactionStore,
+    spaceName: string, replicas: int): int =
+  let csRes = exec(leaderStore, leaderMvccStore,
     "CREATE SPACE " & spaceName & " WITH REPLICAS = " & $replicas)
   doAssert csRes.kind == erkOk, "CREATE SPACE failed: " &
     (if csRes.kind == erkError: csRes.error else: "unknown")
 
-  let ctRes = exec(leaderStore,
+  let ctRes = exec(leaderStore, leaderMvccStore,
     "CREATE TABLE " & spaceName & "_t (id INT PRIMARY KEY, val TEXT) IN SPACE " & spaceName)
   doAssert ctRes.kind == erkOk, "CREATE TABLE failed: " &
     (if ctRes.kind == erkError: ctRes.error else: "unknown")
 
-  findSpaceId(leaderStore, spaceName)
+  findSpaceId(leaderStore, leaderMvccStore, spaceName)
 
 proc execOnLeader(nodes: seq[TestNode], sql: string): ExecResult =
   for node in nodes:
-    let r = exec(node.store, sql)
+    let r = exec(node, sql)
     if r.kind != erkError:
       return r
     if isNotLeaderError(r.error):
       continue
     return r
-  exec(nodes[^1].store, sql)
+  exec(nodes[^1], sql)
+
+proc waitForMetadataReplication(nodes: seq[TestNode], timeoutMs: int = 2000) =
+  ## Wait for Raft to replicate metadata to all nodes.
+  ## Raft replication updates in-memory caches via applyBatchToSM callback.
+  ## This just waits a bit for callbacks to fire on all nodes.
+  sleep(100) # Small delay for callbacks to process
 
 proc replicateMetadata(nodes: seq[TestNode]) =
-  let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
-  if leaderIdx < 0: return
-  let leaderBackend = nodes[leaderIdx].store.getBackend()
-  for sysTableId in [SYS_TABLES_TABLE_ID, SYS_SPACES_TABLE_ID,
-                      SYS_GROUPS_TABLE_ID, SYS_NODES_TABLE_ID]:
-    let startKey = encodeTableKey(sysTableId, "")
-    let endKey = encodeTableKey(sysTableId + 1, "")
-    let pairs = leaderBackend.scan(startKey, endKey)
-    for (k, v) in pairs:
-      for i in 0 ..< nodes.len:
-        if i == leaderIdx: continue
-        let peerBackend = nodes[i].store.getBackend()
-        if peerBackend != nil and peerBackend.isOpen:
-          discard peerBackend.put(k, v)
-  for node in nodes:
-    node.store.loadSpaces()
-    node.store.loadGroupMembers()
-    node.store.loadTableSpaces()
+  ## Deprecated: Use waitForMetadataReplication instead.
+  ## This is now a no-op since Raft handles replication and applyBatchToSM
+  ## updates in-memory caches automatically.
+  sleep(100) # Small delay for Raft callbacks to process
 
 proc insertRows(nodes: seq[TestNode], spaceName: string, rowCount: int) =
   for i in 1 .. rowCount:
@@ -346,8 +403,9 @@ proc setupSpaceWithData(nodes: seq[TestNode], spaceName: string,
   let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
   doAssert leaderIdx >= 0
   let leaderStore = nodes[leaderIdx].store
+  let leaderMvccStore = nodes[leaderIdx].mvccStore
 
-  let spaceId = createSpace(leaderStore, spaceName, replicas)
+  let spaceId = createSpace(leaderStore, leaderMvccStore, spaceName, replicas)
   let gids = findSpaceGroupIds(leaderStore, spaceId)
 
   waitForAutoDistribution(nodes, gids, replicas)
@@ -366,8 +424,8 @@ suite "Space rebalance integration — rebalanceSpaces":
     var nodes = makeCluster2()
     defer: stopCluster(nodes)
 
-    let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
-    let leaderStore = nodes[leaderIdx].store
+    var leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
+    var leaderStore = nodes[leaderIdx].store
     let spaceId = setupSpaceWithData(nodes, "orders", 2, 10)
 
     # Verify: 2 groups, not rebalancing
@@ -380,12 +438,19 @@ suite "Space rebalance integration — rebalanceSpaces":
     # Add a 3rd node
     addNodeToCluster(nodes, 3)
 
+    # Re-check leader after adding node
+    leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
+    leaderStore = nodes[leaderIdx].store
+
     # Trigger rebalance
     leaderStore.rebalanceSpaces()
     sleep(500)
     sleep(500) # Give new groups time to initialize and elect leaders
 
     # Verify: now rebalancing, 3 new groups, old groups preserved
+    # Wait for Raft to replicate the space record update
+    sleep(1000)
+
     acquire(leaderStore.spacesMu)
     let sp2 = leaderStore.spaces[spaceId]
     release(leaderStore.spacesMu)
@@ -445,11 +510,13 @@ suite "Space rebalance integration — reads during migration":
     defer: stopCluster(nodes)
 
     let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
-    let leaderStore = nodes[leaderIdx].store
+    let leaderNode = nodes[leaderIdx]
+    let leaderStore = leaderNode.store
+    let leaderMvccStore = leaderNode.mvccStore
     let spaceId = setupSpaceWithData(nodes, "items", 2, 20)
 
     # Verify all rows readable before rebalance
-    let sel1 = exec(leaderStore, "SELECT * FROM items_t")
+    let sel1 = exec(leaderStore, leaderMvccStore, "SELECT * FROM items_t")
     check sel1.kind == erkRows
     check sel1.rows.len == 20
 
@@ -467,7 +534,7 @@ suite "Space rebalance integration — reads during migration":
     replicateMetadata(nodes)
 
     # All 20 rows still readable (dual-read fallback to old groups)
-    let sel2 = exec(leaderStore, "SELECT * FROM items_t")
+    let sel2 = exec(leaderStore, leaderMvccStore, "SELECT * FROM items_t")
     check sel2.kind == erkRows
     check sel2.rows.len == 20
 
@@ -491,8 +558,6 @@ suite "Space rebalance integration — reads during migration":
 
     for i in 1 .. 10:
       let sel = execOnLeader(nodes, "SELECT * FROM users_t WHERE id = " & $i)
-      if sel.kind != erkRows:
-        echo "DEBUG: SELECT failed for id=", i, " error: ", sel.error
       check sel.kind == erkRows
       if sel.kind == erkRows:
         check sel.rows.len == 1
@@ -510,6 +575,7 @@ proc triggerRebalanceAndSetup(nodes: var seq[TestNode],
   acquire(leaderStore.spacesMu)
   let newGids = leaderStore.spaces[spaceId].groupIds
   release(leaderStore.spacesMu)
+
   waitForAutoDistribution(nodes, newGids, 2, 5000)
   waitForSpaceLeaders(nodes)
   replicateMetadata(nodes)
@@ -520,7 +586,9 @@ suite "Space rebalance integration — full migration":
     defer: stopCluster(nodes)
 
     let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
-    let leaderStore = nodes[leaderIdx].store
+    let leaderNode = nodes[leaderIdx]
+    let leaderStore = leaderNode.store
+    let leaderMvccStore = leaderNode.mvccStore
     let spaceId = setupSpaceWithData(nodes, "migrate", 2, 30)
     triggerRebalanceAndSetup(nodes, leaderStore, spaceId)
 
@@ -543,7 +611,7 @@ suite "Space rebalance integration — full migration":
     check sp.rebalanceWorker == 0
 
     # All data still accessible
-    let sel = exec(leaderStore, "SELECT * FROM migrate_t")
+    let sel = exec(leaderStore, leaderMvccStore, "SELECT * FROM migrate_t")
     check sel.kind == erkRows
     check sel.rows.len == 30
 
@@ -554,23 +622,23 @@ suite "Space rebalance integration — full migration":
     let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
     let leaderStore = nodes[leaderIdx].store
     let spaceId = setupSpaceWithData(nodes, "fullmig", 2, 20)
+
     triggerRebalanceAndSetup(nodes, leaderStore, spaceId)
 
     leaderStore.runRebalanceMigration(spaceId)
-    leaderStore.loadSpaces()
+    # Wait for Raft to replicate and apply the changes
+    sleep(500)
 
-    replicateMetadata(nodes)
-    # Sync all data from each node to all other nodes
-    for srcIdx in 0 ..< nodes.len:
-      let srcBackend = nodes[srcIdx].store.getBackend()
-      if srcBackend == nil or not srcBackend.isOpen: continue
-      let allPairs = srcBackend.scan("/t/", "/u")
-      for (k, v) in allPairs:
-        for dstIdx in 0 ..< nodes.len:
-          if dstIdx == srcIdx: continue
-          let dstBackend = nodes[dstIdx].store.getBackend()
-          if dstBackend != nil and dstBackend.isOpen:
-            discard dstBackend.put(k, v)
+    # Wait for leaders on all new space groups
+    for gid in leaderStore.spaces[spaceId].groupIds:
+      var foundLeader = false
+      for attempt in 0 ..< 50:
+        for node in nodes:
+          if node.coord.isLeader(GroupID(gid)):
+            foundLeader = true
+            break
+        if foundLeader: break
+        sleep(100)
 
     for i in 1 .. 20:
       let sel = execOnLeader(nodes, "SELECT * FROM fullmig_t WHERE id = " & $i)
@@ -624,7 +692,14 @@ suite "Space rebalance integration — crash safety":
     let spaceId = setupSpaceWithData(nodes, "crash", 2, 10)
 
     addNodeToCluster(nodes, 3)
+
+    # Wait for the new node to be visible in sys.nodes on the leader
+    # This ensures rebalanceSpaces will see the correct node count
+    sleep(500)
+
     leaderStore.rebalanceSpaces()
+
+    # Wait for Raft to replicate the space record update
     sleep(500)
 
     # Reload caches (simulates restart reading persisted state)
@@ -642,7 +717,9 @@ suite "Space rebalance integration — crash safety":
     defer: stopCluster(nodes)
 
     let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
-    let leaderStore = nodes[leaderIdx].store
+    let leaderNode = nodes[leaderIdx]
+    let leaderStore = leaderNode.store
+    let leaderMvccStore = leaderNode.mvccStore
     let spaceId = setupSpaceWithData(nodes, "idem", 2, 10)
     triggerRebalanceAndSetup(nodes, leaderStore, spaceId)
 
@@ -650,13 +727,13 @@ suite "Space rebalance integration — crash safety":
     leaderStore.loadSpaces()
 
     # All data accessible
-    let sel1 = exec(leaderStore, "SELECT * FROM idem_t")
+    let sel1 = exec(leaderStore, leaderMvccStore, "SELECT * FROM idem_t")
     check sel1.kind == erkRows
     check sel1.rows.len == 10
 
     # Re-run — should be a no-op (not rebalancing anymore)
     leaderStore.runRebalanceMigration(spaceId)
 
-    let sel2 = exec(leaderStore, "SELECT * FROM idem_t")
+    let sel2 = exec(leaderStore, leaderMvccStore, "SELECT * FROM idem_t")
     check sel2.kind == erkRows
     check sel2.rows.len == 10

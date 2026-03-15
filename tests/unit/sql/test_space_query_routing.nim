@@ -11,9 +11,14 @@ import fractio/sql/planner
 import fractio/sql/executor
 import fractio/distributed/meta/system_tables
 import fractio/protocol/raft_store
+import fractio/protocol/mvcc_store
+import fractio/protocol/txn_manager
 import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/group_types as rangeTypes
+import fractio/distributed/sharedtimer/mock
+import fractio/distributed/sharedtimer/types as timerTypes
+import fractio/core/timestamp_provider
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -30,7 +35,9 @@ proc nextBasePort(): int =
   result = testBasePort
   testBasePort += 100
 
-proc createMultiGroupTestStore(testDir: string, groupCount: int): RaftKVStoreExt =
+proc createMultiGroupTestStore(testDir: string,
+    groupCount: int): tuple[store: RaftKVStoreExt,
+        mvccStore: MvccTransactionStore] =
   ## Create a store with 1 meta range + N space groups.
   ## Seeds sys.spaces and sys.tables so the executor can resolve space routing.
   cleanDir(testDir)
@@ -65,7 +72,7 @@ proc createMultiGroupTestStore(testDir: string, groupCount: int): RaftKVStoreExt
   # Wait for all groups to elect a leader (single-node → self-election)
   let allGroupIds = @[GroupID(1), GroupID(2)] &
     (0 ..< groupCount).mapIt(GroupID(uint64(10 + it)))
-  for attempt in 0 ..< 50:  # up to 5 seconds
+  for attempt in 0 ..< 50: # up to 5 seconds
     var allLeaders = true
     for gid in allGroupIds:
       if not coord.isLeader(gid):
@@ -74,12 +81,18 @@ proc createMultiGroupTestStore(testDir: string, groupCount: int): RaftKVStoreExt
     if allLeaders: break
     os.sleep(100)
 
-  result = newRaftKVStoreExt(coord, proposeTimeoutMs = 5000)
-  result.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
+  let store = newRaftKVStoreExt(coord, proposeTimeoutMs = 5000)
+  store.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
 
   # Pre-create SMs for space groups
   for i in 0 ..< groupCount:
-    discard result.getOrCreateSM(GroupID(uint64(10 + i)))
+    discard store.getOrCreateSM(GroupID(uint64(10 + i)))
+
+  # Create MVCC store for DDL operations
+  let txnMgr = newTransactionManager()
+  let mockTimer = MockTimeProvider(currentTime: timerTypes.Timestamp(1_000_000_000))
+  let tsProvider = newTimestampProvider(mockTimer, nodeId.uint16)
+  let mvccStore = newMvccTransactionStore(store, txnMgr, tsProvider)
 
   # Seed space record
   let spaceKey = encodeSpaceKey(2)
@@ -90,9 +103,11 @@ proc createMultiGroupTestStore(testDir: string, groupCount: int): RaftKVStoreExt
     "groupCount": groupCount,
     "groupIds": groupIds,
   }
-  discard result.raftPut(spaceKey, spaceVal)
+  discard store.raftPut(spaceKey, spaceVal)
 
-  result.loadSpaces()
+  store.loadSpaces()
+
+  result = (store, mvccStore)
 
 proc seedSpaceTable(store: RaftKVStoreExt, tableId: uint32,
     tableName: string, database = "default", schema = "public") =
@@ -135,9 +150,9 @@ proc seedSpaceTableThreeCol(store: RaftKVStoreExt, tableId: uint32,
   discard store.raftPut(tableKey, tableVal)
   store.loadTableSpaces()
 
-proc exec(store: RaftKVStoreExt, sql: string,
+proc exec(store: RaftKVStoreExt, mvccStore: MvccTransactionStore, sql: string,
     database = "default", schema = "public"): ExecResult =
-  executeSQL(sql, store, database, schema)
+  executeSQL(sql, store, mvccStore, database, schema)
 
 proc cleanupTestDir(testDir: string) =
   if dirExists(testDir):
@@ -149,11 +164,12 @@ proc cleanupTestDir(testDir: string) =
 
 suite "SQL Executor — space-routed INSERT":
   var store: RaftKVStoreExt
+  var mvccStore: MvccTransactionStore
   let testDir = "/tmp/fractio_test_space_insert_" & $getCurrentProcessId()
 
   setup:
     cleanupTestDir(testDir)
-    store = createMultiGroupTestStore(testDir, 3)
+    (store, mvccStore) = createMultiGroupTestStore(testDir, 3)
     seedSpaceTable(store, 100, "items")
 
   teardown:
@@ -161,8 +177,10 @@ suite "SQL Executor — space-routed INSERT":
     cleanupTestDir(testDir)
 
   test "INSERT routes rows to space groups":
-    let res = exec(store,
+    let res = exec(store, mvccStore,
         "INSERT INTO items (id, val) VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')")
+    if res.kind == erkError:
+      echo "DEBUG: INSERT error: ", res.error
     check res.kind == erkModified
     check res.count == 5
 
@@ -177,7 +195,7 @@ suite "SQL Executor — space-routed INSERT":
     check nonEmpty >= 2
 
   test "INSERT single row":
-    let res = exec(store,
+    let res = exec(store, mvccStore,
         "INSERT INTO items (id, val) VALUES (42, 'hello')")
     check res.kind == erkModified
     check res.count == 1
@@ -188,15 +206,16 @@ suite "SQL Executor — space-routed INSERT":
 
 suite "SQL Executor — space-routed SELECT":
   var store: RaftKVStoreExt
+  var mvccStore: MvccTransactionStore
   let testDir = "/tmp/fractio_test_space_select_" & $getCurrentProcessId()
 
   setup:
     cleanupTestDir(testDir)
-    store = createMultiGroupTestStore(testDir, 3)
+    (store, mvccStore) = createMultiGroupTestStore(testDir, 3)
     seedSpaceTable(store, 100, "items")
     # Insert 10 rows distributed across groups
     for i in 1 .. 10:
-      discard exec(store,
+      discard exec(store, mvccStore,
           "INSERT INTO items (id, val) VALUES (" & $i & ", 'v" & $i & "')")
 
   teardown:
@@ -204,12 +223,12 @@ suite "SQL Executor — space-routed SELECT":
     cleanupTestDir(testDir)
 
   test "SELECT * returns all rows from all groups":
-    let res = exec(store, "SELECT * FROM items")
+    let res = exec(store, mvccStore, "SELECT * FROM items")
     check res.kind == erkRows
     check res.rows.len == 10
 
   test "SELECT * returns rows in sorted key order":
-    let res = exec(store, "SELECT * FROM items")
+    let res = exec(store, mvccStore, "SELECT * FROM items")
     check res.kind == erkRows
     # Rows should be ordered by key (which includes the padded primary key)
     for i in 1 ..< res.rows.len:
@@ -219,7 +238,7 @@ suite "SQL Executor — space-routed SELECT":
     check res.rows.len == 10
 
   test "SELECT with WHERE point-get routes to single group":
-    let res = exec(store, "SELECT * FROM items WHERE id = 5")
+    let res = exec(store, mvccStore, "SELECT * FROM items WHERE id = 5")
     check res.kind == erkRows
     check res.rows.len == 1
     check res.rows[0][0] == "5"
@@ -227,25 +246,25 @@ suite "SQL Executor — space-routed SELECT":
 
   test "SELECT with WHERE filter on non-PK column":
     # This uses scan + filter, not point get
-    let res = exec(store, "SELECT * FROM items WHERE val = 'v3'")
+    let res = exec(store, mvccStore, "SELECT * FROM items WHERE val = 'v3'")
     check res.kind == erkRows
     check res.rows.len == 1
     check res.rows[0][0] == "3"
 
   test "SELECT with LIMIT":
-    let res = exec(store, "SELECT * FROM items LIMIT 3")
+    let res = exec(store, mvccStore, "SELECT * FROM items LIMIT 3")
     check res.kind == erkRows
     check res.rows.len == 3
 
   test "SELECT from empty space-routed table":
     # Create a second table in the same space, don't insert data
     seedSpaceTable(store, 200, "empty_items")
-    let res = exec(store, "SELECT * FROM empty_items")
+    let res = exec(store, mvccStore, "SELECT * FROM empty_items")
     check res.kind == erkRows
     check res.rows.len == 0
 
   test "SELECT with point-get for non-existent key":
-    let res = exec(store, "SELECT * FROM items WHERE id = 999")
+    let res = exec(store, mvccStore, "SELECT * FROM items WHERE id = 999")
     check res.kind == erkRows
     check res.rows.len == 0
 
@@ -255,14 +274,15 @@ suite "SQL Executor — space-routed SELECT":
 
 suite "SQL Executor — space-routed UPDATE":
   var store: RaftKVStoreExt
+  var mvccStore: MvccTransactionStore
   let testDir = "/tmp/fractio_test_space_update_" & $getCurrentProcessId()
 
   setup:
     cleanupTestDir(testDir)
-    store = createMultiGroupTestStore(testDir, 3)
+    (store, mvccStore) = createMultiGroupTestStore(testDir, 3)
     seedSpaceTable(store, 100, "items")
     for i in 1 .. 5:
-      discard exec(store,
+      discard exec(store, mvccStore,
           "INSERT INTO items (id, val) VALUES (" & $i & ", 'orig')")
 
   teardown:
@@ -270,35 +290,35 @@ suite "SQL Executor — space-routed UPDATE":
     cleanupTestDir(testDir)
 
   test "UPDATE single row by PK":
-    let res = exec(store, "UPDATE items SET val = 'changed' WHERE id = 3")
+    let res = exec(store, mvccStore, "UPDATE items SET val = 'changed' WHERE id = 3")
     check res.kind == erkModified
     check res.count == 1
 
-    let sel = exec(store, "SELECT * FROM items WHERE id = 3")
+    let sel = exec(store, mvccStore, "SELECT * FROM items WHERE id = 3")
     check sel.kind == erkRows
     check sel.rows.len == 1
     check sel.rows[0][1] == "changed"
 
   test "UPDATE all rows (no WHERE)":
-    let res = exec(store, "UPDATE items SET val = 'all_changed'")
+    let res = exec(store, mvccStore, "UPDATE items SET val = 'all_changed'")
     check res.kind == erkModified
     check res.count == 5
 
-    let sel = exec(store, "SELECT * FROM items")
+    let sel = exec(store, mvccStore, "SELECT * FROM items")
     check sel.kind == erkRows
     for row in sel.rows:
       check row[1] == "all_changed"
 
   test "UPDATE with filter matches subset":
     # Update only rows with id > 3
-    let res = exec(store, "UPDATE items SET val = 'hi' WHERE id > 3")
+    let res = exec(store, mvccStore, "UPDATE items SET val = 'hi' WHERE id > 3")
     check res.kind == erkModified
-    check res.count == 2  # id=4 and id=5
+    check res.count == 2 # id=4 and id=5
 
   test "UPDATE preserves data in correct groups":
-    discard exec(store, "UPDATE items SET val = 'new' WHERE id = 1")
+    discard exec(store, mvccStore, "UPDATE items SET val = 'new' WHERE id = 1")
     # Other rows unchanged
-    let sel = exec(store, "SELECT * FROM items WHERE id = 2")
+    let sel = exec(store, mvccStore, "SELECT * FROM items WHERE id = 2")
     check sel.rows[0][1] == "orig"
 
 # ---------------------------------------------------------------------------
@@ -307,14 +327,15 @@ suite "SQL Executor — space-routed UPDATE":
 
 suite "SQL Executor — space-routed DELETE":
   var store: RaftKVStoreExt
+  var mvccStore: MvccTransactionStore
   let testDir = "/tmp/fractio_test_space_delete_" & $getCurrentProcessId()
 
   setup:
     cleanupTestDir(testDir)
-    store = createMultiGroupTestStore(testDir, 3)
+    (store, mvccStore) = createMultiGroupTestStore(testDir, 3)
     seedSpaceTable(store, 100, "items")
     for i in 1 .. 5:
-      discard exec(store,
+      discard exec(store, mvccStore,
           "INSERT INTO items (id, val) VALUES (" & $i & ", 'v" & $i & "')")
 
   teardown:
@@ -322,33 +343,33 @@ suite "SQL Executor — space-routed DELETE":
     cleanupTestDir(testDir)
 
   test "DELETE single row by PK":
-    let res = exec(store, "DELETE FROM items WHERE id = 3")
+    let res = exec(store, mvccStore, "DELETE FROM items WHERE id = 3")
     check res.kind == erkModified
     check res.count == 1
 
-    let sel = exec(store, "SELECT * FROM items")
+    let sel = exec(store, mvccStore, "SELECT * FROM items")
     check sel.rows.len == 4
     for row in sel.rows:
       check row[0] != "3"
 
   test "DELETE all rows":
-    let res = exec(store, "DELETE FROM items")
+    let res = exec(store, mvccStore, "DELETE FROM items")
     check res.kind == erkModified
     check res.count == 5
 
-    let sel = exec(store, "SELECT * FROM items")
+    let sel = exec(store, mvccStore, "SELECT * FROM items")
     check sel.rows.len == 0
 
   test "DELETE with filter":
-    let res = exec(store, "DELETE FROM items WHERE id < 3")
+    let res = exec(store, mvccStore, "DELETE FROM items WHERE id < 3")
     check res.kind == erkModified
-    check res.count == 2  # id=1 and id=2
+    check res.count == 2 # id=1 and id=2
 
-    let sel = exec(store, "SELECT * FROM items")
+    let sel = exec(store, mvccStore, "SELECT * FROM items")
     check sel.rows.len == 3
 
   test "DELETE non-existent rows":
-    let res = exec(store, "DELETE FROM items WHERE id = 999")
+    let res = exec(store, mvccStore, "DELETE FROM items WHERE id = 999")
     check res.kind == erkModified
     check res.count == 0
 
@@ -358,11 +379,12 @@ suite "SQL Executor — space-routed DELETE":
 
 suite "SQL Executor — space routing full round-trip":
   var store: RaftKVStoreExt
+  var mvccStore: MvccTransactionStore
   let testDir = "/tmp/fractio_test_space_roundtrip_" & $getCurrentProcessId()
 
   setup:
     cleanupTestDir(testDir)
-    store = createMultiGroupTestStore(testDir, 4)
+    (store, mvccStore) = createMultiGroupTestStore(testDir, 4)
     seedSpaceTableThreeCol(store, 100, "products")
 
   teardown:
@@ -372,51 +394,51 @@ suite "SQL Executor — space routing full round-trip":
   test "INSERT → SELECT → UPDATE → DELETE round-trip with 4 groups":
     # Insert 20 rows
     for i in 1 .. 20:
-      let res = exec(store,
+      let res = exec(store, mvccStore,
           "INSERT INTO products (id, name, score) VALUES (" &
           $i & ", 'item" & $i & "', " & $(i * 10) & ")")
       check res.kind == erkModified
 
     # SELECT all — should merge from 4 groups
-    var sel = exec(store, "SELECT * FROM products")
+    var sel = exec(store, mvccStore, "SELECT * FROM products")
     check sel.kind == erkRows
     check sel.rows.len == 20
 
     # Point get
-    sel = exec(store, "SELECT * FROM products WHERE id = 15")
+    sel = exec(store, mvccStore, "SELECT * FROM products WHERE id = 15")
     check sel.kind == erkRows
     check sel.rows.len == 1
     check sel.rows[0][1] == "item15"
     check sel.rows[0][2] == "150"
 
     # Update some rows
-    let upd = exec(store,
+    let upd = exec(store, mvccStore,
         "UPDATE products SET score = 0 WHERE score > 150")
     check upd.kind == erkModified
     # Rows with score > 150: id 16-20 → 5 rows
     check upd.count == 5
 
     # Verify update
-    sel = exec(store, "SELECT * FROM products WHERE id = 18")
+    sel = exec(store, mvccStore, "SELECT * FROM products WHERE id = 18")
     check sel.rows[0][2] == "0"
 
     # Delete some rows
-    let del = exec(store, "DELETE FROM products WHERE score = 0")
+    let del = exec(store, mvccStore, "DELETE FROM products WHERE score = 0")
     check del.kind == erkModified
     check del.count == 5
 
     # Verify remaining
-    sel = exec(store, "SELECT * FROM products")
+    sel = exec(store, mvccStore, "SELECT * FROM products")
     check sel.rows.len == 15
 
   test "large dataset with many keys across 4 groups":
     # Insert 100 rows
     for i in 1 .. 100:
-      discard exec(store,
+      discard exec(store, mvccStore,
           "INSERT INTO products (id, name, score) VALUES (" &
           $i & ", 'p" & $i & "', " & $i & ")")
 
-    let sel = exec(store, "SELECT * FROM products")
+    let sel = exec(store, mvccStore, "SELECT * FROM products")
     check sel.kind == erkRows
     check sel.rows.len == 100
 
@@ -436,11 +458,12 @@ suite "SQL Executor — space routing full round-trip":
 
 suite "SQL Executor — space routing backward compat":
   var store: RaftKVStoreExt
+  var mvccStore: MvccTransactionStore
   let testDir = "/tmp/fractio_test_space_compat_" & $getCurrentProcessId()
 
   setup:
     cleanupTestDir(testDir)
-    store = createMultiGroupTestStore(testDir, 3)
+    (store, mvccStore) = createMultiGroupTestStore(testDir, 3)
 
   teardown:
     store.coordinator.stop()
@@ -448,37 +471,37 @@ suite "SQL Executor — space routing backward compat":
 
   test "tables not in a space use default routing":
     # Create table without space assignment (no spaceId in catalog)
-    let res = exec(store,
+    let res = exec(store, mvccStore,
         "CREATE TABLE plain (id INT PRIMARY KEY, val TEXT)")
     check res.kind == erkOk
 
     # INSERT/SELECT should work via default findRangeId path
-    let ins = exec(store,
+    let ins = exec(store, mvccStore,
         "INSERT INTO plain (id, val) VALUES (1, 'a'), (2, 'b')")
     check ins.kind == erkModified
     check ins.count == 2
 
-    let sel = exec(store, "SELECT * FROM plain")
+    let sel = exec(store, mvccStore, "SELECT * FROM plain")
     check sel.kind == erkRows
     check sel.rows.len == 2
 
   test "space-routed and default tables coexist":
     # Default table
-    discard exec(store,
+    discard exec(store, mvccStore,
         "CREATE TABLE plain (id INT PRIMARY KEY, val TEXT)")
-    discard exec(store,
+    discard exec(store, mvccStore,
         "INSERT INTO plain (id, val) VALUES (1, 'plain1')")
 
     # Space-routed table
     seedSpaceTable(store, 200, "spaced")
-    discard exec(store,
+    discard exec(store, mvccStore,
         "INSERT INTO spaced (id, val) VALUES (1, 'spaced1')")
 
     # Both are readable independently
-    let sel1 = exec(store, "SELECT * FROM plain")
+    let sel1 = exec(store, mvccStore, "SELECT * FROM plain")
     check sel1.rows.len == 1
     check sel1.rows[0][1] == "plain1"
 
-    let sel2 = exec(store, "SELECT * FROM spaced")
+    let sel2 = exec(store, mvccStore, "SELECT * FROM spaced")
     check sel2.rows.len == 1
     check sel2.rows[0][1] == "spaced1"

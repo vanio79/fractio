@@ -8,13 +8,13 @@ import std/[strutils, unicode, tables]
 type
   TokenKind* = enum
     # Literals
-    tkInt         ## integer literal
-    tkFloat       ## floating-point literal
-    tkString      ## single-quoted string  'hello'
-    tkIdent       ## identifier / unquoted name
-    tkNull        ## NULL keyword (treated as a literal)
-    tkTrue        ## TRUE
-    tkFalse       ## FALSE
+    tkInt        ## integer literal
+    tkFloat      ## floating-point literal
+    tkString     ## single-quoted string  'hello'
+    tkIdent      ## identifier / unquoted name
+    tkNull       ## NULL keyword (treated as a literal)
+    tkTrue       ## TRUE
+    tkFalse      ## FALSE
 
     # DDL keywords
     tkCreate
@@ -109,91 +109,91 @@ type
     tkError
 
   Token* = object
-    kind*:   TokenKind
-    value*:  string    ## raw text of the token
-    line*:   int
-    col*:    int
+    kind*: TokenKind
+    value*: string ## raw text of the token
+    line*: int
+    col*: int
 
 # ---------------------------------------------------------------------------
 # Keyword table — all uppercase, mapped to the token kind
 # ---------------------------------------------------------------------------
 
 const keywords = {
-  "CREATE":      tkCreate,
-  "DROP":        tkDrop,
-  "TABLE":       tkTable,
-  "DATABASE":    tkDatabase,
-  "SCHEMA":      tkSchema,
-  "IF":          tkIdent,   # handled contextually by the parser
-  "PRIMARY":     tkPrimary,
-  "KEY":         tkKey,
-  "UNIQUE":      tkUnique,
-  "NOT":         tkNot,
-  "NULL":        tkNull,
-  "DEFAULT":     tkDefault,
-  "SELECT":      tkSelect,
-  "INSERT":      tkInsert,
-  "UPDATE":      tkUpdate,
-  "DELETE":      tkDelete,
-  "INTO":        tkInto,
-  "VALUES":      tkValues,
-  "SET":         tkSet,
-  "FROM":        tkFrom,
-  "WHERE":       tkWhere,
-  "AND":         tkAnd,
-  "OR":          tkOr,
-  "IN":          tkIn,
-  "IS":          tkIs,
-  "BETWEEN":     tkBetween,
-  "LIKE":        tkLike,
-  "LIMIT":       tkLimit,
-  "OFFSET":      tkOffset,
-  "ORDER":       tkOrder,
-  "BY":          tkBy,
-  "ASC":         tkAsc,
-  "DESC":        tkDesc,
-  "ALL":         tkAll,
-  "DISTINCT":    tkDistinct,
-  "BEGIN":       tkBegin,
-  "COMMIT":      tkCommit,
-  "ROLLBACK":    tkRollback,
+  "CREATE": tkCreate,
+  "DROP": tkDrop,
+  "TABLE": tkTable,
+  "DATABASE": tkDatabase,
+  "SCHEMA": tkSchema,
+  "IF": tkIdent, # handled contextually by the parser
+  "PRIMARY": tkPrimary,
+  "KEY": tkKey,
+  "UNIQUE": tkUnique,
+  "NOT": tkNot,
+  "NULL": tkNull,
+  "DEFAULT": tkDefault,
+  "SELECT": tkSelect,
+  "INSERT": tkInsert,
+  "UPDATE": tkUpdate,
+  "DELETE": tkDelete,
+  "INTO": tkInto,
+  "VALUES": tkValues,
+  "SET": tkSet,
+  "FROM": tkFrom,
+  "WHERE": tkWhere,
+  "AND": tkAnd,
+  "OR": tkOr,
+  "IN": tkIn,
+  "IS": tkIs,
+  "BETWEEN": tkBetween,
+  "LIKE": tkLike,
+  "LIMIT": tkLimit,
+  "OFFSET": tkOffset,
+  "ORDER": tkOrder,
+  "BY": tkBy,
+  "ASC": tkAsc,
+  "DESC": tkDesc,
+  "ALL": tkAll,
+  "DISTINCT": tkDistinct,
+  "BEGIN": tkBegin,
+  "COMMIT": tkCommit,
+  "ROLLBACK": tkRollback,
   "TRANSACTION": tkTransaction,
-  "WORK":        tkWork,
-  "TRUE":        tkTrue,
-  "FALSE":       tkFalse,
-  "EXPLAIN":     tkExplain,
-  "WITH":        tkWith,
-  "SHOW":        tkShow,
-  "USE":         tkUse,
-  "DATABASES":   tkDatabases,
-  "SCHEMAS":     tkSchemas,
-  "TABLES":      tkTables,
-  "SPACE":       tkSpace,
-  "SPACES":      tkSpaces,
+  "WORK": tkWork,
+  "TRUE": tkTrue,
+  "FALSE": tkFalse,
+  "EXPLAIN": tkExplain,
+  "WITH": tkWith,
+  "SHOW": tkShow,
+  "USE": tkUse,
+  "DATABASES": tkDatabases,
+  "SCHEMAS": tkSchemas,
+  "TABLES": tkTables,
+  "SPACE": tkSpace,
+  "SPACES": tkSpaces,
   # Type aliases
-  "INT":         tkTkInt,
-  "INTEGER":     tkTkInt,
-  "BIGINT":      tkTkInt,
-  "SMALLINT":    tkTkInt,
-  "TINYINT":     tkTkInt,
-  "FLOAT":       tkTkFloat,
-  "DOUBLE":      tkTkFloat,
-  "REAL":        tkTkFloat,
-  "NUMERIC":     tkTkFloat,
-  "DECIMAL":     tkTkFloat,
-  "TEXT":        tkTkText,
-  "VARCHAR":     tkTkText,
-  "CHAR":        tkTkText,
-  "STRING":      tkTkText,
-  "BOOLEAN":     tkTkBool,
-  "BOOL":        tkTkBool,
-  "DATE":        tkTkDate,
-  "DATETIME":    tkTkDateTime,
-  "TIMESTAMP":   tkTkDateTime,
-  "BLOB":        tkTkBytes,
-  "BYTES":       tkTkBytes,
-  "BYTEA":       tkTkBytes,
-  "BINARY":      tkTkBytes,
+  "INT": tkTkInt,
+  "INTEGER": tkTkInt,
+  "BIGINT": tkTkInt,
+  "SMALLINT": tkTkInt,
+  "TINYINT": tkTkInt,
+  "FLOAT": tkTkFloat,
+  "DOUBLE": tkTkFloat,
+  "REAL": tkTkFloat,
+  "NUMERIC": tkTkFloat,
+  "DECIMAL": tkTkFloat,
+  "TEXT": tkTkText,
+  "VARCHAR": tkTkText,
+  "CHAR": tkTkText,
+  "STRING": tkTkText,
+  "BOOLEAN": tkTkBool,
+  "BOOL": tkTkBool,
+  "DATE": tkTkDate,
+  "DATETIME": tkTkDateTime,
+  "TIMESTAMP": tkTkDateTime,
+  "BLOB": tkTkBytes,
+  "BYTES": tkTkBytes,
+  "BYTEA": tkTkBytes,
+  "BINARY": tkTkBytes,
 }.toTable
 
 # ---------------------------------------------------------------------------
@@ -202,10 +202,10 @@ const keywords = {
 
 type
   Lexer* = object
-    src*:    string
-    pos*:    int
-    line*:   int
-    col*:    int
+    src*: string
+    pos*: int
+    line*: int
+    col*: int
 
 proc newLexer*(src: string): Lexer =
   Lexer(src: src, pos: 0, line: 1, col: 1)
@@ -246,7 +246,7 @@ proc skipWhitespaceAndComments(l: var Lexer) =
       break
 
 proc lexString(l: var Lexer, startLine, startCol: int): Token =
-  discard l.advance  # consume opening quote
+  discard l.advance # consume opening quote
   var s = ""
   while not l.atEnd:
     let c = l.advance
@@ -268,7 +268,7 @@ proc lexNumber(l: var Lexer, startLine, startCol: int): Token =
     s.add(l.advance)
   if not l.atEnd and l.peek == '.' and l.peek(1) in {'0'..'9'}:
     isFloat = true
-    s.add(l.advance)  # dot
+    s.add(l.advance) # dot
     while not l.atEnd and l.peek in {'0'..'9'}:
       s.add(l.advance)
   if not l.atEnd and l.peek in {'e', 'E'}:
@@ -290,7 +290,7 @@ proc lexIdent(l: var Lexer, startLine, startCol: int): Token =
   Token(kind: kind, value: s, line: startLine, col: startCol)
 
 proc lexQuotedIdent(l: var Lexer, startLine, startCol: int): Token =
-  discard l.advance  # consume opening "
+  discard l.advance # consume opening "
   var s = ""
   while not l.atEnd:
     let c = l.advance
@@ -310,12 +310,12 @@ proc nextToken*(l: var Lexer): Token =
     return Token(kind: tkEOF, value: "", line: l.line, col: l.col)
 
   let startLine = l.line
-  let startCol  = l.col
+  let startCol = l.col
   let c = l.peek
 
   case c
   of '\'': return l.lexString(startLine, startCol)
-  of '"':  return l.lexQuotedIdent(startLine, startCol)
+  of '"': return l.lexQuotedIdent(startLine, startCol)
   of '`':
     # MySQL-style quoted identifier
     discard l.advance

@@ -24,12 +24,12 @@ import ../core/types as coreTypes
 type
   ParseError* = object of CatchableError
     line*: int
-    col*:  int
+    col*: int
 
 proc parseError(msg: string, tok: Token): ref ParseError =
   let e = newException(ParseError, &"[line {tok.line}:{tok.col}] {msg}")
   e.line = tok.line
-  e.col  = tok.col
+  e.col = tok.col
   e
 
 # ---------------------------------------------------------------------------
@@ -39,7 +39,7 @@ proc parseError(msg: string, tok: Token): ref ParseError =
 type
   Parser* = object
     tokens: seq[Token]
-    pos:    int
+    pos: int
 
 proc newParser*(tokens: seq[Token]): Parser =
   Parser(tokens: tokens, pos: 0)
@@ -126,18 +126,18 @@ proc parseInSpace(p: var Parser): Option[string]
 
 proc tokenBinOp(k: TokenKind): tuple[op: BinOpKind, prec: int, found: bool] =
   case k
-  of tkOr:      (boOr,  1, true)
-  of tkAnd:     (boAnd, 2, true)
-  of tkEq:      (boEq,  3, true)
-  of tkNeq:     (boNeq, 3, true)
-  of tkLt:      (boLt,  4, true)
-  of tkLte:     (boLte, 4, true)
-  of tkGt:      (boGt,  4, true)
-  of tkGte:     (boGte, 4, true)
-  of tkPlus:    (boAdd, 5, true)
-  of tkMinus:   (boSub, 5, true)
-  of tkStar:    (boMul, 6, true)
-  of tkSlash:   (boDiv, 6, true)
+  of tkOr: (boOr, 1, true)
+  of tkAnd: (boAnd, 2, true)
+  of tkEq: (boEq, 3, true)
+  of tkNeq: (boNeq, 3, true)
+  of tkLt: (boLt, 4, true)
+  of tkLte: (boLte, 4, true)
+  of tkGt: (boGt, 4, true)
+  of tkGte: (boGte, 4, true)
+  of tkPlus: (boAdd, 5, true)
+  of tkMinus: (boSub, 5, true)
+  of tkStar: (boMul, 6, true)
+  of tkSlash: (boDiv, 6, true)
   of tkPercent: (boMod, 6, true)
   else: (boEq, 0, false)
 
@@ -234,7 +234,7 @@ proc parseExpr(p: var Parser, minPrec: int = 0): Expr =
     # [NOT] BETWEEN lo AND hi
     if t.kind in {tkBetween}:
       discard p.advance
-      let lo = p.parseExpr(5)  # above AND precedence
+      let lo = p.parseExpr(5) # above AND precedence
       discard p.expect(tkAnd)
       let hi = p.parseExpr(5)
       left = Expr(kind: exBetween, betweenExpr: left, betweenNot: false,
@@ -245,14 +245,15 @@ proc parseExpr(p: var Parser, minPrec: int = 0): Expr =
     if t.kind == tkLike:
       discard p.advance
       let pat = p.parseExpr(5)
-      left = Expr(kind: exLike, likeExpr: left, likeNot: false, likePattern: pat)
+      left = Expr(kind: exLike, likeExpr: left, likeNot: false,
+          likePattern: pat)
       continue
 
     # Binary operators
     let (op, prec, found) = tokenBinOp(t.kind)
     if not found or prec <= minPrec: break
     discard p.advance
-    let right = p.parseExpr(prec)  # left-associative
+    let right = p.parseExpr(prec) # left-associative
     left = Expr(kind: exBinOp, binOp: op, binLeft: left, binRight: right)
 
   left
@@ -264,8 +265,8 @@ proc parseExpr(p: var Parser, minPrec: int = 0): Expr =
 proc parseDataType(p: var Parser): DataType =
   let t = p.peek
   case t.kind
-  of tkTkInt:      discard p.advance; dtInt
-  of tkTkFloat:    discard p.advance; dtFloat
+  of tkTkInt: discard p.advance; dtInt
+  of tkTkFloat: discard p.advance; dtFloat
   of tkTkText:
     discard p.advance
     # optional (n) precision — skip it
@@ -274,10 +275,10 @@ proc parseDataType(p: var Parser): DataType =
       discard p.expect(tkInt)
       discard p.expect(tkRParen)
     dtString
-  of tkTkBool:     discard p.advance; dtBool
-  of tkTkDate:     discard p.advance; dtDate
+  of tkTkBool: discard p.advance; dtBool
+  of tkTkDate: discard p.advance; dtDate
   of tkTkDateTime: discard p.advance; dtDateTime
-  of tkTkBytes:    discard p.advance; dtBytes
+  of tkTkBytes: discard p.advance; dtBytes
   else:
     raise parseError(&"expected a data type but got '{t.value}'", t)
 
@@ -296,7 +297,7 @@ proc parseColDef(p: var Parser): ColDef =
       discard p.expect(tkNull)
       result.notNull = true
     of tkNull:
-      discard p.advance  # explicit nullable — default
+      discard p.advance # explicit nullable — default
     of tkPrimary:
       discard p.advance
       discard p.expect(tkKey)
@@ -393,7 +394,8 @@ proc parseSelect(p: var Parser): Stmt =
     discard p.advance
     fromAlias = p.expectIdent
   elif p.peekKind == tkIdent and
-       p.peek.value.toUpperAscii notin ["WHERE","ORDER","LIMIT","OFFSET","GROUP","HAVING"]:
+       p.peek.value.toUpperAscii notin ["WHERE", "ORDER", "LIMIT", "OFFSET",
+           "GROUP", "HAVING"]:
     fromAlias = p.expectIdent
 
   var whereExpr: Option[Expr]
@@ -545,7 +547,7 @@ proc parseWithReplicas(p: var Parser): Option[int] =
   ## Returns none if absent; raises ParseError if malformed.
   if p.peekKind != tkWith:
     return none(int)
-  discard p.advance  # consume WITH
+  discard p.advance # consume WITH
   let kw = p.expectIdent
   if kw.toUpperAscii != "REPLICAS":
     raise parseError("expected REPLICAS after WITH but got '" & kw & "'", p.peek)
@@ -601,9 +603,10 @@ proc parseCreateSpace(p: var Parser): Stmt =
       raise parseError("REPLICAS must be >= 1, got " & $replicas, tok)
   elif tok.kind == tkAll:
     discard p.advance
-    replicas = 0  # 0 means ALL
+    replicas = 0 # 0 means ALL
   else:
-    raise parseError("expected integer or ALL for REPLICAS but got '" & tok.value & "'", tok)
+    raise parseError("expected integer or ALL for REPLICAS but got '" &
+        tok.value & "'", tok)
   Stmt(kind: stmtCreateSpace, csSpaceName: name, csSpaceReplicas: replicas)
 
 proc parseDropSpace(p: var Parser): Stmt =
@@ -615,10 +618,10 @@ proc parseInSpace(p: var Parser): Option[string] =
   ## Parse optional IN SPACE <name> clause.
   if p.peekKind != tkIn:
     return none(string)
-  discard p.advance  # consume IN
+  discard p.advance # consume IN
   if p.peekKind != tkSpace:
     raise parseError("expected SPACE after IN but got '" & p.peek.value & "'", p.peek)
-  discard p.advance  # consume SPACE
+  discard p.advance # consume SPACE
   let name = p.expectIdent
   some(name)
 

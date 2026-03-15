@@ -203,12 +203,53 @@ src/fractio/
 
 - Compiler flags: Always `--checks:on` during development; `--define:release` for performance.
 - Concurrency: `std/typedthreads` with `createThread(threadVar, workerProc, args)`. Worker proc must be `{.thread.}` and accept typed tuple.
-- ORC GC: Sharing `ref` across threads allowed but must pass explicitly; do not capture in `gcsafe` closures.
+- **Atomic ARC GC**: Sharing `ref` across threads allowed but must pass explicitly; do not capture in `gcsafe` closures.
 - Library target: Set `skipDirs` in `.nimble` to exclude `tests`, `benchmarks`, `docs`, `tmp`.
 
 ---
 
-## 8. When Stuck
+## 8. CodeGraphRAG - Code Navigation (First Priority)
+
+**Always use CodeGraphRAG as the first option when inspecting or exploring the codebase.** It provides fast, semantic access to the indexed code graph.
+
+### When to Use CodeGraphRAG
+- Finding function/method definitions and their locations
+- Understanding class hierarchies and relationships
+- Tracing function call graphs (what calls what)
+- Finding usages of types, classes, and methods
+- Exploring module structure and imports
+
+### Key Queries
+```bash
+# Find a class/type
+codegraphrag_query_code_graph("show me the RaftNode class")
+
+# Find functions by name
+codegraphrag_query_code_graph("search for beginTransaction")
+
+# Get source code snippet
+codegraphrag_get_code_snippet(qualified_name="fractio.core.transaction_manager.TransactionManager.beginTransaction")
+
+# Find call relationships
+codegraphrag_query_code_graph("show what functions call handleAE")
+
+# Explore module contents
+codegraphrag_query_code_graph("show all functions in fractio.distributed.raft.node")
+```
+
+### Important: Cache File
+If reindexing doesn't show new changes, delete the cache file first:
+```bash
+rm .cgr-hash-cache.json
+codegraphrag_index_repository()
+```
+
+### Fallback
+Only use `grep`, `glob`, or file `read` when CodeGraphRAG doesn't have the information needed.
+
+---
+
+## 9. When Stuck
 
 1. **Missing context** → `Read` nearby files first.
 2. **Missing dependencies** → Check `fractio.nimble` `requires` section.

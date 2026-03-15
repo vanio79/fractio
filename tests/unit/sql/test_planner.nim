@@ -9,9 +9,14 @@ import fractio/sql/ast
 import fractio/sql/planner
 import fractio/distributed/meta/system_tables
 import fractio/protocol/raft_store
+import fractio/protocol/mvcc_store
+import fractio/protocol/txn_manager
 import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/group_types
+import fractio/distributed/sharedtimer/mock
+import fractio/distributed/sharedtimer/types as timerTypes
+import fractio/core/timestamp_provider
 
 # ---------------------------------------------------------------------------
 # Test helper: create a single-node RaftKVStoreExt
@@ -23,7 +28,8 @@ proc nextBasePort(): int =
   result = testBasePort
   testBasePort += 100
 
-proc createTestStore(testDir: string): RaftKVStoreExt =
+proc createTestStore(testDir: string): tuple[store: RaftKVStoreExt,
+    mvccStore: MvccTransactionStore] =
   if dirExists(testDir): removeDir(testDir)
   createDir(testDir)
   let nodeId = NodeID(1)
@@ -49,8 +55,16 @@ proc createTestStore(testDir: string): RaftKVStoreExt =
       break
     os.sleep(100)
 
-  result = newRaftKVStoreExt(coord, proposeTimeoutMs = 5000)
-  result.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
+  let store = newRaftKVStoreExt(coord, proposeTimeoutMs = 5000)
+  store.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
+
+  # Create MVCC store for catalog operations
+  let txnMgr = newTransactionManager()
+  let mockTimer = MockTimeProvider(currentTime: timerTypes.Timestamp(1_000_000_000))
+  let tsProvider = newTimestampProvider(mockTimer, nodeId.uint16)
+  let mvccStore = newMvccTransactionStore(store, txnMgr, tsProvider)
+
+  result = (store, mvccStore)
 
 proc cleanupTestDir(testDir: string) =
   if dirExists(testDir):
@@ -85,11 +99,12 @@ proc seedTable(store: RaftKVStoreExt, database, schema, name: string,
 
 suite "SQL Planner":
   var store: RaftKVStoreExt
+  var mvccStore: MvccTransactionStore
   let testDir = "/tmp/fractio_test_planner_" & $getCurrentProcessId()
 
   setup:
     cleanupTestDir(testDir)
-    store = createTestStore(testDir)
+    (store, mvccStore) = createTestStore(testDir)
 
   teardown:
     store.coordinator.stop()
@@ -287,7 +302,7 @@ suite "SQL Planner":
     let plan = planStatement(stmt, store)
     check plan.ops.len == 1
     check plan.ops[0].kind == poShowSchemas
-    check plan.ops[0].ssDatabase == "default"  # uses default database
+    check plan.ops[0].ssDatabase == "default" # uses default database
 
   test "plan SHOW SCHEMAS IN mydb":
     let stmt = parseStatement("SHOW SCHEMAS IN mydb")
@@ -369,11 +384,11 @@ suite "SQL Planner":
     check plan.ops[0].exInnerPlan.ops[0].kind == poCreateTable
 
   test "nextTableId allocates incrementally":
-    let id1 = nextTableId(store)
+    let id1 = nextTableId(store, mvccStore)
     check id1 == FIRST_USER_TABLE_ID
 
     # Seed a table and check the next ID
     seedTable(store, "default", "public", "t1", id1,
       @[("id", "INT")], @["id"])
-    let id2 = nextTableId(store)
+    let id2 = nextTableId(store, mvccStore)
     check id2 == id1 + 1

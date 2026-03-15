@@ -60,7 +60,7 @@ proc cleanupTestDir(testDir: string) =
 
 proc exec(store: RaftKVStoreExt, sql: string,
     database = "default", schema = "public"): ExecResult =
-  executeSQL(sql, store, database, schema)
+  executeSQL(sql, store, mvccStore = nil, database = database, schema = schema)
 
 proc seedTable(store: RaftKVStoreExt, database, schema, name: string,
     tableId: uint32, columns: seq[tuple[name: string, typ: string]],
@@ -222,11 +222,13 @@ suite "EXPLAIN — formatExpr":
     check formatExpr(e) == "42"
 
   test "format string literal":
-    let e = Expr(kind: exLiteral, litValue: ValueRef(kind: dtString, strValue: "hello"))
+    let e = Expr(kind: exLiteral, litValue: ValueRef(kind: dtString,
+        strValue: "hello"))
     check formatExpr(e) == "'hello'"
 
   test "format bool literal":
-    let e = Expr(kind: exLiteral, litValue: ValueRef(kind: dtBool, boolValue: true))
+    let e = Expr(kind: exLiteral, litValue: ValueRef(kind: dtBool,
+        boolValue: true))
     check formatExpr(e) == "true"
 
   test "format column reference":
@@ -244,7 +246,8 @@ suite "EXPLAIN — formatExpr":
     check formatExpr(e) == "id = 1"
 
   test "format comparison operators":
-    for (op, sym) in [(boLt, "<"), (boLte, "<="), (boGt, ">"), (boGte, ">="), (boNeq, "<>")]:
+    for (op, sym) in [(boLt, "<"), (boLte, "<="), (boGt, ">"), (boGte, ">="), (
+        boNeq, "<>")]:
       let e = Expr(kind: exBinOp, binOp: op,
         binLeft: Expr(kind: exColumn, colTable: "", colName: "x"),
         binRight: Expr(kind: exLiteral, litValue: ValueRef(kind: dtInt, intValue: 5)))
@@ -254,10 +257,12 @@ suite "EXPLAIN — formatExpr":
     let e = Expr(kind: exBinOp, binOp: boAnd,
       binLeft: Expr(kind: exBinOp, binOp: boGt,
         binLeft: Expr(kind: exColumn, colTable: "", colName: "age"),
-        binRight: Expr(kind: exLiteral, litValue: ValueRef(kind: dtInt, intValue: 18))),
+        binRight: Expr(kind: exLiteral, litValue: ValueRef(kind: dtInt,
+            intValue: 18))),
       binRight: Expr(kind: exBinOp, binOp: boLt,
         binLeft: Expr(kind: exColumn, colTable: "", colName: "age"),
-        binRight: Expr(kind: exLiteral, litValue: ValueRef(kind: dtInt, intValue: 65))))
+        binRight: Expr(kind: exLiteral, litValue: ValueRef(kind: dtInt,
+            intValue: 65))))
     let formatted = formatExpr(e)
     check "AND" in formatted
     check "age > 18" in formatted
@@ -267,10 +272,12 @@ suite "EXPLAIN — formatExpr":
     let e = Expr(kind: exBinOp, binOp: boOr,
       binLeft: Expr(kind: exBinOp, binOp: boEq,
         binLeft: Expr(kind: exColumn, colTable: "", colName: "status"),
-        binRight: Expr(kind: exLiteral, litValue: ValueRef(kind: dtString, strValue: "active"))),
+        binRight: Expr(kind: exLiteral, litValue: ValueRef(kind: dtString,
+            strValue: "active"))),
       binRight: Expr(kind: exBinOp, binOp: boEq,
         binLeft: Expr(kind: exColumn, colTable: "", colName: "status"),
-        binRight: Expr(kind: exLiteral, litValue: ValueRef(kind: dtString, strValue: "pending"))))
+        binRight: Expr(kind: exLiteral, litValue: ValueRef(kind: dtString,
+            strValue: "pending"))))
     check "OR" in formatExpr(e)
 
   test "format IS NULL":
@@ -306,7 +313,8 @@ suite "EXPLAIN — formatExpr":
   test "format arithmetic":
     let e = Expr(kind: exBinOp, binOp: boAdd,
       binLeft: Expr(kind: exColumn, colTable: "", colName: "price"),
-      binRight: Expr(kind: exLiteral, litValue: ValueRef(kind: dtInt, intValue: 10)))
+      binRight: Expr(kind: exLiteral, litValue: ValueRef(kind: dtInt,
+          intValue: 10)))
     check formatExpr(e) == "price + 10"
 
 # ---------------------------------------------------------------------------
@@ -330,7 +338,8 @@ suite "EXPLAIN — formatPlanOp":
   test "format Scan op with filter":
     let filter = Expr(kind: exBinOp, binOp: boGt,
       binLeft: Expr(kind: exColumn, colTable: "", colName: "age"),
-      binRight: Expr(kind: exLiteral, litValue: ValueRef(kind: dtInt, intValue: 21)))
+      binRight: Expr(kind: exLiteral, litValue: ValueRef(kind: dtInt,
+          intValue: 21)))
     let op = PlanOp(kind: poScan,
       scTableId: 100,
       scColumns: @["name"],
@@ -374,7 +383,8 @@ suite "EXPLAIN — formatPlanOp":
       upTableId: 100,
       upTableName: "users",
       upFilter: some(filter),
-      upSets: @[("name", Expr(kind: exLiteral, litValue: ValueRef(kind: dtString, strValue: "Bob")))])
+      upSets: @[("name", Expr(kind: exLiteral, litValue: ValueRef(
+          kind: dtString, strValue: "Bob")))])
     let s = formatPlanOp(op)
     check "Update" in s
     check "filter=(id = 1)" in s
@@ -392,7 +402,8 @@ suite "EXPLAIN — formatPlanOp":
   test "format Delete op with filter":
     let filter = Expr(kind: exBinOp, binOp: boLt,
       binLeft: Expr(kind: exColumn, colTable: "", colName: "age"),
-      binRight: Expr(kind: exLiteral, litValue: ValueRef(kind: dtInt, intValue: 18)))
+      binRight: Expr(kind: exLiteral, litValue: ValueRef(kind: dtInt,
+          intValue: 18)))
     let op = PlanOp(kind: poDelete,
       delTableId: 100,
       delTableName: "users",
@@ -400,29 +411,41 @@ suite "EXPLAIN — formatPlanOp":
     check "filter=(age < 18)" in formatPlanOp(op)
 
   test "format DDL ops":
-    check "CreateDatabase" in formatPlanOp(PlanOp(kind: poCreateDatabase, cdbName: "mydb"))
-    check "DropDatabase" in formatPlanOp(PlanOp(kind: poDropDatabase, ddbName: "mydb"))
-    check "CreateSchema" in formatPlanOp(PlanOp(kind: poCreateSchema, csName: "s", csDatabase: "d"))
-    check "DropSchema" in formatPlanOp(PlanOp(kind: poDropSchema, dsName: "s", dsDatabase: "d"))
-    check "CreateTable" in formatPlanOp(PlanOp(kind: poCreateTable, ctName: "t", ctSchema: "s", ctDatabase: "d"))
-    check "DropTable" in formatPlanOp(PlanOp(kind: poDropTable, dtName: "t", dtSchema: "s", dtDatabase: "d"))
+    check "CreateDatabase" in formatPlanOp(PlanOp(kind: poCreateDatabase,
+        cdbName: "mydb"))
+    check "DropDatabase" in formatPlanOp(PlanOp(kind: poDropDatabase,
+        ddbName: "mydb"))
+    check "CreateSchema" in formatPlanOp(PlanOp(kind: poCreateSchema,
+        csName: "s", csDatabase: "d"))
+    check "DropSchema" in formatPlanOp(PlanOp(kind: poDropSchema, dsName: "s",
+        dsDatabase: "d"))
+    check "CreateTable" in formatPlanOp(PlanOp(kind: poCreateTable, ctName: "t",
+        ctSchema: "s", ctDatabase: "d"))
+    check "DropTable" in formatPlanOp(PlanOp(kind: poDropTable, dtName: "t",
+        dtSchema: "s", dtDatabase: "d"))
 
   test "format Show ops":
     check "ShowDatabases" in formatPlanOp(PlanOp(kind: poShowDatabases))
-    check "ShowSchemas" in formatPlanOp(PlanOp(kind: poShowSchemas, ssDatabase: "mydb"))
-    check "ShowTables" in formatPlanOp(PlanOp(kind: poShowTables, stDatabase: "d", stSchema: "s"))
+    check "ShowSchemas" in formatPlanOp(PlanOp(kind: poShowSchemas,
+        ssDatabase: "mydb"))
+    check "ShowTables" in formatPlanOp(PlanOp(kind: poShowTables,
+        stDatabase: "d", stSchema: "s"))
     check "ShowSpaces" in formatPlanOp(PlanOp(kind: poShowSpaces))
 
   test "format Space ops":
-    check "CreateSpace" in formatPlanOp(PlanOp(kind: poCreateSpace, cspName: "sp", cspReplicas: 3))
+    check "CreateSpace" in formatPlanOp(PlanOp(kind: poCreateSpace,
+        cspName: "sp", cspReplicas: 3))
     check "DropSpace" in formatPlanOp(PlanOp(kind: poDropSpace, dspName: "sp"))
 
   test "format Use ops":
-    check "UseDatabase" in formatPlanOp(PlanOp(kind: poUseDatabase, udName: "mydb"))
-    check "UseSchema" in formatPlanOp(PlanOp(kind: poUseSchema, usName: "mysch"))
+    check "UseDatabase" in formatPlanOp(PlanOp(kind: poUseDatabase,
+        udName: "mydb"))
+    check "UseSchema" in formatPlanOp(PlanOp(kind: poUseSchema,
+        usName: "mysch"))
 
   test "format Txn ops":
-    check "BeginTxn" in formatPlanOp(PlanOp(kind: poBeginTxn, btReadOnly: false))
+    check "BeginTxn" in formatPlanOp(PlanOp(kind: poBeginTxn,
+        btReadOnly: false))
     check "CommitTxn" in formatPlanOp(PlanOp(kind: poCommitTxn))
     check "RollbackTxn" in formatPlanOp(PlanOp(kind: poRollbackTxn))
 
@@ -476,7 +499,7 @@ suite "EXPLAIN — planner with store":
     seedTable(store, "default", "public", "users", 100,
       @[("id", "INT"), ("name", "TEXT")], @["id"])
     let stmt = parseStatement("EXPLAIN SELECT * FROM users")
-    let plan = planStatement(stmt, store)
+    let plan = planStatement(stmt, store, nil)
     check plan.ops.len == 1
     check plan.ops[0].kind == poExplain
     check plan.ops[0].exInnerPlan.ops.len == 1
@@ -486,7 +509,7 @@ suite "EXPLAIN — planner with store":
     seedTable(store, "default", "public", "users", 100,
       @[("id", "INT"), ("name", "TEXT")], @["id"])
     let stmt = parseStatement("EXPLAIN SELECT * FROM users WHERE id = 1")
-    let plan = planStatement(stmt, store)
+    let plan = planStatement(stmt, store, nil)
     check plan.ops[0].kind == poExplain
     check plan.ops[0].exInnerPlan.ops[0].kind == poPointGet
     check plan.ops[0].exInnerPlan.ops[0].pgKey == "1"
@@ -495,7 +518,7 @@ suite "EXPLAIN — planner with store":
     seedTable(store, "default", "public", "users", 100,
       @[("id", "INT"), ("name", "TEXT")], @["id"])
     let stmt = parseStatement("EXPLAIN UPDATE users SET name = 'X' WHERE id = 1")
-    let plan = planStatement(stmt, store)
+    let plan = planStatement(stmt, store, nil)
     check plan.ops[0].kind == poExplain
     check plan.ops[0].exInnerPlan.ops[0].kind == poUpdate
     check plan.ops[0].exInnerPlan.ops[0].upTableName == "users"
@@ -504,7 +527,7 @@ suite "EXPLAIN — planner with store":
     seedTable(store, "default", "public", "users", 100,
       @[("id", "INT"), ("name", "TEXT")], @["id"])
     let stmt = parseStatement("EXPLAIN DELETE FROM users WHERE id = 1")
-    let plan = planStatement(stmt, store)
+    let plan = planStatement(stmt, store, nil)
     check plan.ops[0].kind == poExplain
     check plan.ops[0].exInnerPlan.ops[0].kind == poDelete
 
@@ -513,7 +536,7 @@ suite "EXPLAIN — planner with store":
       @[("id", "INT"), ("name", "TEXT")], @["id"])
     let stmt = parseStatement(
         "EXPLAIN INSERT INTO users (id, name) VALUES (1, 'A'), (2, 'B'), (3, 'C')")
-    let plan = planStatement(stmt, store)
+    let plan = planStatement(stmt, store, nil)
     check plan.ops[0].kind == poExplain
     let inner = plan.ops[0].exInnerPlan.ops[0]
     check inner.kind == poInsert
@@ -522,12 +545,12 @@ suite "EXPLAIN — planner with store":
   test "EXPLAIN on non-existent table raises PlanError":
     expect(PlanError):
       let stmt = parseStatement("EXPLAIN SELECT * FROM nonexistent")
-      discard planStatement(stmt, store)
+      discard planStatement(stmt, store, nil)
 
   test "EXPLAIN CREATE TABLE does not consume a table ID":
-    let id1 = nextTableId(store)
+    let id1 = nextTableId(store, nil)
     let stmt = parseStatement("EXPLAIN CREATE TABLE t (id INT PRIMARY KEY)")
-    let plan = planStatement(stmt, store)
+    let plan = planStatement(stmt, store, nil)
     check plan.ops[0].kind == poExplain
     # nextTableId should return the same ID — EXPLAIN planning consumed one
     # but we verify the table was NOT actually created
@@ -536,25 +559,25 @@ suite "EXPLAIN — planner with store":
 
   test "EXPLAIN DROP DATABASE":
     let stmt = parseStatement("EXPLAIN DROP DATABASE IF EXISTS mydb")
-    let plan = planStatement(stmt, store)
+    let plan = planStatement(stmt, store, nil)
     check plan.ops[0].kind == poExplain
     check plan.ops[0].exInnerPlan.ops[0].kind == poDropDatabase
 
   test "EXPLAIN CREATE SCHEMA":
     let stmt = parseStatement("EXPLAIN CREATE SCHEMA myschema")
-    let plan = planStatement(stmt, store)
+    let plan = planStatement(stmt, store, nil)
     check plan.ops[0].kind == poExplain
     check plan.ops[0].exInnerPlan.ops[0].kind == poCreateSchema
 
   test "EXPLAIN SHOW SCHEMAS IN mydb":
     let stmt = parseStatement("EXPLAIN SHOW SCHEMAS IN mydb")
-    let plan = planStatement(stmt, store)
+    let plan = planStatement(stmt, store, nil)
     check plan.ops[0].kind == poExplain
     check plan.ops[0].exInnerPlan.ops[0].kind == poShowSchemas
     check plan.ops[0].exInnerPlan.ops[0].ssDatabase == "mydb"
 
   test "EXPLAIN BEGIN TRANSACTION":
     let stmt = parseStatement("EXPLAIN BEGIN TRANSACTION")
-    let plan = planStatement(stmt, store)
+    let plan = planStatement(stmt, store, nil)
     check plan.ops[0].kind == poExplain
     check plan.ops[0].exInnerPlan.ops[0].kind == poBeginTxn

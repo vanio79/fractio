@@ -8,6 +8,8 @@ import std/[options, json, strutils, strformat]
 import ./ast
 import ../distributed/meta/system_tables
 import ../protocol/raft_store
+from ../protocol/mvcc_store import MvccTransactionStore, directGet, directScan,
+    MvccResult, mvccOk, mvccErr
 import ../core/types as coreTypes
 
 # ---------------------------------------------------------------------------
@@ -46,7 +48,7 @@ type
       cdbName*: string
       cdbIfNotExists*: bool
       cdbReplicas*: Option[int]
-      cdbValue*: string  # JSON value to store
+      cdbValue*: string            # JSON value to store
 
     of poDropDatabase:
       ddbName*: string
@@ -57,7 +59,7 @@ type
       csIfNotExists*: bool
       csReplicas*: Option[int]
       csValue*: string
-      csDatabase*: string  # owning database
+      csDatabase*: string          # owning database
 
     of poDropSchema:
       dsName*: string
@@ -67,10 +69,10 @@ type
     of poCreateTable:
       ctName*: string
       ctIfNotExists*: bool
-      ctValue*: string  # JSON table descriptor
+      ctValue*: string             # JSON table descriptor
       ctSchema*: string
       ctDatabase*: string
-      ctSpaceName*: Option[string]  # IN SPACE <name>
+      ctSpaceName*: Option[string] # IN SPACE <name>
 
     of poDropTable:
       dtName*: string
@@ -81,15 +83,15 @@ type
     of poInsert:
       insTableId*: uint32
       insTableName*: string
-      insColumns*: seq[string]   # column names in order
-      insPkColumn*: string       # primary key column name
-      insRows*: seq[string]      # JSON-encoded row objects
+      insColumns*: seq[string]     # column names in order
+      insPkColumn*: string         # primary key column name
+      insRows*: seq[string]        # JSON-encoded row objects
 
     of poPointGet:
       pgTableId*: uint32
-      pgKey*: string             # primary key value
-      pgColumns*: seq[string]    # columns to return (empty = all)
-      pgAllColumns*: seq[string] # all table columns for decoding
+      pgKey*: string               # primary key value
+      pgColumns*: seq[string]      # columns to return (empty = all)
+      pgAllColumns*: seq[string]   # all table columns for decoding
 
     of poScan:
       scTableId*: uint32
@@ -97,8 +99,8 @@ type
       scEndKey*: string
       scLimit*: uint32
       scFilter*: Option[Expr]
-      scColumns*: seq[string]    # columns to return (empty = all)
-      scAllColumns*: seq[string] # all table columns for decoding
+      scColumns*: seq[string]      # columns to return (empty = all)
+      scAllColumns*: seq[string]   # all table columns for decoding
 
     of poUpdate:
       upTableId*: uint32
@@ -119,19 +121,19 @@ type
       discard
 
     of poShowSchemas:
-      ssDatabase*: string  # filter by database (empty = current)
+      ssDatabase*: string          # filter by database (empty = current)
 
     of poShowTables:
-      stDatabase*: string  # filter by database (empty = current)
-      stSchema*: string    # filter by schema (empty = current)
+      stDatabase*: string          # filter by database (empty = current)
+      stSchema*: string            # filter by schema (empty = current)
 
     of poShowSpaces:
       discard
 
     of poCreateSpace:
       cspName*: string
-      cspReplicas*: int     # 0 = ALL
-      cspValue*: string     # JSON value to store
+      cspReplicas*: int            # 0 = ALL
+      cspValue*: string            # JSON value to store
 
     of poDropSpace:
       dspName*: string
@@ -152,7 +154,7 @@ type
       discard
 
     of poExplain:
-      exInnerPlan*: Plan  ## the plan being explained
+      exInnerPlan*: Plan           ## the plan being explained
 
   Plan* = ref object
     ops*: seq[PlanOp]
@@ -210,21 +212,32 @@ proc columnNames*(desc: TableDescriptor): seq[string] =
 # Catalog lookups
 # ---------------------------------------------------------------------------
 
-proc resolveTable*(store: RaftKVStoreExt, database, schema,
-    tableName: string): Option[TableDescriptor] =
+proc resolveTable*(store: RaftKVStoreExt, mvccStore: MvccTransactionStore,
+    database, schema, tableName: string): Option[TableDescriptor] =
   ## Look up a table descriptor from the system catalog.
   ## Key format: /t/<SYS_TABLES_TABLE_ID>/<database>.<schema>.<tableName>
+  ## Uses MVCC store to read committed data (handles MVCC-encoded keys).
   let catalogKey = encodeTableKey(SYS_TABLES_TABLE_ID,
       database & "." & schema & "." & tableName)
-  let res = store.raftGet(catalogKey)
-  if not res.isOk:
-    return none(TableDescriptor)
-  let entryOpt = res.value
+
+  var entryOpt: Option[string] = none(string)
+
+  # Try MVCC store first (handles MVCC-encoded keys)
+  if mvccStore != nil:
+    let mvccRes = mvccStore.directGet(catalogKey)
+    if mvccRes.isOk:
+      entryOpt = mvccRes.value
+  else:
+    # Fall back to direct raft read
+    let res = store.raftGet(catalogKey)
+    if res.isOk and res.value.isSome:
+      entryOpt = some(res.value.get().value)
+
   if entryOpt.isNone:
     return none(TableDescriptor)
 
   try:
-    let j = parseJson(entryOpt.get().value)
+    let j = parseJson(entryOpt.get())
     var desc = TableDescriptor(
       tableId: uint32(j["tableId"].getInt()),
       name: j["name"].getStr(),
@@ -253,21 +266,36 @@ proc resolveTable*(store: RaftKVStoreExt, database, schema,
   except JsonParsingError:
     none(TableDescriptor)
 
-proc nextTableId*(store: RaftKVStoreExt): uint32 =
+proc nextTableId*(store: RaftKVStoreExt,
+    mvccStore: MvccTransactionStore): uint32 =
   ## Allocate the next available user table ID by scanning existing tables.
+  ## Uses MVCC store to scan committed data (handles MVCC-encoded keys).
   let startKey = encodeTableKey(SYS_TABLES_TABLE_ID, "")
   let endKey = encodeTableKey(SYS_TABLES_TABLE_ID + 1, "")
-  let res = store.raftScan(startKey, endKey, 0, includeSystemKeys = true)
   var maxId = FIRST_USER_TABLE_ID - 1
-  if res.isOk:
-    for (key, entry) in res.value:
-      try:
-        let j = parseJson(entry.value)
-        let tid = uint32(j["tableId"].getInt())
-        if tid >= FIRST_USER_TABLE_ID and tid > maxId:
-          maxId = tid
-      except JsonParsingError:
-        discard
+
+  if mvccStore != nil:
+    let scanRes = mvccStore.directScan(startKey, endKey, 0)
+    if scanRes.isOk:
+      for (key, value) in scanRes.value:
+        try:
+          let j = parseJson(value)
+          let tid = uint32(j["tableId"].getInt())
+          if tid >= FIRST_USER_TABLE_ID and tid > maxId:
+            maxId = tid
+        except JsonParsingError:
+          discard
+  else:
+    let res = store.raftScan(startKey, endKey, 0, includeSystemKeys = true)
+    if res.isOk:
+      for (key, entry) in res.value:
+        try:
+          let j = parseJson(entry.value)
+          let tid = uint32(j["tableId"].getInt())
+          if tid >= FIRST_USER_TABLE_ID and tid > maxId:
+            maxId = tid
+        except JsonParsingError:
+          discard
   maxId + 1
 
 # ---------------------------------------------------------------------------
@@ -349,6 +377,7 @@ proc planDropSchema(stmt: Stmt, database: string): Plan =
   plan
 
 proc planCreateTable(stmt: Stmt, store: RaftKVStoreExt,
+    mvccStore: MvccTransactionStore,
     database, schema: string): Plan =
   let plan = newPlan()
 
@@ -373,7 +402,7 @@ proc planCreateTable(stmt: Stmt, store: RaftKVStoreExt,
       if col.primaryKey:
         pk.add(col.name)
 
-  let tableId = nextTableId(store)
+  let tableId = nextTableId(store, mvccStore)
   let value = %*{
     "tableId": int(tableId),
     "name": stmt.ctTable,
@@ -399,9 +428,10 @@ proc planCreateTable(stmt: Stmt, store: RaftKVStoreExt,
   plan
 
 proc planInsert(stmt: Stmt, store: RaftKVStoreExt,
+    mvccStore: MvccTransactionStore,
     database, schema: string): Plan =
   let plan = newPlan()
-  let descOpt = resolveTable(store, database, schema, stmt.intoTable)
+  let descOpt = resolveTable(store, mvccStore, database, schema, stmt.intoTable)
   if descOpt.isNone:
     raise planError(&"table '{stmt.intoTable}' not found")
   let desc = descOpt.get()
@@ -427,9 +457,10 @@ proc planInsert(stmt: Stmt, store: RaftKVStoreExt,
   plan
 
 proc planSelect(stmt: Stmt, store: RaftKVStoreExt,
+    mvccStore: MvccTransactionStore,
     database, schema: string): Plan =
   let plan = newPlan()
-  let descOpt = resolveTable(store, database, schema, stmt.selFrom)
+  let descOpt = resolveTable(store, mvccStore, database, schema, stmt.selFrom)
   if descOpt.isNone:
     raise planError(&"table '{stmt.selFrom}' not found")
   let desc = descOpt.get()
@@ -491,9 +522,10 @@ proc planSelect(stmt: Stmt, store: RaftKVStoreExt,
   plan
 
 proc planUpdate(stmt: Stmt, store: RaftKVStoreExt,
+    mvccStore: MvccTransactionStore,
     database, schema: string): Plan =
   let plan = newPlan()
-  let descOpt = resolveTable(store, database, schema, stmt.updTable)
+  let descOpt = resolveTable(store, mvccStore, database, schema, stmt.updTable)
   if descOpt.isNone:
     raise planError(&"table '{stmt.updTable}' not found")
   let desc = descOpt.get()
@@ -509,9 +541,10 @@ proc planUpdate(stmt: Stmt, store: RaftKVStoreExt,
   plan
 
 proc planDelete(stmt: Stmt, store: RaftKVStoreExt,
+    mvccStore: MvccTransactionStore,
     database, schema: string): Plan =
   let plan = newPlan()
-  let descOpt = resolveTable(store, database, schema, stmt.delTable)
+  let descOpt = resolveTable(store, mvccStore, database, schema, stmt.delTable)
   if descOpt.isNone:
     raise planError(&"table '{stmt.delTable}' not found")
   let desc = descOpt.get()
@@ -595,11 +628,11 @@ proc formatPlanOp*(op: PlanOp): string =
   ## Format a single PlanOp as a human-readable string.
   case op.kind
   of poCreateDatabase: &"CreateDatabase name={op.cdbName}"
-  of poDropDatabase:   &"DropDatabase name={op.ddbName}"
-  of poCreateSchema:   &"CreateSchema name={op.csDatabase}.{op.csName}"
-  of poDropSchema:     &"DropSchema name={op.dsDatabase}.{op.dsName}"
-  of poCreateTable:    &"CreateTable name={op.ctDatabase}.{op.ctSchema}.{op.ctName}"
-  of poDropTable:      &"DropTable name={op.dtDatabase}.{op.dtSchema}.{op.dtName}"
+  of poDropDatabase: &"DropDatabase name={op.ddbName}"
+  of poCreateSchema: &"CreateSchema name={op.csDatabase}.{op.csName}"
+  of poDropSchema: &"DropSchema name={op.dsDatabase}.{op.dsName}"
+  of poCreateTable: &"CreateTable name={op.ctDatabase}.{op.ctSchema}.{op.ctName}"
+  of poDropTable: &"DropTable name={op.dtDatabase}.{op.dtSchema}.{op.dtName}"
   of poInsert:
     &"Insert table={op.insTableName} (id={op.insTableId}) rows={op.insRows.len}"
   of poPointGet:
@@ -622,18 +655,18 @@ proc formatPlanOp*(op: PlanOp): string =
     if op.delFilter.isSome:
       s &= &" filter=({formatExpr(op.delFilter.get())})"
     s
-  of poShowDatabases:  "ShowDatabases"
-  of poShowSchemas:    &"ShowSchemas db={op.ssDatabase}"
-  of poShowTables:     &"ShowTables db={op.stDatabase} schema={op.stSchema}"
-  of poShowSpaces:     "ShowSpaces"
-  of poCreateSpace:    &"CreateSpace name={op.cspName} replicas={op.cspReplicas}"
-  of poDropSpace:      &"DropSpace name={op.dspName}"
-  of poUseDatabase:    &"UseDatabase name={op.udName}"
-  of poUseSchema:      &"UseSchema name={op.usName}"
-  of poBeginTxn:       &"BeginTxn readOnly={op.btReadOnly}"
-  of poCommitTxn:      "CommitTxn"
-  of poRollbackTxn:    "RollbackTxn"
-  of poExplain:        "Explain"
+  of poShowDatabases: "ShowDatabases"
+  of poShowSchemas: &"ShowSchemas db={op.ssDatabase}"
+  of poShowTables: &"ShowTables db={op.stDatabase} schema={op.stSchema}"
+  of poShowSpaces: "ShowSpaces"
+  of poCreateSpace: &"CreateSpace name={op.cspName} replicas={op.cspReplicas}"
+  of poDropSpace: &"DropSpace name={op.dspName}"
+  of poUseDatabase: &"UseDatabase name={op.udName}"
+  of poUseSchema: &"UseSchema name={op.usName}"
+  of poBeginTxn: &"BeginTxn readOnly={op.btReadOnly}"
+  of poCommitTxn: "CommitTxn"
+  of poRollbackTxn: "RollbackTxn"
+  of poExplain: "Explain"
 
 proc formatPlan*(plan: Plan): string =
   ## Format a Plan as a multi-line EXPLAIN output.
@@ -647,15 +680,17 @@ proc formatPlan*(plan: Plan): string =
 # ---------------------------------------------------------------------------
 
 proc planStatement*(stmt: Stmt, store: RaftKVStoreExt,
+    mvccStore: MvccTransactionStore = nil,
     database: string = "default",
     schema: string = "public"): Plan =
   ## Translate a Stmt AST into a Plan (sequence of KV operations).
+  ## mvccStore is used for catalog lookups (handles MVCC-encoded system tables).
   case stmt.kind
   of stmtCreateDatabase: planCreateDatabase(stmt)
-  of stmtDropDatabase:   planDropDatabase(stmt)
-  of stmtCreateSchema:   planCreateSchema(stmt, database)
-  of stmtDropSchema:     planDropSchema(stmt, database)
-  of stmtCreateTable:    planCreateTable(stmt, store, database, schema)
+  of stmtDropDatabase: planDropDatabase(stmt)
+  of stmtCreateSchema: planCreateSchema(stmt, database)
+  of stmtDropSchema: planDropSchema(stmt, database)
+  of stmtCreateTable: planCreateTable(stmt, store, mvccStore, database, schema)
   of stmtDropTable:
     let plan = newPlan()
     plan.add(PlanOp(kind: poDropTable,
@@ -665,10 +700,10 @@ proc planStatement*(stmt: Stmt, store: RaftKVStoreExt,
       dtDatabase: database,
     ))
     plan
-  of stmtInsert:   planInsert(stmt, store, database, schema)
-  of stmtSelect:   planSelect(stmt, store, database, schema)
-  of stmtUpdate:   planUpdate(stmt, store, database, schema)
-  of stmtDelete:   planDelete(stmt, store, database, schema)
+  of stmtInsert: planInsert(stmt, store, mvccStore, database, schema)
+  of stmtSelect: planSelect(stmt, store, mvccStore, database, schema)
+  of stmtUpdate: planUpdate(stmt, store, mvccStore, database, schema)
+  of stmtDelete: planDelete(stmt, store, mvccStore, database, schema)
   of stmtShowDatabases:
     let plan = newPlan()
     plan.add(PlanOp(kind: poShowDatabases))
@@ -681,11 +716,12 @@ proc planStatement*(stmt: Stmt, store: RaftKVStoreExt,
   of stmtShowTables:
     let plan = newPlan()
     let db = if stmt.showTablesDb.len > 0: stmt.showTablesDb else: database
-    let sc = if stmt.showTablesSchema.len > 0: stmt.showTablesSchema else: schema
+    let sc = if stmt.showTablesSchema.len >
+        0: stmt.showTablesSchema else: schema
     plan.add(PlanOp(kind: poShowTables, stDatabase: db, stSchema: sc))
     plan
   of stmtCreateSpace: planCreateSpace(stmt)
-  of stmtDropSpace:   planDropSpace(stmt)
+  of stmtDropSpace: planDropSpace(stmt)
   of stmtShowSpaces:
     let plan = newPlan()
     plan.add(PlanOp(kind: poShowSpaces))
@@ -711,7 +747,7 @@ proc planStatement*(stmt: Stmt, store: RaftKVStoreExt,
     plan.add(PlanOp(kind: poRollbackTxn))
     plan
   of stmtExplain:
-    let innerPlan = planStatement(stmt.explainStmt, store, database, schema)
+    let innerPlan = planStatement(stmt.explainStmt, store, mvccStore, database, schema)
     let plan = newPlan()
     plan.add(PlanOp(kind: poExplain, exInnerPlan: innerPlan))
     plan
