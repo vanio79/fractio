@@ -726,6 +726,19 @@ suite "Space rebalance integration — crash safety":
     leaderStore.runRebalanceMigration(spaceId)
     leaderStore.loadSpaces()
 
+    # Wait for leaders on all new space groups
+    for gid in leaderStore.spaces[spaceId].groupIds:
+      var foundLeader = false
+      for attempt in 0 ..< 50:
+        for node in nodes:
+          if node.coord.isLeader(GroupID(gid)):
+            foundLeader = true
+            break
+        if foundLeader: break
+        sleep(100)
+
+    leaderStore.loadGroupMembers()
+
     # All data accessible
     let sel1 = exec(leaderStore, leaderMvccStore, "SELECT * FROM idem_t")
     check sel1.kind == erkRows

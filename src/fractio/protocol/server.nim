@@ -14,7 +14,8 @@
 #
 # All shared mutable state is protected by Locks.
 
-import std/[net, tables, strformat, strutils, times, atomics, locks, options, algorithm, os]
+import std/[net, tables, strformat, strutils, times, atomics, locks, options,
+    algorithm, os]
 import posix as posixSys
 import ./types
 import ./codec as protoCodec
@@ -78,11 +79,11 @@ type
     sharedTimerNumericNodeId*: uint16 ## 10-bit numeric node ID for Snowflake transaction IDs (default: serverId)
     sharedTimerPeers*: seq[PeerConfig] ## peer nodes for NTP-style clock sync (empty = single-node mode)
     dataDir*: string ## directory for persistent state (registry, etc.); "" = no persistence
-    webPort*: int   ## port for the HTTP management dashboard; 0 = disabled
-    writeBufferSize*: int ## LevelDB write buffer in bytes; 0 = default (4 MB)
-    blockCacheSize*: int ## LevelDB block cache in bytes; 0 = LevelDB default (8 MB)
-    vlogMaxSize*: int64 ## Max vlog file size in bytes; 0 = default (1 GB)
-    vlogCleanThreshold*: int64 ## Garbage records to trigger vlog GC; 0 = default (100000)
+    webPort*: int               ## port for the HTTP management dashboard; 0 = disabled
+    writeBufferSize*: int       ## LevelDB write buffer in bytes; 0 = default (4 MB)
+    blockCacheSize*: int        ## LevelDB block cache in bytes; 0 = LevelDB default (8 MB)
+    vlogMaxSize*: int64         ## Max vlog file size in bytes; 0 = default (1 GB)
+    vlogCleanThreshold*: int64  ## Garbage records to trigger vlog GC; 0 = default (100000)
     vlogMinCleanThreshold*: int64 ## Minimum garbage records for manual cleanup; 0 = default (1000)
     vlogCleanBufferSize*: int64 ## Write buffer for vlog GC in bytes; 0 = default (64 MB)
 
@@ -400,7 +401,7 @@ type
     authenticator*: Authenticator ## Phase 4: auth validator
     sharedTimer*: SharedTimer     ## Phase 7: P2P clock sync (nil when disabled)
     nodeRegistry*: NodeRegistry   ## Phase 8: in-memory cluster node registry
-    raftCoord*: NuRaftCoordinator  ## lifecycle owner; nil until setupRaftNode
+    raftCoord*: NuRaftCoordinator ## lifecycle owner; nil until setupRaftNode
 
 # ---------------------------------------------------------------------------
 # Thread argument types — defined after ProtocolServer to avoid forward refs
@@ -1408,7 +1409,7 @@ proc saveClusterState*(server: ProtocolServer) =
 
   var peersArr = newJArray()
   for nid, info in coord.peerInfo:
-    peersArr.add(%* {
+    peersArr.add( %* {
       "nodeId": nid.int,
       "host": info.host,
       "raftPort": info.basePort,
@@ -1520,7 +1521,8 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
 
   # Build member lists for the initial Raft groups
   # Each group includes self + all known peers
-  var initialMembers: seq[tuple[nodeId: uint32, host: string, basePort: int]] = @[]
+  var initialMembers: seq[tuple[nodeId: uint32, host: string,
+      basePort: int]] = @[]
   initialMembers.add((nodeId: nodeId.uint32, host: server.config.host,
       basePort: raftPort))
   for p in peers:
@@ -1560,7 +1562,8 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
           if coord.hasGroup(gid): continue
 
           # Build member list from replicas
-          var members: seq[tuple[nodeId: uint32, host: string, basePort: int]] = @[]
+          var members: seq[tuple[nodeId: uint32, host: string,
+              basePort: int]] = @[]
           if j.hasKey("replicas"):
             for r in j["replicas"]:
               let nid = uint32(r["nodeId"].getInt())
@@ -1599,7 +1602,7 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
       "webPort": server.config.webPort,
       "status": 1,
     }
-    discard store.raftPut(nodeKey, nodeVal)
+    discard store.sysTablePut(nodeKey, nodeVal)
 
     for gid in [META_GROUP_ID, DATA_GROUP_START_ID]:
       let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
@@ -1607,7 +1610,7 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
         "groupId": gid.uint64.int,
         "replicas": [{"nodeId": server.config.serverId.int, "type": "voter"}],
       }
-      discard store.raftPut(groupKey, groupVal)
+      discard store.sysTablePut(groupKey, groupVal)
 
     for p in peers:
       let peerKey = encodeTableKey(SYS_NODES_TABLE_ID, $p.nodeId)
@@ -1618,20 +1621,20 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
         "clientPort": 0,
         "status": 1,
       }
-      discard store.raftPut(peerKey, peerVal)
+      discard store.sysTablePut(peerKey, peerVal)
 
     # Seed default database and public schema
     let dbKey = encodeTableKey(SYS_DATABASES_TABLE_ID, "default")
-    discard store.raftPut(dbKey, $ %* {"name": "default"})
+    discard store.sysTablePut(dbKey, $ %* {"name": "default"})
 
     let scKey = encodeTableKey(SYS_SCHEMAS_TABLE_ID, "default.public")
-    discard store.raftPut(scKey, $ %* {
+    discard store.sysTablePut(scKey, $ %* {
       "name": "public", "database": "default",
     })
 
     # Seed default space (replicas=0 means ALL, single group = Group 1)
     let spaceKey = encodeTableKey(SYS_SPACES_TABLE_ID, "1")
-    discard store.raftPut(spaceKey, $ %* {
+    discard store.sysTablePut(spaceKey, $ %* {
       "spaceId": 1,
       "name": "default",
       "replicas": 0,

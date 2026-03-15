@@ -620,3 +620,93 @@ proc getActiveTransactionCount*(store: MvccTransactionStore): int {.gcsafe,
 proc getSessionCount*(store: MvccTransactionStore): int {.gcsafe, raises: [].} =
   withLock store.sessionsMu:
     result = store.sessions.len
+
+# ---------------------------------------------------------------------------
+# Batch operations for system tables
+# ---------------------------------------------------------------------------
+
+proc directPutBatch*(store: MvccTransactionStore,
+    writes: openArray[tuple[key: string, value: string]]): MvccVoidResult {.
+    gcsafe, raises: [].} =
+  ## Write multiple key-value pairs in a single MVCC transaction.
+  ## Used for system table updates that need atomicity.
+  if writes.len == 0:
+    return mvccVOk()
+
+  let sessionId = store.createSession()
+  defer: store.closeSession(sessionId)
+
+  let beginRes = store.beginTransaction(sessionId)
+  if not beginRes.isOk:
+    return mvccVErr(beginRes.error)
+
+  for (key, value) in writes:
+    let putRes = store.txnPut(sessionId, key, value)
+    if not putRes.isOk:
+      discard store.rollbackTransaction(sessionId)
+      return putRes
+
+  let commitRes = store.commitTransaction(sessionId)
+  if not commitRes.isOk:
+    return mvccVErr(commitRes.error)
+
+  return mvccVOk()
+
+proc directDeleteBatch*(store: MvccTransactionStore,
+    keys: openArray[string]): MvccVoidResult {.gcsafe, raises: [].} =
+  ## Delete multiple keys in a single MVCC transaction.
+  ## Used for system table cleanup operations.
+  if keys.len == 0:
+    return mvccVOk()
+
+  let sessionId = store.createSession()
+  defer: store.closeSession(sessionId)
+
+  let beginRes = store.beginTransaction(sessionId)
+  if not beginRes.isOk:
+    return mvccVErr(beginRes.error)
+
+  for key in keys:
+    let delRes = store.txnDelete(sessionId, key)
+    if not delRes.isOk:
+      discard store.rollbackTransaction(sessionId)
+      return delRes
+
+  let commitRes = store.commitTransaction(sessionId)
+  if not commitRes.isOk:
+    return mvccVErr(commitRes.error)
+
+  return mvccVOk()
+
+proc directPutAndDeleteBatch*(store: MvccTransactionStore,
+    puts: openArray[tuple[key: string, value: string]],
+    deletes: openArray[string]): MvccVoidResult {.gcsafe, raises: [].} =
+  ## Write and delete multiple keys in a single MVCC transaction.
+  ## Used for atomic updates to system tables (e.g., rebalancing).
+  if puts.len == 0 and deletes.len == 0:
+    return mvccVOk()
+
+  let sessionId = store.createSession()
+  defer: store.closeSession(sessionId)
+
+  let beginRes = store.beginTransaction(sessionId)
+  if not beginRes.isOk:
+    return mvccVErr(beginRes.error)
+
+  for (key, value) in puts:
+    let putRes = store.txnPut(sessionId, key, value)
+    if not putRes.isOk:
+      discard store.rollbackTransaction(sessionId)
+      return putRes
+
+  for key in deletes:
+    let delRes = store.txnDelete(sessionId, key)
+    if not delRes.isOk:
+      discard store.rollbackTransaction(sessionId)
+      return delRes
+
+  let commitRes = store.commitTransaction(sessionId)
+  if not commitRes.isOk:
+    return mvccVErr(commitRes.error)
+
+  return mvccVOk()

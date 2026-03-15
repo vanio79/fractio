@@ -238,6 +238,9 @@ proc newRaftKVStoreExt*(coord: NuRaftCoordinator,
   initLock(result.groupMu)
   result.nextVersion.store(1)
 
+# ---------------------------------------------------------------------------
+# Route to group (helper used before forward declarations are needed)
+# ---------------------------------------------------------------------------
 proc routeToGroup*(primaryKey: string, groupIds: seq[
     uint64]): GroupID {.inline.} =
   ## Hash-route a primary key to one of the space's groups.
@@ -345,6 +348,16 @@ proc loadGroupMembers*(store: RaftKVStoreExt,
               continue # Skip tombstones
             value = mvccVal.data
             ts = mvccVal.timestamp
+        elif v.len >= 17 and v[0] != '{':
+          # Non-version key but value is MVCC-encoded (sysTablePut case)
+          try:
+            let mvccVal = mvccTypes.decodeMVCCValue(v)
+            if mvccVal.isDeleted:
+              continue # Skip tombstones
+            value = mvccVal.data
+            ts = mvccVal.timestamp
+          except:
+            discard # Not MVCC-encoded, use as-is
 
         # Keep only latest version for each user key
         if not latestVersions.hasKey(userKey) or ts > latestVersions[userKey].ts:
@@ -404,6 +417,8 @@ proc fromBytes(b: seq[byte]): string {.inline.} =
 # Forward declarations
 proc raftPut*(store: RaftKVStoreExt, key, value: string): RSResult[
     RaftKVEntry] {.gcsafe, raises: [].}
+proc raftDelete*(store: RaftKVStoreExt,
+    key: string): RSResult[Option[RaftKVEntry]] {.gcsafe, raises: [].}
 proc lookupNodeInfo*(store: RaftKVStoreExt,
     nodeId: uint32): Option[NodeInfo] {.gcsafe, raises: [].}
 proc loadSpaces*(store: RaftKVStoreExt) {.gcsafe, raises: [].}
@@ -414,6 +429,110 @@ proc updateSpaceCache*(store: RaftKVStoreExt, spaceKey: string,
     jsonStr: string) {.gcsafe, raises: [].}
 proc updateTableSpaceCache*(store: RaftKVStoreExt, tableKey: string,
     jsonStr: string) {.gcsafe, raises: [].}
+
+# ---------------------------------------------------------------------------
+# System table write helpers with MVCC encoding
+# ---------------------------------------------------------------------------
+# ALL sys table writes use MVCC encoding for consistency. This ensures:
+# 1. Consistent decoding in load* functions
+# 2. Timestamp tracking for all metadata changes
+# 3. Future support for point-in-time queries on sys tables
+
+proc sysTablePut*(store: RaftKVStoreExt, key: string, value: string): bool {.
+    gcsafe, raises: [].} =
+  ## Write to a sys table with MVCC encoding.
+  ## ALWAYS encodes the value with MVCC header for consistency.
+  ## Returns true on success, false on failure.
+  let backend = store.getBackend()
+  if backend == nil or not backend.isOpen:
+    return false
+
+  # Get timestamp - use current nanosecond time
+  var ts: int64 = 0
+  {.cast(raises: []).}:
+    ts = int64(getTime().toUnixFloat() * 1_000_000_000)
+
+  # Encode value with MVCC header
+  let encoded = mvccTypes.encodeMVCCValue(value, ts, false)
+
+  # Write via Raft for replication
+  let res = store.raftPut(key, encoded)
+  return res.isOk
+
+proc sysTablePutBatch*(store: RaftKVStoreExt,
+    writes: openArray[tuple[key: string, value: string]]): bool {.
+    gcsafe, raises: [].} =
+  ## Write multiple sys table entries atomically with MVCC encoding.
+  ## All entries get the same timestamp for atomicity.
+  ## Returns true on success, false on failure.
+  if writes.len == 0:
+    return true
+
+  # Get timestamp for all writes (same timestamp for atomicity)
+  var ts: int64 = 0
+  {.cast(raises: []).}:
+    ts = int64(getTime().toUnixFloat() * 1_000_000_000)
+
+  # Write all with same timestamp
+  for (key, value) in writes:
+    let encoded = mvccTypes.encodeMVCCValue(value, ts, false)
+    let res = store.raftPut(key, encoded)
+    if not res.isOk:
+      return false
+
+  return true
+
+proc sysTableDelete*(store: RaftKVStoreExt, key: string): bool {.
+    gcsafe, raises: [].} =
+  ## Delete from a sys table through Raft.
+  ## For internal operations, we use actual delete (not MVCC tombstone).
+  ## Returns true on success, false on failure.
+  let res = store.raftDelete(key)
+  return res.isOk
+
+proc sysTableDeleteBatch*(store: RaftKVStoreExt,
+    keys: openArray[string]): bool {.gcsafe, raises: [].} =
+  ## Delete multiple sys table entries through Raft.
+  ## For internal operations, we use actual delete (not MVCC tombstones).
+  ## Returns true on success, false on failure.
+  if keys.len == 0:
+    return true
+
+  for key in keys:
+    let res = store.raftDelete(key)
+    if not res.isOk:
+      return false
+
+  return true
+
+proc sysTablePutAndDeleteBatch*(store: RaftKVStoreExt,
+    puts: openArray[tuple[key: string, value: string]],
+    deletes: openArray[string]): bool {.gcsafe, raises: [].} =
+  ## Write and delete sys table entries atomically through Raft.
+  ## For internal operations, we use actual delete (not MVCC tombstones).
+  ## Returns true on success, false on failure.
+  if puts.len == 0 and deletes.len == 0:
+    return true
+
+  # Get timestamp for all puts (same timestamp for atomicity)
+  var ts: int64 = 0
+  {.cast(raises: []).}:
+    ts = int64(getTime().toUnixFloat() * 1_000_000_000)
+
+  # Do puts first (always MVCC-encoded)
+  for (key, value) in puts:
+    let encoded = mvccTypes.encodeMVCCValue(value, ts, false)
+    let res = store.raftPut(key, encoded)
+    if not res.isOk:
+      return false
+
+  # Then deletes
+  for key in deletes:
+    let res = store.raftDelete(key)
+    if not res.isOk:
+      return false
+
+  return true
 
 # ---------------------------------------------------------------------------
 # Follower apply callback (called by coordinator on committed entries)
@@ -1385,6 +1504,16 @@ proc loadTableSpaces*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
               continue # Skip tombstones
             value = mvccVal.data
             ts = mvccVal.timestamp
+        elif v.len >= 17 and v[0] != '{':
+          # Non-version key but value is MVCC-encoded (sysTablePut case)
+          try:
+            let mvccVal = mvccTypes.decodeMVCCValue(v)
+            if mvccVal.isDeleted:
+              continue # Skip tombstones
+            value = mvccVal.data
+            ts = mvccVal.timestamp
+          except:
+            discard # Not MVCC-encoded, use as-is
 
         # Keep only latest version for each user key
         if not latestVersions.hasKey(userKey) or ts > latestVersions[userKey].ts:
@@ -1918,22 +2047,9 @@ proc raftScanSpace*(store: RaftKVStoreExt, startKey, endKey: string,
 
 proc updateSpaceRecord*(store: RaftKVStoreExt, space: SpaceInfo) {.gcsafe,
     raises: [].} =
-  ## Write the space record to sys.spaces via Raft.
+  ## Write the space record to sys.spaces via Raft with MVCC encoding.
   ## The in-memory cache is updated by applyBatchToSM when Raft commits the write.
   let spaceKey = encodeSpaceKey(space.spaceId)
-
-  # First, delete any MVCC versions of this key that may exist from DDL operations
-  # This ensures our raw write is the only entry for this space
-  let backend = store.getBackend()
-  if backend != nil and backend.isOpen:
-    {.cast(raises: []).}:
-      let prefix = spaceKey
-      let pairs = backend.scan(prefix, prefix & "\xff")
-      for (k, v) in pairs:
-        # Check if this is an MVCC version key (longer than the base key)
-        if k.len > spaceKey.len and k.len >= 10 and k[k.len - 10] == '\x00' and
-            k[k.len - 9] == '\x00':
-          discard store.raftDelete(k)
 
   var groupIdsJ = newJArray()
   for g in space.groupIds:
@@ -1953,7 +2069,7 @@ proc updateSpaceRecord*(store: RaftKVStoreExt, space: SpaceInfo) {.gcsafe,
     "rebalanceHeartbeat": space.rebalanceHeartbeat,
     "rebalanceCursor": space.rebalanceCursor,
   }
-  discard store.raftPut(spaceKey, spaceVal)
+  discard store.sysTablePut(spaceKey, spaceVal)
 
 proc rebalanceSpaces*(store: RaftKVStoreExt) {.raises: [].} =
   ## Check all spaces and initiate rebalancing for any space whose group count
@@ -2109,7 +2225,7 @@ proc rebalanceSpaces*(store: RaftKVStoreExt) {.raises: [].} =
             "replicas": replicasJson,
             "preferredLeader": members[0],
           }
-          discard store.raftPut(groupKey, groupVal)
+          discard store.sysTablePut(groupKey, groupVal)
 
           # Create Raft group in coordinator
           let gid = GroupID(groupId)
@@ -2298,13 +2414,16 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: int) {.raises: [].} 
           continue
 
     # Phase 3: Cutover — migration complete
+    # All writes are already committed (proposeWrite and forwardPutToLeader
+    # are synchronous - they wait for Raft commit before returning).
+
     # Remove old group definitions from sys.groups
     # Data remains in the shared backend, accessible via new groups
     let coord = store.coordinator
     for oldGid64 in oldGroupIds:
       let oldGid = GroupID(oldGid64)
       let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $oldGid64)
-      discard store.raftDelete(groupKey)
+      discard store.sysTableDelete(groupKey)
       if coord.hasGroup(oldGid):
         coord.removeGroup(oldGid)
 
