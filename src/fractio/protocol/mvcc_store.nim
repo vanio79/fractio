@@ -14,6 +14,7 @@ import ../core/timestamp_provider
 import ../storage/mvcc/types
 import ./raft_store
 import ./txn_manager
+import ../distributed/sharedtimer/timeprovider as tp
 import ../utils/logging
 
 # ---------------------------------------------------------------------------
@@ -384,7 +385,8 @@ proc txnPut*(store: MvccTransactionStore, sessionId: uint64,
     let putRes = store.raftStore.raftPut(intentKey, intentValue)
     if not putRes.isOk:
       return mvccVErr(MvccStoreError(
-        kind: mseStorageError, msg: "Failed to write intent"))
+        kind: mseStorageError, msg: "Failed to write intent: " &
+        putRes.error.msg))
 
     state.intents[key] = coreTxn.WriteEntry(key: key, value: value,
         isDelete: false)
@@ -417,7 +419,8 @@ proc txnDelete*(store: MvccTransactionStore, sessionId: uint64,
     let putRes = store.raftStore.raftPut(intentKey, intentValue)
     if not putRes.isOk:
       return mvccVErr(MvccStoreError(
-        kind: mseStorageError, msg: "Failed to write delete intent"))
+        kind: mseStorageError, msg: "Failed to write delete intent: " &
+        putRes.error.msg))
 
     state.intents[key] = coreTxn.WriteEntry(key: key, value: "", isDelete: true)
     return mvccVOk()
@@ -554,6 +557,104 @@ proc directGet*(store: MvccTransactionStore,
       return mvccOk(some(rawValue))
 
   return mvccOk(none(string))
+
+# ---------------------------------------------------------------------------
+# Lightweight snapshot reads (no transaction needed)
+# ---------------------------------------------------------------------------
+
+proc snapshotGet*(store: MvccTransactionStore,
+    key: string, readTs: coreTypes.Timestamp): MvccResult[Option[string]] {.
+    gcsafe, raises: [].} =
+  ## Lightweight read at a specific timestamp without transaction overhead.
+  ## This is optimized for single-statement SELECT queries that don't need
+  ## write intent tracking or commit/rollback.
+  let versionPrefix = key & VERSION_SEPARATOR
+  let scanStart = versionPrefix
+  let scanEnd = key & "\x00\x01"
+
+  let scanRes = store.raftStore.raftScan(scanStart, scanEnd, 100'u32,
+      includeSystemKeys = true)
+  if not scanRes.isOk:
+    return mvccErr[Option[string]](MvccStoreError(
+      kind: mseStorageError, msg: "Scan failed"))
+
+  var latestVersion: tuple[ts: coreTypes.Timestamp, value: string,
+      isDeleted: bool] = (coreTypes.Timestamp(0), "", false)
+  var foundVersion = false
+
+  for (k, entry) in scanRes.value:
+    try:
+      if isVersionKey(k):
+        let decoded = decodeVersionKey(k)
+        if decoded.timestamp <= readTs and decoded.timestamp > latestVersion.ts:
+          let mvccVal = decodeMVCCValue(entry.value)
+          latestVersion = (decoded.timestamp, mvccVal.data, mvccVal.isDeleted)
+          foundVersion = true
+    except:
+      discard
+
+  if not foundVersion or latestVersion.isDeleted:
+    return mvccOk(none(string))
+
+  return mvccOk(some(latestVersion.value))
+
+proc snapshotScan*(store: MvccTransactionStore,
+    startKey: string, endKey: string, readTs: coreTypes.Timestamp,
+    limit: uint32 = 0): MvccResult[seq[tuple[key: string, value: string]]] {.
+    gcsafe, raises: [].} =
+  ## Lightweight scan at a specific timestamp without transaction overhead.
+  ## Optimized for single-statement SELECT/SCAN queries.
+  let scanRes = store.raftStore.raftScan(startKey, endKey, limit,
+      includeSystemKeys = true)
+  if not scanRes.isOk:
+    return mvccErr[seq[tuple[key: string, value: string]]](MvccStoreError(
+      kind: mseStorageError, msg: "Scan failed"))
+
+  var keyVersions: tables.Table[string, tuple[value: string,
+      isDeleted: bool, timestamp: coreTypes.Timestamp]] = initTable[string,
+      tuple[value: string, isDeleted: bool, timestamp: coreTypes.Timestamp]]()
+
+  for (k, entry) in scanRes.value:
+    if isIntentKeyMvcc(k):
+      continue
+
+    if isVersionKey(k):
+      try:
+        let decoded = decodeVersionKey(k)
+        if decoded.timestamp <= readTs:
+          let mvccVal = decodeMVCCValue(entry.value)
+          if not keyVersions.hasKey(decoded.userKey):
+            keyVersions[decoded.userKey] = (mvccVal.data, mvccVal.isDeleted,
+                decoded.timestamp)
+          elif decoded.timestamp > keyVersions[decoded.userKey].timestamp:
+            keyVersions[decoded.userKey] = (mvccVal.data, mvccVal.isDeleted,
+                decoded.timestamp)
+      except:
+        discard
+
+  var results: seq[tuple[key: string, value: string]] = @[]
+  var count = 0
+  for key, val in keyVersions.pairs:
+    if not val.isDeleted:
+      results.add((key, val.value))
+      inc count
+      if limit > 0 and uint32(count) >= limit:
+        break
+
+  results.sort(proc(a, b: tuple[key: string, value: string]): int = cmp(a.key, b.key))
+  return mvccOk(results)
+
+proc getCurrentTimestamp*(store: MvccTransactionStore): coreTypes.Timestamp {.
+    gcsafe, raises: [].} =
+  ## Get the current timestamp for snapshot reads.
+  ## Uses the transaction manager's time provider.
+  let wallNs: uint64 =
+    if not store.txnManager.timeProvider.isNil:
+      try: uint64(store.txnManager.timeProvider.now())
+      except Exception: uint64(getTime().toUnixFloat() * 1_000_000_000)
+    else:
+      uint64(getTime().toUnixFloat() * 1_000_000_000)
+  coreTypes.Timestamp(wallNs)
 
 proc directPut*(store: MvccTransactionStore,
     key: string, value: string): MvccVoidResult {.gcsafe, raises: [].} =

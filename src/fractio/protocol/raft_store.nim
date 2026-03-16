@@ -137,6 +137,22 @@ proc decodeIntentTxnId*(k: string): uint64 {.inline.} =
 proc decodeIntentUserKey*(k: string): string {.inline.} =
   k[INTENT_PREFIX.len + 8 ..< k.len]
 
+proc isMVCCSuffixKey*(k: string): bool {.inline.} =
+  ## Check if key has an MVCC suffix (intent or version).
+  ## Format: <userKey><suffix><8 bytes>
+  ## Suffix is "\x00\x01" for intents, "\x00\x00" for versions.
+  if k.len < 10: return false
+  let suffixPos = k.len - 10
+  k[suffixPos] == '\x00' and (k[suffixPos + 1] == '\x01' or k[suffixPos + 1] == '\x00')
+
+proc stripMVCCSuffix*(k: string): string {.inline.} =
+  ## Strip MVCC suffix (intent or version) from a key, returning the user key.
+  ## Returns the original key if no MVCC suffix is detected.
+  if isMVCCSuffixKey(k):
+    k[0 ..< k.len - 10]
+  else:
+    k
+
 # ---------------------------------------------------------------------------
 # Unified key → GroupID routing
 # ---------------------------------------------------------------------------
@@ -257,26 +273,37 @@ proc resolveGroupId*(store: RaftKVStoreExt, key: string): Option[
   ## Unified key → GroupID routing. Meta/system keys go to META_GROUP_ID,
   ## user-table data keys in a space route to the space's Raft group via
   ## hash(primaryKey), and everything else goes to DATA_GROUP_START_ID.
-  if isMetaGroupKey(key):
+  ##
+  ## Handles MVCC-encoded keys (with intent suffix or version suffix) by
+  ## stripping the suffix before routing.
+
+  # Strip MVCC suffix if present (intent keys and version keys)
+  let routingKey = stripMVCCSuffix(key)
+
+  if isMetaGroupKey(routingKey):
     return some(META_GROUP_ID)
   # Check if this is a user-table data key that belongs to a space
-  if isTableKey(key):
+  if isTableKey(routingKey):
     {.cast(raises: []).}:
       try:
-        let (tableId, primaryKey) = decodeTableKey(key)
+        let (tableId, primaryKey) = decodeTableKey(routingKey)
         if tableId >= FIRST_USER_TABLE_ID:
+          var groupIds: seq[uint64] = @[]
+          var sid: int = 0
           withLock store.spacesMu:
-            let sid = store.tableSpaces.getOrDefault(tableId, 0)
+            sid = store.tableSpaces.getOrDefault(tableId, 0)
             if sid > 1 and store.spaces.hasKey(sid):
               let space = store.spaces.getOrDefault(sid)
-              # decodeTableKey returns "d/<pk>" for data rows; strip the
-              # "d/" prefix so we hash the same bare PK that raftPutInSpace
-              # and the SQL executor use.
-              let pk = if primaryKey.startsWith("d/"):
-                         primaryKey[2 .. ^1]
-                       else:
-                         primaryKey
-              return some(routeToGroup(pk, space.groupIds))
+              groupIds = space.groupIds
+          if groupIds.len > 0:
+            # decodeTableKey returns "d/<pk>" for data rows; strip the
+            # "d/" prefix so we hash the same bare PK that raftPutInSpace
+            # and the SQL executor use.
+            let pk = if primaryKey.startsWith("d/"):
+                       primaryKey[2 .. ^1]
+                     else:
+                       primaryKey
+            return some(routeToGroup(pk, groupIds))
       except:
         discard
   some(DATA_GROUP_START_ID)
@@ -813,19 +840,19 @@ proc proposeWrite(store: RaftKVStoreExt, groupId: GroupID,
   let res = store.coordinator.proposeAndWait(groupId, cmd,
       store.proposeTimeout)
   if not res.success:
+    # Debug: log all failures
+    try:
+      {.cast(gcsafe).}:
+        error("proposeWrite failed",
+              {"groupId": $groupId.uint64, "error": res.error}.toTable)
+    except:
+      discard
     if res.error == "Not the leader" or res.error.contains("code -3"):
       return rsVErr(newRSE(rseNotLeader, res.error))
     if res.error.len > 0 and res.error.contains("Group not found"):
       return rsVErr(newRSE(rseGroupNotFound, res.error))
     if res.error.contains("Timeout") or res.error.contains("code -2"):
       return rsVErr(newRSE(rseTimeout, res.error))
-    # Log unexpected errors for debugging
-    try:
-      {.cast(gcsafe).}:
-        error("proposeWrite unexpected error",
-              {"groupId": $groupId.uint64, "error": res.error}.toTable)
-    except:
-      discard
     return rsVErr(newRSE(rseInternal, res.error))
 
   # The SM was already updated by applyBatchToSM (called from NuRaft's

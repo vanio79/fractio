@@ -11,6 +11,8 @@ import fractio/sql/planner
 import fractio/sql/executor
 import fractio/distributed/meta/system_tables
 import fractio/protocol/raft_store
+import fractio/protocol/mvcc_store
+import fractio/protocol/txn_manager
 import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/group_types
 import fractio/distributed/raft/multigroup_types
@@ -54,13 +56,17 @@ proc createTestStore(testDir: string): RaftKVStoreExt =
   result = newRaftKVStoreExt(coord, proposeTimeoutMs = 5000)
   result.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
 
+proc createMvccStore(store: RaftKVStoreExt): MvccTransactionStore =
+  let txnMgr = newTransactionManager()
+  newMvccTransactionStore(store, txnMgr, nil)
+
 proc cleanupTestDir(testDir: string) =
   if dirExists(testDir):
     removeDir(testDir)
 
-proc exec(store: RaftKVStoreExt, sql: string,
-    database = "default", schema = "public"): ExecResult =
-  executeSQL(sql, store, mvccStore = nil, database = database, schema = schema)
+proc exec(store: RaftKVStoreExt, mvccStore: MvccTransactionStore,
+    sql: string, database = "default", schema = "public"): ExecResult =
+  executeSQL(sql, store, mvccStore, database = database, schema = schema)
 
 proc seedTable(store: RaftKVStoreExt, database, schema, name: string,
     tableId: uint32, columns: seq[tuple[name: string, typ: string]],
@@ -554,7 +560,8 @@ suite "EXPLAIN — planner with store":
     check plan.ops[0].kind == poExplain
     # nextTableId should return the same ID — EXPLAIN planning consumed one
     # but we verify the table was NOT actually created
-    let showRes = exec(store, "SHOW TABLES")
+    let mvccStore = createMvccStore(store)
+    let showRes = exec(store, mvccStore, "SHOW TABLES")
     check showRes.rows.len == 0
 
   test "EXPLAIN DROP DATABASE":

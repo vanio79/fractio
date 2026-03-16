@@ -4,7 +4,7 @@
 # Each PlanOp maps directly to KV operations on the raft store.
 # Supports MVCC transactions when MvccTransactionStore is provided.
 
-import std/[options, json, strutils, strformat, tables, times, hashes, algorithm]
+import std/[options, json, strutils, strformat, tables, times, algorithm]
 import ./ast
 import ./parser
 import ./planner
@@ -16,11 +16,10 @@ from ../protocol/mvcc_store import MvccTransactionStore, MvccResult,
     createSession, closeSession, beginTransaction, commitTransaction,
     rollbackTransaction, txnGet, txnPut, txnDelete, txnScan, directGet,
         directScan,
-    isVersionKey, isIntentKeyMvcc
+    isVersionKey, isIntentKeyMvcc, snapshotGet, snapshotScan, getCurrentTimestamp
 import ../core/types as coreTypes
 import ../distributed/raft/nuraft_coordinator
 import ../distributed/raft/group_types as rangeTypes
-import ../distributed/raft/multigroup_types
 import ../utils/logging
 
 # ---------------------------------------------------------------------------
@@ -264,20 +263,6 @@ proc getPkValue(row: JsonNode, pkColumn: string): string =
     of JInt: return $v.getInt
     else: return $v
   ""
-
-# ---------------------------------------------------------------------------
-# Space routing helper
-# ---------------------------------------------------------------------------
-
-proc getTableSpace(store: RaftKVStoreExt, tableId: uint32): Option[SpaceInfo] =
-  ## Returns Some(SpaceInfo) if the table is in a non-default space with >1 group.
-  ## Returns none otherwise (fall through to existing shard-based routing).
-  let spaceOpt = store.getSpaceForTable(tableId)
-  if spaceOpt.isSome:
-    let space = spaceOpt.get()
-    if space.groupIds.len > 1:
-      return some(space)
-  none(SpaceInfo)
 
 # ---------------------------------------------------------------------------
 # Per-op executors
@@ -561,223 +546,6 @@ proc execDropTable(op: PlanOp, store: RaftKVStoreExt,
 
   okResult("DROP TABLE")
 
-proc execInsert(op: PlanOp, store: RaftKVStoreExt): ExecResult =
-  let spaceOpt = getTableSpace(store, op.insTableId)
-  var count = 0
-  for rowJson in op.insRows:
-    let row = parseJson(rowJson)
-    let pkVal = getPkValue(row, op.insPkColumn)
-    if pkVal.len == 0:
-      return errorResult("INSERT requires a primary key value")
-    let key = encodeDataRowKey(op.insTableId, pkVal)
-    if spaceOpt.isSome:
-      let res = store.raftPutInSpace(key, rowJson, spaceOpt.get(), pkVal)
-      if not res.isOk:
-        return errorResult(&"failed to insert row: {res.error.msg}")
-    else:
-      let res = store.raftPut(key, rowJson)
-      if not res.isOk:
-        return errorResult(&"failed to insert row: {res.error.msg}")
-    inc count
-  modifiedResult(count, &"INSERT {count}")
-
-proc execPointGet(op: PlanOp, store: RaftKVStoreExt): ExecResult =
-  let key = encodeDataRowKey(op.pgTableId, op.pgKey)
-  let spaceOpt = getTableSpace(store, op.pgTableId)
-  let res = if spaceOpt.isSome:
-              store.raftGetInSpace(key, spaceOpt.get(), op.pgKey)
-            else:
-              store.raftGet(key)
-  if not res.isOk:
-    return errorResult(&"failed to read: {res.error.msg}")
-  if res.value.isNone:
-    return rowsResult(op.pgColumns, @[])
-
-  let row = parseJson(res.value.get().value)
-  let vals = extractColumns(row, op.pgColumns)
-  rowsResult(op.pgColumns, @[vals])
-
-proc execScan(op: PlanOp, store: RaftKVStoreExt): ExecResult =
-  let spaceOpt = getTableSpace(store, op.scTableId)
-  let res = if spaceOpt.isSome:
-              store.raftScanSpace(op.scStartKey, op.scEndKey, spaceOpt.get(),
-                  0, includeSystemKeys = true)
-            else:
-              store.raftScan(op.scStartKey, op.scEndKey, 0,
-                  includeSystemKeys = true)
-  if not res.isOk:
-    return errorResult(&"failed to scan: {res.error.msg}")
-
-  var resultRows: seq[seq[string]]
-  var count = 0
-  for (key, entry) in res.value:
-    try:
-      let row = parseJson(entry.value)
-      if matchesFilter(op.scFilter, row):
-        resultRows.add(extractColumns(row, op.scColumns))
-        inc count
-        if op.scLimit > 0 and count >= int(op.scLimit):
-          break
-    except JsonParsingError:
-      discard # skip malformed rows
-
-  rowsResult(op.scColumns, resultRows)
-
-proc execUpdate(op: PlanOp, store: RaftKVStoreExt): ExecResult =
-  let startKey = encodeDataRowKey(op.upTableId, "")
-  let endKey = encodeDataRowKey(op.upTableId + 1, "")
-  let spaceOpt = getTableSpace(store, op.upTableId)
-  let res = if spaceOpt.isSome:
-              store.raftScanSpace(startKey, endKey, spaceOpt.get(), 0,
-                  includeSystemKeys = true)
-            else:
-              store.raftScan(startKey, endKey, 0, includeSystemKeys = true)
-  if not res.isOk:
-    return errorResult(&"failed to scan for update: {res.error.msg}")
-
-  var count = 0
-  for (key, entry) in res.value:
-    try:
-      let row = parseJson(entry.value)
-      if matchesFilter(op.upFilter, row):
-        var updated = row.copy()
-        for (col, valExpr) in op.upSets:
-          updated[col] = evalExpr(valExpr, row)
-        let pkVal = getPkValue(updated, op.upPkColumn)
-        if spaceOpt.isSome and pkVal.len > 0:
-          # During rebalancing, write to BOTH old and new groups
-          let putRes = store.raftPutInSpaceBoth(key, $updated, spaceOpt.get(), pkVal)
-          if not putRes.isOk:
-            return errorResult(&"failed to update row: {putRes.error.msg}")
-        else:
-          let putRes = store.raftPut(key, $updated)
-          if not putRes.isOk:
-            return errorResult(&"failed to update row: {putRes.error.msg}")
-        inc count
-    except JsonParsingError:
-      discard
-
-  modifiedResult(count, &"UPDATE {count}")
-
-proc execDelete(op: PlanOp, store: RaftKVStoreExt): ExecResult =
-  let startKey = encodeDataRowKey(op.delTableId, "")
-  let endKey = encodeDataRowKey(op.delTableId + 1, "")
-  let spaceOpt = getTableSpace(store, op.delTableId)
-  let res = if spaceOpt.isSome:
-              store.raftScanSpace(startKey, endKey, spaceOpt.get(), 0,
-                  includeSystemKeys = true)
-            else:
-              store.raftScan(startKey, endKey, 0, includeSystemKeys = true)
-  if not res.isOk:
-    return errorResult(&"failed to scan for delete: {res.error.msg}")
-
-  var count = 0
-  for (key, entry) in res.value:
-    try:
-      let row = parseJson(entry.value)
-      if matchesFilter(op.delFilter, row):
-        let pkVal = getPkValue(row, op.delPkColumn)
-        if spaceOpt.isSome and pkVal.len > 0:
-          let delRes = store.raftDeleteInSpace(key, spaceOpt.get(), pkVal)
-          if not delRes.isOk:
-            return errorResult(&"failed to delete row: {delRes.error.msg}")
-        else:
-          let delRes = store.raftDelete(key)
-          if not delRes.isOk:
-            return errorResult(&"failed to delete row: {delRes.error.msg}")
-        inc count
-    except JsonParsingError:
-      discard
-
-  modifiedResult(count, &"DELETE {count}")
-
-proc execUseDatabase(op: PlanOp, store: RaftKVStoreExt): ExecResult =
-  # Verify the database exists
-  let key = encodeTableKey(SYS_DATABASES_TABLE_ID, op.udName)
-  let existing = store.raftGet(key)
-  if not existing.isOk or existing.value.isNone:
-    return errorResult(&"database '{op.udName}' does not exist")
-  ExecResult(kind: erkUseDatabase, newDatabase: op.udName)
-
-proc execUseSchema(op: PlanOp, store: RaftKVStoreExt,
-    database: string): ExecResult =
-  # Verify the schema exists in the current database
-  let key = encodeTableKey(SYS_SCHEMAS_TABLE_ID,
-      database & "." & op.usName)
-  let existing = store.raftGet(key)
-  if not existing.isOk or existing.value.isNone:
-    return errorResult(&"schema '{op.usName}' does not exist in database '{database}'")
-  ExecResult(kind: erkUseSchema, newSchema: op.usName)
-
-proc execShowDatabases(op: PlanOp, store: RaftKVStoreExt): ExecResult =
-  let startKey = encodeTableKey(SYS_DATABASES_TABLE_ID, "")
-  let endKey = encodeTableKey(SYS_DATABASES_TABLE_ID + 1, "")
-  let res = store.raftScan(startKey, endKey, 0, includeSystemKeys = true)
-  if not res.isOk:
-    return errorResult(&"failed to scan databases: {res.error.msg}")
-
-  var resultRows: seq[seq[string]]
-  for (key, entry) in res.value:
-    try:
-      let j = parseJson(entry.value)
-      resultRows.add(@[j["name"].getStr()])
-    except JsonParsingError:
-      # Fall back to extracting name from the key
-      let decoded = decodeTableKey(key)
-      resultRows.add(@[decoded.primaryKey])
-
-  rowsResult(@["database_name"], resultRows)
-
-proc execShowSchemas(op: PlanOp, store: RaftKVStoreExt): ExecResult =
-  let prefix = op.ssDatabase & "."
-  let startKey = encodeTableKey(SYS_SCHEMAS_TABLE_ID, "")
-  let endKey = encodeTableKey(SYS_SCHEMAS_TABLE_ID + 1, "")
-  let res = store.raftScan(startKey, endKey, 0, includeSystemKeys = true)
-  if not res.isOk:
-    return errorResult(&"failed to scan schemas: {res.error.msg}")
-
-  var resultRows: seq[seq[string]]
-  for (key, entry) in res.value:
-    try:
-      let j = parseJson(entry.value)
-      let db = j.getOrDefault("database").getStr("")
-      let name = j["name"].getStr()
-      if db == op.ssDatabase or op.ssDatabase.len == 0:
-        resultRows.add(@[name])
-    except JsonParsingError:
-      let decoded = decodeTableKey(key)
-      let pk = decoded.primaryKey
-      if pk.startsWith(prefix):
-        resultRows.add(@[pk[prefix.len .. ^1]])
-
-  rowsResult(@["schema_name"], resultRows)
-
-proc execShowTables(op: PlanOp, store: RaftKVStoreExt): ExecResult =
-  let prefix = op.stDatabase & "." & op.stSchema & "."
-  let startKey = encodeTableKey(SYS_TABLES_TABLE_ID, "")
-  let endKey = encodeTableKey(SYS_TABLES_TABLE_ID + 1, "")
-  let res = store.raftScan(startKey, endKey, 0, includeSystemKeys = true)
-  if not res.isOk:
-    return errorResult(&"failed to scan tables: {res.error.msg}")
-
-  var resultRows: seq[seq[string]]
-  for (key, entry) in res.value:
-    try:
-      let j = parseJson(entry.value)
-      let db = j.getOrDefault("database").getStr("")
-      let sc = j.getOrDefault("schema").getStr("")
-      let name = j["name"].getStr()
-      if (db == op.stDatabase or op.stDatabase.len == 0) and
-         (sc == op.stSchema or op.stSchema.len == 0):
-        resultRows.add(@[name])
-    except JsonParsingError:
-      let decoded = decodeTableKey(key)
-      let pk = decoded.primaryKey
-      if pk.startsWith(prefix):
-        resultRows.add(@[pk[prefix.len .. ^1]])
-
-  rowsResult(@["table_name"], resultRows)
-
 # ---------------------------------------------------------------------------
 # Space executors
 # ---------------------------------------------------------------------------
@@ -1018,34 +786,6 @@ proc execDropSpace(op: PlanOp, store: RaftKVStoreExt,
 
   okResult("DROP SPACE")
 
-proc execShowSpaces(op: PlanOp, store: RaftKVStoreExt): ExecResult =
-  let startKey = encodeTableKey(SYS_SPACES_TABLE_ID, "")
-  let endKey = encodeTableKey(SYS_SPACES_TABLE_ID + 1, "")
-  let res = store.raftScan(startKey, endKey, 0, includeSystemKeys = true)
-  if not res.isOk:
-    return errorResult(&"failed to scan spaces: {res.error.msg}")
-
-  var resultRows: seq[seq[string]]
-  for (key, entry) in res.value:
-    try:
-      let j = parseJson(entry.value)
-      let name = j["name"].getStr()
-      let replicas = j["replicas"].getInt()
-      let replicasStr = if replicas == 0: "ALL" else: $replicas
-      let groupCount = j["groupCount"].getInt()
-      let groupIds = if j.hasKey("groupIds"):
-                       var ids: seq[string]
-                       for r in j["groupIds"]: ids.add($r.getInt())
-                       ids.join(",")
-                     else: ""
-      resultRows.add(@[$j["spaceId"].getInt(), name, replicasStr,
-                        $groupCount, groupIds])
-    except JsonParsingError:
-      discard
-
-  rowsResult(@["space_id", "name", "replicas", "group_count", "group_ids"],
-             resultRows)
-
 # ---------------------------------------------------------------------------
 # Transaction-aware KV operation helpers
 # ---------------------------------------------------------------------------
@@ -1070,32 +810,6 @@ proc txnGet(store: RaftKVStoreExt, mvccStore: MvccTransactionStore,
     else:
       mvccErr[Option[string]](MvccStoreError(
         kind: mseStorageError, msg: res.error.msg))
-
-proc txnPut(store: RaftKVStoreExt, mvccStore: MvccTransactionStore,
-    ctx: ExecutorContext, key: string, value: string): MvccVoidResult =
-  ## Put a value, using transactional write if in a transaction,
-  ## or direct raft write otherwise.
-  if ctx.hasActiveTransaction and ctx.sessionId != 0 and mvccStore != nil:
-    mvccStore.txnPut(ctx.sessionId, key, value)
-  else:
-    let res = store.raftPut(key, value)
-    if res.isOk:
-      mvccVOk()
-    else:
-      mvccVErr(MvccStoreError(kind: mseStorageError, msg: res.error.msg))
-
-proc txnDelete(store: RaftKVStoreExt, mvccStore: MvccTransactionStore,
-    ctx: ExecutorContext, key: string): MvccVoidResult =
-  ## Delete a value, using transactional delete if in a transaction,
-  ## or direct raft delete otherwise.
-  if ctx.hasActiveTransaction and ctx.sessionId != 0 and mvccStore != nil:
-    mvccStore.txnDelete(ctx.sessionId, key)
-  else:
-    let res = store.raftDelete(key)
-    if res.isOk:
-      mvccVOk()
-    else:
-      mvccVErr(MvccStoreError(kind: mseStorageError, msg: res.error.msg))
 
 proc execTxnScan(store: RaftKVStoreExt, mvccStore: MvccTransactionStore,
     ctx: ExecutorContext, startKey, endKey: string,
@@ -1248,8 +962,12 @@ proc execShowSpacesTxn(op: PlanOp, store: RaftKVStoreExt,
              resultRows)
 
 # ---------------------------------------------------------------------------
-# Main entry point (non-transactional)
+# Main entry point - unified with implicit transactions for DML
 # ---------------------------------------------------------------------------
+
+# Forward declaration
+proc executeWithTxn*(plan: Plan, store: RaftKVStoreExt,
+    mvccStore: MvccTransactionStore, ctx: ExecutorContext): ExecResult
 
 proc execute*(plan: Plan, store: RaftKVStoreExt,
     mvccStore: MvccTransactionStore = nil,
@@ -1258,118 +976,46 @@ proc execute*(plan: Plan, store: RaftKVStoreExt,
   ## Processes ops sequentially; returns the result of the last op
   ## (or the first error).
   ##
-  ## DDL operations (CREATE/DROP DATABASE/SCHEMA/TABLE/SPACE) require
-  ## mvccStore to be provided for internal transaction support.
-  ## DML operations (INSERT/SCAN/POINT_GET/UPDATE/DELETE) work without mvccStore.
-  var lastResult = okResult("empty plan")
+  ## All operations require mvccStore for consistency:
+  ## - DDL operations use internal auto-commit transactions
+  ## - DML operations use implicit transactions if not in an explicit one
+  ##
+  ## This is the simplified unified entry point.
+  if mvccStore == nil:
+    return errorResult("MVCC store is required for all operations")
 
-  for op in plan.ops:
-    lastResult = case op.kind
-    of poCreateDatabase:
-      if mvccStore == nil:
-        errorResult("CREATE DATABASE requires MVCC store")
-      else:
-        execCreateDatabase(op, store, mvccStore)
-    of poDropDatabase:
-      if mvccStore == nil:
-        errorResult("DROP DATABASE requires MVCC store")
-      else:
-        execDropDatabase(op, store, mvccStore)
-    of poCreateSchema:
-      if mvccStore == nil:
-        errorResult("CREATE SCHEMA requires MVCC store")
-      else:
-        execCreateSchema(op, store, mvccStore)
-    of poDropSchema:
-      if mvccStore == nil:
-        errorResult("DROP SCHEMA requires MVCC store")
-      else:
-        execDropSchema(op, store, mvccStore)
-    of poCreateTable:
-      if mvccStore == nil:
-        errorResult("CREATE TABLE requires MVCC store")
-      else:
-        execCreateTable(op, store, mvccStore)
-    of poDropTable:
-      if mvccStore == nil:
-        errorResult("DROP TABLE requires MVCC store")
-      else:
-        execDropTable(op, store, mvccStore)
-    of poInsert: execInsert(op, store)
-    of poPointGet: execPointGet(op, store)
-    of poScan: execScan(op, store)
-    of poUpdate: execUpdate(op, store)
-    of poDelete: execDelete(op, store)
-    of poShowDatabases:
-      if mvccStore != nil:
-        let ctx = ExecutorContext(database: database)
-        execShowDatabasesTxn(op, store, mvccStore, ctx)
-      else:
-        execShowDatabases(op, store)
-    of poShowSchemas:
-      if mvccStore != nil:
-        let ctx = ExecutorContext(database: database)
-        execShowSchemasTxn(op, store, mvccStore, ctx)
-      else:
-        execShowSchemas(op, store)
-    of poShowTables:
-      if mvccStore != nil:
-        let ctx = ExecutorContext(database: database)
-        execShowTablesTxn(op, store, mvccStore, ctx)
-      else:
-        execShowTables(op, store)
-    of poShowSpaces:
-      if mvccStore != nil:
-        let ctx = ExecutorContext(database: database)
-        execShowSpacesTxn(op, store, mvccStore, ctx)
-      else:
-        execShowSpaces(op, store)
-    of poCreateSpace:
-      if mvccStore == nil:
-        errorResult("CREATE SPACE requires MVCC store")
-      else:
-        execCreateSpace(op, store, mvccStore)
-    of poDropSpace:
-      if mvccStore == nil:
-        errorResult("DROP SPACE requires MVCC store")
-      else:
-        execDropSpace(op, store, mvccStore)
-    of poUseDatabase:
-      if mvccStore != nil:
-        let ctx = ExecutorContext(database: database)
-        let key = encodeTableKey(SYS_DATABASES_TABLE_ID, op.udName)
-        let existing = txnGet(store, mvccStore, ctx, key)
-        if not existing.isOk or existing.value.isNone:
-          errorResult(&"database '{op.udName}' does not exist")
-        else:
-          ExecResult(kind: erkUseDatabase, newDatabase: op.udName)
-      else:
-        execUseDatabase(op, store)
-    of poUseSchema:
-      if mvccStore != nil:
-        let ctx = ExecutorContext(database: database)
-        let key = encodeTableKey(SYS_SCHEMAS_TABLE_ID, database & "." & op.usName)
-        let existing = txnGet(store, mvccStore, ctx, key)
-        if not existing.isOk or existing.value.isNone:
-          errorResult(&"schema '{op.usName}' does not exist in database '{database}'")
-        else:
-          ExecResult(kind: erkUseSchema, newSchema: op.usName)
-      else:
-        execUseSchema(op, store, database)
-    of poBeginTxn: okResult("BEGIN (auto-commit mode)")
-    of poCommitTxn: okResult("COMMIT (auto-commit mode)")
-    of poRollbackTxn: okResult("ROLLBACK (auto-commit mode)")
-    of poExplain:
-      let text = formatPlan(op.exInnerPlan)
-      var rows: seq[seq[string]]
-      for line in text.split('\n'):
-        rows.add(@[line])
-      rowsResult(@["plan"], rows)
+  let ctx = newExecutorContext(database)
+  ctx.initSession(mvccStore)
+  defer: ctx.closeSession(mvccStore)
 
-    if lastResult.kind == erkError:
-      return lastResult
+  executeWithTxn(plan, store, mvccStore, ctx)
 
-  lastResult
+proc executeSQL*(sql: string, store: RaftKVStoreExt,
+    mvccStore: MvccTransactionStore,
+    database: string = "default", schema: string = "public"): ExecResult =
+  ## Parse and execute SQL with MVCC transaction support.
+  ## This is the main entry point for SQL execution.
+  if mvccStore == nil:
+    return errorResult("MVCC store is required for all operations")
+
+  try:
+    let stmts = parseAll(sql)
+    if stmts.len == 0:
+      return errorResult("No SQL statements to execute")
+
+    let plan = planStatement(stmts[0], store, mvccStore, database, schema)
+    if plan.ops.len == 0:
+      return okResult("empty plan")
+
+    let ctx = newExecutorContext(database, schema)
+    ctx.initSession(mvccStore)
+    defer: ctx.closeSession(mvccStore)
+
+    executeWithTxn(plan, store, mvccStore, ctx)
+  except PlanError as e:
+    errorResult(e.msg)
+  except CatchableError as e:
+    errorResult(&"SQL error: {e.msg}")
 
 # ---------------------------------------------------------------------------
 # Transaction-aware execute
@@ -1378,14 +1024,47 @@ proc execute*(plan: Plan, store: RaftKVStoreExt,
 proc executeWithTxn*(plan: Plan, store: RaftKVStoreExt,
     mvccStore: MvccTransactionStore, ctx: ExecutorContext): ExecResult =
   ## Execute a Plan with MVCC transaction support.
-  ## DDL operations (CREATE/DROP DATABASE/SCHEMA/TABLE/SPACE) are FORBIDDEN
-  ## inside transactions - they must be executed outside transaction blocks.
-  ## DML operations (INSERT/SCAN/POINT_GET/UPDATE/DELETE) are transactional.
+  ##
+  ## All DML operations use MVCC transactions:
+  ## - If in an explicit transaction (BEGIN), use that transaction
+  ## - If not in a transaction, create an implicit auto-commit transaction
+  ##
+  ## DDL operations are FORBIDDEN inside explicit transactions.
+  ##
   ## The ctx holds the session state and transaction status.
+
+  proc needsImplicitTxn(): bool =
+    ## Check if we need to create an implicit transaction for this operation
+    not ctx.hasActiveTransaction
+
+  proc beginImplicitTxn(): bool =
+    ## Begin an implicit transaction. Returns true on success.
+    let res = mvccStore.beginTransaction(ctx.sessionId)
+    if res.isOk:
+      ctx.hasActiveTransaction = true
+      true
+    else:
+      false
+
+  proc commitImplicitTxn(): bool =
+    ## Commit an implicit transaction. Returns true on success.
+    let res = mvccStore.commitTransaction(ctx.sessionId)
+    if res.isOk:
+      ctx.hasActiveTransaction = false
+      true
+    else:
+      false
+
+  proc rollbackImplicitTxn() =
+    ## Rollback an implicit transaction.
+    discard mvccStore.rollbackTransaction(ctx.sessionId)
+    ctx.hasActiveTransaction = false
+
   var lastResult = okResult("empty plan")
 
   for op in plan.ops:
     lastResult = case op.kind
+
     # DDL operations: FORBIDDEN inside transactions, auto-commit outside
     of poCreateDatabase:
       if ctx.hasActiveTransaction:
@@ -1435,131 +1114,189 @@ proc executeWithTxn*(plan: Plan, store: RaftKVStoreExt,
       else:
         execDropSpace(op, store, mvccStore)
 
-    # DML operations: transactional
+    # DML operations: always use MVCC with implicit transaction if needed
     of poInsert:
-      let spaceOpt = getTableSpace(store, op.insTableId)
+      let implicitTxn = needsImplicitTxn()
+      if implicitTxn and not beginImplicitTxn():
+        return errorResult("failed to begin implicit transaction")
+
       var count = 0
+      var error: string = ""
       for rowJson in op.insRows:
         let row = parseJson(rowJson)
         let pkVal = getPkValue(row, op.insPkColumn)
         if pkVal.len == 0:
-          return errorResult("INSERT requires a primary key value")
+          error = "INSERT requires a primary key value"
+          break
         let key = encodeDataRowKey(op.insTableId, pkVal)
-        if ctx.hasActiveTransaction:
-          let res = txnPut(store, mvccStore, ctx, key, rowJson)
-          if not res.isOk:
-            return errorResult(&"failed to insert row: {res.error.msg}")
-        elif spaceOpt.isSome:
-          let res = store.raftPutInSpace(key, rowJson, spaceOpt.get(), pkVal)
-          if not res.isOk:
-            return errorResult(&"failed to insert row: {res.error.msg}")
-        else:
-          let res = store.raftPut(key, rowJson)
-          if not res.isOk:
-            return errorResult(&"failed to insert row: {res.error.msg}")
+        let res = mvccStore.txnPut(ctx.sessionId, key, rowJson)
+        if not res.isOk:
+          error = &"failed to insert row: {res.error.msg}"
+          break
         inc count
+
+      if error.len > 0:
+        if implicitTxn: rollbackImplicitTxn()
+        return errorResult(error)
+
+      if implicitTxn and not commitImplicitTxn():
+        return errorResult("failed to commit implicit transaction")
+
       modifiedResult(count, &"INSERT {count}")
 
     of poPointGet:
+      # Use lightweight snapshot read for single SELECT statements
+      # No transaction needed - just need a read timestamp
       let key = encodeDataRowKey(op.pgTableId, op.pgKey)
-      let spaceOpt = getTableSpace(store, op.pgTableId)
-      var rowJson: Option[string] = none(string)
 
-      if ctx.hasActiveTransaction and mvccStore != nil:
-        # Active transaction: use transactional read
+      if ctx.hasActiveTransaction:
+        # In explicit transaction - use transaction's read timestamp
         let res = mvccStore.txnGet(ctx.sessionId, key)
         if not res.isOk:
           return errorResult(&"failed to read: {res.error.msg}")
-        rowJson = res.value
-      elif mvccStore != nil:
-        # No active transaction but MVCC available: try MVCC read first
-        let res = mvccStore.directGet(key)
-        if not res.isOk:
-          return errorResult(&"failed to read: {res.error.msg}")
-        if res.value.isSome:
-          rowJson = res.value
-        else:
-          # Fall back to regular read for non-MVCC data
-          let regularRes = if spaceOpt.isSome:
-                            store.raftGetInSpace(key, spaceOpt.get(), op.pgKey)
-                          else:
-                            store.raftGet(key)
-          if not regularRes.isOk:
-            return errorResult(&"failed to read: {regularRes.error.msg}")
-          if regularRes.value.isSome:
-            rowJson = some(regularRes.value.get().value)
+        if res.value.isNone:
+          return rowsResult(op.pgColumns, @[])
+        let row = parseJson(res.value.get())
+        let vals = extractColumns(row, op.pgColumns)
+        rowsResult(op.pgColumns, @[vals])
       else:
-        # No MVCC: use regular read
-        let res = if spaceOpt.isSome:
-                    store.raftGetInSpace(key, spaceOpt.get(), op.pgKey)
-                  else:
-                    store.raftGet(key)
+        # Lightweight snapshot read - no transaction overhead
+        let readTs = mvccStore.getCurrentTimestamp()
+        let res = mvccStore.snapshotGet(key, readTs)
         if not res.isOk:
           return errorResult(&"failed to read: {res.error.msg}")
-        if res.value.isSome:
-          rowJson = some(res.value.get().value)
+        if res.value.isNone:
+          return rowsResult(op.pgColumns, @[])
+        let row = parseJson(res.value.get())
+        let vals = extractColumns(row, op.pgColumns)
+        rowsResult(op.pgColumns, @[vals])
 
-      if rowJson.isNone:
-        return rowsResult(op.pgColumns, @[])
+    of poScan:
+      # Use lightweight snapshot scan for single SELECT statements
+      # No transaction needed - just need a read timestamp
+      if ctx.hasActiveTransaction:
+        # In explicit transaction - use transaction's read timestamp
+        let res = mvccStore.txnScan(ctx.sessionId, op.scStartKey, op.scEndKey, op.scLimit)
+        if not res.isOk:
+          return errorResult(&"failed to scan: {res.error.msg}")
 
-      let row = parseJson(rowJson.get())
-      let vals = extractColumns(row, op.pgColumns)
-      rowsResult(op.pgColumns, @[vals])
-
-    of poScan, poUpdate, poDelete, poShowDatabases, poShowSchemas, poShowTables,
-       poShowSpaces:
-      # DML and SHOW operations: use transaction-aware implementations
-      case op.kind
-      of poScan:
-        # MVCC-aware scan - use hybrid scan for non-transactional reads
-        let spaceOpt = getTableSpace(store, op.scTableId)
         var resultRows: seq[seq[string]] = @[]
         var count = 0
+        for (key, value) in res.value:
+          try:
+            let row = parseJson(value)
+            if matchesFilter(op.scFilter, row):
+              resultRows.add(extractColumns(row, op.scColumns))
+              inc count
+              if op.scLimit > 0 and count >= int(op.scLimit):
+                break
+          except JsonParsingError:
+            discard # skip malformed rows
 
-        if ctx.hasActiveTransaction and mvccStore != nil:
-          # Active transaction: use transactional scan
-          let res = mvccStore.txnScan(ctx.sessionId, op.scStartKey,
-              op.scEndKey, op.scLimit)
-          if not res.isOk:
-            return errorResult(&"failed to scan: {res.error.msg}")
+        rowsResult(op.scColumns, resultRows)
+      else:
+        # Lightweight snapshot scan - no transaction overhead
+        let readTs = mvccStore.getCurrentTimestamp()
+        let res = mvccStore.snapshotScan(op.scStartKey, op.scEndKey, readTs, op.scLimit)
+        if not res.isOk:
+          return errorResult(&"failed to scan: {res.error.msg}")
 
-          for (key, value) in res.value:
-            try:
-              let row = parseJson(value)
-              if matchesFilter(op.scFilter, row):
-                resultRows.add(extractColumns(row, op.scColumns))
-                inc count
-                if op.scLimit > 0 and count >= int(op.scLimit):
-                  break
-            except JsonParsingError:
-              discard # skip malformed rows
-        else:
-          # No active transaction: use hybrid scan (regular + MVCC)
-          let res = execTxnScan(store, mvccStore, ctx, op.scStartKey,
-              op.scEndKey, op.scLimit)
-          if not res.isOk:
-            return errorResult(&"failed to scan: {res.error.msg}")
-
-          for (key, value) in res.value:
-            try:
-              let row = parseJson(value)
-              if matchesFilter(op.scFilter, row):
-                resultRows.add(extractColumns(row, op.scColumns))
-                inc count
-                if op.scLimit > 0 and count >= int(op.scLimit):
-                  break
-            except JsonParsingError:
-              discard # skip malformed rows
+        var resultRows: seq[seq[string]] = @[]
+        var count = 0
+        for (key, value) in res.value:
+          try:
+            let row = parseJson(value)
+            if matchesFilter(op.scFilter, row):
+              resultRows.add(extractColumns(row, op.scColumns))
+              inc count
+              if op.scLimit > 0 and count >= int(op.scLimit):
+                break
+          except JsonParsingError:
+            discard # skip malformed rows
 
         rowsResult(op.scColumns, resultRows)
 
-      of poUpdate: execUpdate(op, store) # TODO: MVCC-aware update
-      of poDelete: execDelete(op, store) # TODO: MVCC-aware delete
-      of poShowDatabases: execShowDatabasesTxn(op, store, mvccStore, ctx)
-      of poShowSchemas: execShowSchemasTxn(op, store, mvccStore, ctx)
-      of poShowTables: execShowTablesTxn(op, store, mvccStore, ctx)
-      of poShowSpaces: execShowSpacesTxn(op, store, mvccStore, ctx)
-      else: okResult("ok")
+    of poUpdate:
+      # MVCC-aware UPDATE
+      let implicitTxn = needsImplicitTxn()
+      if implicitTxn and not beginImplicitTxn():
+        return errorResult("failed to begin implicit transaction")
+
+      let startKey = encodeDataRowKey(op.upTableId, "")
+      let endKey = encodeDataRowKey(op.upTableId + 1, "")
+      let res = mvccStore.txnScan(ctx.sessionId, startKey, endKey, 0)
+
+      if not res.isOk:
+        if implicitTxn: rollbackImplicitTxn()
+        return errorResult(&"failed to scan for update: {res.error.msg}")
+
+      var count = 0
+      var error: string = ""
+      for (key, value) in res.value:
+        try:
+          let row = parseJson(value)
+          if matchesFilter(op.upFilter, row):
+            var updated = row.copy()
+            for (col, valExpr) in op.upSets:
+              updated[col] = evalExpr(valExpr, row)
+            let putRes = mvccStore.txnPut(ctx.sessionId, key, $updated)
+            if not putRes.isOk:
+              error = &"failed to update row: {putRes.error.msg}"
+              break
+            inc count
+        except JsonParsingError:
+          discard
+
+      if error.len > 0:
+        if implicitTxn: rollbackImplicitTxn()
+        return errorResult(error)
+
+      if implicitTxn and not commitImplicitTxn():
+        return errorResult("failed to commit implicit transaction")
+
+      modifiedResult(count, &"UPDATE {count}")
+
+    of poDelete:
+      # MVCC-aware DELETE
+      let implicitTxn = needsImplicitTxn()
+      if implicitTxn and not beginImplicitTxn():
+        return errorResult("failed to begin implicit transaction")
+
+      let startKey = encodeDataRowKey(op.delTableId, "")
+      let endKey = encodeDataRowKey(op.delTableId + 1, "")
+      let res = mvccStore.txnScan(ctx.sessionId, startKey, endKey, 0)
+
+      if not res.isOk:
+        if implicitTxn: rollbackImplicitTxn()
+        return errorResult(&"failed to scan for delete: {res.error.msg}")
+
+      var count = 0
+      var error: string = ""
+      for (key, value) in res.value:
+        try:
+          let row = parseJson(value)
+          if matchesFilter(op.delFilter, row):
+            let delRes = mvccStore.txnDelete(ctx.sessionId, key)
+            if not delRes.isOk:
+              error = &"failed to delete row: {delRes.error.msg}"
+              break
+            inc count
+        except JsonParsingError:
+          discard
+
+      if error.len > 0:
+        if implicitTxn: rollbackImplicitTxn()
+        return errorResult(error)
+
+      if implicitTxn and not commitImplicitTxn():
+        return errorResult("failed to commit implicit transaction")
+
+      modifiedResult(count, &"DELETE {count}")
+
+    of poShowDatabases: execShowDatabasesTxn(op, store, mvccStore, ctx)
+    of poShowSchemas: execShowSchemasTxn(op, store, mvccStore, ctx)
+    of poShowTables: execShowTablesTxn(op, store, mvccStore, ctx)
+    of poShowSpaces: execShowSpacesTxn(op, store, mvccStore, ctx)
 
     of poUseDatabase:
       let key = encodeTableKey(SYS_DATABASES_TABLE_ID, op.udName)
@@ -1581,7 +1318,6 @@ proc executeWithTxn*(plan: Plan, store: RaftKVStoreExt,
       if ctx.hasActiveTransaction:
         okResult("BEGIN (transaction already active)")
       else:
-        ctx.initSession(mvccStore)
         let res = mvccStore.beginTransaction(ctx.sessionId)
         if res.isOk:
           ctx.hasActiveTransaction = true
@@ -1623,37 +1359,16 @@ proc executeWithTxn*(plan: Plan, store: RaftKVStoreExt,
 
   lastResult
 
-# ---------------------------------------------------------------------------
-# Convenience: parse + plan + execute in one call
-# ---------------------------------------------------------------------------
-
-proc executeSQL*(sql: string, store: RaftKVStoreExt,
-    mvccStore: MvccTransactionStore = nil,
-    database: string = "default",
-    schema: string = "public"): ExecResult =
-  ## Parse a SQL statement, plan it, and execute it.
-  ## DDL operations require mvccStore to be provided.
-  try:
-    let stmts = parseAll(sql)
-    if stmts.len == 0:
-      return errorResult("empty SQL statement")
-    var lastResult = okResult("ok")
-    for stmt in stmts:
-      let plan = planStatement(stmt, store, mvccStore, database, schema)
-      lastResult = execute(plan, store, mvccStore, database)
-      if lastResult.kind == erkError:
-        return lastResult
-    lastResult
-  except PlanError as e:
-    errorResult(e.msg)
-  except CatchableError as e:
-    errorResult(&"SQL error: {e.msg}")
-
 proc executeSQLWithTxn*(sql: string, store: RaftKVStoreExt,
     mvccStore: MvccTransactionStore, ctx: ExecutorContext): ExecResult =
   ## Parse a SQL statement, plan it, and execute it with MVCC transaction support.
   ## The ctx maintains session state across calls - use the same ctx for
   ## multiple statements in a transaction.
+
+  # Ensure session is initialized
+  if ctx.sessionId == 0:
+    ctx.sessionId = mvccStore.createSession()
+
   try:
     let stmts = parseAll(sql)
     if stmts.len == 0:
