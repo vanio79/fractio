@@ -48,7 +48,8 @@ proc handleClientRequest*(node: RaftNode, rpc: RaftRPC): RaftRPC =
 
 proc sendRPC*(node: RaftNode, rpc: RaftRPC, endpoint: string) =
   ## Send an RPC to another node
-  debug "Sending RPC", rpcType = $rpc.rpcType, endpoint = endpoint
+  discard endpoint # Placeholder - actual network send not implemented
+  debug "Sending RPC", rpcType = $rpc.rpcType
 
   # Implementation would send the RPC over the network
   # This is a placeholder for the actual implementation

@@ -178,16 +178,6 @@ proc newRaftKVStore*(coord: NuRaftCoordinator,
   result.nextVersion.store(1)
 
 # ---------------------------------------------------------------------------
-# Internal: get KVStateMachine for a GroupID
-# ---------------------------------------------------------------------------
-
-proc getKVSM(store: RaftKVStore,
-    groupId: GroupID): Option[KVStateMachine] {.gcsafe, raises: [].} =
-  ## Legacy stub — kept for compatibility. State machines are lightweight
-  ## index trackers only; all data reads go through the WiscKey backend.
-  none(KVStateMachine)
-
-# ---------------------------------------------------------------------------
 # State machine registry (owned by RaftKVStore)
 # ---------------------------------------------------------------------------
 # The NuRaftCoordinator worker thread commits log entries via the group's
@@ -583,6 +573,7 @@ proc applyBatchToSM*(storePtr: pointer, rid: GroupID,
   ## with other threads.  Instead we GC_ref/GC_unref around the cast so the
   ## refcount is balanced and ORC never frees the object.
   if storePtr == nil: return
+  discard rid # GroupID not needed - batch is applied to store directly
   let store = cast[RaftKVStoreExt](storePtr)
   GC_ref(store) # prevent ORC from freeing on scope exit (balances the decrement)
 

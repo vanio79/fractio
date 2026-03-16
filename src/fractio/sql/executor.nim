@@ -268,8 +268,7 @@ proc getPkValue(row: JsonNode, pkColumn: string): string =
 # Per-op executors
 # ---------------------------------------------------------------------------
 
-proc execCreateDatabase(op: PlanOp, store: RaftKVStoreExt,
-    mvccStore: MvccTransactionStore): ExecResult =
+proc execCreateDatabase(op: PlanOp, mvccStore: MvccTransactionStore): ExecResult =
   ## Execute CREATE DATABASE with internal MVCC transaction for consistency.
   let key = encodeTableKey(SYS_DATABASES_TABLE_ID, op.cdbName)
 
@@ -310,8 +309,7 @@ proc execCreateDatabase(op: PlanOp, store: RaftKVStoreExt,
 
   okResult(&"CREATE DATABASE")
 
-proc execDropDatabase(op: PlanOp, store: RaftKVStoreExt,
-    mvccStore: MvccTransactionStore): ExecResult =
+proc execDropDatabase(op: PlanOp, mvccStore: MvccTransactionStore): ExecResult =
   ## Execute DROP DATABASE with internal MVCC transaction for consistency.
   let key = encodeTableKey(SYS_DATABASES_TABLE_ID, op.ddbName)
 
@@ -385,8 +383,7 @@ proc execDropDatabase(op: PlanOp, store: RaftKVStoreExt,
 
   okResult("DROP DATABASE")
 
-proc execCreateSchema(op: PlanOp, store: RaftKVStoreExt,
-    mvccStore: MvccTransactionStore): ExecResult =
+proc execCreateSchema(op: PlanOp, mvccStore: MvccTransactionStore): ExecResult =
   ## Execute CREATE SCHEMA with internal MVCC transaction for consistency.
   let key = encodeTableKey(SYS_SCHEMAS_TABLE_ID,
       op.csDatabase & "." & op.csName)
@@ -417,8 +414,7 @@ proc execCreateSchema(op: PlanOp, store: RaftKVStoreExt,
 
   okResult("CREATE SCHEMA")
 
-proc execDropSchema(op: PlanOp, store: RaftKVStoreExt,
-    mvccStore: MvccTransactionStore): ExecResult =
+proc execDropSchema(op: PlanOp, mvccStore: MvccTransactionStore): ExecResult =
   ## Execute DROP SCHEMA with internal MVCC transaction for consistency.
   let key = encodeTableKey(SYS_SCHEMAS_TABLE_ID,
       op.dsDatabase & "." & op.dsName)
@@ -513,8 +509,7 @@ proc execCreateTable(op: PlanOp, store: RaftKVStoreExt,
 
   okResult("CREATE TABLE")
 
-proc execDropTable(op: PlanOp, store: RaftKVStoreExt,
-    mvccStore: MvccTransactionStore): ExecResult =
+proc execDropTable(op: PlanOp, mvccStore: MvccTransactionStore): ExecResult =
   ## Execute DROP TABLE with internal MVCC transaction for consistency.
   let key = encodeTableKey(SYS_TABLES_TABLE_ID,
       op.dtDatabase & "." & op.dtSchema & "." & op.dtName)
@@ -859,7 +854,7 @@ proc execTxnScan(store: RaftKVStoreExt, mvccStore: MvccTransactionStore,
 # MVCC-aware show operations
 # ---------------------------------------------------------------------------
 
-proc execShowDatabasesTxn(op: PlanOp, store: RaftKVStoreExt,
+proc execShowDatabasesTxn(store: RaftKVStoreExt,
     mvccStore: MvccTransactionStore, ctx: ExecutorContext): ExecResult =
   let startKey = encodeTableKey(SYS_DATABASES_TABLE_ID, "")
   let endKey = encodeTableKey(SYS_DATABASES_TABLE_ID + 1, "")
@@ -931,7 +926,7 @@ proc execShowTablesTxn(op: PlanOp, store: RaftKVStoreExt,
 
   rowsResult(@["table_name"], resultRows)
 
-proc execShowSpacesTxn(op: PlanOp, store: RaftKVStoreExt,
+proc execShowSpacesTxn(store: RaftKVStoreExt,
     mvccStore: MvccTransactionStore, ctx: ExecutorContext): ExecResult =
   ## Transaction-aware SHOW SPACES that can see MVCC-encoded space records.
   let startKey = encodeTableKey(SYS_SPACES_TABLE_ID, "")
@@ -1070,25 +1065,25 @@ proc executeWithTxn*(plan: Plan, store: RaftKVStoreExt,
       if ctx.hasActiveTransaction:
         errorResult("CREATE DATABASE is not allowed inside a transaction")
       else:
-        execCreateDatabase(op, store, mvccStore)
+        execCreateDatabase(op, mvccStore)
 
     of poDropDatabase:
       if ctx.hasActiveTransaction:
         errorResult("DROP DATABASE is not allowed inside a transaction")
       else:
-        execDropDatabase(op, store, mvccStore)
+        execDropDatabase(op, mvccStore)
 
     of poCreateSchema:
       if ctx.hasActiveTransaction:
         errorResult("CREATE SCHEMA is not allowed inside a transaction")
       else:
-        execCreateSchema(op, store, mvccStore)
+        execCreateSchema(op, mvccStore)
 
     of poDropSchema:
       if ctx.hasActiveTransaction:
         errorResult("DROP SCHEMA is not allowed inside a transaction")
       else:
-        execDropSchema(op, store, mvccStore)
+        execDropSchema(op, mvccStore)
 
     of poCreateTable:
       if ctx.hasActiveTransaction:
@@ -1100,7 +1095,7 @@ proc executeWithTxn*(plan: Plan, store: RaftKVStoreExt,
       if ctx.hasActiveTransaction:
         errorResult("DROP TABLE is not allowed inside a transaction")
       else:
-        execDropTable(op, store, mvccStore)
+        execDropTable(op, mvccStore)
 
     of poCreateSpace:
       if ctx.hasActiveTransaction:
@@ -1293,10 +1288,10 @@ proc executeWithTxn*(plan: Plan, store: RaftKVStoreExt,
 
       modifiedResult(count, &"DELETE {count}")
 
-    of poShowDatabases: execShowDatabasesTxn(op, store, mvccStore, ctx)
+    of poShowDatabases: execShowDatabasesTxn(store, mvccStore, ctx)
     of poShowSchemas: execShowSchemasTxn(op, store, mvccStore, ctx)
     of poShowTables: execShowTablesTxn(op, store, mvccStore, ctx)
-    of poShowSpaces: execShowSpacesTxn(op, store, mvccStore, ctx)
+    of poShowSpaces: execShowSpacesTxn(store, mvccStore, ctx)
 
     of poUseDatabase:
       let key = encodeTableKey(SYS_DATABASES_TABLE_ID, op.udName)

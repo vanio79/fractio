@@ -636,6 +636,7 @@ proc readOneFrame(sock: Socket,
 proc handleBuiltinCore(server: ProtocolServer, conn: ClientConnection,
     requestId: uint32, flags: uint16,
     payload: string) {.gcsafe, raises: [].} =
+  discard flags # Reserved for future use
   if payload.len < 2: return
   let typeVal = (uint16(payload[0]) shl 8) or uint16(payload[1])
   case typeVal
@@ -663,6 +664,7 @@ proc handleBuiltinCore(server: ProtocolServer, conn: ClientConnection,
 proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
     requestId: uint32, flags: uint16,
     payload: string) {.gcsafe, raises: [].} =
+  discard flags # Reserved for future use
   if payload.len < 2: return
   let typeVal = (uint16(payload[0]) shl 8) or uint16(payload[1])
 
@@ -1033,6 +1035,7 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
 proc handleBuiltinTxn(server: ProtocolServer, conn: ClientConnection,
     requestId: uint32, flags: uint16,
     payload: string) {.gcsafe, raises: [].} =
+  discard flags # Reserved for future use
   if payload.len < 2: return
   let typeVal = (uint16(payload[0]) shl 8) or uint16(payload[1])
 
@@ -1117,6 +1120,7 @@ proc handleBuiltinTxn(server: ProtocolServer, conn: ClientConnection,
 proc handleBuiltinAdmin(server: ProtocolServer, conn: ClientConnection,
     requestId: uint32, flags: uint16,
     payload: string) {.gcsafe, raises: [].} =
+  discard flags # Reserved for future use
   if payload.len < 2: return
   let typeVal = (uint16(payload[0]) shl 8) or uint16(payload[1])
 
@@ -1173,6 +1177,7 @@ proc handleBuiltinAdmin(server: ProtocolServer, conn: ClientConnection,
 proc handleBuiltinCluster(server: ProtocolServer, conn: ClientConnection,
     requestId: uint32, flags: uint16,
     payload: string) {.gcsafe, raises: [].} =
+  discard flags # Reserved for future use
   if payload.len < 2: return
   let typeVal = (uint16(payload[0]) shl 8) or uint16(payload[1])
 

@@ -131,7 +131,6 @@ when isMainModule:
 
   suite "TimestampProvider":
     test "generates increasing timestamps":
-      var counter = 0
       # Simple mock for testing - just test logical counter behavior
       let ts1 = Timestamp(1000)
       let ts2 = Timestamp(1000)

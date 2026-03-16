@@ -160,8 +160,6 @@ proc lookupMeta2*(lookup: GroupLookup, meta2RangeId: GroupID,
   # Check if we have the meta2 range descriptor
   withLock lookup.lock:
     if lookup.meta2Descriptors.contains(meta2RangeId):
-      let meta2 = lookup.meta2Descriptors[meta2RangeId]
-
       # In production, this would query the meta2 range via RPC
       # For now, we return the cached range if it contains the key
       # This is a simplified implementation

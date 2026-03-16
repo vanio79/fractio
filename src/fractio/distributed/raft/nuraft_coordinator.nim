@@ -68,11 +68,13 @@ type
 # NuRaftGroupInstance may be allocated on NuRaft ASIO threads (via
 # onGroupMetadataApplied callback), and Nim's allocator crashes in
 # addToSharedFreeList when freeing cross-thread allocations.
-proc c_malloc(size: csize_t): pointer {.importc: "malloc", header: "<stdlib.h>".}
+proc c_malloc(size: csize_t): pointer {.importc: "malloc",
+    header: "<stdlib.h>".}
 proc c_free(p: pointer) {.importc: "free", header: "<stdlib.h>".}
 
 proc allocInstance(): NuRaftGroupInstancePtr =
-  result = cast[NuRaftGroupInstancePtr](c_malloc(csize_t(sizeof(NuRaftGroupInstance))))
+  result = cast[NuRaftGroupInstancePtr](c_malloc(csize_t(sizeof(
+      NuRaftGroupInstance))))
   zeroMem(result, sizeof(NuRaftGroupInstance))
 
 proc freeInstance(p: NuRaftGroupInstancePtr) =
@@ -144,6 +146,7 @@ proc nuraftCommitCb(ctx: pointer, logIdx: uint64,
     data: cstring, len: csize_t) {.cdecl, gcsafe.} =
   ## Called from NuRaft C++ when a log entry is committed.
   ## ctx is a raw pointer to NuRaftGroupInstance.
+  discard logIdx # Not needed - commit is applied via batch
   if ctx == nil or data == nil or len == 0: return
 
   {.cast(gcsafe).}:
@@ -173,6 +176,8 @@ proc nuraftCommitCb(ctx: pointer, logIdx: uint64,
 proc nuraftEventCb(ctx: pointer, eventType: int32,
     leaderId: int32, term: uint64) {.cdecl, gcsafe.} =
   ## Called from NuRaft C++ on BecomeLeader/BecomeFollower events.
+  discard leaderId # Not needed for current implementation
+  discard term # Not needed for current implementation
   if ctx == nil: return
 
   {.cast(gcsafe).}:
@@ -392,7 +397,8 @@ proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
 
   inst.server = nuraftLauncherGetServer(inst.launcher)
   if inst.server == nil:
-    error("NuRaft launcher initialized but server is nil", "groupId", $groupId, "port", $myPort)
+    error("NuRaft launcher initialized but server is nil", "groupId", $groupId,
+        "port", $myPort)
     discard nuraftLauncherShutdown(inst.launcher, 3)
     nuraftLauncherDestroy(inst.launcher)
     nuraftSmDestroy(inst.sm)
@@ -450,7 +456,8 @@ proc isLeader*(c: NuRaftCoordinator, groupId: GroupID): bool {.raises: [].} =
       result = nuraftServerIsLeader(inst.server)
       if result:
         {.cast(gcsafe).}: {.cast(raises: []).}:
-          debug("isLeader: true", {"groupId": $groupId, "nodeId": $c.nodeId.uint32}.toTable)
+          debug("isLeader: true", {"groupId": $groupId,
+              "nodeId": $c.nodeId.uint32}.toTable)
 
 proc getLeader*(c: NuRaftCoordinator, groupId: GroupID): int32 =
   ## Returns the leader's server ID, or -1 if unknown.
@@ -560,7 +567,8 @@ proc setPriority*(c: NuRaftCoordinator, groupId: GroupID,
 
   let rc = nuraftServerSetPriority(inst.server, int32(targetNodeId.uint32), priority)
   if rc != 0:
-    warn("Failed to set priority", "groupId", $groupId, "target", $targetNodeId.uint32, "rc", $rc)
+    warn("Failed to set priority", "groupId", $groupId, "target",
+        $targetNodeId.uint32, "rc", $rc)
     return false
   return true
 
