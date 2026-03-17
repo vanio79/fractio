@@ -187,37 +187,69 @@ proc isLikelyMVCCValue*(data: string): bool {.inline.} =
     return false
   true
 
+proc decodeMVCCValueFast*(encodedValue: string): MVCCValue {.inline.} =
+  ## Fast decode MVCC value - assumes caller already validated with isLikelyMVCCValue.
+  ## Skips length and delete flag validation for performance.
+  ## Uses direct computation instead of array extraction.
+  # Direct big-endian to host conversion
+  result.timestamp = Timestamp(
+    (uint64(uint8(encodedValue[0])) shl 56) or
+    (uint64(uint8(encodedValue[1])) shl 48) or
+    (uint64(uint8(encodedValue[2])) shl 40) or
+    (uint64(uint8(encodedValue[3])) shl 32) or
+    (uint64(uint8(encodedValue[4])) shl 24) or
+    (uint64(uint8(encodedValue[5])) shl 16) or
+    (uint64(uint8(encodedValue[6])) shl 8) or
+    uint64(uint8(encodedValue[7]))
+  )
+  result.txnId = TransactionID(
+    (int64(uint8(encodedValue[8])) shl 56) or
+    (int64(uint8(encodedValue[9])) shl 48) or
+    (int64(uint8(encodedValue[10])) shl 40) or
+    (int64(uint8(encodedValue[11])) shl 32) or
+    (int64(uint8(encodedValue[12])) shl 24) or
+    (int64(uint8(encodedValue[13])) shl 16) or
+    (int64(uint8(encodedValue[14])) shl 8) or
+    int64(uint8(encodedValue[15]))
+  )
+  result.isDeleted = encodedValue[16] == '1'
+  result.data = encodedValue[17 ..< encodedValue.len]
+
 proc decodeMVCCValue*(encodedValue: string): MVCCValue =
-  ## Decode MVCC value from storage format
+  ## Decode MVCC value from storage format.
+  ## For hot paths, use isLikelyMVCCValue + decodeMVCCValueFast instead.
   if encodedValue.len < 17:
     raise newException(MVCCError, "Invalid MVCC value: too short")
-
-  # Extract timestamp
-  var tsArr: array[8, uint8]
-  for i in 0..7:
-    tsArr[i] = uint8(encodedValue[i])
-
-  # Extract txnId
-  var txnArr: array[8, uint8]
-  for i in 0..7:
-    txnArr[i] = uint8(encodedValue[8 + i])
 
   let delByte = encodedValue[16]
 
   # Validate delete flag - must be '0' or '1'
-  # This helps distinguish MVCC-encoded data from raw binary data
   if delByte != '0' and delByte != '1':
     raise newException(MVCCError, "Invalid MVCC value: invalid delete flag")
 
-  result.timestamp = fromBigEndian64(Timestamp, tsArr)
-  result.txnId = TransactionID(fromBigEndian64(int64, txnArr))
+  # Use fast path for actual decoding
+  result.timestamp = Timestamp(
+    (uint64(uint8(encodedValue[0])) shl 56) or
+    (uint64(uint8(encodedValue[1])) shl 48) or
+    (uint64(uint8(encodedValue[2])) shl 40) or
+    (uint64(uint8(encodedValue[3])) shl 32) or
+    (uint64(uint8(encodedValue[4])) shl 24) or
+    (uint64(uint8(encodedValue[5])) shl 16) or
+    (uint64(uint8(encodedValue[6])) shl 8) or
+    uint64(uint8(encodedValue[7]))
+  )
+  result.txnId = TransactionID(
+    (int64(uint8(encodedValue[8])) shl 56) or
+    (int64(uint8(encodedValue[9])) shl 48) or
+    (int64(uint8(encodedValue[10])) shl 40) or
+    (int64(uint8(encodedValue[11])) shl 32) or
+    (int64(uint8(encodedValue[12])) shl 24) or
+    (int64(uint8(encodedValue[13])) shl 16) or
+    (int64(uint8(encodedValue[14])) shl 8) or
+    int64(uint8(encodedValue[15]))
+  )
   result.isDeleted = delByte == '1'
   result.data = encodedValue[17 ..< encodedValue.len]
-
-  # Note: We don't validate timestamp range here because:
-  # 1. Tests may use mock timestamps (small values)
-  # 2. The isLikelyMVCCValue heuristic already filters out most false positives
-  # 3. The delete flag check ('0' or '1') is sufficient for distinguishing MVCC from binary
 
 proc encodeIntentKey*(userKey: string, txnId: TransactionID): string =
   ## Encode intent key for transaction resolution

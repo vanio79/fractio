@@ -422,17 +422,29 @@ proc loadGroupMembers*(store: RaftKVStoreExt,
 # Internal: propose a WriteBatch and apply to local state machine
 # ---------------------------------------------------------------------------
 
-# Helper: string → seq[byte]
+# Helper: string → seq[byte] (zero-copy via cast)
 proc toBytes(s: string): seq[byte] {.inline.} =
-  result = newSeq[byte](s.len)
-  for i in 0 ..< s.len:
-    result[i] = byte(s[i])
+  when nimvm:
+    result = newSeq[byte](s.len)
+    for i in 0 ..< s.len:
+      result[i] = byte(s[i])
+  else:
+    if s.len == 0:
+      result = newSeq[byte](0)
+    else:
+      result = cast[seq[byte]](s)
 
-# Helper: seq[byte] → string (safe copy)
+# Helper: seq[byte] → string (zero-copy via cast)
 proc fromBytes(b: seq[byte]): string {.inline.} =
-  result = newString(b.len)
-  for i in 0 ..< b.len:
-    result[i] = char(b[i])
+  when nimvm:
+    result = newString(b.len)
+    for i in 0 ..< b.len:
+      result[i] = char(b[i])
+  else:
+    if b.len == 0:
+      result = ""
+    else:
+      result = cast[string](b)
 
 # Forward declarations
 proc raftPut*(store: RaftKVStoreExt, key, value: string): RSResult[
@@ -622,7 +634,7 @@ proc applyBatchToSM*(storePtr: pointer, rid: GroupID,
           # Raw JSON starts with '{', MVCC-encoded has binary header
           if mvccTypes.isLikelyMVCCValue(groupValue):
             try:
-              let mvccVal = mvccTypes.decodeMVCCValue(groupValue)
+              let mvccVal = mvccTypes.decodeMVCCValueFast(groupValue)
               if not mvccVal.isDeleted:
                 groupValue = mvccVal.data
               else:
@@ -860,7 +872,7 @@ proc wireApplyCallback*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
             var groupVal = valOpt.get()
             # Strip MVCC encoding if present
             if mvccTypes.isLikelyMVCCValue(groupVal):
-              let mvccVal = mvccTypes.decodeMVCCValue(groupVal)
+              let mvccVal = mvccTypes.decodeMVCCValueFast(groupVal)
               if not mvccVal.isDeleted:
                 groupVal = mvccVal.data
             # Decode binary GroupRecord, update leader, re-encode
@@ -1466,7 +1478,7 @@ proc parseSpaceInfoFromBinary*(data: string): Option[SpaceInfo] {.gcsafe,
 
       # Strip MVCC encoding if present
       if isLikelyMVCCValue(data):
-        let mvccVal = mvccTypes.decodeMVCCValue(data)
+        let mvccVal = mvccTypes.decodeMVCCValueFast(data)
         if mvccVal.isDeleted:
           return none(SpaceInfo)
         value = mvccVal.data
@@ -1511,7 +1523,7 @@ proc updateTableSpaceCache*(store: RaftKVStoreExt, tableKey: string,
       var value = jsonStr
       # Check for MVCC encoding
       if mvccTypes.isLikelyMVCCValue(jsonStr):
-        let mvccVal = mvccTypes.decodeMVCCValue(jsonStr)
+        let mvccVal = mvccTypes.decodeMVCCValueFast(jsonStr)
         if mvccVal.isDeleted:
           return
         value = mvccVal.data
@@ -1562,7 +1574,7 @@ proc loadSpaces*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
           # Raw key (non-MVCC) - check if value is MVCC-encoded
           if mvccTypes.isLikelyMVCCValue(v):
             try:
-              let mvccVal = mvccTypes.decodeMVCCValue(v)
+              let mvccVal = mvccTypes.decodeMVCCValueFast(v)
               if not mvccVal.isDeleted:
                 value = mvccVal.data
                 ts = mvccVal.timestamp
@@ -1622,7 +1634,7 @@ proc loadTableSpaces*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
         elif mvccTypes.isLikelyMVCCValue(v):
           # Non-version key but value is MVCC-encoded (sysTablePut case)
           try:
-            let mvccVal = mvccTypes.decodeMVCCValue(v)
+            let mvccVal = mvccTypes.decodeMVCCValueFast(v)
             if mvccVal.isDeleted:
               continue # Skip tombstones
             value = mvccVal.data
@@ -1812,7 +1824,7 @@ proc lookupNodeInfo*(store: RaftKVStoreExt,
         var nodeVal = valOpt.get()
         # Strip MVCC encoding if present
         if mvccTypes.isLikelyMVCCValue(nodeVal):
-          let mvccVal = mvccTypes.decodeMVCCValue(nodeVal)
+          let mvccVal = mvccTypes.decodeMVCCValueFast(nodeVal)
           if mvccVal.isDeleted:
             return none(NodeInfo)
           nodeVal = mvccVal.data
@@ -2212,7 +2224,7 @@ proc rebalanceSpaces*(store: RaftKVStoreExt) {.raises: [].} =
           # Strip MVCC encoding if present
           if mvccTypes.isLikelyMVCCValue(nodeVal):
             try:
-              let mvccVal = mvccTypes.decodeMVCCValue(nodeVal)
+              let mvccVal = mvccTypes.decodeMVCCValueFast(nodeVal)
               if not mvccVal.isDeleted:
                 nodeVal = mvccVal.data
               else:
@@ -2318,7 +2330,7 @@ proc rebalanceSpaces*(store: RaftKVStoreExt) {.raises: [].} =
               # Strip MVCC encoding if present
               if mvccTypes.isLikelyMVCCValue(grpVal):
                 try:
-                  let mvccVal = mvccTypes.decodeMVCCValue(grpVal)
+                  let mvccVal = mvccTypes.decodeMVCCValueFast(grpVal)
                   if not mvccVal.isDeleted:
                     grpVal = mvccVal.data
                   else:
@@ -2457,7 +2469,7 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: int) {.raises: [].} 
           # Check for MVCC encoding
           if mvccTypes.isLikelyMVCCValue(tblVal):
             try:
-              let mvccVal = mvccTypes.decodeMVCCValue(tblVal)
+              let mvccVal = mvccTypes.decodeMVCCValueFast(tblVal)
               if not mvccVal.isDeleted:
                 tblVal = mvccVal.data
               else:

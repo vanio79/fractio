@@ -207,33 +207,34 @@ proc readU8*(r: var BinaryReader): uint8 {.inline.} =
   inc r.pos
 
 proc readU16*(r: var BinaryReader): uint16 {.inline.} =
-  ## Read a uint16 (little-endian)
+  ## Read a uint16 (little-endian) using direct memory access
   if r.pos + 2 > r.data.len:
     raise newException(ValueError, "BinaryReader: unexpected end of data")
-  var bytes: array[2, byte]
-  bytes[0] = cast[uint8](r.data[r.pos])
-  bytes[1] = cast[uint8](r.data[r.pos + 1])
-  result = fromBytesU16(bytes)
+  result = uint16(uint8(r.data[r.pos])) or (uint16(uint8(r.data[r.pos + 1])) shl 8)
   inc r.pos, 2
 
 proc readU32*(r: var BinaryReader): uint32 {.inline.} =
-  ## Read a uint32 (little-endian)
+  ## Read a uint32 (little-endian) using direct computation
   if r.pos + 4 > r.data.len:
     raise newException(ValueError, "BinaryReader: unexpected end of data")
-  var bytes: array[4, byte]
-  for i in 0..<4:
-    bytes[i] = cast[uint8](r.data[r.pos + i])
-  result = fromBytesU32(bytes)
+  result = uint32(uint8(r.data[r.pos])) or
+           (uint32(uint8(r.data[r.pos + 1])) shl 8) or
+           (uint32(uint8(r.data[r.pos + 2])) shl 16) or
+           (uint32(uint8(r.data[r.pos + 3])) shl 24)
   inc r.pos, 4
 
 proc readU64*(r: var BinaryReader): uint64 {.inline.} =
-  ## Read a uint64 (little-endian)
+  ## Read a uint64 (little-endian) using direct computation
   if r.pos + 8 > r.data.len:
     raise newException(ValueError, "BinaryReader: unexpected end of data")
-  var bytes: array[8, byte]
-  for i in 0..<8:
-    bytes[i] = cast[uint8](r.data[r.pos + i])
-  result = fromBytesU64(bytes)
+  result = uint64(uint8(r.data[r.pos])) or
+           (uint64(uint8(r.data[r.pos + 1])) shl 8) or
+           (uint64(uint8(r.data[r.pos + 2])) shl 16) or
+           (uint64(uint8(r.data[r.pos + 3])) shl 24) or
+           (uint64(uint8(r.data[r.pos + 4])) shl 32) or
+           (uint64(uint8(r.data[r.pos + 5])) shl 40) or
+           (uint64(uint8(r.data[r.pos + 6])) shl 48) or
+           (uint64(uint8(r.data[r.pos + 7])) shl 56)
   inc r.pos, 8
 
 proc readI32*(r: var BinaryReader): int32 {.inline.} =
