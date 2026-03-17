@@ -8,13 +8,16 @@
 # Call launchWebDashboard(server) after server.start() to activate the dashboard.
 
 import happyx
-import std/[json, strutils, times, os, atomics, random, asyncdispatch, httpclient, tables]
+import std/[json, strutils, times, os, atomics, random, asyncdispatch,
+    httpclient, tables]
 import zippy
 import ../protocol/server as pserver
 import ../protocol/messages/cluster as clusterMsgs
 import ../sql/executor
 import ../distributed/meta/system_tables
+import ../distributed/meta/system_schemas
 import ../protocol/raft_store
+import ../protocol/mvcc_store
 import ../distributed/raft/nuraft_coordinator
 import ../distributed/raft/group_types
 import ../distributed/raft/multigroup_types
@@ -25,7 +28,7 @@ import ../storage/wisckey_backend
 # Object lifetime is process lifetime, so this is safe.
 # ---------------------------------------------------------------------------
 
-var gSrvPtr  {.global.}: pointer
+var gSrvPtr {.global.}: pointer
 var gWebPort {.global.}: int
 
 template getSrv(): pserver.ProtocolServer =
@@ -120,7 +123,7 @@ footer{padding:.75rem 1.75rem;background:#2d2d2d;color:#999;font-size:.75rem;tex
 """
 
 # Pre-compressed at startup (not const — zippy uses pointer casts)
-var appJsGz     {.global.}: string
+var appJsGz {.global.}: string
 var htmlShellGz {.global.}: string
 
 # ---------------------------------------------------------------------------
@@ -139,7 +142,7 @@ proc parseLevelSizes(stats: string): seq[float] =
       if parts.len >= 3:
         try:
           let level = parseInt(parts[0])
-          let sizeMB = parseFloat(parts[1 + 1])  # Files is [1], Size(MB) is [2]
+          let sizeMB = parseFloat(parts[1 + 1]) # Files is [1], Size(MB) is [2]
           if level >= 0 and level <= 6:
             result[level] = sizeMB
         except ValueError:
@@ -196,11 +199,11 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
         let shards = if srv.raftStore.isNil: 0
                      else: srv.raftStore.coordinator.getGroupCount()
         return %* {
-          "nodeId":      srv.config.serverId.int,
-          "version":     srv.config.serverVersion,
-          "uptimeSecs":  uptime,
-          "role":        role,
-          "shardCount":  shards,
+          "nodeId": srv.config.serverId.int,
+          "version": srv.config.serverVersion,
+          "uptimeSecs": uptime,
+          "role": role,
+          "shardCount": shards,
           "clientCount": srv.clientCount(),
           "clusterName": srv.config.clusterName,
         }
@@ -214,11 +217,11 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
         let nodes = srv.nodeRegistry.listNodes()
         let rc = nodes.len
         return %* {
-          "status":          0,
-          "leaderOK":        true,
-          "replicaCount":    rc,
+          "status": 0,
+          "leaderOK": true,
+          "replicaCount": rc,
           "healthyReplicas": rc,
-          "clusterName":     srv.config.clusterName,
+          "clusterName": srv.config.clusterName,
         }
 
       # ---- REST: metrics ----
@@ -229,17 +232,17 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
           return %* {"error": "server not ready"}
         let m = srv.metrics
         return %* {
-          "requestsTotal":  m.requestsTotal.load(),
-          "requestsOK":     m.requestsOK.load(),
-          "requestsErr":    m.requestsErr.load(),
-          "bytesIn":        m.bytesIn.load(),
-          "bytesOut":       m.bytesOut.load(),
-          "kvGets":         m.kvGets.load(),
-          "kvPuts":         m.kvPuts.load(),
-          "kvDeletes":      m.kvDeletes.load(),
-          "activeTxns":     0,
-          "committedTxns":  0,
-          "abortedTxns":    0,
+          "requestsTotal": m.requestsTotal.load(),
+          "requestsOK": m.requestsOK.load(),
+          "requestsErr": m.requestsErr.load(),
+          "bytesIn": m.bytesIn.load(),
+          "bytesOut": m.bytesOut.load(),
+          "kvGets": m.kvGets.load(),
+          "kvPuts": m.kvPuts.load(),
+          "kvDeletes": m.kvDeletes.load(),
+          "activeTxns": 0,
+          "committedTxns": 0,
+          "abortedTxns": 0,
         }
 
       # ---- REST: storage ----
@@ -253,7 +256,8 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
           let stats = backend.getProperty("leveldb.stats")
           var numFiles = newJArray()
           for level in 0 .. 6:
-            numFiles.add(newJString(backend.getProperty("leveldb.num-files-at-level" & $level)))
+            numFiles.add(newJString(backend.getProperty(
+                "leveldb.num-files-at-level" & $level)))
           let sizes = parseLevelSizes(stats)
           var levelSizes = newJArray()
           for s in sizes:
@@ -281,20 +285,20 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
             if sr.isOk:
               for (key, entry) in sr.value:
                 try:
-                  let j = parseJson(entry.value)
-                  arr.add(j)
-                except JsonParsingError:
+                  let rec = decodeNodeRecord(entry.value)
+                  arr.add(system_schemas.toJson(rec))
+                except ValueError:
                   discard
         else:
           # Fallback to local registry when raft store is not available
           let entries = srv.nodeRegistry.listNodes()
           for e in entries:
-            arr.add(%* {
-              "nodeId":     e.nodeId.int,
-              "host":       e.host,
-              "raftPort":   e.raftPort.int,
+            arr.add( %* {
+              "nodeId": e.nodeId.int,
+              "host": e.host,
+              "raftPort": e.raftPort.int,
               "clientPort": e.clientPort.int,
-              "status":     e.status.int,
+              "status": e.status.int,
             })
         # Enrich each node entry with live role and alive status
         for entry in arr:
@@ -311,7 +315,8 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
               let backend = srv.raftStore.coordinator.store
               var nf = newJArray()
               for level in 0 .. 6:
-                nf.add(newJString(backend.getProperty("leveldb.num-files-at-level" & $level)))
+                nf.add(newJString(backend.getProperty(
+                    "leveldb.num-files-at-level" & $level)))
               entry["numFiles"] = nf
               let stats = backend.getProperty("leveldb.stats")
               let sizes = parseLevelSizes(stats)
@@ -370,9 +375,9 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
           statusCode = 400
           return %* {"success": false, "message": "invalid JSON body"}
 
-        let nodeId     = uint16(j.getOrDefault("nodeId").getInt(0))
-        let host       = j.getOrDefault("host").getStr("")
-        let raftPort   = uint16(j.getOrDefault("raftPort").getInt(0))
+        let nodeId = uint16(j.getOrDefault("nodeId").getInt(0))
+        let host = j.getOrDefault("host").getStr("")
+        let raftPort = uint16(j.getOrDefault("raftPort").getInt(0))
         let clientPort = uint16(j.getOrDefault("clientPort").getInt(0))
 
         if nodeId == 0:
@@ -382,23 +387,26 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
           statusCode = 400
           return %* {"success": false, "message": "host must not be empty"}
 
-        # Write to Raft-backed sys.nodes table for cluster-wide replication
-        if not srv.raftStore.isNil:
-          let nodeKey = encodeTableKey(SYS_NODES_TABLE_ID, $nodeId)
-          let nodeVal = $ %* {
-            "nodeId": nodeId.int,
-            "host": host,
-            "raftPort": raftPort.int,
-            "clientPort": clientPort.int,
-            "status": 1,
-          }
-          var putOk = false
-          {.cast(gcsafe).}:
-            let putResult = srv.raftStore.raftPut(nodeKey, nodeVal)
-            putOk = putResult.isOk
-          if not putOk:
-            statusCode = 500
-            return %* {"success": false, "message": "raft write failed"}
+# Write to Raft-backed sys.nodes table for cluster-wide replication
+      if not srv.raftStore.isNil and not srv.mvccStore.isNil:
+        let nodeKey = encodeTableKey(SYS_NODES_TABLE_ID, $nodeId)
+        let nodeRec = NodeRecord(
+          nodeId: nodeId,
+          host: host,
+          raftPort: raftPort,
+          clientPort: clientPort,
+          status: nsAlive
+        )
+        let nodeVal = encode(nodeRec)
+        var putOk = false
+        {.cast(gcsafe).}:
+          let res = srv.mvccStore.withAutoTransaction(proc(sessionId: uint64): MvccVoidResult =
+            return srv.mvccStore.txnPut(sessionId, nodeKey, nodeVal)
+          )
+          putOk = res.isOk
+        if not putOk:
+          statusCode = 500
+          return %* {"success": false, "message": "raft write failed"}
 
         # Keep local registry for connection management
         let entry = pserver.ClusterNodeEntry(
@@ -426,7 +434,7 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
           return %* {"success": false, "error": "invalid JSON body"}
 
         let peerNodeId = uint32(j.getOrDefault("nodeId").getInt(0))
-        let peerHost   = j.getOrDefault("host").getStr("")
+        let peerHost = j.getOrDefault("host").getStr("")
         let peerRaftPort = j.getOrDefault("raftPort").getInt(0)
         let peerClientPort = j.getOrDefault("clientPort").getInt(0)
         let peerWebPort = j.getOrDefault("webPort").getInt(0)
@@ -451,42 +459,43 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
         {.cast(gcsafe).}:
           srv.addPeerToRaft(peerNodeId, peerHost, peerRaftPort)
 
-        # Now write to sys.nodes via Raft. The replication will include
-        # the new peer, triggering full log sync.
-        if not srv.raftStore.isNil:
-          let nodeKey = encodeTableKey(SYS_NODES_TABLE_ID, $peerNodeId)
-          let nodeVal = $ %* {
-            "nodeId": peerNodeId.int,
-            "host": peerHost,
-            "raftPort": peerRaftPort,
-            "clientPort": peerClientPort,
-            "webPort": peerWebPort,
-            "status": 1,
-          }
-          var putOk = false
-          {.cast(gcsafe).}:
-            let putResult = srv.raftStore.raftPut(nodeKey, nodeVal)
-            putOk = putResult.isOk
-          if not putOk:
-            statusCode = 500
-            return %* {"success": false, "error": "raft write failed"}
+# Now write to sys.nodes via Raft. The replication will include
+      # the new peer, triggering full log sync.
+      if not srv.raftStore.isNil and not srv.mvccStore.isNil:
+        let nodeKey = encodeTableKey(SYS_NODES_TABLE_ID, $peerNodeId)
+        let nodeRec = NodeRecord(
+          nodeId: uint32(peerNodeId),
+          host: peerHost,
+          raftPort: uint16(peerRaftPort),
+          clientPort: uint16(peerClientPort),
+          status: nsAlive
+        )
+        let nodeVal = encode(nodeRec)
+        var putOk = false
+        {.cast(gcsafe).}:
+          let res = srv.mvccStore.withAutoTransaction(proc(sessionId: uint64): MvccVoidResult =
+            return srv.mvccStore.txnPut(sessionId, nodeKey, nodeVal)
+          )
+          putOk = res.isOk
+        if not putOk:
+          statusCode = 500
+          return %* {"success": false, "error": "raft write failed"}
 
-        # Return current cluster members (excluding the joining node)
-        var members = newJArray()
-        if not srv.raftStore.isNil:
-          let startKey = encodeTableKey(SYS_NODES_TABLE_ID, "")
-          let endKey = encodeTableKey(SYS_NODES_TABLE_ID + 1, "")
-          {.cast(gcsafe).}:
-            let sr = srv.raftStore.raftScan(startKey, endKey, 0,
-                includeSystemKeys = true)
-            if sr.isOk:
-              for (key, ent) in sr.value:
-                try:
-                  let mj = parseJson(ent.value)
-                  if mj.getOrDefault("nodeId").getInt(0) != int(peerNodeId):
-                    members.add(mj)
-                except JsonParsingError:
-                  discard
+# Return current cluster members (excluding the joining node)
+      var members = newJArray()
+      if not srv.raftStore.isNil and not srv.mvccStore.isNil:
+        let startKey = encodeTableKey(SYS_NODES_TABLE_ID, "")
+        let endKey = encodeTableKey(SYS_NODES_TABLE_ID + 1, "")
+        {.cast(gcsafe).}:
+          let sr = srv.mvccStore.latestScan(startKey, endKey, 0)
+          if sr.isOk:
+            for (key, value) in sr.value:
+              try:
+                let rec = decodeNodeRecord(value)
+                if rec.nodeId != peerNodeId:
+                  members.add(system_schemas.toJson(rec))
+              except ValueError:
+                discard
 
         # Trigger space rebalancing in background after join
         if not srv.raftStore.isNil:
@@ -527,15 +536,15 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
           statusCode = 404
           return %* {"success": false, "message": "node " & $id & " not found"}
 
-      # ---- REST: spaces ----
+# ---- REST: spaces ----
       get "/api/spaces":
         let srv = getSrv()
         if srv.isNil or srv.raftStore.isNil:
           statusCode = 503
           return %* {"error": "server not ready"}
 
-        # Build groups lookup from sys.groups
-        var groupDescs = initTable[uint64, JsonNode]()
+        # Build groups lookup from sys.groups (binary -> JSON for enrichment)
+        var groupDescs = initTable[uint64, GroupRecord]()
         {.cast(gcsafe).}:
           let gStartKey = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
           let gEndKey = encodeTableKey(SYS_GROUPS_TABLE_ID + 1, "")
@@ -544,11 +553,11 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
           if gsr.isOk:
             for (key, entry) in gsr.value:
               try:
-                let gj = parseJson(entry.value)
-                let gid = uint64(gj.getOrDefault("groupId").getInt(0))
+                let grec = decodeGroupRecord(entry.value)
+                let gid = grec.groupId
                 if gid > 0:
-                  groupDescs[gid] = gj
-              except JsonParsingError:
+                  groupDescs[gid] = grec
+              except ValueError:
                 discard
 
         let startKey = encodeTableKey(SYS_SPACES_TABLE_ID, "")
@@ -560,53 +569,48 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
           if sr.isOk:
             for (key, entry) in sr.value:
               try:
-                let j = parseJson(entry.value)
+                let rec = decodeSpaceRecord(entry.value)
+                var j = system_schemas.toJson(rec)
 
                 # Enrich with group member details
                 var groupsArr = newJArray()
-                if j.hasKey("groupIds"):
-                  for gidNode in j["groupIds"]:
-                    let gid = uint64(gidNode.getInt(0))
-                    var groupObj = %* {"groupId": gid}
-                    var members = newJArray()
-                    if groupDescs.hasKey(gid):
-                      let desc = groupDescs[gid]
-                      # Read persisted leader from sys.groups record
-                      let leaderNid = desc.getOrDefault("leader").getInt(0)
-                      if desc.hasKey("replicas"):
-                        for rep in desc["replicas"]:
-                          let nid = rep.getOrDefault("nodeId").getInt(0)
-                          var role = if nid == leaderNid and leaderNid > 0: "leader"
-                                     else: "follower"
-                          # Fallback: if no persisted leader, check local Raft state
-                          if leaderNid == 0:
-                            if srv.raftStore.coordinator.isLeader(GroupID(gid)) and
-                                nid == srv.config.serverId.int:
-                              role = "leader"
-                          members.add(%* {"nodeId": nid, "role": role})
-                    groupObj["members"] = members
-                    groupsArr.add(groupObj)
+                for gid in rec.groupIds:
+                  var groupObj = %* {"groupId": gid}
+                  var members = newJArray()
+                  if groupDescs.hasKey(gid):
+                    let desc = groupDescs[gid]
+                    # Read persisted leader from group record
+                    let leaderNid = desc.leader
+                    for rep in desc.replicas:
+                      let nid = rep.nodeId
+                      var role = if nid == leaderNid and leaderNid > 0: "leader"
+                                 else: "follower"
+                      # Fallback: if no persisted leader, check local Raft state
+                      if leaderNid == 0:
+                        if srv.raftStore.coordinator.isLeader(GroupID(gid)) and
+                            nid == uint32(srv.config.serverId):
+                          role = "leader"
+                      members.add(%* {"nodeId": nid, "role": role})
+                  groupObj["members"] = members
+                  groupsArr.add(groupObj)
                 j["groups"] = groupsArr
 
                 # Enrich old groups (during rebalancing)
                 var oldGroupsArr = newJArray()
-                if j.hasKey("oldGroupIds"):
-                  for gidNode in j["oldGroupIds"]:
-                    let gid = uint64(gidNode.getInt(0))
-                    var groupObj = %* {"groupId": gid}
-                    var members = newJArray()
-                    if groupDescs.hasKey(gid):
-                      let desc = groupDescs[gid]
-                      if desc.hasKey("replicas"):
-                        for rep in desc["replicas"]:
-                          let nid = rep.getOrDefault("nodeId").getInt(0)
-                          members.add(%* {"nodeId": nid, "role": "follower"})
-                    groupObj["members"] = members
-                    oldGroupsArr.add(groupObj)
+                for gid in rec.oldGroupIds:
+                  var groupObj = %* {"groupId": gid}
+                  var members = newJArray()
+                  if groupDescs.hasKey(gid):
+                    let desc = groupDescs[gid]
+                    for rep in desc.replicas:
+                      let nid = rep.nodeId
+                      members.add(%* {"nodeId": nid, "role": "follower"})
+                  groupObj["members"] = members
+                  oldGroupsArr.add(groupObj)
                 j["oldGroups"] = oldGroupsArr
 
                 arr.add(j)
-              except JsonParsingError:
+              except ValueError:
                 discard
         return arr
 
@@ -640,9 +644,11 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
               if i < row.len:
                 rowObj[col] = newJString(row[i])
             rowsJson.add(rowObj)
-          return %* {"kind": "rows", "columns": execResult.columns, "rows": rowsJson}
+          return %* {"kind": "rows", "columns": execResult.columns,
+              "rows": rowsJson}
         of erkModified:
-          return %* {"kind": "modified", "count": execResult.count, "message": execResult.message}
+          return %* {"kind": "modified", "count": execResult.count,
+              "message": execResult.message}
         of erkOk:
           return %* {"kind": "ok", "message": execResult.okMessage}
         of erkError:
@@ -717,15 +723,21 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
           return %* {"error": "server not ready"}
         # Return the list of known system tables with row counts
         let sysTables = [
-          (id: SYS_DATABASES_TABLE_ID, name: "sys.databases", desc: "Database catalog"),
-          (id: SYS_SCHEMAS_TABLE_ID, name: "sys.schemas", desc: "Schema catalog"),
-          (id: SYS_TABLES_TABLE_ID, name: "sys.tables", desc: "Table descriptors"),
+          (id: SYS_DATABASES_TABLE_ID, name: "sys.databases",
+              desc: "Database catalog"),
+          (id: SYS_SCHEMAS_TABLE_ID, name: "sys.schemas",
+              desc: "Schema catalog"),
+          (id: SYS_TABLES_TABLE_ID, name: "sys.tables",
+              desc: "Table descriptors"),
           (id: SYS_GROUPS_TABLE_ID, name: "sys.groups", desc: "Group map"),
           (id: SYS_NODES_TABLE_ID, name: "sys.nodes", desc: "Node registry"),
-          (id: SYS_SETTINGS_TABLE_ID, name: "sys.settings", desc: "Cluster settings"),
+          (id: SYS_SETTINGS_TABLE_ID, name: "sys.settings",
+              desc: "Cluster settings"),
           (id: SYS_SPACES_TABLE_ID, name: "sys.spaces", desc: "Space catalog"),
-          (id: SYS_NODE_METRICS_ID, name: "sys.node_metrics", desc: "Node metrics"),
-          (id: SYS_GROUP_METRICS_ID, name: "sys.group_metrics", desc: "Group metrics"),
+          (id: SYS_NODE_METRICS_ID, name: "sys.node_metrics",
+              desc: "Node metrics"),
+          (id: SYS_GROUP_METRICS_ID, name: "sys.group_metrics",
+              desc: "Group metrics"),
           (id: SYS_EVENTS_TABLE_ID, name: "sys.events", desc: "Cluster events"),
         ]
         var arr = newJArray()
@@ -738,7 +750,7 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
                 includeSystemKeys = true)
             if sr.isOk:
               rowCount = sr.value.len
-          arr.add(%* {
+          arr.add( %* {
             "id": int(st.id),
             "name": st.name,
             "description": st.desc,
@@ -746,6 +758,7 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
           })
         return arr
 
+# ---- REST: system table row browser ----
       get "/api/sql/system-table/{tableId:int}":
         let srv = getSrv()
         if srv.isNil or srv.raftStore.isNil:
@@ -766,10 +779,36 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
               let decoded = decodeTableKey(key)
               var rowObj = %* {"_key": decoded.primaryKey}
               try:
-                let j = parseJson(entry.value)
+                # Decode binary records based on table ID
+                var j: JsonNode
+                case tid
+                of SYS_DATABASES_TABLE_ID:
+                  let rec = decodeDatabaseRecord(entry.value)
+                  j = system_schemas.toJson(rec)
+                of SYS_SCHEMAS_TABLE_ID:
+                  let rec = decodeSchemaRecord(entry.value)
+                  j = system_schemas.toJson(rec)
+                of SYS_TABLES_TABLE_ID:
+                  let rec = decodeTableRecord(entry.value)
+                  j = system_schemas.toJson(rec)
+                of SYS_GROUPS_TABLE_ID:
+                  let rec = decodeGroupRecord(entry.value)
+                  j = system_schemas.toJson(rec)
+                of SYS_NODES_TABLE_ID:
+                  let rec = decodeNodeRecord(entry.value)
+                  j = system_schemas.toJson(rec)
+                of SYS_SETTINGS_TABLE_ID:
+                  let rec = decodeSettingRecord(entry.value)
+                  j = system_schemas.toJson(rec)
+                of SYS_SPACES_TABLE_ID:
+                  let rec = decodeSpaceRecord(entry.value)
+                  j = system_schemas.toJson(rec)
+                else:
+                  # Unknown table - try JSON parse for backward compatibility
+                  j = parseJson(entry.value)
                 for k, v in j:
                   rowObj[k] = v
-              except JsonParsingError:
+              except ValueError, JsonParsingError:
                 rowObj["_value"] = newJString(entry.value)
               rows.add(rowObj)
         # Column names: from first row if available, otherwise from schema
@@ -780,15 +819,23 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
         else:
           # Hardcoded schemas for empty system tables
           let sysColumns = case tid
-            of SYS_DATABASES_TABLE_ID: @["_key", "id", "name", "replicaCount", "createdAt"]
-            of SYS_SCHEMAS_TABLE_ID: @["_key", "id", "databaseId", "name", "createdAt"]
-            of SYS_TABLES_TABLE_ID: @["_key", "id", "schemaId", "name", "columns", "indices", "createdAt"]
-            of SYS_GROUPS_TABLE_ID: @["_key", "groupId", "startKey", "endKey", "replicas"]
-            of SYS_NODES_TABLE_ID: @["_key", "nodeId", "host", "raftPort", "clientPort", "status"]
+            of SYS_DATABASES_TABLE_ID: @["_key", "name", "createdAt"]
+            of SYS_SCHEMAS_TABLE_ID: @["_key", "name", "database", "createdAt"]
+            of SYS_TABLES_TABLE_ID: @["_key", "tableId", "name", "schema", "database",
+                "spaceId", "primaryKey", "columns"]
+            of SYS_GROUPS_TABLE_ID: @["_key", "groupId", "spaceId", "preferredLeader",
+                "leader", "replicas"]
+            of SYS_NODES_TABLE_ID: @["_key", "nodeId", "host", "raftPort",
+                "clientPort", "status"]
             of SYS_SETTINGS_TABLE_ID: @["_key", "value"]
-            of SYS_NODE_METRICS_ID: @["_key", "nodeId", "cpuPercent", "memUsedBytes", "diskUsedBytes"]
-            of SYS_GROUP_METRICS_ID: @["_key", "groupId", "keyCount", "sizeBytes", "readQps", "writeQps"]
-            of SYS_EVENTS_TABLE_ID: @["_key", "timestamp", "eventType", "nodeId", "message"]
+            of SYS_SPACES_TABLE_ID: @["_key", "spaceId", "name", "replicas", "groupCount",
+                "groupIds", "oldGroupIds", "rebalancing"]
+            of SYS_NODE_METRICS_ID: @["_key", "nodeId", "cpuPercent",
+                "memUsedBytes", "diskUsedBytes"]
+            of SYS_GROUP_METRICS_ID: @["_key", "groupId", "keyCount",
+                "sizeBytes", "readQps", "writeQps"]
+            of SYS_EVENTS_TABLE_ID: @["_key", "timestamp", "eventType",
+                "nodeId", "message"]
             else: @["_key", "_value"]
           for c in sysColumns:
             columns.add(newJString(c))
@@ -796,7 +843,7 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
 
       # ---- WebSocket: clock drift stream ----
       ws "/ws/drift":
-        discard  # no messages expected from client
+        discard # no messages expected from client
 
       wsConnect:
         # Fires once per WebSocket handshake.
@@ -827,14 +874,15 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
 # Launch
 # ---------------------------------------------------------------------------
 
-proc launchWebDashboard*(srv: pserver.ProtocolServer) {.gcsafe, raises: [CatchableError].} =
+proc launchWebDashboard*(srv: pserver.ProtocolServer) {.gcsafe, raises: [
+    CatchableError].} =
   ## Start the HappyX HTTP server (httpbeast via -d:beast) in a background thread.
   ## Must be called after server.start().
-  gSrvPtr  = cast[pointer](srv)
+  gSrvPtr = cast[pointer](srv)
   gWebPort = srv.config.webPort
   # Pre-compress static assets once; globals are written before thread starts.
   {.cast(gcsafe).}:
-    appJsGz     = compress(appJs,       BestCompression, dfGzip)
+    appJsGz = compress(appJs, BestCompression, dfGzip)
     htmlShellGz = compress(htmlShellStr, BestCompression, dfGzip)
   try:
     let tRef = new Thread[int]

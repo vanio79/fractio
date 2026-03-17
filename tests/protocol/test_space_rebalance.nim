@@ -14,6 +14,7 @@ import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
+import fractio/distributed/meta/system_schemas
 import fractio/storage/wisckey_backend
 
 # ---------------------------------------------------------------------------
@@ -130,18 +131,21 @@ suite "Space rebalance — loadSpaces parses rebalance fields":
 
     # Write a space record with rebalance fields
     let spaceKey = encodeSpaceKey(5)
-    let spaceVal = $ %*{
-      "spaceId": 5,
-      "name": "rebaltest",
-      "replicas": 2,
-      "groupIds": [20, 21, 22],
-      "oldGroupIds": [10, 11],
-      "rebalancing": true,
-      "rebalanceWorker": 3,
-      "rebalanceHeartbeat": 1741700000,
-      "rebalanceCursor": "/t/0000000100/d/key42",
-    }
-    discard store.raftPut(spaceKey, spaceVal)
+    let spaceRec = SpaceRecord(
+      spaceId: 5,
+      name: "rebaltest",
+      replicas: 2,
+      groupCount: 3,
+      groupIds: @[20'u64, 21, 22],
+      oldGroupIds: @[10'u64, 11],
+      rebalancing: true,
+      rebalanceWorker: 3,
+      rebalanceHeartbeat: 1741700000'i64,
+      rebalanceCursor: "/t/0000000100/d/key42",
+    )
+    discard store.sysTablePut(spaceKey, spaceRec.encode())
+    # Wait for Raft commit to apply
+    os.sleep(200)
     store.loadSpaces()
 
     acquire(store.spacesMu)
@@ -162,13 +166,16 @@ suite "Space rebalance — loadSpaces parses rebalance fields":
 
     # Write a space record WITHOUT rebalance fields (backward compat)
     let spaceKey = encodeSpaceKey(3)
-    let spaceVal = $ %*{
-      "spaceId": 3,
-      "name": "oldstyle",
-      "replicas": 1,
-      "groupIds": [10],
-    }
-    discard store.raftPut(spaceKey, spaceVal)
+    let spaceRec = SpaceRecord(
+      spaceId: 3,
+      name: "oldstyle",
+      replicas: 1,
+      groupCount: 1,
+      groupIds: @[10'u64],
+    )
+    discard store.sysTablePut(spaceKey, spaceRec.encode())
+    # Wait for Raft commit to apply
+    os.sleep(200)
     store.loadSpaces()
 
     acquire(store.spacesMu)
@@ -202,6 +209,8 @@ suite "Space rebalance — updateSpaceRecord":
       rebalanceCursor: "/t/0000000100/d/abc",
     )
     store.updateSpaceRecord(space)
+    # Wait for Raft commit to apply
+    os.sleep(200)
     store.loadSpaces()
 
     acquire(store.spacesMu)
@@ -234,6 +243,8 @@ suite "Space rebalance — updateSpaceRecord":
       rebalanceCursor: "/some/key",
     )
     store.updateSpaceRecord(space)
+    # Wait for Raft commit to apply
+    os.sleep(200)
 
     # Now clear rebalance state
     space.oldGroupIds = @[]
@@ -242,6 +253,8 @@ suite "Space rebalance — updateSpaceRecord":
     space.rebalanceHeartbeat = 0
     space.rebalanceCursor = ""
     store.updateSpaceRecord(space)
+    # Wait for Raft commit to apply
+    os.sleep(200)
     store.loadSpaces()
 
     acquire(store.spacesMu)
@@ -375,16 +388,16 @@ suite "Space rebalance — dual-read routing":
     let newSpace = SpaceInfo(
       spaceId: 2, name: "t", replicas: 1,
       groupIds: newGroupIds,
-      rebalancing: false,  # not rebalancing
+      rebalancing: false, # not rebalancing
     )
     let gr = store.raftGetInSpace(key, newSpace, testPk)
     check gr.isOk
     # On single-node shared backend, it will still be found, so just
     # verify no error occurred (the semantic test matters more in multi-node)
 
-# ---------------------------------------------------------------------------
-# Suite: raftScanSpace during rebalance
-# ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # Suite: raftScanSpace during rebalance
+  # ---------------------------------------------------------------------------
 
 suite "Space rebalance — dual-scan routing":
   test "raftScanSpace includes data from both old and new groups":

@@ -17,6 +17,7 @@
 import std/[net, tables, strformat, strutils, times, atomics, locks, options,
     algorithm, os]
 import posix as posixSys
+import nativesockets
 import ./types
 import ./codec as protoCodec
 import ./frame
@@ -29,6 +30,7 @@ import ./messages/admin as adminMsgs
 import ./messages/cluster as clusterMsgs
 import ./txn_manager
 import ./raft_store
+import ./mvcc_store
 import ../utils/logging
 import ../utils/socket_utils
 import ../distributed/sharedtimer
@@ -37,6 +39,8 @@ import ../distributed/raft/multigroup_types
 import ../distributed/raft/group_types as rangeTypes
 import ../distributed/sharedtimer/udptransport as udpXport
 import ../distributed/meta/system_tables
+import ../distributed/meta/system_schemas
+import ../core/timestamp_provider
 import std/json
 
 # ---------------------------------------------------------------------------
@@ -388,6 +392,7 @@ type
     logger*: Logger
     running*: Atomic[bool]
     startedAt*: int64             ## Unix seconds; set in start()
+    acceptSock*: Socket           ## Accept socket, closed in stop() to unblock accept thread
     clients*: Table[uint32, ClientConnection]
     clientsMu*: Lock
     handlers*: Table[int, MessageHandler]
@@ -396,12 +401,17 @@ type
     serverFeatures*: uint32
     kvStore*: KVStore             ## Phase 2: in-memory store (fallback when raftStore is nil)
     raftStore*: RaftKVStoreExt    ## Phase 5: Raft-backed KV store (nil = use kvStore)
+    mvccStore*: MvccTransactionStore ## Full MVCC transaction store for all writes
     txnMgr*: TransactionManager   ## Phase 3: transaction manager
     metrics*: ServerMetrics       ## Phase 4: request counters
     authenticator*: Authenticator ## Phase 4: auth validator
     sharedTimer*: SharedTimer     ## Phase 7: P2P clock sync (nil when disabled)
     nodeRegistry*: NodeRegistry   ## Phase 8: in-memory cluster node registry
     raftCoord*: NuRaftCoordinator ## lifecycle owner; nil until setupRaftNode
+    # Per-server thread storage
+    clientThreadCount*: Atomic[int]
+    acceptThreadCount*: Atomic[int]
+    threadsMu*: Lock
 
 # ---------------------------------------------------------------------------
 # Thread argument types — defined after ProtocolServer to avoid forward refs
@@ -412,11 +422,17 @@ type
   AcceptLoopArgs* = tuple[srv: ProtocolServer, sock: Socket]
 
 # Module-level thread storage: keeps Thread objects alive for the process
-# lifetime.  Protected by threadStoreMu.
+# lifetime.  Protected by threadStoreMu. Each thread references its server
+# so we know which threads belong to which server.
 var threadStore {.global.}: seq[ref Thread[ClientLoopArgs]] = @[]
 var acceptThreadStore {.global.}: seq[ref Thread[AcceptLoopArgs]] = @[]
 var threadStoreMu {.global.}: Lock
 initLock(threadStoreMu)
+
+# Global rebalance monitor thread
+var gRebalThread {.global.}: ref Thread[int] = nil
+var gRebalRunning {.global.}: Atomic[bool]
+var gRebalStorePtr {.global.}: pointer = nil
 
 # ---------------------------------------------------------------------------
 
@@ -440,6 +456,14 @@ proc newProtocolServer*(config: ServerConfig): ProtocolServer =
   )
   initLock(result.clientsMu)
   initLock(result.handlersMu)
+  initLock(result.threadsMu)
+  result.running.store(false)
+  result.nextClientId.store(1)
+  result.clientThreadCount.store(0)
+  result.acceptThreadCount.store(0)
+  initLock(result.clientsMu)
+  initLock(result.handlersMu)
+  initLock(result.threadsMu)
   result.running.store(false)
   result.nextClientId.store(1)
   result.serverFeatures = FeatPipelining or FeatTransactions or FeatAsync
@@ -502,8 +526,14 @@ proc srvRecvExact(sock: Socket, buf: var string,
 # ---------------------------------------------------------------------------
 
 proc sendRaw(conn: ClientConnection, data: string) {.gcsafe, raises: [].} =
-  try: conn.socket.send(data)
-  except CatchableError: discard
+  ## Send raw data on the socket. Silently ignore errors if socket is closed.
+  try:
+    conn.socket.send(data)
+  except CatchableError:
+    discard
+  except Defect:
+    # AssertionDefect can be raised when socket is closed during shutdown
+    discard
 
 proc sendFrame(conn: ClientConnection, payload: string,
     requestId: uint32, flags: uint16 = FlagIsResponse) {.gcsafe, raises: [].} =
@@ -529,7 +559,7 @@ proc performHandshake(server: ProtocolServer,
       serverId: server.config.serverId,
       clusterId: server.config.clusterId,
     )
-    conn.socket.send(encodeGreeting(greeting))
+    sendRaw(conn, encodeGreeting(greeting))
 
     # 2. Read client handshake — parse streaming wire format:
     #   2 bytes version + 4 bytes features + 1 byte authType +
@@ -561,13 +591,13 @@ proc performHandshake(server: ProtocolServer,
     let hsR = decodeClientHandshake(buf)
     if hsR.isErr:
       server.logger.logWarn(&"[{conn.address}] bad handshake: {hsR.error}")
-      conn.socket.send(encodeHandshakeResponse(HandshakeResponse(
+      sendRaw(conn, encodeHandshakeResponse(HandshakeResponse(
         status: HandshakeError, errorMessage: $hsR.error)))
       return false
 
     let hs = hsR.value
     if hs.version != PROTOCOL_VERSION_1:
-      conn.socket.send(encodeHandshakeResponse(HandshakeResponse(
+      sendRaw(conn, encodeHandshakeResponse(HandshakeResponse(
         status: HandshakeError,
         errorMessage: &"unsupported protocol version {hs.version}")))
       return false
@@ -575,7 +605,7 @@ proc performHandshake(server: ProtocolServer,
     # Phase 4: authenticate when server requires it
     if server.config.authMethod != amNone:
       if not server.authenticator.authenticate(hs.authType, hsAuthData):
-        conn.socket.send(encodeHandshakeResponse(HandshakeResponse(
+        sendRaw(conn, encodeHandshakeResponse(HandshakeResponse(
           status: HandshakeError, errorMessage: "authentication failed")))
         return false
 
@@ -584,7 +614,7 @@ proc performHandshake(server: ProtocolServer,
     conn.authenticated = true
 
     # 3. Send handshake response
-    conn.socket.send(encodeHandshakeResponse(HandshakeResponse(
+    sendRaw(conn, encodeHandshakeResponse(HandshakeResponse(
       status: HandshakeOK,
       features: negotiated,
       serverName: server.config.serverName)))
@@ -1356,39 +1386,53 @@ proc clientLoop(server: ProtocolServer,
 # ---------------------------------------------------------------------------
 
 proc clientLoopThread(args: ClientLoopArgs) {.thread.} =
-  clientLoop(args.srv, args.conn)
+  try:
+    clientLoop(args.srv, args.conn)
+  finally:
+    discard args.srv.clientThreadCount.fetchSub(1)
 
 proc acceptLoop(args: AcceptLoopArgs) {.thread.} =
   let server = args.srv
   let sock = args.sock
-  while server.running.load():
-    var clientSock: Socket
-    var address = ""
-    try:
-      sock.accept(clientSock)
-      let (peerAddr, _) = clientSock.getPeerAddr()
-      address = peerAddr
-    except CatchableError as e:
-      if server.running.load():
-        server.logger.logWarn("accept error: " & e.msg)
-      break
+  try:
+    while server.running.load():
+      # Use select to poll with timeout so we can check running flag
+      var fds = @[sock.getFd()]
+      let ready = nativesockets.selectRead(fds, 100) # 100ms timeout
+      if ready <= 0:
+        # Timeout or no data, just loop again to check running flag
+        continue
 
-    if server.clientCount() >= server.config.maxConnections:
-      server.logger.logWarn(&"max connections reached, rejecting {address}")
-      try: clientSock.close() except CatchableError: discard
-      continue
+      var clientSock: Socket
+      var address = ""
+      try:
+        sock.accept(clientSock)
+        let (peerAddr, _) = clientSock.getPeerAddr()
+        address = peerAddr
+      except CatchableError as e:
+        if server.running.load():
+          server.logger.logWarn("accept error: " & e.msg)
+        break
 
-    let id = server.nextClientId.fetchAdd(1)
-    let conn = newClientConnection(id, clientSock, address)
-    server.addClient(conn)
+      if server.clientCount() >= server.config.maxConnections:
+        server.logger.logWarn(&"max connections reached, rejecting {address}")
+        try: clientSock.close() except CatchableError: discard
+        continue
 
-    # Allocate a heap-resident Thread so its lifetime is not tied to this
-    # stack frame.  Store in the module-level threadStore so GC won't collect.
-    let tRef = new Thread[ClientLoopArgs]
-    {.cast(gcsafe).}:
-      withLock(threadStoreMu):
-        threadStore.add(tRef)
-    createThread(tRef[], clientLoopThread, (server, conn))
+      let id = server.nextClientId.fetchAdd(1)
+      let conn = newClientConnection(id, clientSock, address)
+      server.addClient(conn)
+
+      # Allocate a heap-resident Thread so its lifetime is not tied to this
+      # stack frame.  Store in the module-level threadStore so GC won't collect.
+      let tRef = new Thread[ClientLoopArgs]
+      {.cast(gcsafe).}:
+        withLock(threadStoreMu):
+          threadStore.add(tRef)
+        discard server.clientThreadCount.fetchAdd(1)
+      createThread(tRef[], clientLoopThread, (server, conn))
+  finally:
+    discard server.acceptThreadCount.fetchSub(1)
 
 # ---------------------------------------------------------------------------
 # Cluster membership persistence
@@ -1538,6 +1582,12 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
   let store = newRaftKVStoreExt(coord)
   server.raftStore = store
 
+  # Create MvccTransactionStore for full MVCC semantics on all writes
+  let tsProvider = newTimestampProvider(server.sharedTimer,
+      server.config.serverId)
+  let mvccStore = newMvccTransactionStore(store, server.txnMgr, tsProvider)
+  server.mvccStore = mvccStore
+
   # Wire callbacks and pre-create state machines before starting NuRaft
   store.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
 
@@ -1561,21 +1611,20 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
     if grpScan.isOk:
       for (key, entry) in grpScan.value:
         try:
-          let j = parseJson(entry.value)
-          let gid = GroupID(uint64(j["groupId"].getInt()))
+          let rec = decodeGroupRecord(entry.value)
+          let gid = GroupID(rec.groupId)
           if gid == META_GROUP_ID or gid == DATA_GROUP_START_ID: continue
           if coord.hasGroup(gid): continue
 
           # Build member list from replicas
           var members: seq[tuple[nodeId: uint32, host: string,
               basePort: int]] = @[]
-          if j.hasKey("replicas"):
-            for r in j["replicas"]:
-              let nid = uint32(r["nodeId"].getInt())
-              let peerInfo = coord.peerInfo.getOrDefault(nid,
-                  (host: coord.host, basePort: coord.basePort))
-              members.add((nodeId: nid, host: peerInfo.host,
-                  basePort: peerInfo.basePort))
+          for rep in rec.replicas:
+            let nid = rep.nodeId
+            let peerInfo = coord.peerInfo.getOrDefault(nid,
+                (host: coord.host, basePort: coord.basePort))
+            members.add((nodeId: nid, host: peerInfo.host,
+                basePort: peerInfo.basePort))
 
           var isMember = false
           for m in members:
@@ -1584,9 +1633,7 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
               break
 
           if isMember:
-            var preferredLeader: uint32 = 0
-            if j.hasKey("preferredLeader"):
-              preferredLeader = uint32(j["preferredLeader"].getInt())
+            let preferredLeader = rec.preferredLeader
             discard coord.createAndStartGroup(gid, members, preferredLeader)
             store.registerGroup(gid)
         except:
@@ -1595,63 +1642,80 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
   # Reload group membership cache after space group recovery
   store.loadGroupMembers()
 
-  # Seed system tables: sys.nodes (table 5) and sys.groups (table 4)
+# Seed system tables: sys.nodes (table 5) and sys.groups (table 4)
   # Only seed when starting as fresh leader (not rejoining and not joining)
   if startAsLeader and not isRejoining:
-    let nodeKey = encodeTableKey(SYS_NODES_TABLE_ID, $server.config.serverId)
-    let nodeVal = $ %* {
-      "nodeId": server.config.serverId.int,
-      "host": server.config.host,
-      "raftPort": raftPort,
-      "clientPort": server.config.port,
-      "webPort": server.config.webPort,
-      "status": 1,
-    }
-    discard store.sysTablePut(nodeKey, nodeVal)
+    # Use a single transaction for all seeding operations
+    discard mvccStore.withAutoTransaction(proc(
+        sessionId: uint64): MvccVoidResult =
+      let nodeKey = encodeTableKey(SYS_NODES_TABLE_ID, $server.config.serverId)
+      let nodeRec = NodeRecord(
+        nodeId: server.config.serverId,
+        host: server.config.host,
+        raftPort: uint16(raftPort),
+        clientPort: uint16(server.config.port),
+        status: nsAlive
+      )
+      discard mvccStore.txnPut(sessionId, nodeKey, encode(nodeRec))
 
-    for gid in [META_GROUP_ID, DATA_GROUP_START_ID]:
-      let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
-      let groupVal = $ %* {
-        "groupId": gid.uint64.int,
-        "replicas": [{"nodeId": server.config.serverId.int, "type": "voter"}],
-      }
-      discard store.sysTablePut(groupKey, groupVal)
+      for gid in [META_GROUP_ID, DATA_GROUP_START_ID]:
+        let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
+        let groupRec = GroupRecord(
+          groupId: gid.uint64,
+          spaceId: 0,
+          preferredLeader: server.config.serverId,
+          leader: server.config.serverId,
+          replicas: @[GroupReplicaBin(nodeId: server.config.serverId,
+              replicaType: rtVoter)]
+        )
+        discard mvccStore.txnPut(sessionId, groupKey, encode(groupRec))
 
-    for p in peers:
-      let peerKey = encodeTableKey(SYS_NODES_TABLE_ID, $p.nodeId)
-      let peerVal = $ %* {
-        "nodeId": p.nodeId.int,
-        "host": p.host,
-        "raftPort": p.basePort,
-        "clientPort": 0,
-        "status": 1,
-      }
-      discard store.sysTablePut(peerKey, peerVal)
+      for p in peers:
+        let peerKey = encodeTableKey(SYS_NODES_TABLE_ID, $p.nodeId)
+        let peerRec = NodeRecord(
+          nodeId: p.nodeId,
+          host: p.host,
+          raftPort: uint16(p.basePort),
+          clientPort: 0,
+          status: nsAlive
+        )
+        discard mvccStore.txnPut(sessionId, peerKey, encode(peerRec))
 
-    # Seed default database and public schema
-    let dbKey = encodeTableKey(SYS_DATABASES_TABLE_ID, "default")
-    discard store.sysTablePut(dbKey, $ %* {"name": "default"})
+      # Seed default database and public schema
+      let dbKey = encodeTableKey(SYS_DATABASES_TABLE_ID, "default")
+      let dbRec = DatabaseRecord(name: "default",
+          createdAtNs: system_schemas.nowNs())
+      discard mvccStore.txnPut(sessionId, dbKey, encode(dbRec))
 
-    let scKey = encodeTableKey(SYS_SCHEMAS_TABLE_ID, "default.public")
-    discard store.sysTablePut(scKey, $ %* {
-      "name": "public", "database": "default",
-    })
+      let scKey = encodeTableKey(SYS_SCHEMAS_TABLE_ID, "default.public")
+      let scRec = SchemaRecord(name: "public", database: "default",
+        createdAtNs: system_schemas.nowNs())
+      discard mvccStore.txnPut(sessionId, scKey, encode(scRec))
 
-    # Seed default space (replicas=0 means ALL, single group = Group 1)
-    let spaceKey = encodeTableKey(SYS_SPACES_TABLE_ID, "1")
-    discard store.sysTablePut(spaceKey, $ %* {
-      "spaceId": 1,
-      "name": "default",
-      "replicas": 0,
-      "groupCount": 1,
-      "groupIds": [1],
-      "createdAt": $now(),
-    })
+      # Seed default space (replicas=0 means ALL, single group = Group 1)
+      let spaceKey = encodeTableKey(SYS_SPACES_TABLE_ID, "1")
+      let spaceRec = SpaceRecord(
+        spaceId: 1,
+        name: "default",
+        replicas: 0,
+        groupCount: 1,
+        groupIds: @[1'u64],
+        oldGroupIds: @[],
+        rebalancing: false,
+        rebalanceWorker: 0,
+        rebalanceHeartbeat: 0,
+        rebalanceCursor: "",
+        createdAtNs: system_schemas.nowNs()
+      )
+      discard mvccStore.txnPut(sessionId, spaceKey, encode(spaceRec))
 
-    # Load space caches after seeding
-    store.loadSpaces()
-    store.loadTableSpaces()
-    store.loadGroupMembers()
+      return mvccVOk()
+    )
+
+  # Load space caches after seeding
+  store.loadSpaces()
+  store.loadTableSpaces()
+  store.loadGroupMembers()
 
   # SharedTimer: enable when we have peers and timer not yet configured
   if peers.len > 0 and server.sharedTimer.isNil:
@@ -1675,46 +1739,49 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
     server.sharedTimer = timer
     server.txnMgr.setTimeProvider(timer)
 
-  # Start rebalance monitor thread
-  block:
-    var gRebalStorePtr {.global.}: pointer
-    gRebalStorePtr = cast[pointer](store)
+  # Start rebalance monitor thread (uses module-level globals)
+  gRebalStorePtr = cast[pointer](store)
+  gRebalRunning.store(true)
 
-    proc rebalanceMonitorThread(_: int) {.thread, gcsafe.} =
-      {.cast(gcsafe).}:
-        let rstoreRef = cast[RaftKVStoreExt](gRebalStorePtr)
-        const checkIntervalSecs = 10
-        const staleHeartbeatSecs = 30
-        while true:
-          sleep(checkIntervalSecs * 1000)
-          try:
-            rstoreRef.loadSpaces()
-            acquire(rstoreRef.spacesMu)
-            var rebalSpaces: seq[SpaceInfo] = @[]
-            for sid, sp in rstoreRef.spaces:
-              if sp.rebalancing:
-                rebalSpaces.add(sp)
-            release(rstoreRef.spacesMu)
+  proc rebalanceMonitorThread(_: int) {.thread, gcsafe.} =
+    {.cast(gcsafe).}:
+      let rstoreRef = cast[RaftKVStoreExt](gRebalStorePtr)
+      const checkIntervalSecs = 10
+      const staleHeartbeatSecs = 30
+      while gRebalRunning.load():
+        sleep(checkIntervalSecs * 1000)
+        if not gRebalRunning.load(): break
+        # Check if coordinator is still running
+        if rstoreRef.coordinator.isNil or
+            not rstoreRef.coordinator.running.load():
+          break
+        try:
+          rstoreRef.loadSpaces()
+          acquire(rstoreRef.spacesMu)
+          var rebalSpaces: seq[SpaceInfo] = @[]
+          for sid, sp in rstoreRef.spaces:
+            if sp.rebalancing:
+              rebalSpaces.add(sp)
+          release(rstoreRef.spacesMu)
 
-            let nowSecs = getTime().toUnix()
-            let myNodeId = int(rstoreRef.coordinator.nodeId)
-            for sp in rebalSpaces:
-              let heartbeatAge = nowSecs - sp.rebalanceHeartbeat
-              if sp.rebalanceWorker == myNodeId:
-                # We are the worker — continue migration
-                rstoreRef.runRebalanceMigration(sp.spaceId)
-              elif sp.rebalanceWorker == 0 or heartbeatAge > staleHeartbeatSecs:
-                # No worker or stale heartbeat — claim and run
-                rstoreRef.runRebalanceMigration(sp.spaceId)
-          except:
-            discard
+          let nowSecs = getTime().toUnix()
+          let myNodeId = int(rstoreRef.coordinator.nodeId)
+          for sp in rebalSpaces:
+            let heartbeatAge = nowSecs - sp.rebalanceHeartbeat
+            if sp.rebalanceWorker == myNodeId:
+              # We are the worker — continue migration
+              rstoreRef.runRebalanceMigration(sp.spaceId)
+            elif sp.rebalanceWorker == 0 or heartbeatAge > staleHeartbeatSecs:
+              # No worker or stale heartbeat — claim and run
+              rstoreRef.runRebalanceMigration(sp.spaceId)
+        except:
+          discard
 
-    var gRebalThread {.global.}: ref Thread[int]
-    try:
-      gRebalThread = new Thread[int]
-      createThread(gRebalThread[], rebalanceMonitorThread, 0)
-    except CatchableError:
-      discard
+  try:
+    gRebalThread = new Thread[int]
+    createThread(gRebalThread[], rebalanceMonitorThread, 0)
+  except CatchableError:
+    discard
 
   # Persist cluster membership for restart recovery
   if peers.len > 0:
@@ -1727,12 +1794,11 @@ proc start*(server: ProtocolServer) {.raises: [].} =
   if not server.sharedTimer.isNil:
     try: server.sharedTimer.start()
     except Exception as e: server.logger.logError("SharedTimer start failed: " & e.msg)
-  var sock: Socket
   try:
-    sock = newSocket()
-    sock.setLingerZero()
-    sock.bindAddr(Port(server.config.port), server.config.host)
-    sock.listen()
+    server.acceptSock = newSocket()
+    server.acceptSock.setLingerZero()
+    server.acceptSock.bindAddr(Port(server.config.port), server.config.host)
+    server.acceptSock.listen()
     server.logger.logInfo(
       &"listening on {server.config.host}:{server.config.port}")
   except CatchableError as e:
@@ -1743,8 +1809,9 @@ proc start*(server: ProtocolServer) {.raises: [].} =
   let aRef = new Thread[AcceptLoopArgs]
   withLock(threadStoreMu):
     acceptThreadStore.add(aRef)
+  discard server.acceptThreadCount.fetchAdd(1)
   try:
-    createThread(aRef[], acceptLoop, (server, sock))
+    createThread(aRef[], acceptLoop, (server, server.acceptSock))
   except ResourceExhaustedError as e:
     server.logger.logError("failed to create accept thread: " & e.msg)
     server.running.store(false)
@@ -1752,7 +1819,47 @@ proc start*(server: ProtocolServer) {.raises: [].} =
 proc stop*(server: ProtocolServer) {.raises: [].} =
   server.running.store(false)
   server.logger.logInfo("server stopping")
+
+  # Close the accept socket FIRST to unblock the accept loop thread.
+  # This must happen before trying to join threads, otherwise joinThread
+  # will block forever waiting for the accept loop to exit.
+  if not server.acceptSock.isNil:
+    try:
+      server.acceptSock.close()
+    except:
+      discard
+    server.acceptSock = nil
+
   # Stop SharedTimer background sync thread and close network transport
   if not server.sharedTimer.isNil:
     try: server.sharedTimer.stop()
     except Exception as e: server.logger.logError("SharedTimer stop failed: " & e.msg)
+
+  # Close all client sockets to unblock their threads
+  withLock server.clientsMu:
+    for id, conn in server.clients:
+      try:
+        conn.socket.close()
+      except:
+        discard
+
+  # Wait for client threads to exit (they should exit quickly after sockets are closed)
+  for _ in 0 ..< 50: # 5 seconds max
+    if server.clientThreadCount.load() == 0:
+      break
+    sleep(100)
+
+  # Wait for accept thread to exit
+  for _ in 0 ..< 50: # 5 seconds max
+    if server.acceptThreadCount.load() == 0:
+      break
+    sleep(100)
+
+  # Stop and join global rebalance monitor thread
+  gRebalRunning.store(false)
+  if gRebalThread != nil:
+    try:
+      joinThread(gRebalThread[])
+    except:
+      discard
+    gRebalThread = nil

@@ -17,6 +17,7 @@ import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
+import fractio/distributed/meta/system_schemas
 import fractio/protocol/raft_store
 import fractio/protocol/server
 
@@ -27,9 +28,9 @@ import fractio/protocol/server
 const
   TMP_DIR = "/tmp/fractio_net_fwd_"
   NODE_COUNT = 3
-  SPACE_GROUP_START = 10'u64  # space groups 10, 11, 12
+  SPACE_GROUP_START = 10'u64 # space groups 10, 11, 12
 
-var nextClientPort = 9100  ## incremented per node to avoid port conflicts between tests
+var nextClientPort = 9100 ## incremented per node to avoid port conflicts between tests
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -147,64 +148,94 @@ proc makeCluster3(): seq[TestNode] =
       leaderIdx = i
       break
 
-  # Seed sys.nodes
+# Seed sys.nodes
   for n in nodes:
     let key = encodeTableKey(SYS_NODES_TABLE_ID, $n.id)
-    let val = $ %*{
-      "nodeId": n.id,
-      "host": "127.0.0.1",
-      "raftPort": n.basePort,
-      "clientPort": n.clientPort,
-      "status": 1,
-    }
-    let r = nodes[leaderIdx].store.raftPut(key, val)
+    let nodeRec = NodeRecord(
+      nodeId: uint32(n.id),
+      host: "127.0.0.1",
+      raftPort: uint16(n.basePort),
+      clientPort: uint16(n.clientPort),
+      status: nsAlive,
+    )
+    let r = nodes[leaderIdx].store.raftPut(key, nodeRec.encode())
     doAssert r.isOk, "failed to seed sys.nodes for node " & $n.id
 
   # Seed sys.groups
   let allNums = @[1, 2, 3]
   for gid in [META_GROUP_ID, DATA_GROUP_START_ID]:
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
-    var replicas = newJArray()
+    var replicas: seq[GroupReplicaBin] = @[]
     for num in allNums:
-      replicas.add(%*{"nodeId": num, "type": "voter"})
-    let val = $ %*{"groupId": gid.uint64.int, "replicas": replicas}
-    discard nodes[leaderIdx].store.raftPut(key, val)
+      replicas.add(GroupReplicaBin(nodeId: uint32(num), replicaType: rtVoter))
+    let groupRec = GroupRecord(
+      groupId: gid.uint64,
+      replicas: replicas,
+    )
+    discard nodes[leaderIdx].store.raftPut(key, groupRec.encode())
 
   for i in 0 ..< NODE_COUNT:
     let gid = SPACE_GROUP_START + uint64(i)
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid)
-    var replicas = newJArray()
+    var replicas: seq[GroupReplicaBin] = @[]
     for num in allNums:
-      replicas.add(%*{"nodeId": num, "type": "voter"})
+      replicas.add(GroupReplicaBin(nodeId: uint32(num), replicaType: rtVoter))
+    # Find who is leader for this group
+    var leaderNodeId = 1'u32
+    for n in nodes:
+      if n.coord.isLeader(GroupID(gid)):
+        leaderNodeId = uint32(n.id)
+        break
+    let groupRec = GroupRecord(
+      groupId: gid,
+      replicas: replicas,
+      leader: leaderNodeId,
+    )
+    discard nodes[leaderIdx].store.raftPut(key, groupRec.encode())
+
+  for i in 0 ..< NODE_COUNT:
+    let gid = SPACE_GROUP_START + uint64(i)
+    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid)
+    var replicasSeq: seq[GroupReplicaBin] = @[]
+    for num in allNums:
+      replicasSeq.add(GroupReplicaBin(nodeId: uint32(num),
+          replicaType: rtVoter))
     # Find who is leader for this group
     var leaderNodeId = 1
     for n in nodes:
       if n.coord.isLeader(GroupID(gid)):
         leaderNodeId = n.id
         break
-    let val = $ %*{"groupId": int(gid), "replicas": replicas, "leader": leaderNodeId}
-    discard nodes[leaderIdx].store.raftPut(key, val)
+    let groupRec = GroupRecord(
+      groupId: gid,
+      replicas: replicasSeq,
+      leader: uint32(leaderNodeId),
+    )
+    discard nodes[leaderIdx].store.raftPut(key, groupRec.encode())
 
   # Seed space and table
-  var gids = newJArray()
+  var spaceGroupIds: seq[uint64] = @[]
   for i in 0 ..< NODE_COUNT:
-    gids.add(newJInt(int(SPACE_GROUP_START + uint64(i))))
+    spaceGroupIds.add(SPACE_GROUP_START + uint64(i))
   let spaceKey = encodeSpaceKey(2)
-  let spaceVal = $ %*{
-    "spaceId": 2,
-    "name": "space_2",
-    "replicas": NODE_COUNT,
-    "groupIds": gids,
-  }
-  discard nodes[leaderIdx].store.raftPut(spaceKey, spaceVal)
+  let spaceRec = SpaceRecord(
+    spaceId: 2,
+    name: "space_2",
+    replicas: int32(NODE_COUNT),
+    groupCount: int32(NODE_COUNT),
+    groupIds: spaceGroupIds,
+  )
+  discard nodes[leaderIdx].store.raftPut(spaceKey, spaceRec.encode())
 
   let tableKey = encodeTableKey(SYS_TABLES_TABLE_ID, "default.public.t100")
-  let tableVal = $ %*{
-    "tableId": 100,
-    "name": "t100",
-    "spaceId": 2,
-  }
-  discard nodes[leaderIdx].store.raftPut(tableKey, tableVal)
+  let tableRec = TableRecord(
+    tableId: 100'u32,
+    name: "t100",
+    schema: "public",
+    database: "default",
+    spaceId: 2,
+  )
+  discard nodes[leaderIdx].store.raftPut(tableKey, tableRec.encode())
 
   sleep(200)
 
@@ -231,7 +262,8 @@ proc spaceInfo(): SpaceInfo =
     groupIds: groupIds,
   )
 
-proc findKeyForNode(nodes: seq[TestNode], targetGroupIdx: int, space: SpaceInfo): string =
+proc findKeyForNode(nodes: seq[TestNode], targetGroupIdx: int,
+    space: SpaceInfo): string =
   ## Find a bare PK that routes to the group at targetGroupIdx in the space.
   let targetGid = GroupID(SPACE_GROUP_START + uint64(targetGroupIdx))
   for i in 0 ..< 1000:

@@ -133,7 +133,8 @@ suite "MVCC Transactions - Basic":
 
   test "MVCC value encoding":
     let value = "test_value"
-    let ts: Timestamp = 12345
+    # Use a realistic nanosecond timestamp (year 2024)
+    let ts: Timestamp = 1_700_000_000_000_000_000
     let txnId = TransactionID(999)
 
     let encoded = encodeMVCCValue(value, ts, false, txnId)

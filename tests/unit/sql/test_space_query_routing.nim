@@ -4,12 +4,13 @@
 # mapping, then runs INSERT/SELECT/UPDATE/DELETE SQL through the executor
 # to verify that data is correctly routed and merged across groups.
 
-import std/[unittest, options, json, os, strutils, tables, hashes, algorithm, sequtils]
+import std/[unittest, options, os, strutils, tables, hashes, algorithm, sequtils]
 import fractio/sql/parser
 import fractio/sql/ast
 import fractio/sql/planner
 import fractio/sql/executor
 import fractio/distributed/meta/system_tables
+import fractio/distributed/meta/system_schemas
 import fractio/protocol/raft_store
 import fractio/protocol/mvcc_store
 import fractio/protocol/txn_manager
@@ -94,16 +95,25 @@ proc createMultiGroupTestStore(testDir: string,
   let tsProvider = newTimestampProvider(mockTimer, nodeId.uint16)
   let mvccStore = newMvccTransactionStore(store, txnMgr, tsProvider)
 
-  # Seed space record
+  # Seed space record (binary)
   let spaceKey = encodeSpaceKey(2)
-  let spaceVal = $ %*{
-    "spaceId": 2,
-    "name": "testspace",
-    "replicas": 1,
-    "groupCount": groupCount,
-    "groupIds": groupIds,
-  }
-  discard store.raftPut(spaceKey, spaceVal)
+  var groupIdsSeq: seq[uint64] = @[]
+  for gid in groupIds:
+    groupIdsSeq.add(uint64(gid))
+  let spaceRec = SpaceRecord(
+    spaceId: 2,
+    name: "testspace",
+    replicas: 1,
+    groupCount: int32(groupCount),
+    groupIds: groupIdsSeq,
+    oldGroupIds: @[],
+    rebalancing: false,
+    rebalanceWorker: 0,
+    rebalanceHeartbeat: 0,
+    rebalanceCursor: "",
+    createdAtNs: 0
+  )
+  discard store.raftPut(spaceKey, encode(spaceRec))
 
   store.loadSpaces()
 
@@ -114,19 +124,19 @@ proc seedSpaceTable(store: RaftKVStoreExt, tableId: uint32,
   ## Register a table in sys.tables pointing to spaceId=2.
   let fullName = database & "." & schema & "." & tableName
   let tableKey = encodeTableKey(SYS_TABLES_TABLE_ID, fullName)
-  let tableVal = $ %*{
-    "tableId": tableId,
-    "name": tableName,
-    "database": database,
-    "schema": schema,
-    "spaceId": 2,
-    "primaryKey": ["id"],
-    "columns": [
-      {"name": "id", "type": "INT", "primaryKey": true},
-      {"name": "val", "type": "TEXT"},
-    ],
-  }
-  discard store.raftPut(tableKey, tableVal)
+  let tableRec = TableRecord(
+    tableId: tableId,
+    name: tableName,
+    database: database,
+    schema: schema,
+    spaceId: 2,
+    primaryKey: @["id"],
+    columns: @[
+      ColumnDefBin(name: "id", dataType: cdtInt, flags: 0x01), # primaryKey
+    ColumnDefBin(name: "val", dataType: cdtString, flags: 0x00),
+  ]
+  )
+  discard store.raftPut(tableKey, encode(tableRec))
   store.loadTableSpaces()
 
 proc seedSpaceTableThreeCol(store: RaftKVStoreExt, tableId: uint32,
@@ -134,20 +144,20 @@ proc seedSpaceTableThreeCol(store: RaftKVStoreExt, tableId: uint32,
   ## Register a table with 3 columns (id, name, score).
   let fullName = database & "." & schema & "." & tableName
   let tableKey = encodeTableKey(SYS_TABLES_TABLE_ID, fullName)
-  let tableVal = $ %*{
-    "tableId": tableId,
-    "name": tableName,
-    "database": database,
-    "schema": schema,
-    "spaceId": 2,
-    "primaryKey": ["id"],
-    "columns": [
-      {"name": "id", "type": "INT", "primaryKey": true},
-      {"name": "name", "type": "TEXT"},
-      {"name": "score", "type": "INT"},
-    ],
-  }
-  discard store.raftPut(tableKey, tableVal)
+  let tableRec = TableRecord(
+    tableId: tableId,
+    name: tableName,
+    database: database,
+    schema: schema,
+    spaceId: 2,
+    primaryKey: @["id"],
+    columns: @[
+      ColumnDefBin(name: "id", dataType: cdtInt, flags: 0x01), # primaryKey
+    ColumnDefBin(name: "name", dataType: cdtString, flags: 0x00),
+    ColumnDefBin(name: "score", dataType: cdtInt, flags: 0x00),
+  ]
+  )
+  discard store.raftPut(tableKey, encode(tableRec))
   store.loadTableSpaces()
 
 proc exec(store: RaftKVStoreExt, mvccStore: MvccTransactionStore, sql: string,

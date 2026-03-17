@@ -22,6 +22,7 @@ import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
+import fractio/distributed/meta/system_schemas
 import fractio/protocol/raft_store
 import fractio/protocol/mvcc_store
 import fractio/protocol/txn_manager
@@ -32,6 +33,7 @@ import fractio/distributed/sharedtimer/mock
 import fractio/distributed/sharedtimer/types as timerTypes
 import fractio/core/timestamp_provider
 import fractio/sql/executor
+import fractio/storage/mvcc/types as mvccTypes
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -141,31 +143,41 @@ proc waitForLeaderOnGroup(nodes: seq[TestNode], gid: GroupID,
 proc seedSysNodes(leaderStore: RaftKVStoreExt, nodes: seq[TestNode]) =
   for n in nodes:
     let key = encodeTableKey(SYS_NODES_TABLE_ID, $n.id)
-    let val = $ %*{
-      "nodeId": n.id,
-      "host": "127.0.0.1",
-      "raftPort": n.basePort,
-      "clientPort": n.clientPort,
-      "status": 1,
-    }
-    let r = leaderStore.raftPut(key, val)
+    let nodeRec = NodeRecord(
+      nodeId: uint32(n.id),
+      host: "127.0.0.1",
+      raftPort: uint16(n.basePort),
+      clientPort: uint16(n.clientPort),
+      status: nsAlive,
+    )
+    let r = leaderStore.raftPut(key, nodeRec.encode())
     doAssert r.isOk, "failed to seed sys.nodes for node " & $n.id
 
 proc seedSysGroups(leaderStore: RaftKVStoreExt, nodeNums: seq[int]) =
   for gid in [META_GROUP_ID, DATA_GROUP_START_ID]:
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
-    var replicas = newJArray()
+    var replicasSeq: seq[GroupReplicaBin] = @[]
     for num in nodeNums:
-      replicas.add(%*{"nodeId": num, "type": "voter"})
-    let val = $ %*{"groupId": gid.uint64.int, "replicas": replicas}
-    discard leaderStore.raftPut(key, val)
+      replicasSeq.add(GroupReplicaBin(nodeId: uint32(num),
+          replicaType: rtVoter))
+    let groupRec = GroupRecord(
+      groupId: gid.uint64,
+      replicas: replicasSeq,
+    )
+    discard leaderStore.raftPut(key, groupRec.encode())
 
 proc seedDefaults(leaderStore: RaftKVStoreExt) =
   let dbKey = encodeTableKey(SYS_DATABASES_TABLE_ID, "default")
-  discard leaderStore.raftPut(dbKey, $ %*{"name": "default"})
+  discard leaderStore.raftPut(dbKey, DatabaseRecord(
+    name: "default",
+    createdAtNs: system_schemas.nowNs()
+  ).encode())
   let scKey = encodeTableKey(SYS_SCHEMAS_TABLE_ID, "default.public")
-  discard leaderStore.raftPut(scKey, $ %*{"name": "public",
-      "database": "default"})
+  discard leaderStore.raftPut(scKey, SchemaRecord(
+    name: "public",
+    database: "default",
+    createdAtNs: system_schemas.nowNs()
+  ).encode())
 
 proc waitForAutoDistribution(nodes: seq[TestNode], expectedGroupIds: seq[
     uint64], replicaCount: int, maxWaitMs: int = 5000) =
@@ -195,8 +207,25 @@ proc waitForSpaceLeaders(nodes: seq[TestNode]) =
   if grpScan.isOk:
     for (key, entry) in grpScan.value:
       try:
-        let j = parseJson(entry.value)
-        let gid = GroupID(uint64(j["groupId"].getInt()))
+        var data = entry.value
+        # Check if MVCC-encoded
+        if data.len >= 17 and data[0] != '{' and (data[16] == '0' or data[16] == '1'):
+          try:
+            let mvccVal = mvccTypes.decodeMVCCValue(data)
+            if not mvccVal.isDeleted:
+              data = mvccVal.data
+            else:
+              continue
+          except CatchableError:
+            discard
+        let gid = if data.len > 0 and data[0] != '{':
+          # Binary format
+          let rec = decodeGroupRecord(data)
+          GroupID(rec.groupId)
+        else:
+          # Legacy JSON format
+          let j = parseJson(data)
+          GroupID(uint64(j["groupId"].getInt()))
         if gid == META_GROUP_ID or gid == DATA_GROUP_START_ID: continue
         # Wait for this group to have a leader
         for attempt in 0 ..< 50:
@@ -462,11 +491,14 @@ suite "Space multinode — resilience after adding a node":
 
     # Seed node 6 into sys.nodes
     let nodeKey = encodeTableKey(SYS_NODES_TABLE_ID, "6")
-    let nodeVal = $ %*{
-      "nodeId": 6, "host": "127.0.0.1",
-      "raftPort": 32000, "clientPort": node6.clientPort, "status": 1,
-    }
-    discard nodes[leaderIdx].store.raftPut(nodeKey, nodeVal)
+    let nodeRec = NodeRecord(
+      nodeId: 6'u32,
+      host: "127.0.0.1",
+      raftPort: 32000'u16,
+      clientPort: uint16(node6.clientPort),
+      status: nsAlive,
+    )
+    discard nodes[leaderIdx].store.raftPut(nodeKey, nodeRec.encode())
     sleep(500)
 
     # Verify space still works — insert via client-side retry

@@ -6,12 +6,13 @@
 #   - dataGroupLeaderNodeId atomic field
 #   - onLeaderChanged skips meta and data groups
 
-import std/[unittest, os, options, json, strutils, tables, atomics]
+import std/[unittest, os, options, strutils, tables, atomics]
 import fractio/distributed/raft/group_types
-import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/meta/system_tables
+import fractio/distributed/meta/system_schemas
 import fractio/protocol/raft_store
+import fractio/storage/mvcc/types as mvccTypes
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -35,7 +36,8 @@ proc makeStore(storagePath: string): tuple[
   let members = @[(nodeId: 1'u32, host: "127.0.0.1", basePort: basePort)]
   let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
     nodeId: nodeId, basePort: basePort, host: "127.0.0.1", dataDir: storagePath,
-    electionTimeoutLowerMs: 200, electionTimeoutUpperMs: 400, heartbeatIntervalMs: 100,
+    electionTimeoutLowerMs: 200, electionTimeoutUpperMs: 400,
+    heartbeatIntervalMs: 100,
   ))
   coord.start()
   for rid in [META_GROUP_ID, DATA_GROUP_START_ID]:
@@ -71,15 +73,17 @@ suite "RaftKVStoreExt - groupLeaders table":
   test "loadGroupMembers populates groupLeaders from sys.groups":
     let gid = GroupID(50)
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
-    let val = $ %*{
-      "groupId": gid.uint64.int,
-      "replicas": [
-        {"nodeId": 10, "type": "voter"},
-        {"nodeId": 20, "type": "voter"},
-      ],
-      "leader": 20,
-    }
-    let wr = store.raftPut(key, val)
+    let val = GroupRecord(
+      groupId: gid.uint64,
+      spaceId: 0,
+      preferredLeader: 0,
+      leader: 20,
+      replicas: @[
+        GroupReplicaBin(nodeId: 10, replicaType: rtVoter),
+        GroupReplicaBin(nodeId: 20, replicaType: rtVoter),
+      ]
+    )
+    let wr = store.raftPut(key, encode(val))
     check wr.isOk
 
     store.loadGroupMembers()
@@ -90,11 +94,14 @@ suite "RaftKVStoreExt - groupLeaders table":
   test "loadGroupMembers skips leader when field is missing":
     let gid = GroupID(51)
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
-    let val = $ %*{
-      "groupId": gid.uint64.int,
-      "replicas": [{"nodeId": 10, "type": "voter"}],
-    }
-    discard store.raftPut(key, val)
+    let val = GroupRecord(
+      groupId: gid.uint64,
+      spaceId: 0,
+      preferredLeader: 0,
+      leader: 0, # 0 = no leader known
+      replicas: @[GroupReplicaBin(nodeId: 10, replicaType: rtVoter)]
+    )
+    discard store.raftPut(key, encode(val))
     store.loadGroupMembers()
 
     check not store.groupLeaders.hasKey(gid)
@@ -102,12 +109,14 @@ suite "RaftKVStoreExt - groupLeaders table":
   test "loadGroupMembers skips leader when value is 0":
     let gid = GroupID(52)
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
-    let val = $ %*{
-      "groupId": gid.uint64.int,
-      "replicas": [{"nodeId": 10, "type": "voter"}],
-      "leader": 0,
-    }
-    discard store.raftPut(key, val)
+    let val = GroupRecord(
+      groupId: gid.uint64,
+      spaceId: 0,
+      preferredLeader: 0,
+      leader: 0, # 0 = no leader known
+      replicas: @[GroupReplicaBin(nodeId: 10, replicaType: rtVoter)]
+    )
+    discard store.raftPut(key, encode(val))
     store.loadGroupMembers()
 
     check not store.groupLeaders.hasKey(gid)
@@ -115,12 +124,14 @@ suite "RaftKVStoreExt - groupLeaders table":
   test "loadGroupMembers clears old groupLeaders on reload":
     let gid = GroupID(53)
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
-    let val = $ %*{
-      "groupId": gid.uint64.int,
-      "replicas": [{"nodeId": 10, "type": "voter"}],
-      "leader": 30,
-    }
-    discard store.raftPut(key, val)
+    let val = GroupRecord(
+      groupId: gid.uint64,
+      spaceId: 0,
+      preferredLeader: 0,
+      leader: 30,
+      replicas: @[GroupReplicaBin(nodeId: 10, replicaType: rtVoter)]
+    )
+    discard store.raftPut(key, encode(val))
     store.loadGroupMembers()
     check store.groupLeaders.hasKey(gid)
     check store.groupLeaders[gid] == 30'u32
@@ -179,40 +190,50 @@ suite "onLeaderChanged callback":
     # Create a sys.groups record for group 100 with non-local replicas
     let gid = GroupID(100)
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
-    let val = $ %*{
-      "groupId": 100,
-      "replicas": [
-        {"nodeId": 10, "type": "voter"},
-        {"nodeId": 20, "type": "voter"},
-      ],
-    }
-    let wr = store.raftPut(key, val)
+    let val = GroupRecord(
+      groupId: 100,
+      spaceId: 0,
+      preferredLeader: 0,
+      leader: 0,
+      replicas: @[
+        GroupReplicaBin(nodeId: 10, replicaType: rtVoter),
+        GroupReplicaBin(nodeId: 20, replicaType: rtVoter),
+      ]
+    )
+    let wr = store.raftPut(key, encode(val))
     check wr.isOk
 
     # Simulate the onLeaderChanged callback (node 20 won election for group 100)
     let storePtr = cast[pointer](store)
     nuraft_coordinator.onLeaderChanged(storePtr, gid, NodeID(20))
 
-    # Read back the sys.groups record and verify the "leader" field
+    # Read back the sys.groups record and verify the leader field
     let gr = store.raftGet(key)
     check gr.isOk
     check gr.value.isSome
-    let j = parseJson(gr.value.get().value)
-    check j["leader"].getInt() == 20
+    var rawVal = gr.value.get().value
+    # Strip MVCC encoding if present (sysTablePut wraps values in MVCC)
+    if mvccTypes.isLikelyMVCCValue(rawVal):
+      let mvccVal = mvccTypes.decodeMVCCValue(rawVal)
+      rawVal = mvccVal.data
+    let rec = decodeGroupRecord(rawVal)
+    check rec.leader == 20
 
   test "callback updates existing leader field":
     let gid = GroupID(101)
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
-    let val = $ %*{
-      "groupId": 101,
-      "replicas": [
-        {"nodeId": 10, "type": "voter"},
-        {"nodeId": 20, "type": "voter"},
-        {"nodeId": 30, "type": "voter"},
-      ],
-      "leader": 10,
-    }
-    discard store.raftPut(key, val)
+    let val = GroupRecord(
+      groupId: 101,
+      spaceId: 0,
+      preferredLeader: 0,
+      leader: 10,
+      replicas: @[
+        GroupReplicaBin(nodeId: 10, replicaType: rtVoter),
+        GroupReplicaBin(nodeId: 20, replicaType: rtVoter),
+        GroupReplicaBin(nodeId: 30, replicaType: rtVoter),
+      ]
+    )
+    discard store.raftPut(key, encode(val))
 
     # Node 30 wins election
     let storePtr = cast[pointer](store)
@@ -220,16 +241,24 @@ suite "onLeaderChanged callback":
 
     let gr = store.raftGet(key)
     check gr.isOk
-    let j = parseJson(gr.value.get().value)
-    check j["leader"].getInt() == 30
+    var rawVal = gr.value.get().value
+    # Strip MVCC encoding if present (sysTablePut wraps values in MVCC)
+    if mvccTypes.isLikelyMVCCValue(rawVal):
+      let mvccVal = mvccTypes.decodeMVCCValue(rawVal)
+      rawVal = mvccVal.data
+    let rec = decodeGroupRecord(rawVal)
+    check rec.leader == 30
 
   test "callback skips META_GROUP_ID":
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $META_GROUP_ID.uint64)
-    let val = $ %*{
-      "groupId": META_GROUP_ID.uint64.int,
-      "replicas": [{"nodeId": 10, "type": "voter"}],
-    }
-    discard store.raftPut(key, val)
+    let val = GroupRecord(
+      groupId: META_GROUP_ID.uint64,
+      spaceId: 0,
+      preferredLeader: 0,
+      leader: 0,
+      replicas: @[GroupReplicaBin(nodeId: 10, replicaType: rtVoter)]
+    )
+    discard store.raftPut(key, encode(val))
 
     # Fire callback for META_GROUP_ID
     let storePtr = cast[pointer](store)
@@ -238,24 +267,27 @@ suite "onLeaderChanged callback":
     # Should NOT have a leader field (callback skips meta group)
     let gr = store.raftGet(key)
     check gr.isOk
-    let j = parseJson(gr.value.get().value)
-    check not j.hasKey("leader")
+    let rec = decodeGroupRecord(gr.value.get().value)
+    check rec.leader == 0 # Still 0 (not updated)
 
   test "callback skips DATA_GROUP_START_ID":
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $DATA_GROUP_START_ID.uint64)
-    let val = $ %*{
-      "groupId": DATA_GROUP_START_ID.uint64.int,
-      "replicas": [{"nodeId": 10, "type": "voter"}],
-    }
-    discard store.raftPut(key, val)
+    let val = GroupRecord(
+      groupId: DATA_GROUP_START_ID.uint64,
+      spaceId: 0,
+      preferredLeader: 0,
+      leader: 0,
+      replicas: @[GroupReplicaBin(nodeId: 10, replicaType: rtVoter)]
+    )
+    discard store.raftPut(key, encode(val))
 
     let storePtr = cast[pointer](store)
     nuraft_coordinator.onLeaderChanged(storePtr, DATA_GROUP_START_ID, NodeID(10))
 
     let gr = store.raftGet(key)
     check gr.isOk
-    let j = parseJson(gr.value.get().value)
-    check not j.hasKey("leader")
+    let rec = decodeGroupRecord(gr.value.get().value)
+    check rec.leader == 0 # Still 0 (not updated)
 
   test "callback ignores nil storePtr":
     # Should not crash with nil pointer
@@ -275,14 +307,17 @@ suite "onLeaderChanged callback":
   test "loadGroupMembers reads back persisted leader after callback":
     let gid = GroupID(102)
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
-    let val = $ %*{
-      "groupId": 102,
-      "replicas": [
-        {"nodeId": 10, "type": "voter"},
-        {"nodeId": 20, "type": "voter"},
-      ],
-    }
-    discard store.raftPut(key, val)
+    let val = GroupRecord(
+      groupId: 102,
+      spaceId: 0,
+      preferredLeader: 0,
+      leader: 0,
+      replicas: @[
+        GroupReplicaBin(nodeId: 10, replicaType: rtVoter),
+        GroupReplicaBin(nodeId: 20, replicaType: rtVoter),
+      ]
+    )
+    discard store.raftPut(key, encode(val))
 
     # Simulate leader election
     let storePtr = cast[pointer](store)

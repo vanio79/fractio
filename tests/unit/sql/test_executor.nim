@@ -9,6 +9,7 @@ import fractio/sql/ast
 import fractio/sql/planner
 import fractio/sql/executor
 import fractio/distributed/meta/system_tables
+import fractio/distributed/meta/system_schemas
 import fractio/protocol/raft_store
 import fractio/protocol/mvcc_store
 import fractio/protocol/txn_manager
@@ -102,7 +103,7 @@ suite "SQL Executor — DDL":
 
     # Verify in catalog
     let key = encodeTableKey(SYS_DATABASES_TABLE_ID, "testdb")
-    let got = mvccStore.directGet(key)
+    let got = mvccStore.latestGet(key)
     check got.isOk
     check got.value.isSome
 
@@ -123,7 +124,7 @@ suite "SQL Executor — DDL":
     check res.kind == erkOk
     # Verify removed
     let key = encodeTableKey(SYS_DATABASES_TABLE_ID, "testdb")
-    let got = mvccStore.directGet(key)
+    let got = mvccStore.latestGet(key)
     check got.isOk
     check got.value.isNone
 
@@ -153,15 +154,15 @@ suite "SQL Executor — DDL":
     check res.kind == erkOk
     check res.okMessage == "CREATE TABLE"
 
-    # Verify catalog entry
+    # Verify catalog entry - decode as binary TableRecord
     let key = encodeTableKey(SYS_TABLES_TABLE_ID,
         "default.public.users")
-    let got = mvccStore.directGet(key)
+    let got = mvccStore.latestGet(key)
     check got.isOk
     check got.value.isSome
-    let j = parseJson(got.value.get())
-    check j["name"].getStr == "users"
-    check j["columns"].len == 3
+    let rec = decodeTableRecord(got.value.get())
+    check rec.name == "users"
+    check rec.columns.len == 3
 
   test "CREATE TABLE IF NOT EXISTS":
     discard exec(store, mvccStore,
@@ -213,7 +214,7 @@ suite "SQL Executor — DML":
 
     # Verify data row exists via MVCC-aware read
     let key = encodeDataRowKey(100, "1")
-    let got = mvccStore.directGet(key)
+    let got = mvccStore.latestGet(key)
     check got.isOk
     check got.value.isSome
     let row = parseJson(got.value.get())

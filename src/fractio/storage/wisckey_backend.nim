@@ -165,7 +165,8 @@ proc openWiscKey*(backend: WiscKeyBackend, config: StorageConfig): bool =
     c_leveldb_cache_destroy(backend.blockCache)
     backend.blockCache = nil
   if config.blockCacheSize > 0:
-    backend.blockCache = c_leveldb_cache_create_lru(csize_t(config.blockCacheSize))
+    backend.blockCache = c_leveldb_cache_create_lru(csize_t(
+        config.blockCacheSize))
     c_leveldb_options_set_cache(backend.options, backend.blockCache)
 
   # Set compression
@@ -218,13 +219,27 @@ method close*(backend: WiscKeyBackend) =
     c_leveldb_close(backend.db)
     backend.db = nil
 
-  # Destroy block cache (it's set on options, must be freed after db close)
+  # Destroy options FIRST (they hold references to the cache)
+  # The cache reference count is decremented when options are destroyed
+  if backend.readOptions != nil:
+    c_leveldb_readoptions_destroy(backend.readOptions)
+    backend.readOptions = nil
+  if backend.writeOptions != nil:
+    c_leveldb_writeoptions_destroy(backend.writeOptions)
+    backend.writeOptions = nil
+  if backend.noSyncWriteOptions != nil:
+    c_leveldb_writeoptions_destroy(backend.noSyncWriteOptions)
+    backend.noSyncWriteOptions = nil
+  if backend.options != nil:
+    c_leveldb_options_destroy(backend.options)
+    backend.options = nil
+
+  # NOW destroy block cache (after options are gone)
+  # This ensures proper reference counting
   if backend.blockCache != nil:
     c_leveldb_cache_destroy(backend.blockCache)
     backend.blockCache = nil
 
-  # Don't destroy options - they can be reused for reopening
-  # Just reset the state
   backend.isOpen = false
 
 method isOpen*(backend: WiscKeyBackend): bool =

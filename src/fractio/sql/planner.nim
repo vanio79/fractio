@@ -7,8 +7,9 @@
 import std/[options, json, strutils, strformat]
 import ./ast
 import ../distributed/meta/system_tables
+import ../distributed/meta/system_schemas
 import ../protocol/raft_store
-from ../protocol/mvcc_store import MvccTransactionStore, directGet, directScan,
+from ../protocol/mvcc_store import MvccTransactionStore, latestGet, latestScan,
     MvccResult, mvccOk, mvccErr
 import ../core/types as coreTypes
 
@@ -212,6 +213,17 @@ proc columnNames*(desc: TableDescriptor): seq[string] =
 # Catalog lookups
 # ---------------------------------------------------------------------------
 
+proc columnDataTypeToDataType(cdt: ColumnDataType): DataType =
+  ## Convert binary format column type to core DataType
+  case cdt
+  of cdtInt: dtInt
+  of cdtFloat: dtFloat
+  of cdtString: dtString
+  of cdtBool: dtBool
+  of cdtBytes: dtBytes
+  of cdtDate: dtDate
+  of cdtDateTime: dtDateTime
+
 proc resolveTable*(store: RaftKVStoreExt, mvccStore: MvccTransactionStore,
     database, schema, tableName: string): Option[TableDescriptor] =
   ## Look up a table descriptor from the system catalog.
@@ -224,7 +236,7 @@ proc resolveTable*(store: RaftKVStoreExt, mvccStore: MvccTransactionStore,
 
   # Try MVCC store first (handles MVCC-encoded keys)
   if mvccStore != nil:
-    let mvccRes = mvccStore.directGet(catalogKey)
+    let mvccRes = mvccStore.latestGet(catalogKey)
     if mvccRes.isOk:
       entryOpt = mvccRes.value
   else:
@@ -236,35 +248,25 @@ proc resolveTable*(store: RaftKVStoreExt, mvccStore: MvccTransactionStore,
   if entryOpt.isNone:
     return none(TableDescriptor)
 
-  try:
-    let j = parseJson(entryOpt.get())
-    var desc = TableDescriptor(
-      tableId: uint32(j["tableId"].getInt()),
-      name: j["name"].getStr(),
-      schema: j.getOrDefault("schema").getStr(""),
-      database: j.getOrDefault("database").getStr(""),
-    )
-    if j.hasKey("primaryKey"):
-      for pk in j["primaryKey"]:
-        desc.primaryKey.add(pk.getStr())
-    if j.hasKey("columns"):
-      for c in j["columns"]:
-        var cd = ColDef(name: c["name"].getStr())
-        let dt = c.getOrDefault("type").getStr("TEXT")
-        case dt.toUpperAscii
-        of "INT", "INTEGER": cd.dataType = dtInt
-        of "FLOAT", "REAL", "DOUBLE": cd.dataType = dtFloat
-        of "BOOL", "BOOLEAN": cd.dataType = dtBool
-        of "DATE": cd.dataType = dtDate
-        of "DATETIME", "TIMESTAMP": cd.dataType = dtDateTime
-        of "BYTES", "BLOB": cd.dataType = dtBytes
-        else: cd.dataType = dtString
-        cd.primaryKey = c.getOrDefault("primaryKey").getBool(false)
-        cd.notNull = c.getOrDefault("notNull").getBool(false)
-        desc.columns.add(cd)
-    some(desc)
-  except JsonParsingError:
-    none(TableDescriptor)
+  let raw = entryOpt.get()
+  let rec = decodeTableRecord(raw)
+  var desc = TableDescriptor(
+    tableId: rec.tableId,
+    name: rec.name,
+    schema: rec.schema,
+    database: rec.database,
+  )
+  # Copy primary key columns
+  for pk in rec.primaryKey:
+    desc.primaryKey.add(pk)
+  # Convert columns
+  for col in rec.columns:
+    var cd = ColDef(name: col.name)
+    cd.dataType = columnDataTypeToDataType(col.dataType)
+    cd.primaryKey = (col.flags and 0x01) != 0
+    cd.notNull = (col.flags and 0x02) != 0
+    desc.columns.add(cd)
+  some(desc)
 
 proc nextTableId*(store: RaftKVStoreExt,
     mvccStore: MvccTransactionStore): uint32 =
@@ -275,27 +277,19 @@ proc nextTableId*(store: RaftKVStoreExt,
   var maxId = FIRST_USER_TABLE_ID - 1
 
   if mvccStore != nil:
-    let scanRes = mvccStore.directScan(startKey, endKey, 0)
+    let scanRes = mvccStore.latestScan(startKey, endKey, 0)
     if scanRes.isOk:
       for (key, value) in scanRes.value:
-        try:
-          let j = parseJson(value)
-          let tid = uint32(j["tableId"].getInt())
-          if tid >= FIRST_USER_TABLE_ID and tid > maxId:
-            maxId = tid
-        except JsonParsingError:
-          discard
+        let rec = decodeTableRecord(value)
+        if rec.tableId >= FIRST_USER_TABLE_ID and rec.tableId > maxId:
+          maxId = rec.tableId
   else:
     let res = store.raftScan(startKey, endKey, 0, includeSystemKeys = true)
     if res.isOk:
       for (key, entry) in res.value:
-        try:
-          let j = parseJson(entry.value)
-          let tid = uint32(j["tableId"].getInt())
-          if tid >= FIRST_USER_TABLE_ID and tid > maxId:
-            maxId = tid
-        except JsonParsingError:
-          discard
+        let rec = decodeTableRecord(entry.value)
+        if rec.tableId >= FIRST_USER_TABLE_ID and rec.tableId > maxId:
+          maxId = rec.tableId
   maxId + 1
 
 # ---------------------------------------------------------------------------
@@ -311,6 +305,17 @@ proc dataTypeToString*(dt: DataType): string =
   of dtDate: "DATE"
   of dtDateTime: "DATETIME"
   of dtBytes: "BYTES"
+
+proc dataTypeToColumnDataType(dt: DataType): ColumnDataType =
+  ## Convert core DataType to binary format ColumnDataType
+  case dt
+  of dtInt: cdtInt
+  of dtFloat: cdtFloat
+  of dtString: cdtString
+  of dtBool: cdtBool
+  of dtBytes: cdtBytes
+  of dtDate: cdtDate
+  of dtDateTime: cdtDateTime
 
 proc exprToJsonValue*(e: Expr): JsonNode =
   ## Convert a literal expression to a JSON value.
@@ -331,15 +336,16 @@ proc exprToJsonValue*(e: Expr): JsonNode =
 
 proc planCreateDatabase(stmt: Stmt): Plan =
   let plan = newPlan()
-  let value = %*{
-    "name": stmt.cdbName,
-    "replicas": if stmt.cdbReplicas.isSome: %stmt.cdbReplicas.get else: newJNull(),
-  }
+  # Use binary encoding for DatabaseRecord
+  let rec = DatabaseRecord(
+    name: stmt.cdbName,
+    createdAtNs: nowNs()
+  )
   plan.add(PlanOp(kind: poCreateDatabase,
     cdbName: stmt.cdbName,
     cdbIfNotExists: stmt.cdbIfNotExists,
     cdbReplicas: stmt.cdbReplicas,
-    cdbValue: $value,
+    cdbValue: encode(rec),
   ))
   plan
 
@@ -353,16 +359,17 @@ proc planDropDatabase(stmt: Stmt): Plan =
 
 proc planCreateSchema(stmt: Stmt, database: string): Plan =
   let plan = newPlan()
-  let value = %*{
-    "name": stmt.csName,
-    "database": database,
-    "replicas": if stmt.csReplicas.isSome: %stmt.csReplicas.get else: newJNull(),
-  }
+  # Use binary encoding for SchemaRecord
+  let rec = SchemaRecord(
+    name: stmt.csName,
+    database: database,
+    createdAtNs: nowNs()
+  )
   plan.add(PlanOp(kind: poCreateSchema,
     csName: stmt.csName,
     csIfNotExists: stmt.csIfNotExists,
     csReplicas: stmt.csReplicas,
-    csValue: $value,
+    csValue: encode(rec),
     csDatabase: database,
   ))
   plan
@@ -381,17 +388,18 @@ proc planCreateTable(stmt: Stmt, store: RaftKVStoreExt,
     database, schema: string): Plan =
   let plan = newPlan()
 
-  # Build column JSON
-  var colsJson = newJArray()
+  # Build column definitions in binary format
+  var columns: seq[ColumnDefBin]
   for col in stmt.ctColumns:
-    var c = %*{
-      "name": col.name,
-      "type": dataTypeToString(col.dataType),
-      "notNull": col.notNull,
-      "primaryKey": col.primaryKey,
-      "unique": col.unique,
-    }
-    colsJson.add(c)
+    var flags: uint8 = 0
+    if col.primaryKey: flags = flags or 0x01
+    if col.notNull: flags = flags or 0x02
+    if col.unique: flags = flags or 0x04
+    columns.add(ColumnDefBin(
+      name: col.name,
+      dataType: dataTypeToColumnDataType(col.dataType),
+      flags: flags
+    ))
 
   # Determine primary key
   var pk: seq[string]
@@ -403,24 +411,22 @@ proc planCreateTable(stmt: Stmt, store: RaftKVStoreExt,
         pk.add(col.name)
 
   let tableId = nextTableId(store, mvccStore)
-  let value = %*{
-    "tableId": int(tableId),
-    "name": stmt.ctTable,
-    "schema": schema,
-    "database": database,
-    "columns": colsJson,
-    "primaryKey": pk,
-    "replicas": if stmt.ctReplicas.isSome: %stmt.ctReplicas.get else: newJNull(),
-  }
 
-  # Store spaceId if IN SPACE specified (resolved at execution time)
-  if stmt.ctSpaceName.isSome:
-    value["spaceName"] = %stmt.ctSpaceName.get()
+  # Use binary encoding for TableRecord
+  let rec = TableRecord(
+    tableId: tableId,
+    name: stmt.ctTable,
+    schema: schema,
+    database: database,
+    spaceId: -1'i32, # Will be resolved at execution time
+    primaryKey: pk,
+    columns: columns
+  )
 
   plan.add(PlanOp(kind: poCreateTable,
     ctName: stmt.ctTable,
     ctIfNotExists: stmt.ctIfNotExists,
-    ctValue: $value,
+    ctValue: encode(rec),
     ctSchema: schema,
     ctDatabase: database,
     ctSpaceName: stmt.ctSpaceName,
@@ -564,14 +570,22 @@ proc planDelete(stmt: Stmt, store: RaftKVStoreExt,
 
 proc planCreateSpace(stmt: Stmt): Plan =
   let plan = newPlan()
-  let value = %*{
-    "name": stmt.csSpaceName,
-    "replicas": stmt.csSpaceReplicas,
-  }
+  # Use binary encoding for SpaceRecord
+  # spaceId will be assigned at execution time
+  let rec = SpaceRecord(
+    spaceId: -1'i32, # Will be assigned at execution time
+    name: stmt.csSpaceName,
+    replicas: int32(stmt.csSpaceReplicas),
+    groupCount: 0,
+    groupIds: @[],
+    oldGroupIds: @[],
+    rebalancing: false,
+    createdAtNs: nowNs()
+  )
   plan.add(PlanOp(kind: poCreateSpace,
     cspName: stmt.csSpaceName,
     cspReplicas: stmt.csSpaceReplicas,
-    cspValue: $value,
+    cspValue: encode(rec),
   ))
   plan
 

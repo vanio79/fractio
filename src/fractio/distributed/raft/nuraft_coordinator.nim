@@ -7,7 +7,6 @@
 # Example: node with basePort=7000, group 6 → port 7006.
 
 import std/atomics
-import std/json
 import std/locks
 import std/options
 import std/os
@@ -18,12 +17,38 @@ import std/logging
 import fractio/distributed/raft/c_bindings
 import fractio/distributed/raft/group_types
 import fractio/distributed/raft/multigroup_types
+import fractio/utils/binary
 import fractio/storage/backend
 import fractio/storage/wisckey_backend
 
 # ============================================================================
 # Types
 # ============================================================================
+
+# C-allocated buffer for commit callbacks (avoids Nim GC cross-thread issues)
+type
+  CommitPayload = object
+    data: ptr char
+    len: int
+    groupId: GroupID
+    storePtr: pointer
+    next: ptr CommitPayload
+
+  CommitQueue = object
+    head: ptr CommitPayload
+    tail: ptr CommitPayload
+    lock: Lock
+    cond: bool # Simple flag for now; can upgrade to condition variable
+
+var commitQueue: CommitQueue
+var commitQueueInitialized {.threadvar.}: bool
+
+proc initCommitQueue() =
+  if not commitQueueInitialized:
+    initLock(commitQueue.lock)
+    commitQueue.head = nil
+    commitQueue.tail = nil
+    commitQueueInitialized = true
 
 type
   NuRaftGroupInstance* = object
@@ -71,6 +96,8 @@ type
 proc c_malloc(size: csize_t): pointer {.importc: "malloc",
     header: "<stdlib.h>".}
 proc c_free(p: pointer) {.importc: "free", header: "<stdlib.h>".}
+proc c_memcpy(dst, src: pointer, n: csize_t): pointer {.importc: "memcpy",
+    header: "<string.h>".}
 
 proc allocInstance(): NuRaftGroupInstancePtr =
   result = cast[NuRaftGroupInstancePtr](c_malloc(csize_t(sizeof(
@@ -86,8 +113,11 @@ proc freeInstance(p: NuRaftGroupInstancePtr) =
 # ============================================================================
 
 ## Called when a committed WriteBatch should be applied to the KV state machine.
+## IMPORTANT: This callback receives raw C data (cstring + len) to avoid Nim GC
+## allocations on NuRaft's ASIO thread. The callback MUST copy the data into
+## Nim-managed memory before using it.
 var applyBatchCallback*: proc(storePtr: pointer, rid: GroupID,
-    batch: WriteBatch) {.gcsafe, raises: [].} = nil
+    data: cstring, len: int) {.gcsafe, raises: [].} = nil
 
 ## Called when a sys.groups key is applied via Raft.
 var onGroupMetadataApplied*: proc(storePtr: pointer,
@@ -101,73 +131,93 @@ var onLeaderChanged*: proc(storePtr: pointer, groupId: GroupID,
 var getPreferredLeaderCallback*: proc(storePtr: pointer,
     groupId: GroupID): Option[NodeID] {.gcsafe, raises: [].} = nil
 
+proc clearModuleCallbacks*() {.gcsafe, raises: [].} =
+  ## Clear all module-level callbacks to prevent stale closures from being
+  ## invoked after shutdown. Must be called before coordinator.stop().
+  ## This breaks the reference cycles that keep RaftKVStoreExt alive.
+  {.cast(gcsafe).}:
+    applyBatchCallback = nil
+    onGroupMetadataApplied = nil
+    onLeaderChanged = nil
+    getPreferredLeaderCallback = nil
+
 # ============================================================================
-# WriteBatch Serialization (JSON — same format as multigroup_log.nim)
+# WriteBatch Serialization (Binary)
 # ============================================================================
 
 proc serializeWriteBatch*(batch: WriteBatch): string =
-  ## Serialize a WriteBatch to JSON string for NuRaft log entries.
-  let j = %*{
-    "commandKind": ord(ckWrite),
-    "puts": newJArray(),
-    "deletes": newJArray()
-  }
+  ## Serialize a WriteBatch to binary format for NuRaft log entries.
+  ## Format:
+  ##   - commandKind: 1 byte (ckWrite = 1)
+  ##   - puts count: 4 bytes (uint32)
+  ##   - for each put:
+  ##     - key length: 4 bytes (uint32)
+  ##     - key: key length bytes
+  ##     - value length: 4 bytes (uint32)
+  ##     - value: value length bytes
+  ##   - deletes count: 4 bytes (uint32)
+  ##   - for each delete:
+  ##     - key length: 4 bytes (uint32)
+  ##     - key: key length bytes
+  var w = initBinaryWriter()
+  w.writeU8(uint8(ckWrite))
+  w.writeU32(uint32(batch.puts.len))
   for (k, v) in batch.puts:
-    j["puts"].add(%*{"key": %k, "value": %v})
+    w.writeU32(uint32(k.len))
+    w.writeBytes(k)
+    w.writeU32(uint32(v.len))
+    w.writeBytes(v)
+  w.writeU32(uint32(batch.deletes.len))
   for k in batch.deletes:
-    j["deletes"].add(%*{"key": %k})
-  result = $j
+    w.writeU32(uint32(k.len))
+    w.writeBytes(k)
+  result = w.finish()
 
 proc deserializeWriteBatch*(data: string): WriteBatch =
-  ## Deserialize a WriteBatch from JSON string.
-  let j = parseJson(data)
+  ## Deserialize a WriteBatch from binary format.
+  var r = initBinaryReader(data)
+  let cmdKind = CommandKind(r.readU8())
+  if cmdKind != ckWrite:
+    return nil
   result = newWriteBatch()
-  if j.hasKey("puts"):
-    for p in j["puts"]:
-      var key: seq[byte]
-      for b in p["key"]:
-        key.add(byte(b.getInt()))
-      var value: seq[byte]
-      for b in p["value"]:
-        value.add(byte(b.getInt()))
-      result.put(key, value)
-  if j.hasKey("deletes"):
-    for d in j["deletes"]:
-      var key: seq[byte]
-      for b in d["key"]:
-        key.add(byte(b.getInt()))
-      result.delete(key)
+  let putsCount = int(r.readU32())
+  for _ in 0 ..< putsCount:
+    let keyLen = int(r.readU32())
+    let key = r.readBytes(keyLen)
+    let valLen = int(r.readU32())
+    let value = r.readBytes(valLen)
+    result.put(key, value)
+  let delCount = int(r.readU32())
+  for _ in 0 ..< delCount:
+    let keyLen = int(r.readU32())
+    let key = r.readBytes(keyLen)
+    result.delete(key)
 
 # ============================================================================
 # NuRaft Commit Callback (C → Nim bridge)
 # ============================================================================
 
 proc nuraftCommitCb(ctx: pointer, logIdx: uint64,
-    data: cstring, len: csize_t) {.cdecl, gcsafe.} =
+    data: cstring, len: csize_t) {.cdecl.} =
   ## Called from NuRaft C++ when a log entry is committed.
   ## ctx is a raw pointer to NuRaftGroupInstance.
-  discard logIdx # Not needed - commit is applied via batch
+  ##
+  ## IMPORTANT: This runs on NuRaft's ASIO thread. We must NOT allocate
+  ## Nim GC-managed memory here. We pass raw C data to the callback,
+  ## which copies it into Nim memory on its own thread.
+  discard logIdx
   if ctx == nil or data == nil or len == 0: return
 
+  let inst = cast[NuRaftGroupInstancePtr](ctx)
+  if inst.stopped: return
+  let coord = cast[NuRaftCoordinator](inst.coordPtr)
+  if coord == nil or coord.kvStorePtr == nil: return
+
+  # Pass raw C data directly to callback - callback handles copying
+  # Cast to gcsafe since the callback is designed to handle cross-thread data
   {.cast(gcsafe).}:
-    let inst = cast[NuRaftGroupInstancePtr](ctx)
-    if inst.stopped: return
-    let coord = cast[NuRaftCoordinator](inst.coordPtr)
-    if coord == nil or coord.kvStorePtr == nil: return
-
-    let payload = newString(len.int)
-    copyMem(addr payload[0], data, len.int)
-
-    try:
-      let j = parseJson(payload)
-      let cmdKind = CommandKind(j["commandKind"].getInt())
-
-      if cmdKind == ckWrite:
-        let batch = deserializeWriteBatch(payload)
-        if applyBatchCallback != nil:
-          applyBatchCallback(coord.kvStorePtr, inst.groupId, batch)
-    except CatchableError:
-      discard
+    if applyBatchCallback != nil:
+      applyBatchCallback(coord.kvStorePtr, inst.groupId, data, len.int)
 
 # ============================================================================
 # NuRaft Event Callback (leader/follower changes)

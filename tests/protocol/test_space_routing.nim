@@ -14,6 +14,7 @@ import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
+import fractio/distributed/meta/system_schemas
 import fractio/storage/wisckey_backend
 
 # ---------------------------------------------------------------------------
@@ -174,10 +175,10 @@ suite "Space routing — put and get with 3 groups":
       if routeToGroup(candidate, space.groupIds) != targetRid:
         otherPk = candidate
         break
-    check otherPk.len > 0  # found one
+    check otherPk.len > 0 # found one
     let gr2 = store.raftGetInSpace(key, space, otherPk)
     check gr2.isOk
-    check gr2.value.isSome  # found via shared backend
+    check gr2.value.isSome # found via shared backend
 
   test "multiple keys distribute across groups":
     let (coord, store, space) = makeMultiGroupStore(
@@ -209,7 +210,7 @@ suite "Space routing — put and get with 3 groups":
     var nonEmpty = 0
     for c in groupKeys:
       if c > 0: inc nonEmpty
-    check nonEmpty >= 2  # at least 2 groups have data
+    check nonEmpty >= 2 # at least 2 groups have data
 
 # ---------------------------------------------------------------------------
 # Suite: raftDeleteInSpace
@@ -377,24 +378,35 @@ suite "Space routing — cache loading":
         "/tmp/fractio_sr_t30", 2)
     defer: teardown(coord, "/tmp/fractio_sr_t30")
 
-    # Write a space record into the meta range
+    # Write a space record into the meta range (binary format)
     let spaceKey = encodeSpaceKey(5)
-    let spaceVal = $ %*{
-      "spaceId": 5,
-      "name": "myspace",
-      "replicas": 1,
-      "groupIds": [10, 11],
-    }
-    discard store.raftPut(spaceKey, spaceVal)
+    let spaceRec = SpaceRecord(
+      spaceId: 5,
+      name: "myspace",
+      replicas: 1,
+      groupCount: 2,
+      groupIds: @[10'u64, 11'u64],
+      oldGroupIds: @[],
+      rebalancing: false,
+      rebalanceWorker: 0,
+      rebalanceHeartbeat: 0,
+      rebalanceCursor: "",
+      createdAtNs: 0
+    )
+    discard store.raftPut(spaceKey, encode(spaceRec))
 
-    # Write a table record with spaceId
+    # Write a table record with spaceId (binary format)
     let tableKey = encodeTableKey(SYS_TABLES_TABLE_ID, "default.public.mytable")
-    let tableVal = $ %*{
-      "tableId": 100,
-      "name": "mytable",
-      "spaceId": 5,
-    }
-    discard store.raftPut(tableKey, tableVal)
+    let tableRec = TableRecord(
+      tableId: 100,
+      name: "mytable",
+      database: "default",
+      schema: "public",
+      spaceId: 5,
+      primaryKey: @[],
+      columns: @[]
+    )
+    discard store.raftPut(tableKey, encode(tableRec))
 
     # Load caches
     store.loadSpaces()

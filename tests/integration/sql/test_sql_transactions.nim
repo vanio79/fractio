@@ -12,6 +12,7 @@ import fractio/protocol/txn_manager
 import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
+import fractio/distributed/meta/system_schemas
 import fractio/distributed/sharedtimer/mock
 import fractio/distributed/sharedtimer/types as timerTypes
 import fractio/core/timestamp_provider
@@ -360,11 +361,16 @@ suite "SQL Transactions - DDL Operations":
     let (coord, raftStore, mvccStore, ctx) = makeTestEnv("/tmp/fractio_sql_txn13")
     defer: teardownTestEnv(coord, "/tmp/fractio_sql_txn13")
 
-    # Seed the node registry so CREATE SPACE can work
+    # Seed the node registry so CREATE SPACE can work (binary format)
     let nodeKey = encodeTableKey(SYS_NODES_TABLE_ID, "1")
-    let nodeVal = $ %*{"nodeId": 1, "host": "127.0.0.1", "raftPort": 20713,
-        "clientPort": 20714}
-    discard raftStore.raftPut(nodeKey, nodeVal)
+    let nodeRec = NodeRecord(
+      nodeId: 1,
+      host: "127.0.0.1",
+      raftPort: 20713,
+      clientPort: 20714,
+      status: nsAlive
+    )
+    discard raftStore.raftPut(nodeKey, encode(nodeRec))
 
     # Create space and table in it
     let spaceRes = executeSQLWithTxn("CREATE SPACE myspace WITH REPLICAS = ALL",
@@ -392,11 +398,16 @@ suite "SQL Transactions - DDL Operations":
     let (coord, raftStore, mvccStore, ctx) = makeTestEnv("/tmp/fractio_sql_txn14")
     defer: teardownTestEnv(coord, "/tmp/fractio_sql_txn14")
 
-    # Seed the node registry so CREATE SPACE can work
+    # Seed the node registry so CREATE SPACE can work (binary format)
     let nodeKey = encodeTableKey(SYS_NODES_TABLE_ID, "1")
-    let nodeVal = $ %*{"nodeId": 1, "host": "127.0.0.1", "raftPort": 20718,
-        "clientPort": 20719}
-    discard raftStore.raftPut(nodeKey, nodeVal)
+    let nodeRec = NodeRecord(
+      nodeId: 1,
+      host: "127.0.0.1",
+      raftPort: 20718,
+      clientPort: 20719,
+      status: nsAlive
+    )
+    discard raftStore.raftPut(nodeKey, encode(nodeRec))
 
     # Create empty space
     let spaceRes = executeSQLWithTxn("CREATE SPACE emptyspace WITH REPLICAS = ALL",
@@ -474,11 +485,16 @@ suite "SQL Transactions - DDL Operations":
     let (coord, raftStore, mvccStore, ctx) = makeTestEnv("/tmp/fractio_sql_txn18")
     defer: teardownTestEnv(coord, "/tmp/fractio_sql_txn18")
 
-    # Seed the node registry so CREATE SPACE can work
+    # Seed the node registry so CREATE SPACE can work (binary format)
     let nodeKey = encodeTableKey(SYS_NODES_TABLE_ID, "1")
-    let nodeVal = $ %*{"nodeId": 1, "host": "127.0.0.1", "raftPort": 20780,
-        "clientPort": 20781}
-    discard raftStore.raftPut(nodeKey, nodeVal)
+    let nodeRec = NodeRecord(
+      nodeId: 1,
+      host: "127.0.0.1",
+      raftPort: 20780,
+      clientPort: 20781,
+      status: nsAlive
+    )
+    discard raftStore.raftPut(nodeKey, encode(nodeRec))
 
     # Start transaction
     discard executeSQLWithTxn("BEGIN", raftStore, mvccStore, ctx)
@@ -511,11 +527,16 @@ suite "SQL Transactions - DDL Operations":
     let (coord, raftStore, mvccStore, ctx) = makeTestEnv("/tmp/fractio_sql_txn19")
     defer: teardownTestEnv(coord, "/tmp/fractio_sql_txn19")
 
-    # Seed the node registry so CREATE SPACE can work
+    # Seed the node registry so CREATE SPACE can work (binary format)
     let nodeKey = encodeTableKey(SYS_NODES_TABLE_ID, "1")
-    let nodeVal = $ %*{"nodeId": 1, "host": "127.0.0.1", "raftPort": 20785,
-        "clientPort": 20786}
-    discard raftStore.raftPut(nodeKey, nodeVal)
+    let nodeRec = NodeRecord(
+      nodeId: 1,
+      host: "127.0.0.1",
+      raftPort: 20785,
+      clientPort: 20786,
+      status: nsAlive
+    )
+    discard raftStore.raftPut(nodeKey, encode(nodeRec))
 
     # Create space outside transaction
     let createRes = executeSQLWithTxn("CREATE SPACE dropspace WITH REPLICAS = ALL",

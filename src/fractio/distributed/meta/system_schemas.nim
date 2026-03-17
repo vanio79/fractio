@@ -1,0 +1,477 @@
+# System Table Binary Schemas for Fractio
+#
+# Defines typed record structures for all system tables.
+# These are serialized using the binary.nim primitives.
+#
+# All variable-length fields use length-prefixed encoding.
+# Multi-field records use a header + trailer pattern for efficiency.
+
+import std/times
+import fractio/utils/binary
+
+# =============================================================================
+# Constants
+# =============================================================================
+
+const
+  MAX_NAME_LEN* = 64          # Max length for names (database, schema, table)
+  MAX_HOST_LEN* = 64          # Max length for hostnames
+  MAX_COLUMN_NAME_LEN* = 32   # Max length for column names
+  MAX_COLUMNS_PER_TABLE* = 64 # Reasonable limit for columns
+
+# =============================================================================
+# Database Record (sys.databases)
+# =============================================================================
+
+type
+  DatabaseRecord* = object
+    ## Record stored in SYS_DATABASES_TABLE
+    ## Key: /t/0000000001/<dbName>
+    name*: string # Database name (length-prefixed)
+    createdAtNs*: int64 # Unix nanoseconds
+
+proc encode*(rec: DatabaseRecord): string =
+  ## Encode a DatabaseRecord to binary
+  var w = initBinaryWriter()
+  w.writeString(rec.name)
+  w.writeI64(rec.createdAtNs)
+  w.finish()
+
+proc decodeDatabaseRecord*(data: string): DatabaseRecord =
+  ## Decode binary data to a DatabaseRecord
+  var r = initBinaryReader(data)
+  result.name = r.readString()
+  result.createdAtNs = r.readI64()
+
+# =============================================================================
+# Schema Record (sys.schemas)
+# =============================================================================
+
+type
+  SchemaRecord* = object
+    ## Record stored in SYS_SCHEMAS_TABLE
+    ## Key: /t/0000000002/<databaseName>.<schemaName>
+    name*: string # Schema name
+    database*: string # Parent database name
+    createdAtNs*: int64 # Unix nanoseconds
+
+proc encode*(rec: SchemaRecord): string =
+  var w = initBinaryWriter()
+  w.writeString(rec.name)
+  w.writeString(rec.database)
+  w.writeI64(rec.createdAtNs)
+  w.finish()
+
+proc decodeSchemaRecord*(data: string): SchemaRecord =
+  var r = initBinaryReader(data)
+  result.name = r.readString()
+  result.database = r.readString()
+  result.createdAtNs = r.readI64()
+
+# =============================================================================
+# Column Definition (for TableRecord)
+# =============================================================================
+
+type
+  ColumnDataType* = enum
+    cdtInt = 0
+    cdtFloat = 1
+    cdtString = 2
+    cdtBool = 3
+    cdtBytes = 4
+    cdtDate = 5
+    cdtDateTime = 6
+
+  ColumnFlags* = enum
+    cfPrimaryKey
+    cfNotNull
+    cfUnique
+
+  ColumnDefBin* = object
+    ## Binary-encoded column definition
+    name*: string
+    dataType*: ColumnDataType
+    flags*: uint8 # Bitfield: bit 0 = primaryKey, bit 1 = notNull, bit 2 = unique
+
+proc encodeColumnDef*(col: ColumnDefBin, w: var BinaryWriter) =
+  w.writeString(col.name)
+  w.writeU8(uint8(col.dataType))
+  w.writeU8(col.flags)
+
+proc decodeColumnDef*(r: var BinaryReader): ColumnDefBin =
+  result.name = r.readString()
+  result.dataType = ColumnDataType(r.readU8())
+  result.flags = r.readU8()
+
+# =============================================================================
+# Table Record (sys.tables)
+# =============================================================================
+
+type
+  TableRecord* = object
+    ## Record stored in SYS_TABLES_TABLE
+    ## Key: /t/0000000003/<database>.<schema>.<tableName>
+    tableId*: uint32
+    name*: string
+    schema*: string
+    database*: string
+    spaceId*: int32 # -1 = default space
+    primaryKey*: seq[string] # Column names forming the primary key
+    columns*: seq[ColumnDefBin]
+
+proc encode*(rec: TableRecord): string =
+  var w = initBinaryWriter()
+  w.writeU32(rec.tableId)
+  w.writeString(rec.name)
+  w.writeString(rec.schema)
+  w.writeString(rec.database)
+  w.writeI32(rec.spaceId)
+  # Primary key columns
+  w.writeU32(uint32(rec.primaryKey.len))
+  for pk in rec.primaryKey:
+    w.writeString(pk)
+  # Columns
+  w.writeU32(uint32(rec.columns.len))
+  for col in rec.columns:
+    encodeColumnDef(col, w)
+  w.finish()
+
+proc decodeTableRecord*(data: string): TableRecord =
+  var r = initBinaryReader(data)
+  result.tableId = r.readU32()
+  result.name = r.readString()
+  result.schema = r.readString()
+  result.database = r.readString()
+  result.spaceId = r.readI32()
+  # Primary key columns
+  let pkCount = int(r.readU32())
+  result.primaryKey = newSeq[string](pkCount)
+  for i in 0..<pkCount:
+    result.primaryKey[i] = r.readString()
+  # Columns
+  let colCount = int(r.readU32())
+  result.columns = newSeq[ColumnDefBin](colCount)
+  for i in 0..<colCount:
+    result.columns[i] = decodeColumnDef(r)
+
+# =============================================================================
+# Group Replica (for GroupRecord)
+# =============================================================================
+
+type
+  ReplicaType* = enum
+    rtVoter = 0
+    rtLearner = 1
+
+  GroupReplicaBin* = object
+    nodeId*: uint32
+    replicaType*: ReplicaType
+
+proc encodeGroupReplica*(rep: GroupReplicaBin, w: var BinaryWriter) =
+  w.writeU32(rep.nodeId)
+  w.writeU8(uint8(rep.replicaType))
+
+proc decodeGroupReplica*(r: var BinaryReader): GroupReplicaBin =
+  result.nodeId = r.readU32()
+  result.replicaType = ReplicaType(r.readU8())
+
+# =============================================================================
+# Group Record (sys.groups)
+# =============================================================================
+
+type
+  GroupRecord* = object
+    ## Record stored in SYS_GROUPS_TABLE
+    ## Key: /t/0000000004/<groupId>
+    groupId*: uint64
+    spaceId*: int32
+    preferredLeader*: uint32
+    leader*: uint32 # Current leader (0 = unknown)
+    replicas*: seq[GroupReplicaBin]
+
+proc encode*(rec: GroupRecord): string =
+  var w = initBinaryWriter()
+  w.writeU64(rec.groupId)
+  w.writeI32(rec.spaceId)
+  w.writeU32(rec.preferredLeader)
+  w.writeU32(rec.leader)
+  # Replicas
+  w.writeU32(uint32(rec.replicas.len))
+  for rep in rec.replicas:
+    encodeGroupReplica(rep, w)
+  w.finish()
+
+proc decodeGroupRecord*(data: string): GroupRecord =
+  var r = initBinaryReader(data)
+  result.groupId = r.readU64()
+  result.spaceId = r.readI32()
+  result.preferredLeader = r.readU32()
+  result.leader = r.readU32()
+  # Replicas
+  let repCount = int(r.readU32())
+  result.replicas = newSeq[GroupReplicaBin](repCount)
+  for i in 0..<repCount:
+    result.replicas[i] = decodeGroupReplica(r)
+
+# =============================================================================
+# Node Record (sys.nodes)
+# =============================================================================
+
+type
+  NodeStatus* = enum
+    nsUnknown = 0
+    nsAlive = 1
+    nsDraining = 2
+    nsDecommissioned = 3
+
+  NodeRecord* = object
+    ## Record stored in SYS_NODES_TABLE
+    ## Key: /t/0000000005/<nodeId>
+    nodeId*: uint32
+    host*: string
+    raftPort*: uint16
+    clientPort*: uint16
+    status*: NodeStatus
+
+proc encode*(rec: NodeRecord): string =
+  var w = initBinaryWriter()
+  w.writeU32(rec.nodeId)
+  w.writeString(rec.host)
+  w.writeU16(rec.raftPort)
+  w.writeU16(rec.clientPort)
+  w.writeU8(uint8(rec.status))
+  w.finish()
+
+proc decodeNodeRecord*(data: string): NodeRecord =
+  var r = initBinaryReader(data)
+  result.nodeId = r.readU32()
+  result.host = r.readString()
+  result.raftPort = r.readU16()
+  result.clientPort = r.readU16()
+  result.status = NodeStatus(r.readU8())
+
+proc decodeNodeRecordFromMVCC*(data: string): tuple[record: NodeRecord,
+    isDeleted: bool] =
+  ## Decode a NodeRecord from MVCC-encoded or raw binary data.
+  ## Returns the record and whether it was marked deleted.
+  ## Handles both:
+  ##   - MVCC-encoded values (8-byte ts + 8-byte checksum + 1-byte flag + data)
+  ##   - Raw binary values (for backward compatibility)
+  var value = data
+
+  # Check for MVCC encoding: 17+ bytes, not starting with '{', and has valid delete flag
+  # MVCC format: <8 bytes timestamp><8 bytes checksum><1 byte delete flag><payload>
+  if data.len >= 17 and data[0] != '{' and (data[16] == '0' or data[16] == '1'):
+    # This looks like MVCC-encoded data
+    # The delete flag is at byte 16 ('0' = not deleted, '1' = deleted)
+    # The payload starts at byte 17
+    let isDeleted = data[16] == '1'
+    if isDeleted:
+      result.isDeleted = true
+      return
+    # Extract payload (skip 17-byte MVCC header)
+    value = data[17..^1]
+
+  result.record = decodeNodeRecord(value)
+  result.isDeleted = false
+
+# =============================================================================
+# Space Record (sys.spaces)
+# =============================================================================
+
+type
+  SpaceRecord* = object
+    ## Record stored in SYS_SPACES_TABLE
+    ## Key: /t/0000000007/<spaceId>
+    spaceId*: int32
+    name*: string
+    replicas*: int32 # 0 = ALL nodes
+    groupCount*: int32
+    groupIds*: seq[uint64]
+    oldGroupIds*: seq[uint64] # Used during rebalancing
+    rebalancing*: bool
+    rebalanceWorker*: int32 # nodeId of the migrating worker
+    rebalanceHeartbeat*: int64 # unix epoch seconds of last worker heartbeat
+    rebalanceCursor*: string # last key migrated (resume point)
+    createdAtNs*: int64
+
+proc encode*(rec: SpaceRecord): string =
+  var w = initBinaryWriter()
+  w.writeI32(rec.spaceId)
+  w.writeString(rec.name)
+  w.writeI32(rec.replicas)
+  w.writeI32(rec.groupCount)
+  # groupIds
+  w.writeU32(uint32(rec.groupIds.len))
+  for gid in rec.groupIds:
+    w.writeU64(gid)
+  # oldGroupIds
+  w.writeU32(uint32(rec.oldGroupIds.len))
+  for gid in rec.oldGroupIds:
+    w.writeU64(gid)
+  # flags
+  var flags: uint8 = 0
+  if rec.rebalancing:
+    flags = flags or 0x01
+  w.writeU8(flags)
+  # rebalance tracking
+  w.writeI32(rec.rebalanceWorker)
+  w.writeI64(rec.rebalanceHeartbeat)
+  w.writeString(rec.rebalanceCursor)
+  w.writeI64(rec.createdAtNs)
+  w.finish()
+
+proc decodeSpaceRecord*(data: string): SpaceRecord =
+  var r = initBinaryReader(data)
+  result.spaceId = r.readI32()
+  result.name = r.readString()
+  result.replicas = r.readI32()
+  result.groupCount = r.readI32()
+  # groupIds
+  let gidCount = int(r.readU32())
+  result.groupIds = newSeq[uint64](gidCount)
+  for i in 0..<gidCount:
+    result.groupIds[i] = r.readU64()
+  # oldGroupIds
+  let oldGidCount = int(r.readU32())
+  result.oldGroupIds = newSeq[uint64](oldGidCount)
+  for i in 0..<oldGidCount:
+    result.oldGroupIds[i] = r.readU64()
+  # flags
+  let flags = r.readU8()
+  result.rebalancing = (flags and 0x01) != 0
+  # rebalance tracking
+  result.rebalanceWorker = r.readI32()
+  result.rebalanceHeartbeat = r.readI64()
+  result.rebalanceCursor = r.readString()
+  result.createdAtNs = r.readI64()
+
+# =============================================================================
+# Setting Record (sys.settings)
+# =============================================================================
+
+type
+  SettingRecord* = object
+    ## Record stored in SYS_SETTINGS_TABLE
+    ## Key: /t/0000000006/<settingKey>
+    value*: string
+
+proc encode*(rec: SettingRecord): string =
+  var w = initBinaryWriter()
+  w.writeString(rec.value)
+  w.finish()
+
+proc decodeSettingRecord*(data: string): SettingRecord =
+  var r = initBinaryReader(data)
+  result.value = r.readString()
+
+# =============================================================================
+# Helper: Current timestamp
+# =============================================================================
+
+proc nowNs*(): int64 =
+  ## Get current time as Unix nanoseconds
+  let t = getTime()
+  let secs = t.toUnix()
+  let nanos = t.nanosecond()
+  result = secs * 1_000_000_000'i64 + nanos
+
+# =============================================================================
+# Conversion helpers: Binary -> JSON (for dashboard API)
+# =============================================================================
+
+import std/json
+
+proc toJson*(rec: DatabaseRecord): JsonNode =
+  result = %*{
+    "name": rec.name,
+    "createdAt": $fromUnix(rec.createdAtNs div 1_000_000_000)
+  }
+
+proc toJson*(rec: SchemaRecord): JsonNode =
+  result = %*{
+    "name": rec.name,
+    "database": rec.database,
+    "createdAt": $fromUnix(rec.createdAtNs div 1_000_000_000)
+  }
+
+proc toJson*(rec: TableRecord): JsonNode =
+  var columns = newJArray()
+  for col in rec.columns:
+    var dt: string
+    case col.dataType
+    of cdtInt: dt = "INT"
+    of cdtFloat: dt = "FLOAT"
+    of cdtString: dt = "TEXT"
+    of cdtBool: dt = "BOOL"
+    of cdtBytes: dt = "BLOB"
+    of cdtDate: dt = "DATE"
+    of cdtDateTime: dt = "DATETIME"
+    columns.add(%*{
+      "name": col.name,
+      "type": dt,
+      "primaryKey": (col.flags and 0x01) != 0,
+      "notNull": (col.flags and 0x02) != 0
+    })
+  var pkArr = newJArray()
+  for pk in rec.primaryKey:
+    pkArr.add(%pk)
+  result = %*{
+    "tableId": rec.tableId,
+    "name": rec.name,
+    "schema": rec.schema,
+    "database": rec.database,
+    "spaceId": rec.spaceId,
+    "primaryKey": pkArr,
+    "columns": columns
+  }
+
+proc toJson*(rec: GroupRecord): JsonNode =
+  var replicas = newJArray()
+  for rep in rec.replicas:
+    replicas.add(%*{
+      "nodeId": rep.nodeId,
+      "type": if rep.replicaType == rtVoter: "voter" else: "learner"
+    })
+  result = %*{
+    "groupId": rec.groupId,
+    "spaceId": rec.spaceId,
+    "preferredLeader": rec.preferredLeader,
+    "leader": rec.leader,
+    "replicas": replicas
+  }
+
+proc toJson*(rec: NodeRecord): JsonNode =
+  var status: string
+  case rec.status
+  of nsUnknown: status = "unknown"
+  of nsAlive: status = "alive"
+  of nsDraining: status = "draining"
+  of nsDecommissioned: status = "decommissioned"
+  result = %*{
+    "nodeId": rec.nodeId,
+    "host": rec.host,
+    "raftPort": rec.raftPort,
+    "clientPort": rec.clientPort,
+    "status": status
+  }
+
+proc toJson*(rec: SpaceRecord): JsonNode =
+  var groupIds = newJArray()
+  for gid in rec.groupIds:
+    groupIds.add(%gid)
+  var oldGroupIds = newJArray()
+  for gid in rec.oldGroupIds:
+    oldGroupIds.add(%gid)
+  result = %*{
+    "spaceId": rec.spaceId,
+    "name": rec.name,
+    "replicas": rec.replicas,
+    "groupCount": rec.groupCount,
+    "groupIds": groupIds,
+    "oldGroupIds": oldGroupIds,
+    "rebalancing": rec.rebalancing,
+    "rebalanceWorker": rec.rebalanceWorker,
+    "rebalanceHeartbeat": rec.rebalanceHeartbeat,
+    "rebalanceCursor": rec.rebalanceCursor
+  }

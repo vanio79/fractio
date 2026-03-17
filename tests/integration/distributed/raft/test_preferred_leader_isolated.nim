@@ -4,6 +4,7 @@ import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
+import fractio/distributed/meta/system_schemas
 import fractio/protocol/raft_store
 
 const TMP_DIR = "/tmp/fractio_pref_leader_iso_"
@@ -80,20 +81,27 @@ proc makeCluster3(portOffset: int = 0): seq[TestNode] =
 
   for num in [1, 2, 3]:
     let key = encodeTableKey(SYS_NODES_TABLE_ID, $num)
-    let val = $ %*{
-      "nodeId": num, "host": "127.0.0.1",
-      "raftPort": 29000 + portOffset + (num - 1) * 1000,
-      "clientPort": 19000 + num, "status": 1,
-    }
-    discard nodes[leaderIdx].store.raftPut(key, val)
+    let nodeRec = NodeRecord(
+      nodeId: uint32(num),
+      host: "127.0.0.1",
+      raftPort: uint16(29000 + portOffset + (num - 1) * 1000),
+      clientPort: uint16(19000 + num),
+      status: nsAlive,
+    )
+    discard nodes[leaderIdx].store.raftPut(key, nodeRec.encode())
 
   for gid in [META_GROUP_ID, DATA_GROUP_START_ID]:
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
-    var replicas = newJArray()
-    for num in [1, 2, 3]: replicas.add(%*{"nodeId": num, "type": "voter"})
-    let val = $ %*{"groupId": gid.uint64.int, "replicas": replicas,
-        "preferredLeader": 1}
-    discard nodes[leaderIdx].store.raftPut(key, val)
+    var replicasSeq: seq[GroupReplicaBin] = @[]
+    for num in [1, 2, 3]:
+      replicasSeq.add(GroupReplicaBin(nodeId: uint32(num),
+          replicaType: rtVoter))
+    let groupRec = GroupRecord(
+      groupId: gid.uint64,
+      replicas: replicasSeq,
+      preferredLeader: 1,
+    )
+    discard nodes[leaderIdx].store.raftPut(key, groupRec.encode())
 
   sleep(500)
   nodes
@@ -161,11 +169,15 @@ suite "Preferred leader isolated test":
     doAssert metaLeader >= 0
 
     let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $testGid.uint64)
-    var replicas = newJArray()
-    for n in 1..3: replicas.add(%*{"nodeId": n, "type": "voter"})
-    discard nodes[metaLeader].store.raftPut(groupKey,
-      $ %*{"groupId": testGid.uint64.int, "replicas": replicas,
-          "preferredLeader": 3})
+    var replicasSeq: seq[GroupReplicaBin] = @[]
+    for n in 1..3:
+      replicasSeq.add(GroupReplicaBin(nodeId: uint32(n), replicaType: rtVoter))
+    let groupRec = GroupRecord(
+      groupId: testGid.uint64,
+      replicas: replicasSeq,
+      preferredLeader: 3,
+    )
+    discard nodes[metaLeader].store.raftPut(groupKey, groupRec.encode())
 
     sleep(1000)
     for node in nodes: node.store.loadGroupMembers()

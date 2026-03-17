@@ -163,7 +163,7 @@ suite "MvccTransactionStore - Transaction lifecycle":
     check rollbackRes.isOk
 
     # Key should not exist
-    let getRes = mvccStore.directGet("rollback_key")
+    let getRes = mvccStore.latestGet("rollback_key")
     check getRes.isOk
     check getRes.value.isNone
 
@@ -254,41 +254,62 @@ suite "MvccTransactionStore - Transactional reads and writes":
 # Suite: Direct operations (auto-commit)
 # ---------------------------------------------------------------------------
 
-suite "MvccTransactionStore - Direct operations":
-  test "directPut and directGet":
+suite "MvccTransactionStore - Auto-commit operations":
+  test "put and latestGet with explicit transaction":
     let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_d01")
     defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_d01")
 
-    let putRes = mvccStore.directPut("direct_key", "direct_value")
+    # Use explicit transaction for put
+    let sessionId = mvccStore.createSession()
+    discard mvccStore.beginTransaction(sessionId)
+    let putRes = mvccStore.txnPut(sessionId, "direct_key", "direct_value")
     check putRes.isOk
+    let commitRes = mvccStore.commitTransaction(sessionId)
+    check commitRes.isOk
+    mvccStore.closeSession(sessionId)
 
-    let getRes = mvccStore.directGet("direct_key")
+    let getRes = mvccStore.latestGet("direct_key")
     check getRes.isOk
     check getRes.value.isSome
     check getRes.value.get() == "direct_value"
 
-  test "directDelete removes key":
+  test "delete removes key":
     let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_d02")
     defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_d02")
 
-    discard mvccStore.directPut("to_delete", "value")
+    # Put
+    var sessionId = mvccStore.createSession()
+    discard mvccStore.beginTransaction(sessionId)
+    discard mvccStore.txnPut(sessionId, "to_delete", "value")
+    discard mvccStore.commitTransaction(sessionId)
+    mvccStore.closeSession(sessionId)
 
-    let delRes = mvccStore.directDelete("to_delete")
+    # Delete
+    sessionId = mvccStore.createSession()
+    discard mvccStore.beginTransaction(sessionId)
+    let delRes = mvccStore.txnDelete(sessionId, "to_delete")
     check delRes.isOk
+    discard mvccStore.commitTransaction(sessionId)
+    mvccStore.closeSession(sessionId)
 
-    let getRes = mvccStore.directGet("to_delete")
+    let getRes = mvccStore.latestGet("to_delete")
     check getRes.isOk
     check getRes.value.isNone
 
-  test "directScan returns multiple keys":
+  test "latestScan returns multiple keys":
     let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_d03")
     defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_d03")
 
-    discard mvccStore.directPut("scan_a", "1")
-    discard mvccStore.directPut("scan_b", "2")
-    discard mvccStore.directPut("scan_c", "3")
+    # Put multiple keys in a transaction
+    let sessionId = mvccStore.createSession()
+    discard mvccStore.beginTransaction(sessionId)
+    discard mvccStore.txnPut(sessionId, "scan_a", "1")
+    discard mvccStore.txnPut(sessionId, "scan_b", "2")
+    discard mvccStore.txnPut(sessionId, "scan_c", "3")
+    discard mvccStore.commitTransaction(sessionId)
+    mvccStore.closeSession(sessionId)
 
-    let scanRes = mvccStore.directScan("scan_a", "scan_d", 0)
+    let scanRes = mvccStore.latestScan("scan_a", "scan_d", 0)
     check scanRes.isOk
     check scanRes.value.len == 3
 

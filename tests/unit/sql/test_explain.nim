@@ -10,6 +10,7 @@ import fractio/sql/ast
 import fractio/sql/planner
 import fractio/sql/executor
 import fractio/distributed/meta/system_tables
+import fractio/distributed/meta/system_schemas
 import fractio/protocol/raft_store
 import fractio/protocol/mvcc_store
 import fractio/protocol/txn_manager
@@ -71,21 +72,34 @@ proc exec(store: RaftKVStoreExt, mvccStore: MvccTransactionStore,
 proc seedTable(store: RaftKVStoreExt, database, schema, name: string,
     tableId: uint32, columns: seq[tuple[name: string, typ: string]],
     pk: seq[string]) =
-  var colsJson = newJArray()
+  # Build binary TableRecord
+  var cols: seq[ColumnDefBin] = @[]
   for (cname, ctype) in columns:
-    colsJson.add(%*{"name": cname, "type": ctype, "notNull": false,
-        "primaryKey": cname in pk})
-  let value = %*{
-    "tableId": int(tableId),
-    "name": name,
-    "schema": schema,
-    "database": database,
-    "columns": colsJson,
-    "primaryKey": pk,
-  }
+    var dt = cdtString
+    case ctype.toLowerAscii()
+    of "int", "integer": dt = cdtInt
+    of "float", "double": dt = cdtFloat
+    of "text", "string", "varchar": dt = cdtString
+    of "bool", "boolean": dt = cdtBool
+    of "bytes", "blob": dt = cdtBytes
+    of "date": dt = cdtDate
+    of "datetime", "timestamp": dt = cdtDateTime
+    var flags: uint8 = 0
+    if cname in pk:
+      flags = flags or 0x01 # primaryKey
+    cols.add(ColumnDefBin(name: cname, dataType: dt, flags: flags))
+  let tableRec = TableRecord(
+    tableId: tableId,
+    name: name,
+    database: database,
+    schema: schema,
+    spaceId: -1, # default space
+    primaryKey: pk,
+    columns: cols,
+  )
   let key = encodeTableKey(SYS_TABLES_TABLE_ID,
       database & "." & schema & "." & name)
-  discard store.raftPut(key, $value)
+  discard store.raftPut(key, encode(tableRec))
 
 # ---------------------------------------------------------------------------
 # Suite 1: Lexer — EXPLAIN token

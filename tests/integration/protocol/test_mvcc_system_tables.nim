@@ -98,12 +98,17 @@ suite "MVCC System Tables - Basic Operations":
     let key = tableKey(tableId)
     let value = """{"name": "users", "columns": 3}"""
 
-    # Write table metadata
-    let putRes = mvccStore.directPut(key, value)
+    # Write table metadata with explicit transaction
+    let sessionId = mvccStore.createSession()
+    discard mvccStore.beginTransaction(sessionId)
+    let putRes = mvccStore.txnPut(sessionId, key, value)
     check putRes.isOk
+    let commitRes = mvccStore.commitTransaction(sessionId)
+    check commitRes.isOk
+    mvccStore.closeSession(sessionId)
 
-    # Read it back
-    let getRes = mvccStore.directGet(key)
+    # Read it back using latestGet
+    let getRes = mvccStore.latestGet(key)
     check getRes.isOk
     check getRes.value.isSome
     check getRes.value.get() == value
@@ -159,7 +164,7 @@ suite "MVCC System Tables - Basic Operations":
     check rollbackRes.isOk
 
     # Verify table doesn't exist
-    let getRes = mvccStore.directGet(tableKey(tableId))
+    let getRes = mvccStore.latestGet(tableKey(tableId))
     check getRes.isOk
     check getRes.value.isNone
 
@@ -171,17 +176,21 @@ suite "MVCC System Tables - Basic Operations":
     let key = tableKey(tableId)
 
     # Initial write
-    discard mvccStore.directPut(key, """{"version": 1}""")
+    var sessionId = mvccStore.createSession()
+    discard mvccStore.beginTransaction(sessionId)
+    discard mvccStore.txnPut(sessionId, key, """{"version": 1}""")
+    discard mvccStore.commitTransaction(sessionId)
+    mvccStore.closeSession(sessionId)
 
     # Update in transaction
-    let sessionId = mvccStore.createSession()
+    sessionId = mvccStore.createSession()
     discard mvccStore.beginTransaction(sessionId)
     discard mvccStore.txnPut(sessionId, key, """{"version": 2}""")
     let commitRes = mvccStore.commitTransaction(sessionId)
     check commitRes.isOk
 
     # Verify new version
-    let getRes = mvccStore.directGet(key)
+    let getRes = mvccStore.latestGet(key)
     check getRes.isOk
     check getRes.value.isSome
     check getRes.value.get() == """{"version": 2}"""
@@ -199,7 +208,11 @@ suite "MVCC System Tables - Isolation":
     let key = tableKey(tableId)
 
     # Initial write
-    discard mvccStore.directPut(key, """{"version": 1}""")
+    var sessionId = mvccStore.createSession()
+    discard mvccStore.beginTransaction(sessionId)
+    discard mvccStore.txnPut(sessionId, key, """{"version": 1}""")
+    discard mvccStore.commitTransaction(sessionId)
+    mvccStore.closeSession(sessionId)
 
     # Start transaction 1
     let session1 = mvccStore.createSession()
@@ -211,7 +224,11 @@ suite "MVCC System Tables - Isolation":
     check get1.value.get() == """{"version": 1}"""
 
     # Transaction 2 updates the key
-    discard mvccStore.directPut(key, """{"version": 2}""")
+    var session2 = mvccStore.createSession()
+    discard mvccStore.beginTransaction(session2)
+    discard mvccStore.txnPut(session2, key, """{"version": 2}""")
+    discard mvccStore.commitTransaction(session2)
+    mvccStore.closeSession(session2)
 
     # Transaction 1 still sees old value (snapshot isolation)
     let get2 = mvccStore.txnGet(session1, key)
@@ -228,7 +245,11 @@ suite "MVCC System Tables - Isolation":
     let key = tableKey(tableId)
 
     # Initial write
-    discard mvccStore.directPut(key, """{"version": 1}""")
+    var sessionId = mvccStore.createSession()
+    discard mvccStore.beginTransaction(sessionId)
+    discard mvccStore.txnPut(sessionId, key, """{"version": 1}""")
+    discard mvccStore.commitTransaction(sessionId)
+    mvccStore.closeSession(sessionId)
 
     # Start two concurrent transactions
     let session1 = mvccStore.createSession()
@@ -289,15 +310,19 @@ suite "MVCC System Tables - Index Operations":
     let idxKey = indexKey(tableId, "temp_idx")
 
     # Create index
-    discard mvccStore.directPut(idxKey, """{"type": "btree"}""")
+    var sessionId = mvccStore.createSession()
+    discard mvccStore.beginTransaction(sessionId)
+    discard mvccStore.txnPut(sessionId, idxKey, """{"type": "btree"}""")
+    discard mvccStore.commitTransaction(sessionId)
+    mvccStore.closeSession(sessionId)
 
     # Verify it exists
-    let get1 = mvccStore.directGet(idxKey)
+    let get1 = mvccStore.latestGet(idxKey)
     check get1.isOk
     check get1.value.isSome
 
     # Delete in transaction
-    let sessionId = mvccStore.createSession()
+    sessionId = mvccStore.createSession()
     discard mvccStore.beginTransaction(sessionId)
     let delRes = mvccStore.txnDelete(sessionId, idxKey)
     check delRes.isOk
@@ -305,7 +330,7 @@ suite "MVCC System Tables - Index Operations":
     check commitRes.isOk
 
     # Verify it's gone
-    let get2 = mvccStore.directGet(idxKey)
+    let get2 = mvccStore.latestGet(idxKey)
     check get2.isOk
     check get2.value.isNone
 
@@ -356,8 +381,13 @@ suite "MVCC System Tables - Persistence":
       let key = tableKey(tableId)
       let value = """{"name": "persistent_table"}"""
 
-      let putRes = mvccStore.directPut(key, value)
+      let sessionId = mvccStore.createSession()
+      discard mvccStore.beginTransaction(sessionId)
+      let putRes = mvccStore.txnPut(sessionId, key, value)
       check putRes.isOk
+      let commitRes = mvccStore.commitTransaction(sessionId)
+      check commitRes.isOk
+      mvccStore.closeSession(sessionId)
 
       coord.stop()
       # Don't delete the storage - we want to verify persistence
@@ -399,7 +429,7 @@ suite "MVCC System Tables - Persistence":
       let tableId = 30'u32
       let key = tableKey(tableId)
 
-      let getRes = mvccStore.directGet(key)
+      let getRes = mvccStore.latestGet(key)
       check getRes.isOk
       check getRes.value.isSome
       check getRes.value.get() == """{"name": "persistent_table"}"""

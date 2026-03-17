@@ -10,6 +10,7 @@ import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
+import fractio/distributed/meta/system_schemas
 import fractio/storage/wisckey_backend
 
 # ---------------------------------------------------------------------------
@@ -96,24 +97,24 @@ proc seedSpaceAndTable(store: RaftKVStoreExt, spaceId: int,
   ## Write a space record and a table record into the meta range, then
   ## reload the caches.
   let spaceKey = encodeSpaceKey(spaceId)
-  var gids = newJArray()
-  for g in groupIds:
-    gids.add(newJInt(int(g)))
-  let spaceVal = $ %*{
-    "spaceId": spaceId,
-    "name": "space_" & $spaceId,
-    "replicas": 1,
-    "groupIds": gids,
-  }
-  discard store.raftPut(spaceKey, spaceVal)
+  let spaceRec = SpaceRecord(
+    spaceId: int32(spaceId),
+    name: "space_" & $spaceId,
+    replicas: 1,
+    groupCount: int32(groupIds.len),
+    groupIds: groupIds,
+  )
+  discard store.raftPut(spaceKey, spaceRec.encode())
 
   let tableKey = encodeTableKey(SYS_TABLES_TABLE_ID, "default.public.t" & $tableId)
-  let tableVal = $ %*{
-    "tableId": int(tableId),
-    "name": "t" & $tableId,
-    "spaceId": spaceId,
-  }
-  discard store.raftPut(tableKey, tableVal)
+  let tableRec = TableRecord(
+    tableId: tableId,
+    name: "t" & $tableId,
+    schema: "public",
+    database: "default",
+    spaceId: int32(spaceId),
+  )
+  discard store.raftPut(tableKey, tableRec.encode())
 
   store.loadSpaces()
   store.loadTableSpaces()
@@ -216,14 +217,14 @@ suite "lookupNodeInfo — cache and backend lookup":
 
     # Seed a node record
     let nodeKey = encodeTableKey(SYS_NODES_TABLE_ID, "2")
-    let nodeVal = $ %*{
-      "nodeId": 2,
-      "host": "10.0.0.2",
-      "raftPort": 7002,
-      "clientPort": 9002,
-      "status": 1,
-    }
-    discard store.raftPut(nodeKey, nodeVal)
+    let nodeRec = NodeRecord(
+      nodeId: 2'u32,
+      host: "10.0.0.2",
+      raftPort: 7002'u16,
+      clientPort: 9002'u16,
+      status: nsAlive,
+    )
+    discard store.raftPut(nodeKey, nodeRec.encode())
 
     let r = store.lookupNodeInfo(2)
     check r.isSome
@@ -235,12 +236,14 @@ suite "lookupNodeInfo — cache and backend lookup":
     defer: teardown(coord, "/tmp/fractio_rgs_t12")
 
     let nodeKey = encodeTableKey(SYS_NODES_TABLE_ID, "3")
-    let nodeVal = $ %*{
-      "nodeId": 3,
-      "host": "10.0.0.3",
-      "clientPort": 9003,
-    }
-    discard store.raftPut(nodeKey, nodeVal)
+    let nodeRec = NodeRecord(
+      nodeId: 3'u32,
+      host: "10.0.0.3",
+      raftPort: 7003'u16,
+      clientPort: 9003'u16,
+      status: nsAlive,
+    )
+    discard store.raftPut(nodeKey, nodeRec.encode())
 
     # First call — backend lookup
     let r1 = store.lookupNodeInfo(3)
@@ -256,10 +259,14 @@ suite "lookupNodeInfo — cache and backend lookup":
     let (coord, store, _) = makeMultiGroupStore("/tmp/fractio_rgs_t13", 1)
     defer: teardown(coord, "/tmp/fractio_rgs_t13")
 
-    # Malformed record — missing host and clientPort
+    # Malformed record — empty host string
     let nodeKey = encodeTableKey(SYS_NODES_TABLE_ID, "4")
-    let nodeVal = $ %*{"nodeId": 4, "status": 1}
-    discard store.raftPut(nodeKey, nodeVal)
+    let nodeRec = NodeRecord(
+      nodeId: 4'u32,
+      host: "", # Empty host is invalid
+      status: nsAlive,
+    )
+    discard store.raftPut(nodeKey, nodeRec.encode())
 
     let r = store.lookupNodeInfo(4)
     check r.isNone

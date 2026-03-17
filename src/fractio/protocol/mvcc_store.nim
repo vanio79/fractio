@@ -298,6 +298,129 @@ proc getTransactionStatus*(store: MvccTransactionStore,
     return mvccOk(state.txn.status)
 
 # ---------------------------------------------------------------------------
+# Callback types for wrapper functions
+# ---------------------------------------------------------------------------
+
+type
+  SessionBody* = proc(sessionId: uint64): MvccVoidResult {.gcsafe, raises: [].}
+  SessionBodyWithResult*[T] = proc(sessionId: uint64): MvccResult[T] {.gcsafe,
+      raises: [].}
+  TransactionBody* = proc(sessionId: uint64): MvccVoidResult {.gcsafe, raises: [].}
+  TransactionBodyWithResult*[T] = proc(sessionId: uint64): MvccResult[
+      T] {.gcsafe, raises: [].}
+
+# ---------------------------------------------------------------------------
+# Session wrapper
+# ---------------------------------------------------------------------------
+
+proc withSession*(store: MvccTransactionStore,
+                  body: SessionBody): MvccVoidResult {.gcsafe, raises: [].} =
+  ## Create a session, execute the body, and close the session.
+  ## Use this when you need multiple transactions in one session.
+  ##
+  ## Example:
+  ##   discard mvccStore.withSession(proc(sessionId: uint64): MvccVoidResult =
+  ##     discard mvccStore.withTransaction(sessionId, proc(sid: uint64): MvccVoidResult =
+  ##       discard mvccStore.txnPut(sid, key1, value1)
+  ##       return mvccVOk()
+  ##     )
+  ##     return mvccVOk()
+  ##   )
+
+  let sessionId = store.createSession()
+  defer: store.closeSession(sessionId)
+  return body(sessionId)
+
+proc withSessionResult*[T](store: MvccTransactionStore,
+                           body: SessionBodyWithResult[T]): MvccResult[
+                               T] {.gcsafe, raises: [].} =
+  ## Same as withSession but returns a value.
+  let sessionId = store.createSession()
+  defer: store.closeSession(sessionId)
+  return body(sessionId)
+
+# ---------------------------------------------------------------------------
+# Transaction wrapper (session must exist)
+# ---------------------------------------------------------------------------
+
+proc withTransaction*(store: MvccTransactionStore,
+                      sessionId: uint64,
+                      body: TransactionBody): MvccVoidResult {.gcsafe, raises: [].} =
+  ## Execute a block within a transaction. Session must already exist.
+  ## Automatically commits on success, rolls back on failure.
+  ##
+  ## Example:
+  ##   discard mvccStore.withSession(proc(sid: uint64): MvccVoidResult =
+  ##     discard mvccStore.withTransaction(sid, proc(sessionId: uint64): MvccVoidResult =
+  ##       discard mvccStore.txnPut(sessionId, key, value)
+  ##       return mvccVOk()
+  ##     )
+  ##     return mvccVOk()
+  ##   )
+
+  let beginRes = store.beginTransaction(sessionId)
+  if not beginRes.isOk:
+    return mvccVErr(beginRes.error)
+
+  let bodyRes = body(sessionId)
+  if not bodyRes.isOk:
+    discard store.rollbackTransaction(sessionId)
+    return bodyRes
+
+  let commitRes = store.commitTransaction(sessionId)
+  if not commitRes.isOk:
+    return mvccVErr(commitRes.error)
+
+  return mvccVOk()
+
+proc withTransactionResult*[T](store: MvccTransactionStore,
+                               sessionId: uint64,
+                               body: TransactionBodyWithResult[T]): MvccResult[
+                                   T] {.gcsafe, raises: [].} =
+  ## Same as withTransaction but returns a value.
+  let beginRes = store.beginTransaction(sessionId)
+  if not beginRes.isOk:
+    return mvccErr[T](beginRes.error)
+
+  let bodyRes = body(sessionId)
+  if not bodyRes.isOk:
+    discard store.rollbackTransaction(sessionId)
+    return mvccErr[T](bodyRes.error)
+
+  let commitRes = store.commitTransaction(sessionId)
+  if not commitRes.isOk:
+    return mvccErr[T](commitRes.error)
+
+  return bodyRes
+
+# ---------------------------------------------------------------------------
+# Convenience: session + transaction in one
+# ---------------------------------------------------------------------------
+
+proc withAutoTransaction*(store: MvccTransactionStore,
+                          body: TransactionBody): MvccVoidResult {.gcsafe,
+                              raises: [].} =
+  ## Create session, start transaction, execute body, commit, close session.
+  ## Convenience for simple single-transaction cases.
+  ##
+  ## Example:
+  ##   discard mvccStore.withAutoTransaction(proc(sessionId: uint64): MvccVoidResult =
+  ##     return mvccStore.txnPut(sessionId, key, value)
+  ##   )
+
+  let sessionId = store.createSession()
+  defer: store.closeSession(sessionId)
+  return store.withTransaction(sessionId, body)
+
+proc withAutoTransactionResult*[T](store: MvccTransactionStore,
+                                   body: TransactionBodyWithResult[
+                                       T]): MvccResult[T] {.gcsafe, raises: [].} =
+  ## Same as withAutoTransaction but returns a value.
+  let sessionId = store.createSession()
+  defer: store.closeSession(sessionId)
+  return store.withTransactionResult(sessionId, body)
+
+# ---------------------------------------------------------------------------
 # Transactional KV operations
 # ---------------------------------------------------------------------------
 
@@ -502,63 +625,6 @@ proc txnScan*(store: MvccTransactionStore, sessionId: uint64,
   return mvccOk(results)
 
 # ---------------------------------------------------------------------------
-# Non-transactional operations
-# ---------------------------------------------------------------------------
-
-proc directGet*(store: MvccTransactionStore,
-    key: string): MvccResult[Option[string]] {.gcsafe, raises: [].} =
-  # First, scan for MVCC-encoded versions
-  let versionPrefix = key & VERSION_SEPARATOR
-  let scanStart = versionPrefix
-  let scanEnd = key & "\x00\x01"
-
-  let scanRes = store.raftStore.raftScan(scanStart, scanEnd, 100'u32,
-      includeSystemKeys = true)
-  if not scanRes.isOk:
-    return mvccErr[Option[string]](MvccStoreError(
-      kind: mseStorageError, msg: "Scan failed"))
-
-  var latestVersion: tuple[ts: coreTypes.Timestamp, value: string,
-      isDeleted: bool] = (coreTypes.Timestamp(0), "", false)
-  var foundVersion = false
-
-  for (k, entry) in scanRes.value:
-    try:
-      if isVersionKey(k):
-        let decoded = decodeVersionKey(k)
-        if decoded.timestamp > latestVersion.ts:
-          let mvccVal = decodeMVCCValue(entry.value)
-          latestVersion = (decoded.timestamp, mvccVal.data, mvccVal.isDeleted)
-          foundVersion = true
-    except:
-      discard
-
-  if foundVersion and not latestVersion.isDeleted:
-    return mvccOk(some(latestVersion.value))
-
-  # Fall back to direct key lookup for non-MVCC data (backward compatibility)
-  # This handles data written directly via raftPut() without MVCC encoding
-  let directRes = store.raftStore.raftGet(key)
-  if directRes.isOk and directRes.value.isSome:
-    let entry = directRes.value.get()
-    let rawValue = entry.value
-    # Check if this is MVCC-encoded data (starts with binary header, not '{')
-    if rawValue.len >= 17 and rawValue[0] != '{':
-      try:
-        let mvccVal = decodeMVCCValue(rawValue)
-        if not mvccVal.isDeleted:
-          return mvccOk(some(mvccVal.data))
-        else:
-          return mvccOk(none(string))
-      except:
-        discard
-    else:
-      # Raw JSON or plain text data
-      return mvccOk(some(rawValue))
-
-  return mvccOk(none(string))
-
-# ---------------------------------------------------------------------------
 # Lightweight snapshot reads (no transaction needed)
 # ---------------------------------------------------------------------------
 
@@ -568,6 +634,13 @@ proc snapshotGet*(store: MvccTransactionStore,
   ## Lightweight read at a specific timestamp without transaction overhead.
   ## This is optimized for single-statement SELECT queries that don't need
   ## write intent tracking or commit/rollback.
+  # First try to get the key directly (for non-MVCC keys)
+  let directRes = store.raftStore.raftGet(key)
+  var nonMvccValue: Option[string] = none(string)
+  if directRes.isOk and directRes.value.isSome:
+    nonMvccValue = some(directRes.value.get().value)
+
+  # Also scan for versioned keys
   let versionPrefix = key & VERSION_SEPARATOR
   let scanStart = versionPrefix
   let scanEnd = key & "\x00\x01"
@@ -575,6 +648,9 @@ proc snapshotGet*(store: MvccTransactionStore,
   let scanRes = store.raftStore.raftScan(scanStart, scanEnd, 100'u32,
       includeSystemKeys = true)
   if not scanRes.isOk:
+    # If scan fails but we have a non-MVCC value, return it
+    if nonMvccValue.isSome:
+      return mvccOk(nonMvccValue)
     return mvccErr[Option[string]](MvccStoreError(
       kind: mseStorageError, msg: "Scan failed"))
 
@@ -593,10 +669,16 @@ proc snapshotGet*(store: MvccTransactionStore,
     except:
       discard
 
-  if not foundVersion or latestVersion.isDeleted:
+  # If we found an MVCC version, return it (takes precedence over non-MVCC)
+  if foundVersion and not latestVersion.isDeleted:
+    return mvccOk(some(latestVersion.value))
+
+  # If we found an MVCC version but it's deleted, key doesn't exist
+  if foundVersion and latestVersion.isDeleted:
     return mvccOk(none(string))
 
-  return mvccOk(some(latestVersion.value))
+  # Fall back to non-MVCC value if no MVCC version found
+  return mvccOk(nonMvccValue)
 
 proc snapshotScan*(store: MvccTransactionStore,
     startKey: string, endKey: string, readTs: coreTypes.Timestamp,
@@ -631,6 +713,23 @@ proc snapshotScan*(store: MvccTransactionStore,
                 decoded.timestamp)
       except:
         discard
+    else:
+      # Non-MVCC key (regular key) - may have MVCC-encoded value
+      # Strip MVCC encoding if present
+      var value = entry.value
+      var isDeleted = false
+      try:
+        # Check if value is MVCC-encoded (17+ bytes, not starting with '{')
+        if entry.value.len >= 17 and entry.value[0] != '{':
+          let mvccVal = decodeMVCCValue(entry.value)
+          value = mvccVal.data
+          isDeleted = mvccVal.isDeleted
+      except:
+        discard # Not MVCC-encoded, use as-is
+      
+      # Only include if no MVCC version exists for this key
+      if not isDeleted and not keyVersions.hasKey(k):
+        keyVersions[k] = (value, false, coreTypes.Timestamp(0))
 
   var results: seq[tuple[key: string, value: string]] = @[]
   var count = 0
@@ -656,56 +755,25 @@ proc getCurrentTimestamp*(store: MvccTransactionStore): coreTypes.Timestamp {.
       uint64(getTime().toUnixFloat() * 1_000_000_000)
   coreTypes.Timestamp(wallNs)
 
-proc directPut*(store: MvccTransactionStore,
-    key: string, value: string): MvccVoidResult {.gcsafe, raises: [].} =
-  let sessionId = store.createSession()
-  defer: store.closeSession(sessionId)
+# ---------------------------------------------------------------------------
+# Convenience: latest reads (no timestamp required)
+# ---------------------------------------------------------------------------
 
-  let beginRes = store.beginTransaction(sessionId)
-  if not beginRes.isOk:
-    return mvccVErr(beginRes.error)
+proc latestGet*(store: MvccTransactionStore,
+    key: string): MvccResult[Option[string]] {.gcsafe, raises: [].} =
+  ## Get the latest value for a key without transaction overhead.
+  ## Equivalent to snapshotGet with the current timestamp.
+  let ts = store.getCurrentTimestamp()
+  store.snapshotGet(key, ts)
 
-  let putRes = store.txnPut(sessionId, key, value)
-  if not putRes.isOk:
-    return putRes
-
-  let commitRes = store.commitTransaction(sessionId)
-  if not commitRes.isOk:
-    return mvccVErr(commitRes.error)
-
-  return mvccVOk()
-
-proc directDelete*(store: MvccTransactionStore,
-    key: string): MvccVoidResult {.gcsafe, raises: [].} =
-  let sessionId = store.createSession()
-  defer: store.closeSession(sessionId)
-
-  let beginRes = store.beginTransaction(sessionId)
-  if not beginRes.isOk:
-    return mvccVErr(beginRes.error)
-
-  let delRes = store.txnDelete(sessionId, key)
-  if not delRes.isOk:
-    return delRes
-
-  let commitRes = store.commitTransaction(sessionId)
-  if not commitRes.isOk:
-    return mvccVErr(commitRes.error)
-
-  return mvccVOk()
-
-proc directScan*(store: MvccTransactionStore,
+proc latestScan*(store: MvccTransactionStore,
     startKey: string, endKey: string,
     limit: uint32 = 0): MvccResult[seq[tuple[key: string,
         value: string]]] {.gcsafe, raises: [].} =
-  let sessionId = store.createSession()
-  defer: store.closeSession(sessionId)
-
-  let beginRes = store.beginTransaction(sessionId)
-  if not beginRes.isOk:
-    return mvccErr[seq[tuple[key: string, value: string]]](beginRes.error)
-
-  return store.txnScan(sessionId, startKey, endKey, limit)
+  ## Scan the latest values without transaction overhead.
+  ## Equivalent to snapshotScan with the current timestamp.
+  let ts = store.getCurrentTimestamp()
+  store.snapshotScan(startKey, endKey, ts, limit)
 
 # ---------------------------------------------------------------------------
 # Utility procs
@@ -721,93 +789,3 @@ proc getActiveTransactionCount*(store: MvccTransactionStore): int {.gcsafe,
 proc getSessionCount*(store: MvccTransactionStore): int {.gcsafe, raises: [].} =
   withLock store.sessionsMu:
     result = store.sessions.len
-
-# ---------------------------------------------------------------------------
-# Batch operations for system tables
-# ---------------------------------------------------------------------------
-
-proc directPutBatch*(store: MvccTransactionStore,
-    writes: openArray[tuple[key: string, value: string]]): MvccVoidResult {.
-    gcsafe, raises: [].} =
-  ## Write multiple key-value pairs in a single MVCC transaction.
-  ## Used for system table updates that need atomicity.
-  if writes.len == 0:
-    return mvccVOk()
-
-  let sessionId = store.createSession()
-  defer: store.closeSession(sessionId)
-
-  let beginRes = store.beginTransaction(sessionId)
-  if not beginRes.isOk:
-    return mvccVErr(beginRes.error)
-
-  for (key, value) in writes:
-    let putRes = store.txnPut(sessionId, key, value)
-    if not putRes.isOk:
-      discard store.rollbackTransaction(sessionId)
-      return putRes
-
-  let commitRes = store.commitTransaction(sessionId)
-  if not commitRes.isOk:
-    return mvccVErr(commitRes.error)
-
-  return mvccVOk()
-
-proc directDeleteBatch*(store: MvccTransactionStore,
-    keys: openArray[string]): MvccVoidResult {.gcsafe, raises: [].} =
-  ## Delete multiple keys in a single MVCC transaction.
-  ## Used for system table cleanup operations.
-  if keys.len == 0:
-    return mvccVOk()
-
-  let sessionId = store.createSession()
-  defer: store.closeSession(sessionId)
-
-  let beginRes = store.beginTransaction(sessionId)
-  if not beginRes.isOk:
-    return mvccVErr(beginRes.error)
-
-  for key in keys:
-    let delRes = store.txnDelete(sessionId, key)
-    if not delRes.isOk:
-      discard store.rollbackTransaction(sessionId)
-      return delRes
-
-  let commitRes = store.commitTransaction(sessionId)
-  if not commitRes.isOk:
-    return mvccVErr(commitRes.error)
-
-  return mvccVOk()
-
-proc directPutAndDeleteBatch*(store: MvccTransactionStore,
-    puts: openArray[tuple[key: string, value: string]],
-    deletes: openArray[string]): MvccVoidResult {.gcsafe, raises: [].} =
-  ## Write and delete multiple keys in a single MVCC transaction.
-  ## Used for atomic updates to system tables (e.g., rebalancing).
-  if puts.len == 0 and deletes.len == 0:
-    return mvccVOk()
-
-  let sessionId = store.createSession()
-  defer: store.closeSession(sessionId)
-
-  let beginRes = store.beginTransaction(sessionId)
-  if not beginRes.isOk:
-    return mvccVErr(beginRes.error)
-
-  for (key, value) in puts:
-    let putRes = store.txnPut(sessionId, key, value)
-    if not putRes.isOk:
-      discard store.rollbackTransaction(sessionId)
-      return putRes
-
-  for key in deletes:
-    let delRes = store.txnDelete(sessionId, key)
-    if not delRes.isOk:
-      discard store.rollbackTransaction(sessionId)
-      return delRes
-
-  let commitRes = store.commitTransaction(sessionId)
-  if not commitRes.isOk:
-    return mvccVErr(commitRes.error)
-
-  return mvccVOk()

@@ -18,6 +18,7 @@ import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
+import fractio/distributed/meta/system_schemas
 import fractio/protocol/raft_store
 
 # ---------------------------------------------------------------------------
@@ -113,24 +114,28 @@ proc makeCluster3(portOffset: int = 0): seq[TestNode] =
   # Seed sys.nodes
   for num in allNums:
     let key = encodeTableKey(SYS_NODES_TABLE_ID, $num)
-    let val = $ %*{
-      "nodeId": num,
-      "host": "127.0.0.1",
-      "raftPort": 29000 + portOffset + (num - 1) * 1000,
-      "clientPort": 19000 + num,
-      "status": 1,
-    }
-    discard nodes[leaderIdx].store.raftPut(key, val)
+    let nodeRec = NodeRecord(
+      nodeId: uint32(num),
+      host: "127.0.0.1",
+      raftPort: uint16(29000 + portOffset + (num - 1) * 1000),
+      clientPort: uint16(19000 + num),
+      status: nsAlive,
+    )
+    discard nodes[leaderIdx].store.raftPut(key, nodeRec.encode())
 
   # Seed sys.groups with preferredLeader = node 1 (nodeNums[0])
   for gid in [META_GROUP_ID, DATA_GROUP_START_ID]:
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
-    var replicas = newJArray()
+    var replicasSeq: seq[GroupReplicaBin] = @[]
     for num in allNums:
-      replicas.add(%*{"nodeId": num, "type": "voter"})
-    let val = $ %*{"groupId": gid.uint64.int, "replicas": replicas,
-                    "preferredLeader": allNums[0]}
-    discard nodes[leaderIdx].store.raftPut(key, val)
+      replicasSeq.add(GroupReplicaBin(nodeId: uint32(num),
+          replicaType: rtVoter))
+    let groupRec = GroupRecord(
+      groupId: gid.uint64,
+      replicas: replicasSeq,
+      preferredLeader: uint32(allNums[0]),
+    )
+    discard nodes[leaderIdx].store.raftPut(key, groupRec.encode())
 
   sleep(400)
 
@@ -253,15 +258,15 @@ suite "Preferred leader rebalancing — 3-node cluster":
 
     # Write sys.groups record with preferredLeader = 2
     let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $testGid.uint64)
-    var replicas = newJArray()
+    var replicasSeq: seq[GroupReplicaBin] = @[]
     for n in 1..3:
-      replicas.add(%*{"nodeId": n, "type": "voter"})
-    let groupVal = $ %*{
-      "groupId": testGid.uint64.int,
-      "replicas": replicas,
-      "preferredLeader": 2,
-    }
-    discard nodes[metaLeader].store.raftPut(groupKey, groupVal)
+      replicasSeq.add(GroupReplicaBin(nodeId: uint32(n), replicaType: rtVoter))
+    let groupRec = GroupRecord(
+      groupId: testGid.uint64,
+      replicas: replicasSeq,
+      preferredLeader: 2,
+    )
+    discard nodes[metaLeader].store.raftPut(groupKey, groupRec.encode())
     sleep(300)
 
     # Force metadata refresh and group creation on all nodes
@@ -334,12 +339,15 @@ suite "Preferred leader rebalancing — 3-node cluster":
     doAssert metaLeader >= 0
 
     let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $testGid.uint64)
-    var replicas = newJArray()
+    var replicasSeq: seq[GroupReplicaBin] = @[]
     for n in 1..3:
-      replicas.add(%*{"nodeId": n, "type": "voter"})
-    discard nodes[metaLeader].store.raftPut(groupKey,
-      $ %*{"groupId": testGid.uint64.int, "replicas": replicas,
-           "preferredLeader": 3})
+      replicasSeq.add(GroupReplicaBin(nodeId: uint32(n), replicaType: rtVoter))
+    let groupRec = GroupRecord(
+      groupId: testGid.uint64,
+      replicas: replicasSeq,
+      preferredLeader: 3,
+    )
+    discard nodes[metaLeader].store.raftPut(groupKey, groupRec.encode())
     sleep(300)
     for node in nodes:
       node.store.loadGroupMembers()

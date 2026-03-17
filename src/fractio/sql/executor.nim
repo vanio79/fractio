@@ -4,19 +4,21 @@
 # Each PlanOp maps directly to KV operations on the raft store.
 # Supports MVCC transactions when MvccTransactionStore is provided.
 
-import std/[options, json, strutils, strformat, tables, times, algorithm]
+import std/[options, json, strutils, strformat, tables, algorithm]
 import ./ast
 import ./parser
 import ./planner
 import ../distributed/meta/system_tables
+import ../distributed/meta/system_schemas
 import ../protocol/raft_store
 from ../protocol/mvcc_store import MvccTransactionStore, MvccResult,
     MvccVoidResult, MvccStoreError, mvccOk, mvccErr, mvccVOk, mvccVErr,
         mseStorageError,
     createSession, closeSession, beginTransaction, commitTransaction,
-    rollbackTransaction, txnGet, txnPut, txnDelete, txnScan, directGet,
-        directScan,
-    isVersionKey, isIntentKeyMvcc, snapshotGet, snapshotScan, getCurrentTimestamp
+    rollbackTransaction, txnGet, txnPut, txnDelete, txnScan,
+    isVersionKey, isIntentKeyMvcc, snapshotGet, snapshotScan,
+        getCurrentTimestamp,
+    latestGet, latestScan
 import ../core/types as coreTypes
 import ../distributed/raft/nuraft_coordinator
 import ../distributed/raft/group_types as rangeTypes
@@ -288,7 +290,7 @@ proc execCreateDatabase(op: PlanOp, mvccStore: MvccTransactionStore): ExecResult
       return okResult("database already exists (IF NOT EXISTS)")
     return errorResult(&"database '{op.cdbName}' already exists")
 
-  # Write database record
+  # Write database record (binary encoded - value already encoded by planner)
   let putRes = mvccStore.txnPut(sessionId, key, op.cdbValue)
   if not putRes.isOk:
     discard mvccStore.rollbackTransaction(sessionId)
@@ -296,8 +298,12 @@ proc execCreateDatabase(op: PlanOp, mvccStore: MvccTransactionStore): ExecResult
 
   # Seed a default "public" schema for every new database
   let pubKey = encodeTableKey(SYS_SCHEMAS_TABLE_ID, op.cdbName & ".public")
-  let pubVal = $ %* {"name": "public", "database": op.cdbName}
-  let pubPutRes = mvccStore.txnPut(sessionId, pubKey, pubVal)
+  let pubRec = SchemaRecord(
+    name: "public",
+    database: op.cdbName,
+    createdAtNs: nowNs()
+  )
+  let pubPutRes = mvccStore.txnPut(sessionId, pubKey, encode(pubRec))
   if not pubPutRes.isOk:
     discard mvccStore.rollbackTransaction(sessionId)
     return errorResult(&"failed to create public schema: {pubPutRes.error.msg}")
@@ -348,27 +354,24 @@ proc execDropDatabase(op: PlanOp, mvccStore: MvccTransactionStore): ExecResult =
   let tableScan = mvccStore.txnScan(sessionId, tableStart, tableEnd, 0)
   if tableScan.isOk:
     for (tk, tv) in tableScan.value:
-      try:
-        let tj = parseJson(tv)
-        if tj.getOrDefault("database").getStr("") == op.ddbName:
-          let tableId = uint32(tj["tableId"].getInt())
-          # Delete all data rows for this table
-          let dataStart = encodeDataRowKey(tableId, "")
-          let dataEnd = encodeDataRowKey(tableId + 1, "")
-          let dataScan = mvccStore.txnScan(sessionId, dataStart, dataEnd, 0)
-          if dataScan.isOk:
-            for (dk, dv) in dataScan.value:
-              let delRes = mvccStore.txnDelete(sessionId, dk)
-              if not delRes.isOk:
-                discard mvccStore.rollbackTransaction(sessionId)
-                return errorResult(&"failed to delete data row: {delRes.error.msg}")
-          # Delete the table record
-          let delRes = mvccStore.txnDelete(sessionId, tk)
-          if not delRes.isOk:
-            discard mvccStore.rollbackTransaction(sessionId)
-            return errorResult(&"failed to delete table: {delRes.error.msg}")
-      except JsonParsingError:
-        discard
+      let rec = decodeTableRecord(tv)
+      if rec.database == op.ddbName:
+        let tableId = rec.tableId
+        # Delete all data rows for this table
+        let dataStart = encodeDataRowKey(tableId, "")
+        let dataEnd = encodeDataRowKey(tableId + 1, "")
+        let dataScan = mvccStore.txnScan(sessionId, dataStart, dataEnd, 0)
+        if dataScan.isOk:
+          for (dk, dv) in dataScan.value:
+            let delRes = mvccStore.txnDelete(sessionId, dk)
+            if not delRes.isOk:
+              discard mvccStore.rollbackTransaction(sessionId)
+              return errorResult(&"failed to delete data row: {delRes.error.msg}")
+        # Delete the table record
+        let delRes = mvccStore.txnDelete(sessionId, tk)
+        if not delRes.isOk:
+          discard mvccStore.rollbackTransaction(sessionId)
+          return errorResult(&"failed to delete table: {delRes.error.msg}")
 
   # Delete the database record
   let delRes = mvccStore.txnDelete(sessionId, key)
@@ -476,23 +479,17 @@ proc execCreateTable(op: PlanOp, store: RaftKVStoreExt,
     var spaceId = -1
     if sScan.isOk:
       for (sk, sv) in sScan.value:
-        try:
-          let sj = parseJson(sv)
-          if sj["name"].getStr() == spaceName:
-            spaceId = sj["spaceId"].getInt()
-            break
-        except JsonParsingError:
-          discard
+        let rec = decodeSpaceRecord(sv)
+        if rec.name == spaceName:
+          spaceId = rec.spaceId
+          break
     if spaceId < 0:
       discard mvccStore.rollbackTransaction(sessionId)
       return errorResult(&"space '{spaceName}' does not exist")
-    # Inject spaceId into the table descriptor JSON
-    try:
-      var j = parseJson(tableValue)
-      j["spaceId"] = %spaceId
-      tableValue = $j
-    except JsonParsingError:
-      discard
+    # Update spaceId in the binary table record
+    var rec = decodeTableRecord(tableValue)
+    rec.spaceId = int32(spaceId)
+    tableValue = encode(rec)
 
   let putRes = mvccStore.txnPut(sessionId, key, tableValue)
   if not putRes.isOk:
@@ -564,13 +561,10 @@ proc execCreateSpace(op: PlanOp, store: RaftKVStoreExt,
   let scanRes = mvccStore.txnScan(sessionId, startKey, endKey, 0)
   if scanRes.isOk:
     for (key, value) in scanRes.value:
-      try:
-        let j = parseJson(value)
-        if j["name"].getStr() == op.cspName:
-          discard mvccStore.rollbackTransaction(sessionId)
-          return errorResult(&"space '{op.cspName}' already exists")
-      except JsonParsingError:
-        discard
+      let rec = decodeSpaceRecord(value)
+      if rec.name == op.cspName:
+        discard mvccStore.rollbackTransaction(sessionId)
+        return errorResult(&"space '{op.cspName}' already exists")
 
   # Count nodes in the cluster (within transaction snapshot)
   let nodesStart = encodeTableKey(SYS_NODES_TABLE_ID, "")
@@ -580,12 +574,9 @@ proc execCreateSpace(op: PlanOp, store: RaftKVStoreExt,
   var nodeIds: seq[int] = @[]
   if nodesRes.isOk:
     for (key, value) in nodesRes.value:
-      try:
-        let j = parseJson(value)
-        nodeIds.add(j["nodeId"].getInt())
-        inc nodeCount
-      except JsonParsingError:
-        discard
+      let rec = decodeNodeRecord(value)
+      nodeIds.add(int(rec.nodeId))
+      inc nodeCount
 
   if nodeCount == 0:
     discard mvccStore.rollbackTransaction(sessionId)
@@ -605,12 +596,8 @@ proc execCreateSpace(op: PlanOp, store: RaftKVStoreExt,
   var spaceId = 1
   if scanRes.isOk:
     for (key, value) in scanRes.value:
-      try:
-        let j = parseJson(value)
-        let sid = j["spaceId"].getInt()
-        if sid >= spaceId: spaceId = sid + 1
-      except JsonParsingError:
-        discard
+      let rec = decodeSpaceRecord(value)
+      if rec.spaceId >= spaceId: spaceId = rec.spaceId + 1
 
   # Find max existing groupId to allocate new ones (within transaction)
   let rangesStart = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
@@ -619,16 +606,12 @@ proc execCreateSpace(op: PlanOp, store: RaftKVStoreExt,
   var maxGroupId: uint64 = 1
   if rangesRes.isOk:
     for (key, value) in rangesRes.value:
-      try:
-        let j = parseJson(value)
-        let rid = uint64(j["groupId"].getInt())
-        if rid > maxGroupId: maxGroupId = rid
-      except JsonParsingError:
-        discard
+      let rec = decodeGroupRecord(value)
+      if rec.groupId > maxGroupId: maxGroupId = rec.groupId
 
-  var groupIds: seq[int] = @[]
+  var groupIds: seq[uint64] = @[]
   for g in 0 ..< groupCount:
-    let groupId = int(maxGroupId) + 1 + g
+    let groupId = maxGroupId + uint64(1 + g)
     groupIds.add(groupId)
 
     # Compute group members using ring algorithm
@@ -636,25 +619,27 @@ proc execCreateSpace(op: PlanOp, store: RaftKVStoreExt,
     for j in 0 ..< replicas:
       members.add(nodeIds[(g + j) mod nodeCount])
 
-    # Write group descriptor to sys.groups (within transaction)
-    var replicasJson = newJArray()
+    # Write group descriptor to sys.groups (within transaction) using binary encoding
+    var groupReplicas: seq[GroupReplicaBin] = @[]
     for m in members:
-      replicasJson.add(%*{"nodeId": m, "type": "voter"})
+      groupReplicas.add(GroupReplicaBin(nodeId: uint32(m),
+          replicaType: rtVoter))
+    let groupRec = GroupRecord(
+      groupId: groupId,
+      spaceId: int32(spaceId),
+      preferredLeader: uint32(members[0]),
+      leader: 0,
+      replicas: groupReplicas
+    )
     let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupId)
-    let groupVal = $ %*{
-      "groupId": groupId,
-      "spaceId": spaceId,
-      "replicas": replicasJson,
-      "preferredLeader": members[0],
-    }
-    let putRes = mvccStore.txnPut(sessionId, groupKey, groupVal)
+    let putRes = mvccStore.txnPut(sessionId, groupKey, encode(groupRec))
     if not putRes.isOk:
       discard mvccStore.rollbackTransaction(sessionId)
       return errorResult(&"failed to create group {groupId}: {putRes.error.msg}")
 
     # Create actual Raft group in the coordinator (outside transaction - infrastructure)
     let coord = store.coordinator
-    let gid = GroupID(uint64(groupId))
+    let gid = GroupID(groupId)
     if not coord.hasGroup(gid):
       var nuraftMembers: seq[tuple[nodeId: uint32, host: string,
           basePort: int]] = @[]
@@ -676,17 +661,19 @@ proc execCreateSpace(op: PlanOp, store: RaftKVStoreExt,
         except:
           discard
 
-  # Write space record (within transaction)
+  # Write space record (within transaction) using binary encoding
+  let spaceRec = SpaceRecord(
+    spaceId: int32(spaceId),
+    name: op.cspName,
+    replicas: int32(op.cspReplicas),
+    groupCount: int32(groupCount),
+    groupIds: groupIds,
+    oldGroupIds: @[],
+    rebalancing: false,
+    createdAtNs: nowNs()
+  )
   let spaceKey = encodeSpaceKey(spaceId)
-  let spaceVal = $ %*{
-    "spaceId": spaceId,
-    "name": op.cspName,
-    "replicas": op.cspReplicas,
-    "groupCount": groupCount,
-    "groupIds": groupIds,
-    "createdAt": $now(),
-  }
-  let putRes = mvccStore.txnPut(sessionId, spaceKey, spaceVal)
+  let putRes = mvccStore.txnPut(sessionId, spaceKey, encode(spaceRec))
   if not putRes.isOk:
     discard mvccStore.rollbackTransaction(sessionId)
     return errorResult(&"failed to write space record: {putRes.error.msg}")
@@ -722,20 +709,15 @@ proc execDropSpace(op: PlanOp, store: RaftKVStoreExt,
   let scanRes = mvccStore.txnScan(sessionId, startKey, endKey, 0)
   var foundKey = ""
   var spaceId = -1
-  var groupIds: seq[int] = @[]
+  var groupIds: seq[uint64] = @[]
   if scanRes.isOk:
     for (key, value) in scanRes.value:
-      try:
-        let j = parseJson(value)
-        if j["name"].getStr() == op.dspName:
-          foundKey = key
-          spaceId = j["spaceId"].getInt()
-          if j.hasKey("groupIds"):
-            for g in j["groupIds"]:
-              groupIds.add(g.getInt())
-          break
-      except JsonParsingError:
-        discard
+      let rec = decodeSpaceRecord(value)
+      if rec.name == op.dspName:
+        foundKey = key
+        spaceId = rec.spaceId
+        groupIds = rec.groupIds
+        break
 
   if foundKey == "":
     discard mvccStore.rollbackTransaction(sessionId)
@@ -747,14 +729,10 @@ proc execDropSpace(op: PlanOp, store: RaftKVStoreExt,
   let tableScan = mvccStore.txnScan(sessionId, tableStart, tableEnd, 0)
   if tableScan.isOk:
     for (tk, tv) in tableScan.value:
-      try:
-        let tj = parseJson(tv)
-        if tj.getOrDefault("spaceId").getInt(-1) == spaceId:
-          let tableName = tj.getOrDefault("name").getStr("unknown")
-          discard mvccStore.rollbackTransaction(sessionId)
-          return errorResult(&"cannot drop space '{op.dspName}': table '{tableName}' is using it")
-      except JsonParsingError:
-        discard
+      let rec = decodeTableRecord(tv)
+      if rec.spaceId == spaceId:
+        discard mvccStore.rollbackTransaction(sessionId)
+        return errorResult(&"cannot drop space '{op.dspName}': table '{rec.name}' is using it")
 
   # Delete all group records for this space (within transaction)
   for groupId in groupIds:
@@ -788,12 +766,12 @@ proc execDropSpace(op: PlanOp, store: RaftKVStoreExt,
 proc txnGet(store: RaftKVStoreExt, mvccStore: MvccTransactionStore,
     ctx: ExecutorContext, key: string): MvccResult[Option[string]] =
   ## Get a value, using transactional read if in a transaction,
-  ## or MVCC direct read otherwise.
+  ## or latest MVCC read otherwise.
   if ctx.hasActiveTransaction and ctx.sessionId != 0 and mvccStore != nil:
     mvccStore.txnGet(ctx.sessionId, key)
   elif mvccStore != nil:
-    # Use MVCC direct get to properly decode MVCC-encoded values
-    mvccStore.directGet(key)
+    # Use latest MVCC get to properly decode MVCC-encoded values
+    mvccStore.latestGet(key)
   else:
     # Fallback: direct raft read (only for non-MVCC data)
     let res = store.raftGet(key)
@@ -811,7 +789,7 @@ proc execTxnScan(store: RaftKVStoreExt, mvccStore: MvccTransactionStore,
     limit: uint32 = 0): MvccResult[seq[tuple[key: string, value: string]]] =
   ## Scan keys with MVCC awareness.
   ## When in a transaction, use transactional scan.
-  ## Otherwise, combine MVCC direct scan (for MVCC-encoded data) with
+  ## Otherwise, combine MVCC latest scan (for MVCC-encoded data) with
   ## regular scan (for non-MVCC data), merging results with MVCC priority.
   if ctx.hasActiveTransaction and ctx.sessionId != 0 and mvccStore != nil:
     return mvccStore.txnScan(ctx.sessionId, startKey, endKey, limit)
@@ -828,9 +806,9 @@ proc execTxnScan(store: RaftKVStoreExt, mvccStore: MvccTransactionStore,
       if not isVersionKey(k) and not isIntentKeyMvcc(k):
         keyValues[k] = entry.value
 
-  # Then, do MVCC direct scan for MVCC-encoded data (if MVCC store available)
+  # Then, do MVCC latest scan for MVCC-encoded data (if MVCC store available)
   if mvccStore != nil:
-    let mvccRes = mvccStore.directScan(startKey, endKey, limit)
+    let mvccRes = mvccStore.latestScan(startKey, endKey, limit)
     if mvccRes.isOk:
       for (k, v) in mvccRes.value:
         # MVCC versions take priority over regular keys
@@ -864,19 +842,13 @@ proc execShowDatabasesTxn(store: RaftKVStoreExt,
 
   var resultRows: seq[seq[string]]
   for (key, value) in res.value:
-    try:
-      let j = parseJson(value)
-      resultRows.add(@[j["name"].getStr()])
-    except JsonParsingError:
-      # Fall back to extracting name from the key
-      let decoded = decodeTableKey(key)
-      resultRows.add(@[decoded.primaryKey])
+    let rec = decodeDatabaseRecord(value)
+    resultRows.add(@[rec.name])
 
   rowsResult(@["database_name"], resultRows)
 
 proc execShowSchemasTxn(op: PlanOp, store: RaftKVStoreExt,
     mvccStore: MvccTransactionStore, ctx: ExecutorContext): ExecResult =
-  let prefix = op.ssDatabase & "."
   let startKey = encodeTableKey(SYS_SCHEMAS_TABLE_ID, "")
   let endKey = encodeTableKey(SYS_SCHEMAS_TABLE_ID + 1, "")
   let res = execTxnScan(store, mvccStore, ctx, startKey, endKey, 0)
@@ -885,23 +857,14 @@ proc execShowSchemasTxn(op: PlanOp, store: RaftKVStoreExt,
 
   var resultRows: seq[seq[string]]
   for (key, value) in res.value:
-    try:
-      let j = parseJson(value)
-      let db = j.getOrDefault("database").getStr("")
-      let name = j["name"].getStr()
-      if db == op.ssDatabase or op.ssDatabase.len == 0:
-        resultRows.add(@[name])
-    except JsonParsingError:
-      let decoded = decodeTableKey(key)
-      let pk = decoded.primaryKey
-      if pk.startsWith(prefix):
-        resultRows.add(@[pk[prefix.len .. ^1]])
+    let rec = decodeSchemaRecord(value)
+    if rec.database == op.ssDatabase or op.ssDatabase.len == 0:
+      resultRows.add(@[rec.name])
 
   rowsResult(@["schema_name"], resultRows)
 
 proc execShowTablesTxn(op: PlanOp, store: RaftKVStoreExt,
     mvccStore: MvccTransactionStore, ctx: ExecutorContext): ExecResult =
-  let prefix = op.stDatabase & "." & op.stSchema & "."
   let startKey = encodeTableKey(SYS_TABLES_TABLE_ID, "")
   let endKey = encodeTableKey(SYS_TABLES_TABLE_ID + 1, "")
   let res = execTxnScan(store, mvccStore, ctx, startKey, endKey, 0)
@@ -910,19 +873,10 @@ proc execShowTablesTxn(op: PlanOp, store: RaftKVStoreExt,
 
   var resultRows: seq[seq[string]]
   for (key, value) in res.value:
-    try:
-      let j = parseJson(value)
-      let db = j.getOrDefault("database").getStr("")
-      let sc = j.getOrDefault("schema").getStr("")
-      let name = j["name"].getStr()
-      if (db == op.stDatabase or op.stDatabase.len == 0) and
-         (sc == op.stSchema or op.stSchema.len == 0):
-        resultRows.add(@[name])
-    except JsonParsingError:
-      let decoded = decodeTableKey(key)
-      let pk = decoded.primaryKey
-      if pk.startsWith(prefix):
-        resultRows.add(@[pk[prefix.len .. ^1]])
+    let rec = decodeTableRecord(value)
+    if (rec.database == op.stDatabase or op.stDatabase.len == 0) and
+       (rec.schema == op.stSchema or op.stSchema.len == 0):
+      resultRows.add(@[rec.name])
 
   rowsResult(@["table_name"], resultRows)
 
@@ -937,21 +891,13 @@ proc execShowSpacesTxn(store: RaftKVStoreExt,
 
   var resultRows: seq[seq[string]]
   for (key, value) in res.value:
-    try:
-      let j = parseJson(value)
-      let name = j["name"].getStr()
-      let replicas = j["replicas"].getInt()
-      let replicasStr = if replicas == 0: "ALL" else: $replicas
-      let groupCount = j["groupCount"].getInt()
-      let groupIds = if j.hasKey("groupIds"):
-                       var ids: seq[string]
-                       for r in j["groupIds"]: ids.add($r.getInt())
-                       ids.join(",")
-                     else: ""
-      resultRows.add(@[$j["spaceId"].getInt(), name, replicasStr,
-                        $groupCount, groupIds])
-    except JsonParsingError:
-      discard
+    let rec = decodeSpaceRecord(value)
+    let replicasStr = if rec.replicas == 0: "ALL" else: $rec.replicas
+    var groupIdsStr = ""
+    for i, gid in rec.groupIds:
+      if i > 0: groupIdsStr.add(",")
+      groupIdsStr.add($gid)
+    resultRows.add(@[$rec.spaceId, rec.name, replicasStr, $rec.groupCount, groupIdsStr])
 
   rowsResult(@["space_id", "name", "replicas", "group_count", "group_ids"],
              resultRows)

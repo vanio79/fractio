@@ -8,6 +8,7 @@ import fractio/sql/parser
 import fractio/sql/ast
 import fractio/sql/planner
 import fractio/distributed/meta/system_tables
+import fractio/distributed/meta/system_schemas
 import fractio/protocol/raft_store
 import fractio/protocol/mvcc_store
 import fractio/protocol/txn_manager
@@ -77,21 +78,34 @@ proc cleanupTestDir(testDir: string) =
 proc seedTable(store: RaftKVStoreExt, database, schema, name: string,
     tableId: uint32, columns: seq[tuple[name: string, typ: string]],
     pk: seq[string]) =
-  var colsJson = newJArray()
+  # Build binary TableRecord
+  var cols: seq[ColumnDefBin] = @[]
   for (cname, ctype) in columns:
-    colsJson.add(%*{"name": cname, "type": ctype, "notNull": false,
-        "primaryKey": cname in pk})
-  let value = %*{
-    "tableId": int(tableId),
-    "name": name,
-    "schema": schema,
-    "database": database,
-    "columns": colsJson,
-    "primaryKey": pk,
-  }
+    var dt = cdtString
+    case ctype.toLowerAscii()
+    of "int", "integer": dt = cdtInt
+    of "float", "double": dt = cdtFloat
+    of "text", "string", "varchar": dt = cdtString
+    of "bool", "boolean": dt = cdtBool
+    of "bytes", "blob": dt = cdtBytes
+    of "date": dt = cdtDate
+    of "datetime", "timestamp": dt = cdtDateTime
+    var flags: uint8 = 0
+    if cname in pk:
+      flags = flags or 0x01 # primaryKey
+    cols.add(ColumnDefBin(name: cname, dataType: dt, flags: flags))
+  let tableRec = TableRecord(
+    tableId: tableId,
+    name: name,
+    database: database,
+    schema: schema,
+    spaceId: -1, # default space
+    primaryKey: pk,
+    columns: cols,
+  )
   let key = encodeTableKey(SYS_TABLES_TABLE_ID,
       database & "." & schema & "." & name)
-  discard store.raftPut(key, $value)
+  discard store.raftPut(key, encode(tableRec))
 
 # ---------------------------------------------------------------------------
 # Tests
@@ -165,11 +179,11 @@ suite "SQL Planner":
     check plan.ops.len == 1
     check plan.ops[0].kind == poCreateTable
     check plan.ops[0].ctName == "users"
-    # Verify the JSON descriptor contains column info
-    let j = parseJson(plan.ops[0].ctValue)
-    check j["name"].getStr == "users"
-    check j["columns"].len == 3
-    check j["tableId"].getInt >= int(FIRST_USER_TABLE_ID)
+    # Verify the binary TableRecord contains column info
+    let rec = decodeTableRecord(plan.ops[0].ctValue)
+    check rec.name == "users"
+    check rec.columns.len == 3
+    check rec.tableId >= FIRST_USER_TABLE_ID
 
   test "plan CREATE TABLE IF NOT EXISTS":
     let stmt = parseStatement(

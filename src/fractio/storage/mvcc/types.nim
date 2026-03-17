@@ -173,6 +173,20 @@ proc encodeMVCCValue*(value: string, timestamp: Timestamp,
   result.add(delByte)
   result.add(value)
 
+proc isLikelyMVCCValue*(data: string): bool {.inline.} =
+  ## Fast check if data might be MVCC-encoded.
+  ## Returns false for data that is definitely NOT MVCC (JSON, too short, wrong flag).
+  ## Returns true for data that MIGHT be MVCC - caller should try decodeMVCCValue.
+  if data.len < 17: return false
+  if data[0] == '{': return false # JSON
+  let d = data[16]
+  if d != '0' and d != '1': return false
+  # Binary data with small uint32: byte 0 non-zero, bytes 1-3 zero
+  # MVCC never has this pattern for valid timestamps
+  if data[0] != '\0' and data[1] == '\0' and data[2] == '\0' and data[3] == '\0':
+    return false
+  true
+
 proc decodeMVCCValue*(encodedValue: string): MVCCValue =
   ## Decode MVCC value from storage format
   if encodedValue.len < 17:
@@ -190,10 +204,20 @@ proc decodeMVCCValue*(encodedValue: string): MVCCValue =
 
   let delByte = encodedValue[16]
 
+  # Validate delete flag - must be '0' or '1'
+  # This helps distinguish MVCC-encoded data from raw binary data
+  if delByte != '0' and delByte != '1':
+    raise newException(MVCCError, "Invalid MVCC value: invalid delete flag")
+
   result.timestamp = fromBigEndian64(Timestamp, tsArr)
   result.txnId = TransactionID(fromBigEndian64(int64, txnArr))
   result.isDeleted = delByte == '1'
   result.data = encodedValue[17 ..< encodedValue.len]
+
+  # Note: We don't validate timestamp range here because:
+  # 1. Tests may use mock timestamps (small values)
+  # 2. The isLikelyMVCCValue heuristic already filters out most false positives
+  # 3. The delete flag check ('0' or '1') is sufficient for distinguishing MVCC from binary
 
 proc encodeIntentKey*(userKey: string, txnId: TransactionID): string =
   ## Encode intent key for transaction resolution

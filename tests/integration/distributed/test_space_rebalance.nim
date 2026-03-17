@@ -21,6 +21,7 @@ import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
+import fractio/distributed/meta/system_schemas
 import fractio/distributed/sharedtimer/mock
 import fractio/distributed/sharedtimer/types as timerTypes
 import fractio/core/timestamp_provider
@@ -36,6 +37,34 @@ const
   TMP_DIR = "/tmp/fractio_rebal_"
 
 var nextClientPort = 19100 ## incremented per node to avoid port conflicts between tests
+
+# ---------------------------------------------------------------------------
+# Memory monitoring
+# ---------------------------------------------------------------------------
+
+proc getRSSMB(): int =
+  try:
+    let status = readFile("/proc/self/status")
+    for line in status.splitLines:
+      if line.startsWith("VmRSS:"):
+        let kb = parseInt(line.splitWhitespace()[1])
+        return kb div 1024
+  except:
+    discard
+  return 0
+
+proc getThreadCount(): int =
+  try:
+    let status = readFile("/proc/self/status")
+    for line in status.splitLines:
+      if line.startsWith("Threads:"):
+        return parseInt(line.splitWhitespace()[1])
+  except:
+    discard
+  return 0
+
+proc printResourceUsage(label: string) =
+  echo "=== ", label, ": RSS=", getRSSMB(), " MB, Threads=", getThreadCount(), " ==="
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -123,10 +152,16 @@ proc startNode(n: TestNode) =
   n.server.start()
 
 proc stopNode*(n: TestNode) =
+  echo "=== stopNode ", n.id, " starting ==="
+  n.store.stop()
+  echo "=== stopNode ", n.id, " store stopped ==="
   n.server.stop()
+  echo "=== stopNode ", n.id, " server stopped ==="
   n.coord.stop()
+  echo "=== stopNode ", n.id, " coord stopped ==="
   sleep(100) # Give LevelDB a moment to release its lock
   cleanDir(n.storagePath)
+  echo "=== stopNode ", n.id, " done ==="
 
 proc waitForLeaderOnGroup(nodes: seq[TestNode], gid: GroupID,
     maxAttempts: int = 50): int =
@@ -140,34 +175,45 @@ proc waitForLeaderOnGroup(nodes: seq[TestNode], gid: GroupID,
 proc seedSysNodes(leaderStore: RaftKVStoreExt, nodes: seq[TestNode]) =
   for n in nodes:
     let key = encodeTableKey(SYS_NODES_TABLE_ID, $n.id)
-    let val = $ %*{
-      "nodeId": n.id, "host": "127.0.0.1",
-      "raftPort": n.basePort, "clientPort": n.clientPort, "status": 1,
-    }
-    let r = leaderStore.raftPut(key, val)
+    let nodeRec = NodeRecord(
+      nodeId: uint32(n.id),
+      host: "127.0.0.1",
+      raftPort: uint16(n.basePort),
+      clientPort: uint16(n.clientPort),
+      status: nsAlive,
+    )
+    let r = leaderStore.raftPut(key, nodeRec.encode())
     doAssert r.isOk, "failed to seed sys.nodes for node " & $n.id
 
 proc seedSysGroups(leaderStore: RaftKVStoreExt, nodeNums: seq[int]) =
   for gid in [META_GROUP_ID, DATA_GROUP_START_ID]:
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
-    var replicas = newJArray()
+    var replicas: seq[GroupReplicaBin] = @[]
     for num in nodeNums:
-      replicas.add(%*{"nodeId": num, "type": "voter"})
-    let val = $ %*{"groupId": gid.uint64.int, "replicas": replicas}
-    discard leaderStore.raftPut(key, val)
+      replicas.add(GroupReplicaBin(nodeId: uint32(num), replicaType: rtVoter))
+    let groupRec = GroupRecord(
+      groupId: gid.uint64,
+      replicas: replicas,
+    )
+    discard leaderStore.raftPut(key, groupRec.encode())
 
 proc seedDefaults(leaderStore: RaftKVStoreExt) =
   discard leaderStore.raftPut(
     encodeTableKey(SYS_DATABASES_TABLE_ID, "default"),
-    $ %*{"name": "default"})
+    DatabaseRecord(name: "default", createdAtNs: system_schemas.nowNs()).encode())
   discard leaderStore.raftPut(
     encodeTableKey(SYS_SCHEMAS_TABLE_ID, "default.public"),
-    $ %*{"name": "public", "database": "default"})
+    SchemaRecord(name: "public", database: "default",
+        createdAtNs: system_schemas.nowNs()).encode())
   # Seed default space (replicas=0 = ALL, single group = meta group)
-  discard leaderStore.raftPut(
-    encodeSpaceKey(1),
-    $ %*{"spaceId": 1, "name": "default", "replicas": 0,
-         "groupCount": 1, "groupIds": [1]})
+  let spaceRec = SpaceRecord(
+    spaceId: 1,
+    name: "default",
+    replicas: 0,
+    groupCount: 1,
+    groupIds: @[1'u64],
+  )
+  discard leaderStore.raftPut(encodeSpaceKey(1), spaceRec.encode())
 
 proc waitForAutoDistribution(nodes: seq[TestNode], expectedGroupIds: seq[
     uint64], replicaCount: int, maxWaitMs: int = 3000) =
@@ -193,19 +239,34 @@ proc waitForSpaceLeaders(nodes: seq[TestNode]) =
   if grpScan.isOk:
     for (key, entry) in grpScan.value:
       try:
-        # Handle MVCC-encoded values
-        var jsonStr = entry.value
-        # Check if value is MVCC-encoded (starts with 17-byte header)
-        if jsonStr.len >= 17:
-          try:
-            let mvccVal = mvccTypes.decodeMVCCValue(jsonStr)
-            if not mvccVal.isDeleted:
-              jsonStr = mvccVal.data
-          except:
-            discard # Not MVCC-encoded, use as-is
+        let data = entry.value
+        # Data is either binary or JSON (no MVCC since written via raftPut)
+        # Note: Binary encoding can start with '{' (0x7B) when groupId >= 123
+        # So we try JSON first if it starts with '{', then fall back to binary
+        var gid: GroupID
+        var parsed = false
 
-        let j = parseJson(jsonStr)
-        let gid = GroupID(uint64(j["groupId"].getInt()))
+        if data.len > 0 and data[0] == '{':
+          # Try JSON first
+          try:
+            let j = parseJson(data)
+            gid = GroupID(uint64(j["groupId"].getInt()))
+            parsed = true
+          except:
+            discard
+
+        if not parsed:
+          # Try binary decoding (GroupRecord)
+          try:
+            let groupRec = decodeGroupRecord(data)
+            gid = GroupID(groupRec.groupId)
+            parsed = true
+          except:
+            discard
+
+        if not parsed:
+          continue
+
         if gid == META_GROUP_ID or gid == DATA_GROUP_START_ID: continue
         for attempt in 0 ..< 50:
           var hasLeader = false
@@ -272,20 +333,30 @@ proc waitForNodeInSysNodes(store: RaftKVStoreExt, nodeId: int,
     if nodesRes.isOk:
       for (key, entry) in nodesRes.value:
         try:
-          # Decode MVCC-encoded value if needed
-          var jsonStr = entry.value
-          if jsonStr.len >= 17 and jsonStr[0] != '{':
+          let data = entry.value
+          # Data is either binary or JSON (no MVCC since written via raftPut)
+          # Note: Binary encoding can start with '{' (0x7B) when nodeId >= 123
+          # So we try JSON first if it starts with '{', then fall back to binary
+          var found = false
+
+          if data.len > 0 and data[0] == '{':
+            # Try JSON first
             try:
-              let mvccVal = mvccTypes.decodeMVCCValue(jsonStr)
-              if not mvccVal.isDeleted:
-                jsonStr = mvccVal.data
-              else:
-                continue
+              let j = parseJson(data)
+              if j["nodeId"].getInt() == nodeId:
+                return true
+              found = true
             except:
               discard
-          let j = parseJson(jsonStr)
-          if j["nodeId"].getInt() == nodeId:
-            return true
+
+          if not found:
+            # Try binary decoding (NodeRecord)
+            try:
+              let nodeRec = decodeNodeRecord(data)
+              if nodeRec.nodeId == uint32(nodeId):
+                return true
+            except:
+              discard
         except:
           discard
     sleep(100)
@@ -316,12 +387,14 @@ proc addNodeToCluster(nodes: var seq[TestNode], newNodeNum: int) =
   let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
   if leaderIdx >= 0:
     let nodeKey = encodeTableKey(SYS_NODES_TABLE_ID, $newNodeNum)
-    let nodeVal = $ %*{
-      "nodeId": newNodeNum, "host": "127.0.0.1",
-      "raftPort": newBasePort, "clientPort": newNode.clientPort,
-      "status": 1,
-    }
-    discard nodes[leaderIdx].store.raftPut(nodeKey, nodeVal)
+    let nodeRec = NodeRecord(
+      nodeId: uint32(newNodeNum),
+      host: "127.0.0.1",
+      raftPort: uint16(newBasePort),
+      clientPort: uint16(newNode.clientPort),
+      status: nsAlive,
+    )
+    discard nodes[leaderIdx].store.raftPut(nodeKey, nodeRec.encode())
 
     # Wait for the node to be visible in sys.nodes before returning
     # This ensures rebalanceSpaces() will see the new node
@@ -329,20 +402,39 @@ proc addNodeToCluster(nodes: var seq[TestNode], newNodeNum: int) =
       "Node " & $newNodeNum & " did not appear in sys.nodes within timeout"
 
 proc stopCluster(nodes: seq[TestNode]) =
+  # Log group counts before shutdown
+  var totalGroups = 0
+  for n in nodes:
+    totalGroups += n.coord.getGroupCount()
+  printResourceUsage("stopCluster: " & $nodes.len & " nodes, " & $totalGroups & " groups")
+
   for i in countdown(nodes.high, 0):
     stopNode(nodes[i])
+  # Force garbage collection to release memory from previous test
+  # before starting the next one. Without this, sequential tests
+  # accumulate memory until the process is OOM killed.
+  GC_fullCollect()
+  printResourceUsage("stopCluster done")
 
 proc findSpaceId(leaderStore: RaftKVStoreExt,
     leaderMvccStore: MvccTransactionStore, spaceName: string): int =
   let spacesStart = encodeTableKey(SYS_SPACES_TABLE_ID, "")
   let spacesEnd = encodeTableKey(SYS_SPACES_TABLE_ID + 1, "")
-  let sr = leaderMvccStore.directScan(spacesStart, spacesEnd, 0)
+  let sr = leaderMvccStore.latestScan(spacesStart, spacesEnd, 0)
   if sr.isOk:
     for (k, v) in sr.value:
       try:
-        let j = parseJson(v)
-        if j["name"].getStr() == spaceName:
-          return j["spaceId"].getInt()
+        # Data is either binary or JSON
+        if v.len > 0 and v[0] != '{':
+          # Binary-encoded SpaceRecord
+          let spaceRec = decodeSpaceRecord(v)
+          if spaceRec.name == spaceName:
+            return spaceRec.spaceId
+        else:
+          # JSON format
+          let j = parseJson(v)
+          if j["name"].getStr() == spaceName:
+            return j["spaceId"].getInt()
       except: discard
   doAssert false, "space '" & spaceName & "' not found"
 
@@ -450,6 +542,7 @@ suite "Space rebalance integration — rebalanceSpaces":
     # Verify: now rebalancing, 3 new groups, old groups preserved
     # Wait for Raft to replicate the space record update
     sleep(1000)
+    leaderStore.loadSpaces() # Reload cache after Raft replication
 
     acquire(leaderStore.spacesMu)
     let sp2 = leaderStore.spaces[spaceId]
@@ -469,6 +562,7 @@ suite "Space rebalance integration — rebalanceSpaces":
     addNodeToCluster(nodes, 3)
     leaderStore.rebalanceSpaces()
     sleep(500)
+    leaderStore.loadSpaces() # Reload cache after rebalance
 
     acquire(leaderStore.spacesMu)
     let firstNewGroups = leaderStore.spaces[spaceId].groupIds
@@ -506,6 +600,7 @@ suite "Space rebalance integration — rebalanceSpaces":
 
 suite "Space rebalance integration — reads during migration":
   test "SELECT returns all rows during rebalance":
+    printResourceUsage("test start")
     var nodes = makeCluster2()
     defer: stopCluster(nodes)
 
@@ -571,6 +666,8 @@ proc triggerRebalanceAndSetup(nodes: var seq[TestNode],
     leaderStore: RaftKVStoreExt, spaceId: int) =
   addNodeToCluster(nodes, 3)
   leaderStore.rebalanceSpaces()
+  sleep(500) # Wait for Raft to replicate
+  leaderStore.loadSpaces() # Reload cache after rebalance
 
   acquire(leaderStore.spacesMu)
   let newGids = leaderStore.spaces[spaceId].groupIds
@@ -658,6 +755,7 @@ suite "Space rebalance integration — full migration":
     addNodeToCluster(nodes, 3)
     leaderStore.rebalanceSpaces()
     sleep(500)
+    leaderStore.loadSpaces() # Reload cache after rebalance
 
     acquire(leaderStore.spacesMu)
     let oldGids = leaderStore.spaces[spaceId].oldGroupIds

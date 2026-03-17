@@ -9,6 +9,7 @@ import fractio/distributed/raft/group_types
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/meta/system_tables
+import fractio/distributed/meta/system_schemas
 import fractio/protocol/raft_store
 
 # ---------------------------------------------------------------------------
@@ -33,7 +34,8 @@ proc makeStore(storagePath: string): tuple[
   let members = @[(nodeId: 1'u32, host: "127.0.0.1", basePort: basePort)]
   let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
     nodeId: nodeId, basePort: basePort, host: "127.0.0.1", dataDir: storagePath,
-    electionTimeoutLowerMs: 200, electionTimeoutUpperMs: 400, heartbeatIntervalMs: 100,
+    electionTimeoutLowerMs: 200, electionTimeoutUpperMs: 400,
+    heartbeatIntervalMs: 100,
   ))
   coord.start()
   for rid in [META_GROUP_ID, DATA_GROUP_START_ID]:
@@ -65,19 +67,21 @@ suite "RaftKVStoreExt - preferredLeaders table":
     let (coord, store) = makeStore(path)
     defer: teardown(coord, path)
 
-    # Seed sys.groups with a group that has preferredLeader
+    # Seed sys.groups with a group that has preferredLeader (binary format)
     let gid = GroupID(42)
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
-    let val = $ %*{
-      "groupId": gid.uint64.int,
-      "replicas": [
-        {"nodeId": 10, "type": "voter"},
-        {"nodeId": 20, "type": "voter"},
-        {"nodeId": 30, "type": "voter"},
-      ],
-      "preferredLeader": 20,
-    }
-    let wr = store.raftPut(key, val)
+    let val = GroupRecord(
+      groupId: gid.uint64,
+      spaceId: 0,
+      preferredLeader: 20,
+      leader: 0,
+      replicas: @[
+        GroupReplicaBin(nodeId: 10, replicaType: rtVoter),
+        GroupReplicaBin(nodeId: 20, replicaType: rtVoter),
+        GroupReplicaBin(nodeId: 30, replicaType: rtVoter),
+      ]
+    )
+    let wr = store.raftPut(key, encode(val))
     check wr.isOk
 
     store.loadGroupMembers()
@@ -92,11 +96,14 @@ suite "RaftKVStoreExt - preferredLeaders table":
 
     let gid = GroupID(43)
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
-    let val = $ %*{
-      "groupId": gid.uint64.int,
-      "replicas": [{"nodeId": 10, "type": "voter"}],
-    }
-    discard store.raftPut(key, val)
+    let val = GroupRecord(
+      groupId: gid.uint64,
+      spaceId: 0,
+      preferredLeader: 0, # 0 = no preferred leader
+      leader: 0,
+      replicas: @[GroupReplicaBin(nodeId: 10, replicaType: rtVoter)]
+    )
+    discard store.raftPut(key, encode(val))
     store.loadGroupMembers()
 
     check not store.preferredLeaders.hasKey(gid)
@@ -108,12 +115,14 @@ suite "RaftKVStoreExt - preferredLeaders table":
 
     let gid = GroupID(44)
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
-    let val = $ %*{
-      "groupId": gid.uint64.int,
-      "replicas": [{"nodeId": 10, "type": "voter"}],
-      "preferredLeader": 0,
-    }
-    discard store.raftPut(key, val)
+    let val = GroupRecord(
+      groupId: gid.uint64,
+      spaceId: 0,
+      preferredLeader: 0, # 0 = no preferred leader
+      leader: 0,
+      replicas: @[GroupReplicaBin(nodeId: 10, replicaType: rtVoter)]
+    )
+    discard store.raftPut(key, encode(val))
     store.loadGroupMembers()
 
     check not store.preferredLeaders.hasKey(gid)
@@ -123,15 +132,17 @@ suite "RaftKVStoreExt - preferredLeaders table":
     let (coord, store) = makeStore(path)
     defer: teardown(coord, path)
 
-    # Insert a group with preferred leader
+    # Insert a group with preferred leader (binary format)
     let gid = GroupID(45)
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
-    let val = $ %*{
-      "groupId": gid.uint64.int,
-      "replicas": [{"nodeId": 10, "type": "voter"}],
-      "preferredLeader": 3,
-    }
-    discard store.raftPut(key, val)
+    let val = GroupRecord(
+      groupId: gid.uint64,
+      spaceId: 0,
+      preferredLeader: 3,
+      leader: 0,
+      replicas: @[GroupReplicaBin(nodeId: 10, replicaType: rtVoter)]
+    )
+    discard store.raftPut(key, encode(val))
     store.loadGroupMembers()
     check store.preferredLeaders.hasKey(gid)
 
