@@ -267,7 +267,8 @@ proc execCreateDatabase(op: PlanOp, ctx: ExecutorContext): ExecResult =
   let internalReadTimestamp = txnRes.val.readTimestamp
 
   # Check for duplicate (within transaction snapshot)
-  let existing = ctx.client.kvGet(key, txnId = internalTxnId, readTimestamp = internalReadTimestamp)
+  let existing = ctx.client.kvGet(key, txnId = internalTxnId,
+      readTimestamp = internalReadTimestamp)
   if existing.isOk and existing.val.isSome:
     discard ctx.client.rollbackTxn(internalTxnId)
     if op.cdbIfNotExists:
@@ -287,7 +288,8 @@ proc execCreateDatabase(op: PlanOp, ctx: ExecutorContext): ExecResult =
     database: op.cdbName,
     createdAtNs: nowNs()
   )
-  let pubPutRes = ctx.client.kvPut(pubKey, encode(pubRec), txnId = internalTxnId)
+  let pubPutRes = ctx.client.kvPut(pubKey, encode(pubRec),
+      txnId = internalTxnId)
   if not pubPutRes.isOk:
     discard ctx.client.rollbackTxn(internalTxnId)
     return errorResult(&"failed to create public schema: {pubPutRes.err}")
@@ -311,7 +313,8 @@ proc execDropDatabase(op: PlanOp, ctx: ExecutorContext): ExecResult =
   let internalReadTimestamp = txnRes.val.readTimestamp
 
   # Check if database exists
-  let existing = ctx.client.kvGet(key, txnId = internalTxnId, readTimestamp = internalReadTimestamp)
+  let existing = ctx.client.kvGet(key, txnId = internalTxnId,
+      readTimestamp = internalReadTimestamp)
   if not existing.isOk or existing.val.isNone:
     discard ctx.client.rollbackTxn(internalTxnId)
     if op.ddbIfExists:
@@ -323,7 +326,8 @@ proc execDropDatabase(op: PlanOp, ctx: ExecutorContext): ExecResult =
   let schemaPrefix = op.ddbName & "."
   let schemaStart = encodeTableKey(SYS_SCHEMAS_TABLE_ID, schemaPrefix)
   let schemaEnd = encodeTableKey(SYS_SCHEMAS_TABLE_ID, schemaPrefix & "\xFF")
-  let schemaScan = ctx.client.kvScan(schemaStart, schemaEnd, 0, txnId = internalTxnId, readTimestamp = internalReadTimestamp)
+  let schemaScan = ctx.client.kvScan(schemaStart, schemaEnd, 0,
+      txnId = internalTxnId, readTimestamp = internalReadTimestamp)
   if schemaScan.isOk:
     for entry in schemaScan.val:
       let delRes = ctx.client.kvDelete(entry.key, txnId = internalTxnId)
@@ -334,7 +338,8 @@ proc execDropDatabase(op: PlanOp, ctx: ExecutorContext): ExecResult =
   # Find and delete all tables and their data rows
   let tableStart = encodeTableKey(SYS_TABLES_TABLE_ID, "")
   let tableEnd = encodeTableKey(SYS_TABLES_TABLE_ID + 1, "")
-  let tableScan = ctx.client.kvScan(tableStart, tableEnd, 0, txnId = internalTxnId, readTimestamp = internalReadTimestamp)
+  let tableScan = ctx.client.kvScan(tableStart, tableEnd, 0,
+      txnId = internalTxnId, readTimestamp = internalReadTimestamp)
   if tableScan.isOk:
     for entry in tableScan.val:
       let rec = decodeTableRecord(entry.value)
@@ -343,10 +348,12 @@ proc execDropDatabase(op: PlanOp, ctx: ExecutorContext): ExecResult =
         # Delete all data rows for this table
         let dataStart = encodeDataRowKey(tableId, "")
         let dataEnd = encodeDataRowKey(tableId + 1, "")
-        let dataScan = ctx.client.kvScan(dataStart, dataEnd, 0, txnId = internalTxnId, readTimestamp = internalReadTimestamp)
+        let dataScan = ctx.client.kvScan(dataStart, dataEnd, 0,
+            txnId = internalTxnId, readTimestamp = internalReadTimestamp)
         if dataScan.isOk:
           for dataEntry in dataScan.val:
-            let delRes = ctx.client.kvDelete(dataEntry.key, txnId = internalTxnId)
+            let delRes = ctx.client.kvDelete(dataEntry.key,
+                txnId = internalTxnId)
             if not delRes.isOk:
               discard ctx.client.rollbackTxn(internalTxnId)
               return errorResult(&"failed to delete data row: {delRes.err}")
@@ -381,7 +388,8 @@ proc execCreateSchema(op: PlanOp, ctx: ExecutorContext): ExecResult =
   let internalTxnId = txnRes.val.txnId
   let internalReadTimestamp = txnRes.val.readTimestamp
 
-  let existing = ctx.client.kvGet(key, txnId = internalTxnId, readTimestamp = internalReadTimestamp)
+  let existing = ctx.client.kvGet(key, txnId = internalTxnId,
+      readTimestamp = internalReadTimestamp)
   if existing.isOk and existing.val.isSome:
     discard ctx.client.rollbackTxn(internalTxnId)
     if op.csIfNotExists:
@@ -411,7 +419,8 @@ proc execDropSchema(op: PlanOp, ctx: ExecutorContext): ExecResult =
   let internalTxnId = txnRes.val.txnId
   let internalReadTimestamp = txnRes.val.readTimestamp
 
-  let existing = ctx.client.kvGet(key, txnId = internalTxnId, readTimestamp = internalReadTimestamp)
+  let existing = ctx.client.kvGet(key, txnId = internalTxnId,
+      readTimestamp = internalReadTimestamp)
   if not existing.isOk or existing.val.isNone:
     discard ctx.client.rollbackTxn(internalTxnId)
     if op.dsIfExists:
@@ -441,7 +450,8 @@ proc execCreateTable(op: PlanOp, ctx: ExecutorContext): ExecResult =
   let internalTxnId = txnRes.val.txnId
   let internalReadTimestamp = txnRes.val.readTimestamp
 
-  let existing = ctx.client.kvGet(key, txnId = internalTxnId, readTimestamp = internalReadTimestamp)
+  let existing = ctx.client.kvGet(key, txnId = internalTxnId,
+      readTimestamp = internalReadTimestamp)
   if existing.isOk and existing.val.isSome:
     discard ctx.client.rollbackTxn(internalTxnId)
     if op.ctIfNotExists:
@@ -454,7 +464,8 @@ proc execCreateTable(op: PlanOp, ctx: ExecutorContext): ExecResult =
     let spaceName = op.ctSpaceName.get()
     let sStart = encodeTableKey(SYS_SPACES_TABLE_ID, "")
     let sEnd = encodeTableKey(SYS_SPACES_TABLE_ID + 1, "")
-    let sScan = ctx.client.kvScan(sStart, sEnd, 0, txnId = internalTxnId, readTimestamp = internalReadTimestamp)
+    let sScan = ctx.client.kvScan(sStart, sEnd, 0, txnId = internalTxnId,
+        readTimestamp = internalReadTimestamp)
     var spaceId = -1
     if sScan.isOk:
       for entry in sScan.val:
@@ -494,7 +505,8 @@ proc execDropTable(op: PlanOp, ctx: ExecutorContext): ExecResult =
   let internalTxnId = txnRes.val.txnId
   let internalReadTimestamp = txnRes.val.readTimestamp
 
-  let existing = ctx.client.kvGet(key, txnId = internalTxnId, readTimestamp = internalReadTimestamp)
+  let existing = ctx.client.kvGet(key, txnId = internalTxnId,
+      readTimestamp = internalReadTimestamp)
   if not existing.isOk or existing.val.isNone:
     discard ctx.client.rollbackTxn(internalTxnId)
     if op.dtIfExists:
@@ -531,7 +543,8 @@ proc execCreateSpace(op: PlanOp, ctx: ExecutorContext): ExecResult =
   # Check for duplicate by name (within transaction snapshot)
   let startKey = encodeTableKey(SYS_SPACES_TABLE_ID, "")
   let endKey = encodeTableKey(SYS_SPACES_TABLE_ID + 1, "")
-  let scanRes = ctx.client.kvScan(startKey, endKey, 0, txnId = internalTxnId, readTimestamp = internalReadTimestamp)
+  let scanRes = ctx.client.kvScan(startKey, endKey, 0, txnId = internalTxnId,
+      readTimestamp = internalReadTimestamp)
   if scanRes.isOk:
     for entry in scanRes.val:
       echo "DEBUG: decoding space record for key ", entry.key
@@ -543,12 +556,14 @@ proc execCreateSpace(op: PlanOp, ctx: ExecutorContext): ExecResult =
   # Count nodes in the cluster (within transaction snapshot)
   let nodesStart = encodeTableKey(SYS_NODES_TABLE_ID, "")
   let nodesEnd = encodeTableKey(SYS_NODES_TABLE_ID + 1, "")
-  let nodesRes = ctx.client.kvScan(nodesStart, nodesEnd, 0, txnId = internalTxnId, readTimestamp = internalReadTimestamp)
+  let nodesRes = ctx.client.kvScan(nodesStart, nodesEnd, 0,
+      txnId = internalTxnId, readTimestamp = internalReadTimestamp)
   var nodeCount = 0
   var nodeIds: seq[int] = @[]
   if nodesRes.isOk:
     for entry in nodesRes.val:
-      echo "DEBUG: decoding node record for key ", entry.key, " len=", entry.value.len
+      echo "DEBUG: decoding node record for key ", entry.key, " len=",
+          entry.value.len
       let rec = decodeNodeRecord(entry.value)
       nodeIds.add(int(rec.nodeId))
       inc nodeCount
@@ -577,7 +592,8 @@ proc execCreateSpace(op: PlanOp, ctx: ExecutorContext): ExecResult =
   # Find max existing groupId to allocate new ones (within transaction)
   let rangesStart = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
   let rangesEnd = encodeTableKey(SYS_GROUPS_TABLE_ID + 1, "")
-  let rangesRes = ctx.client.kvScan(rangesStart, rangesEnd, 0, txnId = internalTxnId, readTimestamp = internalReadTimestamp)
+  let rangesRes = ctx.client.kvScan(rangesStart, rangesEnd, 0,
+      txnId = internalTxnId, readTimestamp = internalReadTimestamp)
   var maxGroupId: uint64 = 1
   if rangesRes.isOk:
     for entry in rangesRes.val:
@@ -607,7 +623,8 @@ proc execCreateSpace(op: PlanOp, ctx: ExecutorContext): ExecResult =
       replicas: groupReplicas
     )
     let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupId)
-    let putRes = ctx.client.kvPut(groupKey, encode(groupRec), txnId = internalTxnId)
+    let putRes = ctx.client.kvPut(groupKey, encode(groupRec),
+        txnId = internalTxnId)
     if not putRes.isOk:
       discard ctx.client.rollbackTxn(internalTxnId)
       return errorResult(&"failed to create group {groupId}: {putRes.err}")
@@ -627,7 +644,8 @@ proc execCreateSpace(op: PlanOp, ctx: ExecutorContext): ExecResult =
     createdAtNs: nowNs()
   )
   let spaceKey = encodeSpaceKey(spaceId)
-  let putRes = ctx.client.kvPut(spaceKey, encode(spaceRec), txnId = internalTxnId)
+  let putRes = ctx.client.kvPut(spaceKey, encode(spaceRec),
+      txnId = internalTxnId)
   if not putRes.isOk:
     discard ctx.client.rollbackTxn(internalTxnId)
     return errorResult(&"failed to write space record: {putRes.err}")
@@ -654,7 +672,8 @@ proc execDropSpace(op: PlanOp, ctx: ExecutorContext): ExecResult =
   # Find space by name and extract spaceId and groupIds (within transaction)
   let startKey = encodeTableKey(SYS_SPACES_TABLE_ID, "")
   let endKey = encodeTableKey(SYS_SPACES_TABLE_ID + 1, "")
-  let scanRes = ctx.client.kvScan(startKey, endKey, 0, txnId = internalTxnId, readTimestamp = internalReadTimestamp)
+  let scanRes = ctx.client.kvScan(startKey, endKey, 0, txnId = internalTxnId,
+      readTimestamp = internalReadTimestamp)
   var foundKey = ""
   var spaceId = -1
   var groupIds: seq[uint64] = @[]
@@ -674,7 +693,8 @@ proc execDropSpace(op: PlanOp, ctx: ExecutorContext): ExecResult =
   # Check if any tables are using this space (within transaction)
   let tableStart = encodeTableKey(SYS_TABLES_TABLE_ID, "")
   let tableEnd = encodeTableKey(SYS_TABLES_TABLE_ID + 1, "")
-  let tableScan = ctx.client.kvScan(tableStart, tableEnd, 0, txnId = internalTxnId, readTimestamp = internalReadTimestamp)
+  let tableScan = ctx.client.kvScan(tableStart, tableEnd, 0,
+      txnId = internalTxnId, readTimestamp = internalReadTimestamp)
   if tableScan.isOk:
     for entry in tableScan.val:
       let rec = decodeTableRecord(entry.value)
@@ -731,8 +751,9 @@ proc execShowDatabasesTxn(ctx: ExecutorContext): ExecResult =
 
   var resultRows: seq[seq[string]]
   for entry in res.val:
-    let rec = decodeDatabaseRecord(entry.value)
-    resultRows.add(@[rec.name])
+    let (rec, isDeleted) = decodeDatabaseRecordFromMVCC(entry.value)
+    if not isDeleted:
+      resultRows.add(@[rec.name])
 
   rowsResult(@["database_name"], resultRows)
 
@@ -745,8 +766,8 @@ proc execShowSchemasTxn(op: PlanOp, ctx: ExecutorContext): ExecResult =
 
   var resultRows: seq[seq[string]]
   for entry in res.val:
-    let rec = decodeSchemaRecord(entry.value)
-    if rec.database == op.ssDatabase or op.ssDatabase.len == 0:
+    let (rec, isDeleted) = decodeSchemaRecordFromMVCC(entry.value)
+    if not isDeleted and (rec.database == op.ssDatabase or op.ssDatabase.len == 0):
       resultRows.add(@[rec.name])
 
   rowsResult(@["schema_name"], resultRows)
@@ -760,8 +781,9 @@ proc execShowTablesTxn(op: PlanOp, ctx: ExecutorContext): ExecResult =
 
   var resultRows: seq[seq[string]]
   for entry in res.val:
-    let rec = decodeTableRecord(entry.value)
-    if (rec.database == op.stDatabase or op.stDatabase.len == 0) and
+    let (rec, isDeleted) = decodeTableRecordFromMVCC(entry.value)
+    if not isDeleted and
+       (rec.database == op.stDatabase or op.stDatabase.len == 0) and
        (rec.schema == op.stSchema or op.stSchema.len == 0):
       resultRows.add(@[rec.name])
 
@@ -777,13 +799,14 @@ proc execShowSpacesTxn(ctx: ExecutorContext): ExecResult =
 
   var resultRows: seq[seq[string]]
   for entry in res.val:
-    let rec = decodeSpaceRecord(entry.value)
-    let replicasStr = if rec.replicas == 0: "ALL" else: $rec.replicas
-    var groupIdsStr = ""
-    for i, gid in rec.groupIds:
-      if i > 0: groupIdsStr.add(",")
-      groupIdsStr.add($gid)
-    resultRows.add(@[$rec.spaceId, rec.name, replicasStr, $rec.groupCount, groupIdsStr])
+    let (rec, isDeleted) = decodeSpaceRecordFromMVCC(entry.value)
+    if not isDeleted:
+      let replicasStr = if rec.replicas == 0: "ALL" else: $rec.replicas
+      var groupIdsStr = ""
+      for i, gid in rec.groupIds:
+        if i > 0: groupIdsStr.add(",")
+        groupIdsStr.add($gid)
+      resultRows.add(@[$rec.spaceId, rec.name, replicasStr, $rec.groupCount, groupIdsStr])
 
   rowsResult(@["space_id", "name", "replicas", "group_count", "group_ids"],
              resultRows)
@@ -984,7 +1007,8 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
 
       let startKey = encodeDataRowKey(op.upTableId, "")
       let endKey = encodeDataRowKey(op.upTableId + 1, "")
-      let res = ctx.client.kvScan(startKey, endKey, 0, txnId = ctx.txnId, readTimestamp = ctx.readTimestamp)
+      let res = ctx.client.kvScan(startKey, endKey, 0, txnId = ctx.txnId,
+          readTimestamp = ctx.readTimestamp)
 
       if not res.isOk:
         if implicitTxn: rollbackImplicitTxn()
@@ -999,7 +1023,8 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
             var updated = row.copy()
             for (col, valExpr) in op.upSets:
               updated[col] = evalExpr(valExpr, row)
-            let putRes = ctx.client.kvPut(entry.key, $updated, txnId = ctx.txnId)
+            let putRes = ctx.client.kvPut(entry.key, $updated,
+                txnId = ctx.txnId)
             if not putRes.isOk:
               error = &"failed to update row: {putRes.err}"
               break
@@ -1024,7 +1049,8 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
 
       let startKey = encodeDataRowKey(op.delTableId, "")
       let endKey = encodeDataRowKey(op.delTableId + 1, "")
-      let res = ctx.client.kvScan(startKey, endKey, 0, txnId = ctx.txnId, readTimestamp = ctx.readTimestamp)
+      let res = ctx.client.kvScan(startKey, endKey, 0, txnId = ctx.txnId,
+          readTimestamp = ctx.readTimestamp)
 
       if not res.isOk:
         if implicitTxn: rollbackImplicitTxn()

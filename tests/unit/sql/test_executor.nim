@@ -41,7 +41,7 @@ proc createTestEnv(suiteName: string): tuple[client: FractioClient,
   let testDir = "/tmp/fractio_test_" & suiteName & "_" & randomId
   if dirExists(testDir): removeDir(testDir)
   createDir(testDir)
-  
+
   let nodeId = NodeID(1)
   let raftBasePort = nextBasePort()
   let clientPort = nextBasePort()
@@ -512,10 +512,12 @@ suite "SQL Executor — SHOW statements":
     discard client.exec("CREATE SCHEMA other", database = "otherdb")
     let res = client.exec("SHOW SCHEMAS", database = "mydb")
     check res.kind == erkRows
-    check res.rows.len == 2
+    # Note: CREATE DATABASE auto-creates "public" schema, so we have 3 schemas
+    check res.rows.len == 3
     var names: seq[string]
     for row in res.rows:
       names.add(row[0])
+    check "public" in names # auto-created
     check "api" in names
     check "internal" in names
 
@@ -525,8 +527,13 @@ suite "SQL Executor — SHOW statements":
     discard client.exec("CREATE SCHEMA s1", database = "db1")
     discard client.exec("CREATE SCHEMA s2", database = "db2")
     let res = client.exec("SHOW SCHEMAS IN db1")
-    check res.rows.len == 1
-    check res.rows[0][0] == "s1"
+    # Note: CREATE DATABASE auto-creates "public" schema, so we have 2 schemas
+    check res.rows.len == 2
+    var names: seq[string]
+    for row in res.rows:
+      names.add(row[0])
+    check "public" in names # auto-created
+    check "s1" in names
 
   test "SHOW TABLES empty":
     let res = client.exec("SHOW TABLES")

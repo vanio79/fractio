@@ -253,14 +253,14 @@ proc decodeNodeRecord*(data: string): NodeRecord =
 proc stripMVCCHeader*(data: string): tuple[payload: string, isDeleted: bool] =
   ## Internal helper to strip MVCC header from a value.
   ## MVCC format: <MAGIC (4 bytes)><8 bytes timestamp><8 bytes txn_id><1 byte delete flag><payload>
-  
+
   const MVCC_HEADER_SIZE = 21
   const MVCC_MAGIC = "MVCC"
-  
+
   if data.len >= MVCC_HEADER_SIZE and data.startsWith(MVCC_MAGIC):
     let isDeleted = data[20] == '1'
     return (data[MVCC_HEADER_SIZE..^1], isDeleted)
-  
+
   return (data, false)
 
 
@@ -518,4 +518,15 @@ proc decodeSpaceRecordFromMVCC*(data: string): tuple[record: SpaceRecord,
     return (decodeSpaceRecord(payload), false)
   except CatchableError as e:
     echo "DEBUG: decodeSpaceRecordFromMVCC failed: ", e.msg, " len=", payload.len
+    raise e
+
+proc decodeSchemaRecordFromMVCC*(data: string): tuple[record: SchemaRecord,
+    isDeleted: bool] =
+  let (payload, isDeleted) = stripMVCCHeader(data)
+  if isDeleted: return (SchemaRecord(), true)
+  if payload.len < 4: return (SchemaRecord(), false)
+  try:
+    return (decodeSchemaRecord(payload), false)
+  except CatchableError as e:
+    echo "DEBUG: decodeSchemaRecordFromMVCC failed: ", e.msg, " len=", payload.len
     raise e
