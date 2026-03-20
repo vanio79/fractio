@@ -442,8 +442,16 @@ proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
     return false
 
   # Wait for initialization so that launcher.get_server() is valid.
-  let waitMs = if members.len == 1: 5000'i32 else: 500'i32
-  discard nuraftLauncherWaitInit(inst.launcher, waitMs)
+  # Space groups (3+ members) may take longer to initialize due to port binding and network setup
+  let waitMs = if members.len == 1: 5000'i32 elif members.len <=
+      3: 2000'i32 else: 1000'i32
+  var waitRes = nuraftLauncherWaitInit(inst.launcher, waitMs)
+  # Retry once if first attempt fails (common with port binding races)
+  if not waitRes:
+    sleep(300)
+    waitRes = nuraftLauncherWaitInit(inst.launcher, waitMs)
+  if not waitRes:
+    error("NuRaft launcher wait init failed", "groupId", $groupId, "waitMs", $waitMs)
 
   inst.server = nuraftLauncherGetServer(inst.launcher)
   if inst.server == nil:
