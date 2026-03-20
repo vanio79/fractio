@@ -14,6 +14,8 @@ import zippy
 import ../protocol/server as pserver
 import ../protocol/messages/cluster as clusterMsgs
 import ../sql/executor
+import ../client/fractio_client
+import ../client/sql_client
 import ../distributed/meta/system_tables
 import ../distributed/meta/system_schemas
 import ../protocol/raft_store
@@ -30,9 +32,19 @@ import ../storage/wisckey_backend
 
 var gSrvPtr {.global.}: pointer
 var gWebPort {.global.}: int
+var gClient {.global.}: FractioClient
 
 template getSrv(): pserver.ProtocolServer =
   cast[pserver.ProtocolServer](gSrvPtr)
+
+proc getClient(): FractioClient =
+  if gClient == nil:
+    let srv = getSrv()
+    # Dashboard connects to the local node's client port
+    let host = if srv.config.host == "0.0.0.0": "127.0.0.1" else: srv.config.host
+    gClient = newFractioClient(host, srv.config.port)
+    discard gClient.initialize()
+  gClient
 
 # ---------------------------------------------------------------------------
 # Static assets embedded at compile time
@@ -634,7 +646,7 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
           return %* {"error": "missing 'sql' field"}
         var execResult: ExecResult
         {.cast(gcsafe).}:
-          execResult = executeSQL(sql, srv.raftStore, db, sc)
+          execResult = getClient().query(sql, db, sc)
         case execResult.kind
         of erkRows:
           var rowsJson = newJArray()

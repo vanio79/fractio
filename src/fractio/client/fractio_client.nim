@@ -14,6 +14,7 @@ import std/[options, tables, sets, locks, atomics, strutils]
 import ../protocol/client
 import ../protocol/types
 import ../protocol/messages/kv as kvMsgs
+import ../protocol/messages/txn as txnMsgs
 import ../distributed/meta/system_tables
 import ../distributed/meta/system_schemas
 import ../storage/mvcc/types as mvccTypes
@@ -369,7 +370,8 @@ proc getGroupForKey*(client: FractioClient, key: string): uint64 =
 # KV Operations
 # =============================================================================
 
-proc kvGet*(client: FractioClient, key: string): KVOpResult[Option[string]] =
+proc kvGet*(client: FractioClient, key: string, txnId: uint64 = 0,
+    readTimestamp: uint64 = 0): KVOpResult[Option[string]] =
   ## Get a value by key, routing to the correct group leader
   if not client.initialized.load(moRelaxed):
     return kvOpErr[Option[string]]("client not initialized")
@@ -383,7 +385,7 @@ proc kvGet*(client: FractioClient, key: string): KVOpResult[Option[string]] =
       return kvOpErr[Option[string]]("no connection to group leader")
 
     let conn = connOpt.get()
-    let res = conn.kvGet(key)
+    let res = conn.kvGet(key, txnId = txnId, readTimestamp = readTimestamp)
 
     if res.isOk:
       if res.value.found:
@@ -402,7 +404,8 @@ proc kvGet*(client: FractioClient, key: string): KVOpResult[Option[string]] =
 
   return kvOpErr[Option[string]]("too many retries")
 
-proc kvPut*(client: FractioClient, key, value: string): KVOpVoidResult =
+proc kvPut*(client: FractioClient, key, value: string,
+    txnId: uint64 = 0): KVOpVoidResult =
   ## Put a key-value pair, routing to the correct group leader
   if not client.initialized.load(moRelaxed):
     return kvVoidErr("client not initialized")
@@ -415,7 +418,7 @@ proc kvPut*(client: FractioClient, key, value: string): KVOpVoidResult =
       return kvVoidErr("no connection to group leader")
 
     let conn = connOpt.get()
-    let res = conn.kvPut(key, value)
+    let res = conn.kvPut(key, value, txnId = txnId)
 
     if res.isOk and res.value.status == kvMsgs.PutStatusOK:
       return kvVoidOk()
@@ -431,7 +434,8 @@ proc kvPut*(client: FractioClient, key, value: string): KVOpVoidResult =
 
   return kvVoidErr("too many retries")
 
-proc kvDelete*(client: FractioClient, key: string): KVOpVoidResult =
+proc kvDelete*(client: FractioClient, key: string,
+    txnId: uint64 = 0): KVOpVoidResult =
   ## Delete a key, routing to the correct group leader
   if not client.initialized.load(moRelaxed):
     return kvVoidErr("client not initialized")
@@ -444,7 +448,7 @@ proc kvDelete*(client: FractioClient, key: string): KVOpVoidResult =
       return kvVoidErr("no connection to group leader")
 
     let conn = connOpt.get()
-    let res = conn.kvDelete(key)
+    let res = conn.kvDelete(key, txnId = txnId)
 
     if res.isOk and res.value.status in {kvMsgs.DelStatusDeleted,
         kvMsgs.DelStatusNotFound}:
@@ -461,7 +465,8 @@ proc kvDelete*(client: FractioClient, key: string): KVOpVoidResult =
   return kvVoidErr("too many retries")
 
 proc kvScan*(client: FractioClient, startKey, endKey: string,
-             limit: uint32 = 0): KVOpResult[seq[tuple[key, value: string]]] =
+    limit: uint32 = 0, txnId: uint64 = 0,
+    readTimestamp: uint64 = 0): KVOpResult[seq[tuple[key, value: string]]] =
   ## Scan a key range, routing to the correct group leader
   if not client.initialized.load(moRelaxed):
     return kvOpErr[seq[tuple[key, value: string]]]("client not initialized")
@@ -474,7 +479,8 @@ proc kvScan*(client: FractioClient, startKey, endKey: string,
       return kvOpErr[seq[tuple[key, value: string]]]("no connection to group leader")
 
     let conn = connOpt.get()
-    let res = conn.kvScan(startKey, endKey, limit)
+    let res = conn.kvScan(startKey, endKey, limit, txnId = txnId,
+                          readTimestamp = readTimestamp)
 
     if res.isOk:
       var entries: seq[tuple[key, value: string]] = @[]
@@ -490,6 +496,59 @@ proc kvScan*(client: FractioClient, startKey, endKey: string,
     return kvOpErr[seq[tuple[key, value: string]]](res.error.msg)
 
   return kvOpErr[seq[tuple[key, value: string]]]("too many retries")
+
+# =============================================================================
+# Transaction Operations
+# =============================================================================
+
+proc beginTxn*(client: FractioClient): KVOpResult[tuple[txnId,
+    readTimestamp: uint64]] =
+  ## Begin a new transaction by contacting any node (prefers meta group leader)
+  if not client.initialized.load(moRelaxed):
+    if not client.initialize():
+      return kvOpErr[tuple[txnId, readTimestamp: uint64]]("failed to initialize client")
+
+  # Use meta group leader if possible, otherwise any connection
+  let connOpt = client.getGroupLeaderConnection(1) # Group 1 is meta
+  if connOpt.isNone:
+    return kvOpErr[tuple[txnId, readTimestamp: uint64]]("no connection for beginTxn")
+
+  let conn = connOpt.get()
+  let res = conn.beginTxn()
+  if res.isOk:
+    return kvOpOk((txnId: res.value.txnId, readTimestamp: res.value.readTimestamp))
+  else:
+    return kvOpErr[tuple[txnId, readTimestamp: uint64]](res.error.msg)
+
+proc commitTxn*(client: FractioClient, txnId: uint64): KVOpVoidResult =
+  ## Commit a transaction.
+  # We should send commit to the node that started it, or any node if they share txn state.
+  # For now, use meta group leader.
+  let connOpt = client.getGroupLeaderConnection(1)
+  if connOpt.isNone:
+    return kvVoidErr("no connection for commitTxn")
+
+  let conn = connOpt.get()
+  let res = conn.commitTxn(txnId)
+  if res.isOk and res.value.status == txnMsgs.TxnCommitOK:
+    return kvVoidOk()
+  else:
+    let errMsg = if res.isOk: "commit failed with status " & $res.value.status
+                 else: res.error.msg
+    return kvVoidErr(errMsg)
+
+proc rollbackTxn*(client: FractioClient, txnId: uint64): KVOpVoidResult =
+  ## Rollback a transaction.
+  let connOpt = client.getGroupLeaderConnection(1)
+  if connOpt.isNone:
+    return kvVoidErr("no connection for rollbackTxn")
+
+  let conn = connOpt.get()
+  let res = conn.rollbackTxn(txnId)
+  if res.isOk:
+    return kvVoidOk()
+  else:
+    return kvVoidErr(res.error.msg)
 
 # =============================================================================
 # Cleanup

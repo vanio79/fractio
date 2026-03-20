@@ -8,9 +8,7 @@ import std/[options, json, strutils, strformat]
 import ./ast
 import ../distributed/meta/system_tables
 import ../distributed/meta/system_schemas
-import ../protocol/raft_store
-from ../protocol/mvcc_store import MvccTransactionStore, latestGet, latestScan,
-    MvccResult, mvccOk, mvccErr
+import ../client/fractio_client
 import ../core/types as coreTypes
 
 # ---------------------------------------------------------------------------
@@ -224,31 +222,18 @@ proc columnDataTypeToDataType(cdt: ColumnDataType): DataType =
   of cdtDate: dtDate
   of cdtDateTime: dtDateTime
 
-proc resolveTable*(store: RaftKVStoreExt, mvccStore: MvccTransactionStore,
+proc resolveTable*(client: FractioClient,
     database, schema, tableName: string): Option[TableDescriptor] =
   ## Look up a table descriptor from the system catalog.
   ## Key format: /t/<SYS_TABLES_TABLE_ID>/<database>.<schema>.<tableName>
-  ## Uses MVCC store to read committed data (handles MVCC-encoded keys).
   let catalogKey = encodeTableKey(SYS_TABLES_TABLE_ID,
       database & "." & schema & "." & tableName)
 
-  var entryOpt: Option[string] = none(string)
-
-  # Try MVCC store first (handles MVCC-encoded keys)
-  if mvccStore != nil:
-    let mvccRes = mvccStore.latestGet(catalogKey)
-    if mvccRes.isOk:
-      entryOpt = mvccRes.value
-  else:
-    # Fall back to direct raft read
-    let res = store.raftGet(catalogKey)
-    if res.isOk and res.value.isSome:
-      entryOpt = some(res.value.get().value)
-
-  if entryOpt.isNone:
+  let res = client.kvGet(catalogKey)
+  if res.isErr or res.val.isNone:
     return none(TableDescriptor)
 
-  let raw = entryOpt.get()
+  let raw = res.val.get()
   let rec = decodeTableRecord(raw)
   var desc = TableDescriptor(
     tableId: rec.tableId,
@@ -268,28 +253,19 @@ proc resolveTable*(store: RaftKVStoreExt, mvccStore: MvccTransactionStore,
     desc.columns.add(cd)
   some(desc)
 
-proc nextTableId*(store: RaftKVStoreExt,
-    mvccStore: MvccTransactionStore): uint32 =
+proc nextTableId*(client: FractioClient): uint32 =
   ## Allocate the next available user table ID by scanning existing tables.
-  ## Uses MVCC store to scan committed data (handles MVCC-encoded keys).
   let startKey = encodeTableKey(SYS_TABLES_TABLE_ID, "")
   let endKey = encodeTableKey(SYS_TABLES_TABLE_ID + 1, "")
   var maxId = FIRST_USER_TABLE_ID - 1
 
-  if mvccStore != nil:
-    let scanRes = mvccStore.latestScan(startKey, endKey, 0)
-    if scanRes.isOk:
-      for (key, value) in scanRes.value:
-        let rec = decodeTableRecord(value)
-        if rec.tableId >= FIRST_USER_TABLE_ID and rec.tableId > maxId:
-          maxId = rec.tableId
-  else:
-    let res = store.raftScan(startKey, endKey, 0, includeSystemKeys = true)
-    if res.isOk:
-      for (key, entry) in res.value:
-        let rec = decodeTableRecord(entry.value)
-        if rec.tableId >= FIRST_USER_TABLE_ID and rec.tableId > maxId:
-          maxId = rec.tableId
+  let scanRes = client.kvScan(startKey, endKey, limit = 1000)
+  if scanRes.isOk:
+    for item in scanRes.val:
+      let rec = decodeTableRecord(item.value)
+      if rec.tableId >= FIRST_USER_TABLE_ID and rec.tableId > maxId:
+        maxId = rec.tableId
+
   maxId + 1
 
 # ---------------------------------------------------------------------------
@@ -383,8 +359,7 @@ proc planDropSchema(stmt: Stmt, database: string): Plan =
   ))
   plan
 
-proc planCreateTable(stmt: Stmt, store: RaftKVStoreExt,
-    mvccStore: MvccTransactionStore,
+proc planCreateTable(stmt: Stmt, client: FractioClient,
     database, schema: string): Plan =
   let plan = newPlan()
 
@@ -410,7 +385,7 @@ proc planCreateTable(stmt: Stmt, store: RaftKVStoreExt,
       if col.primaryKey:
         pk.add(col.name)
 
-  let tableId = nextTableId(store, mvccStore)
+  let tableId = nextTableId(client)
 
   # Use binary encoding for TableRecord
   let rec = TableRecord(
@@ -433,11 +408,10 @@ proc planCreateTable(stmt: Stmt, store: RaftKVStoreExt,
   ))
   plan
 
-proc planInsert(stmt: Stmt, store: RaftKVStoreExt,
-    mvccStore: MvccTransactionStore,
+proc planInsert(stmt: Stmt, client: FractioClient,
     database, schema: string): Plan =
   let plan = newPlan()
-  let descOpt = resolveTable(store, mvccStore, database, schema, stmt.intoTable)
+  let descOpt = resolveTable(client, database, schema, stmt.intoTable)
   if descOpt.isNone:
     raise planError(&"table '{stmt.intoTable}' not found")
   let desc = descOpt.get()
@@ -462,11 +436,10 @@ proc planInsert(stmt: Stmt, store: RaftKVStoreExt,
   ))
   plan
 
-proc planSelect(stmt: Stmt, store: RaftKVStoreExt,
-    mvccStore: MvccTransactionStore,
+proc planSelect(stmt: Stmt, client: FractioClient,
     database, schema: string): Plan =
   let plan = newPlan()
-  let descOpt = resolveTable(store, mvccStore, database, schema, stmt.selFrom)
+  let descOpt = resolveTable(client, database, schema, stmt.selFrom)
   if descOpt.isNone:
     raise planError(&"table '{stmt.selFrom}' not found")
   let desc = descOpt.get()
@@ -527,11 +500,10 @@ proc planSelect(stmt: Stmt, store: RaftKVStoreExt,
   ))
   plan
 
-proc planUpdate(stmt: Stmt, store: RaftKVStoreExt,
-    mvccStore: MvccTransactionStore,
+proc planUpdate(stmt: Stmt, client: FractioClient,
     database, schema: string): Plan =
   let plan = newPlan()
-  let descOpt = resolveTable(store, mvccStore, database, schema, stmt.updTable)
+  let descOpt = resolveTable(client, database, schema, stmt.updTable)
   if descOpt.isNone:
     raise planError(&"table '{stmt.updTable}' not found")
   let desc = descOpt.get()
@@ -546,11 +518,10 @@ proc planUpdate(stmt: Stmt, store: RaftKVStoreExt,
   ))
   plan
 
-proc planDelete(stmt: Stmt, store: RaftKVStoreExt,
-    mvccStore: MvccTransactionStore,
+proc planDelete(stmt: Stmt, client: FractioClient,
     database, schema: string): Plan =
   let plan = newPlan()
-  let descOpt = resolveTable(store, mvccStore, database, schema, stmt.delTable)
+  let descOpt = resolveTable(client, database, schema, stmt.delTable)
   if descOpt.isNone:
     raise planError(&"table '{stmt.delTable}' not found")
   let desc = descOpt.get()
@@ -693,18 +664,16 @@ proc formatPlan*(plan: Plan): string =
 # Main entry point
 # ---------------------------------------------------------------------------
 
-proc planStatement*(stmt: Stmt, store: RaftKVStoreExt,
-    mvccStore: MvccTransactionStore = nil,
+proc planStatement*(stmt: Stmt, client: FractioClient,
     database: string = "default",
     schema: string = "public"): Plan =
   ## Translate a Stmt AST into a Plan (sequence of KV operations).
-  ## mvccStore is used for catalog lookups (handles MVCC-encoded system tables).
   case stmt.kind
   of stmtCreateDatabase: planCreateDatabase(stmt)
   of stmtDropDatabase: planDropDatabase(stmt)
   of stmtCreateSchema: planCreateSchema(stmt, database)
   of stmtDropSchema: planDropSchema(stmt, database)
-  of stmtCreateTable: planCreateTable(stmt, store, mvccStore, database, schema)
+  of stmtCreateTable: planCreateTable(stmt, client, database, schema)
   of stmtDropTable:
     let plan = newPlan()
     plan.add(PlanOp(kind: poDropTable,
@@ -714,10 +683,10 @@ proc planStatement*(stmt: Stmt, store: RaftKVStoreExt,
       dtDatabase: database,
     ))
     plan
-  of stmtInsert: planInsert(stmt, store, mvccStore, database, schema)
-  of stmtSelect: planSelect(stmt, store, mvccStore, database, schema)
-  of stmtUpdate: planUpdate(stmt, store, mvccStore, database, schema)
-  of stmtDelete: planDelete(stmt, store, mvccStore, database, schema)
+  of stmtInsert: planInsert(stmt, client, database, schema)
+  of stmtSelect: planSelect(stmt, client, database, schema)
+  of stmtUpdate: planUpdate(stmt, client, database, schema)
+  of stmtDelete: planDelete(stmt, client, database, schema)
   of stmtShowDatabases:
     let plan = newPlan()
     plan.add(PlanOp(kind: poShowDatabases))
@@ -761,7 +730,7 @@ proc planStatement*(stmt: Stmt, store: RaftKVStoreExt,
     plan.add(PlanOp(kind: poRollbackTxn))
     plan
   of stmtExplain:
-    let innerPlan = planStatement(stmt.explainStmt, store, mvccStore, database, schema)
+    let innerPlan = planStatement(stmt.explainStmt, client, database, schema)
     let plan = newPlan()
     plan.add(PlanOp(kind: poExplain, exInnerPlan: innerPlan))
     plan
