@@ -83,3 +83,10 @@ src/fractio/web/static/app.js
 
 src/fractio/protocol/mvcc_store.nim
 .cgr-hash-cache.json
+
+# Compiled Nim binaries without extension in src/
+src/fractio/distributed/raft/nuraft_coordinator
+src/fractio/protocol/mvcc_store
+src/fractio/protocol/raft_store
+src/fractio/sql/executor
+src/fractio/storage/mvcc/types
