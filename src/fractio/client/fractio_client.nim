@@ -68,6 +68,8 @@ type
     # State
     initialized*: Atomic[bool]
     lastRefreshNs*: Atomic[int64]
+    activeTxnId*: uint64
+    activeReadTs*: uint64
 
 # =============================================================================
 # Result type helpers
@@ -185,20 +187,34 @@ proc fetchNodesTable(client: FractioClient, conn: ProtocolClient): bool =
   let startKey = encodeTableKey(SYS_NODES_TABLE_ID, "")
   let endKey = encodeTableKey(SYS_NODES_TABLE_ID + 1, "")
 
+  echo "DEBUG: fetching nodes table, range: ", startKey, " to ", endKey
   let scanRes = conn.kvScan(startKey, endKey, limit = 1000)
   if scanRes.isErr:
+    echo "DEBUG: fetchNodesTable scan failed: ", scanRes.error.msg
     return false
 
+  echo "DEBUG: fetchNodesTable got ", scanRes.value.pairs.len, " entries"
   withLock client.lock:
     for pair in scanRes.value.pairs:
-      let nodeRec = decodeNodeRecord(pair.value)
-      client.nodes[nodeRec.nodeId] = NodeInfo(
-        nodeId: nodeRec.nodeId,
-        host: nodeRec.host,
-        clientPort: nodeRec.clientPort,
-        status: nodeRec.status,
-        client: nil # Will be created on-demand
-      )
+      # Hex log the record
+      var hex = ""
+      for i in 0 ..< min(pair.value.len, 32):
+        hex &= " " & toHex(uint8(pair.value[i]))
+      echo "DEBUG: raw record hex:", hex
+      
+      # Use MVCC decoder
+      let (nodeRec, isDeleted) = decodeNodeRecordFromMVCC(pair.value)
+      if not isDeleted:
+        echo "DEBUG: caching node ", nodeRec.nodeId, " host=", nodeRec.host, " port=", nodeRec.clientPort
+        client.nodes[nodeRec.nodeId] = NodeInfo(
+          nodeId: nodeRec.nodeId,
+          host: nodeRec.host,
+          clientPort: nodeRec.clientPort,
+          status: nodeRec.status,
+          client: nil # Will be created on-demand
+        )
+      else:
+        echo "DEBUG: skipping deleted node record"
 
   return true
 
@@ -207,23 +223,29 @@ proc fetchGroupsTable(client: FractioClient, conn: ProtocolClient): bool =
   let startKey = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
   let endKey = encodeTableKey(SYS_GROUPS_TABLE_ID + 1, "")
 
+  echo "DEBUG: fetching groups table, range: ", startKey, " to ", endKey
   let scanRes = conn.kvScan(startKey, endKey, limit = 1000)
   if scanRes.isErr:
+    echo "DEBUG: fetchGroupsTable scan failed: ", scanRes.error.msg
     return false
 
+  echo "DEBUG: fetchGroupsTable got ", scanRes.value.pairs.len, " entries"
   withLock client.lock:
     for pair in scanRes.value.pairs:
-      let groupRec = decodeGroupRecord(pair.value)
-      var replicaNodeIds: seq[uint32] = @[]
-      for rep in groupRec.replicas:
-        replicaNodeIds.add(rep.nodeId)
+      # Use MVCC decoder
+      let (groupRec, isDeleted) = decodeGroupRecordFromMVCC(pair.value)
+      if not isDeleted:
+        var replicaNodeIds: seq[uint32] = @[]
+        for rep in groupRec.replicas:
+          replicaNodeIds.add(rep.nodeId)
 
-      client.groups[groupRec.groupId] = GroupInfo(
-        groupId: groupRec.groupId,
-        spaceId: groupRec.spaceId,
-        leaderNodeId: groupRec.leader,
-        replicaNodeIds: replicaNodeIds
-      )
+        echo "DEBUG: caching group ", groupRec.groupId, " leader=", groupRec.leader
+        client.groups[groupRec.groupId] = GroupInfo(
+          groupId: groupRec.groupId,
+          spaceId: groupRec.spaceId,
+          leaderNodeId: groupRec.leader,
+          replicaNodeIds: replicaNodeIds
+        )
 
   return true
 
@@ -233,10 +255,12 @@ proc initialize*(client: FractioClient): bool =
   if client.initialized.load(moRelaxed):
     return true
 
+  echo "DEBUG: initializing client, connecting to ", client.config.initialHost, ":", client.config.initialPort
   # Connect to initial node
   let connOpt = client.connectToNode(client.config.initialHost,
       client.config.initialPort)
   if connOpt.isNone:
+    echo "DEBUG: failed to connect to initial node"
     return false
 
   let conn = connOpt.get()
@@ -244,11 +268,14 @@ proc initialize*(client: FractioClient): bool =
 
   # Fetch system tables
   if not client.fetchNodesTable(conn):
+    echo "DEBUG: fetchNodesTable failed"
     return false
   if not client.fetchGroupsTable(conn):
+    echo "DEBUG: fetchGroupsTable failed"
     return false
 
   client.initialized.store(true, moRelaxed)
+  echo "DEBUG: client initialized successfully"
   return true
 
 proc refreshMetadata*(client: FractioClient): bool =
@@ -295,9 +322,11 @@ proc getGroupLeaderConnection*(client: FractioClient, groupId: uint64): Option[
   withLock client.lock:
     # Check if we have cached group info
     if groupId notin client.groups:
+      echo "DEBUG: groupId ", groupId, " not in client.groups"
       return none(ProtocolClient)
 
     let groupInfo = client.groups[groupId]
+    echo "DEBUG: groupInfo for ", groupId, ": leader=", groupInfo.leaderNodeId, " replicas=", groupInfo.replicaNodeIds
 
     # If we know the leader and have a connection, use it
     if groupInfo.leaderNodeId != 0:
@@ -310,17 +339,23 @@ proc getGroupLeaderConnection*(client: FractioClient, groupId: uint64): Option[
       # Try to connect to leader (use internal version since we hold the lock)
       let connOpt = client.getNodeConnectionInternal(groupInfo.leaderNodeId)
       if connOpt.isSome:
+        echo "DEBUG: connected to leader ", groupInfo.leaderNodeId
         client.leaderConnections[groupId] = connOpt.get()
         return connOpt
+      else:
+        echo "DEBUG: failed to connect to leader ", groupInfo.leaderNodeId
 
     # Leader unknown - try all replicas until we find one that works
+    echo "DEBUG: leader unknown for group ", groupId, ", trying replicas"
     for nodeId in groupInfo.replicaNodeIds:
       let connOpt = client.getNodeConnectionInternal(nodeId)
       if connOpt.isSome:
+        echo "DEBUG: connected to replica ", nodeId
         # We'll try this connection; if it's not the leader,
         # the operation will fail and we'll retry
         return connOpt
 
+  echo "DEBUG: no connection found for group ", groupId
   return none(ProtocolClient)
 
 proc refreshGroupLeader(client: FractioClient, groupId: uint64): bool =
@@ -357,13 +392,14 @@ proc getGroupForKey*(client: FractioClient, key: string): uint64 =
         let tableId = parseUInt(tableIdStr).uint32
         if tableId <= MAX_META_GROUP_TABLE_ID:
           return 1'u64 # Meta group
-        # For data tables, we'd need more sophisticated routing
-        # For now, assume group 2 for all data
-        return 2'u64
+        else:
+          # For data tables, we'd need more sophisticated routing
+          # For now, assume group 2 for all data tables (tableId >= 100)
+          return 2'u64
       except ValueError:
         discard
 
-  # Default to group 2 (data group)
+  # Default to group 2 (data group) for non-table keys or if parsing failed
   return 2'u64
 
 # =============================================================================
@@ -429,7 +465,8 @@ proc kvPut*(client: FractioClient, key, value: string,
         return kvVoidErr("failed to refresh group leader")
       continue
 
-    let errMsg = if res.isOk: "put failed" else: res.error.msg
+    let errMsg = if res.isOk: "put failed with status " & $res.value.status
+                 else: res.error.msg
     return kvVoidErr(errMsg)
 
   return kvVoidErr("too many retries")
@@ -511,6 +548,7 @@ proc beginTxn*(client: FractioClient): KVOpResult[tuple[txnId,
   # Use meta group leader if possible, otherwise any connection
   let connOpt = client.getGroupLeaderConnection(1) # Group 1 is meta
   if connOpt.isNone:
+    echo "DEBUG: beginTxn failed: no connection to meta group leader"
     return kvOpErr[tuple[txnId, readTimestamp: uint64]]("no connection for beginTxn")
 
   let conn = connOpt.get()
@@ -518,6 +556,7 @@ proc beginTxn*(client: FractioClient): KVOpResult[tuple[txnId,
   if res.isOk:
     return kvOpOk((txnId: res.value.txnId, readTimestamp: res.value.readTimestamp))
   else:
+    echo "DEBUG: beginTxn failed: ", res.error.msg
     return kvOpErr[tuple[txnId, readTimestamp: uint64]](res.error.msg)
 
 proc commitTxn*(client: FractioClient, txnId: uint64): KVOpVoidResult =
@@ -533,7 +572,11 @@ proc commitTxn*(client: FractioClient, txnId: uint64): KVOpVoidResult =
   if res.isOk and res.value.status == txnMsgs.TxnCommitOK:
     return kvVoidOk()
   else:
-    let errMsg = if res.isOk: "commit failed with status " & $res.value.status
+    let errMsg = if res.isOk:
+                   if res.value.status == txnMsgs.TxnCommitConflict:
+                     "commit failed due to conflict"
+                   else:
+                     "commit failed with status " & $res.value.status
                  else: res.error.msg
     return kvVoidErr(errMsg)
 

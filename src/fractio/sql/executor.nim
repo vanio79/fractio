@@ -78,9 +78,9 @@ proc newExecutorContext*(client: FractioClient, database: string = "default",
   ## Create a new executor context with default settings
   ExecutorContext(
     client: client,
-    txnId: 0,
-    readTimestamp: 0,
-    hasActiveTransaction: false,
+    txnId: client.activeTxnId,
+    readTimestamp: client.activeReadTs,
+    hasActiveTransaction: client.activeTxnId != 0,
     database: database,
     schema: schema
   )
@@ -472,6 +472,7 @@ proc execCreateTable(op: PlanOp, ctx: ExecutorContext): ExecResult =
 
   let putRes = ctx.client.kvPut(key, tableValue, txnId = internalTxnId)
   if not putRes.isOk:
+    echo "DEBUG: execCreateTable kvPut failed: ", putRes.err
     discard ctx.client.rollbackTxn(internalTxnId)
     return errorResult(&"failed to create table: {putRes.err}")
 
@@ -533,6 +534,7 @@ proc execCreateSpace(op: PlanOp, ctx: ExecutorContext): ExecResult =
   let scanRes = ctx.client.kvScan(startKey, endKey, 0, txnId = internalTxnId, readTimestamp = internalReadTimestamp)
   if scanRes.isOk:
     for entry in scanRes.val:
+      echo "DEBUG: decoding space record for key ", entry.key
       let rec = decodeSpaceRecord(entry.value)
       if rec.name == op.cspName:
         discard ctx.client.rollbackTxn(internalTxnId)
@@ -546,6 +548,7 @@ proc execCreateSpace(op: PlanOp, ctx: ExecutorContext): ExecResult =
   var nodeIds: seq[int] = @[]
   if nodesRes.isOk:
     for entry in nodesRes.val:
+      echo "DEBUG: decoding node record for key ", entry.key, " len=", entry.value.len
       let rec = decodeNodeRecord(entry.value)
       nodeIds.add(int(rec.nodeId))
       inc nodeCount
@@ -928,6 +931,7 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
         let key = encodeDataRowKey(op.insTableId, pkVal)
         let res = ctx.client.kvPut(key, rowJson, txnId = ctx.txnId)
         if not res.isOk:
+          echo "DEBUG: INSERT failed for key ", key, ": ", res.err
           error = &"failed to insert row: {res.err}"
           break
         inc count
@@ -953,7 +957,7 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
       rowsResult(op.pgColumns, @[vals])
 
     of poScan:
-      let res = execTxnScan(ctx, op.scStartKey, op.scEndKey, op.scLimit)
+      let res = execTxnScan(ctx, op.scStartKey, op.scEndKey, 0)
       if not res.isOk:
         return errorResult(&"failed to scan: {res.err}")
 
@@ -1079,6 +1083,8 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
           ctx.txnId = res.val.txnId
           ctx.readTimestamp = res.val.readTimestamp
           ctx.hasActiveTransaction = true
+          ctx.client.activeTxnId = res.val.txnId
+          ctx.client.activeReadTs = res.val.readTimestamp
           okResult("BEGIN")
         else:
           errorResult(&"failed to begin transaction: {res.err}")
@@ -1092,6 +1098,8 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
           ctx.hasActiveTransaction = false
           ctx.txnId = 0
           ctx.readTimestamp = 0
+          ctx.client.activeTxnId = 0
+          ctx.client.activeReadTs = 0
           okResult("COMMIT")
         else:
           errorResult(&"failed to commit transaction: {res.err}")
@@ -1105,6 +1113,8 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
           ctx.hasActiveTransaction = false
           ctx.txnId = 0
           ctx.readTimestamp = 0
+          ctx.client.activeTxnId = 0
+          ctx.client.activeReadTs = 0
           okResult("ROLLBACK")
         else:
           errorResult(&"failed to rollback transaction: {res.err}")

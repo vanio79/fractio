@@ -1,9 +1,9 @@
 # Tests for the SQL Executor
 #
 # Integration-style tests: parse SQL → plan → execute → verify KV state.
-# Uses a real single-node RaftKVStoreExt.
+# Uses a real single-node RaftKVStoreExt and a ProtocolServer.
 
-import std/[unittest, options, json, os, strutils]
+import std/[unittest, options, json, os, strutils, times, random]
 import fractio/sql/parser
 import fractio/sql/ast
 import fractio/sql/planner
@@ -19,9 +19,13 @@ import fractio/distributed/raft/multigroup_types
 import fractio/distributed/sharedtimer/mock
 import fractio/distributed/sharedtimer/types as timerTypes
 import fractio/core/timestamp_provider
+import fractio/storage/mvcc/types as mvccTypes
+import fractio/protocol/server
+import fractio/client/fractio_client
+import fractio/client/sql_client
 
 # ---------------------------------------------------------------------------
-# Test helper: create a single-node RaftKVStoreExt with MVCC store
+# Test helper: create a single-node environment
 # ---------------------------------------------------------------------------
 
 var testBasePort {.global.} = 17000
@@ -30,17 +34,22 @@ proc nextBasePort(): int =
   result = testBasePort
   testBasePort += 100
 
-proc createTestEnv(testDir: string): tuple[store: RaftKVStoreExt,
-    mvccStore: MvccTransactionStore] =
+proc createTestEnv(suiteName: string): tuple[client: FractioClient,
+    server: ProtocolServer, testDir: string] =
+  randomize()
+  let randomId = $rand(10000..99999)
+  let testDir = "/tmp/fractio_test_" & suiteName & "_" & randomId
   if dirExists(testDir): removeDir(testDir)
   createDir(testDir)
+  
   let nodeId = NodeID(1)
-  let basePort = nextBasePort()
-  let members = @[(nodeId: 1'u32, host: "127.0.0.1", basePort: basePort)]
+  let raftBasePort = nextBasePort()
+  let clientPort = nextBasePort()
+  let members = @[(nodeId: 1'u32, host: "127.0.0.1", basePort: raftBasePort)]
 
   let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
     nodeId: nodeId,
-    basePort: basePort,
+    basePort: raftBasePort,
     host: "127.0.0.1",
     dataDir: testDir,
     electionTimeoutLowerMs: 200,
@@ -61,11 +70,53 @@ proc createTestEnv(testDir: string): tuple[store: RaftKVStoreExt,
   store.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
 
   let txnMgr = newTransactionManager()
-  let mockTimer = MockTimeProvider(currentTime: timerTypes.Timestamp(1_000_000_000))
-  let tsProvider = newTimestampProvider(mockTimer, nodeId.uint16)
-  let mvccStore = newMvccTransactionStore(store, txnMgr, tsProvider)
+  let mvccStore = newMvccTransactionStore(store, txnMgr, nil)
 
-  result = (store, mvccStore)
+  # Seed system tables via sysTablePut to ensure valid headers
+  let nodeRec = NodeRecord(
+    nodeId: 1,
+    host: "127.0.0.1",
+    raftPort: raftBasePort.uint16,
+    clientPort: clientPort.uint16,
+    status: nsAlive
+  )
+  let nodeVal = encode(nodeRec)
+  discard store.sysTablePut(encodeTableKey(SYS_NODES_TABLE_ID, "1"), nodeVal)
+
+  let metaGroupRec = GroupRecord(
+    groupId: 1,
+    spaceId: 0,
+    leader: 1,
+    replicas: @[GroupReplicaBin(nodeId: 1, replicaType: rtVoter)]
+  )
+  discard store.sysTablePut(encodeTableKey(SYS_GROUPS_TABLE_ID, "1"), encode(metaGroupRec))
+
+  let dataGroupRec = GroupRecord(
+    groupId: 2,
+    spaceId: 1,
+    leader: 1,
+    replicas: @[GroupReplicaBin(nodeId: 1, replicaType: rtVoter)]
+  )
+  discard store.sysTablePut(encodeTableKey(SYS_GROUPS_TABLE_ID, "2"), encode(dataGroupRec))
+
+  # Start ProtocolServer
+  var srvConfig = defaultServerConfig()
+  srvConfig.port = clientPort
+  srvConfig.host = "127.0.0.1"
+  srvConfig.serverId = nodeId.uint16
+  srvConfig.dataDir = testDir
+  let server = newProtocolServer(srvConfig)
+  server.raftStore = store
+  server.mvccStore = mvccStore
+  server.txnMgr = txnMgr
+  server.start()
+
+  # Create client
+  let client = newFractioClient("127.0.0.1", clientPort)
+  if not client.initialize():
+    raise newException(CatchableError, "Failed to initialize client")
+
+  result = (client, server, testDir)
 
 proc cleanupTestDir(testDir: string) =
   if dirExists(testDir):
@@ -75,215 +126,229 @@ proc cleanupTestDir(testDir: string) =
 # Helper: execute SQL and return result
 # ---------------------------------------------------------------------------
 
-proc exec(store: RaftKVStoreExt, mvccStore: MvccTransactionStore, sql: string,
+proc exec(client: FractioClient, sql: string,
     database = "default", schema = "public"): ExecResult =
-  executeSQL(sql, store, mvccStore, database, schema)
+  client.query(sql, database, schema)
 
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 
 suite "SQL Executor — DDL":
-  var store: RaftKVStoreExt
-  var mvccStore: MvccTransactionStore
-  let testDir = "/tmp/fractio_test_executor_ddl_" & $getCurrentProcessId()
+  var client: FractioClient
+  var server: ProtocolServer
+  var testDir: string
 
   setup:
-    cleanupTestDir(testDir)
-    (store, mvccStore) = createTestEnv(testDir)
+    (client, server, testDir) = createTestEnv("ddl")
 
   teardown:
-    store.coordinator.stop()
+    if client != nil: client.close()
+    if server != nil:
+      server.stop()
+      if server.raftStore != nil and server.raftStore.coordinator != nil:
+        server.raftStore.coordinator.stop()
     cleanupTestDir(testDir)
 
   test "CREATE DATABASE":
-    let res = exec(store, mvccStore, "CREATE DATABASE testdb")
+    let res = client.exec("CREATE DATABASE testdb")
     check res.kind == erkOk
     check res.okMessage == "CREATE DATABASE"
 
-    # Verify in catalog
+    # Verify in catalog (via client)
     let key = encodeTableKey(SYS_DATABASES_TABLE_ID, "testdb")
-    let got = mvccStore.latestGet(key)
+    let got = client.kvGet(key)
     check got.isOk
-    check got.value.isSome
+    check got.val.isSome
 
   test "CREATE DATABASE duplicate error":
-    discard exec(store, mvccStore, "CREATE DATABASE testdb")
-    let res = exec(store, mvccStore, "CREATE DATABASE testdb")
+    discard client.exec("CREATE DATABASE testdb")
+    let res = client.exec("CREATE DATABASE testdb")
     check res.kind == erkError
     check "already exists" in res.error
 
   test "CREATE DATABASE IF NOT EXISTS":
-    discard exec(store, mvccStore, "CREATE DATABASE testdb")
-    let res = exec(store, mvccStore, "CREATE DATABASE IF NOT EXISTS testdb")
+    discard client.exec("CREATE DATABASE testdb")
+    let res = client.exec("CREATE DATABASE IF NOT EXISTS testdb")
     check res.kind == erkOk
 
   test "DROP DATABASE":
-    discard exec(store, mvccStore, "CREATE DATABASE testdb")
-    let res = exec(store, mvccStore, "DROP DATABASE testdb")
+    discard client.exec("CREATE DATABASE testdb")
+    let res = client.exec("DROP DATABASE testdb")
     check res.kind == erkOk
     # Verify removed
     let key = encodeTableKey(SYS_DATABASES_TABLE_ID, "testdb")
-    let got = mvccStore.latestGet(key)
+    let got = client.kvGet(key)
     check got.isOk
-    check got.value.isNone
+    check got.val.isNone
 
   test "DROP DATABASE non-existent error":
-    let res = exec(store, mvccStore, "DROP DATABASE nope")
+    let res = client.exec("DROP DATABASE nope")
     check res.kind == erkError
 
   test "DROP DATABASE IF EXISTS":
-    let res = exec(store, mvccStore, "DROP DATABASE IF EXISTS nope")
+    let res = client.exec("DROP DATABASE IF EXISTS nope")
     check res.kind == erkOk
 
   test "CREATE SCHEMA":
-    let res = exec(store, mvccStore, "CREATE SCHEMA myschema",
+    # Need to create database first
+    discard client.exec("CREATE DATABASE testdb")
+    let res = client.exec("CREATE SCHEMA myschema",
         database = "testdb")
     check res.kind == erkOk
 
   test "DROP SCHEMA":
-    discard exec(store, mvccStore, "CREATE SCHEMA myschema",
+    discard client.exec("CREATE DATABASE testdb")
+    discard client.exec("CREATE SCHEMA myschema",
         database = "testdb")
-    let res = exec(store, mvccStore, "DROP SCHEMA myschema",
+    let res = client.exec("DROP SCHEMA myschema",
         database = "testdb")
     check res.kind == erkOk
 
   test "CREATE TABLE":
-    let res = exec(store, mvccStore,
+    let res = client.exec(
         "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT)")
+    if res.kind == erkError:
+      echo "DEBUG ERROR: ", res.error
     check res.kind == erkOk
     check res.okMessage == "CREATE TABLE"
 
     # Verify catalog entry - decode as binary TableRecord
     let key = encodeTableKey(SYS_TABLES_TABLE_ID,
         "default.public.users")
-    let got = mvccStore.latestGet(key)
+    let got = client.kvGet(key)
     check got.isOk
-    check got.value.isSome
-    let rec = decodeTableRecord(got.value.get())
+    check got.val.isSome
+    let rec = decodeTableRecord(got.val.get())
     check rec.name == "users"
     check rec.columns.len == 3
 
   test "CREATE TABLE IF NOT EXISTS":
-    discard exec(store, mvccStore,
+    discard client.exec(
         "CREATE TABLE users (id INT PRIMARY KEY)")
-    let res = exec(store, mvccStore,
+    let res = client.exec(
         "CREATE TABLE IF NOT EXISTS users (id INT PRIMARY KEY)")
     check res.kind == erkOk
 
   test "CREATE TABLE duplicate error":
-    discard exec(store, mvccStore,
+    discard client.exec(
         "CREATE TABLE users (id INT PRIMARY KEY)")
-    let res = exec(store, mvccStore,
+    let res = client.exec(
         "CREATE TABLE users (id INT PRIMARY KEY)")
     check res.kind == erkError
     check "already exists" in res.error
 
   test "DROP TABLE":
-    discard exec(store, mvccStore,
+    discard client.exec(
         "CREATE TABLE users (id INT PRIMARY KEY)")
-    let res = exec(store, mvccStore, "DROP TABLE users")
+    let res = client.exec("DROP TABLE users")
     check res.kind == erkOk
 
   test "DROP TABLE IF EXISTS":
-    let res = exec(store, mvccStore, "DROP TABLE IF EXISTS nope")
+    let res = client.exec("DROP TABLE IF EXISTS nope")
     check res.kind == erkOk
 
 
 suite "SQL Executor — DML":
-  var store: RaftKVStoreExt
-  var mvccStore: MvccTransactionStore
-  let testDir = "/tmp/fractio_test_executor_dml_" & $getCurrentProcessId()
+  var client: FractioClient
+  var server: ProtocolServer
+  var testDir: string
 
   setup:
-    cleanupTestDir(testDir)
-    (store, mvccStore) = createTestEnv(testDir)
+    (client, server, testDir) = createTestEnv("dml")
     # Create a test table
-    discard exec(store, mvccStore,
+    discard client.exec(
         "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT)")
 
   teardown:
-    store.coordinator.stop()
+    if client != nil: client.close()
+    if server != nil:
+      server.stop()
+      if server.raftStore != nil and server.raftStore.coordinator != nil:
+        server.raftStore.coordinator.stop()
     cleanupTestDir(testDir)
 
   test "INSERT single row":
-    let res = exec(store, mvccStore,
+    let res = client.exec(
         "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)")
+    if res.kind == erkError:
+      echo "DEBUG ERROR: ", res.error
     check res.kind == erkModified
     check res.count == 1
 
-    # Verify data row exists via MVCC-aware read
+    # Verify data row exists via client
+    # User tables start at 100. Table 'users' should be 100.
     let key = encodeDataRowKey(100, "1")
-    let got = mvccStore.latestGet(key)
+    let got = client.kvGet(key)
     check got.isOk
-    check got.value.isSome
-    let row = parseJson(got.value.get())
+    check got.val.isSome
+    let row = parseJson(got.val.get())
     check row["name"].getStr == "Alice"
     check row["age"].getInt == 30
 
   test "INSERT multiple rows":
-    let res = exec(store, mvccStore,
+    let res = client.exec(
         "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30), (2, 'Bob', 25)")
     check res.kind == erkModified
     check res.count == 2
 
   test "INSERT into non-existent table":
-    let res = exec(store, mvccStore,
+    let res = client.exec(
         "INSERT INTO nonexistent (id) VALUES (1)")
     check res.kind == erkError
     check ("not found" in res.error or "nonexistent" in res.error)
 
   test "SELECT all rows":
-    discard exec(store, mvccStore,
+    discard client.exec(
         "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)")
-    discard exec(store, mvccStore,
+    discard client.exec(
         "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)")
 
-    let res = exec(store, mvccStore, "SELECT * FROM users")
+    let res = client.exec("SELECT * FROM users")
     check res.kind == erkRows
     check res.columns == @["id", "name", "age"]
     check res.rows.len == 2
 
   test "SELECT with point get":
-    discard exec(store, mvccStore,
+    discard client.exec(
         "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)")
-    discard exec(store, mvccStore,
+    discard client.exec(
         "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)")
 
-    let res = exec(store, mvccStore, "SELECT * FROM users WHERE id = 1")
+    let res = client.exec("SELECT * FROM users WHERE id = 1")
     check res.kind == erkRows
     check res.rows.len == 1
     check res.rows[0][1] == "Alice" # name column
 
   test "SELECT with filter":
-    discard exec(store, mvccStore,
+    discard client.exec(
         "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)")
-    discard exec(store, mvccStore,
+    discard client.exec(
         "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)")
-    discard exec(store, mvccStore,
+    discard client.exec(
         "INSERT INTO users (id, name, age) VALUES (3, 'Carol', 35)")
 
-    let res = exec(store, mvccStore, "SELECT * FROM users WHERE age > 28")
+    let res = client.exec("SELECT * FROM users WHERE age > 28")
     check res.kind == erkRows
     check res.rows.len == 2 # Alice (30) and Carol (35)
 
   test "SELECT with LIMIT":
-    discard exec(store, mvccStore,
+    discard client.exec(
         "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)")
-    discard exec(store, mvccStore,
+    discard client.exec(
         "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)")
-    discard exec(store, mvccStore,
+    discard client.exec(
         "INSERT INTO users (id, name, age) VALUES (3, 'Carol', 35)")
 
-    let res = exec(store, mvccStore, "SELECT * FROM users LIMIT 2")
+    let res = client.exec("SELECT * FROM users LIMIT 2")
     check res.kind == erkRows
     check res.rows.len == 2
 
   test "SELECT specific columns":
-    discard exec(store, mvccStore,
+    discard client.exec(
         "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)")
 
-    let res = exec(store, mvccStore, "SELECT name, age FROM users")
+    let res = client.exec("SELECT name, age FROM users")
     check res.kind == erkRows
     check res.columns == @["name", "age"]
     check res.rows.len == 1
@@ -291,124 +356,130 @@ suite "SQL Executor — DML":
     check res.rows[0][1] == "30"
 
   test "SELECT from empty table":
-    let res = exec(store, mvccStore, "SELECT * FROM users")
+    let res = client.exec("SELECT * FROM users")
     check res.kind == erkRows
     check res.rows.len == 0
 
   test "SELECT from non-existent table":
-    let res = exec(store, mvccStore, "SELECT * FROM nonexistent")
+    let res = client.exec("SELECT * FROM nonexistent")
     check res.kind == erkError
     check ("not found" in res.error or "nonexistent" in res.error)
 
   test "UPDATE rows":
-    discard exec(store, mvccStore,
+    discard client.exec(
         "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)")
-    discard exec(store, mvccStore,
+    discard client.exec(
         "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)")
 
-    let res = exec(store, mvccStore, "UPDATE users SET age = 31 WHERE id = 1")
+    let res = client.exec("UPDATE users SET age = 31 WHERE id = 1")
     check res.kind == erkModified
     check res.count == 1
 
     # Verify the update
-    let sel = exec(store, mvccStore, "SELECT * FROM users WHERE id = 1")
+    let sel = client.exec("SELECT * FROM users WHERE id = 1")
     check sel.kind == erkRows
     check sel.rows[0][2] == "31" # age column
 
   test "UPDATE all rows (no WHERE)":
-    discard exec(store, mvccStore,
+    discard client.exec(
         "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)")
-    discard exec(store, mvccStore,
+    discard client.exec(
         "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)")
 
-    let res = exec(store, mvccStore, "UPDATE users SET name = 'Unknown'")
+    let res = client.exec("UPDATE users SET name = 'Unknown'")
     check res.kind == erkModified
     check res.count == 2
 
   test "DELETE rows":
-    discard exec(store, mvccStore,
+    discard client.exec(
         "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)")
-    discard exec(store, mvccStore,
+    discard client.exec(
         "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)")
 
-    let res = exec(store, mvccStore, "DELETE FROM users WHERE id = 1")
+    let res = client.exec("DELETE FROM users WHERE id = 1")
     check res.kind == erkModified
     check res.count == 1
 
     # Verify deletion
-    let sel = exec(store, mvccStore, "SELECT * FROM users")
+    let sel = client.exec("SELECT * FROM users")
     check sel.kind == erkRows
     check sel.rows.len == 1
 
   test "DELETE all rows (no WHERE)":
-    discard exec(store, mvccStore,
+    discard client.exec(
         "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)")
-    discard exec(store, mvccStore,
+    discard client.exec(
         "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)")
 
-    let res = exec(store, mvccStore, "DELETE FROM users")
+    let res = client.exec("DELETE FROM users")
     check res.kind == erkModified
     check res.count == 2
 
-    let sel = exec(store, mvccStore, "SELECT * FROM users")
+    let sel = client.exec("SELECT * FROM users")
     check sel.rows.len == 0
 
 
 suite "SQL Executor — Transactions":
-  var store: RaftKVStoreExt
-  var mvccStore: MvccTransactionStore
-  let testDir = "/tmp/fractio_test_executor_txn_" & $getCurrentProcessId()
+  var client: FractioClient
+  var server: ProtocolServer
+  var testDir: string
 
   setup:
-    cleanupTestDir(testDir)
-    (store, mvccStore) = createTestEnv(testDir)
+    (client, server, testDir) = createTestEnv("txn")
 
   teardown:
-    store.coordinator.stop()
+    if client != nil: client.close()
+    if server != nil:
+      server.stop()
+      if server.raftStore != nil and server.raftStore.coordinator != nil:
+        server.raftStore.coordinator.stop()
     cleanupTestDir(testDir)
 
   test "BEGIN returns OK":
-    let res = exec(store, mvccStore, "BEGIN")
+    let res = client.exec("BEGIN")
     check res.kind == erkOk
     check res.okMessage == "BEGIN"
 
   test "COMMIT returns OK":
-    let res = exec(store, mvccStore, "COMMIT")
+    let res = client.exec("COMMIT")
     check res.kind == erkOk
     # COMMIT without active transaction returns a message
     check "COMMIT" in res.okMessage
 
   test "ROLLBACK returns OK":
-    let res = exec(store, mvccStore, "ROLLBACK")
+    let res = client.exec("ROLLBACK")
     check res.kind == erkOk
     # ROLLBACK without active transaction returns a message
     check "ROLLBACK" in res.okMessage
 
 
 suite "SQL Executor — SHOW statements":
-  var store: RaftKVStoreExt
-  var mvccStore: MvccTransactionStore
-  let testDir = "/tmp/fractio_test_executor_show_" & $getCurrentProcessId()
+  var client: FractioClient
+  var server: ProtocolServer
+  var testDir: string
 
   setup:
-    cleanupTestDir(testDir)
-    (store, mvccStore) = createTestEnv(testDir)
+    (client, server, testDir) = createTestEnv("show")
 
   teardown:
-    store.coordinator.stop()
+    if client != nil: client.close()
+    if server != nil:
+      server.stop()
+      if server.raftStore != nil and server.raftStore.coordinator != nil:
+        server.raftStore.coordinator.stop()
     cleanupTestDir(testDir)
 
   test "SHOW DATABASES empty":
-    let res = exec(store, mvccStore, "SHOW DATABASES")
+    let res = client.exec("SHOW DATABASES")
     check res.kind == erkRows
     check res.columns == @["database_name"]
     check res.rows.len == 0
 
   test "SHOW DATABASES after creating some":
-    discard exec(store, mvccStore, "CREATE DATABASE alpha")
-    discard exec(store, mvccStore, "CREATE DATABASE beta")
-    discard exec(store, mvccStore, "CREATE DATABASE gamma")
-    let res = exec(store, mvccStore, "SHOW DATABASES")
+    discard client.exec("CREATE DATABASE alpha")
+    discard client.exec("CREATE DATABASE beta")
+    discard client.exec("CREATE DATABASE gamma")
+    let res = client.exec("SHOW DATABASES")
     check res.kind == erkRows
     check res.rows.len == 3
     # Check all names are present (order may vary by key sort)
@@ -420,24 +491,26 @@ suite "SQL Executor — SHOW statements":
     check "gamma" in names
 
   test "SHOW DATABASES reflects drops":
-    discard exec(store, mvccStore, "CREATE DATABASE db1")
-    discard exec(store, mvccStore, "CREATE DATABASE db2")
-    discard exec(store, mvccStore, "DROP DATABASE db1")
-    let res = exec(store, mvccStore, "SHOW DATABASES")
+    discard client.exec("CREATE DATABASE db1")
+    discard client.exec("CREATE DATABASE db2")
+    discard client.exec("DROP DATABASE db1")
+    let res = client.exec("SHOW DATABASES")
     check res.rows.len == 1
     check res.rows[0][0] == "db2"
 
   test "SHOW SCHEMAS empty":
-    let res = exec(store, mvccStore, "SHOW SCHEMAS", database = "mydb")
+    let res = client.exec("SHOW SCHEMAS", database = "mydb")
     check res.kind == erkRows
     check res.columns == @["schema_name"]
     check res.rows.len == 0
 
   test "SHOW SCHEMAS after creating some":
-    discard exec(store, mvccStore, "CREATE SCHEMA api", database = "mydb")
-    discard exec(store, mvccStore, "CREATE SCHEMA internal", database = "mydb")
-    discard exec(store, mvccStore, "CREATE SCHEMA other", database = "otherdb")
-    let res = exec(store, mvccStore, "SHOW SCHEMAS", database = "mydb")
+    discard client.exec("CREATE DATABASE mydb")
+    discard client.exec("CREATE DATABASE otherdb")
+    discard client.exec("CREATE SCHEMA api", database = "mydb")
+    discard client.exec("CREATE SCHEMA internal", database = "mydb")
+    discard client.exec("CREATE SCHEMA other", database = "otherdb")
+    let res = client.exec("SHOW SCHEMAS", database = "mydb")
     check res.kind == erkRows
     check res.rows.len == 2
     var names: seq[string]
@@ -447,22 +520,24 @@ suite "SQL Executor — SHOW statements":
     check "internal" in names
 
   test "SHOW SCHEMAS IN specific_db":
-    discard exec(store, mvccStore, "CREATE SCHEMA s1", database = "db1")
-    discard exec(store, mvccStore, "CREATE SCHEMA s2", database = "db2")
-    let res = exec(store, mvccStore, "SHOW SCHEMAS IN db1")
+    discard client.exec("CREATE DATABASE db1")
+    discard client.exec("CREATE DATABASE db2")
+    discard client.exec("CREATE SCHEMA s1", database = "db1")
+    discard client.exec("CREATE SCHEMA s2", database = "db2")
+    let res = client.exec("SHOW SCHEMAS IN db1")
     check res.rows.len == 1
     check res.rows[0][0] == "s1"
 
   test "SHOW TABLES empty":
-    let res = exec(store, mvccStore, "SHOW TABLES")
+    let res = client.exec("SHOW TABLES")
     check res.kind == erkRows
     check res.columns == @["table_name"]
     check res.rows.len == 0
 
   test "SHOW TABLES after creating some":
-    discard exec(store, mvccStore, "CREATE TABLE users (id INT PRIMARY KEY)")
-    discard exec(store, mvccStore, "CREATE TABLE orders (id INT PRIMARY KEY)")
-    let res = exec(store, mvccStore, "SHOW TABLES")
+    discard client.exec("CREATE TABLE users (id INT PRIMARY KEY)")
+    discard client.exec("CREATE TABLE orders (id INT PRIMARY KEY)")
+    let res = client.exec("SHOW TABLES")
     check res.kind == erkRows
     check res.rows.len == 2
     var names: seq[string]
@@ -472,265 +547,285 @@ suite "SQL Executor — SHOW statements":
     check "orders" in names
 
   test "SHOW TABLES filters by schema":
-    discard exec(store, mvccStore, "CREATE TABLE t1 (id INT PRIMARY KEY)",
+    discard client.exec("CREATE DATABASE mydb")
+    discard client.exec("CREATE SCHEMA api", database = "mydb")
+    discard client.exec("CREATE SCHEMA internal", database = "mydb")
+    discard client.exec("CREATE TABLE t1 (id INT PRIMARY KEY)",
         database = "mydb", schema = "api")
-    discard exec(store, mvccStore, "CREATE TABLE t2 (id INT PRIMARY KEY)",
+    discard client.exec("CREATE TABLE t2 (id INT PRIMARY KEY)",
         database = "mydb", schema = "internal")
-    let res = exec(store, mvccStore, "SHOW TABLES IN api", database = "mydb")
+    let res = client.exec("SHOW TABLES IN api", database = "mydb")
     check res.rows.len == 1
     check res.rows[0][0] == "t1"
 
   test "SHOW TABLES IN db.schema":
-    discard exec(store, mvccStore, "CREATE TABLE t1 (id INT PRIMARY KEY)",
+    discard client.exec("CREATE DATABASE db1")
+    discard client.exec("CREATE DATABASE db2")
+    discard client.exec("CREATE SCHEMA s1", database = "db1")
+    discard client.exec("CREATE SCHEMA s2", database = "db1")
+    discard client.exec("CREATE SCHEMA s1", database = "db2")
+    discard client.exec("CREATE TABLE t1 (id INT PRIMARY KEY)",
         database = "db1", schema = "s1")
-    discard exec(store, mvccStore, "CREATE TABLE t2 (id INT PRIMARY KEY)",
+    discard client.exec("CREATE TABLE t2 (id INT PRIMARY KEY)",
         database = "db1", schema = "s2")
-    discard exec(store, mvccStore, "CREATE TABLE t3 (id INT PRIMARY KEY)",
+    discard client.exec("CREATE TABLE t3 (id INT PRIMARY KEY)",
         database = "db2", schema = "s1")
-    let res = exec(store, mvccStore, "SHOW TABLES IN db1.s1")
+    let res = client.exec("SHOW TABLES IN db1.s1")
     check res.rows.len == 1
     check res.rows[0][0] == "t1"
 
   test "SHOW TABLES reflects drops":
-    discard exec(store, mvccStore, "CREATE TABLE t1 (id INT PRIMARY KEY)")
-    discard exec(store, mvccStore, "CREATE TABLE t2 (id INT PRIMARY KEY)")
-    discard exec(store, mvccStore, "DROP TABLE t1")
-    let res = exec(store, mvccStore, "SHOW TABLES")
+    discard client.exec("CREATE TABLE t1 (id INT PRIMARY KEY)")
+    discard client.exec("CREATE TABLE t2 (id INT PRIMARY KEY)")
+    discard client.exec("DROP TABLE t1")
+    let res = client.exec("SHOW TABLES")
     check res.rows.len == 1
     check res.rows[0][0] == "t2"
 
 
 suite "SQL Executor — USE statements":
-  var store: RaftKVStoreExt
-  var mvccStore: MvccTransactionStore
-  let testDir = "/tmp/fractio_test_executor_use_" & $getCurrentProcessId()
+  var client: FractioClient
+  var server: ProtocolServer
+  var testDir: string
 
   setup:
-    cleanupTestDir(testDir)
-    (store, mvccStore) = createTestEnv(testDir)
+    (client, server, testDir) = createTestEnv("use")
 
   teardown:
-    store.coordinator.stop()
+    if client != nil: client.close()
+    if server != nil:
+      server.stop()
+      if server.raftStore != nil and server.raftStore.coordinator != nil:
+        server.raftStore.coordinator.stop()
     cleanupTestDir(testDir)
 
   test "USE DATABASE succeeds when database exists":
-    discard exec(store, mvccStore, "CREATE DATABASE mydb")
-    let res = exec(store, mvccStore, "USE DATABASE mydb")
+    discard client.exec("CREATE DATABASE mydb")
+    let res = client.exec("USE DATABASE mydb")
     check res.kind == erkUseDatabase
     check res.newDatabase == "mydb"
 
   test "USE DATABASE fails when database does not exist":
-    let res = exec(store, mvccStore, "USE DATABASE nope")
+    let res = client.exec("USE DATABASE nope")
     check res.kind == erkError
     check "does not exist" in res.error
 
   test "USE (bare) defaults to USE DATABASE":
-    discard exec(store, mvccStore, "CREATE DATABASE mydb")
-    let res = exec(store, mvccStore, "USE mydb")
+    discard client.exec("CREATE DATABASE mydb")
+    let res = client.exec("USE mydb")
     check res.kind == erkUseDatabase
     check res.newDatabase == "mydb"
 
   test "USE SCHEMA succeeds when schema exists":
-    discard exec(store, mvccStore, "CREATE DATABASE mydb")
-    discard exec(store, mvccStore, "CREATE SCHEMA api", database = "mydb")
-    let res = exec(store, mvccStore, "USE SCHEMA api", database = "mydb")
+    discard client.exec("CREATE DATABASE mydb")
+    discard client.exec("CREATE SCHEMA api", database = "mydb")
+    let res = client.exec("USE SCHEMA api", database = "mydb")
     check res.kind == erkUseSchema
     check res.newSchema == "api"
 
   test "USE SCHEMA fails when schema does not exist":
-    discard exec(store, mvccStore, "CREATE DATABASE mydb")
-    let res = exec(store, mvccStore, "USE SCHEMA nope", database = "mydb")
+    discard client.exec("CREATE DATABASE mydb")
+    let res = client.exec("USE SCHEMA nope", database = "mydb")
     check res.kind == erkError
     check "does not exist" in res.error
 
   test "USE SCHEMA fails when schema is in different database":
-    discard exec(store, mvccStore, "CREATE DATABASE db1")
-    discard exec(store, mvccStore, "CREATE DATABASE db2")
-    discard exec(store, mvccStore, "CREATE SCHEMA api", database = "db1")
-    let res = exec(store, mvccStore, "USE SCHEMA api", database = "db2")
+    discard client.exec("CREATE DATABASE db1")
+    discard client.exec("CREATE DATABASE db2")
+    discard client.exec("CREATE SCHEMA api", database = "db1")
+    let res = client.exec("USE SCHEMA api", database = "db2")
     check res.kind == erkError
 
 
 suite "SQL Executor — Full round-trip":
-  var store: RaftKVStoreExt
-  var mvccStore: MvccTransactionStore
-  let testDir = "/tmp/fractio_test_executor_roundtrip_" & $getCurrentProcessId()
+  var client: FractioClient
+  var server: ProtocolServer
+  var testDir: string
 
   setup:
-    cleanupTestDir(testDir)
-    (store, mvccStore) = createTestEnv(testDir)
+    (client, server, testDir) = createTestEnv("roundtrip")
 
   teardown:
-    store.coordinator.stop()
+    if client != nil: client.close()
+    if server != nil:
+      server.stop()
+      if server.raftStore != nil and server.raftStore.coordinator != nil:
+        server.raftStore.coordinator.stop()
     cleanupTestDir(testDir)
 
   test "full DDL + DML round-trip":
     # Create database
-    var res = exec(store, mvccStore, "CREATE DATABASE myapp")
+    var res = client.exec("CREATE DATABASE myapp")
     check res.kind == erkOk
 
     # Create schema
-    res = exec(store, mvccStore, "CREATE SCHEMA api", database = "myapp")
+    res = client.exec("CREATE SCHEMA api", database = "myapp")
     check res.kind == erkOk
 
     # Create table
-    res = exec(store, mvccStore,
+    res = client.exec(
         "CREATE TABLE products (id INT PRIMARY KEY, name TEXT, price INT)",
         database = "myapp", schema = "api")
     check res.kind == erkOk
 
     # Insert rows
-    res = exec(store, mvccStore,
+    res = client.exec(
         "INSERT INTO products (id, name, price) VALUES (1, 'Widget', 999), (2, 'Gadget', 1999)",
         database = "myapp", schema = "api")
     check res.kind == erkModified
     check res.count == 2
 
     # Select all
-    res = exec(store, mvccStore, "SELECT * FROM products",
+    res = client.exec("SELECT * FROM products",
         database = "myapp", schema = "api")
     check res.kind == erkRows
     check res.rows.len == 2
 
     # Update one
-    res = exec(store, mvccStore, "UPDATE products SET price = 1099 WHERE id = 1",
+    res = client.exec("UPDATE products SET price = 1099 WHERE id = 1",
         database = "myapp", schema = "api")
     check res.kind == erkModified
     check res.count == 1
 
     # Verify update
-    res = exec(store, mvccStore, "SELECT * FROM products WHERE id = 1",
+    res = client.exec("SELECT * FROM products WHERE id = 1",
         database = "myapp", schema = "api")
     check res.kind == erkRows
     check res.rows.len == 1
     check res.rows[0][2] == "1099"
 
     # Delete one
-    res = exec(store, mvccStore, "DELETE FROM products WHERE id = 2",
+    res = client.exec("DELETE FROM products WHERE id = 2",
         database = "myapp", schema = "api")
     check res.kind == erkModified
     check res.count == 1
 
     # Verify only one remains
-    res = exec(store, mvccStore, "SELECT * FROM products",
+    res = client.exec("SELECT * FROM products",
         database = "myapp", schema = "api")
     check res.kind == erkRows
     check res.rows.len == 1
 
     # Drop table
-    res = exec(store, mvccStore, "DROP TABLE products",
+    res = client.exec("DROP TABLE products",
         database = "myapp", schema = "api")
     check res.kind == erkOk
 
     # Drop schema
-    res = exec(store, mvccStore, "DROP SCHEMA api", database = "myapp")
+    res = client.exec("DROP SCHEMA api", database = "myapp")
     check res.kind == erkOk
 
     # Drop database
-    res = exec(store, mvccStore, "DROP DATABASE myapp")
+    res = client.exec("DROP DATABASE myapp")
     check res.kind == erkOk
 
 
 suite "SQL Executor — Expression evaluation":
-  var store: RaftKVStoreExt
-  var mvccStore: MvccTransactionStore
-  let testDir = "/tmp/fractio_test_executor_expr_" & $getCurrentProcessId()
+  var client: FractioClient
+  var server: ProtocolServer
+  var testDir: string
 
   setup:
-    cleanupTestDir(testDir)
-    (store, mvccStore) = createTestEnv(testDir)
-    discard exec(store, mvccStore,
+    (client, server, testDir) = createTestEnv("expr")
+    discard client.exec(
         "CREATE TABLE items (id INT PRIMARY KEY, name TEXT, qty INT, active BOOL)")
-    discard exec(store, mvccStore,
+    discard client.exec(
         "INSERT INTO items (id, name, qty, active) VALUES (1, 'apple', 10, true)")
-    discard exec(store, mvccStore,
+    discard client.exec(
         "INSERT INTO items (id, name, qty, active) VALUES (2, 'banana', 0, false)")
-    discard exec(store, mvccStore,
+    discard client.exec(
         "INSERT INTO items (id, name, qty, active) VALUES (3, 'cherry', 5, true)")
 
   teardown:
-    store.coordinator.stop()
+    if client != nil: client.close()
+    if server != nil:
+      server.stop()
+      if server.raftStore != nil and server.raftStore.coordinator != nil:
+        server.raftStore.coordinator.stop()
     cleanupTestDir(testDir)
 
   test "WHERE with AND":
-    let res = exec(store, mvccStore,
+    let res = client.exec(
         "SELECT * FROM items WHERE qty > 0 AND active = true")
     check res.kind == erkRows
     check res.rows.len == 2 # apple and cherry
 
   test "WHERE with OR":
-    let res = exec(store, mvccStore,
+    let res = client.exec(
         "SELECT * FROM items WHERE qty = 0 OR qty = 10")
     check res.kind == erkRows
     check res.rows.len == 2 # apple and banana
 
   test "WHERE with comparison operators":
-    var res = exec(store, mvccStore, "SELECT * FROM items WHERE qty >= 5")
+    var res = client.exec("SELECT * FROM items WHERE qty >= 5")
     check res.rows.len == 2 # apple (10) and cherry (5)
 
-    res = exec(store, mvccStore, "SELECT * FROM items WHERE qty <= 5")
+    res = client.exec("SELECT * FROM items WHERE qty <= 5")
     check res.rows.len == 2 # banana (0) and cherry (5)
 
 
 suite "SQL Executor — EXPLAIN":
-  var store: RaftKVStoreExt
-  var mvccStore: MvccTransactionStore
-  let testDir = "/tmp/fractio_test_executor_explain_" & $getCurrentProcessId()
+  var client: FractioClient
+  var server: ProtocolServer
+  var testDir: string
 
   setup:
-    cleanupTestDir(testDir)
-    (store, mvccStore) = createTestEnv(testDir)
+    (client, server, testDir) = createTestEnv("explain")
 
   teardown:
-    store.coordinator.stop()
+    if client != nil: client.close()
+    if server != nil:
+      server.stop()
+      if server.raftStore != nil and server.raftStore.coordinator != nil:
+        server.raftStore.coordinator.stop()
     cleanupTestDir(testDir)
 
   test "EXPLAIN SELECT full scan":
-    discard exec(store, mvccStore,
+    discard client.exec(
         "CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
-    let res = exec(store, mvccStore, "EXPLAIN SELECT * FROM users")
+    let res = client.exec("EXPLAIN SELECT * FROM users")
     check res.kind == erkRows
     check res.columns == @["plan"]
     check res.rows.len == 1
     check "Scan" in res.rows[0][0]
 
   test "EXPLAIN SELECT point get":
-    discard exec(store, mvccStore,
+    discard client.exec(
         "CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
-    let res = exec(store, mvccStore, "EXPLAIN SELECT * FROM users WHERE id = 42")
+    let res = client.exec("EXPLAIN SELECT * FROM users WHERE id = 42")
     check res.kind == erkRows
     check res.rows.len == 1
     check "PointGet" in res.rows[0][0]
     check "42" in res.rows[0][0]
 
   test "EXPLAIN SELECT with filter":
-    discard exec(store, mvccStore,
+    discard client.exec(
         "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT)")
-    let res = exec(store, mvccStore, "EXPLAIN SELECT * FROM users WHERE age > 21")
+    let res = client.exec("EXPLAIN SELECT * FROM users WHERE age > 21")
     check res.kind == erkRows
     check "Scan" in res.rows[0][0]
     check "filter" in res.rows[0][0]
 
   test "EXPLAIN INSERT":
-    discard exec(store, mvccStore,
+    discard client.exec(
         "CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
-    let res = exec(store, mvccStore,
+    let res = client.exec(
         "EXPLAIN INSERT INTO users (id, name) VALUES (1, 'Alice')")
     check res.kind == erkRows
     check "Insert" in res.rows[0][0]
     check "rows=1" in res.rows[0][0]
 
   test "EXPLAIN CREATE TABLE":
-    let res = exec(store, mvccStore,
+    let res = client.exec(
         "EXPLAIN CREATE TABLE t1 (id INT PRIMARY KEY)")
     check res.kind == erkRows
     check "CreateTable" in res.rows[0][0]
 
   test "EXPLAIN does not execute the statement":
-    let res = exec(store, mvccStore,
+    let res = client.exec(
         "EXPLAIN CREATE TABLE invisible (id INT PRIMARY KEY)")
     check res.kind == erkRows
     # The table should NOT have been created
-    let showRes = exec(store, mvccStore, "SHOW TABLES")
+    let showRes = client.exec("SHOW TABLES")
     check showRes.kind == erkRows
     check showRes.rows.len == 0

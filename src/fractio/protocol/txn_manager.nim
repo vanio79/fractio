@@ -131,9 +131,9 @@ proc isExpired(rec: TxnRecord): bool {.gcsafe, raises: [].} =
 # ---------------------------------------------------------------------------
 
 proc beginTransaction*(mgr: TransactionManager, flags: uint8 = 0,
-    timeoutMs: uint32 = 0): TxnRecord {.gcsafe, raises: [].} =
+    timeoutMs: uint32 = 0, forcedId: Option[uint64] = none(uint64)): TxnRecord {.gcsafe, raises: [].} =
   ## Create a new transaction and return its record.
-  let id = mgr.nextTxnId.fetchAdd(1)
+  let id = if forcedId.isSome: forcedId.get() else: mgr.nextTxnId.fetchAdd(1)
   let readTs = mgr.allocTimestamp()
   let rec = TxnRecord(
     id: id,

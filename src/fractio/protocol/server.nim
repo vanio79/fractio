@@ -710,63 +710,47 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
     if req.key.len == 0 or req.key.len > int(server.config.maxKeyBytes):
       sendError(conn, requestId, ErrProtocol, ErrCatKV, "invalid key length")
       return
-    # Transactional read: register the key as read by the transaction
+    # Transactional read: register the key as read by the transaction manager
     if req.txnId != 0:
-      let rr = server.txnMgr.recordRead(req.txnId, req.key)
-      if rr.isErr:
-        sendError(conn, requestId, ErrTxnAborted, ErrCatTransaction,
-          "txn expired or not found: " & rr.error.msg)
-        return
+      if not server.mvccStore.isNil:
+        let rr = server.mvccStore.recordRead(req.txnId, req.key)
+        if not rr.isOk:
+          sendError(conn, requestId, ErrTxnAborted, ErrCatTransaction,
+            "txn expired or not found: " & rr.error.msg)
+          return
+      else:
+        let rr = server.txnMgr.recordRead(req.txnId, req.key)
+        if rr.isErr:
+          sendError(conn, requestId, ErrTxnAborted, ErrCatTransaction,
+            "txn expired or not found: " & rr.error.msg)
+          return
+
 
     var resp: GetResponse
-    if not server.raftStore.isNil:
-      # Phase 5: Raft-backed read.
-      # If the request is inside a transaction, use raftGetForTxn so that
-      # writes buffered as intents by this txn are visible (reads-your-own-writes).
-      let rr = if req.txnId != 0:
-                 server.raftStore.raftGetForTxn(req.txnId, req.key)
-               elif req.groupId != 0:
-                 server.raftStore.raftGetInGroup(req.key,
-                     GroupID(req.groupId))
-               else:
-                 server.raftStore.raftGet(req.key)
-      if not rr.isOk:
-        if rr.error.kind == rseNotLeader:
-          sendError(conn, requestId, ErrNotLeader, ErrCatKV,
-            "not the leader for key: " & req.key)
-        elif rr.error.kind == rseBadRouting:
-          sendError(conn, requestId, ErrBadRouting, ErrCatKV, rr.error.msg)
+    if not server.mvccStore.isNil:
+      let res = if req.txnId != 0:
+                  server.mvccStore.txnGet(req.txnId, req.key)
+                else:
+                  server.mvccStore.latestGet(req.key)
+      
+      if res.isOk:
+        if res.value.isSome:
+          resp = GetResponse(
+            found: true,
+            hasTimestamp: (req.flags and GetFlagIncludeTimestamp) != 0,
+            hasVersion: (req.flags and GetFlagIncludeVersion) != 0,
+            timestamp: 0,
+            version: 1,
+            value: res.value.get(),
+          )
         else:
-          sendError(conn, requestId, ErrInternal, ErrCatKV, rr.error.msg)
+          resp = GetResponse(found: false)
+      else:
+        sendError(conn, requestId, ErrInternal, ErrCatKV, res.error.msg)
         return
-      let entryOpt = rr.value
-      if entryOpt.isSome:
-        let entry = entryOpt.get()
-        resp = GetResponse(
-          found: true,
-          hasTimestamp: (req.flags and GetFlagIncludeTimestamp) != 0,
-          hasVersion: (req.flags and GetFlagIncludeVersion) != 0,
-          timestamp: entry.timestamp,
-          version: entry.version,
-          value: entry.value,
-        )
-      else:
-        resp = GetResponse(found: false)
     else:
-      # Phase 2 fallback: in-memory read
-      let entryOpt = server.kvStore.kvGet(req.key)
-      if entryOpt.isSome:
-        let entry = entryOpt.get()
-        resp = GetResponse(
-          found: true,
-          hasTimestamp: (req.flags and GetFlagIncludeTimestamp) != 0,
-          hasVersion: (req.flags and GetFlagIncludeVersion) != 0,
-          timestamp: entry.timestamp,
-          version: entry.version,
-          value: entry.value,
-        )
-      else:
-        resp = GetResponse(found: false)
+      sendError(conn, requestId, ErrInternal, ErrCatKV, "MVCC store not initialized")
+      return
     sendFrame(conn, encodeGetResponse(resp), requestId)
 
   of uint16(mtPut):
@@ -782,90 +766,26 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
     if req.value.len > int(server.config.maxValueBytes):
       sendError(conn, requestId, ErrProtocol, ErrCatKV, "value too large")
       return
-    # Transactional write: register the key as written by the transaction
-    if req.txnId != 0:
-      let wr = server.txnMgr.recordWrite(req.txnId, req.key)
-      if wr.isErr:
-        let resp = PutResponse(status: PutStatusTxnAborted,
-                               timestamp: 0, version: 0)
-        sendFrame(conn, encodePutResponse(resp), requestId)
-        return
 
-    if not server.raftStore.isNil:
-      # Phase 5: Raft-backed write
-      # Transactional writes: buffer as intent (no fsync); commit resolves later
+    if not server.mvccStore.isNil:
       if req.txnId != 0:
-        let wr = server.raftStore.raftBufferIntent(req.txnId, req.key, req.value)
-        if not wr.isOk:
-          sendError(conn, requestId, ErrInternal, ErrCatKV, wr.error.msg)
-          return
-        let ver = server.raftStore.nextVersion.fetchAdd(1)
-        let ts = uint64(getTime().toUnixFloat() * 1_000_000_000)
-        sendFrame(conn, encodePutResponse(PutResponse(
-          status: PutStatusOK, timestamp: ts, version: ver)), requestId)
-        return
-      # Non-transactional: CAS check via raftGet
-      if (req.flags and PutFlagCAS) != 0:
-        let existR = server.raftStore.raftGet(req.key)
-        let currentVer: uint64 = if existR.isOk and existR.value.isSome:
-                                    existR.value.get().version
-                                  else: 0'u64
-        if currentVer != req.expectedVersion:
+        let res = server.mvccStore.txnPut(req.txnId, req.key, req.value)
+        if res.isOk:
           sendFrame(conn, encodePutResponse(PutResponse(
-            status: PutStatusCASFailed,
-            timestamp: 0, version: 0)), requestId)
-          return
-      var prevEntry: Option[RaftKVEntry]
-      if (req.flags and PutFlagReturnPrev) != 0:
-        let pr = server.raftStore.raftGet(req.key)
-        if pr.isOk: prevEntry = pr.value
-      let wr = if req.groupId != 0:
-                 server.raftStore.raftPutInGroup(req.key, req.value,
-                     GroupID(req.groupId))
-               else:
-                 server.raftStore.raftPut(req.key, req.value)
-      if not wr.isOk:
-        if wr.error.kind == rseNotLeader:
-          sendError(conn, requestId, ErrNotLeader, ErrCatKV,
-            "not the leader for key: " & req.key)
-        elif wr.error.kind == rseBadRouting:
-          sendError(conn, requestId, ErrBadRouting, ErrCatKV, wr.error.msg)
+            status: PutStatusOK, timestamp: 0, version: 1)), requestId)
         else:
-          sendError(conn, requestId, ErrInternal, ErrCatKV, wr.error.msg)
-        return
-      let entry = wr.value
-      var resp = PutResponse(
-        status: PutStatusOK,
-        timestamp: entry.timestamp,
-        version: entry.version,
-      )
-      if (req.flags and PutFlagReturnPrev) != 0 and prevEntry.isSome:
-        resp.hasPreviousValue = true
-        resp.previousValue = prevEntry.get().value
-      sendFrame(conn, encodePutResponse(resp), requestId)
+          sendError(conn, requestId, ErrInternal, ErrCatKV, res.error.msg)
+      else:
+        let res = server.mvccStore.withAutoTransaction(proc(sid: uint64): MvccVoidResult =
+          server.mvccStore.txnPut(sid, req.key, req.value)
+        )
+        if res.isOk:
+          sendFrame(conn, encodePutResponse(PutResponse(
+            status: PutStatusOK, timestamp: 0, version: 1)), requestId)
+        else:
+          sendError(conn, requestId, ErrInternal, ErrCatKV, res.error.msg)
     else:
-      # Phase 2 fallback: in-memory write
-      if (req.flags and PutFlagCAS) != 0:
-        let existing = server.kvStore.kvGet(req.key)
-        let currentVer: uint64 = if existing.isSome: existing.get().version else: 0
-        if currentVer != req.expectedVersion:
-          let resp = PutResponse(status: PutStatusCASFailed,
-            timestamp: 0, version: 0)
-          sendFrame(conn, encodePutResponse(resp), requestId)
-          return
-      var prevEntry: Option[KVEntry]
-      if (req.flags and PutFlagReturnPrev) != 0:
-        prevEntry = server.kvStore.kvGet(req.key)
-      let entry = server.kvStore.kvPut(req.key, req.value)
-      var resp = PutResponse(
-        status: PutStatusOK,
-        timestamp: entry.timestamp,
-        version: entry.version,
-      )
-      if (req.flags and PutFlagReturnPrev) != 0 and prevEntry.isSome:
-        resp.hasPreviousValue = true
-        resp.previousValue = prevEntry.get().value
-      sendFrame(conn, encodePutResponse(resp), requestId)
+      sendError(conn, requestId, ErrInternal, ErrCatKV, "MVCC store not initialized")
 
   of uint16(mtDelete):
     discard server.metrics.kvDeletes.fetchAdd(1)
@@ -877,61 +797,26 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
     if req.key.len == 0 or req.key.len > int(server.config.maxKeyBytes):
       sendError(conn, requestId, ErrProtocol, ErrCatKV, "invalid key length")
       return
-    # Transactional write: register the key as written by the transaction
-    if req.txnId != 0:
-      let wr = server.txnMgr.recordWrite(req.txnId, req.key)
-      if wr.isErr:
-        let resp = DeleteResponse(status: DelStatusTxnAborted)
-        sendFrame(conn, encodeDeleteResponse(resp), requestId)
-        return
 
-    if not server.raftStore.isNil:
-      # Phase 5: Raft-backed delete
-      # Transactional deletes: buffer as intent deletion (no fsync)
+    if not server.mvccStore.isNil:
       if req.txnId != 0:
-        let dr = server.raftStore.raftDeleteIntent(req.txnId, req.key)
-        if not dr.isOk:
-          sendError(conn, requestId, ErrInternal, ErrCatKV, dr.error.msg)
-          return
-        sendFrame(conn, encodeDeleteResponse(DeleteResponse(
-          status: DelStatusDeleted)), requestId)
-        return
-      # Non-transactional delete
-      let dr = if req.groupId != 0:
-                 server.raftStore.raftDeleteInGroupExplicit(req.key,
-                     GroupID(req.groupId))
-               else:
-                 server.raftStore.raftDelete(req.key)
-      if not dr.isOk:
-        if dr.error.kind == rseNotLeader:
-          sendError(conn, requestId, ErrNotLeader, ErrCatKV,
-            "not the leader for key: " & req.key)
-        elif dr.error.kind == rseBadRouting:
-          sendError(conn, requestId, ErrBadRouting, ErrCatKV, dr.error.msg)
+        let res = server.mvccStore.txnDelete(req.txnId, req.key)
+        if res.isOk:
+          sendFrame(conn, encodeDeleteResponse(DeleteResponse(
+            status: DelStatusDeleted)), requestId)
         else:
-          sendError(conn, requestId, ErrInternal, ErrCatKV, dr.error.msg)
-        return
-      var resp: DeleteResponse
-      if dr.value.isNone:
-        resp = DeleteResponse(status: DelStatusNotFound)
+          sendError(conn, requestId, ErrInternal, ErrCatKV, res.error.msg)
       else:
-        resp = DeleteResponse(status: DelStatusDeleted)
-        if (req.flags and DelFlagReturnPrev) != 0:
-          resp.hasPreviousValue = true
-          resp.previousValue = dr.value.get().value
-      sendFrame(conn, encodeDeleteResponse(resp), requestId)
+        let res = server.mvccStore.withAutoTransaction(proc(sid: uint64): MvccVoidResult =
+          server.mvccStore.txnDelete(sid, req.key)
+        )
+        if res.isOk:
+          sendFrame(conn, encodeDeleteResponse(DeleteResponse(
+            status: DelStatusDeleted)), requestId)
+        else:
+          sendError(conn, requestId, ErrInternal, ErrCatKV, res.error.msg)
     else:
-      # Phase 2 fallback
-      let deleted = server.kvStore.kvDelete(req.key)
-      var resp: DeleteResponse
-      if deleted.isNone:
-        resp = DeleteResponse(status: DelStatusNotFound)
-      else:
-        resp = DeleteResponse(status: DelStatusDeleted)
-        if (req.flags and DelFlagReturnPrev) != 0:
-          resp.hasPreviousValue = true
-          resp.previousValue = deleted.get().value
-      sendFrame(conn, encodeDeleteResponse(resp), requestId)
+      sendError(conn, requestId, ErrInternal, ErrCatKV, "MVCC store not initialized")
 
   of uint16(mtBatch):
     let reqR = decodeBatchRequest(payload)
@@ -939,70 +824,50 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
       sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
       return
     let req = reqR.value
-    var results = newSeq[BatchOpResult](req.operations.len)
-    var anyFailed = false
-    var allFailed = req.operations.len > 0
-    for i, op in req.operations:
-      case op.kind
-      of BatchOpGet:
-        discard server.metrics.kvGets.fetchAdd(1)
-        # Decode key from op.data (uint32-prefixed)
-        var dpos = 0
-        let keyR = protoCodec.readBytes(op.data, dpos)
-        if keyR.isErr:
-          results[i] = BatchOpResult(status: 0x01'u8, data: "")
-          anyFailed = true
-        else:
-          let entryOpt = server.kvStore.kvGet(keyR.value)
-          if entryOpt.isSome:
-            allFailed = false
-            var rdata = ""
-            rdata.writeBytes(entryOpt.get().value)
-            results[i] = BatchOpResult(status: 0x00'u8, data: rdata)
-          else:
-            anyFailed = true
-            results[i] = BatchOpResult(status: 0x01'u8, data: "")
-      of BatchOpPut:
-        discard server.metrics.kvPuts.fetchAdd(1)
-        var dpos = 0
-        let keyR = protoCodec.readBytes(op.data, dpos)
-        if keyR.isErr:
-          results[i] = BatchOpResult(status: 0x01'u8, data: "")
-          anyFailed = true
-          continue
-        let valR = protoCodec.readBytes(op.data, dpos)
-        if valR.isErr:
-          results[i] = BatchOpResult(status: 0x01'u8, data: "")
-          anyFailed = true
-          continue
-        discard server.kvStore.kvPut(keyR.value, valR.value)
-        allFailed = false
-        results[i] = BatchOpResult(status: 0x00'u8, data: "")
-      of BatchOpDelete:
-        discard server.metrics.kvDeletes.fetchAdd(1)
-        var dpos = 0
-        let keyR = protoCodec.readBytes(op.data, dpos)
-        if keyR.isErr:
-          results[i] = BatchOpResult(status: 0x01'u8, data: "")
-          anyFailed = true
-          continue
-        let deleted = server.kvStore.kvDelete(keyR.value)
-        if deleted.isNone:
-          anyFailed = true
-          results[i] = BatchOpResult(status: 0x01'u8, data: "")
-        else:
-          allFailed = false
-          results[i] = BatchOpResult(status: 0x00'u8, data: "")
-      else:
-        results[i] = BatchOpResult(status: 0x01'u8, data: "")
-        anyFailed = true
+    if server.mvccStore.isNil:
+      sendError(conn, requestId, ErrInternal, ErrCatKV, "MVCC store not initialized")
+      return
 
-    let batchStatus: uint8 =
-      if not anyFailed: BatchStatusAllOK
-      elif allFailed: BatchStatusAllFailed
-      else: BatchStatusPartialFailure
-    let resp = BatchResponse(status: batchStatus, results: results)
-    sendFrame(conn, encodeBatchResponse(resp), requestId)
+    # Use an auto-transaction for the whole batch
+    let res = server.mvccStore.withAutoTransactionResult(proc(sid: uint64): MvccResult[seq[BatchOpResult]] =
+      var opsResults = newSeq[BatchOpResult](req.operations.len)
+      for i, op in req.operations:
+        case op.kind
+        of BatchOpGet:
+          var dpos = 0
+          let keyR = protoCodec.readBytes(op.data, dpos)
+          if keyR.isErr: return mvccErr[seq[BatchOpResult]](MvccStoreError(msg: "invalid key in batch"))
+          let getRes = server.mvccStore.txnGet(sid, keyR.value)
+          if getRes.isOk and getRes.value.isSome:
+            var rdata = ""
+            rdata.writeBytes(getRes.value.get())
+            opsResults[i] = BatchOpResult(status: 0x00'u8, data: rdata)
+          else:
+            opsResults[i] = BatchOpResult(status: 0x01'u8, data: "")
+        of BatchOpPut:
+          var dpos = 0
+          let keyR = protoCodec.readBytes(op.data, dpos)
+          if keyR.isErr: return mvccErr[seq[BatchOpResult]](MvccStoreError(msg: "invalid key in batch"))
+          let valR = protoCodec.readBytes(op.data, dpos)
+          if valR.isErr: return mvccErr[seq[BatchOpResult]](MvccStoreError(msg: "invalid val in batch"))
+          discard server.mvccStore.txnPut(sid, keyR.value, valR.value)
+          opsResults[i] = BatchOpResult(status: 0x00'u8, data: "")
+        of BatchOpDelete:
+          var dpos = 0
+          let keyR = protoCodec.readBytes(op.data, dpos)
+          if keyR.isErr: return mvccErr[seq[BatchOpResult]](MvccStoreError(msg: "invalid key in batch"))
+          discard server.mvccStore.txnDelete(sid, keyR.value)
+          opsResults[i] = BatchOpResult(status: 0x00'u8, data: "")
+        else:
+          opsResults[i] = BatchOpResult(status: 0x01'u8, data: "")
+      return mvccOk(opsResults)
+    )
+
+    if res.isOk:
+      let resp = BatchResponse(status: BatchStatusAllOK, results: res.value)
+      sendFrame(conn, encodeBatchResponse(resp), requestId)
+    else:
+      sendError(conn, requestId, ErrInternal, ErrCatKV, res.error.msg)
 
   of uint16(mtScan):
     let reqR = decodeScanRequest(payload)
@@ -1011,48 +876,31 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
       return
     let req = reqR.value
 
-    if not server.raftStore.isNil:
-      # Phase 5: Raft-backed scan
-      let sr = server.raftStore.raftScan(req.startKey, req.endKey, req.limit)
-      if not sr.isOk:
-        if sr.error.kind == rseNotLeader:
-          sendError(conn, requestId, ErrNotLeader, ErrCatKV, "not the leader")
-        else:
-          sendError(conn, requestId, ErrInternal, ErrCatKV, sr.error.msg)
-        return
-      var scanPairs = newSeq[ScanPair](sr.value.len)
-      for i, p in sr.value:
-        let (k, entry) = p
-        scanPairs[i] = ScanPair(
-          key: k,
-          value: entry.value,
-          timestamp: entry.timestamp,
-          version: entry.version,
+    if not server.mvccStore.isNil:
+      let res = if req.txnId != 0:
+                  server.mvccStore.txnScan(req.txnId, req.startKey, req.endKey, req.limit)
+                else:
+                  server.mvccStore.latestScan(req.startKey, req.endKey, req.limit)
+      
+      if res.isOk:
+        var scanPairs = newSeq[ScanPair](res.value.len)
+        for i, p in res.value:
+          scanPairs[i] = ScanPair(
+            key: p.key,
+            value: p.value,
+            timestamp: 0, # Placeholder
+            version: 1,
+          )
+        let rf = ScanResponseFrame(
+          respFlags: ScanRespFlagEndOfScan,
+          pairs: scanPairs,
+          reqFlags: req.flags,
         )
-      let rf = ScanResponseFrame(
-        respFlags: ScanRespFlagEndOfScan,
-        pairs: scanPairs,
-        reqFlags: req.flags,
-      )
-      sendFrame(conn, encodeScanResponseFrame(rf), requestId)
+        sendFrame(conn, encodeScanResponseFrame(rf), requestId)
+      else:
+        sendError(conn, requestId, ErrInternal, ErrCatKV, res.error.msg)
     else:
-      # Phase 2 fallback
-      let pairs = server.kvStore.kvScan(req.startKey, req.endKey, req.limit)
-      var scanPairs = newSeq[ScanPair](pairs.len)
-      for i, p in pairs:
-        let (k, entry) = p
-        scanPairs[i] = ScanPair(
-          key: k,
-          value: entry.value,
-          timestamp: entry.timestamp,
-          version: entry.version,
-        )
-      let rf = ScanResponseFrame(
-        respFlags: ScanRespFlagEndOfScan,
-        pairs: scanPairs,
-        reqFlags: req.flags,
-      )
-      sendFrame(conn, encodeScanResponseFrame(rf), requestId)
+      sendError(conn, requestId, ErrInternal, ErrCatKV, "MVCC store not initialized")
 
   else:
     sendError(conn, requestId, ErrProtocol, ErrCatProtocol,
@@ -1077,14 +925,34 @@ proc handleBuiltinTxn(server: ProtocolServer, conn: ClientConnection,
       sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
       return
     let req = reqR.value
-    # Opportunistically expire timed-out transactions before starting new ones
-    server.txnMgr.expireTimedOutTxns()
-    let rec = server.txnMgr.beginTransaction(req.flags, req.timeoutMs)
-    let resp = txnMsgs.BeginTxnResponse(
-      txnId: rec.id,
-      readTimestamp: rec.readTimestamp,
-    )
-    sendFrame(conn, txnMsgs.encodeBeginTxnResponse(resp), requestId)
+    
+    if not server.mvccStore.isNil:
+      # Use MVCC store to manage the transaction session
+      let sessionId = server.mvccStore.createSession()
+      let res = server.mvccStore.beginTransaction(sessionId)
+      if res.isOk:
+        # Register in txnMgr as well so recordRead/recordWrite can work if needed
+        # We use sessionId as the transaction ID for simplicity.
+        discard server.txnMgr.beginTransaction(req.flags, 300_000'u32, 
+                                              forcedId = some(sessionId))
+        
+        let resp = txnMsgs.BeginTxnResponse(
+          txnId: sessionId,
+          readTimestamp: uint64(res.value),
+        )
+        sendFrame(conn, txnMsgs.encodeBeginTxnResponse(resp), requestId)
+      else:
+        server.mvccStore.closeSession(sessionId)
+        sendError(conn, requestId, ErrInternal, ErrCatTransaction, res.error.msg)
+    else:
+      # Legacy fallback
+      server.txnMgr.expireTimedOutTxns()
+      let rec = server.txnMgr.beginTransaction(req.flags, req.timeoutMs)
+      let resp = txnMsgs.BeginTxnResponse(
+        txnId: rec.id,
+        readTimestamp: rec.readTimestamp,
+      )
+      sendFrame(conn, txnMsgs.encodeBeginTxnResponse(resp), requestId)
 
   of uint16(mtCommitTxn):
     let reqR = txnMsgs.decodeCommitTxnRequest(payload)
@@ -1092,28 +960,29 @@ proc handleBuiltinTxn(server: ProtocolServer, conn: ClientConnection,
       sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
       return
     let txnId = reqR.value.txnId
-    # Capture write-set BEFORE committing (txnMgr.commitTransaction may clear it)
-    let writeSet = server.txnMgr.getWriteSet(txnId)
-    let resp = server.txnMgr.commitTransaction(txnId)
-    if resp.status == txnMsgs.TxnCommitOK:
-      discard server.metrics.committedTxns.fetchAdd(1)
-      # Resolve all buffered intents via pipelined commit: all shard proposals
-      # are dispatched simultaneously so their fsyncs overlap (one fsync wall-time
-      # regardless of shard count, vs Σ(fsync_i) in the old sequential path).
-      if not server.raftStore.isNil and writeSet.len > 0:
-        let cr = server.raftStore.raftCommitTxnPipelined(txnId, writeSet)
-        if not cr.isOk:
-          # Intent resolution failed — client sees commit OK but data may not
-          # be durable; log the error. In a full impl we'd return a conflict.
-          server.logger.logError(
-            "raftCommitTxnPipelined failed for txn " & $txnId & ": " & cr.error.msg)
+    
+    if not server.mvccStore.isNil:
+      let res = server.mvccStore.commitTransaction(txnId)
+      # Also update txnMgr state for this txnId
+      discard server.txnMgr.commitTransaction(txnId)
+      
+      if res.isOk:
+        discard server.metrics.committedTxns.fetchAdd(1)
+        sendFrame(conn, txnMsgs.encodeCommitTxnResponse(
+          txnMsgs.CommitTxnResponse(status: txnMsgs.TxnCommitOK)), requestId)
+        server.mvccStore.closeSession(txnId)
+      else:
+        discard server.metrics.abortedTxns.fetchAdd(1)
+        sendFrame(conn, txnMsgs.encodeCommitTxnResponse(
+          txnMsgs.CommitTxnResponse(status: txnMsgs.TxnCommitConflict)), requestId)
+        server.mvccStore.closeSession(txnId)
     else:
-      discard server.metrics.abortedTxns.fetchAdd(1)
-      # Clean up buffered intents on conflict/timeout (no fsync needed)
-      if not server.raftStore.isNil and writeSet.len > 0:
-        for key in writeSet:
-          discard server.raftStore.raftDeleteIntent(txnId, key)
-    sendFrame(conn, txnMsgs.encodeCommitTxnResponse(resp), requestId)
+      let resp = server.txnMgr.commitTransaction(txnId)
+      if resp.status == txnMsgs.TxnCommitOK:
+        discard server.metrics.committedTxns.fetchAdd(1)
+      else:
+        discard server.metrics.abortedTxns.fetchAdd(1)
+      sendFrame(conn, txnMsgs.encodeCommitTxnResponse(resp), requestId)
 
   of uint16(mtRollbackTxn):
     let reqR = txnMsgs.decodeRollbackTxnRequest(payload)
@@ -1121,15 +990,17 @@ proc handleBuiltinTxn(server: ProtocolServer, conn: ClientConnection,
       sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
       return
     let txnId = reqR.value.txnId
-    # Capture write-set before rolling back
-    let writeSet = server.txnMgr.getWriteSet(txnId)
-    let resp = server.txnMgr.rollbackTransaction(txnId)
-    discard server.metrics.abortedTxns.fetchAdd(1)
-    # Delete all buffered intents (no fsync)
-    if not server.raftStore.isNil and writeSet.len > 0:
-      for key in writeSet:
-        discard server.raftStore.raftDeleteIntent(txnId, key)
-    sendFrame(conn, txnMsgs.encodeRollbackTxnResponse(resp), requestId)
+    
+    if not server.mvccStore.isNil:
+      discard server.mvccStore.rollbackTransaction(txnId)
+      discard server.txnMgr.rollbackTransaction(txnId)
+      server.mvccStore.closeSession(txnId)
+      sendFrame(conn, txnMsgs.encodeRollbackTxnResponse(
+        txnMsgs.RollbackTxnResponse(status: 0)), requestId)
+    else:
+      discard server.metrics.abortedTxns.fetchAdd(1)
+      let resp = server.txnMgr.rollbackTransaction(txnId)
+      sendFrame(conn, txnMsgs.encodeRollbackTxnResponse(resp), requestId)
 
   of uint16(mtTxnStatus):
     let reqR = txnMsgs.decodeTxnStatusRequest(payload)

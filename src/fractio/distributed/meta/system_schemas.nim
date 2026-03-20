@@ -6,7 +6,7 @@
 # All variable-length fields use length-prefixed encoding.
 # Multi-field records use a header + trailer pattern for efficiency.
 
-import std/times
+import std/[times, strutils, json]
 import fractio/utils/binary
 
 # =============================================================================
@@ -250,29 +250,26 @@ proc decodeNodeRecord*(data: string): NodeRecord =
   result.clientPort = r.readU16()
   result.status = NodeStatus(r.readU8())
 
+proc stripMVCCHeader*(data: string): tuple[payload: string, isDeleted: bool] =
+  ## Internal helper to strip MVCC header from a value.
+  ## MVCC format: <MAGIC (4 bytes)><8 bytes timestamp><8 bytes txn_id><1 byte delete flag><payload>
+  
+  const MVCC_HEADER_SIZE = 21
+  const MVCC_MAGIC = "MVCC"
+  
+  if data.len >= MVCC_HEADER_SIZE and data.startsWith(MVCC_MAGIC):
+    let isDeleted = data[20] == '1'
+    return (data[MVCC_HEADER_SIZE..^1], isDeleted)
+  
+  return (data, false)
+
+
 proc decodeNodeRecordFromMVCC*(data: string): tuple[record: NodeRecord,
     isDeleted: bool] =
-  ## Decode a NodeRecord from MVCC-encoded or raw binary data.
-  ## Returns the record and whether it was marked deleted.
-  ## Handles both:
-  ##   - MVCC-encoded values (8-byte ts + 8-byte checksum + 1-byte flag + data)
-  ##   - Raw binary values (for backward compatibility)
-  var value = data
-
-  # Check for MVCC encoding: 17+ bytes, not starting with '{', and has valid delete flag
-  # MVCC format: <8 bytes timestamp><8 bytes checksum><1 byte delete flag><payload>
-  if data.len >= 17 and data[0] != '{' and (data[16] == '0' or data[16] == '1'):
-    # This looks like MVCC-encoded data
-    # The delete flag is at byte 16 ('0' = not deleted, '1' = deleted)
-    # The payload starts at byte 17
-    let isDeleted = data[16] == '1'
-    if isDeleted:
-      result.isDeleted = true
-      return
-    # Extract payload (skip 17-byte MVCC header)
-    value = data[17..^1]
-
-  result.record = decodeNodeRecord(value)
+  let (payload, isDeleted) = stripMVCCHeader(data)
+  if isDeleted: return (NodeRecord(), true)
+  if payload.len < 10: return (NodeRecord(), false)
+  result.record = decodeNodeRecord(payload)
   result.isDeleted = false
 
 # =============================================================================
@@ -475,3 +472,50 @@ proc toJson*(rec: SpaceRecord): JsonNode =
     "rebalanceHeartbeat": rec.rebalanceHeartbeat,
     "rebalanceCursor": rec.rebalanceCursor
   }
+
+# =============================================================================
+# MVCC-aware Decoders
+# =============================================================================
+
+
+proc decodeGroupRecordFromMVCC*(data: string): tuple[record: GroupRecord,
+    isDeleted: bool] =
+  let (payload, isDeleted) = stripMVCCHeader(data)
+  if isDeleted: return (GroupRecord(), true)
+  if payload.len < 8: return (GroupRecord(), false)
+  try:
+    return (decodeGroupRecord(payload), false)
+  except CatchableError as e:
+    echo "DEBUG: decodeGroupRecordFromMVCC failed: ", e.msg, " len=", payload.len
+    raise e
+
+proc decodeTableRecordFromMVCC*(data: string): tuple[record: TableRecord,
+    isDeleted: bool] =
+  let (payload, isDeleted) = stripMVCCHeader(data)
+  if isDeleted: return (TableRecord(), true)
+  if payload.len < 4: return (TableRecord(), false)
+  try:
+    return (decodeTableRecord(payload), false)
+  except CatchableError as e:
+    echo "DEBUG: decodeTableRecordFromMVCC failed: ", e.msg, " len=", payload.len
+    raise e
+
+proc decodeDatabaseRecordFromMVCC*(data: string): tuple[record: DatabaseRecord,
+    isDeleted: bool] =
+  let (payload, isDeleted) = stripMVCCHeader(data)
+  if isDeleted: return (DatabaseRecord(), true)
+  try:
+    return (decodeDatabaseRecord(payload), false)
+  except CatchableError as e:
+    echo "DEBUG: decodeDatabaseRecordFromMVCC failed: ", e.msg, " len=", payload.len
+    raise e
+
+proc decodeSpaceRecordFromMVCC*(data: string): tuple[record: SpaceRecord,
+    isDeleted: bool] =
+  let (payload, isDeleted) = stripMVCCHeader(data)
+  if isDeleted: return (SpaceRecord(), true)
+  try:
+    return (decodeSpaceRecord(payload), false)
+  except CatchableError as e:
+    echo "DEBUG: decodeSpaceRecordFromMVCC failed: ", e.msg, " len=", payload.len
+    raise e

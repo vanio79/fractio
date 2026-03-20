@@ -11,7 +11,7 @@ import std/[tables, locks, options, atomics, strutils, algorithm, times]
 import ../core/types as coreTypes
 import ../core/transaction as coreTxn
 import ../core/timestamp_provider
-import ../storage/mvcc/types
+import ../storage/mvcc/types as mvccTypes
 import ./raft_store
 import ./txn_manager
 import ../distributed/sharedtimer/timeprovider as tp
@@ -84,14 +84,14 @@ type
 # ---------------------------------------------------------------------------
 
 proc encodeVersionKey(userKey: string, timestamp: Timestamp): string =
-  result = userKey & VERSION_SEPARATOR
-  var tsBytes = toBigEndian64(timestamp)
+  result = userKey & mvccTypes.VERSION_SEPARATOR
+  var tsBytes = mvccTypes.toBigEndian64(timestamp)
   for i in 0..7:
     result.add(chr(int(tsBytes[i])))
 
 proc encodeIntentKey(userKey: string, txnId: coreTypes.TransactionID): string =
-  result = userKey & INTENT_SUFFIX
-  var txnBytes = toBigEndian64(int64(txnId))
+  result = userKey & mvccTypes.INTENT_SUFFIX
+  var txnBytes = mvccTypes.toBigEndian64(int64(txnId))
   for i in 0..7:
     result.add(chr(int(txnBytes[i])))
 
@@ -101,7 +101,7 @@ proc isVersionKey*(key: string): bool =
   # VERSION_SEPARATOR is at positions [key.len - 10, key.len - 9]
   if key.len < 10: return false
   let sepPos = key.len - 10
-  result = key[sepPos] == '\x00' and key[sepPos + 1] == '\x00'
+  result = key[sepPos .. sepPos+1] == mvccTypes.VERSION_SEPARATOR
 
 proc isIntentKeyMvcc*(key: string): bool =
   # Intent key format: <userKey>\x00\x01<8 bytes txnId>
@@ -109,20 +109,20 @@ proc isIntentKeyMvcc*(key: string): bool =
   # INTENT_SUFFIX is at positions [key.len - 10, key.len - 9]
   if key.len < 10: return false
   let sepPos = key.len - 10
-  result = key[sepPos] == '\x00' and key[sepPos + 1] == '\x01'
+  result = key[sepPos .. sepPos+1] == mvccTypes.INTENT_SUFFIX
 
 proc decodeVersionKey(encoded: string): tuple[userKey: string,
     timestamp: Timestamp] =
   # Version key format: <userKey>\x00\x00<8 bytes timestamp>
   # userKey ends at position encoded.len - 10
   if encoded.len < 10:
-    raise newException(MVCCError, "Invalid version key: too short")
+    raise newException(mvccTypes.MVCCError, "Invalid version key: too short")
   let userKeyEnd = encoded.len - 10
   result.userKey = encoded[0 ..< userKeyEnd]
   var tsArr: array[8, uint8]
   for i in 0..7:
     tsArr[i] = uint8(encoded[encoded.len - 8 + i])
-  result.timestamp = fromBigEndian64(Timestamp, tsArr)
+  result.timestamp = mvccTypes.fromBigEndian64(Timestamp, tsArr)
 
 # ---------------------------------------------------------------------------
 # Constructor
@@ -160,7 +160,7 @@ proc closeSession*(store: MvccTransactionStore, sessionId: uint64) {.gcsafe,
   withLock store.sessionsMu:
     let state = store.sessions.getOrDefault(sessionId)
     if not state.isNil:
-      if state.txn != nil and state.txn.status == TXN_PENDING:
+      if state.txn != nil and state.txn.status == mvccTypes.TXN_PENDING:
         discard store.txnManager.rollbackTransaction(uint64(state.txn.id))
       store.sessions.del(sessionId)
 
@@ -184,13 +184,13 @@ proc beginTransaction*(store: MvccTransactionStore,
       return mvccErr[coreTypes.TransactionID](MvccStoreError(
         kind: mseTransactionNotFound, msg: "Session not found"))
 
-    if state.txn != nil and state.txn.status == TXN_PENDING:
+    if state.txn != nil and state.txn.status == mvccTypes.TXN_PENDING:
       return mvccOk(state.txn.id)
 
     let txnRec = store.txnManager.beginTransaction()
     state.txn = coreTxn.MVCCTransaction(
       id: coreTypes.TransactionID(txnRec.id),
-      status: TXN_PENDING,
+      status: mvccTypes.TXN_PENDING,
       startTimestamp: coreTypes.Timestamp(txnRec.readTimestamp),
       commitTimestamp: coreTypes.Timestamp(0),
       priority: coreTxn.DEFAULT_PRIORITY,
@@ -212,7 +212,7 @@ proc commitTransaction*(store: MvccTransactionStore,
       return mvccErr[coreTypes.Timestamp](MvccStoreError(
         kind: mseNotInTransaction, msg: "No active transaction"))
 
-    if state.txn.status != TXN_PENDING:
+    if state.txn.status != mvccTypes.TXN_PENDING:
       return mvccErr[coreTypes.Timestamp](MvccStoreError(
         kind: mseTransactionNotActive, msg: "Transaction is not active"))
 
@@ -221,18 +221,22 @@ proc commitTransaction*(store: MvccTransactionStore,
     case commitResp.status:
     of TxnCommitOK:
       let commitTs = coreTypes.Timestamp(commitResp.commitTimestamp)
-      state.txn.status = TXN_COMMITTED
+      state.txn.status = mvccTypes.TXN_COMMITTED
       state.txn.commitTimestamp = commitTs
 
       for key, entry in state.intents.pairs:
         let versionKey = encodeVersionKey(key, commitTs)
         let intentKey = encodeIntentKey(key, state.txn.id)
         if entry.isDelete:
-          let tombstone = encodeMVCCValue("", commitTs, true, state.txn.id)
+          let tombstone = mvccTypes.encodeMVCCValue("", commitTs, true, state.txn.id)
           discard store.raftStore.raftPut(versionKey, tombstone)
+          # Requirement 6: Also put to primary key
+          discard store.raftStore.raftPut(key, tombstone)
         else:
-          let committedValue = encodeMVCCValue(entry.value, commitTs, false, state.txn.id)
+          let committedValue = mvccTypes.encodeMVCCValue(entry.value, commitTs, false, state.txn.id)
           discard store.raftStore.raftPut(versionKey, committedValue)
+          # Requirement 6: Also put to primary key
+          discard store.raftStore.raftPut(key, committedValue)
         discard store.raftStore.raftDelete(intentKey)
 
       state.intents = initTable[string, coreTxn.WriteEntry]()
@@ -240,7 +244,7 @@ proc commitTransaction*(store: MvccTransactionStore,
       return mvccOk(commitTs)
 
     of TxnCommitConflict:
-      state.txn.status = TXN_ABORTED
+      state.txn.status = mvccTypes.TXN_ABORTED
       for key, entry in state.intents.pairs:
         discard store.raftStore.raftDelete(encodeIntentKey(key, state.txn.id))
       state.intents = initTable[string, coreTxn.WriteEntry]()
@@ -249,7 +253,7 @@ proc commitTransaction*(store: MvccTransactionStore,
         kind: mseConflictDetected, msg: "Transaction conflict detected"))
 
     of TxnCommitTimeout:
-      state.txn.status = TXN_ABORTED
+      state.txn.status = mvccTypes.TXN_ABORTED
       for key, entry in state.intents.pairs:
         discard store.raftStore.raftDelete(encodeIntentKey(key, state.txn.id))
       state.intents = initTable[string, coreTxn.WriteEntry]()
@@ -278,21 +282,21 @@ proc rollbackTransaction*(store: MvccTransactionStore,
     for key, entry in state.intents.pairs:
       discard store.raftStore.raftDelete(encodeIntentKey(key, state.txn.id))
 
-    state.txn.status = TXN_ABORTED
+    state.txn.status = mvccTypes.TXN_ABORTED
     state.intents = initTable[string, coreTxn.WriteEntry]()
     state.txn = nil
     return mvccVOk()
 
 proc getTransactionStatus*(store: MvccTransactionStore,
-    sessionId: uint64): MvccResult[MVCCTransactionStatus] {.gcsafe, raises: [].} =
+    sessionId: uint64): MvccResult[mvccTypes.MVCCTransactionStatus] {.gcsafe, raises: [].} =
   withLock store.sessionsMu:
     let state = store.sessions.getOrDefault(sessionId)
     if state.isNil:
-      return mvccErr[TXN_PENDING](MvccStoreError(
+      return mvccErr[mvccTypes.MVCCTransactionStatus](MvccStoreError(
         kind: mseTransactionNotFound, msg: "Session not found"))
 
     if state.txn == nil:
-      return mvccErr[TXN_PENDING](MvccStoreError(
+      return mvccErr[mvccTypes.MVCCTransactionStatus](MvccStoreError(
         kind: mseNotInTransaction, msg: "No active transaction"))
 
     return mvccOk(state.txn.status)
@@ -424,6 +428,25 @@ proc withAutoTransactionResult*[T](store: MvccTransactionStore,
 # Transactional KV operations
 # ---------------------------------------------------------------------------
 
+proc recordRead*(store: MvccTransactionStore, sessionId: uint64,
+    key: string): MvccVoidResult {.gcsafe, raises: [].} =
+  withLock store.sessionsMu:
+    let state = store.sessions.getOrDefault(sessionId)
+    if state.isNil:
+      return mvccVErr(MvccStoreError(
+        kind: mseTransactionNotFound, msg: "Session not found"))
+
+    if state.txn == nil:
+      return mvccVErr(MvccStoreError(
+        kind: mseNotInTransaction, msg: "No active transaction"))
+
+    let res = store.txnManager.recordRead(uint64(state.txn.id), key)
+    if not res.isOk:
+      return mvccVErr(MvccStoreError(
+        kind: mseStorageError, msg: "Failed to record read"))
+
+    return mvccVOk()
+
 proc txnGet*(store: MvccTransactionStore, sessionId: uint64,
     key: string): MvccResult[Option[string]] {.gcsafe, raises: [].} =
   var readTs: coreTypes.Timestamp = coreTypes.Timestamp(0)
@@ -470,7 +493,7 @@ proc txnGet*(store: MvccTransactionStore, sessionId: uint64,
       if isVersionKey(k):
         let decoded = decodeVersionKey(k)
         if decoded.timestamp <= readTs and decoded.timestamp > latestVersion.ts:
-          let mvccVal = decodeMVCCValue(entry.value)
+          let mvccVal = mvccTypes.decodeMVCCValue(entry.value)
           latestVersion = (decoded.timestamp, mvccVal.data, mvccVal.isDeleted)
           foundVersion = true
     except:
@@ -493,7 +516,7 @@ proc txnPut*(store: MvccTransactionStore, sessionId: uint64,
       return mvccVErr(MvccStoreError(
         kind: mseNotInTransaction, msg: "No active transaction"))
 
-    if state.txn.status != TXN_PENDING:
+    if state.txn.status != mvccTypes.TXN_PENDING:
       return mvccVErr(MvccStoreError(
         kind: mseTransactionNotActive, msg: "Transaction is not active"))
 
@@ -503,7 +526,7 @@ proc txnPut*(store: MvccTransactionStore, sessionId: uint64,
         kind: mseTransactionNotActive, msg: "Failed to record write"))
 
     let intentKey = encodeIntentKey(key, state.txn.id)
-    let intentValue = encodeMVCCValue(value, state.txn.startTimestamp, false, state.txn.id)
+    let intentValue = mvccTypes.encodeMVCCValue(value, state.txn.startTimestamp, false, state.txn.id)
 
     let putRes = store.raftStore.raftPut(intentKey, intentValue)
     if not putRes.isOk:
@@ -527,7 +550,7 @@ proc txnDelete*(store: MvccTransactionStore, sessionId: uint64,
       return mvccVErr(MvccStoreError(
         kind: mseNotInTransaction, msg: "No active transaction"))
 
-    if state.txn.status != TXN_PENDING:
+    if state.txn.status != mvccTypes.TXN_PENDING:
       return mvccVErr(MvccStoreError(
         kind: mseTransactionNotActive, msg: "Transaction is not active"))
 
@@ -537,7 +560,7 @@ proc txnDelete*(store: MvccTransactionStore, sessionId: uint64,
         kind: mseTransactionNotActive, msg: "Failed to record write"))
 
     let intentKey = encodeIntentKey(key, state.txn.id)
-    let intentValue = encodeMVCCValue("", state.txn.startTimestamp, true, state.txn.id)
+    let intentValue = mvccTypes.encodeMVCCValue("", state.txn.startTimestamp, true, state.txn.id)
 
     let putRes = store.raftStore.raftPut(intentKey, intentValue)
     if not putRes.isOk:
@@ -587,7 +610,7 @@ proc txnScan*(store: MvccTransactionStore, sessionId: uint64,
       try:
         let decoded = decodeVersionKey(k)
         if decoded.timestamp <= readTs:
-          let mvccVal = decodeMVCCValue(entry.value)
+          let mvccVal = mvccTypes.decodeMVCCValue(entry.value)
           # Only update if this version is newer than what we have
           if not keyVersions.hasKey(decoded.userKey):
             keyVersions[decoded.userKey] = (mvccVal.data, mvccVal.isDeleted,
@@ -600,10 +623,17 @@ proc txnScan*(store: MvccTransactionStore, sessionId: uint64,
       except:
         discard
     else:
-      # Non-MVCC key (regular key) - include as-is
-      # Only include if no MVCC version exists for this key
+      # Non-MVCC key (regular key) - include as-is or strip MVCC if sysTablePut wrote it directly
       if not keyVersions.hasKey(k):
-        keyVersions[k] = (entry.value, false, coreTypes.Timestamp(0))
+        if mvccTypes.isLikelyMVCCValue(entry.value):
+          try:
+            let mvccVal = mvccTypes.decodeMVCCValue(entry.value)
+            if mvccVal.timestamp <= readTs:
+              keyVersions[k] = (mvccVal.data, mvccVal.isDeleted, mvccVal.timestamp)
+          except:
+            keyVersions[k] = (entry.value, false, coreTypes.Timestamp(0))
+        else:
+          keyVersions[k] = (entry.value, false, coreTypes.Timestamp(0))
 
   for key, entry in localIntents.pairs:
     if key >= startKey and (endKey.len == 0 or key < endKey):
@@ -632,52 +662,52 @@ proc snapshotGet*(store: MvccTransactionStore,
     key: string, readTs: coreTypes.Timestamp): MvccResult[Option[string]] {.
     gcsafe, raises: [].} =
   ## Lightweight read at a specific timestamp without transaction overhead.
-  ## This is optimized for single-statement SELECT queries that don't need
-  ## write intent tracking or commit/rollback.
-  # First try to get the key directly (for non-MVCC keys)
+  # First try to get the key directly
   let directRes = store.raftStore.raftGet(key)
   var nonMvccValue: Option[string] = none(string)
   if directRes.isOk and directRes.value.isSome:
-    nonMvccValue = some(directRes.value.get().value)
+    let val = directRes.value.get().value
+    if mvccTypes.isLikelyMVCCValue(val):
+      try:
+        let decoded = mvccTypes.decodeMVCCValue(val)
+        if decoded.timestamp <= readTs:
+          if not decoded.isDeleted:
+            nonMvccValue = some(decoded.data)
+          else:
+            nonMvccValue = none(string)
+      except:
+        nonMvccValue = some(val)
+    else:
+      nonMvccValue = some(val)
 
   # Also scan for versioned keys
-  let versionPrefix = key & VERSION_SEPARATOR
-  let scanStart = versionPrefix
-  let scanEnd = key & "\x00\x01"
-
-  let scanRes = store.raftStore.raftScan(scanStart, scanEnd, 100'u32,
+  let versionPrefix = key & mvccTypes.VERSION_SEPARATOR
+  let scanRes = store.raftStore.raftScan(versionPrefix, key & "\x00\x01", 100'u32,
       includeSystemKeys = true)
+  
   if not scanRes.isOk:
-    # If scan fails but we have a non-MVCC value, return it
-    if nonMvccValue.isSome:
-      return mvccOk(nonMvccValue)
+    if nonMvccValue.isSome: return mvccOk(nonMvccValue)
     return mvccErr[Option[string]](MvccStoreError(
       kind: mseStorageError, msg: "Scan failed"))
 
-  var latestVersion: tuple[ts: coreTypes.Timestamp, value: string,
-      isDeleted: bool] = (coreTypes.Timestamp(0), "", false)
+  var latestVersion: tuple[ts: Timestamp, value: string, isDeleted: bool] = (Timestamp(0), "", false)
   var foundVersion = false
 
   for (k, entry) in scanRes.value:
-    try:
-      if isVersionKey(k):
-        let decoded = decodeVersionKey(k)
-        if decoded.timestamp <= readTs and decoded.timestamp > latestVersion.ts:
-          let mvccVal = decodeMVCCValue(entry.value)
-          latestVersion = (decoded.timestamp, mvccVal.data, mvccVal.isDeleted)
+    if isIntentKeyMvcc(k): continue
+    if isVersionKey(k):
+      try:
+        let decodedKey = decodeVersionKey(k)
+        if decodedKey.timestamp <= readTs and decodedKey.timestamp >= latestVersion.ts:
+          let mvccVal = mvccTypes.decodeMVCCValue(entry.value)
+          latestVersion = (decodedKey.timestamp, mvccVal.data, mvccVal.isDeleted)
           foundVersion = true
-    except:
-      discard
+      except: discard
 
-  # If we found an MVCC version, return it (takes precedence over non-MVCC)
-  if foundVersion and not latestVersion.isDeleted:
+  if foundVersion:
+    if latestVersion.isDeleted: return mvccOk(none(string))
     return mvccOk(some(latestVersion.value))
 
-  # If we found an MVCC version but it's deleted, key doesn't exist
-  if foundVersion and latestVersion.isDeleted:
-    return mvccOk(none(string))
-
-  # Fall back to non-MVCC value if no MVCC version found
   return mvccOk(nonMvccValue)
 
 proc snapshotScan*(store: MvccTransactionStore,
@@ -696,51 +726,45 @@ proc snapshotScan*(store: MvccTransactionStore,
       isDeleted: bool, timestamp: coreTypes.Timestamp]] = initTable[string,
       tuple[value: string, isDeleted: bool, timestamp: coreTypes.Timestamp]]()
 
+  # Pass 1: Collect latest versioned keys
   for (k, entry) in scanRes.value:
-    if isIntentKeyMvcc(k):
-      continue
-
+    if isIntentKeyMvcc(k): continue
     if isVersionKey(k):
       try:
         let decoded = decodeVersionKey(k)
         if decoded.timestamp <= readTs:
-          let mvccVal = decodeMVCCValue(entry.value)
-          if not keyVersions.hasKey(decoded.userKey):
-            keyVersions[decoded.userKey] = (mvccVal.data, mvccVal.isDeleted,
-                decoded.timestamp)
-          elif decoded.timestamp > keyVersions[decoded.userKey].timestamp:
+          let mvccVal = mvccTypes.decodeMVCCValue(entry.value)
+          if not keyVersions.hasKey(decoded.userKey) or decoded.timestamp > keyVersions[decoded.userKey].timestamp:
             keyVersions[decoded.userKey] = (mvccVal.data, mvccVal.isDeleted,
                 decoded.timestamp)
       except:
         discard
-    else:
-      # Non-MVCC key (regular key) - may have MVCC-encoded value
-      # Strip MVCC encoding if present
-      var value = entry.value
-      var isDeleted = false
-      try:
-        # Check if value is MVCC-encoded (17+ bytes, not starting with '{')
-        if entry.value.len >= 17 and entry.value[0] != '{':
-          let mvccVal = decodeMVCCValue(entry.value)
-          value = mvccVal.data
-          isDeleted = mvccVal.isDeleted
-      except:
-        discard # Not MVCC-encoded, use as-is
-      
-      # Only include if no MVCC version exists for this key
-      if not isDeleted and not keyVersions.hasKey(k):
-        keyVersions[k] = (value, false, coreTypes.Timestamp(0))
+
+  # Pass 2: For keys not in Pass 1, if not an intent or version key, check if likely MVCC.
+  # If MVCC and ts <= readTs, add to keyVersions. If not MVCC, add as-is.
+  for (k, entry) in scanRes.value:
+    if isIntentKeyMvcc(k) or isVersionKey(k): continue
+    if not keyVersions.hasKey(k):
+      if mvccTypes.isLikelyMVCCValue(entry.value):
+        try:
+          let mvccVal = mvccTypes.decodeMVCCValue(entry.value)
+          if mvccVal.timestamp <= readTs:
+            keyVersions[k] = (mvccVal.data, mvccVal.isDeleted, mvccVal.timestamp)
+        except:
+          keyVersions[k] = (entry.value, false, coreTypes.Timestamp(0))
+      else:
+        keyVersions[k] = (entry.value, false, coreTypes.Timestamp(0))
 
   var results: seq[tuple[key: string, value: string]] = @[]
-  var count = 0
   for key, val in keyVersions.pairs:
     if not val.isDeleted:
       results.add((key, val.value))
-      inc count
-      if limit > 0 and uint32(count) >= limit:
-        break
 
   results.sort(proc(a, b: tuple[key: string, value: string]): int = cmp(a.key, b.key))
+  
+  if limit > 0 and uint32(results.len) > limit:
+    results.setLen(int(limit))
+
   return mvccOk(results)
 
 proc getCurrentTimestamp*(store: MvccTransactionStore): coreTypes.Timestamp {.
@@ -783,7 +807,7 @@ proc getActiveTransactionCount*(store: MvccTransactionStore): int {.gcsafe,
     raises: [].} =
   withLock store.sessionsMu:
     for sessionId, state in store.sessions.pairs:
-      if state.txn != nil and state.txn.status == TXN_PENDING:
+      if state.txn != nil and state.txn.status == mvccTypes.TXN_PENDING:
         inc result
 
 proc getSessionCount*(store: MvccTransactionStore): int {.gcsafe, raises: [].} =

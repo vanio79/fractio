@@ -17,6 +17,8 @@
 # Temp storage: /tmp/fractio_space_mn_<nodeId>/ (cleaned up per test)
 
 import std/[unittest, os, options, json, strutils, tables]
+import fractio/client/fractio_client
+import fractio/client/sql_client
 
 import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
@@ -42,6 +44,13 @@ import fractio/storage/mvcc/types as mvccTypes
 const
   TMP_DIR = "/tmp/fractio_space_mn_"
 
+
+var testBasePort {.global.} = 28000
+
+proc nextBasePort(): int =
+  result = testBasePort
+  testBasePort += 100
+
 var nextClientPort = 19200 ## incremented per node to avoid port conflicts between tests
 
 # ---------------------------------------------------------------------------
@@ -58,6 +67,7 @@ type
     store*: RaftKVStoreExt
     mvccStore*: MvccTransactionStore
     storagePath*: string
+    client*: FractioClient
 
 proc cleanDir(p: string) =
   try: removeDir(p) except CatchableError: discard
@@ -116,16 +126,23 @@ proc makeNode(nodeNum: int, basePort: int,
   let srv = newProtocolServer(cfg)
   srv.raftStore = store
   srv.raftCoord = coord
+  srv.mvccStore = mvccStore
+  srv.txnMgr = txnMgr
 
   TestNode(
     id: nodeNum, basePort: basePort, clientPort: cPort, server: srv,
     coord: coord, store: store, mvccStore: mvccStore, storagePath: storagePath,
   )
 
-proc startNode(n: TestNode) =
+proc initClient(n: var TestNode, leaderPort: int) =
+  n.client = newFractioClient("127.0.0.1", leaderPort)
+  doAssert n.client.initialize()
+
+proc startNode(n: var TestNode) =
   n.server.start()
 
 proc stopNode(n: TestNode) =
+  if not n.client.isNil: n.client.close()
   n.server.stop()
   n.coord.stop()
   cleanDir(n.storagePath)
@@ -150,8 +167,8 @@ proc seedSysNodes(leaderStore: RaftKVStoreExt, nodes: seq[TestNode]) =
       clientPort: uint16(n.clientPort),
       status: nsAlive,
     )
-    let r = leaderStore.raftPut(key, nodeRec.encode())
-    doAssert r.isOk, "failed to seed sys.nodes for node " & $n.id
+    let r = leaderStore.sysTablePut(key, nodeRec.encode())
+    doAssert r, "failed to seed sys.nodes for node " & $n.id
 
 proc seedSysGroups(leaderStore: RaftKVStoreExt, nodeNums: seq[int]) =
   for gid in [META_GROUP_ID, DATA_GROUP_START_ID]:
@@ -162,18 +179,20 @@ proc seedSysGroups(leaderStore: RaftKVStoreExt, nodeNums: seq[int]) =
           replicaType: rtVoter))
     let groupRec = GroupRecord(
       groupId: gid.uint64,
+      spaceId: if gid == META_GROUP_ID: 0 else: 1,
+      leader: uint32(nodeNums[0]),
       replicas: replicasSeq,
     )
-    discard leaderStore.raftPut(key, groupRec.encode())
+    discard leaderStore.sysTablePut(key, groupRec.encode())
 
 proc seedDefaults(leaderStore: RaftKVStoreExt) =
   let dbKey = encodeTableKey(SYS_DATABASES_TABLE_ID, "default")
-  discard leaderStore.raftPut(dbKey, DatabaseRecord(
+  discard leaderStore.sysTablePut(dbKey, DatabaseRecord(
     name: "default",
     createdAtNs: system_schemas.nowNs()
   ).encode())
   let scKey = encodeTableKey(SYS_SCHEMAS_TABLE_ID, "default.public")
-  discard leaderStore.raftPut(scKey, SchemaRecord(
+  discard leaderStore.sysTablePut(scKey, SchemaRecord(
     name: "public",
     database: "default",
     createdAtNs: system_schemas.nowNs()
@@ -209,7 +228,7 @@ proc waitForSpaceLeaders(nodes: seq[TestNode]) =
       try:
         var data = entry.value
         # Check if MVCC-encoded
-        if data.len >= 17 and data[0] != '{' and (data[16] == '0' or data[16] == '1'):
+        if mvccTypes.isLikelyMVCCValue(data):
           try:
             let mvccVal = mvccTypes.decodeMVCCValue(data)
             if not mvccVal.isDeleted:
@@ -249,9 +268,8 @@ proc reelectLeaders(nodes: seq[TestNode], deadNodeIds: seq[int]) =
   ## NuRaft handles this automatically, but we may need to wait for timeouts.
   sleep(1000) # Allow NuRaft election timeouts to fire
 
-proc exec(store: RaftKVStoreExt, mvccStore: MvccTransactionStore,
-    sql: string): ExecResult =
-  executeSQL(sql, store, mvccStore, "default", "public")
+proc exec(node: TestNode, sql: string): ExecResult =
+  node.client.query(sql)
 
 proc loadMetadataOnAllNodes(nodes: seq[TestNode]) =
   ## Load space, table, and group membership metadata on all nodes.
@@ -278,32 +296,37 @@ proc loadMetadataOnAllNodes(nodes: seq[TestNode]) =
 proc execOnLeader(nodes: seq[TestNode], sql: string): ExecResult =
   ## Try executing SQL on each node until one succeeds.
   for node in nodes:
-    let r = exec(node.store, node.mvccStore, sql)
+    let r = exec(node, sql)
     if r.kind != erkError:
       return r
     if isNotLeaderError(r.error):
       continue
     return r
-  exec(nodes[^1].store, nodes[^1].mvccStore, sql)
+  exec(nodes[^1], sql)
 
 # ---------------------------------------------------------------------------
 # Cluster fixture: 5 nodes
 # ---------------------------------------------------------------------------
 
 proc makeCluster5(): seq[TestNode] =
+  let p1 = nextBasePort()
+  let p2 = nextBasePort()
+  let p3 = nextBasePort()
+  let p4 = nextBasePort()
+  let p5 = nextBasePort()
   let members = @[
-    (nodeId: 1'u32, host: "127.0.0.1", basePort: 27000),
-    (nodeId: 2'u32, host: "127.0.0.1", basePort: 28000),
-    (nodeId: 3'u32, host: "127.0.0.1", basePort: 29000),
-    (nodeId: 4'u32, host: "127.0.0.1", basePort: 30000),
-    (nodeId: 5'u32, host: "127.0.0.1", basePort: 31000),
+    (nodeId: 1'u32, host: "127.0.0.1", basePort: p1),
+    (nodeId: 2'u32, host: "127.0.0.1", basePort: p2),
+    (nodeId: 3'u32, host: "127.0.0.1", basePort: p3),
+    (nodeId: 4'u32, host: "127.0.0.1", basePort: p4),
+    (nodeId: 5'u32, host: "127.0.0.1", basePort: p5),
   ]
 
   var nodes: seq[TestNode]
   for i, m in members:
     nodes.add(makeNode(int(m.nodeId), m.basePort, members))
 
-  for n in nodes: startNode(n)
+  for i in 0 ..< nodes.len: startNode(nodes[i])
 
   # Wait for leader election on meta + data groups
   discard waitForLeaderOnGroup(nodes, META_GROUP_ID)
@@ -318,6 +341,7 @@ proc makeCluster5(): seq[TestNode] =
   seedSysGroups(nodes[leaderIdx].store, allNums)
   seedDefaults(nodes[leaderIdx].store)
   sleep(400)
+  for i in 0 ..< nodes.len: initClient(nodes[i], nodes[leaderIdx].clientPort)
 
   nodes
 
@@ -335,7 +359,7 @@ suite "Space multinode — CREATE SPACE creates real Raft groups":
     defer: stopCluster(nodes)
 
     let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
-    let res = exec(nodes[leaderIdx].store, nodes[leaderIdx].mvccStore,
+    let res = exec(nodes[leaderIdx],
         "CREATE SPACE testspace WITH REPLICAS = 3")
     if res.kind == erkError:
       echo "  CREATE SPACE error: " & res.error
@@ -355,7 +379,7 @@ suite "Space multinode — CREATE SPACE creates real Raft groups":
     defer: stopCluster(nodes)
 
     let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
-    discard exec(nodes[leaderIdx].store, nodes[leaderIdx].mvccStore,
+    discard exec(nodes[leaderIdx],
         "CREATE SPACE testspace WITH REPLICAS = 3")
 
     waitForAutoDistribution(nodes, @[3'u64, 4, 5, 6, 7], 3)
@@ -372,13 +396,13 @@ suite "Space multinode — CREATE SPACE creates real Raft groups":
     defer: stopCluster(nodes)
 
     let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
-    discard exec(nodes[leaderIdx].store, nodes[leaderIdx].mvccStore,
+    discard exec(nodes[leaderIdx],
         "CREATE SPACE testspace WITH REPLICAS = 3")
     distributeSpaceGroups(nodes)
     nodes[leaderIdx].store.loadSpaces()
     nodes[leaderIdx].store.loadGroupMembers()
 
-    let ctRes = exec(nodes[leaderIdx].store, nodes[leaderIdx].mvccStore,
+    let ctRes = exec(nodes[leaderIdx],
         "CREATE TABLE t1 (id INT PRIMARY KEY, name TEXT) IN SPACE testspace")
     check ctRes.kind == erkOk
 
@@ -389,11 +413,11 @@ suite "Space multinode — data operations through space groups":
     defer: stopCluster(nodes)
 
     let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
-    discard exec(nodes[leaderIdx].store, nodes[leaderIdx].mvccStore,
+    discard exec(nodes[leaderIdx],
         "CREATE SPACE testspace WITH REPLICAS = 3")
     distributeSpaceGroups(nodes)
 
-    discard exec(nodes[leaderIdx].store, nodes[leaderIdx].mvccStore,
+    discard exec(nodes[leaderIdx],
         "CREATE TABLE t1 (id INT PRIMARY KEY, name TEXT) IN SPACE testspace")
     loadMetadataOnAllNodes(nodes)
 
@@ -414,7 +438,7 @@ suite "Space multinode — data operations through space groups":
       echo "  INSERT 3 error: " & ins3.error
     check ins3.kind == erkModified
 
-    let sel = exec(nodes[leaderIdx].store, nodes[leaderIdx].mvccStore,
+    let sel = exec(nodes[leaderIdx],
         "SELECT * FROM t1")
     check sel.kind == erkRows
     if sel.kind == erkRows:
@@ -425,11 +449,11 @@ suite "Space multinode — data operations through space groups":
     defer: stopCluster(nodes)
 
     let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
-    discard exec(nodes[leaderIdx].store, nodes[leaderIdx].mvccStore,
+    discard exec(nodes[leaderIdx],
         "CREATE SPACE myspace WITH REPLICAS = 3")
     distributeSpaceGroups(nodes)
 
-    discard exec(nodes[leaderIdx].store, nodes[leaderIdx].mvccStore,
+    discard exec(nodes[leaderIdx],
         "CREATE TABLE users (id INT PRIMARY KEY, email TEXT) IN SPACE myspace")
     loadMetadataOnAllNodes(nodes)
 
@@ -447,7 +471,7 @@ suite "Space multinode — data operations through space groups":
       if sel.rows.len > 0:
         check sel.rows[0][1] == "user5@test.com"
 
-    let all = exec(nodes[leaderIdx].store, nodes[leaderIdx].mvccStore,
+    let all = exec(nodes[leaderIdx],
         "SELECT * FROM users")
     check all.kind == erkRows
     if all.kind == erkRows:
@@ -461,11 +485,11 @@ suite "Space multinode — resilience after adding a node":
       for n in nodes: stopNode(n)
 
     let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
-    discard exec(nodes[leaderIdx].store, nodes[leaderIdx].mvccStore,
+    discard exec(nodes[leaderIdx],
         "CREATE SPACE testspace WITH REPLICAS = 3")
     distributeSpaceGroups(nodes)
 
-    discard exec(nodes[leaderIdx].store, nodes[leaderIdx].mvccStore,
+    discard exec(nodes[leaderIdx],
         "CREATE TABLE t1 (id INT PRIMARY KEY, val TEXT) IN SPACE testspace")
     loadMetadataOnAllNodes(nodes)
 
@@ -473,21 +497,24 @@ suite "Space multinode — resilience after adding a node":
     check ins1.kind == erkModified
 
     # Add node 6
+    let p6 = nextBasePort()
     let node6Members = @[
-      (nodeId: 1'u32, host: "127.0.0.1", basePort: 27000),
-      (nodeId: 2'u32, host: "127.0.0.1", basePort: 28000),
-      (nodeId: 3'u32, host: "127.0.0.1", basePort: 29000),
-      (nodeId: 4'u32, host: "127.0.0.1", basePort: 30000),
-      (nodeId: 5'u32, host: "127.0.0.1", basePort: 31000),
-      (nodeId: 6'u32, host: "127.0.0.1", basePort: 32000),
+      (nodeId: 1'u32, host: "127.0.0.1", basePort: nodes[0].basePort),
+      (nodeId: 2'u32, host: "127.0.0.1", basePort: nodes[1].basePort),
+      (nodeId: 3'u32, host: "127.0.0.1", basePort: nodes[2].basePort),
+      (nodeId: 4'u32, host: "127.0.0.1", basePort: nodes[3].basePort),
+      (nodeId: 5'u32, host: "127.0.0.1", basePort: nodes[4].basePort),
+      (nodeId: 6'u32, host: "127.0.0.1", basePort: p6),
     ]
-    let node6 = makeNode(6, 32000, node6Members)
+    var node6 = makeNode(6, p6, node6Members)
     startNode(node6)
     nodes.add(node6)
+    let metaLeader = waitForLeaderOnGroup(nodes, META_GROUP_ID)
+    initClient(nodes[^1], nodes[metaLeader].clientPort)
 
     # Register node 6 with existing nodes' NuRaft groups
     for i in 0 ..< 5:
-      nodes[i].server.addPeerToRaft(6, "127.0.0.1", 32000)
+      nodes[i].server.addPeerToRaft(6, "127.0.0.1", p6)
 
     # Seed node 6 into sys.nodes
     let nodeKey = encodeTableKey(SYS_NODES_TABLE_ID, "6")
@@ -498,7 +525,7 @@ suite "Space multinode — resilience after adding a node":
       clientPort: uint16(node6.clientPort),
       status: nsAlive,
     )
-    discard nodes[leaderIdx].store.raftPut(nodeKey, nodeRec.encode())
+    discard nodes[leaderIdx].store.sysTablePut(nodeKey, nodeRec.encode())
     sleep(500)
 
     # Verify space still works — insert via client-side retry
@@ -507,7 +534,7 @@ suite "Space multinode — resilience after adding a node":
       echo "  INSERT after add error: " & ins2.error
     check ins2.kind == erkModified
 
-    let sel = exec(nodes[leaderIdx].store, nodes[leaderIdx].mvccStore,
+    let sel = exec(nodes[leaderIdx],
         "SELECT * FROM t1")
     check sel.kind == erkRows
     if sel.kind == erkRows:
@@ -523,11 +550,11 @@ suite "Space multinode — resilience after killing a node":
         except: discard
 
     let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
-    discard exec(nodes[leaderIdx].store, nodes[leaderIdx].mvccStore,
+    discard exec(nodes[leaderIdx],
         "CREATE SPACE testspace WITH REPLICAS = 3")
     distributeSpaceGroups(nodes)
 
-    discard exec(nodes[leaderIdx].store, nodes[leaderIdx].mvccStore,
+    discard exec(nodes[leaderIdx],
         "CREATE TABLE t1 (id INT PRIMARY KEY, val TEXT) IN SPACE testspace")
     loadMetadataOnAllNodes(nodes)
 
@@ -552,7 +579,7 @@ suite "Space multinode — resilience after killing a node":
 
     check postKillSuccess >= 1
 
-    let sel = exec(nodes[leaderIdx].store, nodes[leaderIdx].mvccStore,
+    let sel = exec(nodes[leaderIdx],
         "SELECT * FROM t1")
     check sel.kind == erkRows
     if sel.kind == erkRows:
@@ -566,11 +593,11 @@ suite "Space multinode — resilience after killing a node":
         except: discard
 
     let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
-    discard exec(nodes[leaderIdx].store, nodes[leaderIdx].mvccStore,
+    discard exec(nodes[leaderIdx],
         "CREATE SPACE testspace WITH REPLICAS = 3")
     distributeSpaceGroups(nodes)
 
-    discard exec(nodes[leaderIdx].store, nodes[leaderIdx].mvccStore,
+    discard exec(nodes[leaderIdx],
         "CREATE TABLE t1 (id INT PRIMARY KEY, val TEXT) IN SPACE testspace")
     loadMetadataOnAllNodes(nodes)
 
@@ -597,7 +624,7 @@ suite "Space multinode — resilience after killing a node":
 
     check successCount > 0
 
-    let sel = exec(nodes[leaderIdx].store, nodes[leaderIdx].mvccStore,
+    let sel = exec(nodes[leaderIdx],
         "SELECT * FROM t1")
     check sel.kind == erkRows
     if sel.kind == erkRows:

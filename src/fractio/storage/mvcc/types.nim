@@ -1,7 +1,7 @@
 # MVCC Types - Key encoding, value format, and metadata definitions
 # for Multi-Version Concurrency Control storage
 
-import std/[options, hashes]
+import std/[options, hashes, strutils]
 import ../../core/types
 import ../../core/timestamp_provider
 
@@ -156,100 +156,81 @@ proc decodeMVCCKey*(encodedKey: string): MVCCKey =
     tsArr[i] = uint8(encodedKey[encodedKey.len - 8 + i])
   result.timestamp = fromBigEndian64(Timestamp, tsArr)
 
+const
+  MVCC_MAGIC* = "MVCC"
+  MVCC_HEADER_SIZE* = 21 # 4 (magic) + 8 (ts) + 8 (txn) + 1 (del)
+
 proc encodeMVCCValue*(value: string, timestamp: Timestamp,
     isDeleted: bool = false, txnId: TransactionID = InvalidTransactionID): string =
   ## Encode MVCC value with metadata
-  ## Format: <timestamp (8 bytes)><txn_id (8 bytes)><is_deleted (1 byte)><value>
+  ## Format: <MAGIC (4 bytes)><timestamp (8 bytes)><txn_id (8 bytes)><is_deleted (1 byte)><value>
   var tsBytes = toBigEndian64(timestamp)
   var txnBytes = toBigEndian64(int64(txnId))
   var delByte = if isDeleted: "1" else: "0"
 
   # Build result string manually
-  result = ""
+  result = MVCC_MAGIC
   for i in 0..7:
     result.add(chr(int(tsBytes[i])))
   for i in 0..7:
     result.add(chr(int(txnBytes[i])))
   result.add(delByte)
   result.add(value)
+  
+  var hex = ""
+  for i in 0 ..< min(result.len, 16):
+    hex &= " " & toHex(uint8(result[i]))
+  echo "DEBUG: encodeMVCCValue result prefix:", hex
 
 proc isLikelyMVCCValue*(data: string): bool {.inline.} =
-  ## Fast check if data might be MVCC-encoded.
-  ## Returns false for data that is definitely NOT MVCC (JSON, too short, wrong flag).
-  ## Returns true for data that MIGHT be MVCC - caller should try decodeMVCCValue.
-  if data.len < 17: return false
-  if data[0] == '{': return false # JSON
-  let d = data[16]
-  if d != '0' and d != '1': return false
-  # Binary data with small uint32: byte 0 non-zero, bytes 1-3 zero
-  # MVCC never has this pattern for valid timestamps
-  if data[0] != '\0' and data[1] == '\0' and data[2] == '\0' and data[3] == '\0':
-    return false
-  true
+  ## Fast check if data starts with MVCC magic
+  data.startsWith(MVCC_MAGIC)
 
 proc decodeMVCCValueFast*(encodedValue: string): MVCCValue {.inline.} =
   ## Fast decode MVCC value - assumes caller already validated with isLikelyMVCCValue.
-  ## Skips length and delete flag validation for performance.
-  ## Uses direct computation instead of array extraction.
-  # Direct big-endian to host conversion
+  if encodedValue.len < MVCC_HEADER_SIZE:
+    return MVCCValue(timestamp: 0, txnId: TransactionID(0), isDeleted: false,
+        data: encodedValue)
+
+  # Direct big-endian to host conversion, offset by magic length
   result.timestamp = Timestamp(
-    (uint64(uint8(encodedValue[0])) shl 56) or
-    (uint64(uint8(encodedValue[1])) shl 48) or
-    (uint64(uint8(encodedValue[2])) shl 40) or
-    (uint64(uint8(encodedValue[3])) shl 32) or
-    (uint64(uint8(encodedValue[4])) shl 24) or
-    (uint64(uint8(encodedValue[5])) shl 16) or
-    (uint64(uint8(encodedValue[6])) shl 8) or
-    uint64(uint8(encodedValue[7]))
+    (uint64(uint8(encodedValue[4])) shl 56) or
+    (uint64(uint8(encodedValue[5])) shl 48) or
+    (uint64(uint8(encodedValue[6])) shl 40) or
+    (uint64(uint8(encodedValue[7])) shl 32) or
+    (uint64(uint8(encodedValue[8])) shl 24) or
+    (uint64(uint8(encodedValue[9])) shl 16) or
+    (uint64(uint8(encodedValue[10])) shl 8) or
+    uint64(uint8(encodedValue[11]))
   )
   result.txnId = TransactionID(
-    (int64(uint8(encodedValue[8])) shl 56) or
-    (int64(uint8(encodedValue[9])) shl 48) or
-    (int64(uint8(encodedValue[10])) shl 40) or
-    (int64(uint8(encodedValue[11])) shl 32) or
-    (int64(uint8(encodedValue[12])) shl 24) or
-    (int64(uint8(encodedValue[13])) shl 16) or
-    (int64(uint8(encodedValue[14])) shl 8) or
-    int64(uint8(encodedValue[15]))
+    (int64(uint8(encodedValue[12])) shl 56) or
+    (int64(uint8(encodedValue[13])) shl 48) or
+    (int64(uint8(encodedValue[14])) shl 40) or
+    (int64(uint8(encodedValue[15])) shl 32) or
+    (int64(uint8(encodedValue[16])) shl 24) or
+    (int64(uint8(encodedValue[17])) shl 16) or
+    (int64(uint8(encodedValue[18])) shl 8) or
+    int64(uint8(encodedValue[19]))
   )
-  result.isDeleted = encodedValue[16] == '1'
-  result.data = encodedValue[17 ..< encodedValue.len]
+  result.isDeleted = encodedValue[20] == '1'
+  result.data = encodedValue[MVCC_HEADER_SIZE ..< encodedValue.len]
 
 proc decodeMVCCValue*(encodedValue: string): MVCCValue =
   ## Decode MVCC value from storage format.
-  ## For hot paths, use isLikelyMVCCValue + decodeMVCCValueFast instead.
-  if encodedValue.len < 17:
+  if not isLikelyMVCCValue(encodedValue):
+    raise newException(MVCCError, "Invalid MVCC value: missing magic")
+  if encodedValue.len < MVCC_HEADER_SIZE:
     raise newException(MVCCError, "Invalid MVCC value: too short")
 
-  let delByte = encodedValue[16]
+  let delByte = encodedValue[20]
 
   # Validate delete flag - must be '0' or '1'
   if delByte != '0' and delByte != '1':
     raise newException(MVCCError, "Invalid MVCC value: invalid delete flag")
 
   # Use fast path for actual decoding
-  result.timestamp = Timestamp(
-    (uint64(uint8(encodedValue[0])) shl 56) or
-    (uint64(uint8(encodedValue[1])) shl 48) or
-    (uint64(uint8(encodedValue[2])) shl 40) or
-    (uint64(uint8(encodedValue[3])) shl 32) or
-    (uint64(uint8(encodedValue[4])) shl 24) or
-    (uint64(uint8(encodedValue[5])) shl 16) or
-    (uint64(uint8(encodedValue[6])) shl 8) or
-    uint64(uint8(encodedValue[7]))
-  )
-  result.txnId = TransactionID(
-    (int64(uint8(encodedValue[8])) shl 56) or
-    (int64(uint8(encodedValue[9])) shl 48) or
-    (int64(uint8(encodedValue[10])) shl 40) or
-    (int64(uint8(encodedValue[11])) shl 32) or
-    (int64(uint8(encodedValue[12])) shl 24) or
-    (int64(uint8(encodedValue[13])) shl 16) or
-    (int64(uint8(encodedValue[14])) shl 8) or
-    int64(uint8(encodedValue[15]))
-  )
-  result.isDeleted = delByte == '1'
-  result.data = encodedValue[17 ..< encodedValue.len]
+  result = decodeMVCCValueFast(encodedValue)
 
 proc encodeIntentKey*(userKey: string, txnId: TransactionID): string =
   ## Encode intent key for transaction resolution

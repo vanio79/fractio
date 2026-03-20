@@ -3,7 +3,11 @@
 # Covers all layers: lexer tokenization, parser AST, planner plan generation,
 # formatExpr/formatPlanOp formatting, and executor result shape.
 
-import std/[unittest, options, json, os, strutils]
+import std/[unittest, options, json, os, strutils, random]
+import fractio/client/fractio_client
+import fractio/client/sql_client
+import fractio/protocol/server
+import fractio/protocol/types as protoTypes
 import fractio/sql/lexer
 import fractio/sql/parser
 import fractio/sql/ast
@@ -28,11 +32,12 @@ proc nextBasePort(): int =
   result = testBasePort
   testBasePort += 100
 
-proc createTestStore(testDir: string): RaftKVStoreExt =
+proc makeTestEnv(testDir: string): tuple[client: FractioClient, server: ProtocolServer, store: RaftKVStoreExt] =
   if dirExists(testDir): removeDir(testDir)
   createDir(testDir)
   let nodeId = NodeID(1)
   let basePort = nextBasePort()
+  let clientPort = nextBasePort()
   let members = @[(nodeId: 1'u32, host: "127.0.0.1", basePort: basePort)]
 
   let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
@@ -54,20 +59,55 @@ proc createTestStore(testDir: string): RaftKVStoreExt =
       break
     os.sleep(100)
 
-  result = newRaftKVStoreExt(coord, proposeTimeoutMs = 5000)
-  result.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
+  let store = newRaftKVStoreExt(coord, proposeTimeoutMs = 5000)
+  store.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
 
-proc createMvccStore(store: RaftKVStoreExt): MvccTransactionStore =
   let txnMgr = newTransactionManager()
-  newMvccTransactionStore(store, txnMgr, nil)
+  let mvccStore = newMvccTransactionStore(store, txnMgr, nil)
+
+  # Seed system tables for client routing
+  let nodeRec = NodeRecord(
+    nodeId: 1, host: "127.0.0.1", raftPort: basePort.uint16,
+    clientPort: clientPort.uint16, status: nsAlive
+  )
+  discard store.sysTablePut(encodeTableKey(SYS_NODES_TABLE_ID, "1"), encode(nodeRec))
+
+  let metaGroupRec = GroupRecord(
+    groupId: 1, spaceId: 0, leader: 1,
+    replicas: @[GroupReplicaBin(nodeId: 1, replicaType: rtVoter)]
+  )
+  discard store.sysTablePut(encodeTableKey(SYS_GROUPS_TABLE_ID, "1"), encode(metaGroupRec))
+
+  let dataGroupRec = GroupRecord(
+    groupId: 2, spaceId: 1, leader: 1,
+    replicas: @[GroupReplicaBin(nodeId: 1, replicaType: rtVoter)]
+  )
+  discard store.sysTablePut(encodeTableKey(SYS_GROUPS_TABLE_ID, "2"), encode(dataGroupRec))
+
+  # Start ProtocolServer
+  var srvConfig = defaultServerConfig()
+  srvConfig.port = clientPort
+  srvConfig.host = "127.0.0.1"
+  srvConfig.serverId = nodeId.uint16
+  srvConfig.dataDir = testDir
+  let server = newProtocolServer(srvConfig)
+  server.raftStore = store
+  server.mvccStore = mvccStore
+  server.txnMgr = txnMgr
+  server.start()
+
+  # Create client
+  let client = newFractioClient("127.0.0.1", clientPort)
+  doAssert client.initialize()
+
+  result = (client, server, store)
 
 proc cleanupTestDir(testDir: string) =
   if dirExists(testDir):
     removeDir(testDir)
 
-proc exec(store: RaftKVStoreExt, mvccStore: MvccTransactionStore,
-    sql: string, database = "default", schema = "public"): ExecResult =
-  executeSQL(sql, store, mvccStore, database = database, schema = schema)
+proc exec(client: FractioClient, sql: string, database = "default", schema = "public"): ExecResult =
+  client.query(sql, database, schema)
 
 proc seedTable(store: RaftKVStoreExt, database, schema, name: string,
     tableId: uint32, columns: seq[tuple[name: string, typ: string]],
@@ -99,7 +139,7 @@ proc seedTable(store: RaftKVStoreExt, database, schema, name: string,
   )
   let key = encodeTableKey(SYS_TABLES_TABLE_ID,
       database & "." & schema & "." & name)
-  discard store.raftPut(key, encode(tableRec))
+  discard store.sysTablePut(key, encode(tableRec))
 
 # ---------------------------------------------------------------------------
 # Suite 1: Lexer — EXPLAIN token
@@ -504,14 +544,18 @@ suite "EXPLAIN — formatPlan":
 # ---------------------------------------------------------------------------
 
 suite "EXPLAIN — planner with store":
+  var client: FractioClient
+  var server: ProtocolServer
   var store: RaftKVStoreExt
   let testDir = "/tmp/fractio_test_explain_planner_" & $getCurrentProcessId()
 
   setup:
     cleanupTestDir(testDir)
-    store = createTestStore(testDir)
+    (client, server, store) = makeTestEnv(testDir)
 
   teardown:
+    client.close()
+    server.stop()
     store.coordinator.stop()
     cleanupTestDir(testDir)
 
@@ -519,7 +563,7 @@ suite "EXPLAIN — planner with store":
     seedTable(store, "default", "public", "users", 100,
       @[("id", "INT"), ("name", "TEXT")], @["id"])
     let stmt = parseStatement("EXPLAIN SELECT * FROM users")
-    let plan = planStatement(stmt, store, nil)
+    let plan = planStatement(stmt, client)
     check plan.ops.len == 1
     check plan.ops[0].kind == poExplain
     check plan.ops[0].exInnerPlan.ops.len == 1
@@ -529,7 +573,7 @@ suite "EXPLAIN — planner with store":
     seedTable(store, "default", "public", "users", 100,
       @[("id", "INT"), ("name", "TEXT")], @["id"])
     let stmt = parseStatement("EXPLAIN SELECT * FROM users WHERE id = 1")
-    let plan = planStatement(stmt, store, nil)
+    let plan = planStatement(stmt, client)
     check plan.ops[0].kind == poExplain
     check plan.ops[0].exInnerPlan.ops[0].kind == poPointGet
     check plan.ops[0].exInnerPlan.ops[0].pgKey == "1"
@@ -538,7 +582,7 @@ suite "EXPLAIN — planner with store":
     seedTable(store, "default", "public", "users", 100,
       @[("id", "INT"), ("name", "TEXT")], @["id"])
     let stmt = parseStatement("EXPLAIN UPDATE users SET name = 'X' WHERE id = 1")
-    let plan = planStatement(stmt, store, nil)
+    let plan = planStatement(stmt, client)
     check plan.ops[0].kind == poExplain
     check plan.ops[0].exInnerPlan.ops[0].kind == poUpdate
     check plan.ops[0].exInnerPlan.ops[0].upTableName == "users"
@@ -547,7 +591,7 @@ suite "EXPLAIN — planner with store":
     seedTable(store, "default", "public", "users", 100,
       @[("id", "INT"), ("name", "TEXT")], @["id"])
     let stmt = parseStatement("EXPLAIN DELETE FROM users WHERE id = 1")
-    let plan = planStatement(stmt, store, nil)
+    let plan = planStatement(stmt, client)
     check plan.ops[0].kind == poExplain
     check plan.ops[0].exInnerPlan.ops[0].kind == poDelete
 
@@ -556,7 +600,7 @@ suite "EXPLAIN — planner with store":
       @[("id", "INT"), ("name", "TEXT")], @["id"])
     let stmt = parseStatement(
         "EXPLAIN INSERT INTO users (id, name) VALUES (1, 'A'), (2, 'B'), (3, 'C')")
-    let plan = planStatement(stmt, store, nil)
+    let plan = planStatement(stmt, client)
     check plan.ops[0].kind == poExplain
     let inner = plan.ops[0].exInnerPlan.ops[0]
     check inner.kind == poInsert
@@ -565,40 +609,39 @@ suite "EXPLAIN — planner with store":
   test "EXPLAIN on non-existent table raises PlanError":
     expect(PlanError):
       let stmt = parseStatement("EXPLAIN SELECT * FROM nonexistent")
-      discard planStatement(stmt, store, nil)
+      discard planStatement(stmt, client)
 
   test "EXPLAIN CREATE TABLE does not consume a table ID":
-    let id1 = nextTableId(store, nil)
+    let id1 = nextTableId(client)
     let stmt = parseStatement("EXPLAIN CREATE TABLE t (id INT PRIMARY KEY)")
-    let plan = planStatement(stmt, store, nil)
+    let plan = planStatement(stmt, client)
     check plan.ops[0].kind == poExplain
     # nextTableId should return the same ID — EXPLAIN planning consumed one
     # but we verify the table was NOT actually created
-    let mvccStore = createMvccStore(store)
-    let showRes = exec(store, mvccStore, "SHOW TABLES")
+    let showRes = exec(client, "SHOW TABLES")
     check showRes.rows.len == 0
 
   test "EXPLAIN DROP DATABASE":
     let stmt = parseStatement("EXPLAIN DROP DATABASE IF EXISTS mydb")
-    let plan = planStatement(stmt, store, nil)
+    let plan = planStatement(stmt, client)
     check plan.ops[0].kind == poExplain
     check plan.ops[0].exInnerPlan.ops[0].kind == poDropDatabase
 
   test "EXPLAIN CREATE SCHEMA":
     let stmt = parseStatement("EXPLAIN CREATE SCHEMA myschema")
-    let plan = planStatement(stmt, store, nil)
+    let plan = planStatement(stmt, client)
     check plan.ops[0].kind == poExplain
     check plan.ops[0].exInnerPlan.ops[0].kind == poCreateSchema
 
   test "EXPLAIN SHOW SCHEMAS IN mydb":
     let stmt = parseStatement("EXPLAIN SHOW SCHEMAS IN mydb")
-    let plan = planStatement(stmt, store, nil)
+    let plan = planStatement(stmt, client)
     check plan.ops[0].kind == poExplain
     check plan.ops[0].exInnerPlan.ops[0].kind == poShowSchemas
     check plan.ops[0].exInnerPlan.ops[0].ssDatabase == "mydb"
 
   test "EXPLAIN BEGIN TRANSACTION":
     let stmt = parseStatement("EXPLAIN BEGIN TRANSACTION")
-    let plan = planStatement(stmt, store, nil)
+    let plan = planStatement(stmt, client)
     check plan.ops[0].kind == poExplain
     check plan.ops[0].exInnerPlan.ops[0].kind == poBeginTxn

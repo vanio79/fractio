@@ -597,6 +597,9 @@ proc applyBatchToSM*(storePtr: pointer, rid: GroupID,
   # Parse the binary payload
   var batch: WriteBatch = nil
   try:
+    var hexPayload = ""
+    for i in 0 ..< min(len, 16): hexPayload &= " " & toHex(uint8(payload[i]))
+    echo "DEBUG: applyBatchToSM raw payload len=", len, " prefix=", hexPayload
     batch = nuraft_coordinator.deserializeWriteBatch(payload)
   except CatchableError:
     return
@@ -609,6 +612,9 @@ proc applyBatchToSM*(storePtr: pointer, rid: GroupID,
     {.cast(raises: []).}:
       var pairs: seq[KeyValuePair] = @[]
       var delKeys: seq[string] = @[]
+
+      let now = int64(getTime().toUnixFloat() * 1_000_000_000)
+
       for (k, v) in batch.puts:
         pairs.add((key: fromBytes(k), value: fromBytes(v)))
       for k in batch.deletes:
