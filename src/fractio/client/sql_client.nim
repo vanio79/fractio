@@ -21,7 +21,6 @@ proc query*(client: FractioClient, sql: string,
       if not client.initialize():
         return errorResult("failed to initialize client")
 
-    echo "DEBUG: query SQL: ", sql
     let stmts = parseAll(sql)
     if stmts.len == 0:
       return errorResult("empty SQL statement")
@@ -31,16 +30,11 @@ proc query*(client: FractioClient, sql: string,
       let plan = planStatement(stmt, client, database, schema)
       lastResult = execute(plan, client, database)
       if lastResult.kind == erkError:
-        echo "DEBUG: execution failed for SQL: ", sql
-        echo "DEBUG: error: ", lastResult.error
         return lastResult
     return lastResult
   except ParseError as e:
-    echo "DEBUG: SQL parse error: ", e.msg
     return errorResult("SQL parse error: " & e.msg)
   except PlanError as e:
-    echo "DEBUG: SQL plan error: ", e.msg
     return errorResult("SQL plan error: " & e.msg)
   except CatchableError as e:
-    echo "DEBUG: SQL execution error: ", e.msg, " type=", e.name
     return errorResult("SQL execution error: " & e.msg)

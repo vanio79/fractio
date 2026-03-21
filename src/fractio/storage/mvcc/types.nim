@@ -176,11 +176,6 @@ proc encodeMVCCValue*(value: string, timestamp: Timestamp,
     result.add(chr(int(txnBytes[i])))
   result.add(delByte)
   result.add(value)
-  
-  var hex = ""
-  for i in 0 ..< min(result.len, 16):
-    hex &= " " & toHex(uint8(result[i]))
-  echo "DEBUG: encodeMVCCValue result prefix:", hex
 
 proc isLikelyMVCCValue*(data: string): bool {.inline.} =
   ## Fast check if data starts with MVCC magic

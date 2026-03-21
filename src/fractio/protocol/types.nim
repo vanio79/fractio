@@ -68,6 +68,7 @@ type
     mtDelete = 0x0102
     mtBatch = 0x0103
     mtScan = 0x0104
+    mtRawPut = 0x0105
 
     # Transactions (0x0200-0x02FF)
     mtBeginTxn = 0x0200

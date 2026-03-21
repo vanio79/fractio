@@ -483,7 +483,6 @@ proc execCreateTable(op: PlanOp, ctx: ExecutorContext): ExecResult =
 
   let putRes = ctx.client.kvPut(key, tableValue, txnId = internalTxnId)
   if not putRes.isOk:
-    echo "DEBUG: execCreateTable kvPut failed: ", putRes.err
     discard ctx.client.rollbackTxn(internalTxnId)
     return errorResult(&"failed to create table: {putRes.err}")
 
@@ -530,51 +529,40 @@ proc execDropTable(op: PlanOp, ctx: ExecutorContext): ExecResult =
 # ---------------------------------------------------------------------------
 
 proc execCreateSpace(op: PlanOp, ctx: ExecutorContext): ExecResult =
-  ## Execute CREATE SPACE with internal MVCC transaction for consistency.
-  ## Allocates spaceId, computes group placement, creates Raft groups, writes space record.
+  ## Execute CREATE SPACE with auto-transaction mode for system table writes.
+  ## NOTE: Transaction sessions are node-local, so we can't use a single transaction
+  ## across multiple nodes. We use auto-transaction mode (txnId=0) for each write.
+  ## TODO: Implement distributed transaction coordination for proper multi-node transactions.
 
-  # Create internal transaction
-  let txnRes = ctx.client.beginTxn()
-  if not txnRes.isOk:
-    return errorResult(&"failed to start internal transaction: {txnRes.err}")
-  let internalTxnId = txnRes.val.txnId
-  let internalReadTimestamp = txnRes.val.readTimestamp
-
-  # Check for duplicate by name (within transaction snapshot)
+  # Check for duplicate by name
   let startKey = encodeTableKey(SYS_SPACES_TABLE_ID, "")
   let endKey = encodeTableKey(SYS_SPACES_TABLE_ID + 1, "")
-  let scanRes = ctx.client.kvScan(startKey, endKey, 0, txnId = internalTxnId,
-      readTimestamp = internalReadTimestamp)
+  let scanRes = ctx.client.kvScan(startKey, endKey, 0, txnId = 0,
+      readTimestamp = 0)
   if scanRes.isOk:
     for entry in scanRes.val:
-      echo "DEBUG: decoding space record for key ", entry.key
       let rec = decodeSpaceRecord(entry.value)
       if rec.name == op.cspName:
-        discard ctx.client.rollbackTxn(internalTxnId)
         return errorResult(&"space '{op.cspName}' already exists")
 
-  # Count nodes in the cluster (within transaction snapshot)
+  # Count nodes in the cluster
   let nodesStart = encodeTableKey(SYS_NODES_TABLE_ID, "")
   let nodesEnd = encodeTableKey(SYS_NODES_TABLE_ID + 1, "")
-  let nodesRes = ctx.client.kvScan(nodesStart, nodesEnd, 0,
-      txnId = internalTxnId, readTimestamp = internalReadTimestamp)
+  let nodesRes = ctx.client.kvScan(nodesStart, nodesEnd, 0, txnId = 0,
+      readTimestamp = 0)
   var nodeCount = 0
   var nodeIds: seq[int] = @[]
   if nodesRes.isOk:
     for entry in nodesRes.val:
-      echo "DEBUG: decoding node record for key ", entry.key, " len=",
-          entry.value.len
       let rec = decodeNodeRecord(entry.value)
       nodeIds.add(int(rec.nodeId))
       inc nodeCount
 
   if nodeCount == 0:
-    discard ctx.client.rollbackTxn(internalTxnId)
     return errorResult("no nodes in cluster")
 
   let replicas = if op.cspReplicas == 0: nodeCount else: op.cspReplicas
   if replicas > nodeCount:
-    discard ctx.client.rollbackTxn(internalTxnId)
     return errorResult(&"REPLICAS ({replicas}) exceeds node count ({nodeCount})")
 
   # Compute group count and placement
@@ -582,18 +570,18 @@ proc execCreateSpace(op: PlanOp, ctx: ExecutorContext): ExecResult =
   let groupCount = nodeCount
   nodeIds.sort()
 
-  # Allocate space ID (scan for max within transaction)
+  # Allocate space ID (scan for max)
   var spaceId = 1
   if scanRes.isOk:
     for entry in scanRes.val:
       let rec = decodeSpaceRecord(entry.value)
       if rec.spaceId >= spaceId: spaceId = rec.spaceId + 1
 
-  # Find max existing groupId to allocate new ones (within transaction)
+  # Find max existing groupId to allocate new ones
   let rangesStart = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
   let rangesEnd = encodeTableKey(SYS_GROUPS_TABLE_ID + 1, "")
-  let rangesRes = ctx.client.kvScan(rangesStart, rangesEnd, 0,
-      txnId = internalTxnId, readTimestamp = internalReadTimestamp)
+  let rangesRes = ctx.client.kvScan(rangesStart, rangesEnd, 0, txnId = 0,
+      readTimestamp = 0)
   var maxGroupId: uint64 = 1
   if rangesRes.isOk:
     for entry in rangesRes.val:
@@ -610,7 +598,7 @@ proc execCreateSpace(op: PlanOp, ctx: ExecutorContext): ExecResult =
     for j in 0 ..< replicas:
       members.add(nodeIds[(g + j) mod nodeCount])
 
-    # Write group descriptor to sys.groups (within transaction) using binary encoding
+    # Write group descriptor to sys.groups using auto-transaction mode (txnId=0)
     var groupReplicas: seq[GroupReplicaBin] = @[]
     for m in members:
       groupReplicas.add(GroupReplicaBin(nodeId: uint32(m),
@@ -623,16 +611,15 @@ proc execCreateSpace(op: PlanOp, ctx: ExecutorContext): ExecResult =
       replicas: groupReplicas
     )
     let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupId)
-    let putRes = ctx.client.kvPut(groupKey, encode(groupRec),
-        txnId = internalTxnId)
+    # Use txnId = 0 for auto-transaction mode
+    let putRes = ctx.client.kvPut(groupKey, encode(groupRec), txnId = 0)
     if not putRes.isOk:
-      discard ctx.client.rollbackTxn(internalTxnId)
       return errorResult(&"failed to create group {groupId}: {putRes.err}")
 
     # Note: actual Raft group creation is handled by the server nodes
     # observing the sys.groups metadata change via applyBatchToSM.
 
-  # Write space record (within transaction) using binary encoding
+  # Write space record using auto-transaction mode (txnId=0)
   let spaceRec = SpaceRecord(
     spaceId: int32(spaceId),
     name: op.cspName,
@@ -644,16 +631,10 @@ proc execCreateSpace(op: PlanOp, ctx: ExecutorContext): ExecResult =
     createdAtNs: nowNs()
   )
   let spaceKey = encodeSpaceKey(spaceId)
-  let putRes = ctx.client.kvPut(spaceKey, encode(spaceRec),
-      txnId = internalTxnId)
+  # Use txnId = 0 for auto-transaction mode
+  let putRes = ctx.client.kvPut(spaceKey, encode(spaceRec), txnId = 0)
   if not putRes.isOk:
-    discard ctx.client.rollbackTxn(internalTxnId)
     return errorResult(&"failed to write space record: {putRes.err}")
-
-  # Commit the transaction
-  let commitRes = ctx.client.commitTxn(internalTxnId)
-  if not commitRes.isOk:
-    return errorResult(&"failed to commit: {commitRes.err}")
 
   okResult(&"CREATE SPACE ({groupCount} groups)")
 
@@ -939,10 +920,10 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
 
     # DML operations: always use MVCC with implicit transaction if needed
     of poInsert:
-      let implicitTxn = needsImplicitTxn()
-      if implicitTxn and not beginImplicitTxn():
-        return errorResult("failed to begin implicit transaction")
-
+      # NOTE: For data table writes, we use auto-transaction mode (txnId = 0)
+      # because transaction sessions are node-local and the write may be routed
+      # to a different group leader. This means each INSERT is its own transaction.
+      # TODO: Implement distributed transaction coordination for multi-statement transactions.
       var count = 0
       var error: string = ""
       for rowJson in op.insRows:
@@ -952,19 +933,15 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
           error = "INSERT requires a primary key value"
           break
         let key = encodeDataRowKey(op.insTableId, pkVal)
-        let res = ctx.client.kvPut(key, rowJson, txnId = ctx.txnId)
+        # Use txnId = 0 for auto-transaction mode (each write is its own transaction)
+        let res = ctx.client.kvPut(key, rowJson, txnId = 0)
         if not res.isOk:
-          echo "DEBUG: INSERT failed for key ", key, ": ", res.err
           error = &"failed to insert row: {res.err}"
           break
         inc count
 
       if error.len > 0:
-        if implicitTxn: rollbackImplicitTxn()
         return errorResult(error)
-
-      if implicitTxn and not commitImplicitTxn():
-        return errorResult("failed to commit implicit transaction")
 
       modifiedResult(count, &"INSERT {count}")
 
@@ -1001,17 +978,16 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
 
     of poUpdate:
       # MVCC-aware UPDATE
-      let implicitTxn = needsImplicitTxn()
-      if implicitTxn and not beginImplicitTxn():
-        return errorResult("failed to begin implicit transaction")
-
+      # NOTE: For data table writes, we use auto-transaction mode (txnId = 0)
+      # because transaction sessions are node-local and the write may be routed
+      # to a different group leader.
       let startKey = encodeDataRowKey(op.upTableId, "")
       let endKey = encodeDataRowKey(op.upTableId + 1, "")
-      let res = ctx.client.kvScan(startKey, endKey, 0, txnId = ctx.txnId,
+      # Use read timestamp for consistent scan
+      let res = ctx.client.kvScan(startKey, endKey, 0, txnId = 0,
           readTimestamp = ctx.readTimestamp)
 
       if not res.isOk:
-        if implicitTxn: rollbackImplicitTxn()
         return errorResult(&"failed to scan for update: {res.err}")
 
       var count = 0
@@ -1023,8 +999,8 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
             var updated = row.copy()
             for (col, valExpr) in op.upSets:
               updated[col] = evalExpr(valExpr, row)
-            let putRes = ctx.client.kvPut(entry.key, $updated,
-                txnId = ctx.txnId)
+            # Use txnId = 0 for auto-transaction mode
+            let putRes = ctx.client.kvPut(entry.key, $updated, txnId = 0)
             if not putRes.isOk:
               error = &"failed to update row: {putRes.err}"
               break
@@ -1033,27 +1009,22 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
           discard
 
       if error.len > 0:
-        if implicitTxn: rollbackImplicitTxn()
         return errorResult(error)
-
-      if implicitTxn and not commitImplicitTxn():
-        return errorResult("failed to commit implicit transaction")
 
       modifiedResult(count, &"UPDATE {count}")
 
     of poDelete:
       # MVCC-aware DELETE
-      let implicitTxn = needsImplicitTxn()
-      if implicitTxn and not beginImplicitTxn():
-        return errorResult("failed to begin implicit transaction")
-
+      # NOTE: For data table writes, we use auto-transaction mode (txnId = 0)
+      # because transaction sessions are node-local and the write may be routed
+      # to a different group leader.
       let startKey = encodeDataRowKey(op.delTableId, "")
       let endKey = encodeDataRowKey(op.delTableId + 1, "")
-      let res = ctx.client.kvScan(startKey, endKey, 0, txnId = ctx.txnId,
+      # Use read timestamp for consistent scan
+      let res = ctx.client.kvScan(startKey, endKey, 0, txnId = 0,
           readTimestamp = ctx.readTimestamp)
 
       if not res.isOk:
-        if implicitTxn: rollbackImplicitTxn()
         return errorResult(&"failed to scan for delete: {res.err}")
 
       var count = 0
@@ -1062,7 +1033,8 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
         try:
           let row = parseJson(entry.value)
           if matchesFilter(op.delFilter, row):
-            let delRes = ctx.client.kvDelete(entry.key, txnId = ctx.txnId)
+            # Use txnId = 0 for auto-transaction mode
+            let delRes = ctx.client.kvDelete(entry.key, txnId = 0)
             if not delRes.isOk:
               error = &"failed to delete row: {delRes.err}"
               break
@@ -1071,11 +1043,7 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
           discard
 
       if error.len > 0:
-        if implicitTxn: rollbackImplicitTxn()
         return errorResult(error)
-
-      if implicitTxn and not commitImplicitTxn():
-        return errorResult("failed to commit implicit transaction")
 
       modifiedResult(count, &"DELETE {count}")
 

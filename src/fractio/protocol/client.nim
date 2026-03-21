@@ -366,6 +366,19 @@ proc kvGetInGroup*(client: ProtocolClient, key: string,
   if r.isErr: return peErr(r.error)
   decodeGetResponse(r.value.payload)
 
+proc kvRawPutInGroup*(client: ProtocolClient, key: string, value: string,
+    groupId: uint64,
+    flags: uint8 = 0, txnId: uint64 = 0,
+    expectedVersion: uint64 = 0): Result[PutResponse, ProtocolError] {.gcsafe,
+    raises: [].} =
+  let req = PutRequest(flags: flags, txnId: txnId,
+                       expectedVersion: expectedVersion,
+                       key: key, value: value,
+                       groupId: groupId)
+  let r = client.send(encodeRawPutRequest(req))
+  if r.isErr: return peErr(r.error)
+  decodePutResponse(r.value.payload)
+
 proc kvPutInGroup*(client: ProtocolClient, key: string, value: string,
     groupId: uint64,
     flags: uint8 = 0, txnId: uint64 = 0,

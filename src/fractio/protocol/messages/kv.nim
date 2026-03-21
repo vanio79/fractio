@@ -181,6 +181,20 @@ type
     hasPreviousValue*: bool
     previousValue*: string
 
+
+proc encodeRawPutRequest*(req: PutRequest): string =
+  var buf = ""
+  buf.writeUint16BE(uint16(mtRawPut))
+  var flags = req.flags
+  if req.groupId != 0: flags = flags or PutFlagGroupRouted
+  buf.writeUint8(flags)
+  buf.writeUint64BE(req.txnId)
+  buf.writeUint64BE(req.expectedVersion)
+  buf.writeBytes(req.key)
+  buf.writeBytes(req.value)
+  if req.groupId != 0:
+    buf.writeUint64BE(req.groupId)
+  buf
 proc encodePutRequest*(req: PutRequest): string =
   var buf = ""
   buf.writeUint16BE(uint16(mtPut))

@@ -294,7 +294,7 @@ proc resolveGroupId*(store: RaftKVStoreExt, key: string): Option[
                        primaryKey[2 .. ^1]
                      else:
                        primaryKey
-            return some(routeToGroup(pk, groupIds))
+            return some(routeToGroup(stripMvccSuffix(pk), groupIds))
       except:
         discard
   some(DATA_GROUP_START_ID)
@@ -412,6 +412,13 @@ proc loadGroupMembers*(store: RaftKVStoreExt,
           newGroupLeaders[gid] = leader
       except:
         discard
+
+  # Preserve in-memory leader info for groups where we know the leader
+  # (onLeaderChanged is the source of truth, backend may be stale during rebalancing)
+  withLock store.groupMu:
+    for gid, leader in store.groupLeaders:
+      if leader > 0 and gid notin newGroupLeaders:
+        newGroupLeaders[gid] = leader
 
   withLock store.groupMu:
     store.groupMembers = newGroupMembers
@@ -597,9 +604,6 @@ proc applyBatchToSM*(storePtr: pointer, rid: GroupID,
   # Parse the binary payload
   var batch: WriteBatch = nil
   try:
-    var hexPayload = ""
-    for i in 0 ..< min(len, 16): hexPayload &= " " & toHex(uint8(payload[i]))
-    echo "DEBUG: applyBatchToSM raw payload len=", len, " prefix=", hexPayload
     batch = nuraft_coordinator.deserializeWriteBatch(payload)
   except CatchableError:
     return
@@ -850,24 +854,37 @@ proc wireApplyCallback*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
       withLock s.groupMu:
         s.groupLeaders[groupId] = leaderNodeId.uint32
 
-      # Skip persisting leader for meta and default data groups
-      if groupId == META_GROUP_ID or groupId == DATA_GROUP_START_ID:
+      # Skip persisting leader for default data group (no space association)
+      # but DO persist for META_GROUP_ID since clients need to route to it
+      if groupId == DATA_GROUP_START_ID:
         return
 
-      # Check if any space is rebalancing - don't persist during migration
-      var isRebalancing = false
-      withLock s.spacesMu:
-        for spaceId, space in s.spaces:
-          if space.rebalancing:
-            isRebalancing = true
-            break
+      # For META_GROUP_ID, we can persist even if another node is meta leader
+      # (this is safe because we just won the election for THIS group)
+      # For space groups, only persist if we're the meta leader
+      if groupId != META_GROUP_ID:
+        # Check if this group belongs to a rebalancing space
+        var isRebalancingOldGroup = false
+        var isRebalancingNewGroup = false
+        withLock s.spacesMu:
+          for spaceId, space in s.spaces:
+            if space.rebalancing:
+              # Check if groupId is in oldGroupIds (being migrated away) or groupIds (new)
+              if groupId.uint64 in space.oldGroupIds:
+                isRebalancingOldGroup = true
+                break
+              elif groupId.uint64 in space.groupIds:
+                isRebalancingNewGroup = true
+                break
 
-      if isRebalancing:
-        return
+        # Skip persistence for old groups during rebalancing (being migrated away)
+        # but ALLOW persistence for new groups (need leaders for routing)
+        if isRebalancingOldGroup:
+          return
 
-      # Persist leader to sys.groups (only if we're the meta leader)
-      if not s.coordinator.isLeader(META_GROUP_ID):
-        return
+        # Persist leader to sys.groups (only if we're the meta leader)
+        if not s.coordinator.isLeader(META_GROUP_ID):
+          return
 
       let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupId.uint64)
       let backend = s.coordinator.store
@@ -1006,10 +1023,12 @@ proc raftPut*(store: RaftKVStoreExt, key, value: string): RSResult[
     return rsErr[RaftKVEntry](newRSE(rseGroupNotFound,
         &"no shard for key '{key}'"))
 
+  let groupId = ridOpt.get()
+
   let batch = newWriteBatch()
   batch.put(toBytes(key), toBytes(value))
 
-  let vr = proposeWrite(store, ridOpt.get(), batch)
+  let vr = proposeWrite(store, groupId, batch)
   if not vr.isOk:
     return rsErr[RaftKVEntry](vr.error)
 
@@ -1071,7 +1090,7 @@ proc validateKeyRouting(store: RaftKVStoreExt, key: string,
                    primaryKey[2 .. ^1]
                  else:
                    primaryKey
-        let expected = routeToGroup(pk, space.groupIds)
+        let expected = routeToGroup(stripMvccSuffix(pk), space.groupIds)
         if expected != groupId:
           # During rebalancing, also check if the key routes to an old group
           if space.rebalancing and space.oldGroupIds.len > 0:
@@ -1684,31 +1703,108 @@ proc getSpaceForTable*(store: RaftKVStoreExt,
 # Forward a request to the group leader over the network when this node is
 # not the leader for the target group.
 
-proc findLeaderForGroup(store: RaftKVStoreExt,
-    groupId: GroupID): Option[NodeInfo] {.gcsafe, raises: [].} =
-  ## Look up network address for the leader of `groupId`.
+# Forward declarations for helper procedures
+proc forwardPutToLeaderRemote(store: RaftKVStoreExt, groupId: GroupID,
+    targetNodeId: uint32, key, value: string): RSResult[RaftKVEntry] {.gcsafe,
+        raises: [].}
+proc forwardDeleteToLeaderRemote(store: RaftKVStoreExt, groupId: GroupID,
+    targetNodeId: uint32, key: string): RSResult[Option[RaftKVEntry]] {.gcsafe,
+        raises: [].}
+proc forwardGetToLeaderRemote(store: RaftKVStoreExt, groupId: GroupID,
+    targetNodeId: uint32, key: string): RSResult[Option[RaftKVEntry]] {.gcsafe,
+        raises: [].}
+
+proc findLeaderForGroup*(store: RaftKVStoreExt,
+    groupId: GroupID): Option[uint32] {.gcsafe, raises: [].} =
+  ## Look up node ID for the leader of `groupId`.
   ## Tries groupLeaders first, then falls back to groupMembers.
+  ## Returns local nodeId if this node is the leader.
   let localNodeId = store.coordinator.nodeId.uint32
   var targetNode: uint32 = 0
   withLock store.groupMu:
     targetNode = store.groupLeaders.getOrDefault(groupId, 0)
-    if targetNode == 0 or targetNode == localNodeId:
+    if targetNode == 0:
+      # No leader known, try to find another member to forward to
       let members = store.groupMembers.getOrDefault(groupId, @[])
       for nid in members:
         if nid != localNodeId:
           targetNode = nid
           break
-  if targetNode == 0 or targetNode == localNodeId:
-    return none(NodeInfo)
-  store.lookupNodeInfo(targetNode)
+  if targetNode == 0:
+    return none(uint32)
+  return some(targetNode)
 
 proc forwardPutToLeader(store: RaftKVStoreExt, groupId: GroupID,
     key, value: string): RSResult[RaftKVEntry] {.gcsafe, raises: [].} =
-  ## Forward a PUT to the leader of `groupId` via the wire protocol.
-  let infoOpt = store.findLeaderForGroup(groupId)
-  if infoOpt.isNone:
+  ## Forward a PUT to the leader of `groupId`. If the local node is the
+  ## leader (verified by coordinator), performs a local write.
+  let localNodeId = store.coordinator.nodeId.uint32
+
+  # Check if we think we're the leader AND verify with coordinator
+  let amLeader = store.coordinator.isLeader(groupId)
+  if amLeader:
+    # We're the leader - do a local write
+    let batch = newWriteBatch()
+    batch.put(toBytes(key), toBytes(value))
+    let writeRes = proposeWrite(store, groupId, batch)
+    if not writeRes.isOk:
+      return rsErr[RaftKVEntry](newRSE(rseInternal,
+          "local write failed: " & $writeRes.error))
+    return rsOk[RaftKVEntry](RaftKVEntry(
+      value: value, version: 1'u64, timestamp: uint64(getTime().toUnixFloat() *
+          1_000_000_000)))
+
+  # We're not the leader - look up who is and forward
+  let leaderOpt = store.findLeaderForGroup(groupId)
+  if leaderOpt.isNone:
     return rsErr[RaftKVEntry](newRSE(rseNotLeader,
         "no reachable leader for group " & $groupId.uint64))
+  let leaderNodeId = leaderOpt.get()
+
+  # If findLeaderForGroup returns our own nodeId, we should attempt
+  # the write anyway. This handles the case where coordinator state is
+  # stale during leadership transition - our node might still be the leader.
+  if leaderNodeId == localNodeId:
+    # Try local write as fallback - this is safe because either:
+    # 1. We're the actual leader and write succeeds
+    # 2. We're not leader and proposeWrite fails - in that case, try other members
+    let batch = newWriteBatch()
+    batch.put(toBytes(key), toBytes(value))
+    let writeRes = proposeWrite(store, groupId, batch)
+    if writeRes.isOk:
+      let ts = uint64(getTime().toUnixFloat() * 1_000_000_000)
+      return rsOk[RaftKVEntry](RaftKVEntry(value: value, version: 1'u64,
+          timestamp: ts))
+    # Local write failed - not actually leader, try other group members
+    {.cast(raises: []).}:
+      {.cast(gcsafe).}:
+        debug("forwardPutToLeader: local write failed, trying other members",
+            {"groupId": $groupId.uint64, "error": $writeRes.error}.toTable)
+    # Find another member to forward to
+    var targetNodeId: uint32 = 0
+    withLock store.groupMu:
+      let members = store.groupMembers.getOrDefault(groupId, @[])
+      for nid in members:
+        if nid != localNodeId:
+          targetNodeId = nid
+          break
+    if targetNodeId == 0:
+      return rsErr[RaftKVEntry](newRSE(rseNotLeader,
+          "no other members for group " & $groupId.uint64))
+    # Forward to the other member using remote procedure
+    return forwardPutToLeaderRemote(store, groupId, targetNodeId, key, value)
+
+  # Remote write - look up node info and forward
+  return forwardPutToLeaderRemote(store, groupId, leaderNodeId, key, value)
+
+proc forwardPutToLeaderRemote(store: RaftKVStoreExt, groupId: GroupID,
+    targetNodeId: uint32, key, value: string): RSResult[RaftKVEntry] {.gcsafe,
+        raises: [].} =
+  ## Helper: forward a PUT to a specific remote node
+  let infoOpt = store.lookupNodeInfo(targetNodeId)
+  if infoOpt.isNone:
+    return rsErr[RaftKVEntry](newRSE(rseNotLeader,
+        "no node info for leader " & $targetNodeId))
   let info = infoOpt.get()
   {.cast(raises: []).}:
     try:
@@ -1720,7 +1816,7 @@ proc forwardPutToLeader(store: RaftKVStoreExt, groupId: GroupID,
         return rsErr[RaftKVEntry](newRSE(rseNotLeader,
             "failed to connect to leader: " & $cr.err))
       defer: pc.disconnect()
-      let pr = pc.kvPutInGroup(key, value, groupId.uint64)
+      let pr = pc.kvRawPutInGroup(key, value, groupId.uint64)
       if not pr.isOk:
         if pr.err.kind == peNotLeader:
           return rsErr[RaftKVEntry](newRSE(rseNotLeader, pr.err.msg))
@@ -1737,11 +1833,55 @@ proc forwardPutToLeader(store: RaftKVStoreExt, groupId: GroupID,
 
 proc forwardDeleteToLeader(store: RaftKVStoreExt, groupId: GroupID,
     key: string): RSResult[Option[RaftKVEntry]] {.gcsafe, raises: [].} =
-  ## Forward a DELETE to the leader of `groupId` via the wire protocol.
-  let infoOpt = store.findLeaderForGroup(groupId)
-  if infoOpt.isNone:
+  ## Forward a DELETE to the leader of `groupId`. If the local node is the
+  ## leader (verified by coordinator), performs a local delete.
+  let localNodeId = store.coordinator.nodeId.uint32
+
+  # Check if we're the leader via coordinator
+  let amLeader = store.coordinator.isLeader(groupId)
+  if amLeader:
+    let deleteRes = store.raftDelete(key)
+    if not deleteRes.isOk:
+      return rsErr[Option[RaftKVEntry]](newRSE(rseInternal,
+          "local delete failed: " & $deleteRes.error))
+    return deleteRes
+
+  # We're not the leader - look up who is
+  let leaderOpt = store.findLeaderForGroup(groupId)
+  if leaderOpt.isNone:
     return rsErr[Option[RaftKVEntry]](newRSE(rseNotLeader,
         "no reachable leader for group " & $groupId.uint64))
+  let leaderNodeId = leaderOpt.get()
+
+  # If findLeaderForGroup returns our own nodeId, try local delete anyway
+  if leaderNodeId == localNodeId:
+    let deleteRes = store.raftDelete(key)
+    if deleteRes.isOk:
+      return deleteRes
+    # Local delete failed - try other group members
+    var targetNodeId: uint32 = 0
+    withLock store.groupMu:
+      let members = store.groupMembers.getOrDefault(groupId, @[])
+      for nid in members:
+        if nid != localNodeId:
+          targetNodeId = nid
+          break
+    if targetNodeId == 0:
+      return rsErr[Option[RaftKVEntry]](newRSE(rseNotLeader,
+          "no other members for group " & $groupId.uint64))
+    return forwardDeleteToLeaderRemote(store, groupId, targetNodeId, key)
+
+  # Remote delete - forward to specific node
+  return forwardDeleteToLeaderRemote(store, groupId, leaderNodeId, key)
+
+proc forwardDeleteToLeaderRemote(store: RaftKVStoreExt, groupId: GroupID,
+    targetNodeId: uint32, key: string): RSResult[Option[RaftKVEntry]] {.gcsafe,
+        raises: [].} =
+  ## Helper: forward a DELETE to a specific remote node
+  let infoOpt = store.lookupNodeInfo(targetNodeId)
+  if infoOpt.isNone:
+    return rsErr[Option[RaftKVEntry]](newRSE(rseNotLeader,
+        "no node info for leader " & $targetNodeId))
   let info = infoOpt.get()
   {.cast(raises: []).}:
     try:
@@ -1774,11 +1914,54 @@ proc forwardDeleteToLeader(store: RaftKVStoreExt, groupId: GroupID,
 
 proc forwardGetToLeader(store: RaftKVStoreExt, groupId: GroupID,
     key: string): RSResult[Option[RaftKVEntry]] {.gcsafe, raises: [].} =
-  ## Forward a GET to the leader of `groupId` via the wire protocol.
-  let infoOpt = store.findLeaderForGroup(groupId)
-  if infoOpt.isNone:
+  ## Forward a GET to the leader of `groupId`. If the local node is the
+  ## leader (verified by coordinator), performs a local read.
+  let localNodeId = store.coordinator.nodeId.uint32
+
+  # Check if we're the leader via coordinator
+  let amLeader = store.coordinator.isLeader(groupId)
+  if amLeader:
+    let getRes = store.raftGet(key)
+    if not getRes.isOk:
+      return rsErr[Option[RaftKVEntry]](getRes.error)
+    return getRes
+
+  # We're not the leader - look up who is
+  let leaderOpt = store.findLeaderForGroup(groupId)
+  if leaderOpt.isNone:
     return rsErr[Option[RaftKVEntry]](newRSE(rseNotLeader,
         "no reachable leader for group " & $groupId.uint64))
+  let leaderNodeId = leaderOpt.get()
+
+  # If findLeaderForGroup returns our own nodeId, try local read anyway
+  if leaderNodeId == localNodeId:
+    let getRes = store.raftGet(key)
+    if getRes.isOk:
+      return getRes
+    # Local read failed - try other group members
+    var targetNodeId: uint32 = 0
+    withLock store.groupMu:
+      let members = store.groupMembers.getOrDefault(groupId, @[])
+      for nid in members:
+        if nid != localNodeId:
+          targetNodeId = nid
+          break
+    if targetNodeId == 0:
+      return rsErr[Option[RaftKVEntry]](newRSE(rseNotLeader,
+          "no other members for group " & $groupId.uint64))
+    return forwardGetToLeaderRemote(store, groupId, targetNodeId, key)
+
+  # Remote read - forward to specific node
+  return forwardGetToLeaderRemote(store, groupId, leaderNodeId, key)
+
+proc forwardGetToLeaderRemote(store: RaftKVStoreExt, groupId: GroupID,
+    targetNodeId: uint32, key: string): RSResult[Option[RaftKVEntry]] {.gcsafe,
+        raises: [].} =
+  ## Helper: forward a GET to a specific remote node
+  let infoOpt = store.lookupNodeInfo(targetNodeId)
+  if infoOpt.isNone:
+    return rsErr[Option[RaftKVEntry]](newRSE(rseNotLeader,
+        "no node info for leader " & $targetNodeId))
   let info = infoOpt.get()
   {.cast(raises: []).}:
     try:
@@ -2108,11 +2291,11 @@ proc raftScanSpace*(store: RaftKVStoreExt, startKey, endKey: string,
               let (tableId, primaryKey) = decodeTableKey(k)
               let pk = if primaryKey.startsWith("d/"): primaryKey[
                   2..^1] else: primaryKey
-              let routedGid = routeToGroup(pk, space.groupIds)
+              let routedGid = routeToGroup(stripMvccSuffix(pk), space.groupIds)
               # Include if it routes to new groups OR (during rebalancing) old groups
               var matches = (routedGid == gid)
               if not matches and space.rebalancing:
-                let oldRoutedGid = routeToGroup(pk, space.oldGroupIds)
+                let oldRoutedGid = routeToGroup(stripMvccSuffix(pk), space.oldGroupIds)
                 matches = (oldRoutedGid == gid)
               if matches:
                 if k notin resultMap:
@@ -2188,11 +2371,12 @@ proc raftScanSpace*(store: RaftKVStoreExt, startKey, endKey: string,
 # Space rebalancing
 # ---------------------------------------------------------------------------
 
-proc updateSpaceRecord*(store: RaftKVStoreExt, space: SpaceInfo) {.gcsafe,
+proc updateSpaceRecord*(store: RaftKVStoreExt, space: SpaceInfo): bool {.gcsafe,
     raises: [].} =
   ## Write the space record to sys.spaces via Raft with MVCC encoding.
-  ## The in-memory cache is updated by applyBatchToSM when Raft commits the write.
+  ## Also updates the in-memory cache immediately for consistency.
   ## Uses binary encoding (SpaceRecord) for consistency with other system tables.
+  ## Returns true if the write was proposed successfully.
   let spaceKey = encodeSpaceKey(space.spaceId)
 
   # Create binary-encoded SpaceRecord
@@ -2210,7 +2394,13 @@ proc updateSpaceRecord*(store: RaftKVStoreExt, space: SpaceInfo) {.gcsafe,
     createdAtNs: 0'i64, # Not tracked in SpaceInfo
   )
   let encoded = encode(spaceRec)
+  # Update in-memory cache immediately
+  acquire(store.spacesMu)
+  store.spaces[space.spaceId] = space
+  release(store.spacesMu)
+  # Write to Raft
   discard store.sysTablePut(spaceKey, encoded)
+  result = true
 
 proc rebalanceSpaces*(store: RaftKVStoreExt) {.raises: [].} =
   ## Check all spaces and initiate rebalancing for any space whose group count
@@ -2411,7 +2601,7 @@ proc rebalanceSpaces*(store: RaftKVStoreExt) {.raises: [].} =
           rebalanceHeartbeat: 0,
           rebalanceCursor: "",
         )
-        store.updateSpaceRecord(space)
+        discard store.updateSpaceRecord(space)
       except:
         discard
 
@@ -2449,7 +2639,7 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: int) {.raises: [].} 
     let nowSecs = getTime().toUnix()
     space.rebalanceWorker = myNodeId
     space.rebalanceHeartbeat = nowSecs
-    store.updateSpaceRecord(space)
+    discard store.updateSpaceRecord(space)
     # Note: Don't call loadSpaces() here - it would read stale data from backend
     # before raftPut completes. The in-memory cache is already updated by updateSpaceRecord.
 
@@ -2515,31 +2705,30 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: int) {.raises: [].} 
           if not afterD.startsWith("d/"): continue
           let pk = afterD[2..^1]
 
-          let oldGroup = routeToGroup(pk, oldGroupIds)
-          let newGroup = routeToGroup(pk, newGroupIds)
+          let oldGroup = routeToGroup(stripMvccSuffix(pk), oldGroupIds)
+          let newGroup = routeToGroup(stripMvccSuffix(pk), newGroupIds)
 
           # Only migrate if the key moves to a different group
           if oldGroup != newGroup:
             let newRid = GroupID(newGroup)
 
-            # Write to new group via Raft for replication
+            # Forward to leader - this handles both local and remote cases
             # The data is in the shared backend, accessible by both old and new groups
-            let hasGroup = store.coordinator.hasGroup(newRid)
-            let isLeaderForNew = store.coordinator.isLeader(newRid)
-
-            if hasGroup:
-              if isLeaderForNew:
-                # This node is the leader - write locally
-                let batch = newWriteBatch()
-                batch.put(toBytes(k), toBytes(v))
-                discard proposeWrite(store, newRid, batch)
-              else:
-                # Not the leader - forward to the group leader
-                discard store.forwardPutToLeader(newRid, k, v)
-              # Note: We do NOT delete from old group here because:
-              # 1. Both groups share the same backend
-              # 2. Deleting would remove the data we just wrote
-              # 3. The old group will be removed at cutover
+            var writeResult = store.forwardPutToLeader(newRid, k, v)
+            if not writeResult.isOk:
+              # Brief pause for leader election, retry once
+              sleep(50)
+              writeResult = store.forwardPutToLeader(newRid, k, v)
+            if not writeResult.isOk:
+              # Migration failed - cannot proceed
+              debug("runRebalanceMigration: forwardPutToLeader failed",
+                  {"spaceId": $spaceId, "key": $k, "newGroup": $newRid.uint64,
+                   "error": $writeResult.error}.toTable)
+              return
+            # Note: We do NOT delete from old group here because:
+            # 1. Both groups share the same backend
+            # 2. Deleting would remove the data we just wrote
+            # 3. The old group will be removed at cutover
 
           inc keysMigrated
 
@@ -2557,7 +2746,7 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: int) {.raises: [].} 
 
             space.rebalanceCursor = k
             space.rebalanceHeartbeat = curNow
-            store.updateSpaceRecord(space)
+            discard store.updateSpaceRecord(space)
             # Note: Don't call loadSpaces() here - it would read stale data
             lastHeartbeat = curNow
         except:
@@ -2566,6 +2755,9 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: int) {.raises: [].} 
     # Phase 3: Cutover — migration complete
     # All writes are already committed (proposeWrite and forwardPutToLeader
     # are synchronous - they wait for Raft commit before returning).
+    debug("runRebalanceMigration: starting cutover", {"spaceId": $spaceId,
+        "oldGroupIds": $oldGroupIds, "newGroupIds": $newGroupIds,
+        "keysMigrated": $keysMigrated}.toTable)
 
     # Remove old group definitions from sys.groups
     # Data remains in the shared backend, accessible via new groups
@@ -2577,12 +2769,19 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: int) {.raises: [].} 
       if coord.hasGroup(oldGid):
         coord.removeGroup(oldGid)
 
-    # Clear rebalance state
+    # Clear rebalance state (in-memory cache was already updated by updateSpaceRecord)
     space.oldGroupIds = @[]
     space.rebalancing = false
     space.rebalanceWorker = 0
     space.rebalanceHeartbeat = 0
     space.rebalanceCursor = ""
-    store.updateSpaceRecord(space)
-    # The in-memory cache is updated by applyBatchToSM when Raft commits the write.
+    discard store.updateSpaceRecord(space)
+    # Verify state was updated
+    {.cast(raises: []).}:
+      {.cast(gcsafe).}:
+        debug("runRebalanceMigration: state cleared", {"spaceId": $spaceId,
+            "rebalancing": $space.rebalancing,
+            "oldGroupIds": $space.oldGroupIds}.toTable)
+    # Wait for Raft to commit the final state
+    sleep(100)
     store.loadGroupMembers()

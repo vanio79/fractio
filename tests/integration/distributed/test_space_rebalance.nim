@@ -28,6 +28,10 @@ import fractio/core/timestamp_provider
 import fractio/storage/wisckey_backend
 import fractio/storage/mvcc/types as mvccTypes
 import fractio/sql/executor
+import fractio/client/fractio_client
+import fractio/client/sql_client
+
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -37,6 +41,11 @@ const
   TMP_DIR = "/tmp/fractio_rebal_"
 
 var nextClientPort = 19100 ## incremented per node to avoid port conflicts between tests
+var testBasePort {.global.} = 28000
+
+proc nextBasePort(): int =
+  result = testBasePort
+  testBasePort += 100
 
 # ---------------------------------------------------------------------------
 # Memory monitoring
@@ -80,6 +89,7 @@ type
     store*: RaftKVStoreExt
     mvccStore*: MvccTransactionStore
     storagePath*: string
+    client*: FractioClient
 
 proc cleanDir(p: string) =
   try: removeDir(p) except CatchableError: discard
@@ -142,17 +152,29 @@ proc makeNode(nodeNum: int, basePort: int,
   let srv = newProtocolServer(cfg)
   srv.raftStore = store
   srv.raftCoord = coord
+  srv.mvccStore = mvccStore
+  srv.txnMgr = txnMgr
+
+  # Create FractioClient (will be initialized when node starts)
+  let fractioClient = newFractioClient("127.0.0.1", cPort)
 
   TestNode(
     id: nodeNum, basePort: basePort, clientPort: cPort, server: srv,
     coord: coord, store: store, mvccStore: mvccStore, storagePath: storagePath,
+    client: fractioClient,
   )
+
+proc initClient(n: var TestNode, leaderPort: int) =
+  n.client = newFractioClient("127.0.0.1", leaderPort)
+  doAssert n.client.initialize()
 
 proc startNode(n: TestNode) =
   n.server.start()
 
 proc stopNode*(n: TestNode) =
   echo "=== stopNode ", n.id, " starting ==="
+  if n.client != nil:
+    n.client.close()
   n.store.stop()
   echo "=== stopNode ", n.id, " store stopped ==="
   n.server.stop()
@@ -182,18 +204,27 @@ proc seedSysNodes(leaderStore: RaftKVStoreExt, nodes: seq[TestNode]) =
       clientPort: uint16(n.clientPort),
       status: nsAlive,
     )
-    let r = leaderStore.raftPut(key, nodeRec.encode())
-    doAssert r.isOk, "failed to seed sys.nodes for node " & $n.id
+    let r = leaderStore.sysTablePut(key, nodeRec.encode())
+    doAssert r, "failed to seed sys.nodes for node " & $n.id
 
 proc seedSysGroups(leaderStore: RaftKVStoreExt, nodeNums: seq[int]) =
+  let coord = leaderStore.coordinator
   for gid in [META_GROUP_ID, DATA_GROUP_START_ID]:
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
     var replicas: seq[GroupReplicaBin] = @[]
     for num in nodeNums:
       replicas.add(GroupReplicaBin(nodeId: uint32(num), replicaType: rtVoter))
+    # Query the coordinator for the actual leader of this group
+    var leader: uint32 = 0
+    if coord != nil:
+      for nodeId in nodeNums:
+        if coord.isLeader(gid):
+          leader = uint32(nodeId)
+          break
     let groupRec = GroupRecord(
       groupId: gid.uint64,
       replicas: replicas,
+      leader: leader,
     )
     discard leaderStore.raftPut(key, groupRec.encode())
 
@@ -240,9 +271,7 @@ proc waitForSpaceLeaders(nodes: seq[TestNode]) =
     for (key, entry) in grpScan.value:
       try:
         let data = entry.value
-        # Data is either binary or JSON (no MVCC since written via raftPut)
-        # Note: Binary encoding can start with '{' (0x7B) when groupId >= 123
-        # So we try JSON first if it starts with '{', then fall back to binary
+        # Data may have MVCC header if written through MVCC store, or be raw binary/JSON
         var gid: GroupID
         var parsed = false
 
@@ -256,7 +285,16 @@ proc waitForSpaceLeaders(nodes: seq[TestNode]) =
             discard
 
         if not parsed:
-          # Try binary decoding (GroupRecord)
+          # Try MVCC-aware binary decoding first (handles both MVCC and raw)
+          try:
+            let (groupRec, _) = decodeGroupRecordFromMVCC(data)
+            gid = GroupID(groupRec.groupId)
+            parsed = true
+          except:
+            discard
+
+        if not parsed:
+          # Fall back to raw binary decoding
           try:
             let groupRec = decodeGroupRecord(data)
             gid = GroupID(groupRec.groupId)
@@ -278,12 +316,68 @@ proc waitForSpaceLeaders(nodes: seq[TestNode]) =
           sleep(100)
       except: discard
 
-proc exec(store: RaftKVStoreExt, mvccStore: MvccTransactionStore,
-    sql: string): ExecResult =
-  executeSQL(sql, store, mvccStore, database = "default", schema = "public")
+proc updateGroupLeaders(nodes: seq[TestNode]) =
+  ## Update sys.groups with actual leader info from the coordinator.
+  ## This is needed because onLeaderChanged only persists if the node is meta leader.
+  let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
+  if leaderIdx < 0: return
+  let leaderStore = nodes[leaderIdx].store
 
-proc exec(node: TestNode, sql: string): ExecResult =
-  exec(node.store, node.mvccStore, sql)
+  let grpStart = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
+  let grpEnd = encodeTableKey(SYS_GROUPS_TABLE_ID + 1, "")
+  let grpScan = leaderStore.raftScan(grpStart, grpEnd, 0,
+      includeSystemKeys = true)
+  if grpScan.isOk:
+    for (key, entry) in grpScan.value:
+      try:
+        let data = entry.value
+        var gid: GroupID
+        var groupRec: GroupRecord
+        var parsed = false
+
+        # Try MVCC-aware binary decoding first
+        try:
+          let (rec, _) = decodeGroupRecordFromMVCC(data)
+          groupRec = rec
+          gid = GroupID(groupRec.groupId)
+          parsed = true
+        except:
+          discard
+
+        if not parsed:
+          # Try raw binary decoding
+          try:
+            groupRec = decodeGroupRecord(data)
+            gid = GroupID(groupRec.groupId)
+            parsed = true
+          except:
+            discard
+
+        if not parsed:
+          continue
+
+        # Skip meta and default data groups
+        if gid == META_GROUP_ID or gid == DATA_GROUP_START_ID:
+          continue
+
+        # Find the actual leader from the coordinator
+        var actualLeader: uint32 = 0
+        for node in nodes:
+          if node.coord.isLeader(gid):
+            actualLeader = uint32(node.id)
+            break
+
+        # Update the group record if leader differs
+        if actualLeader != 0 and groupRec.leader != actualLeader:
+          groupRec.leader = actualLeader
+          let encoded = encode(groupRec)
+          discard leaderStore.sysTablePut(key, encoded)
+      except:
+        discard
+
+proc exec(node: TestNode, sql: string, database = "default",
+    schema = "public"): ExecResult =
+  node.client.query(sql, database, schema)
 
 # ---------------------------------------------------------------------------
 # Cluster fixtures
@@ -291,9 +385,11 @@ proc exec(node: TestNode, sql: string): ExecResult =
 
 proc makeCluster2(): seq[TestNode] =
   ## 2-node cluster.
+  let p1 = nextBasePort()
+  let p2 = nextBasePort()
   let members = @[
-    (nodeId: 1'u32, host: "127.0.0.1", basePort: 28000),
-    (nodeId: 2'u32, host: "127.0.0.1", basePort: 29000),
+    (nodeId: 1'u32, host: "127.0.0.1", basePort: p1),
+    (nodeId: 2'u32, host: "127.0.0.1", basePort: p2),
   ]
 
   var nodes: seq[TestNode]
@@ -312,12 +408,17 @@ proc makeCluster2(): seq[TestNode] =
   seedSysGroups(nodes[leaderIdx].store, allNums)
   seedDefaults(nodes[leaderIdx].store)
   sleep(400)
+  for i in 0 ..< nodes.len: initClient(nodes[i], nodes[leaderIdx].clientPort)
 
   # Load space caches
   for n in nodes:
     n.store.loadSpaces()
     n.store.loadTableSpaces()
     n.store.loadGroupMembers()
+
+  # Refresh client metadata after seeding system tables
+  for n in nodes:
+    discard n.client.refreshMetadata()
 
   nodes
 
@@ -401,6 +502,10 @@ proc addNodeToCluster(nodes: var seq[TestNode], newNodeNum: int) =
     doAssert waitForNodeInSysNodes(nodes[leaderIdx].store, newNodeNum),
       "Node " & $newNodeNum & " did not appear in sys.nodes within timeout"
 
+  # Refresh all clients' metadata after adding new node
+  for n in nodes:
+    discard n.client.refreshMetadata()
+
 proc stopCluster(nodes: seq[TestNode]) =
   # Log group counts before shutdown
   var totalGroups = 0
@@ -444,20 +549,18 @@ proc findSpaceGroupIds(leaderStore: RaftKVStoreExt, spaceId: int): seq[uint64] =
   result = leaderStore.spaces[spaceId].groupIds
   release(leaderStore.spacesMu)
 
-proc createSpace(leaderStore: RaftKVStoreExt,
-    leaderMvccStore: MvccTransactionStore,
-    spaceName: string, replicas: int): int =
-  let csRes = exec(leaderStore, leaderMvccStore,
+proc createSpace(leaderNode: TestNode, spaceName: string, replicas: int): int =
+  let csRes = exec(leaderNode,
     "CREATE SPACE " & spaceName & " WITH REPLICAS = " & $replicas)
   doAssert csRes.kind == erkOk, "CREATE SPACE failed: " &
     (if csRes.kind == erkError: csRes.error else: "unknown")
 
-  let ctRes = exec(leaderStore, leaderMvccStore,
+  let ctRes = exec(leaderNode,
     "CREATE TABLE " & spaceName & "_t (id INT PRIMARY KEY, val TEXT) IN SPACE " & spaceName)
   doAssert ctRes.kind == erkOk, "CREATE TABLE failed: " &
     (if ctRes.kind == erkError: ctRes.error else: "unknown")
 
-  findSpaceId(leaderStore, leaderMvccStore, spaceName)
+  findSpaceId(leaderNode.store, leaderNode.mvccStore, spaceName)
 
 proc execOnLeader(nodes: seq[TestNode], sql: string): ExecResult =
   for node in nodes:
@@ -494,15 +597,19 @@ proc setupSpaceWithData(nodes: seq[TestNode], spaceName: string,
   ## Full setup: create space, distribute groups, elect leaders, insert data.
   let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
   doAssert leaderIdx >= 0
-  let leaderStore = nodes[leaderIdx].store
-  let leaderMvccStore = nodes[leaderIdx].mvccStore
+  let leaderNode = nodes[leaderIdx]
 
-  let spaceId = createSpace(leaderStore, leaderMvccStore, spaceName, replicas)
-  let gids = findSpaceGroupIds(leaderStore, spaceId)
+  let spaceId = createSpace(leaderNode, spaceName, replicas)
+  let gids = findSpaceGroupIds(leaderNode.store, spaceId)
 
   waitForAutoDistribution(nodes, gids, replicas)
   waitForSpaceLeaders(nodes)
+  updateGroupLeaders(nodes) # Update sys.groups with actual leaders
   replicateMetadata(nodes)
+
+  # Refresh all clients' metadata to pick up new groups
+  for n in nodes:
+    discard n.client.refreshMetadata()
 
   insertRows(nodes, spaceName, rowCount)
   spaceId
@@ -607,11 +714,10 @@ suite "Space rebalance integration — reads during migration":
     let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
     let leaderNode = nodes[leaderIdx]
     let leaderStore = leaderNode.store
-    let leaderMvccStore = leaderNode.mvccStore
     let spaceId = setupSpaceWithData(nodes, "items", 2, 20)
 
     # Verify all rows readable before rebalance
-    let sel1 = exec(leaderStore, leaderMvccStore, "SELECT * FROM items_t")
+    let sel1 = exec(leaderNode, "SELECT * FROM items_t")
     check sel1.kind == erkRows
     check sel1.rows.len == 20
 
@@ -629,7 +735,7 @@ suite "Space rebalance integration — reads during migration":
     replicateMetadata(nodes)
 
     # All 20 rows still readable (dual-read fallback to old groups)
-    let sel2 = exec(leaderStore, leaderMvccStore, "SELECT * FROM items_t")
+    let sel2 = exec(leaderNode, "SELECT * FROM items_t")
     check sel2.kind == erkRows
     check sel2.rows.len == 20
 
@@ -653,6 +759,7 @@ suite "Space rebalance integration — reads during migration":
 
     for i in 1 .. 10:
       let sel = execOnLeader(nodes, "SELECT * FROM users_t WHERE id = " & $i)
+      if sel.kind != erkRows: echo "DEBUG: SELECT failed: ", sel.error
       check sel.kind == erkRows
       if sel.kind == erkRows:
         check sel.rows.len == 1
@@ -666,7 +773,7 @@ proc triggerRebalanceAndSetup(nodes: var seq[TestNode],
     leaderStore: RaftKVStoreExt, spaceId: int) =
   addNodeToCluster(nodes, 3)
   leaderStore.rebalanceSpaces()
-  sleep(500) # Wait for Raft to replicate
+  sleep(1000) # Wait longer for Raft to replicate
   leaderStore.loadSpaces() # Reload cache after rebalance
 
   acquire(leaderStore.spacesMu)
@@ -675,6 +782,12 @@ proc triggerRebalanceAndSetup(nodes: var seq[TestNode],
 
   waitForAutoDistribution(nodes, newGids, 2, 5000)
   waitForSpaceLeaders(nodes)
+  # Refresh metadata with retries
+  for n in nodes:
+    for i in 0..<3:
+      if n.client.refreshMetadata():
+        break
+      sleep(100)
   replicateMetadata(nodes)
 
 suite "Space rebalance integration — full migration":
@@ -697,9 +810,10 @@ suite "Space rebalance integration — full migration":
 
     # Run migration
     leaderStore.runRebalanceMigration(spaceId)
-    leaderStore.loadSpaces()
+    # Wait for Raft to commit migration state changes
+    sleep(500)
 
-    # Verify rebalance is complete
+    # Verify rebalance is complete - check in-memory cache directly
     acquire(leaderStore.spacesMu)
     sp = leaderStore.spaces[spaceId]
     release(leaderStore.spacesMu)
@@ -707,8 +821,16 @@ suite "Space rebalance integration — full migration":
     check sp.oldGroupIds.len == 0
     check sp.rebalanceWorker == 0
 
+    # Reload from backend to verify persistence
+    leaderStore.loadSpaces()
+    acquire(leaderStore.spacesMu)
+    sp = leaderStore.spaces[spaceId]
+    release(leaderStore.spacesMu)
+    check sp.rebalancing == false
+    check sp.oldGroupIds.len == 0
+
     # All data still accessible
-    let sel = exec(leaderStore, leaderMvccStore, "SELECT * FROM migrate_t")
+    let sel = exec(leaderNode, "SELECT * FROM migrate_t")
     check sel.kind == erkRows
     check sel.rows.len == 30
 
@@ -737,8 +859,10 @@ suite "Space rebalance integration — full migration":
         if foundLeader: break
         sleep(100)
 
+    for n in nodes: discard n.client.refreshMetadata()
     for i in 1 .. 20:
       let sel = execOnLeader(nodes, "SELECT * FROM fullmig_t WHERE id = " & $i)
+      if sel.kind != erkRows: echo "DEBUG: SELECT failed: ", sel.error
       check sel.kind == erkRows
       if sel.kind == erkRows:
         check sel.rows.len == 1
@@ -768,6 +892,8 @@ suite "Space rebalance integration — full migration":
     replicateMetadata(nodes)
 
     leaderStore.runRebalanceMigration(spaceId)
+    # Wait for Raft to commit the group deletions
+    sleep(500)
 
     # Old groups should be removed from sys.groups
     for oldGid in oldGids:
@@ -817,7 +943,6 @@ suite "Space rebalance integration — crash safety":
     let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
     let leaderNode = nodes[leaderIdx]
     let leaderStore = leaderNode.store
-    let leaderMvccStore = leaderNode.mvccStore
     let spaceId = setupSpaceWithData(nodes, "idem", 2, 10)
     triggerRebalanceAndSetup(nodes, leaderStore, spaceId)
 
@@ -837,14 +962,18 @@ suite "Space rebalance integration — crash safety":
 
     leaderStore.loadGroupMembers()
 
+    for n in nodes: discard n.client.refreshMetadata()
+
     # All data accessible
-    let sel1 = exec(leaderStore, leaderMvccStore, "SELECT * FROM idem_t")
+    let sel1 = exec(leaderNode, "SELECT * FROM idem_t")
+    if sel1.kind != erkRows: echo "DEBUG: SELECT 1 failed: ", sel1.error
     check sel1.kind == erkRows
     check sel1.rows.len == 10
 
     # Re-run — should be a no-op (not rebalancing anymore)
     leaderStore.runRebalanceMigration(spaceId)
 
-    let sel2 = exec(leaderStore, leaderMvccStore, "SELECT * FROM idem_t")
+    let sel2 = exec(leaderNode, "SELECT * FROM idem_t")
+    if sel2.kind != erkRows: echo "DEBUG: SELECT 2 failed: ", sel2.error
     check sel2.kind == erkRows
     check sel2.rows.len == 10

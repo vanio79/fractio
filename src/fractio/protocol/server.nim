@@ -732,7 +732,7 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
                   server.mvccStore.txnGet(req.txnId, req.key)
                 else:
                   server.mvccStore.latestGet(req.key)
-      
+
       if res.isOk:
         if res.value.isSome:
           resp = GetResponse(
@@ -752,6 +752,26 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
       sendError(conn, requestId, ErrInternal, ErrCatKV, "MVCC store not initialized")
       return
     sendFrame(conn, encodeGetResponse(resp), requestId)
+
+  of uint16(mtRawPut):
+    let reqR = decodePutRequest(payload)
+    if reqR.isErr:
+      sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
+      return
+    let req = reqR.value
+    if req.key.len == 0 or req.key.len > int(server.config.maxKeyBytes):
+      sendError(conn, requestId, ErrProtocol, ErrCatKV, "invalid key length")
+      return
+    
+    let writeRes = raftPutInGroup(server.raftStore, req.key, req.value, GroupID(req.groupId))
+    if writeRes.isOk:
+      sendFrame(conn, encodePutResponse(PutResponse(
+        status: PutStatusOK, timestamp: 0, version: 1)), requestId)
+    else:
+      if writeRes.error.kind == rseNotLeader:
+        sendError(conn, requestId, ErrNotLeader, ErrCatKV, $writeRes.error)
+      else:
+        sendError(conn, requestId, ErrInternal, ErrCatKV, $writeRes.error)
 
   of uint16(mtPut):
     discard server.metrics.kvPuts.fetchAdd(1)
@@ -774,16 +794,29 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
           sendFrame(conn, encodePutResponse(PutResponse(
             status: PutStatusOK, timestamp: 0, version: 1)), requestId)
         else:
-          sendError(conn, requestId, ErrInternal, ErrCatKV, res.error.msg)
+          # Check for "not leader" error and return appropriate error code
+          if res.error.msg.contains("not the leader") or
+             res.error.msg.contains("Not the leader") or
+             res.error.msg.contains("Raft append failed (code -3)"):
+            sendError(conn, requestId, ErrNotLeader, ErrCatKV, res.error.msg)
+          else:
+            sendError(conn, requestId, ErrInternal, ErrCatKV, res.error.msg)
       else:
-        let res = server.mvccStore.withAutoTransaction(proc(sid: uint64): MvccVoidResult =
+        let res = server.mvccStore.withAutoTransaction(proc(
+            sid: uint64): MvccVoidResult =
           server.mvccStore.txnPut(sid, req.key, req.value)
         )
         if res.isOk:
           sendFrame(conn, encodePutResponse(PutResponse(
             status: PutStatusOK, timestamp: 0, version: 1)), requestId)
         else:
-          sendError(conn, requestId, ErrInternal, ErrCatKV, res.error.msg)
+          # Check for "not leader" error and return appropriate error code
+          if res.error.msg.contains("not the leader") or
+             res.error.msg.contains("Not the leader") or
+             res.error.msg.contains("Raft append failed (code -3)"):
+            sendError(conn, requestId, ErrNotLeader, ErrCatKV, res.error.msg)
+          else:
+            sendError(conn, requestId, ErrInternal, ErrCatKV, res.error.msg)
     else:
       sendError(conn, requestId, ErrInternal, ErrCatKV, "MVCC store not initialized")
 
@@ -805,16 +838,25 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
           sendFrame(conn, encodeDeleteResponse(DeleteResponse(
             status: DelStatusDeleted)), requestId)
         else:
-          sendError(conn, requestId, ErrInternal, ErrCatKV, res.error.msg)
+          # Check for "not leader" error and return appropriate error code
+          if res.error.msg.contains("not the leader") or res.error.msg.contains("Not the leader"):
+            sendError(conn, requestId, ErrNotLeader, ErrCatKV, res.error.msg)
+          else:
+            sendError(conn, requestId, ErrInternal, ErrCatKV, res.error.msg)
       else:
-        let res = server.mvccStore.withAutoTransaction(proc(sid: uint64): MvccVoidResult =
+        let res = server.mvccStore.withAutoTransaction(proc(
+            sid: uint64): MvccVoidResult =
           server.mvccStore.txnDelete(sid, req.key)
         )
         if res.isOk:
           sendFrame(conn, encodeDeleteResponse(DeleteResponse(
             status: DelStatusDeleted)), requestId)
         else:
-          sendError(conn, requestId, ErrInternal, ErrCatKV, res.error.msg)
+          # Check for "not leader" error and return appropriate error code
+          if res.error.msg.contains("not the leader") or res.error.msg.contains("Not the leader"):
+            sendError(conn, requestId, ErrNotLeader, ErrCatKV, res.error.msg)
+          else:
+            sendError(conn, requestId, ErrInternal, ErrCatKV, res.error.msg)
     else:
       sendError(conn, requestId, ErrInternal, ErrCatKV, "MVCC store not initialized")
 
@@ -829,14 +871,16 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
       return
 
     # Use an auto-transaction for the whole batch
-    let res = server.mvccStore.withAutoTransactionResult(proc(sid: uint64): MvccResult[seq[BatchOpResult]] =
+    let res = server.mvccStore.withAutoTransactionResult(proc(
+        sid: uint64): MvccResult[seq[BatchOpResult]] =
       var opsResults = newSeq[BatchOpResult](req.operations.len)
       for i, op in req.operations:
         case op.kind
         of BatchOpGet:
           var dpos = 0
           let keyR = protoCodec.readBytes(op.data, dpos)
-          if keyR.isErr: return mvccErr[seq[BatchOpResult]](MvccStoreError(msg: "invalid key in batch"))
+          if keyR.isErr: return mvccErr[seq[BatchOpResult]](MvccStoreError(
+              msg: "invalid key in batch"))
           let getRes = server.mvccStore.txnGet(sid, keyR.value)
           if getRes.isOk and getRes.value.isSome:
             var rdata = ""
@@ -847,15 +891,18 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
         of BatchOpPut:
           var dpos = 0
           let keyR = protoCodec.readBytes(op.data, dpos)
-          if keyR.isErr: return mvccErr[seq[BatchOpResult]](MvccStoreError(msg: "invalid key in batch"))
+          if keyR.isErr: return mvccErr[seq[BatchOpResult]](MvccStoreError(
+              msg: "invalid key in batch"))
           let valR = protoCodec.readBytes(op.data, dpos)
-          if valR.isErr: return mvccErr[seq[BatchOpResult]](MvccStoreError(msg: "invalid val in batch"))
+          if valR.isErr: return mvccErr[seq[BatchOpResult]](MvccStoreError(
+              msg: "invalid val in batch"))
           discard server.mvccStore.txnPut(sid, keyR.value, valR.value)
           opsResults[i] = BatchOpResult(status: 0x00'u8, data: "")
         of BatchOpDelete:
           var dpos = 0
           let keyR = protoCodec.readBytes(op.data, dpos)
-          if keyR.isErr: return mvccErr[seq[BatchOpResult]](MvccStoreError(msg: "invalid key in batch"))
+          if keyR.isErr: return mvccErr[seq[BatchOpResult]](MvccStoreError(
+              msg: "invalid key in batch"))
           discard server.mvccStore.txnDelete(sid, keyR.value)
           opsResults[i] = BatchOpResult(status: 0x00'u8, data: "")
         else:
@@ -881,7 +928,7 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
                   server.mvccStore.txnScan(req.txnId, req.startKey, req.endKey, req.limit)
                 else:
                   server.mvccStore.latestScan(req.startKey, req.endKey, req.limit)
-      
+
       if res.isOk:
         var scanPairs = newSeq[ScanPair](res.value.len)
         for i, p in res.value:
@@ -925,7 +972,7 @@ proc handleBuiltinTxn(server: ProtocolServer, conn: ClientConnection,
       sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
       return
     let req = reqR.value
-    
+
     if not server.mvccStore.isNil:
       # Use MVCC store to manage the transaction session
       let sessionId = server.mvccStore.createSession()
@@ -933,9 +980,9 @@ proc handleBuiltinTxn(server: ProtocolServer, conn: ClientConnection,
       if res.isOk:
         # Register in txnMgr as well so recordRead/recordWrite can work if needed
         # We use sessionId as the transaction ID for simplicity.
-        discard server.txnMgr.beginTransaction(req.flags, 300_000'u32, 
+        discard server.txnMgr.beginTransaction(req.flags, 300_000'u32,
                                               forcedId = some(sessionId))
-        
+
         let resp = txnMsgs.BeginTxnResponse(
           txnId: sessionId,
           readTimestamp: uint64(res.value),
@@ -960,12 +1007,12 @@ proc handleBuiltinTxn(server: ProtocolServer, conn: ClientConnection,
       sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
       return
     let txnId = reqR.value.txnId
-    
+
     if not server.mvccStore.isNil:
       let res = server.mvccStore.commitTransaction(txnId)
       # Also update txnMgr state for this txnId
       discard server.txnMgr.commitTransaction(txnId)
-      
+
       if res.isOk:
         discard server.metrics.committedTxns.fetchAdd(1)
         sendFrame(conn, txnMsgs.encodeCommitTxnResponse(
@@ -990,7 +1037,7 @@ proc handleBuiltinTxn(server: ProtocolServer, conn: ClientConnection,
       sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
       return
     let txnId = reqR.value.txnId
-    
+
     if not server.mvccStore.isNil:
       discard server.mvccStore.rollbackTransaction(txnId)
       discard server.txnMgr.rollbackTransaction(txnId)
