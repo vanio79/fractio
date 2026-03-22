@@ -15,10 +15,26 @@ import fractio/protocol/types
 import fractio/protocol/server
 import fractio/protocol/client
 import fractio/protocol/messages/admin as adminMsgs
+import fractio/protocol/mvcc_store
+import fractio/protocol/txn_manager
+import fractio/protocol/raft_store
+import fractio/distributed/raft/nuraft_coordinator
+import fractio/distributed/raft/group_types as rangeTypes
+import fractio/distributed/raft/multigroup_types
+import fractio/distributed/meta/system_tables
+import fractio/distributed/sharedtimer/mock
+import fractio/distributed/sharedtimer/types as timerTypes
+import fractio/core/timestamp_provider
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+var testBasePort {.global.} = 20050
+
+proc nextRaftPort(): int =
+  result = testBasePort
+  testBasePort += 10
 
 proc startAdminServer(port: int, clusterName: string = "test-cluster",
     version: string = "1.0.0"): ProtocolServer =
@@ -30,8 +46,52 @@ proc startAdminServer(port: int, clusterName: string = "test-cluster",
   cfg.serverVersion = version
   cfg.serverName = "fractio-test"
   result = newProtocolServer(cfg)
+
+  # Set up MVCC store for KV operations (requires single-node Raft)
+  let storagePath = "/tmp/fractio_admin_test_" & $port
+  try: removeDir(storagePath) except CatchableError: discard
+  createDir(storagePath)
+
+  let nodeId = rangeTypes.NodeID(1)
+  let raftPort = nextRaftPort()
+  let members = @[(nodeId: 1'u32, host: "127.0.0.1", basePort: raftPort)]
+
+  let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
+    nodeId: nodeId,
+    basePort: raftPort,
+    host: "127.0.0.1",
+    dataDir: storagePath,
+    electionTimeoutLowerMs: 200,
+    electionTimeoutUpperMs: 400,
+    heartbeatIntervalMs: 100,
+  ))
+  coord.start()
+
+  # Create meta + data groups
+  for gid in [META_GROUP_ID, DATA_GROUP_START_ID]:
+    discard coord.createAndStartGroup(gid, members)
+
+  # Wait for leader election
+  for attempt in 0 ..< 30:
+    if coord.isLeader(META_GROUP_ID):
+      break
+    sleep(100)
+
+  let raftStore = newRaftKVStoreExt(coord, proposeTimeoutMs = 2000)
+  raftStore.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
+
+  let txnMgr = newTransactionManager()
+  let mockTimer = MockTimeProvider(currentTime: timerTypes.Timestamp(1_000_000_000))
+  let tsProvider = newTimestampProvider(mockTimer, nodeId.uint16)
+  let mvccStore = newMvccTransactionStore(raftStore, txnMgr, tsProvider)
+
+  result.raftStore = raftStore
+  result.raftCoord = coord
+  result.mvccStore = mvccStore
+  result.txnMgr = txnMgr
+
   result.start()
-  sleep(60)
+  sleep(100)
 
 proc connectAdmin(port: int): ProtocolClient =
   var cfg = defaultClientConfig("127.0.0.1", port)
@@ -285,11 +345,11 @@ suite "admin e2e - ServerInfo":
       check r.isOk
       check r.value.clientCount >= 1
 
-  test "serverInfo shardCount is 1 in Phase 4":
+  test "serverInfo shardCount is 2 with meta and data groups":
     withAdminServer(20003) do (srv: ProtocolServer, cli: ProtocolClient):
       let r = cli.serverInfo()
       check r.isOk
-      check r.value.shardCount == 1
+      check r.value.shardCount == 2 # META_GROUP_ID + DATA_GROUP_START_ID
 
   test "serverInfo custom version string":
     var cfg = defaultServerConfig()
