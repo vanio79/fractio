@@ -15,10 +15,26 @@ import fractio/protocol/server
 import fractio/protocol/client
 import fractio/protocol/router
 import fractio/protocol/messages/kv
+import fractio/protocol/mvcc_store
+import fractio/protocol/txn_manager
+import fractio/protocol/raft_store
+import fractio/distributed/raft/nuraft_coordinator
+import fractio/distributed/raft/group_types as rangeTypes
+import fractio/distributed/raft/multigroup_types
+import fractio/distributed/meta/system_tables
+import fractio/distributed/sharedtimer/mock
+import fractio/distributed/sharedtimer/types as timerTypes
+import fractio/core/timestamp_provider
 
 # ---------------------------------------------------------------------------
 # Helpers (mirrors test_core.nim conventions)
 # ---------------------------------------------------------------------------
+
+var testBasePort {.global.} = 19900
+
+proc nextRaftPort(): int =
+  result = testBasePort
+  testBasePort += 10
 
 proc startTestServer(port: int): ProtocolServer =
   var cfg = defaultServerConfig()
@@ -26,8 +42,52 @@ proc startTestServer(port: int): ProtocolServer =
   cfg.port = port
   cfg.idleTimeoutSecs = 120
   result = newProtocolServer(cfg)
+
+  # Set up MVCC store for KV operations (requires single-node Raft)
+  let storagePath = "/tmp/fractio_kv_test_" & $port
+  try: removeDir(storagePath) except CatchableError: discard
+  createDir(storagePath)
+
+  let nodeId = rangeTypes.NodeID(1)
+  let raftPort = nextRaftPort()
+  let members = @[(nodeId: 1'u32, host: "127.0.0.1", basePort: raftPort)]
+
+  let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
+    nodeId: nodeId,
+    basePort: raftPort,
+    host: "127.0.0.1",
+    dataDir: storagePath,
+    electionTimeoutLowerMs: 200,
+    electionTimeoutUpperMs: 400,
+    heartbeatIntervalMs: 100,
+  ))
+  coord.start()
+
+  # Create meta + data groups
+  for gid in [META_GROUP_ID, DATA_GROUP_START_ID]:
+    discard coord.createAndStartGroup(gid, members)
+
+  # Wait for leader election
+  for attempt in 0 ..< 30:
+    if coord.isLeader(META_GROUP_ID):
+      break
+    sleep(100)
+
+  let raftStore = newRaftKVStoreExt(coord, proposeTimeoutMs = 2000)
+  raftStore.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
+
+  let txnMgr = newTransactionManager()
+  let mockTimer = MockTimeProvider(currentTime: timerTypes.Timestamp(1_000_000_000))
+  let tsProvider = newTimestampProvider(mockTimer, nodeId.uint16)
+  let mvccStore = newMvccTransactionStore(raftStore, txnMgr, tsProvider)
+
+  result.raftStore = raftStore
+  result.raftCoord = coord
+  result.mvccStore = mvccStore
+  result.txnMgr = txnMgr
+
   result.start()
-  sleep(60)
+  sleep(100)
 
 proc connectTestClient(port: int): ProtocolClient =
   var cfg = defaultClientConfig("127.0.0.1", port)
