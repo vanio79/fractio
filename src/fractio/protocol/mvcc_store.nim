@@ -14,6 +14,7 @@ import ../core/timestamp_provider
 import ../storage/mvcc/types as mvccTypes
 import ./raft_store
 import ./txn_manager
+import ./messages/kv
 import ../distributed/sharedtimer/timeprovider as tp
 import ../utils/logging
 
@@ -56,6 +57,29 @@ proc mvccVOk*(): MvccVoidResult = MvccVoidResult(isOk: true)
 proc mvccVErr*(e: MvccStoreError): MvccVoidResult = MvccVoidResult(isOk: false, error: e)
 
 # ---------------------------------------------------------------------------
+# Value with metadata (for KV operations)
+# ---------------------------------------------------------------------------
+
+type
+  MvccValueWithMeta* = object
+    ## Value with MVCC metadata for KV operations
+    value*: string
+    timestamp*: uint64
+    version*: uint64 ## Version counter for CAS operations
+
+  MvccPutResult* = object
+    ## Result of a put operation with metadata
+    status*: uint8 ## PutStatusOK, PutStatusCASFailed, etc.
+    timestamp*: uint64
+    version*: uint64
+    previousValue*: Option[string]
+
+  MvccDeleteResult* = object
+    ## Result of a delete operation with metadata
+    found*: bool
+    previousValue*: Option[string]
+
+# ---------------------------------------------------------------------------
 # Session transaction state
 # ---------------------------------------------------------------------------
 
@@ -78,6 +102,9 @@ type
     sessionsMu*: Lock
     logger*: Logger
     nextSessionId*: Atomic[uint64]
+    # Version tracking for CAS operations
+    keyVersions*: tables.Table[string, uint64]
+    keyVersionsMu*: Lock
 
 # ---------------------------------------------------------------------------
 # Key encoding helpers
@@ -136,9 +163,11 @@ proc newMvccTransactionStore*(raftStore: RaftKVStoreExt,
     txnManager: txnManager,
     tsProvider: tsProvider,
     sessions: initTable[uint64, SessionTxnState](),
+    keyVersions: initTable[string, uint64](),
     logger: newLogger("protocol.mvcc_store"),
   )
   initLock(result.sessionsMu)
+  initLock(result.keyVersionsMu)
   result.nextSessionId.store(1)
 
 # ---------------------------------------------------------------------------
@@ -233,7 +262,8 @@ proc commitTransaction*(store: MvccTransactionStore,
           # Requirement 6: Also put to primary key
           discard store.raftStore.raftPut(key, tombstone)
         else:
-          let committedValue = mvccTypes.encodeMVCCValue(entry.value, commitTs, false, state.txn.id)
+          let committedValue = mvccTypes.encodeMVCCValue(entry.value, commitTs,
+              false, state.txn.id)
           discard store.raftStore.raftPut(versionKey, committedValue)
           # Requirement 6: Also put to primary key
           discard store.raftStore.raftPut(key, committedValue)
@@ -288,7 +318,8 @@ proc rollbackTransaction*(store: MvccTransactionStore,
     return mvccVOk()
 
 proc getTransactionStatus*(store: MvccTransactionStore,
-    sessionId: uint64): MvccResult[mvccTypes.MVCCTransactionStatus] {.gcsafe, raises: [].} =
+    sessionId: uint64): MvccResult[mvccTypes.MVCCTransactionStatus] {.gcsafe,
+        raises: [].} =
   withLock store.sessionsMu:
     let state = store.sessions.getOrDefault(sessionId)
     if state.isNil:
@@ -526,7 +557,8 @@ proc txnPut*(store: MvccTransactionStore, sessionId: uint64,
         kind: mseTransactionNotActive, msg: "Failed to record write"))
 
     let intentKey = encodeIntentKey(key, state.txn.id)
-    let intentValue = mvccTypes.encodeMVCCValue(value, state.txn.startTimestamp, false, state.txn.id)
+    let intentValue = mvccTypes.encodeMVCCValue(value, state.txn.startTimestamp,
+        false, state.txn.id)
 
     let putRes = store.raftStore.raftPut(intentKey, intentValue)
     if not putRes.isOk:
@@ -560,7 +592,8 @@ proc txnDelete*(store: MvccTransactionStore, sessionId: uint64,
         kind: mseTransactionNotActive, msg: "Failed to record write"))
 
     let intentKey = encodeIntentKey(key, state.txn.id)
-    let intentValue = mvccTypes.encodeMVCCValue("", state.txn.startTimestamp, true, state.txn.id)
+    let intentValue = mvccTypes.encodeMVCCValue("", state.txn.startTimestamp,
+        true, state.txn.id)
 
     let putRes = store.raftStore.raftPut(intentKey, intentValue)
     if not putRes.isOk:
@@ -629,7 +662,8 @@ proc txnScan*(store: MvccTransactionStore, sessionId: uint64,
           try:
             let mvccVal = mvccTypes.decodeMVCCValue(entry.value)
             if mvccVal.timestamp <= readTs:
-              keyVersions[k] = (mvccVal.data, mvccVal.isDeleted, mvccVal.timestamp)
+              keyVersions[k] = (mvccVal.data, mvccVal.isDeleted,
+                  mvccVal.timestamp)
           except:
             keyVersions[k] = (entry.value, false, coreTypes.Timestamp(0))
         else:
@@ -682,15 +716,16 @@ proc snapshotGet*(store: MvccTransactionStore,
 
   # Also scan for versioned keys
   let versionPrefix = key & mvccTypes.VERSION_SEPARATOR
-  let scanRes = store.raftStore.raftScan(versionPrefix, key & "\x00\x01", 100'u32,
-      includeSystemKeys = true)
-  
+  let scanRes = store.raftStore.raftScan(versionPrefix, key & "\x00\x01",
+      100'u32, includeSystemKeys = true)
+
   if not scanRes.isOk:
     if nonMvccValue.isSome: return mvccOk(nonMvccValue)
     return mvccErr[Option[string]](MvccStoreError(
       kind: mseStorageError, msg: "Scan failed"))
 
-  var latestVersion: tuple[ts: Timestamp, value: string, isDeleted: bool] = (Timestamp(0), "", false)
+  var latestVersion: tuple[ts: Timestamp, value: string, isDeleted: bool] = (
+    Timestamp(0), "", false)
   var foundVersion = false
 
   for (k, entry) in scanRes.value:
@@ -698,9 +733,11 @@ proc snapshotGet*(store: MvccTransactionStore,
     if isVersionKey(k):
       try:
         let decodedKey = decodeVersionKey(k)
-        if decodedKey.timestamp <= readTs and decodedKey.timestamp >= latestVersion.ts:
+        if decodedKey.timestamp <= readTs and decodedKey.timestamp >=
+            latestVersion.ts:
           let mvccVal = mvccTypes.decodeMVCCValue(entry.value)
-          latestVersion = (decodedKey.timestamp, mvccVal.data, mvccVal.isDeleted)
+          latestVersion = (decodedKey.timestamp, mvccVal.data,
+              mvccVal.isDeleted)
           foundVersion = true
       except: discard
 
@@ -716,8 +753,10 @@ proc snapshotScan*(store: MvccTransactionStore,
     gcsafe, raises: [].} =
   ## Lightweight scan at a specific timestamp without transaction overhead.
   ## Optimized for single-statement SELECT/SCAN queries.
-  let scanRes = store.raftStore.raftScan(startKey, endKey, limit,
-      includeSystemKeys = true)
+  ## Note: We scan without limit at the storage layer because MVCC keys can
+  ## have multiple versions per user key. We apply the limit after deduplication.
+  let scanRes = store.raftStore.raftScan(startKey, endKey, 0, # no limit at storage level
+    includeSystemKeys = true)
   if not scanRes.isOk:
     return mvccErr[seq[tuple[key: string, value: string]]](MvccStoreError(
       kind: mseStorageError, msg: "Scan failed"))
@@ -734,7 +773,8 @@ proc snapshotScan*(store: MvccTransactionStore,
         let decoded = decodeVersionKey(k)
         if decoded.timestamp <= readTs:
           let mvccVal = mvccTypes.decodeMVCCValue(entry.value)
-          if not keyVersions.hasKey(decoded.userKey) or decoded.timestamp > keyVersions[decoded.userKey].timestamp:
+          if not keyVersions.hasKey(decoded.userKey) or decoded.timestamp >
+              keyVersions[decoded.userKey].timestamp:
             keyVersions[decoded.userKey] = (mvccVal.data, mvccVal.isDeleted,
                 decoded.timestamp)
       except:
@@ -749,7 +789,8 @@ proc snapshotScan*(store: MvccTransactionStore,
         try:
           let mvccVal = mvccTypes.decodeMVCCValue(entry.value)
           if mvccVal.timestamp <= readTs:
-            keyVersions[k] = (mvccVal.data, mvccVal.isDeleted, mvccVal.timestamp)
+            keyVersions[k] = (mvccVal.data, mvccVal.isDeleted,
+                mvccVal.timestamp)
         except:
           keyVersions[k] = (entry.value, false, coreTypes.Timestamp(0))
       else:
@@ -761,7 +802,7 @@ proc snapshotScan*(store: MvccTransactionStore,
       results.add((key, val.value))
 
   results.sort(proc(a, b: tuple[key: string, value: string]): int = cmp(a.key, b.key))
-  
+
   if limit > 0 and uint32(results.len) > limit:
     results.setLen(int(limit))
 
@@ -798,6 +839,273 @@ proc latestScan*(store: MvccTransactionStore,
   ## Equivalent to snapshotScan with the current timestamp.
   let ts = store.getCurrentTimestamp()
   store.snapshotScan(startKey, endKey, ts, limit)
+
+# ---------------------------------------------------------------------------
+# KV operations with metadata (for protocol server)
+# ---------------------------------------------------------------------------
+
+proc latestGetWithMeta*(store: MvccTransactionStore,
+    key: string): MvccResult[Option[MvccValueWithMeta]] {.gcsafe, raises: [].} =
+  ## Get the latest value for a key with MVCC metadata.
+  let ts = store.getCurrentTimestamp()
+
+  # First check for existing version
+  let directRes = store.raftStore.raftGet(key)
+  var latestTs: coreTypes.Timestamp = coreTypes.Timestamp(0)
+  var latestValue: string = ""
+  var found = false
+  var isDeleted = false
+
+  if directRes.isOk and directRes.value.isSome:
+    let val = directRes.value.get().value
+    if mvccTypes.isLikelyMVCCValue(val):
+      try:
+        let decoded = mvccTypes.decodeMVCCValue(val)
+        if decoded.timestamp <= ts:
+          latestTs = decoded.timestamp
+          isDeleted = decoded.isDeleted
+          if not decoded.isDeleted:
+            latestValue = decoded.data
+            found = true
+      except:
+        discard
+    else:
+      # Non-MVCC value (backward compat)
+      latestValue = val
+      found = true
+
+  # Also scan for versioned keys
+  let versionPrefix = key & mvccTypes.VERSION_SEPARATOR
+  let scanRes = store.raftStore.raftScan(versionPrefix, key & "\x00\x01",
+      100'u32, includeSystemKeys = true)
+
+  if scanRes.isOk:
+    for (k, entry) in scanRes.value:
+      if isIntentKeyMvcc(k): continue
+      if isVersionKey(k):
+        try:
+          let decodedKey = decodeVersionKey(k)
+          if decodedKey.timestamp <= ts and decodedKey.timestamp >= latestTs:
+            let mvccVal = mvccTypes.decodeMVCCValue(entry.value)
+            latestTs = decodedKey.timestamp
+            isDeleted = mvccVal.isDeleted
+            if not mvccVal.isDeleted:
+              latestValue = mvccVal.data
+              found = true
+            else:
+              # Tombstone - clear found flag since this version is deleted
+              found = false
+        except: discard
+
+  if not found or isDeleted:
+    return mvccOk(none(MvccValueWithMeta))
+
+  # Get version counter
+  var version: uint64 = 1
+  withLock store.keyVersionsMu:
+    version = store.keyVersions.getOrDefault(key, 1'u64)
+
+  return mvccOk(some(MvccValueWithMeta(
+    value: latestValue,
+    timestamp: uint64(latestTs),
+    version: version
+  )))
+
+proc txnGetWithMeta*(store: MvccTransactionStore, sessionId: uint64,
+    key: string): MvccResult[Option[MvccValueWithMeta]] {.gcsafe, raises: [].} =
+  ## Get a value within a transaction, checking intents first.
+  ## Returns metadata including timestamp and version.
+
+  # First check if there's an intent for this key in the transaction
+  withLock store.sessionsMu:
+    let state = store.sessions.getOrDefault(sessionId)
+    if state.isNil:
+      return mvccErr[Option[MvccValueWithMeta]](MvccStoreError(
+        kind: mseTransactionNotFound, msg: "Session not found"))
+
+    # Check intents first (uncommitted writes from this transaction)
+    if state.txn != nil and state.intents.hasKey(key):
+      let entry = state.intents.getOrDefault(key)
+      if entry.isDelete:
+        return mvccOk(none(MvccValueWithMeta))
+      # Get version for this key
+      var ver: uint64 = 1
+      withLock store.keyVersionsMu:
+        ver = store.keyVersions.getOrDefault(key, 1'u64)
+      return mvccOk(some(MvccValueWithMeta(
+        value: entry.value,
+        timestamp: uint64(state.txn.startTimestamp),
+        version: ver
+      )))
+
+  # Fall back to committed data
+  store.latestGetWithMeta(key)
+
+proc txnPutWithResult*(store: MvccTransactionStore, sessionId: uint64,
+    key: string, value: string,
+    flags: uint8 = 0, expectedVersion: uint64 = 0): MvccResult[MvccPutResult] {.
+    gcsafe, raises: [].} =
+  ## Put with full result including previous value and CAS support.
+  ## flags: PutFlagReturnPrev, PutFlagCAS
+  const PutFlagReturnPrev = 0x01'u8
+  const PutFlagCAS = 0x04'u8
+
+  var previousValue: Option[string] = none(string)
+  var currentVersion: uint64 = 0
+
+  # Check current value and version
+  let getRes = store.latestGetWithMeta(key)
+  if getRes.isOk and getRes.value.isSome:
+    let meta = getRes.value.get()
+    previousValue = some(meta.value)
+    currentVersion = meta.version
+
+  # CAS check
+  if (flags and PutFlagCAS) != 0:
+    if currentVersion != expectedVersion:
+      return mvccOk(MvccPutResult(
+        status: PutStatusCASFailed,
+        timestamp: 0,
+        version: currentVersion,
+        previousValue: if (flags and PutFlagReturnPrev) !=
+            0: previousValue else: none(string)
+      ))
+
+  # Perform the put
+  let putRes = store.txnPut(sessionId, key, value)
+  if not putRes.isOk:
+    return mvccErr[MvccPutResult](putRes.error)
+
+  # Increment version
+  let newVersion = currentVersion + 1
+  withLock store.keyVersionsMu:
+    store.keyVersions[key] = newVersion
+
+  let ts = store.getCurrentTimestamp()
+  return mvccOk(MvccPutResult(
+    status: PutStatusOK,
+    timestamp: uint64(ts),
+    version: newVersion,
+    previousValue: if (flags and PutFlagReturnPrev) !=
+        0: previousValue else: none(string)
+  ))
+
+proc txnDeleteWithResult*(store: MvccTransactionStore, sessionId: uint64,
+    key: string, flags: uint8 = 0): MvccResult[MvccDeleteResult] {.
+    gcsafe, raises: [].} =
+  ## Delete with full result including previous value and found status.
+  ## flags: DelFlagReturnPrev
+  const DelFlagReturnPrev = 0x01'u8
+
+  # Check current value
+  let getRes = store.latestGetWithMeta(key)
+  var found = false
+  var previousValue: Option[string] = none(string)
+
+  if getRes.isOk and getRes.value.isSome:
+    found = true
+    previousValue = some(getRes.value.get().value)
+
+  if not found:
+    return mvccOk(MvccDeleteResult(
+      found: false,
+      previousValue: none(string)
+    ))
+
+  # Perform the delete
+  let delRes = store.txnDelete(sessionId, key)
+  if not delRes.isOk:
+    return mvccErr[MvccDeleteResult](delRes.error)
+
+  return mvccOk(MvccDeleteResult(
+    found: true,
+    previousValue: if (flags and DelFlagReturnPrev) !=
+        0: previousValue else: none(string)
+  ))
+
+proc autoPutWithResult*(store: MvccTransactionStore, key: string, value: string,
+    flags: uint8 = 0, expectedVersion: uint64 = 0): MvccResult[MvccPutResult] {.
+    gcsafe, raises: [].} =
+  ## Put with auto-transaction and full result.
+  const PutFlagReturnPrev = 0x01'u8
+  const PutFlagCAS = 0x04'u8
+
+  var previousValue: Option[string] = none(string)
+  var currentVersion: uint64 = 0
+
+  # Check current value and version
+  let getRes = store.latestGetWithMeta(key)
+  if getRes.isOk and getRes.value.isSome:
+    let meta = getRes.value.get()
+    previousValue = some(meta.value)
+    currentVersion = meta.version
+
+  # CAS check
+  if (flags and PutFlagCAS) != 0:
+    if currentVersion != expectedVersion:
+      return mvccOk(MvccPutResult(
+        status: PutStatusCASFailed,
+        timestamp: 0,
+        version: currentVersion,
+        previousValue: if (flags and PutFlagReturnPrev) !=
+            0: previousValue else: none(string)
+      ))
+
+  # Perform the put with auto-transaction
+  let res = store.withAutoTransaction(proc(sid: uint64): MvccVoidResult =
+    store.txnPut(sid, key, value)
+  )
+
+  if not res.isOk:
+    return mvccErr[MvccPutResult](res.error)
+
+  # Increment version
+  let newVersion = currentVersion + 1
+  withLock store.keyVersionsMu:
+    store.keyVersions[key] = newVersion
+
+  let ts = store.getCurrentTimestamp()
+  return mvccOk(MvccPutResult(
+    status: PutStatusOK,
+    timestamp: uint64(ts),
+    version: newVersion,
+    previousValue: if (flags and PutFlagReturnPrev) !=
+        0: previousValue else: none(string)
+  ))
+
+proc autoDeleteWithResult*(store: MvccTransactionStore, key: string,
+    flags: uint8 = 0): MvccResult[MvccDeleteResult] {.gcsafe, raises: [].} =
+  ## Delete with auto-transaction and full result.
+  const DelFlagReturnPrev = 0x01'u8
+
+  # Check current value
+  let getRes = store.latestGetWithMeta(key)
+  var found = false
+  var previousValue: Option[string] = none(string)
+
+  if getRes.isOk and getRes.value.isSome:
+    found = true
+    previousValue = some(getRes.value.get().value)
+
+  if not found:
+    return mvccOk(MvccDeleteResult(
+      found: false,
+      previousValue: none(string)
+    ))
+
+  # Perform the delete with auto-transaction
+  let res = store.withAutoTransaction(proc(sid: uint64): MvccVoidResult =
+    store.txnDelete(sid, key)
+  )
+
+  if not res.isOk:
+    return mvccErr[MvccDeleteResult](res.error)
+
+  return mvccOk(MvccDeleteResult(
+    found: true,
+    previousValue: if (flags and DelFlagReturnPrev) !=
+        0: previousValue else: none(string)
+  ))
 
 # ---------------------------------------------------------------------------
 # Utility procs

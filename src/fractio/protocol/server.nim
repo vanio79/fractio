@@ -728,25 +728,28 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
 
     var resp: GetResponse
     if not server.mvccStore.isNil:
-      let res = if req.txnId != 0:
-                  server.mvccStore.txnGet(req.txnId, req.key)
-                else:
-                  server.mvccStore.latestGet(req.key)
+      # Use metadata-aware get for timestamps and versions
+      # If in a transaction, check intents first
+      let metaRes = if req.txnId != 0:
+                      server.mvccStore.txnGetWithMeta(req.txnId, req.key)
+                    else:
+                      server.mvccStore.latestGetWithMeta(req.key)
 
-      if res.isOk:
-        if res.value.isSome:
+      if metaRes.isOk:
+        if metaRes.value.isSome:
+          let meta = metaRes.value.get()
           resp = GetResponse(
             found: true,
             hasTimestamp: (req.flags and GetFlagIncludeTimestamp) != 0,
             hasVersion: (req.flags and GetFlagIncludeVersion) != 0,
-            timestamp: 0,
-            version: 1,
-            value: res.value.get(),
+            timestamp: meta.timestamp,
+            version: meta.version,
+            value: meta.value,
           )
         else:
           resp = GetResponse(found: false)
       else:
-        sendError(conn, requestId, ErrInternal, ErrCatKV, res.error.msg)
+        sendError(conn, requestId, ErrInternal, ErrCatKV, metaRes.error.msg)
         return
     else:
       sendError(conn, requestId, ErrInternal, ErrCatKV, "MVCC store not initialized")
@@ -762,7 +765,7 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
     if req.key.len == 0 or req.key.len > int(server.config.maxKeyBytes):
       sendError(conn, requestId, ErrProtocol, ErrCatKV, "invalid key length")
       return
-    
+
     let writeRes = raftPutInGroup(server.raftStore, req.key, req.value, GroupID(req.groupId))
     if writeRes.isOk:
       sendFrame(conn, encodePutResponse(PutResponse(
@@ -789,10 +792,19 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
 
     if not server.mvccStore.isNil:
       if req.txnId != 0:
-        let res = server.mvccStore.txnPut(req.txnId, req.key, req.value)
+        let res = server.mvccStore.txnPutWithResult(req.txnId, req.key, req.value,
+                    req.flags, req.expectedVersion)
         if res.isOk:
-          sendFrame(conn, encodePutResponse(PutResponse(
-            status: PutStatusOK, timestamp: 0, version: 1)), requestId)
+          let pr = res.value
+          var resp = PutResponse(
+            status: pr.status,
+            timestamp: pr.timestamp,
+            version: pr.version,
+          )
+          if pr.previousValue.isSome:
+            resp.hasPreviousValue = true
+            resp.previousValue = pr.previousValue.get()
+          sendFrame(conn, encodePutResponse(resp), requestId)
         else:
           # Check for "not leader" error and return appropriate error code
           if res.error.msg.contains("not the leader") or
@@ -802,13 +814,19 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
           else:
             sendError(conn, requestId, ErrInternal, ErrCatKV, res.error.msg)
       else:
-        let res = server.mvccStore.withAutoTransaction(proc(
-            sid: uint64): MvccVoidResult =
-          server.mvccStore.txnPut(sid, req.key, req.value)
-        )
+        let res = server.mvccStore.autoPutWithResult(req.key, req.value,
+                    req.flags, req.expectedVersion)
         if res.isOk:
-          sendFrame(conn, encodePutResponse(PutResponse(
-            status: PutStatusOK, timestamp: 0, version: 1)), requestId)
+          let pr = res.value
+          var resp = PutResponse(
+            status: pr.status,
+            timestamp: pr.timestamp,
+            version: pr.version,
+          )
+          if pr.previousValue.isSome:
+            resp.hasPreviousValue = true
+            resp.previousValue = pr.previousValue.get()
+          sendFrame(conn, encodePutResponse(resp), requestId)
         else:
           # Check for "not leader" error and return appropriate error code
           if res.error.msg.contains("not the leader") or
@@ -833,10 +851,16 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
 
     if not server.mvccStore.isNil:
       if req.txnId != 0:
-        let res = server.mvccStore.txnDelete(req.txnId, req.key)
+        let res = server.mvccStore.txnDeleteWithResult(req.txnId, req.key, req.flags)
         if res.isOk:
-          sendFrame(conn, encodeDeleteResponse(DeleteResponse(
-            status: DelStatusDeleted)), requestId)
+          let dr = res.value
+          var resp = DeleteResponse(
+            status: if dr.found: DelStatusDeleted else: DelStatusNotFound,
+          )
+          if dr.previousValue.isSome:
+            resp.hasPreviousValue = true
+            resp.previousValue = dr.previousValue.get()
+          sendFrame(conn, encodeDeleteResponse(resp), requestId)
         else:
           # Check for "not leader" error and return appropriate error code
           if res.error.msg.contains("not the leader") or res.error.msg.contains("Not the leader"):
@@ -844,13 +868,16 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
           else:
             sendError(conn, requestId, ErrInternal, ErrCatKV, res.error.msg)
       else:
-        let res = server.mvccStore.withAutoTransaction(proc(
-            sid: uint64): MvccVoidResult =
-          server.mvccStore.txnDelete(sid, req.key)
-        )
+        let res = server.mvccStore.autoDeleteWithResult(req.key, req.flags)
         if res.isOk:
-          sendFrame(conn, encodeDeleteResponse(DeleteResponse(
-            status: DelStatusDeleted)), requestId)
+          let dr = res.value
+          var resp = DeleteResponse(
+            status: if dr.found: DelStatusDeleted else: DelStatusNotFound,
+          )
+          if dr.previousValue.isSome:
+            resp.hasPreviousValue = true
+            resp.previousValue = dr.previousValue.get()
+          sendFrame(conn, encodeDeleteResponse(resp), requestId)
         else:
           # Check for "not leader" error and return appropriate error code
           if res.error.msg.contains("not the leader") or res.error.msg.contains("Not the leader"):
@@ -874,6 +901,7 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
     let res = server.mvccStore.withAutoTransactionResult(proc(
         sid: uint64): MvccResult[seq[BatchOpResult]] =
       var opsResults = newSeq[BatchOpResult](req.operations.len)
+      var hasFailure = false
       for i, op in req.operations:
         case op.kind
         of BatchOpGet:
@@ -888,6 +916,7 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
             opsResults[i] = BatchOpResult(status: 0x00'u8, data: rdata)
           else:
             opsResults[i] = BatchOpResult(status: 0x01'u8, data: "")
+            hasFailure = true
         of BatchOpPut:
           var dpos = 0
           let keyR = protoCodec.readBytes(op.data, dpos)
@@ -907,11 +936,21 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
           opsResults[i] = BatchOpResult(status: 0x00'u8, data: "")
         else:
           opsResults[i] = BatchOpResult(status: 0x01'u8, data: "")
+          hasFailure = true
+      # Store hasFailure flag in a threadvar or use a wrapper
+      # For now, we'll just return results and check them after
       return mvccOk(opsResults)
     )
 
     if res.isOk:
-      let resp = BatchResponse(status: BatchStatusAllOK, results: res.value)
+      # Check for partial failures in results
+      var hasFailure = false
+      for r in res.value:
+        if r.status != 0x00'u8:
+          hasFailure = true
+          break
+      let batchStatus = if hasFailure: BatchStatusPartialFailure else: BatchStatusAllOK
+      let resp = BatchResponse(status: batchStatus, results: res.value)
       sendFrame(conn, encodeBatchResponse(resp), requestId)
     else:
       sendError(conn, requestId, ErrInternal, ErrCatKV, res.error.msg)
@@ -930,13 +969,18 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
                   server.mvccStore.latestScan(req.startKey, req.endKey, req.limit)
 
       if res.isOk:
+        let currentTs = server.mvccStore.getCurrentTimestamp()
         var scanPairs = newSeq[ScanPair](res.value.len)
         for i, p in res.value:
+          # Get version for this key
+          var ver: uint64 = 1
+          withLock server.mvccStore.keyVersionsMu:
+            ver = server.mvccStore.keyVersions.getOrDefault(p.key, 1'u64)
           scanPairs[i] = ScanPair(
             key: p.key,
             value: p.value,
-            timestamp: 0, # Placeholder
-            version: 1,
+            timestamp: uint64(currentTs),
+            version: ver,
           )
         let rf = ScanResponseFrame(
           respFlags: ScanRespFlagEndOfScan,
