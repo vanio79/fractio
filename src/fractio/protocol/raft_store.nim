@@ -2263,8 +2263,8 @@ proc raftScanSpace*(store: RaftKVStoreExt, startKey, endKey: string,
   ## For each group, we read from the **leader** to guarantee we see
   ## committed data (followers may lag).
   ##
-  ## Uses a merge-sort approach: collect results from all group leaders,
-  ## then deduplicate by key (keeping newer timestamp) and sort by key.
+  ## Uses hash-map based deduplication with sorting for correctness and
+  ## simplicity. Future optimization could use k-way merge for O(n*k).
 
   # Collect all group IDs to scan (old + new during rebalancing)
   var allGidsToScan = space.groupIds
@@ -2273,7 +2273,7 @@ proc raftScanSpace*(store: RaftKVStoreExt, startKey, endKey: string,
       if ogid notin allGidsToScan:
         allGidsToScan.add(ogid)
 
-  # Results collected from all sources, keyed by key
+  # Collect results from all groups, deduplicating by key
   # We track the best (newest) entry for each key
   var resultMap: Table[string, RaftKVEntry]
 
@@ -2295,7 +2295,8 @@ proc raftScanSpace*(store: RaftKVStoreExt, startKey, endKey: string,
               # Include if it routes to new groups OR (during rebalancing) old groups
               var matches = (routedGid == gid)
               if not matches and space.rebalancing:
-                let oldRoutedGid = routeToGroup(stripMvccSuffix(pk), space.oldGroupIds)
+                let oldRoutedGid = routeToGroup(stripMvccSuffix(pk),
+                    space.oldGroupIds)
                 matches = (oldRoutedGid == gid)
               if matches:
                 if k notin resultMap:

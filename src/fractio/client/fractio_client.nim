@@ -10,7 +10,7 @@
 ## This enables client-side SQL parsing, planning, and execution
 ## with direct KV operations to group leaders, avoiding internal rerouting.
 
-import std/[options, tables, sets, locks, atomics, strutils, hashes]
+import std/[options, tables, sets, locks, atomics, strutils, hashes, algorithm]
 import posix
 import ../protocol/client
 import ../protocol/types
@@ -473,6 +473,37 @@ proc getGroupForKey*(client: FractioClient, key: string): uint64 =
   # Default to group 2 (data group) for non-table keys or if parsing failed
   return 2'u64
 
+proc getGroupsForTable*(client: FractioClient, tableId: uint32): seq[uint64] =
+  ## Get all groups that store data for a given table.
+  ## For multi-group spaces, returns ALL groups in the space.
+  ## Returns empty seq if the table is not found.
+
+  withLock client.lock:
+    if tableId in client.tables:
+      let tableInfo = client.tables[tableId]
+      let spaceId = tableInfo.spaceId
+      if spaceId in client.spaces:
+        let spaceInfo = client.spaces[spaceId]
+        return spaceInfo.groupIds
+
+  # Fall back to default data group
+  return @[2'u64]
+
+proc getTableIdFromKey*(client: FractioClient, key: string): uint32 =
+  ## Extract tableId from a key, returns 0 if not parseable.
+  if not key.startsWith(TABLE_KEY_PREFIX):
+    return 0
+
+  let afterPrefix = key[TABLE_KEY_PREFIX.len .. ^1]
+  if afterPrefix.len < TABLE_ID_WIDTH:
+    return 0
+
+  try:
+    let tableIdStr = afterPrefix[0 ..< TABLE_ID_WIDTH]
+    return parseUInt(tableIdStr).uint32
+  except ValueError:
+    return 0
+
 # =============================================================================
 # KV Operations
 # =============================================================================
@@ -577,35 +608,57 @@ proc kvDelete*(client: FractioClient, key: string,
 proc kvScan*(client: FractioClient, startKey, endKey: string,
     limit: uint32 = 0, txnId: uint64 = 0,
     readTimestamp: uint64 = 0): KVOpResult[seq[tuple[key, value: string]]] =
-  ## Scan a key range, routing to the correct group leader
+  ## Scan a key range across ALL groups in the space.
+  ## For multi-group spaces, data is sharded across groups by primary key hash,
+  ## so we must scan ALL groups and merge results.
   if not client.initialized.load(moRelaxed):
     return kvOpErr[seq[tuple[key, value: string]]]("client not initialized")
 
-  let groupId = client.getGroupForKey(startKey)
+  # Determine which table this scan is for
+  let tableId = client.getTableIdFromKey(startKey)
+  let groupIds = client.getGroupsForTable(tableId)
 
-  for attempt in 0 ..< 3:
-    let connOpt = client.getGroupLeaderConnection(groupId)
-    if connOpt.isNone:
-      return kvOpErr[seq[tuple[key, value: string]]]("no connection to group leader")
+  # Collect results from all groups, deduplicating by key
+  var resultMap: Table[string, string] = initTable[string, string]()
 
-    let conn = connOpt.get()
-    let res = conn.kvScan(startKey, endKey, limit, txnId = txnId,
-                          readTimestamp = readTimestamp)
+  for groupId in groupIds:
+    for attempt in 0 ..< 3:
+      let connOpt = client.getGroupLeaderConnection(groupId)
+      if connOpt.isNone:
+        # Skip this group if we can't connect - it may not have data for this range
+        break
 
-    if res.isOk:
-      var entries: seq[tuple[key, value: string]] = @[]
-      for pair in res.value.pairs:
-        entries.add((key: pair.key, value: pair.value))
-      return kvOpOk(entries)
+      let conn = connOpt.get()
+      let res = conn.kvScan(startKey, endKey, 0, txnId = txnId,
+                            readTimestamp = readTimestamp)
 
-    if res.error.kind == peNotLeader:
-      if not client.refreshGroupLeader(groupId):
-        return kvOpErr[seq[tuple[key, value: string]]]("failed to refresh group leader")
-      continue
+      if res.isOk:
+        for pair in res.value.pairs:
+          # Deduplicate: keep first occurrence
+          if pair.key notin resultMap:
+            resultMap[pair.key] = pair.value
+        break # Success, move to next group
 
-    return kvOpErr[seq[tuple[key, value: string]]](res.error.msg)
+      if res.error.kind == peNotLeader:
+        if not client.refreshGroupLeader(groupId):
+          break # Give up on this group
+        continue # Retry this group
 
-  return kvOpErr[seq[tuple[key, value: string]]]("too many retries")
+      break # Other error, skip this group
+
+  # Convert to result sequence
+  var entries: seq[tuple[key, value: string]] = @[]
+  for key, value in resultMap.pairs:
+    entries.add((key: key, value: value))
+
+  # Sort by key for consistent ordering
+  entries.sort(proc(a, b: tuple[key, value: string]): int = cmp(a.key, b.key))
+
+  # Apply limit if specified
+  if limit > 0 and entries.len > int(limit):
+    entries.setLen(int(limit))
+
+  return kvOpOk(entries)
 
 # =============================================================================
 # Transaction Operations

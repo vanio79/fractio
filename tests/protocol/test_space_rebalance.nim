@@ -208,7 +208,7 @@ suite "Space rebalance — updateSpaceRecord":
       rebalanceHeartbeat: 9999'i64,
       rebalanceCursor: "/t/0000000100/d/abc",
     )
-    store.updateSpaceRecord(space)
+    discard store.updateSpaceRecord(space)
     # Wait for Raft commit to apply
     os.sleep(200)
     store.loadSpaces()
@@ -242,7 +242,7 @@ suite "Space rebalance — updateSpaceRecord":
       rebalanceHeartbeat: 5000,
       rebalanceCursor: "/some/key",
     )
-    store.updateSpaceRecord(space)
+    discard store.updateSpaceRecord(space)
     # Wait for Raft commit to apply
     os.sleep(200)
 
@@ -252,7 +252,7 @@ suite "Space rebalance — updateSpaceRecord":
     space.rebalanceWorker = 0
     space.rebalanceHeartbeat = 0
     space.rebalanceCursor = ""
-    store.updateSpaceRecord(space)
+    discard store.updateSpaceRecord(space)
     # Wait for Raft commit to apply
     os.sleep(200)
     store.loadSpaces()
