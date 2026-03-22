@@ -918,12 +918,8 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
       else:
         execDropSpace(op, ctx)
 
-    # DML operations: always use MVCC with implicit transaction if needed
+    # DML operations: use active transaction if one exists, otherwise auto-transaction
     of poInsert:
-      # NOTE: For data table writes, we use auto-transaction mode (txnId = 0)
-      # because transaction sessions are node-local and the write may be routed
-      # to a different group leader. This means each INSERT is its own transaction.
-      # TODO: Implement distributed transaction coordination for multi-statement transactions.
       var count = 0
       var error: string = ""
       for rowJson in op.insRows:
@@ -933,8 +929,8 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
           error = "INSERT requires a primary key value"
           break
         let key = encodeDataRowKey(op.insTableId, pkVal)
-        # Use txnId = 0 for auto-transaction mode (each write is its own transaction)
-        let res = ctx.client.kvPut(key, rowJson, txnId = 0)
+        # Use active transaction if available, otherwise auto-transaction
+        let res = ctx.client.kvPut(key, rowJson, txnId = ctx.txnId)
         if not res.isOk:
           error = &"failed to insert row: {res.err}"
           break
@@ -978,13 +974,10 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
 
     of poUpdate:
       # MVCC-aware UPDATE
-      # NOTE: For data table writes, we use auto-transaction mode (txnId = 0)
-      # because transaction sessions are node-local and the write may be routed
-      # to a different group leader.
       let startKey = encodeDataRowKey(op.upTableId, "")
       let endKey = encodeDataRowKey(op.upTableId + 1, "")
-      # Use read timestamp for consistent scan
-      let res = ctx.client.kvScan(startKey, endKey, 0, txnId = 0,
+      # Use transaction context for consistent scan
+      let res = ctx.client.kvScan(startKey, endKey, 0, txnId = ctx.txnId,
           readTimestamp = ctx.readTimestamp)
 
       if not res.isOk:
@@ -999,8 +992,9 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
             var updated = row.copy()
             for (col, valExpr) in op.upSets:
               updated[col] = evalExpr(valExpr, row)
-            # Use txnId = 0 for auto-transaction mode
-            let putRes = ctx.client.kvPut(entry.key, $updated, txnId = 0)
+            # Use active transaction if available
+            let putRes = ctx.client.kvPut(entry.key, $updated,
+                txnId = ctx.txnId)
             if not putRes.isOk:
               error = &"failed to update row: {putRes.err}"
               break
@@ -1015,13 +1009,10 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
 
     of poDelete:
       # MVCC-aware DELETE
-      # NOTE: For data table writes, we use auto-transaction mode (txnId = 0)
-      # because transaction sessions are node-local and the write may be routed
-      # to a different group leader.
       let startKey = encodeDataRowKey(op.delTableId, "")
       let endKey = encodeDataRowKey(op.delTableId + 1, "")
-      # Use read timestamp for consistent scan
-      let res = ctx.client.kvScan(startKey, endKey, 0, txnId = 0,
+      # Use transaction context for consistent scan
+      let res = ctx.client.kvScan(startKey, endKey, 0, txnId = ctx.txnId,
           readTimestamp = ctx.readTimestamp)
 
       if not res.isOk:
@@ -1033,8 +1024,8 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
         try:
           let row = parseJson(entry.value)
           if matchesFilter(op.delFilter, row):
-            # Use txnId = 0 for auto-transaction mode
-            let delRes = ctx.client.kvDelete(entry.key, txnId = 0)
+            # Use active transaction if available
+            let delRes = ctx.client.kvDelete(entry.key, txnId = ctx.txnId)
             if not delRes.isOk:
               error = &"failed to delete row: {delRes.err}"
               break
