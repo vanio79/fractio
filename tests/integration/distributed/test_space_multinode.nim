@@ -89,9 +89,9 @@ proc makeNode(nodeNum: int, basePort: int,
     basePort: basePort,
     host: "127.0.0.1",
     dataDir: storagePath,
-    electionTimeoutLowerMs: 200,
-    electionTimeoutUpperMs: 400,
-    heartbeatIntervalMs: 100,
+    electionTimeoutLowerMs: 500,  # Increased for stability
+    electionTimeoutUpperMs: 1000, # Increased for stability
+    heartbeatIntervalMs: 150,     # Faster heartbeats
   ))
 
   for m in members:
@@ -99,11 +99,11 @@ proc makeNode(nodeNum: int, basePort: int,
 
   coord.start()
 
-  # Create meta + data groups
+  # Create meta + data groups with node 1 as preferred leader
   for gid in [META_GROUP_ID, DATA_GROUP_START_ID]:
     var success = false
     for attempt in 0 ..< 5:
-      if coord.createAndStartGroup(gid, members):
+      if coord.createAndStartGroup(gid, members, preferredLeader = 1'u32):
         success = true
         break
       sleep(200)
@@ -157,46 +157,142 @@ proc waitForLeaderOnGroup(nodes: seq[TestNode], gid: GroupID,
     sleep(100)
   -1
 
-proc seedSysNodes(leaderStore: RaftKVStoreExt, nodes: seq[TestNode]) =
+proc probeLeaderReady(store: RaftKVStoreExt, gid: GroupID): bool =
+  ## Test if a group leader can actually accept writes.
+  ## NuRaft's isLeader() returns true before the leader is ready.
+  ## We verify by attempting a no-op write to the specified group.
+  ## Uses a probe key that routes to the specified group.
+  # Use a key that routes to the meta group for META_GROUP_ID
+  # or a key that routes to data group for DATA_GROUP_START_ID
+  let testKey = if gid == META_GROUP_ID:
+                  encodeTableKey(SYS_NODES_TABLE_ID, "\x00PROBE\x00")
+                else:
+                  "\x00PROBE_DATA\x00" # Non-table key routes to DATA_GROUP_START_ID
+  let testVal = "probe"
+  let res = store.raftPut(testKey, testVal)
+  if res.isOk:
+    # Clean up the probe key
+    discard store.raftDelete(testKey)
+    return true
+  false
+
+proc waitForReadyLeader(nodes: seq[TestNode], gid: GroupID,
+    maxAttempts: int = 30): int =
+  ## Wait for a leader that can actually accept writes.
+  ## Returns leader node index or -1.
+  for attempt in 0 ..< maxAttempts:
+    let leaderIdx = waitForLeaderOnGroup(nodes, gid, maxAttempts = 5)
+    if leaderIdx >= 0:
+      # Give the leader extra time to stabilize before probing
+      sleep(300)
+      if probeLeaderReady(nodes[leaderIdx].store, gid):
+        # Probe passed, add a small delay before returning to reduce race
+        sleep(100)
+        return leaderIdx
+    sleep(200)
+  -1
+
+proc seedSysNodes(nodes: seq[TestNode], maxRetries: int = 10): bool =
+  ## Seed sys.nodes table with per-write retry logic. Returns true on success.
+  ## Each write independently retries on failure (leader may change between writes).
   for n in nodes:
-    let key = encodeTableKey(SYS_NODES_TABLE_ID, $n.id)
-    let nodeRec = NodeRecord(
-      nodeId: uint32(n.id),
-      host: "127.0.0.1",
-      raftPort: uint16(n.basePort),
-      clientPort: uint16(n.clientPort),
-      status: nsAlive,
-    )
-    let r = leaderStore.sysTablePut(key, nodeRec.encode())
-    doAssert r, "failed to seed sys.nodes for node " & $n.id
+    var success = false
+    for retry in 0 ..< maxRetries:
+      let leaderIdx = waitForReadyLeader(nodes, META_GROUP_ID)
+      if leaderIdx < 0:
+        sleep(100)
+        continue
 
-proc seedSysGroups(leaderStore: RaftKVStoreExt, nodeNums: seq[int]) =
+      let key = encodeTableKey(SYS_NODES_TABLE_ID, $n.id)
+      let nodeRec = NodeRecord(
+        nodeId: uint32(n.id),
+        host: "127.0.0.1",
+        raftPort: uint16(n.basePort),
+        clientPort: uint16(n.clientPort),
+        status: nsAlive,
+      )
+      if nodes[leaderIdx].store.sysTablePut(key, nodeRec.encode()):
+        success = true
+        break
+      sleep(100 * (retry + 1))
+
+    if not success:
+      return false
+  true
+
+proc seedSysGroups(nodes: seq[TestNode], nodeNums: seq[int],
+    maxRetries: int = 10): bool =
+  ## Seed sys.groups table with per-write retry logic. Returns true on success.
   for gid in [META_GROUP_ID, DATA_GROUP_START_ID]:
-    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
-    var replicasSeq: seq[GroupReplicaBin] = @[]
-    for num in nodeNums:
-      replicasSeq.add(GroupReplicaBin(nodeId: uint32(num),
-          replicaType: rtVoter))
-    let groupRec = GroupRecord(
-      groupId: gid.uint64,
-      spaceId: if gid == META_GROUP_ID: 0 else: 1,
-      leader: uint32(nodeNums[0]),
-      replicas: replicasSeq,
-    )
-    discard leaderStore.sysTablePut(key, groupRec.encode())
+    var success = false
+    for retry in 0 ..< maxRetries:
+      let leaderIdx = waitForReadyLeader(nodes, META_GROUP_ID)
+      if leaderIdx < 0:
+        sleep(100)
+        continue
 
-proc seedDefaults(leaderStore: RaftKVStoreExt) =
-  let dbKey = encodeTableKey(SYS_DATABASES_TABLE_ID, "default")
-  discard leaderStore.sysTablePut(dbKey, DatabaseRecord(
-    name: "default",
-    createdAtNs: system_schemas.nowNs()
-  ).encode())
-  let scKey = encodeTableKey(SYS_SCHEMAS_TABLE_ID, "default.public")
-  discard leaderStore.sysTablePut(scKey, SchemaRecord(
-    name: "public",
-    database: "default",
-    createdAtNs: system_schemas.nowNs()
-  ).encode())
+      let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
+      var replicasSeq: seq[GroupReplicaBin] = @[]
+      for num in nodeNums:
+        replicasSeq.add(GroupReplicaBin(nodeId: uint32(num),
+            replicaType: rtVoter))
+      let groupRec = GroupRecord(
+        groupId: gid.uint64,
+        spaceId: if gid == META_GROUP_ID: 0 else: 1,
+        leader: uint32(nodeNums[0]),
+        replicas: replicasSeq,
+      )
+      if nodes[leaderIdx].store.sysTablePut(key, groupRec.encode()):
+        success = true
+        break
+      sleep(100 * (retry + 1))
+
+    if not success:
+      return false
+  true
+
+proc seedDefaults(nodes: seq[TestNode], maxRetries: int = 10): bool =
+  ## Seed default database and schema with per-write retry logic. Returns true on success.
+  # Seed default database
+  var dbSuccess = false
+  for retry in 0 ..< maxRetries:
+    let leaderIdx = waitForReadyLeader(nodes, META_GROUP_ID)
+    if leaderIdx < 0:
+      sleep(100)
+      continue
+
+    let dbKey = encodeTableKey(SYS_DATABASES_TABLE_ID, "default")
+    let dbRec = DatabaseRecord(
+      name: "default",
+      createdAtNs: system_schemas.nowNs()
+    ).encode()
+
+    if nodes[leaderIdx].store.sysTablePut(dbKey, dbRec):
+      dbSuccess = true
+      break
+    sleep(100 * (retry + 1))
+
+  if not dbSuccess:
+    return false
+
+  # Seed default schema
+  for retry in 0 ..< maxRetries:
+    let leaderIdx = waitForReadyLeader(nodes, META_GROUP_ID)
+    if leaderIdx < 0:
+      sleep(100)
+      continue
+
+    let scKey = encodeTableKey(SYS_SCHEMAS_TABLE_ID, "default.public")
+    let scRec = SchemaRecord(
+      name: "public",
+      database: "default",
+      createdAtNs: system_schemas.nowNs()
+    ).encode()
+
+    if nodes[leaderIdx].store.sysTablePut(scKey, scRec):
+      return true
+    sleep(100 * (retry + 1))
+  false
 
 proc waitForAutoDistribution(nodes: seq[TestNode], expectedGroupIds: seq[
     uint64], replicaCount: int, maxWaitMs: int = 5000) =
@@ -263,10 +359,33 @@ proc distributeSpaceGroups(nodes: seq[TestNode], replicaCount: int = 3) =
   waitForAutoDistribution(nodes, @[3'u64, 4, 5, 6, 7], replicaCount)
   waitForSpaceLeaders(nodes)
 
+# Forward declarations
+proc exec(node: TestNode, sql: string): ExecResult
+
 proc reelectLeaders(nodes: seq[TestNode], deadNodeIds: seq[int]) =
   ## After killing nodes, wait for NuRaft to re-elect leaders on surviving nodes.
   ## NuRaft handles this automatically, but we may need to wait for timeouts.
   sleep(1000) # Allow NuRaft election timeouts to fire
+
+proc execWithRetry(nodes: seq[TestNode], sql: string,
+    maxRetries: int = 10): ExecResult =
+  ## Execute SQL with automatic retry on leader changes.
+  ## Finds the current meta leader before each attempt.
+  for retry in 0 ..< maxRetries:
+    let leaderIdx = waitForReadyLeader(nodes, META_GROUP_ID)
+    if leaderIdx < 0:
+      sleep(100)
+      continue
+
+    let res = exec(nodes[leaderIdx], sql)
+    if res.kind != erkError:
+      return res
+    if isNotLeaderError(res.error):
+      sleep(100 * (retry + 1))
+      continue
+    # Non-leader error, return as-is
+    return res
+  ExecResult(kind: erkError, error: "max retries exceeded for: " & sql)
 
 proc exec(node: TestNode, sql: string): ExecResult =
   node.client.query(sql)
@@ -325,23 +444,36 @@ proc makeCluster5(): seq[TestNode] =
   var nodes: seq[TestNode]
   for i, m in members:
     nodes.add(makeNode(int(m.nodeId), m.basePort, members))
+    # Stagger node starts to reduce election conflicts
+    # First node gets a head start to become leader
+    if i == 0:
+      startNode(nodes[i])
+      sleep(200) # Give first node time to start
+    else:
+      startNode(nodes[i])
 
-  for i in 0 ..< nodes.len: startNode(nodes[i])
+  # Wait for leader election to stabilize
+  sleep(500)
 
   # Wait for leader election on meta + data groups
-  discard waitForLeaderOnGroup(nodes, META_GROUP_ID)
-  discard waitForLeaderOnGroup(nodes, DATA_GROUP_START_ID)
+  let metaLeader = waitForLeaderOnGroup(nodes, META_GROUP_ID, maxAttempts = 50)
+  doAssert metaLeader >= 0, "No meta leader elected"
 
-  # Find the meta leader and seed system tables
-  let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
-  doAssert leaderIdx >= 0
+  discard waitForLeaderOnGroup(nodes, DATA_GROUP_START_ID, maxAttempts = 30)
 
+  # Seed system tables with retry logic (finds leader before each write)
   let allNums = @[1, 2, 3, 4, 5]
-  seedSysNodes(nodes[leaderIdx].store, nodes)
-  seedSysGroups(nodes[leaderIdx].store, allNums)
-  seedDefaults(nodes[leaderIdx].store)
-  sleep(400)
-  for i in 0 ..< nodes.len: initClient(nodes[i], nodes[leaderIdx].clientPort)
+  doAssert seedSysNodes(nodes), "Failed to seed sys.nodes"
+  doAssert seedSysGroups(nodes, allNums), "Failed to seed sys.groups"
+  doAssert seedDefaults(nodes), "Failed to seed defaults"
+
+  # Brief wait for replication to propagate
+  sleep(200)
+
+  # Re-find meta leader for client initialization (leader may have changed)
+  let finalLeader = waitForLeaderOnGroup(nodes, META_GROUP_ID)
+  doAssert finalLeader >= 0, "No meta leader after seeding"
+  for i in 0 ..< nodes.len: initClient(nodes[i], nodes[finalLeader].clientPort)
 
   nodes
 
@@ -358,8 +490,7 @@ suite "Space multinode — CREATE SPACE creates real Raft groups":
     var nodes = makeCluster5()
     defer: stopCluster(nodes)
 
-    let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
-    let res = exec(nodes[leaderIdx],
+    let res = execWithRetry(nodes,
         "CREATE SPACE testspace WITH REPLICAS = 3")
     if res.kind == erkError:
       echo "  CREATE SPACE error: " & res.error
@@ -370,7 +501,7 @@ suite "Space multinode — CREATE SPACE creates real Raft groups":
     # With RF=3, the leader (node 1) has groups it's a member of.
     var leaderGroupCount = 0
     for gid in 3'u64 .. 7'u64:
-      if nodes[leaderIdx].coord.hasGroup(GroupID(gid)):
+      if nodes[0].coord.hasGroup(GroupID(gid)):
         inc leaderGroupCount
     check leaderGroupCount >= 3
 
@@ -378,8 +509,7 @@ suite "Space multinode — CREATE SPACE creates real Raft groups":
     var nodes = makeCluster5()
     defer: stopCluster(nodes)
 
-    let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
-    discard exec(nodes[leaderIdx],
+    discard execWithRetry(nodes,
         "CREATE SPACE testspace WITH REPLICAS = 3")
 
     waitForAutoDistribution(nodes, @[3'u64, 4, 5, 6, 7], 3)
@@ -395,15 +525,22 @@ suite "Space multinode — CREATE SPACE creates real Raft groups":
     var nodes = makeCluster5()
     defer: stopCluster(nodes)
 
-    let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
-    discard exec(nodes[leaderIdx],
-        "CREATE SPACE testspace WITH REPLICAS = 3")
-    distributeSpaceGroups(nodes)
-    nodes[leaderIdx].store.loadSpaces()
-    nodes[leaderIdx].store.loadGroupMembers()
+    let res1 = execWithRetry(nodes, "CREATE SPACE testspace WITH REPLICAS = 3")
+    if res1.kind == erkError:
+      echo "  CREATE SPACE error: " & res1.error
+    check res1.kind == erkOk
 
-    let ctRes = exec(nodes[leaderIdx],
+    distributeSpaceGroups(nodes)
+
+    let leaderIdx = waitForReadyLeader(nodes, META_GROUP_ID)
+    if leaderIdx >= 0:
+      nodes[leaderIdx].store.loadSpaces()
+      nodes[leaderIdx].store.loadGroupMembers()
+
+    let ctRes = execWithRetry(nodes,
         "CREATE TABLE t1 (id INT PRIMARY KEY, name TEXT) IN SPACE testspace")
+    if ctRes.kind == erkError:
+      echo "  CREATE TABLE error: " & ctRes.error
     check ctRes.kind == erkOk
 
 suite "Space multinode — data operations through space groups":
