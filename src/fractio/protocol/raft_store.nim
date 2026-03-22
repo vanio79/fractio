@@ -415,9 +415,10 @@ proc loadGroupMembers*(store: RaftKVStoreExt,
 
   # Preserve in-memory leader info for groups where we know the leader
   # (onLeaderChanged is the source of truth, backend may be stale during rebalancing)
+  # Only preserve for groups that still exist in sys.groups
   withLock store.groupMu:
     for gid, leader in store.groupLeaders:
-      if leader > 0 and gid notin newGroupLeaders:
+      if leader > 0 and gid in newGroupMembers and gid notin newGroupLeaders:
         newGroupLeaders[gid] = leader
 
   withLock store.groupMu:

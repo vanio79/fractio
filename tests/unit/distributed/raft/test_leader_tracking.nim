@@ -249,7 +249,8 @@ suite "onLeaderChanged callback":
     let rec = decodeGroupRecord(rawVal)
     check rec.leader == 30
 
-  test "callback skips META_GROUP_ID":
+  test "callback persists leader for META_GROUP_ID":
+    # META_GROUP_ID leader IS persisted so clients can route to it
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $META_GROUP_ID.uint64)
     let val = GroupRecord(
       groupId: META_GROUP_ID.uint64,
@@ -264,11 +265,16 @@ suite "onLeaderChanged callback":
     let storePtr = cast[pointer](store)
     nuraft_coordinator.onLeaderChanged(storePtr, META_GROUP_ID, NodeID(10))
 
-    # Should NOT have a leader field (callback skips meta group)
+    # Leader SHOULD be updated (clients need to route to meta leader)
     let gr = store.raftGet(key)
     check gr.isOk
-    let rec = decodeGroupRecord(gr.value.get().value)
-    check rec.leader == 0 # Still 0 (not updated)
+    var rawVal = gr.value.get().value
+    # Strip MVCC encoding if present (sysTablePut wraps values in MVCC)
+    if mvccTypes.isLikelyMVCCValue(rawVal):
+      let mvccVal = mvccTypes.decodeMVCCValue(rawVal)
+      rawVal = mvccVal.data
+    let rec = decodeGroupRecord(rawVal)
+    check rec.leader == 10 # Updated to 10
 
   test "callback skips DATA_GROUP_START_ID":
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $DATA_GROUP_START_ID.uint64)
@@ -286,7 +292,12 @@ suite "onLeaderChanged callback":
 
     let gr = store.raftGet(key)
     check gr.isOk
-    let rec = decodeGroupRecord(gr.value.get().value)
+    var rawVal = gr.value.get().value
+    # Strip MVCC encoding if present (sysTablePut wraps values in MVCC)
+    if mvccTypes.isLikelyMVCCValue(rawVal):
+      let mvccVal = mvccTypes.decodeMVCCValue(rawVal)
+      rawVal = mvccVal.data
+    let rec = decodeGroupRecord(rawVal)
     check rec.leader == 0 # Still 0 (not updated)
 
   test "callback ignores nil storePtr":
