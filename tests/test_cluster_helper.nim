@@ -440,8 +440,8 @@ proc seedSystemTables*(cluster: TestCluster) =
     )
     discard leader.store.raftPut(key, groupRec.encode())
 
-  # Wait for replication
-  sleep(TEST_REPLICATION_WAIT_MS)
+  # Wait for state machine to catch up (need enough time for replication)
+  sleep(TEST_REPLICATION_WAIT_MS * 4) # 400ms total
 
 # ============================================================================
 # Cluster Management
