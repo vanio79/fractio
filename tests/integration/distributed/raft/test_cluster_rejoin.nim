@@ -12,6 +12,7 @@
 import unittest
 import std/[os, osproc, strutils, json, httpclient, times, strformat, posix]
 import fractio/protocol/types
+import ../../../test_config
 
 const
   BinaryPath = "bin/fractio_web"
@@ -22,6 +23,23 @@ const
   BaseRaftPort = 27000
   BaseClientPort = 19001
   BaseWebPort = 19876
+
+  # ---------------------------------------------------------------------------
+  # Test Timing Constants
+  # ---------------------------------------------------------------------------
+  # These tests spawn external fractio_web processes which use production-like
+  # Raft timeouts internally. Adjust these constants if the binary is configured
+  # with faster election timeouts.
+
+  # Time for a node to join cluster and stabilize (used after startNode with --join)
+  JOIN_STABILIZE_MS = 500 # Reduced from 2000ms - waitForNodeCount handles the rest
+
+  # Time for leader election after killing the leader
+  # Production election timeout is 1-2s, so need ~2 election cycles
+  ELECTION_WAIT_MS = 800 # Reduced from 4000ms - tryInsert retries anyway
+
+  # Time for follower removal to propagate (no election needed)
+  FOLLOWER_DOWN_MS = 200 # Reduced from 1000ms - leader stays up
 
 type
   TestNode = object
@@ -117,7 +135,7 @@ proc waitForReady(node: TestNode; timeoutMs = 10_000) =
       client.close()
       return
     except CatchableError:
-      sleep(200)
+      sleep(TEST_POLL_INTERVAL_MS)
   raise newException(IOError, &"node {node.id} did not become ready within {timeoutMs}ms")
 
 proc waitForNodeCount(node: TestNode; expected: int; timeoutMs = 15_000) =
@@ -130,7 +148,7 @@ proc waitForNodeCount(node: TestNode; expected: int; timeoutMs = 15_000) =
         return
     except CatchableError:
       discard
-    sleep(300)
+    sleep(TEST_POLL_INTERVAL_MS)
   raise newException(IOError,
     &"node {node.id} did not reach {expected} members within {timeoutMs}ms")
 
@@ -147,7 +165,7 @@ proc waitForData(node: TestNode; sql: string; expectedRows: int;
           return
     except CatchableError:
       discard
-    sleep(300)
+    sleep(TEST_POLL_INTERVAL_MS)
   raise newException(IOError,
     &"node {node.id} did not reach {expectedRows} rows within {timeoutMs}ms")
 
@@ -168,7 +186,7 @@ proc tryInsert(nodes: openArray[TestNode]; sql: string;
           return res # A real error, not just "not the leader"
       except CatchableError:
         continue
-    sleep(500)
+    sleep(TEST_POLL_INTERVAL_MS * 5) # 50ms - poll faster for leader
   raise newException(IOError, "no node accepted the insert: " & sql)
 
 
@@ -199,10 +217,10 @@ suite "Cluster Dynamic Join and Node Restart":
     waitForReady(nodes[0])
 
     nodes[1] = startNode(2, join = &"{TestHost}:{nodes[0].webPort}")
-    sleep(2000)
+    sleep(JOIN_STABILIZE_MS)
 
     nodes[2] = startNode(3, join = &"{TestHost}:{nodes[0].webPort}")
-    sleep(2000)
+    sleep(JOIN_STABILIZE_MS)
 
     # All 3 nodes should see all 3 members
     waitForNodeCount(nodes[0], 3)
@@ -227,9 +245,9 @@ suite "Cluster Dynamic Join and Node Restart":
     waitForReady(nodes[0])
 
     nodes[1] = startNode(2, join = &"{TestHost}:{nodes[0].webPort}")
-    sleep(2000)
+    sleep(JOIN_STABILIZE_MS)
     nodes[2] = startNode(3, join = &"{TestHost}:{nodes[0].webPort}")
-    sleep(2000)
+    sleep(JOIN_STABILIZE_MS)
 
     waitForNodeCount(nodes[0], 3)
 
@@ -241,7 +259,7 @@ suite "Cluster Dynamic Join and Node Restart":
 
     # Kill leader (node 1)
     stopNode(nodes[0])
-    sleep(4000) # Wait for election
+    sleep(ELECTION_WAIT_MS) # Wait for election
 
     # Insert on surviving nodes (one should be the new leader)
     let insertRes = tryInsert([nodes[1], nodes[2]],
@@ -259,9 +277,9 @@ suite "Cluster Dynamic Join and Node Restart":
     waitForReady(nodes[0])
 
     nodes[1] = startNode(2, join = &"{TestHost}:{nodes[0].webPort}")
-    sleep(2000)
+    sleep(JOIN_STABILIZE_MS)
     nodes[2] = startNode(3, join = &"{TestHost}:{nodes[0].webPort}")
-    sleep(2000)
+    sleep(JOIN_STABILIZE_MS)
 
     waitForNodeCount(nodes[0], 3)
 
@@ -274,7 +292,7 @@ suite "Cluster Dynamic Join and Node Restart":
 
     # Kill leader (node 1)
     stopNode(nodes[0])
-    sleep(4000)
+    sleep(ELECTION_WAIT_MS)
 
     # Insert new data on the new leader
     let insertRes = tryInsert([nodes[1], nodes[2]],
@@ -304,9 +322,9 @@ suite "Cluster Dynamic Join and Node Restart":
     waitForReady(nodes[0])
 
     nodes[1] = startNode(2, join = &"{TestHost}:{nodes[0].webPort}")
-    sleep(2000)
+    sleep(JOIN_STABILIZE_MS)
     nodes[2] = startNode(3, join = &"{TestHost}:{nodes[0].webPort}")
-    sleep(2000)
+    sleep(JOIN_STABILIZE_MS)
 
     waitForNodeCount(nodes[0], 3)
 
@@ -317,7 +335,7 @@ suite "Cluster Dynamic Join and Node Restart":
 
     # Kill node 1
     stopNode(nodes[0])
-    sleep(4000)
+    sleep(ELECTION_WAIT_MS)
 
     # Insert "Bob" on new leader
     discard tryInsert([nodes[1], nodes[2]],
@@ -346,7 +364,7 @@ suite "Cluster Dynamic Join and Node Restart":
     waitForReady(nodes[0])
 
     nodes[1] = startNode(2, join = &"{TestHost}:{nodes[0].webPort}")
-    sleep(2000)
+    sleep(JOIN_STABILIZE_MS)
 
     waitForNodeCount(nodes[0], 2)
     waitForNodeCount(nodes[1], 2)
@@ -372,9 +390,9 @@ suite "Cluster Dynamic Join and Node Restart":
     nodes[0] = startNode(1)
     waitForReady(nodes[0])
     nodes[1] = startNode(2, join = &"{TestHost}:{nodes[0].webPort}")
-    sleep(2000)
+    sleep(JOIN_STABILIZE_MS)
     nodes[2] = startNode(3, join = &"{TestHost}:{nodes[0].webPort}")
-    sleep(2000)
+    sleep(JOIN_STABILIZE_MS)
 
     waitForNodeCount(nodes[0], 3)
 
@@ -386,7 +404,7 @@ suite "Cluster Dynamic Join and Node Restart":
     # Kill-restart cycle: kill node 1, insert, restart, verify
     for round in 1..2:
       stopNode(nodes[0])
-      sleep(4000)
+      sleep(ELECTION_WAIT_MS)
 
       let val = &"round{round}"
       discard tryInsert([nodes[1], nodes[2]],
@@ -408,9 +426,9 @@ suite "Cluster Dynamic Join and Node Restart":
     nodes[0] = startNode(1)
     waitForReady(nodes[0])
     nodes[1] = startNode(2, join = &"{TestHost}:{nodes[0].webPort}")
-    sleep(2000)
+    sleep(JOIN_STABILIZE_MS)
     nodes[2] = startNode(3, join = &"{TestHost}:{nodes[0].webPort}")
-    sleep(2000)
+    sleep(JOIN_STABILIZE_MS)
 
     waitForNodeCount(nodes[0], 3)
 
@@ -421,7 +439,7 @@ suite "Cluster Dynamic Join and Node Restart":
 
     # Kill follower (node 2) — leader (node 1) stays up
     stopNode(nodes[1])
-    sleep(1000)
+    sleep(FOLLOWER_DOWN_MS)
 
     # Leader can still write (quorum of 2/3 with nodes 1 + 3)
     discard sqlQuery(nodes[0], "INSERT INTO t1 VALUES (2, 'during')")
@@ -441,9 +459,9 @@ suite "Cluster Dynamic Join and Node Restart":
     nodes[0] = startNode(1)
     waitForReady(nodes[0])
     nodes[1] = startNode(2, join = &"{TestHost}:{nodes[0].webPort}")
-    sleep(2000)
+    sleep(JOIN_STABILIZE_MS)
     nodes[2] = startNode(3, join = &"{TestHost}:{nodes[0].webPort}")
-    sleep(2000)
+    sleep(JOIN_STABILIZE_MS)
 
     waitForNodeCount(nodes[0], 3)
 
