@@ -69,3 +69,12 @@ const
   TEST_NODE_START_DELAY_MS* = 20 # Delay between node starts
   TEST_CLUSTER_STARTUP_MS* = 100 # Initial wait after all nodes start
   TEST_SHUTDOWN_DELAY_MS* = 10 # Delay for graceful shutdown
+
+  # ---------------------------------------------------------------------------
+  # Preferred Leader Rebalancing
+  # ---------------------------------------------------------------------------
+  # Timeouts for preferred leader election and transfer.
+
+  TEST_LEADER_TRANSFER_WAIT_MS* = 200 # Wait for leadership transfer to complete
+  TEST_REBALANCE_SETTLE_MS* = 1000 # Wait for rebalance background task (was 5000ms)
+  TEST_LEADER_STABILITY_CHECKS* = 30 # Number of polls to verify leader stability

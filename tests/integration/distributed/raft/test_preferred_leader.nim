@@ -20,6 +20,7 @@ import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
 import fractio/distributed/meta/system_schemas
 import fractio/protocol/raft_store
+import ../../../test_config
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -63,9 +64,9 @@ proc makeCluster3(portOffset: int = 0): seq[TestNode] =
       basePort: basePort,
       host: "127.0.0.1",
       dataDir: storagePath,
-      electionTimeoutLowerMs: 200,
-      electionTimeoutUpperMs: 400,
-      heartbeatIntervalMs: 100,
+      electionTimeoutLowerMs: TEST_ELECTION_TIMEOUT_LOWER_MS_MULTINODE,
+      electionTimeoutUpperMs: TEST_ELECTION_TIMEOUT_UPPER_MS_MULTINODE,
+      heartbeatIntervalMs: TEST_HEARTBEAT_INTERVAL_MS_MULTINODE,
     ))
 
     # Populate peerInfo so dynamic group creation knows peer ports
@@ -101,7 +102,7 @@ proc makeCluster3(portOffset: int = 0): seq[TestNode] =
         allLeaders = false
         break
     if allLeaders: break
-    sleep(100)
+    sleep(TEST_POLL_INTERVAL_MS)
 
   # Find meta leader and seed system tables
   var leaderIdx = 0
@@ -137,7 +138,7 @@ proc makeCluster3(portOffset: int = 0): seq[TestNode] =
     )
     discard nodes[leaderIdx].store.raftPut(key, groupRec.encode())
 
-  sleep(400)
+  sleep(TEST_REPLICATION_WAIT_MS * 4) # 400ms for replication
 
   nodes
 
@@ -158,7 +159,7 @@ proc waitForLeader(nodes: seq[TestNode], gid: GroupID,
   for attempt in 0 ..< maxAttempts:
     let idx = findLeader(nodes, gid)
     if idx >= 0: return idx
-    sleep(100)
+    sleep(TEST_POLL_INTERVAL_MS)
   -1
 
 # ---------------------------------------------------------------------------
@@ -172,7 +173,6 @@ suite "Preferred leader rebalancing — 3-node cluster":
     globalLogger.setMinLevel(llDebug)
 
   test "loadGroupMembers reads preferredLeader from sys.groups":
-    sleep(5000)
     var nodes = makeCluster3(0)
     defer: stopCluster(nodes)
 
@@ -190,7 +190,6 @@ suite "Preferred leader rebalancing — 3-node cluster":
     check nodes[leaderIdx].store.preferredLeaders[DATA_GROUP_START_ID] == 1'u32
 
   test "transferLeadership moves leadership to target node":
-    sleep(5000)
     var nodes = makeCluster3(10000)
     defer: stopCluster(nodes)
 
@@ -211,7 +210,7 @@ suite "Preferred leader rebalancing — 3-node cluster":
       # Wait for node 2 to become leader
       var transferred = false
       for attempt in 0 ..< 50:
-        sleep(100)
+        sleep(TEST_POLL_INTERVAL_MS)
         if findLeader(nodes, DATA_GROUP_START_ID) == 1:
           transferred = true
           break
@@ -226,7 +225,7 @@ suite "Preferred leader rebalancing — 3-node cluster":
 
       var preferredWon = false
       for attempt in 0 ..< 50:
-        sleep(100)
+        sleep(TEST_POLL_INTERVAL_MS)
         if findLeader(nodes, DATA_GROUP_START_ID) == 0:
           preferredWon = true
           break
@@ -235,7 +234,6 @@ suite "Preferred leader rebalancing — 3-node cluster":
   test "preferred leader wins via NuRaft election":
     ## Verifies that after leadership transfer, the preferred leader
     ## can take over and remain stable.
-    sleep(5000)
     let offset = 20000
     var nodes = makeCluster3(offset)
     defer: stopCluster(nodes)
@@ -267,7 +265,7 @@ suite "Preferred leader rebalancing — 3-node cluster":
       preferredLeader: 2,
     )
     discard nodes[metaLeader].store.raftPut(groupKey, groupRec.encode())
-    sleep(300)
+    sleep(TEST_POLL_INTERVAL_MS * 30) # 300ms
 
     # Force metadata refresh and group creation on all nodes
     for node in nodes:
@@ -278,7 +276,7 @@ suite "Preferred leader rebalancing — 3-node cluster":
     # Wait for group to be created automatically by metadata sync
     var groupCreated = false
     for attempt in 0 ..< 100:
-      sleep(100)
+      sleep(TEST_POLL_INTERVAL_MS)
       groupCreated = true
       for node in nodes:
         if not node.coord.hasGroup(testGid):
@@ -295,18 +293,18 @@ suite "Preferred leader rebalancing — 3-node cluster":
       node.store.triggerRebal.store(true)
 
     # Let rebalance task run and settle
-    sleep(5000)
+    sleep(TEST_REBALANCE_SETTLE_MS)
 
     # Wait up to 15 seconds for node 2 to become the stable leader.
     var preferredWon = false
-    for attempt in 0 ..< 150: # 150 * 100ms = 15s
-      sleep(100)
+    for attempt in 0 ..< 150: # 150 * 10ms = 1.5s
+      sleep(TEST_POLL_INTERVAL_MS)
       let leaderIdx = findLeader(nodes, testGid)
       if leaderIdx == 1: # node 2 is index 1
-        # Verify it stays leader for at least 3 seconds (no storm)
+        # Verify it stays leader for at least 300ms (no storm)
         var stable = true
-        for _ in 0 ..< 30:
-          sleep(100)
+        for _ in 0 ..< TEST_LEADER_STABILITY_CHECKS:
+          sleep(TEST_POLL_INTERVAL_MS)
           if findLeader(nodes, testGid) != 1:
             stable = false
             break
@@ -319,7 +317,6 @@ suite "Preferred leader rebalancing — 3-node cluster":
   test "non-preferred leader is replaced exactly once (no repeated stepdowns)":
     ## Verifies that once the preferred leader takes over, there are no
     ## further elections (the stepdown-election cycle is broken).
-    sleep(5000)
     let offset = 30000
     var nodes = makeCluster3(offset)
     defer: stopCluster(nodes)
@@ -348,7 +345,7 @@ suite "Preferred leader rebalancing — 3-node cluster":
       preferredLeader: 3,
     )
     discard nodes[metaLeader].store.raftPut(groupKey, groupRec.encode())
-    sleep(300)
+    sleep(TEST_POLL_INTERVAL_MS * 30) # 300ms
     for node in nodes:
       node.store.loadGroupMembers()
       node.store.bootstrapStore(@[testGid])
@@ -356,7 +353,7 @@ suite "Preferred leader rebalancing — 3-node cluster":
     # Wait for the group to be created automatically by metadata sync
     var groupCreated = false
     for attempt in 0 ..< 100:
-      sleep(100)
+      sleep(TEST_POLL_INTERVAL_MS)
       groupCreated = true
       for node in nodes:
         if not node.coord.hasGroup(testGid):
@@ -380,13 +377,13 @@ suite "Preferred leader rebalancing — 3-node cluster":
     for node in nodes:
       node.store.triggerRebal.store(true)
 
-    sleep(5000)
+    sleep(TEST_REBALANCE_SETTLE_MS)
 
     # Count how many times the leader changes
     var leaderChanges = 0
     var lastLeader = findLeader(nodes, testGid)
-    for _ in 0 ..< 200: # 200 * 100ms = 20s
-      sleep(100)
+    for _ in 0 ..< 200: # 200 * 10ms = 2s
+      sleep(TEST_POLL_INTERVAL_MS)
       let cur = findLeader(nodes, testGid)
       if cur != lastLeader and cur >= 0:
         inc leaderChanges
@@ -395,8 +392,8 @@ suite "Preferred leader rebalancing — 3-node cluster":
       if cur == 2 and leaderChanges >= 1:
         # Let it run a bit more to ensure no further changes
         var extraChanges = 0
-        for _ in 0 ..< 50: # 5 more seconds
-          sleep(100)
+        for _ in 0 ..< 50: # 500ms
+          sleep(TEST_POLL_INTERVAL_MS)
           let c2 = findLeader(nodes, testGid)
           if c2 != 2 and c2 >= 0:
             inc extraChanges
