@@ -4,7 +4,8 @@
 # mapping, then runs INSERT/SELECT/UPDATE/DELETE SQL through the executor
 # to verify that data is correctly routed and merged across groups.
 
-import std/[unittest, options, os, strutils, tables, hashes, algorithm, sequtils, random]
+import std/[unittest, options, os, strutils, tables, hashes, algorithm,
+    sequtils, random]
 import fractio/client/fractio_client
 import fractio/client/sql_client
 import fractio/protocol/server
@@ -41,7 +42,8 @@ proc nextBasePort(): int =
   testBasePort += 100
 
 proc createMultiGroupTestStore(testDir: string,
-    groupCount: int): tuple[client: FractioClient, server: ProtocolServer, store: RaftKVStoreExt] =
+    groupCount: int): tuple[client: FractioClient, server: ProtocolServer,
+        store: RaftKVStoreExt] =
   ## Create a store with 1 meta range + N space groups.
   ## Seeds sys.spaces and sys.tables so the executor can resolve space routing.
   cleanDir(testDir)
@@ -101,31 +103,34 @@ proc createMultiGroupTestStore(testDir: string,
 
   # Seed space record (binary)
 
-  # Seed system tables for client routing
+  # Seed system tables via batch write for efficiency
   let nodeRec = NodeRecord(
     nodeId: 1, host: "127.0.0.1", raftPort: basePort.uint16,
     clientPort: clientPort.uint16, status: nsAlive
   )
-  discard store.sysTablePut(encodeTableKey(SYS_NODES_TABLE_ID, "1"), encode(nodeRec))
-
   let metaGroupRec = GroupRecord(
     groupId: 1, spaceId: 0, leader: 1,
     replicas: @[GroupReplicaBin(nodeId: 1, replicaType: rtVoter)]
   )
-  discard store.sysTablePut(encodeTableKey(SYS_GROUPS_TABLE_ID, "1"), encode(metaGroupRec))
-
   let dataGroupRec = GroupRecord(
     groupId: 2, spaceId: 1, leader: 1,
     replicas: @[GroupReplicaBin(nodeId: 1, replicaType: rtVoter)]
   )
-  discard store.sysTablePut(encodeTableKey(SYS_GROUPS_TABLE_ID, "2"), encode(dataGroupRec))
-
+  var sysTableWrites: seq[tuple[key: string, value: string]] = @[
+    (key: encodeTableKey(SYS_NODES_TABLE_ID, "1"), value: encode(nodeRec)),
+    (key: encodeTableKey(SYS_GROUPS_TABLE_ID, "1"), value: encode(
+        metaGroupRec)),
+    (key: encodeTableKey(SYS_GROUPS_TABLE_ID, "2"), value: encode(dataGroupRec))
+  ]
+  # Add space group records
   for gid in groupIds:
     let spaceGroupRec = GroupRecord(
       groupId: uint64(gid), spaceId: 2, leader: 1,
       replicas: @[GroupReplicaBin(nodeId: 1, replicaType: rtVoter)]
     )
-    discard store.sysTablePut(encodeTableKey(SYS_GROUPS_TABLE_ID, $gid), encode(spaceGroupRec))
+    sysTableWrites.add((key: encodeTableKey(SYS_GROUPS_TABLE_ID, $gid),
+        value: encode(spaceGroupRec)))
+  discard store.sysTablePutBatch(sysTableWrites)
 
   let spaceKey = encodeSpaceKey(2)
   var groupIdsSeq: seq[uint64] = @[]

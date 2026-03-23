@@ -43,7 +43,7 @@ proc makeTestEnv(suiteName: string): tuple[
   let randomId = $rand(10000..99999)
   let testDir = "/tmp/fractio_sql_txn_" & suiteName & "_" & randomId
   cleanDir(testDir)
-  
+
   let nodeId = rangeTypes.NodeID(1)
   let raftBasePort = nextBasePort()
   let clientPort = nextBasePort()
@@ -71,24 +71,25 @@ proc makeTestEnv(suiteName: string): tuple[
   let raftStore = newRaftKVStoreExt(coord, proposeTimeoutMs = 2000)
   raftStore.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
 
-  # Seed system tables via sysTablePut to ensure valid headers
+  # Seed system tables via batch write for efficiency
   let nodeRec = NodeRecord(
     nodeId: 1, host: "127.0.0.1", raftPort: raftBasePort.uint16,
     clientPort: clientPort.uint16, status: nsAlive
   )
-  discard raftStore.sysTablePut(encodeTableKey(SYS_NODES_TABLE_ID, "1"), encode(nodeRec))
-
   let metaGroupRec = GroupRecord(
     groupId: 1, spaceId: 0, leader: 1,
     replicas: @[GroupReplicaBin(nodeId: 1, replicaType: rtVoter)]
   )
-  discard raftStore.sysTablePut(encodeTableKey(SYS_GROUPS_TABLE_ID, "1"), encode(metaGroupRec))
-
   let dataGroupRec = GroupRecord(
     groupId: 2, spaceId: 1, leader: 1,
     replicas: @[GroupReplicaBin(nodeId: 1, replicaType: rtVoter)]
   )
-  discard raftStore.sysTablePut(encodeTableKey(SYS_GROUPS_TABLE_ID, "2"), encode(dataGroupRec))
+  discard raftStore.sysTablePutBatch(@[
+    (key: encodeTableKey(SYS_NODES_TABLE_ID, "1"), value: encode(nodeRec)),
+    (key: encodeTableKey(SYS_GROUPS_TABLE_ID, "1"), value: encode(
+        metaGroupRec)),
+    (key: encodeTableKey(SYS_GROUPS_TABLE_ID, "2"), value: encode(dataGroupRec))
+  ])
 
   let txnMgr = newTransactionManager()
   let mvccStore = newMvccTransactionStore(raftStore, txnMgr, nil)
@@ -112,7 +113,8 @@ proc makeTestEnv(suiteName: string): tuple[
 
   result = (client, server, testDir)
 
-proc teardownTestEnv(client: FractioClient, server: ProtocolServer, testDir: string) =
+proc teardownTestEnv(client: FractioClient, server: ProtocolServer,
+    testDir: string) =
   if client != nil: client.close()
   if server != nil:
     server.stop()
@@ -150,7 +152,7 @@ suite "SQL Transactions - Basic Flow":
     defer: teardownTestEnv(client, server, testDir)
 
     discard client.query("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
-    
+
     # Each INSERT runs in its own implicit txn
     let res1 = client.query("INSERT INTO users (id, name) VALUES (1, 'Alice')")
     check res1.kind == erkModified
@@ -167,23 +169,23 @@ suite "SQL Transactions - Data Isolation":
     defer: teardownTestEnv(client, server, testDir)
 
     discard client.query("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
-    
+
     discard client.query("BEGIN")
     discard client.query("INSERT INTO users (id, name) VALUES (1, 'Alice')")
-    
+
     # Should see its own insert
     let res = client.query("SELECT * FROM users WHERE id = 1")
     check res.kind == erkRows
     check res.rows.len == 1
     check res.rows[0][1] == "Alice"
-    
+
     discard client.query("COMMIT")
 
   test "Snapshot Isolation (Dirty Read prevention)":
     let (client1, server, testDir) = makeTestEnv("isolation_dirty_read")
     let client2 = newFractioClient("127.0.0.1", server.config.port)
     doAssert client2.initialize()
-    defer: 
+    defer:
       client1.close()
       client2.close()
       server.stop()
@@ -191,17 +193,17 @@ suite "SQL Transactions - Data Isolation":
       try: removeDir(testDir) except: discard
 
     discard client1.query("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
-    
+
     discard client1.query("BEGIN")
     discard client1.query("INSERT INTO users (id, name) VALUES (1, 'Alice')")
-    
+
     # Other client should NOT see uncommitted insert
     let res = client2.query("SELECT * FROM users WHERE id = 1")
     check res.kind == erkRows
     check res.rows.len == 0
-    
+
     discard client1.query("COMMIT")
-    
+
     # Now it should be visible
     let res2 = client2.query("SELECT * FROM users WHERE id = 1")
     check res2.rows.len == 1
@@ -211,7 +213,7 @@ suite "SQL Transactions - Conflict Detection":
     let (client1, server, testDir) = makeTestEnv("ww_conflict")
     let client2 = newFractioClient("127.0.0.1", server.config.port)
     doAssert client2.initialize()
-    defer: 
+    defer:
       client1.close()
       client2.close()
       server.stop()
@@ -220,20 +222,20 @@ suite "SQL Transactions - Conflict Detection":
 
     discard client1.query("CREATE TABLE counter (id INT PRIMARY KEY, val INT)")
     discard client1.query("INSERT INTO counter (id, val) VALUES (1, 10)")
-    
+
     discard client1.query("BEGIN")
     discard client2.query("BEGIN")
-    
+
     # Client 1 updates
     discard client1.query("UPDATE counter SET val = 11 WHERE id = 1")
-    
+
     # Client 2 updates same row
     discard client2.query("UPDATE counter SET val = 12 WHERE id = 1")
-    
+
     # Client 1 commits first - should succeed
     let c1 = client1.query("COMMIT")
     check c1.kind == erkOk
-    
+
     # Client 2 commits - should fail with conflict
     let c2 = client2.query("COMMIT")
     check c2.kind == erkError
@@ -246,12 +248,12 @@ suite "SQL Transactions - Complex Scenarios":
 
     discard client.query("CREATE TABLE accounts (id INT PRIMARY KEY, balance INT)")
     discard client.query("INSERT INTO accounts (id, balance) VALUES (1, 1000), (2, 500)")
-    
+
     discard client.query("BEGIN")
     discard client.query("UPDATE accounts SET balance = balance - 100 WHERE id = 1")
     discard client.query("UPDATE accounts SET balance = balance + 100 WHERE id = 2")
     discard client.query("COMMIT")
-    
+
     let res1 = client.query("SELECT balance FROM accounts WHERE id = 1")
     check res1.rows[0][0] == "900"
     let res2 = client.query("SELECT balance FROM accounts WHERE id = 2")
@@ -263,10 +265,10 @@ suite "SQL Transactions - Complex Scenarios":
 
     discard client.query("CREATE TABLE accounts (id INT PRIMARY KEY, balance INT)")
     discard client.query("INSERT INTO accounts (id, balance) VALUES (1, 1000)")
-    
+
     discard client.query("BEGIN")
     discard client.query("UPDATE accounts SET balance = 0 WHERE id = 1")
     discard client.query("ROLLBACK")
-    
+
     let res = client.query("SELECT balance FROM accounts WHERE id = 1")
     check res.rows[0][0] == "1000"

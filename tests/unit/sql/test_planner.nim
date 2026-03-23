@@ -66,7 +66,7 @@ proc createTestEnv(suiteName: string): tuple[client: FractioClient,
   let txnMgr = newTransactionManager()
   let mvccStore = newMvccTransactionStore(store, txnMgr, nil)
 
-  # Seed system tables via sysTablePut to ensure valid headers
+  # Seed system tables via batch write for efficiency
   let nodeRec = NodeRecord(
     nodeId: 1,
     host: "127.0.0.1",
@@ -74,23 +74,24 @@ proc createTestEnv(suiteName: string): tuple[client: FractioClient,
     clientPort: clientPort.uint16,
     status: nsAlive
   )
-  discard store.sysTablePut(encodeTableKey(SYS_NODES_TABLE_ID, "1"), encode(nodeRec))
-
   let metaGroupRec = GroupRecord(
     groupId: 1,
     spaceId: 0,
     leader: 1,
     replicas: @[GroupReplicaBin(nodeId: 1, replicaType: rtVoter)]
   )
-  discard store.sysTablePut(encodeTableKey(SYS_GROUPS_TABLE_ID, "1"), encode(metaGroupRec))
-
   let dataGroupRec = GroupRecord(
     groupId: 2,
     spaceId: 1,
     leader: 1,
     replicas: @[GroupReplicaBin(nodeId: 1, replicaType: rtVoter)]
   )
-  discard store.sysTablePut(encodeTableKey(SYS_GROUPS_TABLE_ID, "2"), encode(dataGroupRec))
+  discard store.sysTablePutBatch(@[
+    (key: encodeTableKey(SYS_NODES_TABLE_ID, "1"), value: encode(nodeRec)),
+    (key: encodeTableKey(SYS_GROUPS_TABLE_ID, "1"), value: encode(
+        metaGroupRec)),
+    (key: encodeTableKey(SYS_GROUPS_TABLE_ID, "2"), value: encode(dataGroupRec))
+  ])
 
   # Start ProtocolServer
   var srvConfig = defaultServerConfig()
