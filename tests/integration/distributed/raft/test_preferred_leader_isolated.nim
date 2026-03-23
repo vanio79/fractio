@@ -6,6 +6,7 @@ import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
 import fractio/distributed/meta/system_schemas
 import fractio/protocol/raft_store
+import ../../../test_config
 
 const TMP_DIR = "/tmp/fractio_pref_leader_iso_"
 
@@ -40,9 +41,9 @@ proc makeCluster3(portOffset: int = 0): seq[TestNode] =
       basePort: basePort,
       host: "127.0.0.1",
       dataDir: storagePath,
-      electionTimeoutLowerMs: 1000,
-      electionTimeoutUpperMs: 2000,
-      heartbeatIntervalMs: 500,
+      electionTimeoutLowerMs: TEST_ELECTION_TIMEOUT_LOWER_MS_MULTINODE,
+      electionTimeoutUpperMs: TEST_ELECTION_TIMEOUT_UPPER_MS_MULTINODE,
+      heartbeatIntervalMs: TEST_HEARTBEAT_INTERVAL_MS_MULTINODE,
     ))
 
     # Populate peerInfo so dynamic group creation knows peer ports
@@ -73,7 +74,7 @@ proc makeCluster3(portOffset: int = 0): seq[TestNode] =
         if n.coord.isLeader(gid): hasLeader = true; break
       if not hasLeader: allLeaders = false; break
     if allLeaders: break
-    sleep(100)
+    sleep(TEST_POLL_INTERVAL_MS)
 
   var leaderIdx = 0
   for i, n in nodes:
@@ -103,7 +104,7 @@ proc makeCluster3(portOffset: int = 0): seq[TestNode] =
     )
     discard nodes[leaderIdx].store.raftPut(key, groupRec.encode())
 
-  sleep(500)
+  sleep(TEST_REPLICATION_WAIT_MS * 5) # 500ms for replication
   nodes
 
 proc stopCluster(nodes: seq[TestNode]) =
@@ -145,7 +146,7 @@ proc waitForStableLeader(nodes: seq[TestNode], gid: GroupID,
     else:
       consecutiveAgreements = 0
     lastLeader = idx
-    sleep(100)
+    sleep(TEST_POLL_INTERVAL_MS)
   -1
 
 proc waitForLeader(nodes: seq[TestNode], gid: GroupID,
@@ -153,7 +154,7 @@ proc waitForLeader(nodes: seq[TestNode], gid: GroupID,
   for attempt in 0 ..< maxAttempts:
     let idx = getAgreedLeader(nodes, gid)
     if idx >= 0: return idx
-    sleep(100)
+    sleep(TEST_POLL_INTERVAL_MS)
   -1
 
 suite "Preferred leader isolated test":
@@ -179,13 +180,13 @@ suite "Preferred leader isolated test":
     )
     discard nodes[metaLeader].store.raftPut(groupKey, groupRec.encode())
 
-    sleep(1000)
+    sleep(TEST_POLL_INTERVAL_MS * 100) # 1s for group metadata to propagate
     for node in nodes: node.store.loadGroupMembers()
 
     # Wait for dynamic group creation
     var groupCreated = false
     for attempt in 0 ..< 100:
-      sleep(100)
+      sleep(TEST_POLL_INTERVAL_MS)
       groupCreated = true
       for node in nodes:
         if not node.coord.hasGroup(testGid):
@@ -207,7 +208,7 @@ suite "Preferred leader isolated test":
 
     # Trigger rebalance
     for node in nodes: node.store.triggerRebal.store(true)
-    sleep(5000)
+    sleep(TEST_REBALANCE_SETTLE_MS)
 
     # Wait for leadership to stabilize on preferred leader (node 3, index 2)
     let finalLeader = waitForStableLeader(nodes, testGid, maxAttempts = 300,
