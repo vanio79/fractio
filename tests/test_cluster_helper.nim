@@ -44,14 +44,15 @@ type
   TestClusterConfig* = object
     ## Configuration for a test cluster
     nodeCount*: int
-    basePort*: int         ## Starting port (each node uses basePort + (nodeId-1)*1000)
-    portOffset*: int       ## Additional offset to avoid port conflicts between tests
-    preferredLeader*: uint32 ## Which node should be preferred leader (default: 1)
+    basePort*: int               ## Starting port (each node uses basePort + (nodeId-1)*1000)
+    portOffset*: int             ## Additional offset to avoid port conflicts between tests
+    preferredLeader*: uint32     ## Which node should be preferred leader (default: 1)
     electionTimeoutLowerMs*: int32
     electionTimeoutUpperMs*: int32
     heartbeatIntervalMs*: int32
-    parallelStartup*: bool ## Create nodes in parallel (default: true)
-    seedSystemTables*: bool ## Automatically seed sys.nodes and sys.groups (default: true)
+    parallelStartup*: bool       ## Create nodes in parallel (default: true)
+    parallelGroupCreation*: bool ## Create groups in parallel (default: true)
+    seedSystemTables*: bool      ## Automatically seed sys.nodes and sys.groups (default: true)
 
   TestNode* = object
     ## A single test node with its coordinator and store
@@ -87,6 +88,7 @@ proc defaultTestClusterConfig*(): TestClusterConfig =
     electionTimeoutUpperMs: TEST_ELECTION_TIMEOUT_UPPER_MS_MULTINODE,
     heartbeatIntervalMs: TEST_HEARTBEAT_INTERVAL_MS_MULTINODE,
     parallelStartup: true,
+    parallelGroupCreation: true,
     seedSystemTables: true
   )
 
@@ -170,21 +172,24 @@ proc newTestNode(
 proc createGroups(node: var TestNode, members: seq[MemberInfo],
     config: TestClusterConfig): bool =
   ## Create META and DATA groups for a node.
+  ## Uses parallel creation if config.parallelGroupCreation is true.
 
   let preferredLeader = if config.preferredLeader >
       0: config.preferredLeader else: 0'u32
 
-  # Create META group
-  if not node.coord.createAndStartGroup(META_GROUP_ID, members,
-      preferredLeader):
-    return false
-
-  # Create DATA group
-  if not node.coord.createAndStartGroup(DATA_GROUP_START_ID, members,
-      preferredLeader):
-    return false
-
-  return true
+  if config.parallelGroupCreation:
+    # Create both groups in parallel for faster startup
+    return node.coord.createAndStartGroupsParallel(
+      @[META_GROUP_ID, DATA_GROUP_START_ID], members, preferredLeader)
+  else:
+    # Sequential creation (fallback for debugging)
+    if not node.coord.createAndStartGroup(META_GROUP_ID, members,
+        preferredLeader):
+      return false
+    if not node.coord.createAndStartGroup(DATA_GROUP_START_ID, members,
+        preferredLeader):
+      return false
+    return true
 
 proc createStore(node: var TestNode): bool =
   ## Create and bootstrap the RaftKVStoreExt for a node.

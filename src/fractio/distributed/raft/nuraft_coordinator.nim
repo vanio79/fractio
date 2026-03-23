@@ -12,6 +12,7 @@ import std/options
 import std/os
 import std/strutils
 import std/tables
+import std/typedthreads
 import std/logging
 
 import fractio/distributed/raft/c_bindings
@@ -479,6 +480,82 @@ proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
        "groupId", $groupId, "port", $myPort, "members", $members.len)
 
   return true
+
+# ============================================================================
+# Parallel Group Creation
+# ============================================================================
+
+type
+  GroupCreationArg = object
+    ## Thread argument for parallel group creation.
+    ## Uses raw pointer for coordinator to avoid GC cross-thread issues.
+    coord: pointer
+    groupId: GroupID
+    members: seq[tuple[nodeId: uint32, host: string, basePort: int]]
+    preferredLeader: uint32
+    success: bool
+
+proc groupCreationWorker(arg: ptr GroupCreationArg) {.thread.} =
+  ## Worker thread for creating a single Raft group.
+  let coord = cast[NuRaftCoordinator](arg.coord)
+  arg.success = coord.createAndStartGroup(
+    arg.groupId, arg.members, arg.preferredLeader)
+
+proc createAndStartGroupsParallel*(c: NuRaftCoordinator,
+    groupIds: openArray[GroupID],
+    members: seq[tuple[nodeId: uint32, host: string, basePort: int]],
+    preferredLeader: uint32 = 0): bool =
+  ## Create and start multiple NuRaft instances in parallel.
+  ## This is faster than sequential creation for multiple groups (e.g., META + DATA).
+  ##
+  ## Parameters:
+  ##   groupIds: List of group IDs to create
+  ##   members: List of (nodeId, host, basePort) for all replicas
+  ##   preferredLeader: Optional preferred leader node ID
+  ##
+  ## Returns true if all groups were created successfully.
+  ## On partial failure, successfully created groups are left running.
+  if groupIds.len == 0:
+    return true
+
+  # Check for already-existing groups (must be done sequentially)
+  for gid in groupIds:
+    withLock c.groupsLock:
+      if c.groups.hasKey(gid):
+        # Already exists, skip this one
+        continue
+
+  if groupIds.len == 1:
+    # Single group - no need for parallelism
+    return c.createAndStartGroup(groupIds[0], members, preferredLeader)
+
+  # Create groups in parallel
+  var args = newSeq[GroupCreationArg](groupIds.len)
+  var threads = newSeq[Thread[ptr GroupCreationArg]](groupIds.len)
+
+  {.cast(raises: []).}:
+    for i, gid in groupIds:
+      args[i] = GroupCreationArg(
+        coord: cast[pointer](c),
+        groupId: gid,
+        members: members,
+        preferredLeader: preferredLeader,
+        success: false
+      )
+      createThread(threads[i], groupCreationWorker, addr args[i])
+
+    # Wait for all threads to complete
+    for t in threads.mitems:
+      joinThread(t)
+
+  # Check results
+  var allSuccess = true
+  for i, arg in args:
+    if not arg.success:
+      error("Failed to create group in parallel", "groupId", $groupIds[i])
+      allSuccess = false
+
+  return allSuccess
 
 proc removeGroup*(c: NuRaftCoordinator, groupId: GroupID) =
   ## Stop and remove a NuRaft group instance.
