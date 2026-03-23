@@ -411,6 +411,7 @@ proc waitForAllLeaders*(cluster: TestCluster): bool =
 
 proc seedSystemTables*(cluster: TestCluster) =
   ## Seed sys.nodes and sys.groups tables on the cluster.
+  ## Uses batch writes for efficiency.
   ## Must be called after leader election.
 
   let leaderIdx = cluster.findLeader(META_GROUP_ID)
@@ -420,7 +421,8 @@ proc seedSystemTables*(cluster: TestCluster) =
   let leader = cluster.nodes[leaderIdx]
   let config = cluster.config
 
-  # Seed sys.nodes
+  # Build batch of node records
+  var nodeWrites: seq[tuple[key: string, value: string]] = @[]
   for i, node in cluster.nodes:
     let key = encodeTableKey(SYS_NODES_TABLE_ID, $node.nodeId)
     let nodeRec = NodeRecord(
@@ -430,9 +432,10 @@ proc seedSystemTables*(cluster: TestCluster) =
       clientPort: uint16(19000 + i),
       status: nsAlive,
     )
-    discard leader.store.raftPut(key, nodeRec.encode())
+    nodeWrites.add((key: key, value: nodeRec.encode()))
 
-  # Seed sys.groups
+  # Build batch of group records
+  var groupWrites: seq[tuple[key: string, value: string]] = @[]
   for gid in [META_GROUP_ID, DATA_GROUP_START_ID]:
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
     var replicasSeq: seq[GroupReplicaBin] = @[]
@@ -444,7 +447,11 @@ proc seedSystemTables*(cluster: TestCluster) =
       replicas: replicasSeq,
       preferredLeader: config.preferredLeader,
     )
-    discard leader.store.raftPut(key, groupRec.encode())
+    groupWrites.add((key: key, value: groupRec.encode()))
+
+  # Write all records in batches (same timestamp for atomicity)
+  discard leader.store.sysTablePutBatch(nodeWrites)
+  discard leader.store.sysTablePutBatch(groupWrites)
 
   # Wait for state machine to catch up (need enough time for replication)
   sleep(TEST_REPLICATION_WAIT_MS * 4) # 400ms total
@@ -490,6 +497,25 @@ proc kvGet*(node: TestNode, key: string): Option[string] =
   if res.isOk and res.value.isSome:
     return some(res.value.get.value)
   none(string)
+
+proc sysTablePutBatch*(node: TestNode,
+    writes: openArray[tuple[key: string, value: string]]): bool =
+  ## Write multiple sys table entries atomically with MVCC encoding.
+  ## All entries get the same timestamp for atomicity.
+  ## Returns true on success, false on failure.
+  node.store.sysTablePutBatch(writes)
+
+proc sysTableDeleteBatch*(node: TestNode, keys: openArray[string]): bool =
+  ## Delete multiple sys table entries through Raft.
+  ## Returns true on success, false on failure.
+  node.store.sysTableDeleteBatch(keys)
+
+proc sysTablePutAndDeleteBatch*(node: TestNode,
+    puts: openArray[tuple[key: string, value: string]],
+    deletes: openArray[string]): bool =
+  ## Write and delete sys table entries atomically through Raft.
+  ## Returns true on success, false on failure.
+  node.store.sysTablePutAndDeleteBatch(puts, deletes)
 
 # ============================================================================
 # Shared Test Fixtures
