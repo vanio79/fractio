@@ -10,7 +10,7 @@
 ## This enables client-side SQL parsing, planning, and execution
 ## with direct KV operations to group leaders, avoiding internal rerouting.
 
-import std/[options, tables, sets, locks, atomics, strutils, hashes, algorithm]
+import std/[options, tables, sets, locks, atomics, strutils, hashes, algorithm, os]
 import posix
 import ../protocol/client
 import ../protocol/types
@@ -550,10 +550,18 @@ proc kvPut*(client: FractioClient, key, value: string,
 
   let groupId = client.getGroupForKey(key)
 
-  # Increase retries to handle leader election races
-  for attempt in 0 ..< 10:
+  # Retry with backoff to handle leader election races during group creation.
+  # New groups may need time for leader election, especially during CREATE SPACE.
+  const maxRetries = 20
+  const baseBackoffMs = 10
+
+  for attempt in 0 ..< maxRetries:
     let connOpt = client.getGroupLeaderConnection(groupId)
     if connOpt.isNone:
+      # No leader connection yet - group may still be initializing
+      if attempt < maxRetries - 1:
+        sleep(baseBackoffMs + attempt * 5) # Linear backoff: 10, 15, 20, ...ms
+        continue
       return kvVoidErr("no connection to group leader")
 
     let conn = connOpt.get()
@@ -566,7 +574,9 @@ proc kvPut*(client: FractioClient, key, value: string,
     if res.isErr and isNotLeaderError(res.error.msg):
       if not client.refreshGroupLeader(groupId):
         return kvVoidErr("failed to refresh group leader")
-      # Continue to retry
+      # Backoff before retry to allow leader election to complete
+      if attempt < maxRetries - 1:
+        sleep(baseBackoffMs + attempt * 5)
       continue
 
     let errMsg = if res.isOk: "put failed with status " & $res.value.status
