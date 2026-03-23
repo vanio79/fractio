@@ -10,8 +10,7 @@
 # Port allocation: 28000–28299 (NuRaft ASIO, basePort per node spaced by 100)
 # Temp storage: /tmp/fractio_rebal_<nodeId>/ (cleaned up per test)
 
-import std/[unittest, os, options, json, strutils, tables, hashes, algorithm,
-    times, locks]
+import std/[unittest, os, options, json, strutils, tables, locks]
 import fractio/protocol/raft_store
 import fractio/protocol/server
 import fractio/protocol/types
@@ -30,6 +29,9 @@ import fractio/storage/mvcc/types as mvccTypes
 import fractio/sql/executor
 import fractio/client/fractio_client
 import fractio/client/sql_client
+
+# Import optimized test configuration
+import ../../test_config
 
 
 
@@ -111,9 +113,9 @@ proc makeNode(nodeNum: int, basePort: int,
     basePort: basePort,
     host: "127.0.0.1",
     dataDir: storagePath,
-    electionTimeoutLowerMs: 200,
-    electionTimeoutUpperMs: 400,
-    heartbeatIntervalMs: 100,
+    electionTimeoutLowerMs: TEST_ELECTION_TIMEOUT_LOWER_MS,
+    electionTimeoutUpperMs: TEST_ELECTION_TIMEOUT_UPPER_MS,
+    heartbeatIntervalMs: TEST_HEARTBEAT_INTERVAL_MS,
   ))
 
   # Populate peerInfo so dynamic group creation knows peer ports
@@ -125,11 +127,11 @@ proc makeNode(nodeNum: int, basePort: int,
   # Create meta + data groups with retries
   for gid in [META_GROUP_ID, DATA_GROUP_START_ID]:
     var success = false
-    for attempt in 0 ..< 5:
+    for attempt in 0 ..< TEST_MAX_RETRY_ATTEMPTS:
       if coord.createAndStartGroup(gid, members):
         success = true
         break
-      sleep(200)
+      sleep(TEST_RETRY_BACKOFF_MS)
     if not success:
       raise newException(AssertionDefect, "Failed to create group " & $gid &
           " for node " & $nodeNum)
@@ -181,17 +183,17 @@ proc stopNode*(n: TestNode) =
   echo "=== stopNode ", n.id, " server stopped ==="
   n.coord.stop()
   echo "=== stopNode ", n.id, " coord stopped ==="
-  sleep(100) # Give LevelDB a moment to release its lock
+  sleep(TEST_SHUTDOWN_DELAY_MS) # Give LevelDB a moment to release its lock
   cleanDir(n.storagePath)
   echo "=== stopNode ", n.id, " done ==="
 
 proc waitForLeaderOnGroup(nodes: seq[TestNode], gid: GroupID,
-    maxAttempts: int = 50): int =
+    maxAttempts: int = TEST_MAX_LEADER_POLL_ATTEMPTS): int =
   for attempt in 0 ..< maxAttempts:
     for i, n in nodes:
       if n.coord.isLeader(gid):
         return i
-    sleep(100)
+    sleep(TEST_POLL_INTERVAL_MS)
   -1
 
 proc seedSysNodes(leaderStore: RaftKVStoreExt, nodes: seq[TestNode]) =
@@ -247,9 +249,9 @@ proc seedDefaults(leaderStore: RaftKVStoreExt) =
   discard leaderStore.raftPut(encodeSpaceKey(1), spaceRec.encode())
 
 proc waitForAutoDistribution(nodes: seq[TestNode], expectedGroupIds: seq[
-    uint64], replicaCount: int, maxWaitMs: int = 3000) =
+    uint64], replicaCount: int, maxWaitMs: int = 1500) =
   let expectedTotal = expectedGroupIds.len * replicaCount
-  let stepMs = 50
+  let stepMs = TEST_POLL_INTERVAL_MS
   var waited = 0
   while waited < maxWaitMs:
     var totalMemberships = 0
@@ -313,7 +315,7 @@ proc waitForSpaceLeaders(nodes: seq[TestNode]) =
               hasLeader = true
               break
           if hasLeader: break
-          sleep(100)
+          sleep(TEST_POLL_INTERVAL_MS)
       except: discard
 
 proc updateGroupLeaders(nodes: seq[TestNode]) =
@@ -401,13 +403,13 @@ proc makeCluster2(): seq[TestNode] =
   # Wait for leader election
   let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
   doAssert leaderIdx >= 0
-  sleep(200)
+  sleep(TEST_CLUSTER_STARTUP_MS)
 
   let allNums = @[1, 2]
   seedSysNodes(nodes[leaderIdx].store, nodes)
   seedSysGroups(nodes[leaderIdx].store, allNums)
   seedDefaults(nodes[leaderIdx].store)
-  sleep(400)
+  sleep(TEST_REPLICATION_WAIT_MS * 2)
   for i in 0 ..< nodes.len: initClient(nodes[i], nodes[leaderIdx].clientPort)
 
   # Load space caches
@@ -460,7 +462,7 @@ proc waitForNodeInSysNodes(store: RaftKVStoreExt, nodeId: int,
               discard
         except:
           discard
-    sleep(100)
+    sleep(TEST_POLL_INTERVAL_MS)
   false
 
 proc addNodeToCluster(nodes: var seq[TestNode], newNodeNum: int) =
@@ -572,17 +574,17 @@ proc execOnLeader(nodes: seq[TestNode], sql: string): ExecResult =
     return r
   exec(nodes[^1], sql)
 
-proc waitForMetadataReplication(nodes: seq[TestNode], timeoutMs: int = 2000) =
+proc waitForMetadataReplication(nodes: seq[TestNode], timeoutMs: int = 500) =
   ## Wait for Raft to replicate metadata to all nodes.
   ## Raft replication updates in-memory caches via applyBatchToSM callback.
   ## This just waits a bit for callbacks to fire on all nodes.
-  sleep(100) # Small delay for callbacks to process
+  sleep(TEST_REPLICATION_WAIT_MS) # Small delay for callbacks to process
 
 proc replicateMetadata(nodes: seq[TestNode]) =
   ## Deprecated: Use waitForMetadataReplication instead.
   ## This is now a no-op since Raft handles replication and applyBatchToSM
   ## updates in-memory caches automatically.
-  sleep(100) # Small delay for Raft callbacks to process
+  sleep(TEST_REPLICATION_WAIT_MS) # Small delay for Raft callbacks to process
 
 proc insertRows(nodes: seq[TestNode], spaceName: string, rowCount: int) =
   for i in 1 .. rowCount:
@@ -643,12 +645,12 @@ suite "Space rebalance integration — rebalanceSpaces":
 
     # Trigger rebalance
     leaderStore.rebalanceSpaces()
-    sleep(500)
-    sleep(500) # Give new groups time to initialize and elect leaders
+    sleep(TEST_REPLICATION_WAIT_MS)
+    sleep(TEST_REPLICATION_WAIT_MS) # Give new groups time to initialize and elect leaders
 
     # Verify: now rebalancing, 3 new groups, old groups preserved
     # Wait for Raft to replicate the space record update
-    sleep(1000)
+    sleep(TEST_REPLICATION_WAIT_MS * 2)
     leaderStore.loadSpaces() # Reload cache after Raft replication
 
     acquire(leaderStore.spacesMu)
@@ -668,7 +670,7 @@ suite "Space rebalance integration — rebalanceSpaces":
 
     addNodeToCluster(nodes, 3)
     leaderStore.rebalanceSpaces()
-    sleep(500)
+    sleep(TEST_REPLICATION_WAIT_MS)
     leaderStore.loadSpaces() # Reload cache after rebalance
 
     acquire(leaderStore.spacesMu)
@@ -677,7 +679,7 @@ suite "Space rebalance integration — rebalanceSpaces":
 
     # Call again — should not create more groups
     leaderStore.rebalanceSpaces()
-    sleep(500)
+    sleep(TEST_REPLICATION_WAIT_MS)
 
     acquire(leaderStore.spacesMu)
     let secondNewGroups = leaderStore.spaces[spaceId].groupIds
@@ -694,7 +696,7 @@ suite "Space rebalance integration — rebalanceSpaces":
 
     # Don't add any nodes — group count (2) == node count (2)
     leaderStore.rebalanceSpaces()
-    sleep(500)
+    sleep(TEST_REPLICATION_WAIT_MS)
 
     acquire(leaderStore.spacesMu)
     let sp = leaderStore.spaces[spaceId]
@@ -724,13 +726,13 @@ suite "Space rebalance integration — reads during migration":
     # Add 3rd node and trigger rebalance
     addNodeToCluster(nodes, 3)
     leaderStore.rebalanceSpaces()
-    sleep(500)
+    sleep(TEST_REPLICATION_WAIT_MS)
 
     # Wait for new groups and leaders
     acquire(leaderStore.spacesMu)
     let newGids = leaderStore.spaces[spaceId].groupIds
     release(leaderStore.spacesMu)
-    waitForAutoDistribution(nodes, newGids, 2, 3000)
+    waitForAutoDistribution(nodes, newGids, 2, 1500)
     waitForSpaceLeaders(nodes)
     replicateMetadata(nodes)
 
@@ -749,11 +751,11 @@ suite "Space rebalance integration — reads during migration":
 
     addNodeToCluster(nodes, 3)
     leaderStore.rebalanceSpaces()
-    sleep(500)
+    sleep(TEST_REPLICATION_WAIT_MS)
     acquire(leaderStore.spacesMu)
     let newGids = leaderStore.spaces[spaceId].groupIds
     release(leaderStore.spacesMu)
-    waitForAutoDistribution(nodes, newGids, 2, 3000)
+    waitForAutoDistribution(nodes, newGids, 2, 1500)
     waitForSpaceLeaders(nodes)
     replicateMetadata(nodes)
 
@@ -773,21 +775,21 @@ proc triggerRebalanceAndSetup(nodes: var seq[TestNode],
     leaderStore: RaftKVStoreExt, spaceId: int) =
   addNodeToCluster(nodes, 3)
   leaderStore.rebalanceSpaces()
-  sleep(1000) # Wait longer for Raft to replicate
+  sleep(TEST_REPLICATION_WAIT_MS * 2) # Wait for Raft to replicate
   leaderStore.loadSpaces() # Reload cache after rebalance
 
   acquire(leaderStore.spacesMu)
   let newGids = leaderStore.spaces[spaceId].groupIds
   release(leaderStore.spacesMu)
 
-  waitForAutoDistribution(nodes, newGids, 2, 5000)
+  waitForAutoDistribution(nodes, newGids, 2, 2000)
   waitForSpaceLeaders(nodes)
   # Refresh metadata with retries
   for n in nodes:
     for i in 0..<3:
       if n.client.refreshMetadata():
         break
-      sleep(100)
+      sleep(TEST_POLL_INTERVAL_MS)
   replicateMetadata(nodes)
 
 suite "Space rebalance integration — full migration":
@@ -811,7 +813,7 @@ suite "Space rebalance integration — full migration":
     # Run migration
     leaderStore.runRebalanceMigration(spaceId)
     # Wait for Raft to commit migration state changes
-    sleep(500)
+    sleep(TEST_REPLICATION_WAIT_MS)
 
     # Verify rebalance is complete - check in-memory cache directly
     acquire(leaderStore.spacesMu)
@@ -846,7 +848,7 @@ suite "Space rebalance integration — full migration":
 
     leaderStore.runRebalanceMigration(spaceId)
     # Wait for Raft to replicate and apply the changes
-    sleep(500)
+    sleep(TEST_REPLICATION_WAIT_MS)
 
     # Wait for leaders on all new space groups
     for gid in leaderStore.spaces[spaceId].groupIds:
@@ -857,7 +859,7 @@ suite "Space rebalance integration — full migration":
             foundLeader = true
             break
         if foundLeader: break
-        sleep(100)
+        sleep(TEST_POLL_INTERVAL_MS)
 
     for n in nodes: discard n.client.refreshMetadata()
     for i in 1 .. 20:
@@ -878,7 +880,7 @@ suite "Space rebalance integration — full migration":
 
     addNodeToCluster(nodes, 3)
     leaderStore.rebalanceSpaces()
-    sleep(500)
+    sleep(TEST_REPLICATION_WAIT_MS)
     leaderStore.loadSpaces() # Reload cache after rebalance
 
     acquire(leaderStore.spacesMu)
@@ -887,13 +889,13 @@ suite "Space rebalance integration — full migration":
     release(leaderStore.spacesMu)
     check oldGids.len > 0
 
-    waitForAutoDistribution(nodes, newGids, 2, 5000)
+    waitForAutoDistribution(nodes, newGids, 2, 2000)
     waitForSpaceLeaders(nodes)
     replicateMetadata(nodes)
 
     leaderStore.runRebalanceMigration(spaceId)
     # Wait for Raft to commit the group deletions
-    sleep(500)
+    sleep(TEST_REPLICATION_WAIT_MS)
 
     # Old groups should be removed from sys.groups
     for oldGid in oldGids:
@@ -919,12 +921,12 @@ suite "Space rebalance integration — crash safety":
 
     # Wait for the new node to be visible in sys.nodes on the leader
     # This ensures rebalanceSpaces will see the correct node count
-    sleep(500)
+    sleep(TEST_REPLICATION_WAIT_MS)
 
     leaderStore.rebalanceSpaces()
 
     # Wait for Raft to replicate the space record update
-    sleep(500)
+    sleep(TEST_REPLICATION_WAIT_MS)
 
     # Reload caches (simulates restart reading persisted state)
     leaderStore.loadSpaces()
@@ -958,7 +960,7 @@ suite "Space rebalance integration — crash safety":
             foundLeader = true
             break
         if foundLeader: break
-        sleep(100)
+        sleep(TEST_POLL_INTERVAL_MS)
 
     leaderStore.loadGroupMembers()
 
