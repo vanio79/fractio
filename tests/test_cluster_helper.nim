@@ -21,8 +21,7 @@
 #       let cluster = fixture.get()
 #       # use cluster...
 
-import std/[os, atomics, locks, tables, options]
-import std/strformat
+import std/[os, locks, tables, options]
 
 import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/group_types as rangeTypes
