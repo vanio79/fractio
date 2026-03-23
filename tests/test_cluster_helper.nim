@@ -6,13 +6,20 @@
 # Usage:
 #   import test_cluster_helper
 #
-#   var cluster = newTestCluster(TestClusterConfig(
-#     nodeCount: 3,
-#     parallelStartup: true
-#   ))
+#   # Per-test cluster (creates new cluster for each test)
+#   var cluster = newTestCluster(defaultTestClusterConfig())
 #   defer: cluster.stop()
 #
-#   let leaderIdx = cluster.waitForLeader(META_GROUP_ID)
+#   # Shared fixture (cluster shared across tests in a suite)
+#   var fixture = newSharedClusterFixture(defaultTestClusterConfig())
+#   suite "My tests":
+#     setup:
+#       fixture.setup()
+#     teardown:
+#       fixture.teardown()
+#     test "example":
+#       let cluster = fixture.get()
+#       # use cluster...
 
 import std/[os, atomics, locks, tables, options]
 import std/strformat
@@ -484,3 +491,134 @@ proc kvGet*(node: TestNode, key: string): Option[string] =
   if res.isOk and res.value.isSome:
     return some(res.value.get.value)
   none(string)
+
+# ============================================================================
+# Shared Test Fixtures
+# ============================================================================
+
+type
+  SharedClusterFixture* = ref object
+    ## A shared test fixture that allows multiple tests to reuse the same cluster.
+    ## This avoids the overhead of creating/destroying clusters between tests.
+    ##
+    ## Usage:
+    ##   var fixture = newSharedClusterFixture(defaultTestClusterConfig())
+    ##   suite "My tests":
+    ##     setup:
+    ##       fixture.setup()
+    ##     teardown:
+    ##       fixture.teardown()
+    ##     test "example 1":
+    ##       let cluster = fixture.get()
+    ##       # use cluster...
+    ##     test "example 2":
+    ##       let cluster = fixture.get()  # Same cluster, state persists
+    ##       # use cluster...
+    ##
+    ## The cluster is created lazily on first setup() and destroyed when
+    ## the fixture is garbage collected or stop() is called.
+    config: TestClusterConfig
+    cluster: TestCluster
+    initialized: bool
+    testCount: int
+    lock: Lock
+
+proc newSharedClusterFixture*(config: TestClusterConfig): SharedClusterFixture =
+  ## Create a new shared cluster fixture with the given configuration.
+  ## The cluster is not created until setup() is called.
+  result = SharedClusterFixture(
+    config: config,
+    initialized: false,
+    testCount: 0
+  )
+  initLock(result.lock)
+
+proc setup*(fixture: SharedClusterFixture) =
+  ## Setup for each test. Creates the cluster on first call.
+  ## Subsequent calls return the same cluster.
+  withLock fixture.lock:
+    if not fixture.initialized:
+      fixture.cluster = newTestCluster(fixture.config)
+      fixture.initialized = true
+    inc fixture.testCount
+
+proc teardown*(fixture: SharedClusterFixture) =
+  ## Teardown for each test. Currently a no-op since the cluster is shared.
+  ## Override this in your tests if you need per-test cleanup.
+  discard
+
+proc get*(fixture: SharedClusterFixture): var TestCluster =
+  ## Get the shared cluster. Must call setup() first.
+  doAssert fixture.initialized, "Fixture not initialized - call setup() first"
+  fixture.cluster
+
+proc stop*(fixture: SharedClusterFixture) =
+  ## Stop the shared cluster and clean up.
+  withLock fixture.lock:
+    if fixture.initialized:
+      fixture.cluster.stop()
+      fixture.initialized = false
+
+proc isInitialized*(fixture: SharedClusterFixture): bool =
+  ## Check if the fixture has been initialized.
+  withLock fixture.lock:
+    result = fixture.initialized
+
+proc reset*(fixture: SharedClusterFixture) =
+  ## Reset the cluster by stopping and recreating it.
+  ## Use this if tests corrupt the cluster state.
+  withLock fixture.lock:
+    if fixture.initialized:
+      fixture.cluster.stop()
+    fixture.cluster = newTestCluster(fixture.config)
+    fixture.initialized = true
+
+# ============================================================================
+# Test State Isolation Helpers
+# ============================================================================
+
+proc clearTestData*(cluster: var TestCluster) =
+  ## Clear all user data from the cluster, keeping system tables.
+  ## Use this between tests to isolate test data while reusing the cluster.
+  for node in cluster.nodes.mitems:
+    # Clear any user-created groups (keep META and DATA_GROUP_START)
+    var groupsToRemove: seq[GroupID] = @[]
+    for gid, _ in node.coord.groups:
+      if gid != META_GROUP_ID and gid != DATA_GROUP_START_ID:
+        groupsToRemove.add(gid)
+    for gid in groupsToRemove:
+      node.coord.removeGroup(gid)
+
+proc reseedSystemTables*(cluster: var TestCluster) =
+  ## Re-seed system tables after clearing or modifying cluster state.
+  cluster.seedSystemTables()
+
+# ============================================================================
+# Test Suite Template
+# ============================================================================
+
+template sharedClusterSuite*(suiteName: string, config: TestClusterConfig,
+                             body: untyped): untyped =
+  ## Template to create a test suite with a shared cluster fixture.
+  ## The cluster is created once and shared across all tests in the suite.
+  ##
+  ## Usage:
+  ##   sharedClusterSuite("My Cluster Tests", defaultTestClusterConfig()):
+  ##     test "first test":
+  ##       let cluster = fixture.get()
+  ##       # ...
+  ##     test "second test":
+  ##       let cluster = fixture.get()
+  ##       # ... (same cluster, state persists from first test)
+  ##
+  ## If you need isolated state between tests, call fixture.reset() in setup.
+  var fixture {.global.} = newSharedClusterFixture(config)
+
+  suite suiteName:
+    setup:
+      fixture.setup()
+
+    teardown:
+      fixture.teardown()
+
+    body
