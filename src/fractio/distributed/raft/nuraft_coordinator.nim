@@ -12,6 +12,7 @@ import std/options
 import std/os
 import std/strutils
 import std/tables
+import std/times
 import std/typedthreads
 import std/logging
 
@@ -66,6 +67,13 @@ type
 
   NuRaftGroupInstancePtr* = ptr NuRaftGroupInstance
 
+  GroupCreationRequest = object
+    ## Request to create a Raft group asynchronously.
+    groupId*: GroupID
+    members*: seq[tuple[nodeId: uint32, host: string, basePort: int]]
+    preferredLeader*: uint32
+    storePtr*: pointer ## RaftKVStoreExt for registerGroup call
+
   NuRaftCoordinator* = ref object
     nodeId*: NodeID
     basePort*: int
@@ -89,6 +97,13 @@ type
     ## Peer info cache: nodeId → (host, basePort)
     ## Updated when nodes join/leave.
     peerInfo*: Table[uint32, tuple[host: string, basePort: int]]
+
+    ## Async group creation queue (to avoid blocking NuRaft ASIO thread)
+    groupCreationQueue*: seq[GroupCreationRequest]
+    groupCreationLock*: Lock
+    groupCreationThread*: Thread[pointer]
+    groupCreationRunning*: Atomic[bool]
+    groupCreationPending*: Atomic[int32] ## Number of groups being created
 
 # Use C malloc/free to avoid atomicArc cross-thread dealloc crashes.
 # NuRaftGroupInstance may be allocated on NuRaft ASIO threads (via
@@ -132,6 +147,10 @@ var onLeaderChanged*: proc(storePtr: pointer, groupId: GroupID,
 var getPreferredLeaderCallback*: proc(storePtr: pointer,
     groupId: GroupID): Option[NodeID] {.gcsafe, raises: [].} = nil
 
+## Called when a group is successfully created asynchronously.
+var onGroupCreatedCallback*: proc(storePtr: pointer, groupId: GroupID) {.gcsafe,
+    raises: [].} = nil
+
 proc clearModuleCallbacks*() {.gcsafe, raises: [].} =
   ## Clear all module-level callbacks to prevent stale closures from being
   ## invoked after shutdown. Must be called before coordinator.stop().
@@ -141,6 +160,7 @@ proc clearModuleCallbacks*() {.gcsafe, raises: [].} =
     onGroupMetadataApplied = nil
     onLeaderChanged = nil
     getPreferredLeaderCallback = nil
+    onGroupCreatedCallback = nil
 
 # ============================================================================
 # WriteBatch Serialization (Binary)
@@ -276,7 +296,10 @@ proc newNuRaftCoordinator*(config: CoordinatorConfig): NuRaftCoordinator =
   if result.heartbeatIntervalMs == 0: result.heartbeatIntervalMs = 500
   result.kvStorePtr = nil
   result.running.store(false)
+  result.groupCreationRunning.store(false)
+  result.groupCreationPending.store(0)
   initLock(result.groupsLock)
+  initLock(result.groupCreationLock)
 
   # Open WiscKey backend
   let wbs = if config.writeBufferSize > 0: config.writeBufferSize
@@ -292,9 +315,42 @@ proc newNuRaftCoordinator*(config: CoordinatorConfig): NuRaftCoordinator =
   if not result.store.open(storeCfg):
     raise newException(CatchableError, "Failed to open storage backend")
 
+# Forward declaration for use in the async worker thread
+proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
+    members: seq[tuple[nodeId: uint32, host: string, basePort: int]],
+    preferredLeader: uint32 = 0): bool
+
 proc start*(c: NuRaftCoordinator) =
   ## Start the coordinator. Groups are started individually via createAndStartGroup.
   c.running.store(true)
+  c.groupCreationRunning.store(true)
+  # Start the async group creation worker thread
+  createThread(c.groupCreationThread, proc(p: pointer) {.thread, gcsafe.} =
+    let coord = cast[NuRaftCoordinator](p)
+    while coord.groupCreationRunning.load():
+      var requests: seq[GroupCreationRequest] = @[]
+      withLock coord.groupCreationLock:
+        if coord.groupCreationQueue.len > 0:
+          requests = coord.groupCreationQueue
+          coord.groupCreationQueue = @[]
+          # Track pending count
+          discard coord.groupCreationPending.fetchAdd(int32(requests.len))
+
+      for req in requests:
+        if not coord.groupCreationRunning.load(): break
+        {.cast(gcsafe).}:
+          let ok = coord.createAndStartGroup(req.groupId, req.members,
+              req.preferredLeader)
+          if ok and req.storePtr != nil:
+            # Notify that group was created
+            if onGroupCreatedCallback != nil:
+              onGroupCreatedCallback(req.storePtr, req.groupId)
+        # Decrement pending count after processing
+        discard coord.groupCreationPending.fetchAdd(-1)
+
+      # Poll interval for new requests
+      sleep(50)
+  , cast[pointer](c))
 
 proc shutdownGroupInstance(inst: NuRaftGroupInstancePtr) {.thread.} =
   discard nuraftLauncherShutdown(inst.launcher, 3)
@@ -303,6 +359,10 @@ proc stop*(c: NuRaftCoordinator) =
   ## Stop all NuRaft instances and close the storage backend.
   if not c.running.load: return
   c.running.store(false)
+
+  # Stop the async group creation worker
+  c.groupCreationRunning.store(false)
+  joinThread(c.groupCreationThread)
 
   # Mark all instances as stopped to prevent callbacks from accessing
   # freed coordinator memory.
@@ -336,6 +396,37 @@ proc stop*(c: NuRaftCoordinator) =
 
   if c.store != nil:
     c.store.close()
+
+proc queueGroupCreation*(c: NuRaftCoordinator, groupId: GroupID,
+    members: seq[tuple[nodeId: uint32, host: string, basePort: int]],
+    preferredLeader: uint32 = 0, storePtr: pointer = nil) =
+  ## Queue a group creation request to be processed asynchronously.
+  ## This is safe to call from NuRaft's ASIO thread without blocking.
+  ## storePtr is the RaftKVStoreExt for registerGroup callback.
+  withLock c.groupCreationLock:
+    c.groupCreationQueue.add(GroupCreationRequest(
+      groupId: groupId,
+      members: members,
+      preferredLeader: preferredLeader,
+      storePtr: storePtr
+    ))
+
+proc waitForGroupCreationQueue*(c: NuRaftCoordinator,
+    timeoutMs: int = 5000): bool =
+  ## Wait for the group creation queue to be empty AND no pending creations.
+  ## Returns true if queue is empty and no pending, false if timeout.
+  let startMs = getTime().toUnixFloat() * 1000
+  while true:
+    var queueLen = 0
+    withLock c.groupCreationLock:
+      queueLen = c.groupCreationQueue.len
+    let pending = c.groupCreationPending.load()
+    if queueLen == 0 and pending == 0:
+      return true
+    let nowMs = getTime().toUnixFloat() * 1000
+    if nowMs - startMs > timeoutMs.float:
+      return false
+    sleep(10)
 
 # ============================================================================
 # Group Management

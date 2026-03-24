@@ -259,6 +259,10 @@ proc seedDefaults(leaderStore: RaftKVStoreExt) =
 
 proc waitForAutoDistribution(nodes: seq[TestNode], expectedGroupIds: seq[
     uint64], replicaCount: int, maxWaitMs: int = 1500) =
+  # First, wait for all async group creation queues to be empty
+  for node in nodes:
+    discard node.coord.waitForGroupCreationQueue(maxWaitMs)
+
   let expectedTotal = expectedGroupIds.len * replicaCount
   let stepMs = TEST_POLL_INTERVAL_MS
   var waited = 0

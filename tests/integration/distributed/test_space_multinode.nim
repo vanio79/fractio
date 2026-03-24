@@ -315,6 +315,10 @@ proc waitForAutoDistribution(nodes: seq[TestNode], expectedGroupIds: seq[
   ## Wait for the onGroupMetadataApplied callback to create space groups on
   ## all peer nodes. Polls until the expected total membership count is reached
   ## or the timeout expires.
+  # First, wait for all async group creation queues to be empty
+  for node in nodes:
+    discard node.coord.waitForGroupCreationQueue(maxWaitMs)
+
   let expectedTotal = expectedGroupIds.len * replicaCount
   let stepMs = TEST_POLL_INTERVAL_MS
   var waited = 0
@@ -471,13 +475,13 @@ proc makeCluster5(): seq[TestNode] =
   # Wait for leader election to stabilize
   sleep(TEST_CLUSTER_STARTUP_MS)
 
-  # Wait for leader election on meta + data groups
-  let metaLeader = waitForLeaderOnGroup(nodes, META_GROUP_ID,
-      maxAttempts = TEST_MAX_LEADER_POLL_ATTEMPTS)
+  # Wait for a READY leader on meta group (one that can accept writes)
+  let metaLeader = waitForReadyLeader(nodes, META_GROUP_ID,
+      maxAttempts = TEST_MAX_READY_POLL_ATTEMPTS)
   doAssert metaLeader >= 0, "No meta leader elected"
 
-  discard waitForLeaderOnGroup(nodes, DATA_GROUP_START_ID,
-      maxAttempts = TEST_MAX_LEADER_POLL_ATTEMPTS)
+  discard waitForReadyLeader(nodes, DATA_GROUP_START_ID,
+      maxAttempts = TEST_MAX_READY_POLL_ATTEMPTS)
 
   # Seed system tables with retry logic (finds leader before each write)
   let allNums = @[1, 2, 3, 4, 5]
@@ -521,6 +525,13 @@ suite "Space multinode — CREATE SPACE creates real Raft groups":
     check res.kind == erkOk
     if res.kind == erkOk:
       check "5 groups" in res.okMessage
+
+    # Wait for async group creation to complete
+    for node in nodes:
+      discard node.coord.waitForGroupCreationQueue(3000)
+
+    # Brief wait for leaders to be elected
+    sleep(TEST_ELECTION_SETTLE_MS)
 
     # With RF=3, the leader (node 1) has groups it's a member of.
     var leaderGroupCount = 0

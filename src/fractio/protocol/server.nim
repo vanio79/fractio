@@ -1390,28 +1390,41 @@ proc handleBuiltinCluster(server: ProtocolServer, conn: ClientConnection,
 
   of uint16(mtCreateSpace):
     # Handle CREATE SPACE - requires SpaceManager
+    server.logger.logInfo("mtCreateSpace: handler called")
     if server.spaceManager.isNil:
+      server.logger.logError("mtCreateSpace: spaceManager is nil")
       sendError(conn, requestId, ErrInternal, ErrCatSystem,
         "space manager not initialized")
       return
     let reqR = decodeCreateSpaceRequest(payload)
     if reqR.isErr:
+      server.logger.logError("mtCreateSpace: failed to decode request: " & $reqR.error)
       sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
       return
+    server.logger.logInfo("mtCreateSpace: request decoded, calling createSpace")
     # Execute with error protection
     var resp: spaceMsgs.CreateSpaceResponse
     try:
       resp = server.spaceManager.createSpace(reqR.value)
+      server.logger.logInfo("mtCreateSpace: createSpace returned, success=" & $resp.success)
     except Exception as e:
+      server.logger.logError("mtCreateSpace: exception: " & e.msg)
       resp = spaceMsgs.CreateSpaceResponse(
         success: false,
         error: "internal error: " & e.msg
+      )
+    except Defect as e:
+      server.logger.logError("mtCreateSpace: DEFECT: " & $e.name & " - " & e.msg)
+      resp = spaceMsgs.CreateSpaceResponse(
+        success: false,
+        error: "internal defect: " & e.msg
       )
     # Check for NOT_LEADER error and include redirect info
     if not resp.success and isNotLeaderError(resp.error):
       let redirect = server.getLeaderRedirect(META_GROUP_ID)
       sendNotLeaderError(conn, requestId, resp.error, redirect)
     else:
+      server.logger.logInfo("mtCreateSpace: sending response frame")
       sendFrame(conn, encodeCreateSpaceResponse(resp), requestId)
 
   of uint16(mtDropSpace):

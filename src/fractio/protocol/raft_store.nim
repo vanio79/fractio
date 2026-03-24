@@ -823,23 +823,23 @@ proc wireApplyCallback*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
                 break
 
             if isMember:
-              let ok = coord.createAndStartGroup(gid, members, preferredLeader)
-              if ok:
-                s.registerGroup(gid)
-              else:
-                # This is a real error - we ARE a member but couldn't create the group
-                try:
-                  {.cast(gcsafe).}:
-                    error("Failed to create group (member node, possible port conflict)",
-                          {"groupId": $gid.uint64,
-                              "nodeId": $coord.nodeId.uint32}.toTable)
-                except:
-                  discard
+              # Use async queue instead of blocking createAndStartGroup
+              # The callback runs on NuRaft's ASIO thread and must not block
+              coord.queueGroupCreation(gid, members, preferredLeader, storePtr)
 
           # Refresh caches in background
           s.triggerRebal.store(true)
         except:
           discard
+
+    # --- Async group creation callback ---
+    nuraft_coordinator.onGroupCreatedCallback = proc(
+        storePtr: pointer, groupId: GroupID) {.gcsafe, raises: [].} =
+      ## Called when a group is successfully created asynchronously.
+      if storePtr == nil: return
+      let s = cast[RaftKVStoreExt](storePtr)
+      s.registerGroup(groupId)
+      s.triggerRebal.store(true)
 
     # --- Leader tracking and persistence ---
     nuraft_coordinator.onLeaderChanged = proc(

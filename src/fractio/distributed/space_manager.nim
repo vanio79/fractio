@@ -102,7 +102,7 @@ proc isMetaLeader(sm: SpaceManager): bool =
   ## Check if this node is the leader of the META group.
   sm.coord.isLeader(META_GROUP_ID)
 
-proc getNodes(sm: SpaceManager): seq[NodeRecord] =
+proc getNodes*(sm: SpaceManager): seq[NodeRecord] =
   ## Get all nodes from sys.nodes.
   let startKey = encodeTableKey(SYS_NODES_TABLE_ID, "")
   let endKey = encodeTableKey(SYS_NODES_TABLE_ID + 1, "")
@@ -122,7 +122,7 @@ proc getNodes(sm: SpaceManager): seq[NodeRecord] =
       except CatchableError:
         discard
 
-proc getGroups(sm: SpaceManager): seq[GroupRecord] =
+proc getGroups*(sm: SpaceManager): seq[GroupRecord] =
   ## Get all groups from sys.groups.
   let startKey = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
   let endKey = encodeTableKey(SYS_GROUPS_TABLE_ID + 1, "")
@@ -141,7 +141,7 @@ proc getGroups(sm: SpaceManager): seq[GroupRecord] =
       except CatchableError:
         discard
 
-proc getSpaces(sm: SpaceManager): seq[SpaceRecord] =
+proc getSpaces*(sm: SpaceManager): seq[SpaceRecord] =
   ## Get all spaces from sys.spaces.
   let startKey = encodeTableKey(SYS_SPACES_TABLE_ID, "")
   let endKey = encodeTableKey(SYS_SPACES_TABLE_ID + 1, "")
@@ -160,20 +160,20 @@ proc getSpaces(sm: SpaceManager): seq[SpaceRecord] =
       except CatchableError:
         discard
 
-proc findSpaceByName(sm: SpaceManager, name: string): Option[SpaceRecord] =
+proc findSpaceByName*(sm: SpaceManager, name: string): Option[SpaceRecord] =
   ## Find a space by name.
   for space in sm.getSpaces():
     if space.name == name:
       return some(space)
   return none(SpaceRecord)
 
-proc findMaxGroupId(sm: SpaceManager): uint64 =
+proc findMaxGroupId*(sm: SpaceManager): uint64 =
   ## Find the maximum groupId in sys.groups.
   for group in sm.getGroups():
     if group.groupId > result:
       result = group.groupId
 
-proc findMaxSpaceId(sm: SpaceManager): int32 =
+proc findMaxSpaceId*(sm: SpaceManager): int32 =
   ## Find the maximum spaceId in sys.spaces.
   for space in sm.getSpaces():
     if space.spaceId > result:
@@ -272,15 +272,26 @@ proc createSpace*(sm: SpaceManager, req: CreateSpaceRequest): CreateSpaceRespons
   var groupIds: seq[uint64] = @[]
   var replicas = 0
 
+  let t0 = times.getTime()
+  template timedLog(msg: string) =
+    let t1 = times.getTime()
+    sm.logInfo(safeFmt("[$# ms] $#", $(t1 - t0).inMilliseconds, msg))
+
+  timedLog(safeFmt("createSpace: starting for '$#'", req.name))
+
   try:
     # 1. Check if we're the META leader
+    timedLog("checking META leadership")
     if not sm.isMetaLeader():
+      timedLog("not META leader, returning error")
       return CreateSpaceResponse(
         success: false,
         error: "not the leader for META group"
       )
+    timedLog("we are META leader")
 
     # 2. Check for duplicate name
+    timedLog("checking for duplicate space name")
     if sm.findSpaceByName(req.name).isSome:
       return CreateSpaceResponse(
         success: false,
@@ -288,8 +299,11 @@ proc createSpace*(sm: SpaceManager, req: CreateSpaceRequest): CreateSpaceRespons
       )
 
     # 3. Get cluster nodes
+    timedLog("getting nodes from sys.nodes")
     let nodes = sm.getNodes()
+    timedLog(safeFmt("found $# nodes", $nodes.len))
     if nodes.len == 0:
+      sm.logError("createSpace: no nodes found, returning error")
       return CreateSpaceResponse(
         success: false,
         error: "no nodes in cluster"
@@ -298,6 +312,7 @@ proc createSpace*(sm: SpaceManager, req: CreateSpaceRequest): CreateSpaceRespons
     let nodeIds = nodes.mapIt(it.nodeId)
     let nodeCount = nodeIds.len
     replicas = if req.replicas <= 0: nodeCount else: min(req.replicas.int, nodeCount)
+    timedLog(safeFmt("nodeCount=$# replicas=$#", $nodeCount, $replicas))
 
     if replicas > nodeCount:
       return CreateSpaceResponse(
@@ -306,16 +321,21 @@ proc createSpace*(sm: SpaceManager, req: CreateSpaceRequest): CreateSpaceRespons
       )
 
     # 4. Allocate IDs
+    timedLog("finding max spaceId")
     spaceId = sm.findMaxSpaceId() + 1
+    timedLog(safeFmt("spaceId=$#", $spaceId))
+    timedLog("finding max groupId")
     let startGroupId = sm.findMaxGroupId() + 1
+    timedLog(safeFmt("startGroupId=$#", $startGroupId))
     groupCount = nodeCount
 
     # 5. Compute group placement
+    timedLog("computing group placement")
     groupRecs = computeGroupPlacement(nodeIds, replicas, startGroupId, spaceId)
     for gr in groupRecs:
       groupIds.add(gr.groupId)
 
-    sm.logInfo(safeFmt("Creating space '$#' with $# groups, replicas=$#",
+    timedLog(safeFmt("Creating space '$#' with $# groups, replicas=$#",
         req.name, $groupCount, $replicas))
 
     # 6. Write group records to sys.groups via Raft
@@ -325,22 +345,30 @@ proc createSpace*(sm: SpaceManager, req: CreateSpaceRequest): CreateSpaceRespons
       let value = encode(gr)
       groupWrites.add((key: key, value: value))
 
-    # Write each group record with MVCC encoding
+# Write each group record with MVCC encoding
+    timedLog(safeFmt("writing $# group records", $groupWrites.len))
+    var writeIdx = 0
     for (key, value) in groupWrites:
+      writeIdx += 1
+      timedLog(safeFmt("writing group record $#", $writeIdx))
       let ts = int64(times.getTime().toUnixFloat() * 1_000_000_000)
       let encoded = mvccTypes.encodeMVCCValue(value, ts, false)
+      timedLog(safeFmt("calling raftPut for group record $#", $writeIdx))
       let res = sm.store.raftPut(key, encoded)
+      timedLog(safeFmt("raftPut returned for group record $#", $writeIdx))
       if not res.isOk:
         return CreateSpaceResponse(
           success: false,
           error: safeFmt("failed to write group record to Raft: $#", $res.error)
         )
+    timedLog("group records written")
 
     # 7. Groups are created asynchronously via onGroupMetadataApplied callback
     #    when the Raft entries are committed. We return immediately because
     #    waiting would block the handler thread.
 
     # 8. Write space record to sys.spaces via Raft
+    timedLog("writing space record")
     let spaceRec = SpaceRecord(
       spaceId: spaceId,
       name: req.name,
@@ -355,14 +383,16 @@ proc createSpace*(sm: SpaceManager, req: CreateSpaceRequest): CreateSpaceRespons
     let spaceValue = encode(spaceRec)
 
     if not sm.store.sysTablePut(spaceKey, spaceValue):
+      sm.logError("createSpace: sysTablePut failed")
       return CreateSpaceResponse(
         success: false,
         error: "failed to write space record to Raft"
       )
 
-    sm.logInfo(safeFmt("Created space '$#' (spaceId=$#)", req.name, $spaceId))
+    timedLog(safeFmt("Created space '$#' (spaceId=$#)", req.name, $spaceId))
 
     # 10. Build response with updated sys table data
+    timedLog("building response")
     var groupRecords: seq[GroupRecordData] = @[]
     for gr in groupRecs:
       groupRecords.add(GroupRecordData(
@@ -370,6 +400,7 @@ proc createSpace*(sm: SpaceManager, req: CreateSpaceRequest): CreateSpaceRespons
         record: encode(gr)
       ))
 
+    timedLog("returning success")
     result = CreateSpaceResponse(
       success: true,
       spaceId: spaceId,
@@ -377,6 +408,7 @@ proc createSpace*(sm: SpaceManager, req: CreateSpaceRequest): CreateSpaceRespons
       spaceRecord: spaceValue,
       groupRecords: groupRecords
     )
+    timedLog("done")
   except CatchableError as e:
     sm.logError(safeFmt("createSpace error: $#", e.msg))
     result = CreateSpaceResponse(
