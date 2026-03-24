@@ -825,7 +825,7 @@ proc wireApplyCallback*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
             if isMember:
               # Use async queue instead of blocking createAndStartGroup
               # The callback runs on NuRaft's ASIO thread and must not block
-              coord.queueGroupCreation(gid, members, preferredLeader, storePtr)
+              discard coord.queueGroupCreation(gid, members, preferredLeader, storePtr)
 
           # Refresh caches in background
           s.triggerRebal.store(true)

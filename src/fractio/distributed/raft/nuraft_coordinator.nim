@@ -104,6 +104,8 @@ type
     groupCreationThread*: Thread[pointer]
     groupCreationRunning*: Atomic[bool]
     groupCreationPending*: Atomic[int32] ## Number of groups being created
+    groupsCreating*: Table[GroupID, bool] ## Groups currently being created (prevents duplicate queueing)
+    groupsCreatingLock*: Lock
 
 # Use C malloc/free to avoid atomicArc cross-thread dealloc crashes.
 # NuRaftGroupInstance may be allocated on NuRaft ASIO threads (via
@@ -300,6 +302,7 @@ proc newNuRaftCoordinator*(config: CoordinatorConfig): NuRaftCoordinator =
   result.groupCreationPending.store(0)
   initLock(result.groupsLock)
   initLock(result.groupCreationLock)
+  initLock(result.groupsCreatingLock)
 
   # Open WiscKey backend
   let wbs = if config.writeBufferSize > 0: config.writeBufferSize
@@ -320,6 +323,9 @@ proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
     members: seq[tuple[nodeId: uint32, host: string, basePort: int]],
     preferredLeader: uint32 = 0): bool
 
+# Forward declaration for use in queueGroupCreation
+proc hasGroup*(c: NuRaftCoordinator, groupId: GroupID): bool
+
 proc start*(c: NuRaftCoordinator) =
   ## Start the coordinator. Groups are started individually via createAndStartGroup.
   c.running.store(true)
@@ -333,7 +339,7 @@ proc start*(c: NuRaftCoordinator) =
         if coord.groupCreationQueue.len > 0:
           requests = coord.groupCreationQueue
           coord.groupCreationQueue = @[]
-          # Track pending count
+          # Increment pending count BEFORE processing to avoid race with waitForGroupCreationQueue
           discard coord.groupCreationPending.fetchAdd(int32(requests.len))
 
       for req in requests:
@@ -345,6 +351,9 @@ proc start*(c: NuRaftCoordinator) =
             # Notify that group was created
             if onGroupCreatedCallback != nil:
               onGroupCreatedCallback(req.storePtr, req.groupId)
+        # Clean up the in-progress tracking
+        withLock coord.groupsCreatingLock:
+          coord.groupsCreating.del(req.groupId)
         # Decrement pending count after processing
         discard coord.groupCreationPending.fetchAdd(-1)
 
@@ -363,6 +372,10 @@ proc stop*(c: NuRaftCoordinator) =
   # Stop the async group creation worker
   c.groupCreationRunning.store(false)
   joinThread(c.groupCreationThread)
+
+  # Clear in-progress tracking
+  withLock c.groupsCreatingLock:
+    c.groupsCreating.clear()
 
   # Mark all instances as stopped to prevent callbacks from accessing
   # freed coordinator memory.
@@ -399,10 +412,24 @@ proc stop*(c: NuRaftCoordinator) =
 
 proc queueGroupCreation*(c: NuRaftCoordinator, groupId: GroupID,
     members: seq[tuple[nodeId: uint32, host: string, basePort: int]],
-    preferredLeader: uint32 = 0, storePtr: pointer = nil) =
+    preferredLeader: uint32 = 0, storePtr: pointer = nil): bool =
   ## Queue a group creation request to be processed asynchronously.
   ## This is safe to call from NuRaft's ASIO thread without blocking.
   ## storePtr is the RaftKVStoreExt for registerGroup callback.
+  ## Returns true if queued, false if already queued or exists.
+
+  # First check if group already exists (quick check without lock)
+  if c.hasGroup(groupId):
+    return true
+
+  # Check if already in creation queue or being created
+  withLock c.groupsCreatingLock:
+    if c.groupsCreating.hasKey(groupId):
+      # Already queued or being created
+      return true
+    # Mark as being queued
+    c.groupsCreating[groupId] = true
+
   withLock c.groupCreationLock:
     c.groupCreationQueue.add(GroupCreationRequest(
       groupId: groupId,
@@ -410,6 +437,7 @@ proc queueGroupCreation*(c: NuRaftCoordinator, groupId: GroupID,
       preferredLeader: preferredLeader,
       storePtr: storePtr
     ))
+  return true
 
 proc waitForGroupCreationQueue*(c: NuRaftCoordinator,
     timeoutMs: int = 5000): bool =
@@ -418,10 +446,13 @@ proc waitForGroupCreationQueue*(c: NuRaftCoordinator,
   let startMs = getTime().toUnixFloat() * 1000
   while true:
     var queueLen = 0
+    var creatingLen = 0
     withLock c.groupCreationLock:
       queueLen = c.groupCreationQueue.len
+    withLock c.groupsCreatingLock:
+      creatingLen = c.groupsCreating.len
     let pending = c.groupCreationPending.load()
-    if queueLen == 0 and pending == 0:
+    if queueLen == 0 and pending == 0 and creatingLen == 0:
       return true
     let nowMs = getTime().toUnixFloat() * 1000
     if nowMs - startMs > timeoutMs.float:
@@ -442,7 +473,9 @@ proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
   ## Create and start a NuRaft instance for one Raft group.
   ## members: list of (nodeId, host, basePort) for all replicas.
   ## Returns true on success.
+  ## NOTE: groupsCreating tracking is handled externally by the async worker.
 
+  # Check if already exists - use groupsLock only for existing groups check
   withLock c.groupsLock:
     if c.groups.hasKey(groupId):
       return true # Already exists
@@ -544,6 +577,8 @@ proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
     waitRes = nuraftLauncherWaitInit(inst.launcher, waitMs)
   if not waitRes:
     error("NuRaft launcher wait init failed", "groupId", $groupId, "waitMs", $waitMs)
+    # Clean up on wait failure - but don't return false, the launcher might still work
+    # NuRaft can sometimes return false from wait_init but the server is still usable
 
   inst.server = nuraftLauncherGetServer(inst.launcher)
   if inst.server == nil:
@@ -564,6 +599,7 @@ proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
       else:
         discard nuraftServerSetPriority(inst.server, int32(m.nodeId), 50)
 
+  # Add to groups table
   withLock c.groupsLock:
     c.groups[groupId] = inst
 
