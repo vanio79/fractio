@@ -5,6 +5,7 @@
 #   - getPreferredLeaderCallback wiring
 
 import std/[unittest, os, options, json, strutils, tables, atomics]
+import fractio/core/types except NodeID
 import fractio/distributed/raft/group_types
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/nuraft_coordinator
@@ -41,7 +42,8 @@ proc makeStore(storagePath: string): tuple[
   for rid in [META_GROUP_ID, DATA_GROUP_START_ID]:
     doAssert coord.createAndStartGroup(rid, members)
   for attempt in 0 ..< 50:
-    if coord.isLeader(GroupID(1)) and coord.isLeader(GroupID(2)): break
+    if coord.isLeader(META_GROUP_ID) and coord.isLeader(
+        DATA_GROUP_START_ID): break
     os.sleep(100)
   let store = newRaftKVStoreExt(coord, proposeTimeoutMs = 2000)
   store.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
@@ -68,11 +70,11 @@ suite "RaftKVStoreExt - preferredLeaders table":
     defer: teardown(coord, path)
 
     # Seed sys.groups with a group that has preferredLeader (binary format)
-    let gid = GroupID(42)
-    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
+    let gid = genGroupID()
+    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(gid))
     let val = GroupRecord(
-      groupId: gid.uint64,
-      spaceId: 0,
+      groupId: groupIDToULID(gid),
+      spaceId: ZeroULID(),
       preferredLeader: 20,
       leader: 0,
       replicas: @[
@@ -94,11 +96,11 @@ suite "RaftKVStoreExt - preferredLeaders table":
     let (coord, store) = makeStore(path)
     defer: teardown(coord, path)
 
-    let gid = GroupID(43)
-    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
+    let gid = genGroupID()
+    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(gid))
     let val = GroupRecord(
-      groupId: gid.uint64,
-      spaceId: 0,
+      groupId: groupIDToULID(gid),
+      spaceId: ZeroULID(),
       preferredLeader: 0, # 0 = no preferred leader
       leader: 0,
       replicas: @[GroupReplicaBin(nodeId: 10, replicaType: rtVoter)]
@@ -113,11 +115,11 @@ suite "RaftKVStoreExt - preferredLeaders table":
     let (coord, store) = makeStore(path)
     defer: teardown(coord, path)
 
-    let gid = GroupID(44)
-    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
+    let gid = genGroupID()
+    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(gid))
     let val = GroupRecord(
-      groupId: gid.uint64,
-      spaceId: 0,
+      groupId: groupIDToULID(gid),
+      spaceId: ZeroULID(),
       preferredLeader: 0, # 0 = no preferred leader
       leader: 0,
       replicas: @[GroupReplicaBin(nodeId: 10, replicaType: rtVoter)]
@@ -133,11 +135,11 @@ suite "RaftKVStoreExt - preferredLeaders table":
     defer: teardown(coord, path)
 
     # Insert a group with preferred leader (binary format)
-    let gid = GroupID(45)
-    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
+    let gid = genGroupID()
+    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(gid))
     let val = GroupRecord(
-      groupId: gid.uint64,
-      spaceId: 0,
+      groupId: groupIDToULID(gid),
+      spaceId: ZeroULID(),
       preferredLeader: 3,
       leader: 0,
       replicas: @[GroupReplicaBin(nodeId: 10, replicaType: rtVoter)]
@@ -162,13 +164,14 @@ suite "getPreferredLeaderCallback wiring":
     defer: teardown(coord, path)
 
     # Manually populate preferredLeaders
-    store.preferredLeaders[GroupID(50)] = 3'u32
+    let testGid = genGroupID()
+    store.preferredLeaders[testGid] = 3'u32
 
     # The callback should have been wired by bootstrapStore -> wireApplyCallback
     check getPreferredLeaderCallback != nil
 
     let result = getPreferredLeaderCallback(
-      cast[pointer](store), GroupID(50))
+      cast[pointer](store), testGid)
     check result.isSome
     check result.get == NodeID(3)
 
@@ -179,5 +182,5 @@ suite "getPreferredLeaderCallback wiring":
 
     check getPreferredLeaderCallback != nil
     let result = getPreferredLeaderCallback(
-      cast[pointer](store), GroupID(999))
+      cast[pointer](store), genGroupID())
     check result.isNone

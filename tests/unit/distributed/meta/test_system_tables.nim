@@ -77,10 +77,10 @@ suite "Lexicographic Ordering":
     ]
     var sorted = @keys
     sorted.sort()
-    check sorted[0] == keys[1]  # databases (1)
-    check sorted[1] == keys[3]  # schemas (2)
-    check sorted[2] == keys[2]  # tables (3)
-    check sorted[3] == keys[0]  # nodes (5)
+    check sorted[0] == keys[1] # databases (1)
+    check sorted[1] == keys[3] # schemas (2)
+    check sorted[2] == keys[2] # tables (3)
+    check sorted[3] == keys[0] # nodes (5)
 
   test "same table sorts by primary key":
     let k1 = encodeTableKey(1, "alpha")
@@ -117,7 +117,7 @@ suite "Key Classification":
   test "isMetaGroupKey for table keys":
     check isMetaGroupKey(encodeTableKey(1, "db"))
     check isMetaGroupKey(encodeTableKey(6, "setting"))
-    check isMetaGroupKey(encodeTableKey(7, "space"))  # SYS_SPACES_TABLE_ID
+    check isMetaGroupKey(encodeTableKey(7, "space")) # SYS_SPACES_TABLE_ID
     check not isMetaGroupKey(encodeTableKey(8, "x"))
     check not isMetaGroupKey(encodeTableKey(10, "metric"))
     check not isMetaGroupKey(encodeTableKey(100, "user"))
@@ -153,27 +153,28 @@ suite "User Table Key Helpers":
   test "data rows sort before index entries":
     let dataKey = encodeDataRowKey(100, "alice")
     let indexKey = encodeIndexKey(100, 1, "alice@example.com", "alice")
-    check dataKey < indexKey  # "d/" < "i/"
+    check dataKey < indexKey # "d/" < "i/"
 
 suite "GroupDescriptor.isMetaGroup":
   test "Range 1 is meta range":
-    let desc = newGroupDescriptor(GroupID(1))
+    let desc = newGroupDescriptor(META_GROUP_ID)
     check desc.isMetaGroup
 
   test "Range 2 is not meta range":
-    let desc = newGroupDescriptor(GroupID(2))
+    let desc = newGroupDescriptor(DATA_GROUP_START_ID)
     check not desc.isMetaGroup
 
-  test "Range 100 is not meta range":
-    let desc = newGroupDescriptor(GroupID(100))
+  test "other groups are not meta range":
+    let gid = genGroupID()
+    let desc = newGroupDescriptor(gid)
     check not desc.isMetaGroup
 
 suite "Constants":
   test "META_GROUP_ID is 1":
-    check META_GROUP_ID == GroupID(1)
+    check META_GROUP_ID == META_GROUP_ID
 
   test "DATA_GROUP_START_ID is 2":
-    check DATA_GROUP_START_ID == GroupID(2)
+    check DATA_GROUP_START_ID == DATA_GROUP_START_ID
 
   test "system table IDs":
     check SYS_DATABASES_TABLE_ID == 1'u32

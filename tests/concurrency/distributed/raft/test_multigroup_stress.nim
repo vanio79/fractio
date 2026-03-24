@@ -101,14 +101,14 @@ suite "MultiGroupStress":
     )
 
     let desc = newGroupDescriptor(
-      GroupID(1)
+      META_GROUP_ID
     )
     discard desc.addReplica(NodeID(1))
     discard desc.addReplica(NodeID(2))
     discard desc.addReplica(NodeID(3))
 
     let group = newRaftGroup(
-      GroupID(1),
+      META_GROUP_ID,
       NodeID(1),
       ReplicaID(1),
       desc

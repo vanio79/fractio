@@ -5,6 +5,7 @@ import std/atomics
 
 import fractio/distributed/raft/group_types
 import fractio/distributed/raft/multigroup_types
+import fractio/distributed/meta/system_tables
 
 suite "RaftState":
   test "state transitions":
@@ -64,21 +65,21 @@ suite "LogEntry":
     let entry = newLogEntry(1'u64, 1'u64, RaftCommand(
       kind: ckSplit,
       splitKey: @[byte 0x05],
-      newRangeId: GroupID(2)
+      newRangeId: DATA_GROUP_START_ID
     ))
     check entry.command.kind == ckSplit
     check entry.command.splitKey == @[byte 0x05]
-    check entry.command.newRangeId == GroupID(2)
+    check entry.command.newRangeId == DATA_GROUP_START_ID
 
 suite "RaftGroup":
   test "create group":
-    let desc = newGroupDescriptor(GroupID(1))
+    let desc = newGroupDescriptor(META_GROUP_ID)
     discard desc.addReplica(NodeID(1))
     discard desc.addReplica(NodeID(2))
     discard desc.addReplica(NodeID(3))
 
-    let group = newRaftGroup(GroupID(1), NodeID(1), ReplicaID(1), desc)
-    check group.groupId == GroupID(1)
+    let group = newRaftGroup(META_GROUP_ID, NodeID(1), ReplicaID(1), desc)
+    check group.groupId == META_GROUP_ID
     check group.nodeId == NodeID(1)
     check group.replicaId == ReplicaID(1)
     check group.state.load() == rsFollower
@@ -86,10 +87,10 @@ suite "RaftGroup":
     group.close()
 
   test "state transitions":
-    let desc = newGroupDescriptor(GroupID(1))
+    let desc = newGroupDescriptor(META_GROUP_ID)
     discard desc.addReplica(NodeID(1))
 
-    let group = newRaftGroup(GroupID(1), NodeID(1), ReplicaID(1), desc)
+    let group = newRaftGroup(META_GROUP_ID, NodeID(1), ReplicaID(1), desc)
 
     # Start as follower
     check group.state.load() == rsFollower
@@ -114,12 +115,12 @@ suite "RaftGroup":
     group.close()
 
   test "quorum calculation":
-    let desc = newGroupDescriptor(GroupID(1))
+    let desc = newGroupDescriptor(META_GROUP_ID)
     discard desc.addReplica(NodeID(1))
     discard desc.addReplica(NodeID(2))
     discard desc.addReplica(NodeID(3))
 
-    let group = newRaftGroup(GroupID(1), NodeID(1), ReplicaID(1), desc)
+    let group = newRaftGroup(META_GROUP_ID, NodeID(1), ReplicaID(1), desc)
     check group.quorum() == 2 # Majority of 3
     check group.hasQuorum(2)
     check not group.hasQuorum(1)
@@ -127,10 +128,10 @@ suite "RaftGroup":
     group.close()
 
   test "heartbeat tracking":
-    let desc = newGroupDescriptor(GroupID(1))
+    let desc = newGroupDescriptor(META_GROUP_ID)
     discard desc.addReplica(NodeID(1))
 
-    let group = newRaftGroup(GroupID(1), NodeID(1), ReplicaID(1), desc)
+    let group = newRaftGroup(META_GROUP_ID, NodeID(1), ReplicaID(1), desc)
 
     group.updateHeartbeat()
     let elapsed = group.timeSinceHeartbeat()

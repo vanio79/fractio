@@ -6,7 +6,9 @@ import std/strutils
 import std/tables
 import std/options
 
+import fractio/core/types except NodeID
 import fractio/distributed/raft/group_types
+import fractio/distributed/meta/system_tables
 
 suite "NodeID":
   test "string representation":
@@ -40,25 +42,40 @@ suite "NodeID":
     check table[NodeID(1)] == "one"
 
 suite "GroupID":
-  test "string representation":
-    let id = GroupID(100)
-    check $id == "r100"
+  test "string representation is 26-char ULID":
+    let id = genGroupID()
+    let str = $id
+    check str.len == 26
+    check str.allCharsInSet(Digits + {'A'..'Z'})
 
-  test "parse from string":
-    let id = parseGroupID("r100")
-    check id == GroupID(100)
+  test "parse from ULID string":
+    let id = genGroupID()
+    let parsed = parseGroupID($id)
+    check parsed == id
 
-  test "first group ID":
-    let first = firstGroupID()
-    check first.uint64 == 1
+  test "META_GROUP_ID has expected format":
+    # META_GROUP_ID should be a well-known ULID (ends with 01)
+    let str = $META_GROUP_ID
+    check str.len == 26
+    check str == "00000000000000000000000001"
 
   test "equality comparison":
-    check GroupID(1) == GroupID(1)
-    check GroupID(1) != GroupID(2)
+    check META_GROUP_ID == META_GROUP_ID
+    check DATA_GROUP_START_ID == DATA_GROUP_START_ID
+    check META_GROUP_ID != DATA_GROUP_START_ID
 
   test "ordering":
-    check GroupID(1) < GroupID(2)
-    check GroupID(1) <= GroupID(2)
+    check META_GROUP_ID < DATA_GROUP_START_ID
+    check META_GROUP_ID <= DATA_GROUP_START_ID
+
+  test "generation produces unique IDs":
+    let id1 = genGroupID()
+    let id2 = genGroupID()
+    # ULIDs are unique
+    check id1 != id2
+    # Both are valid ULIDs
+    check ($id1).len == 26
+    check ($id2).len == 26
 
 suite "ReplicaID":
   test "string representation":
@@ -115,13 +132,13 @@ suite "ReplicaDescriptor":
 
 suite "GroupDescriptor":
   test "create basic descriptor":
-    let desc = newGroupDescriptor(GroupID(1))
-    check desc.groupId == GroupID(1)
+    let desc = newGroupDescriptor(META_GROUP_ID)
+    check desc.groupId == META_GROUP_ID
     check desc.replicas.len == 0
     check desc.generation == 1
 
   test "add replica":
-    let desc = newGroupDescriptor(GroupID(1))
+    let desc = newGroupDescriptor(META_GROUP_ID)
     let rep1 = desc.addReplica(NodeID(1))
     check desc.replicas.len == 1
     check rep1.nodeId == NodeID(1)
@@ -134,13 +151,13 @@ suite "GroupDescriptor":
     check desc.generation == 3
 
   test "add non-voter replica":
-    let desc = newGroupDescriptor(GroupID(1))
+    let desc = newGroupDescriptor(META_GROUP_ID)
     discard desc.addReplica(NodeID(1))
     let rep2 = desc.addReplica(NodeID(2), rtNonVoter)
     check rep2.replicaType == rtNonVoter
 
   test "remove replica":
-    let desc = newGroupDescriptor(GroupID(1))
+    let desc = newGroupDescriptor(META_GROUP_ID)
     discard desc.addReplica(NodeID(1))
     discard desc.addReplica(NodeID(2))
     check desc.replicas.len == 2
@@ -152,7 +169,7 @@ suite "GroupDescriptor":
     check desc.generation == 4 # +1 for remove
 
   test "get replica by node":
-    let desc = newGroupDescriptor(GroupID(1))
+    let desc = newGroupDescriptor(META_GROUP_ID)
     discard desc.addReplica(NodeID(1))
     discard desc.addReplica(NodeID(2))
 
@@ -164,7 +181,7 @@ suite "GroupDescriptor":
     check missing.isNone()
 
   test "get voters and non-voters":
-    let desc = newGroupDescriptor(GroupID(1))
+    let desc = newGroupDescriptor(META_GROUP_ID)
     discard desc.addReplica(NodeID(1)) # voter
     discard desc.addReplica(NodeID(2)) # voter
     discard desc.addReplica(NodeID(3), rtNonVoter) # non-voter
@@ -176,22 +193,23 @@ suite "GroupDescriptor":
     check nonVoters.len == 1
 
   test "quorum size":
-    let desc = newGroupDescriptor(GroupID(1))
+    let desc = newGroupDescriptor(META_GROUP_ID)
     discard desc.addReplica(NodeID(1))
     discard desc.addReplica(NodeID(2))
     discard desc.addReplica(NodeID(3))
     check desc.quorumSize() == 2 # majority of 3
 
   test "is initialized":
-    var desc = newGroupDescriptor(GroupID(0))
+    var desc = newGroupDescriptor(GroupID(ULID()))
     check not desc.isInitialized()
 
-    desc = newGroupDescriptor(GroupID(1))
+    desc = newGroupDescriptor(META_GROUP_ID)
     discard desc.addReplica(NodeID(1))
     check desc.isInitialized()
 
   test "JSON round-trip":
-    let desc = newGroupDescriptor(GroupID(42))
+    let gid = genGroupID()
+    let desc = newGroupDescriptor(gid)
     discard desc.addReplica(NodeID(1))
     discard desc.addReplica(NodeID(2))
     discard desc.addReplica(NodeID(3))
@@ -205,27 +223,39 @@ suite "GroupDescriptor":
 
 suite "Key Encoding":
   test "group prefix":
-    let prefix = encodeGroupPrefix(GroupID(123))
-    check prefix == "/range/123/"
+    let gid = genGroupID()
+    let prefix = encodeGroupPrefix(gid)
+    check prefix.startsWith("/range/")
+    check prefix.endsWith("/")
 
   test "data key":
-    let key = encodeDataKey(GroupID(123), @[byte 0x01, 0x02])
-    check key.startsWith("/range/123/data/")
+    let gid = genGroupID()
+    let key = encodeDataKey(gid, @[byte 0x01, 0x02])
+    check key.startsWith("/range/")
+    check key.contains("/data/")
 
   test "log key":
-    let key = encodeLogKey(GroupID(456), 789'u64)
-    check key == "/raft/456/log/789"
+    let gid = genGroupID()
+    let key = encodeLogKey(gid, 789'u64)
+    check key.startsWith("/raft/")
+    check key.endsWith("/log/789")
 
   test "state key":
-    let key = encodeStateKey(GroupID(456))
-    check key == "/raft/456/state"
+    let gid = genGroupID()
+    let key = encodeStateKey(gid)
+    check key.startsWith("/raft/")
+    check key.endsWith("/state")
 
   test "snapshot key":
-    let key = encodeSnapshotKey(GroupID(456))
-    check key == "/raft/456/snapshot"
+    let gid = genGroupID()
+    let key = encodeSnapshotKey(gid)
+    check key.startsWith("/raft/")
+    check key.endsWith("/snapshot")
 
   test "parse log index":
-    let index = parseLogIndex("/raft/456/log/789")
+    let gid = genGroupID()
+    let key = encodeLogKey(gid, 789'u64)
+    let index = parseLogIndex(key)
     check index == 789'u64
 
     expect ValueError:

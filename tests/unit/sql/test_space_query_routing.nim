@@ -36,17 +36,24 @@ proc cleanDir(path: string) =
   try: createDir(path) except CatchableError: discard
 
 var testBasePort {.global.} = 17000
+var testCounter {.global.} = 0
 
 proc nextBasePort(): int =
   ## Return a fresh base port to avoid collisions between test runs.
   result = testBasePort
   testBasePort += 100
 
+proc nextTestDir(baseName: string): string =
+  ## Return a unique test directory for each test.
+  inc testCounter
+  result = "/tmp/fractio_" & baseName & "_" & $getCurrentProcessId() & "_" & $testCounter
+
 proc createMultiGroupTestStore(testDir: string,
     groupCount: int): tuple[client: FractioClient, server: ProtocolServer,
-        store: RaftKVStoreExt] =
+        store: RaftKVStoreExt, spaceGroupIds: seq[GroupID]] =
   ## Create a store with 1 meta range + N space groups.
   ## Seeds sys.spaces and sys.tables so the executor can resolve space routing.
+  ## Returns the space group IDs so tests can verify routing.
   cleanDir(testDir)
   let clientPort = nextBasePort()
   let nodeId = NodeID(1)
@@ -64,22 +71,21 @@ proc createMultiGroupTestStore(testDir: string,
   ))
   coord.start()
 
-  # Meta group (Group 1)
-  doAssert coord.createAndStartGroup(groupIDFromUint64(1), members)
+  # Meta group - use the well-known META_GROUP_ID constant
+  doAssert coord.createAndStartGroup(META_GROUP_ID, members)
 
-  # Data group (Group 2)
-  doAssert coord.createAndStartGroup(groupIDFromUint64(2), members)
+  # Data group - use the well-known DATA_GROUP_START_ID constant
+  doAssert coord.createAndStartGroup(DATA_GROUP_START_ID, members)
 
-  # Space groups (Group 10..10+N-1)
-  var groupIds: seq[int] = @[]
+  # Space groups (generate ULIDs for test groups)
+  var groupIds: seq[GroupID] = @[]
   for i in 0 ..< groupCount:
-    let gid = groupIDFromUint64(uint64(10 + i))
-    groupIds.add(10 + i)
+    let gid = genGroupID()
+    groupIds.add(gid)
     doAssert coord.createAndStartGroup(gid, members)
 
   # Wait for all groups to elect a leader (single-node → self-election)
-  let allGroupIds = @[groupIDFromUint64(1), groupIDFromUint64(2)] &
-    (0 ..< groupCount).mapIt(groupIDFromUint64(uint64(10 + it)))
+  let allGroupIds = @[META_GROUP_ID, DATA_GROUP_START_ID] & groupIds
   for attempt in 0 ..< 50: # up to 5 seconds
     var allLeaders = true
     for gid in allGroupIds:
@@ -93,8 +99,8 @@ proc createMultiGroupTestStore(testDir: string,
   store.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
 
   # Pre-create SMs for space groups
-  for i in 0 ..< groupCount:
-    discard store.getOrCreateSM(groupIDFromUint64(uint64(10 + i)))
+  for gid in groupIds:
+    discard store.getOrCreateSM(gid)
 
   # Create MVCC store for DDL operations
   let txnMgr = newTransactionManager()
@@ -135,7 +141,7 @@ proc createMultiGroupTestStore(testDir: string,
   ]
   # Add space group records
   for gid in groupIds:
-    let gidUlid = groupIDToULID(groupIDFromUint64(uint64(gid)))
+    let gidUlid = groupIDToULID(gid)
     let spaceGroupRec = GroupRecord(
       groupId: gidUlid,
       spaceId: ZeroULID(),
@@ -151,7 +157,7 @@ proc createMultiGroupTestStore(testDir: string,
   let spaceKey = encodeSpaceKey(testSpaceUlid)
   var groupIdsSeq: seq[ULID] = @[]
   for gid in groupIds:
-    groupIdsSeq.add(groupIDToULID(groupIDFromUint64(uint64(gid))))
+    groupIdsSeq.add(groupIDToULID(gid))
   let spaceRec = SpaceRecord(
     spaceId: testSpaceUlid,
     name: "testspace",
@@ -185,11 +191,12 @@ proc createMultiGroupTestStore(testDir: string,
   let client = newFractioClient("127.0.0.1", clientPort)
   doAssert client.initialize()
 
-  result = (client, server, store)
+  result = (client, server, store, groupIds)
 
-proc seedSpaceTable(store: RaftKVStoreExt, tableId: uint32,
-    tableName: string, database = "default", schema = "public") =
-  ## Register a table in sys.tables pointing to spaceId=2.
+proc seedSpaceTable(client: FractioClient, store: RaftKVStoreExt,
+    tableId: uint32, tableName: string, database = "default",
+        schema = "public") =
+  ## Register a table in sys.tables and refresh client metadata.
   let fullName = database & "." & schema & "." & tableName
   let tableKey = encodeTableKey(SYS_TABLES_TABLE_ID, fullName)
   let tableRec = TableRecord(
@@ -206,10 +213,13 @@ proc seedSpaceTable(store: RaftKVStoreExt, tableId: uint32,
   )
   discard store.sysTablePut(tableKey, encode(tableRec))
   store.loadTableSpaces()
+  # Refresh client metadata to pick up the new table
+  discard client.refreshMetadata()
 
-proc seedSpaceTableThreeCol(store: RaftKVStoreExt, tableId: uint32,
-    tableName: string, database = "default", schema = "public") =
-  ## Register a table with 3 columns (id, name, score).
+proc seedSpaceTableThreeCol(client: FractioClient, store: RaftKVStoreExt,
+    tableId: uint32, tableName: string, database = "default",
+        schema = "public") =
+  ## Register a table with 3 columns (id, name, score) and refresh client metadata.
   let fullName = database & "." & schema & "." & tableName
   let tableKey = encodeTableKey(SYS_TABLES_TABLE_ID, fullName)
   let tableRec = TableRecord(
@@ -227,6 +237,8 @@ proc seedSpaceTableThreeCol(store: RaftKVStoreExt, tableId: uint32,
   )
   discard store.sysTablePut(tableKey, encode(tableRec))
   store.loadTableSpaces()
+  # Refresh client metadata to pick up the new table
+  discard client.refreshMetadata()
 
 proc exec(client: FractioClient, sql: string,
     database = "default", schema = "public"): ExecResult =
@@ -244,12 +256,14 @@ suite "SQL Executor — space-routed INSERT":
   var client: FractioClient
   var server: ProtocolServer
   var store: RaftKVStoreExt
-  let testDir = "/tmp/fractio_test_space_insert_" & $getCurrentProcessId()
+  var spaceGroupIds: seq[GroupID]
+  var testDir: string
 
   setup:
+    testDir = nextTestDir("insert")
     cleanupTestDir(testDir)
-    (client, server, store) = createMultiGroupTestStore(testDir, 3)
-    seedSpaceTable(store, 100, "items")
+    (client, server, store, spaceGroupIds) = createMultiGroupTestStore(testDir, 3)
+    seedSpaceTable(client, store, 100, "items")
 
   teardown:
     client.close()
@@ -266,14 +280,16 @@ suite "SQL Executor — space-routed INSERT":
     check res.count == 5
 
     # Verify data is spread across groups (at least 2 of 3)
-    var groupHits: array[3, int]
+    # Use a map to count group hits since we can't index by GroupID directly
+    var groupHits = newTable[GroupID, int]()
+    for gid in spaceGroupIds:
+      groupHits[gid] = 0
     for i in 1 .. 5:
-      let rid = routeToGroup($i, @[groupIDFromUint64(10'u64), groupIDFromUint64(
-          11'u64), groupIDFromUint64(12'u64)])
-      inc groupHits[int(groupIDToUint64(rid)) - 10]
+      let rid = routeToGroup($i, spaceGroupIds)
+      groupHits[rid] = groupHits.getOrDefault(rid, 0) + 1
     var nonEmpty = 0
-    for c in groupHits:
-      if c > 0: inc nonEmpty
+    for gid in spaceGroupIds:
+      if groupHits.getOrDefault(gid, 0) > 0: inc nonEmpty
     check nonEmpty >= 2
 
   test "INSERT single row":
@@ -290,12 +306,14 @@ suite "SQL Executor — space-routed SELECT":
   var client: FractioClient
   var server: ProtocolServer
   var store: RaftKVStoreExt
-  let testDir = "/tmp/fractio_test_space_select_" & $getCurrentProcessId()
+  var spaceGroupIds: seq[GroupID]
+  var testDir: string
 
   setup:
+    testDir = nextTestDir("select")
     cleanupTestDir(testDir)
-    (client, server, store) = createMultiGroupTestStore(testDir, 3)
-    seedSpaceTable(store, 100, "items")
+    (client, server, store, spaceGroupIds) = createMultiGroupTestStore(testDir, 3)
+    seedSpaceTable(client, store, 100, "items")
     # Insert 10 rows distributed across groups
     for i in 1 .. 10:
       discard exec(client,
@@ -343,7 +361,7 @@ suite "SQL Executor — space-routed SELECT":
 
   test "SELECT from empty space-routed table":
     # Create a second table in the same space, don't insert data
-    seedSpaceTable(store, 200, "empty_items")
+    seedSpaceTable(client, store, 200, "empty_items")
     let res = exec(client, "SELECT * FROM empty_items")
     check res.kind == erkRows
     check res.rows.len == 0
@@ -361,12 +379,14 @@ suite "SQL Executor — space-routed UPDATE":
   var client: FractioClient
   var server: ProtocolServer
   var store: RaftKVStoreExt
-  let testDir = "/tmp/fractio_test_space_update_" & $getCurrentProcessId()
+  var spaceGroupIds: seq[GroupID]
+  var testDir: string
 
   setup:
+    testDir = nextTestDir("update")
     cleanupTestDir(testDir)
-    (client, server, store) = createMultiGroupTestStore(testDir, 3)
-    seedSpaceTable(store, 100, "items")
+    (client, server, store, spaceGroupIds) = createMultiGroupTestStore(testDir, 3)
+    seedSpaceTable(client, store, 100, "items")
     for i in 1 .. 5:
       discard exec(client,
           "INSERT INTO items (id, val) VALUES (" & $i & ", 'orig')")
@@ -417,12 +437,14 @@ suite "SQL Executor — space-routed DELETE":
   var client: FractioClient
   var server: ProtocolServer
   var store: RaftKVStoreExt
-  let testDir = "/tmp/fractio_test_space_delete_" & $getCurrentProcessId()
+  var spaceGroupIds: seq[GroupID]
+  var testDir: string
 
   setup:
+    testDir = nextTestDir("delete")
     cleanupTestDir(testDir)
-    (client, server, store) = createMultiGroupTestStore(testDir, 3)
-    seedSpaceTable(store, 100, "items")
+    (client, server, store, spaceGroupIds) = createMultiGroupTestStore(testDir, 3)
+    seedSpaceTable(client, store, 100, "items")
     for i in 1 .. 5:
       discard exec(client,
           "INSERT INTO items (id, val) VALUES (" & $i & ", 'v" & $i & "')")
@@ -472,12 +494,14 @@ suite "SQL Executor — space routing full round-trip":
   var client: FractioClient
   var server: ProtocolServer
   var store: RaftKVStoreExt
-  let testDir = "/tmp/fractio_test_space_roundtrip_" & $getCurrentProcessId()
+  var spaceGroupIds: seq[GroupID]
+  var testDir: string
 
   setup:
+    testDir = nextTestDir("roundtrip")
     cleanupTestDir(testDir)
-    (client, server, store) = createMultiGroupTestStore(testDir, 4)
-    seedSpaceTableThreeCol(store, 100, "products")
+    (client, server, store, spaceGroupIds) = createMultiGroupTestStore(testDir, 4)
+    seedSpaceTableThreeCol(client, store, 100, "products")
 
   teardown:
     client.close()
@@ -537,14 +561,15 @@ suite "SQL Executor — space routing full round-trip":
     check sel.rows.len == 100
 
     # Verify data distribution: check that at least 3 of 4 groups have data
-    var groupHits: array[4, int]
+    var groupHits = newTable[GroupID, int]()
+    for gid in spaceGroupIds:
+      groupHits[gid] = 0
     for i in 1 .. 100:
-      let rid = routeToGroup($i, @[groupIDFromUint64(10'u64), groupIDFromUint64(
-          11'u64), groupIDFromUint64(12'u64), groupIDFromUint64(13'u64)])
-      inc groupHits[int(groupIDToUint64(rid)) - 10]
+      let rid = routeToGroup($i, spaceGroupIds)
+      groupHits[rid] = groupHits.getOrDefault(rid, 0) + 1
     var nonEmpty = 0
-    for c in groupHits:
-      if c > 0: inc nonEmpty
+    for gid in spaceGroupIds:
+      if groupHits.getOrDefault(gid, 0) > 0: inc nonEmpty
     check nonEmpty >= 3
 
 # ---------------------------------------------------------------------------
@@ -555,11 +580,13 @@ suite "SQL Executor — space routing backward compat":
   var client: FractioClient
   var server: ProtocolServer
   var store: RaftKVStoreExt
-  let testDir = "/tmp/fractio_test_space_compat_" & $getCurrentProcessId()
+  var spaceGroupIds: seq[GroupID]
+  var testDir: string
 
   setup:
+    testDir = nextTestDir("compat")
     cleanupTestDir(testDir)
-    (client, server, store) = createMultiGroupTestStore(testDir, 3)
+    (client, server, store, spaceGroupIds) = createMultiGroupTestStore(testDir, 3)
 
   teardown:
     client.close()
@@ -591,7 +618,7 @@ suite "SQL Executor — space routing backward compat":
         "INSERT INTO plain (id, val) VALUES (1, 'plain1')")
 
     # Space-routed table
-    seedSpaceTable(store, 200, "spaced")
+    seedSpaceTable(client, store, 200, "spaced")
     discard exec(client,
         "INSERT INTO spaced (id, val) VALUES (1, 'spaced1')")
 

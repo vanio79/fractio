@@ -236,47 +236,50 @@ proc genULID*(): ULID {.raises: [].} =
         result.data[i] = uint8(i * 17)
 
 proc ulidFromString*(s: string): ULID =
-  ## Parse a 26-character ULID string to binary
+  ## Parse a 26-character ULID string to binary.
+  ## ULID encodes 128 bits into 26 base32 chars (5 bits each = 130 bits).
+  ## The first 2 bits are padding zeros, so we decode MSB to LSB order.
   doAssert s.len == ULID_STRING_SIZE, "ULID string must be 26 characters"
   const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+
   proc charVal(c: char): int =
     for i, ch in alphabet:
       if ch == c: return i
     return 0
-  var bits: array[130, int]
+
   var bitIdx = 0
   for i in 0 ..< 26:
     let v = charVal(s[i])
     for j in countdown(4, 0):
-      bits[bitIdx] = (v shr j) and 1
-      inc bitIdx
-  for i in 0 ..< 16:
-    var b = 0
-    for j in 0 ..< 8:
-      b = (b shl 1) or bits[i * 8 + j]
-    result.data[i] = uint8(b)
+      # Skip padding bits (first 2 bits of first char, which are bits 4 and 3)
+      if not (i == 0 and j >= 3):
+        if bitIdx < 128:
+          let bit = (v shr j) and 1
+          let byteIdx = bitIdx div 8
+          let bitInByte = 7 - (bitIdx mod 8)
+          result.data[byteIdx] = result.data[byteIdx] or (uint8(
+              bit) shl bitInByte)
+        inc bitIdx
 
 proc `$`*(u: ULID): string =
-  ## Convert ULID to 26-character string representation
+  ## Convert ULID to 26-character string representation.
+  ## ULID encodes 128 bits into 26 base32 chars (5 bits each = 130 bits).
+  ## The first 2 bits are padding zeros, so we encode MSB to LSB order.
   const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
-  # Convert 16 bytes to 128 bits
-  var bits: array[128, int]
-  for i in 0 ..< 16:
-    for j in 0 ..< 8:
-      bits[i * 8 + j] = int((u.data[i] shr (7 - j)) and 1)
-  # Encode 128 bits as 26 base32 chars (need to pad to 130 bits)
-  # First 10 chars encode 48-bit timestamp (50 bits with padding)
   result = newString(26)
   var bitIdx = 0
+
   for i in 0 ..< 26:
     var v = 0
-    let numBits = if i == 0: 2 else: 5 # First char only uses 2 bits
-    for j in 0 ..< numBits:
-      if bitIdx < 128:
-        v = (v shl 1) or bits[bitIdx]
+    for j in 0 ..< 5:
+      v = v shl 1
+      # First 2 bits of first char are padding (zeros), skip them
+      if not (i == 0 and j < 2):
+        if bitIdx < 128:
+          let byteIdx = bitIdx div 8
+          let bitInByte = 7 - (bitIdx mod 8)
+          v = v or int((u.data[byteIdx] shr bitInByte) and 1)
         inc bitIdx
-      else:
-        v = v shl 1
     result[i] = alphabet[v]
 
 proc ulidToBytes*(u: ULID): string =

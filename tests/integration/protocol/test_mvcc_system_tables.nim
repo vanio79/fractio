@@ -57,7 +57,7 @@ proc makeMvccStore(storagePath: string): tuple[
     doAssert coord.createAndStartGroup(rid, members)
 
   for attempt in 0 ..< 50:
-    if coord.isLeader(GroupID(1)) and coord.isLeader(GroupID(2)):
+    if coord.isLeader(META_GROUP_ID) and coord.isLeader(DATA_GROUP_START_ID):
       break
     os.sleep(100)
 
@@ -364,7 +364,7 @@ suite "MVCC System Tables - Persistence":
         doAssert coord.createAndStartGroup(rid, members)
 
       for attempt in 0 ..< 50:
-        if coord.isLeader(GroupID(1)) and coord.isLeader(GroupID(2)):
+        if coord.isLeader(META_GROUP_ID) and coord.isLeader(DATA_GROUP_START_ID):
           break
         os.sleep(100)
 
@@ -413,7 +413,7 @@ suite "MVCC System Tables - Persistence":
         doAssert coord.createAndStartGroup(rid, members)
 
       for attempt in 0 ..< 50:
-        if coord.isLeader(GroupID(1)) and coord.isLeader(GroupID(2)):
+        if coord.isLeader(META_GROUP_ID) and coord.isLeader(DATA_GROUP_START_ID):
           break
         os.sleep(100)
 

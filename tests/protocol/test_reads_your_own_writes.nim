@@ -64,7 +64,7 @@ proc makeStore(storagePath: string): tuple[
   for rid in [META_GROUP_ID, DATA_GROUP_START_ID]:
     doAssert coord.createAndStartGroup(rid, members)
   for attempt in 0 ..< 50:
-    if coord.isLeader(GroupID(1)) and coord.isLeader(GroupID(2)): break
+    if coord.isLeader(META_GROUP_ID) and coord.isLeader(DATA_GROUP_START_ID): break
     os.sleep(100)
   let store = newRaftKVStoreExt(coord, proposeTimeoutMs = 3000)
   store.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
@@ -87,7 +87,7 @@ proc makeRaftServer(port: int, storagePath: string): ProtocolServer =
   for rid in [META_GROUP_ID, DATA_GROUP_START_ID]:
     doAssert coord.createAndStartGroup(rid, members)
   for attempt in 0 ..< 50:
-    if coord.isLeader(GroupID(1)) and coord.isLeader(GroupID(2)): break
+    if coord.isLeader(META_GROUP_ID) and coord.isLeader(DATA_GROUP_START_ID): break
     os.sleep(100)
   let raftSt = newRaftKVStoreExt(coord, proposeTimeoutMs = 3000)
   raftSt.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])

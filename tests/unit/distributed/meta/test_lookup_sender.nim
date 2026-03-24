@@ -27,7 +27,7 @@ suite "Range Lookup":
     let lookup = newGroupLookup(cache)
 
     let meta1 = newGroupDescriptor(
-      GroupID(1),
+      META_GROUP_ID,
       @[newReplicaDescriptor(NodeID(1), ReplicaID(1))]
     )
 
@@ -40,11 +40,11 @@ suite "Range Lookup":
     let lookup = newGroupLookup(cache)
 
     let meta2 = newGroupDescriptor(
-      GroupID(2),
+      DATA_GROUP_START_ID,
       @[newReplicaDescriptor(NodeID(1), ReplicaID(1))]
     )
 
-    lookup.setMeta2Descriptor(GroupID(2), meta2)
+    lookup.setMeta2Descriptor(DATA_GROUP_START_ID, meta2)
     lookup.destroy()
     cache.destroy()
 
@@ -56,7 +56,7 @@ suite "Range Lookup":
     let lookup = newGroupLookup(cache)
 
     let desc = newGroupDescriptor(
-      GroupID(1),
+      META_GROUP_ID,
       @[
         newReplicaDescriptor(NodeID(1), ReplicaID(1)),
         newReplicaDescriptor(NodeID(2), ReplicaID(2)),
@@ -66,7 +66,7 @@ suite "Range Lookup":
 
     cache.put(desc, 1000)
 
-    let leaseholder = lookup.getLeaseholder(GroupID(1), 5000)
+    let leaseholder = lookup.getLeaseholder(META_GROUP_ID, 5000)
     check leaseholder.isSome
     check leaseholder.get == NodeID(1) # First voter
 
@@ -78,17 +78,17 @@ suite "Range Lookup":
     let lookup = newGroupLookup(cache)
 
     let desc1 = newGroupDescriptor(
-      GroupID(1),
+      META_GROUP_ID,
       @[newReplicaDescriptor(NodeID(1), ReplicaID(1))]
     )
 
     lookup.updateDescriptor(desc1, 1000)
 
-    check lookup.getLeaseholder(GroupID(1), 5000).isSome
+    check lookup.getLeaseholder(META_GROUP_ID, 5000).isSome
 
-    lookup.invalidateGroup(GroupID(1))
+    lookup.invalidateGroup(META_GROUP_ID)
 
-    check lookup.getLeaseholder(GroupID(1), 5000).isNone
+    check lookup.getLeaseholder(META_GROUP_ID, 5000).isNone
 
     lookup.destroy()
     cache.destroy()
@@ -248,7 +248,7 @@ suite "DistSender":
 
     let sender = newDistSender(lookup, mockSend)
 
-    let err = newNotLeaderError(GroupID(1), NodeID(2))
+    let err = newNotLeaderError(META_GROUP_ID, NodeID(2))
     check sender.shouldRetry(err, 0)
     check sender.shouldRetry(err, 4)
     check not sender.shouldRetry(err, 5) # Max retries
@@ -266,7 +266,7 @@ suite "DistSender":
 
     let sender = newDistSender(lookup, mockSend)
 
-    let err = newGroupUnavailableError(GroupID(1))
+    let err = newGroupUnavailableError(META_GROUP_ID)
     check sender.shouldRetry(err, 0)
     check not sender.shouldRetry(err, 3) # Fewer retries for unavailable
 
@@ -281,19 +281,19 @@ suite "DistSender":
 
 suite "Error Types":
   test "not leader error":
-    let err = newNotLeaderError(GroupID(1), NodeID(2))
-    check err.groupId == GroupID(1)
+    let err = newNotLeaderError(META_GROUP_ID, NodeID(2))
+    check err.groupId == META_GROUP_ID
     check err.leaderHint == NodeID(2)
     check "Not leader" in err.msg
 
   test "range unavailable error":
-    let err = newGroupUnavailableError(GroupID(1))
-    check err.groupId == GroupID(1)
+    let err = newGroupUnavailableError(META_GROUP_ID)
+    check err.groupId == META_GROUP_ID
     check "unavailable" in err.msg
 
   test "send timeout error":
-    let err = newSendTimeoutError(GroupID(1))
-    check err.groupId == GroupID(1)
+    let err = newSendTimeoutError(META_GROUP_ID)
+    check err.groupId == META_GROUP_ID
     check "timed out" in err.msg
 
 suite "Constants":

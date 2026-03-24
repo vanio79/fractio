@@ -7,6 +7,7 @@
 #   - onLeaderChanged skips meta and data groups
 
 import std/[unittest, os, options, strutils, tables, atomics]
+import fractio/core/types except NodeID
 import fractio/distributed/raft/group_types
 import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/meta/system_tables
@@ -43,7 +44,8 @@ proc makeStore(storagePath: string): tuple[
   for rid in [META_GROUP_ID, DATA_GROUP_START_ID]:
     doAssert coord.createAndStartGroup(rid, members)
   for attempt in 0 ..< 50:
-    if coord.isLeader(GroupID(1)) and coord.isLeader(GroupID(2)): break
+    if coord.isLeader(META_GROUP_ID) and coord.isLeader(
+        DATA_GROUP_START_ID): break
     os.sleep(100)
   let store = newRaftKVStoreExt(coord, proposeTimeoutMs = 2000)
   store.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
@@ -71,11 +73,11 @@ suite "RaftKVStoreExt - groupLeaders table":
     check store.groupLeaders.len == 0
 
   test "loadGroupMembers populates groupLeaders from sys.groups":
-    let gid = GroupID(50)
-    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
+    let gid = genGroupID()
+    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(gid))
     let val = GroupRecord(
-      groupId: gid.uint64,
-      spaceId: 0,
+      groupId: groupIDToULID(gid),
+      spaceId: ZeroULID(),
       preferredLeader: 0,
       leader: 20,
       replicas: @[
@@ -92,11 +94,11 @@ suite "RaftKVStoreExt - groupLeaders table":
     check store.groupLeaders[gid] == 20'u32
 
   test "loadGroupMembers skips leader when field is missing":
-    let gid = GroupID(51)
-    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
+    let gid = genGroupID()
+    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(gid))
     let val = GroupRecord(
-      groupId: gid.uint64,
-      spaceId: 0,
+      groupId: groupIDToULID(gid),
+      spaceId: ZeroULID(),
       preferredLeader: 0,
       leader: 0, # 0 = no leader known
       replicas: @[GroupReplicaBin(nodeId: 10, replicaType: rtVoter)]
@@ -107,11 +109,11 @@ suite "RaftKVStoreExt - groupLeaders table":
     check not store.groupLeaders.hasKey(gid)
 
   test "loadGroupMembers skips leader when value is 0":
-    let gid = GroupID(52)
-    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
+    let gid = genGroupID()
+    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(gid))
     let val = GroupRecord(
-      groupId: gid.uint64,
-      spaceId: 0,
+      groupId: groupIDToULID(gid),
+      spaceId: ZeroULID(),
       preferredLeader: 0,
       leader: 0, # 0 = no leader known
       replicas: @[GroupReplicaBin(nodeId: 10, replicaType: rtVoter)]
@@ -122,11 +124,11 @@ suite "RaftKVStoreExt - groupLeaders table":
     check not store.groupLeaders.hasKey(gid)
 
   test "loadGroupMembers clears old groupLeaders on reload":
-    let gid = GroupID(53)
-    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
+    let gid = genGroupID()
+    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(gid))
     let val = GroupRecord(
-      groupId: gid.uint64,
-      spaceId: 0,
+      groupId: groupIDToULID(gid),
+      spaceId: ZeroULID(),
       preferredLeader: 0,
       leader: 30,
       replicas: @[GroupReplicaBin(nodeId: 10, replicaType: rtVoter)]
@@ -187,12 +189,12 @@ suite "onLeaderChanged callback":
     check nuraft_coordinator.onLeaderChanged != nil
 
   test "callback persists leader in sys.groups for space group":
-    # Create a sys.groups record for group 100 with non-local replicas
-    let gid = GroupID(100)
-    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
+    # Create a sys.groups record for a space group with non-local replicas
+    let gid = genGroupID()
+    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(gid))
     let val = GroupRecord(
-      groupId: 100,
-      spaceId: 0,
+      groupId: groupIDToULID(gid),
+      spaceId: ZeroULID(),
       preferredLeader: 0,
       leader: 0,
       replicas: @[
@@ -220,11 +222,11 @@ suite "onLeaderChanged callback":
     check rec.leader == 20
 
   test "callback updates existing leader field":
-    let gid = GroupID(101)
-    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
+    let gid = genGroupID()
+    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(gid))
     let val = GroupRecord(
-      groupId: 101,
-      spaceId: 0,
+      groupId: groupIDToULID(gid),
+      spaceId: ZeroULID(),
       preferredLeader: 0,
       leader: 10,
       replicas: @[
@@ -251,10 +253,10 @@ suite "onLeaderChanged callback":
 
   test "callback persists leader for META_GROUP_ID":
     # META_GROUP_ID leader IS persisted so clients can route to it
-    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $META_GROUP_ID.uint64)
+    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(META_GROUP_ID))
     let val = GroupRecord(
-      groupId: META_GROUP_ID.uint64,
-      spaceId: 0,
+      groupId: groupIDToULID(META_GROUP_ID),
+      spaceId: ZeroULID(),
       preferredLeader: 0,
       leader: 0,
       replicas: @[GroupReplicaBin(nodeId: 10, replicaType: rtVoter)]
@@ -277,10 +279,10 @@ suite "onLeaderChanged callback":
     check rec.leader == 10 # Updated to 10
 
   test "callback skips DATA_GROUP_START_ID":
-    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $DATA_GROUP_START_ID.uint64)
+    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(DATA_GROUP_START_ID))
     let val = GroupRecord(
-      groupId: DATA_GROUP_START_ID.uint64,
-      spaceId: 0,
+      groupId: groupIDToULID(DATA_GROUP_START_ID),
+      spaceId: ZeroULID(),
       preferredLeader: 0,
       leader: 0,
       replicas: @[GroupReplicaBin(nodeId: 10, replicaType: rtVoter)]
@@ -302,25 +304,27 @@ suite "onLeaderChanged callback":
 
   test "callback ignores nil storePtr":
     # Should not crash with nil pointer
-    nuraft_coordinator.onLeaderChanged(nil, GroupID(100), NodeID(10))
+    let gid = genGroupID()
+    nuraft_coordinator.onLeaderChanged(nil, gid, NodeID(10))
 
   test "callback is no-op when sys.groups record does not exist":
     # Fire callback for a group that has no sys.groups record
+    let gid = genGroupID()
     let storePtr = cast[pointer](store)
-    nuraft_coordinator.onLeaderChanged(storePtr, GroupID(999), NodeID(10))
+    nuraft_coordinator.onLeaderChanged(storePtr, gid, NodeID(10))
 
     # Should not create a record
-    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $999'u64)
+    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(gid))
     let gr = store.raftGet(key)
     check gr.isOk
     check gr.value.isNone
 
   test "loadGroupMembers reads back persisted leader after callback":
-    let gid = GroupID(102)
-    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
+    let gid = genGroupID()
+    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(gid))
     let val = GroupRecord(
-      groupId: 102,
-      spaceId: 0,
+      groupId: groupIDToULID(gid),
+      spaceId: ZeroULID(),
       preferredLeader: 0,
       leader: 0,
       replicas: @[

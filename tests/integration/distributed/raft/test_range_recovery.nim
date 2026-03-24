@@ -52,14 +52,14 @@ suite "RangeRecovery":
 
     # Create a group
     let desc = newGroupDescriptor(
-      GroupID(1)
+      META_GROUP_ID
     )
     discard desc.addReplica(NodeID(1))
     discard desc.addReplica(NodeID(2))
     discard desc.addReplica(NodeID(3))
 
     let group = newRaftGroup(
-      GroupID(1),
+      META_GROUP_ID,
       NodeID(1),
       ReplicaID(1),
       desc
@@ -143,19 +143,19 @@ suite "RangeRecovery":
 
   test "range metadata consistency":
     let desc = newGroupDescriptor(
-      GroupID(1)
+      META_GROUP_ID
     )
     discard desc.addReplica(NodeID(1))
     discard desc.addReplica(NodeID(2))
     discard desc.addReplica(NodeID(3))
 
     # Verify initial state
-    check desc.groupId == GroupID(1)
+    check desc.groupId == META_GROUP_ID
     check desc.replicas.len == 3
     check desc.isInitialized()
 
     # After simulated crash/recovery, metadata should be unchanged
-    check desc.groupId == GroupID(1)
+    check desc.groupId == META_GROUP_ID
     check desc.isInitialized()
 
   test "multiple range recovery scenarios":

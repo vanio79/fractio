@@ -522,8 +522,8 @@ proc getGroupForKey*(client: FractioClient, key: string): GroupID =
                   # Hash-based routing for multi-group spaces
                   let groupId = routeToGroup(pk, spaceInfo.groupIds)
                   return groupId
-          # Fall back to default data group
-          return genGroupID() # Generate a new ID as fallback (not ideal)
+          # Fall back to default data group for tables without space assignment
+          return DATA_GROUP_START_ID
       except ValueError:
         discard
 

@@ -63,8 +63,8 @@ proc makeMultiShardStore(storagePath: string): tuple[
   ))
   coord.start()
 
-  let rid1 = META_GROUP_ID         # GroupID(1) — for coord records / system keys
-  let rid2 = DATA_GROUP_START_ID   # GroupID(2) — where resolveGroupId routes data keys
+  let rid1 = META_GROUP_ID         # META_GROUP_ID — for coord records / system keys
+  let rid2 = DATA_GROUP_START_ID   # DATA_GROUP_START_ID — where resolveGroupId routes data keys
   let rid3 = GroupID(3)
 
   for rid in [rid1, rid2, rid3]:

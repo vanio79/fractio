@@ -63,7 +63,7 @@ proc makeMultiGroupStore(storagePath: string, groupCount: int): tuple[
     doAssert coord.createAndStartGroup(rid, members)
 
   # Wait for all groups to elect leaders
-  let allGroupIds = @[GroupID(1)] & groupIds.mapIt(GroupID(it))
+  let allGroupIds = @[META_GROUP_ID] & groupIds.mapIt(GroupID(it))
   for attempt in 0 ..< 50:
     var allLeaders = true
     for gid in allGroupIds:

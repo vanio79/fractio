@@ -12,6 +12,7 @@ import std/json
 import std/options
 
 import fractio/distributed/meta/types
+import fractio/distributed/meta/system_tables
 import fractio/distributed/raft/group_types
 
 suite "Meta Key Encoding":
@@ -59,18 +60,18 @@ suite "Meta Key Encoding":
 suite "Cache Entry":
   test "create cache entry":
     let desc = newGroupDescriptor(
-      GroupID(1),
+      META_GROUP_ID,
       @[newReplicaDescriptor(NodeID(1), ReplicaID(1))]
     )
     let entry = newCacheEntry(desc, 1000'i64, 60000'i64)
-    check entry.descriptor.groupId == GroupID(1)
+    check entry.descriptor.groupId == META_GROUP_ID
     check entry.cachedAtNs == 1000
     check entry.expiresAtNs == 61000
     check entry.accessCount == 0
 
   test "is expired":
     let desc = newGroupDescriptor(
-      GroupID(1),
+      META_GROUP_ID,
       @[newReplicaDescriptor(NodeID(1), ReplicaID(1))]
     )
     let entry = newCacheEntry(desc, 1000'i64, 60000'i64)
@@ -79,7 +80,7 @@ suite "Cache Entry":
 
   test "touch updates access":
     let desc = newGroupDescriptor(
-      GroupID(1),
+      META_GROUP_ID,
       @[newReplicaDescriptor(NodeID(1), ReplicaID(1))]
     )
     let entry = newCacheEntry(desc, 1000'i64, 60000'i64)
@@ -92,7 +93,7 @@ suite "Cache Entry":
 
   test "age calculation":
     let desc = newGroupDescriptor(
-      GroupID(1),
+      META_GROUP_ID,
       @[newReplicaDescriptor(NodeID(1), ReplicaID(1))]
     )
     let entry = newCacheEntry(desc, 1000'i64, 60000'i64)
@@ -100,7 +101,7 @@ suite "Cache Entry":
 
   test "time until expiry":
     let desc = newGroupDescriptor(
-      GroupID(1),
+      META_GROUP_ID,
       @[newReplicaDescriptor(NodeID(1), ReplicaID(1))]
     )
     let entry = newCacheEntry(desc, 1000'i64, 60000'i64)
@@ -125,14 +126,14 @@ suite "Range Cache":
   test "put and get by range ID":
     let cache = newGroupCache(ttlNs = 60000'i64)
     let desc = newGroupDescriptor(
-      GroupID(1),
+      META_GROUP_ID,
       @[newReplicaDescriptor(NodeID(1), ReplicaID(1))]
     )
     cache.put(desc, 1000)
 
-    let result = cache.get(GroupID(1), 5000)
+    let result = cache.get(META_GROUP_ID, 5000)
     check result.isSome
-    check result.get.groupId == GroupID(1)
+    check result.get.groupId == META_GROUP_ID
 
     let stats = cache.stats()
     check stats.hits == 1
@@ -141,7 +142,8 @@ suite "Range Cache":
 
   test "get non-existent range":
     let cache = newGroupCache()
-    let result = cache.get(GroupID(999), 1000)
+    let gid = genGroupID()
+    let result = cache.get(gid, 1000)
     check result.isNone
 
     let stats = cache.stats()
@@ -151,13 +153,13 @@ suite "Range Cache":
   test "get expired entry":
     let cache = newGroupCache(ttlNs = 1000'i64)
     let desc = newGroupDescriptor(
-      GroupID(1),
+      META_GROUP_ID,
       @[newReplicaDescriptor(NodeID(1), ReplicaID(1))]
     )
     cache.put(desc, 0)
 
     # Entry should be expired
-    let result = cache.get(GroupID(1), 2000)
+    let result = cache.get(META_GROUP_ID, 2000)
     check result.isNone
 
     let stats = cache.stats()
@@ -167,22 +169,25 @@ suite "Range Cache":
   test "invalidate group":
     let cache = newGroupCache(ttlNs = 60000'i64)
     let desc = newGroupDescriptor(
-      GroupID(1),
+      META_GROUP_ID,
       @[newReplicaDescriptor(NodeID(1), ReplicaID(1))]
     )
     cache.put(desc, 1000)
 
-    cache.invalidate(GroupID(1))
+    cache.invalidate(META_GROUP_ID)
 
-    let result = cache.get(GroupID(1), 5000)
+    let result = cache.get(META_GROUP_ID, 5000)
     check result.isNone
     cache.destroy()
 
   test "invalidate all":
     let cache = newGroupCache(ttlNs = 60000'i64)
+    var gids: seq[GroupID] = @[]
     for i in 1..5:
+      let gid = genGroupID()
+      gids.add(gid)
       let desc = newGroupDescriptor(
-        GroupID(i),
+        gid,
         @[newReplicaDescriptor(NodeID(1), ReplicaID(i))]
       )
       cache.put(desc, 1000)
@@ -197,19 +202,20 @@ suite "Range Cache":
   test "hit rate calculation":
     let cache = newGroupCache(ttlNs = 60000'i64)
     let desc = newGroupDescriptor(
-      GroupID(1),
+      META_GROUP_ID,
       @[newReplicaDescriptor(NodeID(1), ReplicaID(1))]
     )
     cache.put(desc, 1000)
 
     # 3 hits
-    discard cache.get(GroupID(1), 2000)
-    discard cache.get(GroupID(1), 3000)
-    discard cache.get(GroupID(1), 4000)
+    discard cache.get(META_GROUP_ID, 2000)
+    discard cache.get(META_GROUP_ID, 3000)
+    discard cache.get(META_GROUP_ID, 4000)
 
     # 2 misses
-    discard cache.get(GroupID(2), 5000)
-    discard cache.get(GroupID(3), 6000)
+    discard cache.get(DATA_GROUP_START_ID, 5000)
+    let gid = genGroupID()
+    discard cache.get(gid, 6000)
 
     check cache.hitRate() == 0.6 # 3/5
     cache.destroy()
@@ -218,7 +224,7 @@ suite "Meta2 Cache":
   test "put and get meta2":
     let cache = newGroupCache(ttlNs = 60000'i64)
     let desc = newGroupDescriptor(
-      GroupID(1),
+      META_GROUP_ID,
       @[newReplicaDescriptor(NodeID(1), ReplicaID(1))]
     )
 
@@ -227,7 +233,7 @@ suite "Meta2 Cache":
 
     let result = cache.getMeta2(key, 5000)
     check result.isSome
-    check result.get.groupId == GroupID(1)
+    check result.get.groupId == META_GROUP_ID
     cache.destroy()
 
   test "get non-existent meta2":
@@ -279,40 +285,40 @@ suite "Node Descriptor":
 
 suite "Leaseholder Info":
   test "create leaseholder info":
-    let info = newLeaseholderInfo(GroupID(1), NodeID(1), 100000'i64)
-    check info.groupId == GroupID(1)
+    let info = newLeaseholderInfo(META_GROUP_ID, NodeID(1), 100000'i64)
+    check info.groupId == META_GROUP_ID
     check info.leaseholder == NodeID(1)
     check info.leaseExpirationNs == 100000
     check info.epoch == 0
 
   test "create with epoch":
-    let info = newLeaseholderInfo(GroupID(1), NodeID(1), 100000'i64, 5)
+    let info = newLeaseholderInfo(META_GROUP_ID, NodeID(1), 100000'i64, 5)
     check info.epoch == 5
 
   test "is valid":
-    let info = newLeaseholderInfo(GroupID(1), NodeID(1), 100000'i64)
+    let info = newLeaseholderInfo(META_GROUP_ID, NodeID(1), 100000'i64)
     check info.isValid(50000) # Not expired
     check not info.isValid(100000) # Expired
     check not info.isValid(150000) # Expired
 
   test "serialize to JSON":
-    let info = newLeaseholderInfo(GroupID(1), NodeID(1), 100000'i64, 5)
+    let info = newLeaseholderInfo(META_GROUP_ID, NodeID(1), 100000'i64, 5)
     let json = info.toJson()
-    check json["groupId"].getInt() == 1
+    check json["groupId"].getStr() == $META_GROUP_ID
     check json["leaseholder"].getInt() == 1
     check json["leaseExpirationNs"].getInt() == 100000
     check json["epoch"].getInt() == 5
 
   test "parse from JSON":
     let json = %*{
-      "groupId": 1,
+      "groupId": $META_GROUP_ID,
       "leaseholder": 1,
       "leaseExpirationNs": 100000,
       "epoch": 5
     }
 
     let info = parseLeaseholderInfo(json)
-    check info.groupId == GroupID(1)
+    check info.groupId == META_GROUP_ID
     check info.leaseholder == NodeID(1)
     check info.leaseExpirationNs == 100000
     check info.epoch == 5
@@ -325,10 +331,10 @@ suite "Constants":
     check META2_KEY_PREFIX == "/sys/meta2/"
 
   test "meta1 range ID":
-    check META1_RANGE_ID == GroupID(1)
+    check META1_RANGE_ID() == META_GROUP_ID
 
   test "meta2 range ID start":
-    check META2_RANGE_ID_START == GroupID(2)
+    check META2_RANGE_ID_START() == DATA_GROUP_START_ID
 
   test "default cache TTL":
     check DEFAULT_CACHE_TTL_NS == 60_000_000_000

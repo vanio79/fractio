@@ -164,7 +164,7 @@ suite "Allocator":
     let alloc = newAllocator(pool)
 
     let replicas = @[newReplicaDescriptor(NodeID(1), ReplicaID(1))]
-    let decisions = alloc.shouldRebalance(GroupID(1), replicas, NodeID(1))
+    let decisions = alloc.shouldRebalance(META_GROUP_ID, replicas, NodeID(1))
 
     # Should add replica (only 1 of 3)
     check decisions.len == 1
@@ -190,22 +190,22 @@ suite "Allocator":
 
 suite "Allocation Decision":
   test "create add replica decision":
-    let decision = newAddReplicaDecision(GroupID(1), NodeID(2), 10, "test")
+    let decision = newAddReplicaDecision(META_GROUP_ID, NodeID(2), 10, "test")
     check decision.kind == adkAddReplica
-    check decision.addGroupId == GroupID(1)
+    check decision.addGroupId == META_GROUP_ID
     check decision.addTarget == NodeID(2)
     check decision.priority == 10
 
   test "create remove replica decision":
-    let decision = newRemoveReplicaDecision(GroupID(1), NodeID(2), 5, "test")
+    let decision = newRemoveReplicaDecision(META_GROUP_ID, NodeID(2), 5, "test")
     check decision.kind == adkRemoveReplica
-    check decision.removeGroupId == GroupID(1)
+    check decision.removeGroupId == META_GROUP_ID
     check decision.removeTarget == NodeID(2)
 
   test "create transfer lease decision":
-    let decision = newTransferLeaseDecision(GroupID(1), NodeID(1), NodeID(2), 3, "test")
+    let decision = newTransferLeaseDecision(META_GROUP_ID, NodeID(1), NodeID(2), 3, "test")
     check decision.kind == adkTransferLease
-    check decision.transferGroupId == GroupID(1)
+    check decision.transferGroupId == META_GROUP_ID
     check decision.transferFrom == NodeID(1)
     check decision.transferTo == NodeID(2)
 
@@ -216,14 +216,14 @@ suite "Rebalance Queue":
 
   test "enqueue and dequeue":
     let queue = newRebalanceQueue()
-    let decision = newAddReplicaDecision(GroupID(1), NodeID(2), 10, "test")
+    let decision = newAddReplicaDecision(META_GROUP_ID, NodeID(2), 10, "test")
 
     let op = queue.enqueue(decision, 1000)
-    check op.decision.addGroupId == GroupID(1)
+    check op.decision.addGroupId == META_GROUP_ID
 
     let dequeued = queue.dequeue()
     check dequeued.isSome
-    check dequeued.get.decision.addGroupId == GroupID(1)
+    check dequeued.get.decision.addGroupId == META_GROUP_ID
 
     queue.destroy()
 
@@ -231,8 +231,8 @@ suite "Rebalance Queue":
     let queue = newRebalanceQueue()
 
     # Add low priority first
-    let low = newAddReplicaDecision(GroupID(2), NodeID(1), 1, "low")
-    let high = newAddReplicaDecision(GroupID(1), NodeID(2), 10, "high")
+    let low = newAddReplicaDecision(DATA_GROUP_START_ID, NodeID(1), 1, "low")
+    let high = newAddReplicaDecision(META_GROUP_ID, NodeID(2), 10, "high")
 
     discard queue.enqueue(low, 1000)
     discard queue.enqueue(high, 1000)
@@ -245,7 +245,7 @@ suite "Rebalance Queue":
 
   test "operation state transitions":
     let queue = newRebalanceQueue()
-    let decision = newAddReplicaDecision(GroupID(1), NodeID(2), 10, "test")
+    let decision = newAddReplicaDecision(META_GROUP_ID, NodeID(2), 10, "test")
 
     let op = queue.enqueue(decision, 1000)
     check op.state == rosPending
@@ -279,7 +279,7 @@ suite "Rebalance Scheduler":
     proc mockExecute(op: RebalanceOp): bool = true
 
     let scheduler = newRebalanceScheduler(alloc, mockExecute)
-    let decision = newAddReplicaDecision(GroupID(1), NodeID(2), 10, "test")
+    let decision = newAddReplicaDecision(META_GROUP_ID, NodeID(2), 10, "test")
 
     let op = scheduler.addDecision(decision, 1000)
     check op.isSome

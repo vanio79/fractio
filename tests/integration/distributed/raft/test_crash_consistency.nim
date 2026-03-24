@@ -21,21 +21,21 @@ suite "CrashConsistency":
 
   test "create raft group":
     let desc = newGroupDescriptor(
-      GroupID(1)
+      META_GROUP_ID
     )
     discard desc.addReplica(NodeID(1))
     discard desc.addReplica(NodeID(2))
     discard desc.addReplica(NodeID(3))
 
     let group = newRaftGroup(
-      GroupID(1),
+      META_GROUP_ID,
       NodeID(1),
       ReplicaID(1),
       desc
     )
 
     check group != nil
-    check group.groupId == GroupID(1)
+    check group.groupId == META_GROUP_ID
     check group.nodeId == NodeID(1)
     check group.descriptor.replicas.len == 3
     check group.state.load() == rsFollower
@@ -45,14 +45,14 @@ suite "CrashConsistency":
 
   test "raft group state transitions":
     let desc = newGroupDescriptor(
-      GroupID(1)
+      META_GROUP_ID
     )
     discard desc.addReplica(NodeID(1))
     discard desc.addReplica(NodeID(2))
     discard desc.addReplica(NodeID(3))
 
     let group = newRaftGroup(
-      GroupID(1),
+      META_GROUP_ID,
       NodeID(1),
       ReplicaID(1),
       desc
@@ -79,14 +79,14 @@ suite "CrashConsistency":
 
   test "raft group term progression":
     let desc = newGroupDescriptor(
-      GroupID(1)
+      META_GROUP_ID
     )
     discard desc.addReplica(NodeID(1))
     discard desc.addReplica(NodeID(2))
     discard desc.addReplica(NodeID(3))
 
     let group = newRaftGroup(
-      GroupID(1),
+      META_GROUP_ID,
       NodeID(1),
       ReplicaID(1),
       desc
@@ -109,14 +109,14 @@ suite "CrashConsistency":
 
   test "quorum calculation 3-node":
     let desc3 = newGroupDescriptor(
-      GroupID(1)
+      META_GROUP_ID
     )
     discard desc3.addReplica(NodeID(1))
     discard desc3.addReplica(NodeID(2))
     discard desc3.addReplica(NodeID(3))
 
     let group3 = newRaftGroup(
-      GroupID(1),
+      META_GROUP_ID,
       NodeID(1),
       ReplicaID(1),
       desc3
@@ -128,7 +128,7 @@ suite "CrashConsistency":
 
   test "quorum calculation 5-node":
     let desc5 = newGroupDescriptor(
-      GroupID(2)
+      DATA_GROUP_START_ID
     )
     discard desc5.addReplica(NodeID(1))
     discard desc5.addReplica(NodeID(2))
@@ -137,7 +137,7 @@ suite "CrashConsistency":
     discard desc5.addReplica(NodeID(5))
 
     let group5 = newRaftGroup(
-      GroupID(2),
+      DATA_GROUP_START_ID,
       NodeID(1),
       ReplicaID(1),
       desc5
@@ -149,13 +149,13 @@ suite "CrashConsistency":
 
   test "range descriptor creation":
     let desc = newGroupDescriptor(
-      GroupID(1)
+      META_GROUP_ID
     )
     discard desc.addReplica(NodeID(1))
     discard desc.addReplica(NodeID(2))
     discard desc.addReplica(NodeID(3))
 
-    check desc.groupId == GroupID(1)
+    check desc.groupId == META_GROUP_ID
     check desc.replicas.len == 3
 
   test "crash consistency stats tracking":
@@ -250,14 +250,14 @@ suite "CrashConsistency":
   test "concurrent state transitions simulation":
     # Simulate what happens during a crash scenario
     let desc = newGroupDescriptor(
-      GroupID(1)
+      META_GROUP_ID
     )
     discard desc.addReplica(NodeID(1))
     discard desc.addReplica(NodeID(2))
     discard desc.addReplica(NodeID(3))
 
     let group = newRaftGroup(
-      GroupID(1),
+      META_GROUP_ID,
       NodeID(1),
       ReplicaID(1),
       desc

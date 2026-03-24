@@ -13,6 +13,7 @@ import fractio/sql/parser
 import fractio/sql/ast
 import fractio/sql/planner
 import fractio/sql/executor
+import fractio/core/types except NodeID
 import fractio/distributed/meta/system_tables
 import fractio/distributed/meta/system_schemas
 import fractio/protocol/raft_store
@@ -52,11 +53,11 @@ proc makeTestEnv(testDir: string): tuple[client: FractioClient,
   ))
   coord.start()
 
-  doAssert coord.createAndStartGroup(GroupID(1), members)
-  doAssert coord.createAndStartGroup(GroupID(2), members)
+  doAssert coord.createAndStartGroup(META_GROUP_ID, members)
+  doAssert coord.createAndStartGroup(DATA_GROUP_START_ID, members)
 
   for attempt in 0 ..< 50:
-    if coord.isLeader(GroupID(1)) and coord.isLeader(GroupID(2)):
+    if coord.isLeader(META_GROUP_ID) and coord.isLeader(DATA_GROUP_START_ID):
       break
     os.sleep(100)
 
@@ -72,18 +73,23 @@ proc makeTestEnv(testDir: string): tuple[client: FractioClient,
     clientPort: clientPort.uint16, status: nsAlive
   )
   let metaGroupRec = GroupRecord(
-    groupId: 1, spaceId: 0, leader: 1,
+    groupId: groupIDToULID(META_GROUP_ID),
+    spaceId: ZeroULID(),
+    preferredLeader: 1, leader: 1,
     replicas: @[GroupReplicaBin(nodeId: 1, replicaType: rtVoter)]
   )
   let dataGroupRec = GroupRecord(
-    groupId: 2, spaceId: 1, leader: 1,
+    groupId: groupIDToULID(DATA_GROUP_START_ID),
+    spaceId: ZeroULID(),
+    preferredLeader: 1, leader: 1,
     replicas: @[GroupReplicaBin(nodeId: 1, replicaType: rtVoter)]
   )
   discard store.sysTablePutBatch(@[
     (key: encodeTableKey(SYS_NODES_TABLE_ID, "1"), value: encode(nodeRec)),
-    (key: encodeTableKey(SYS_GROUPS_TABLE_ID, "1"), value: encode(
-        metaGroupRec)),
-    (key: encodeTableKey(SYS_GROUPS_TABLE_ID, "2"), value: encode(dataGroupRec))
+    (key: encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(META_GROUP_ID)),
+        value: encode(metaGroupRec)),
+    (key: encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(
+        DATA_GROUP_START_ID)), value: encode(dataGroupRec))
   ])
 
   # Start ProtocolServer
@@ -136,7 +142,7 @@ proc seedTable(store: RaftKVStoreExt, database, schema, name: string,
     name: name,
     database: database,
     schema: schema,
-    spaceId: -1, # default space
+    spaceId: ZeroULID(), # default space (zero ULID)
     primaryKey: pk,
     columns: cols,
   )

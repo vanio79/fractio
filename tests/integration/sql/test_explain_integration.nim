@@ -57,11 +57,11 @@ proc makeTestEnv(testDir: string): tuple[client: FractioClient,
   ))
   coord.start()
 
-  doAssert coord.createAndStartGroup(GroupID(1), members)
-  doAssert coord.createAndStartGroup(GroupID(2), members)
+  doAssert coord.createAndStartGroup(META_GROUP_ID, members)
+  doAssert coord.createAndStartGroup(DATA_GROUP_START_ID, members)
 
   for attempt in 0 ..< 50:
-    if coord.isLeader(GroupID(1)) and coord.isLeader(GroupID(2)):
+    if coord.isLeader(META_GROUP_ID) and coord.isLeader(DATA_GROUP_START_ID):
       break
     os.sleep(100)
 

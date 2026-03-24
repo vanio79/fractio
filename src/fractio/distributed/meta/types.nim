@@ -13,6 +13,7 @@ import std/options
 import std/strutils
 import std/tables
 import fractio/distributed/raft/group_types
+import fractio/distributed/meta/system_tables
 
 # ============================================================================
 # Constants
@@ -25,17 +26,20 @@ const
   META2_KEY_PREFIX* = "/sys/meta2/"
     ## Prefix for meta2 keys
 
-  META1_RANGE_ID* = GroupID(1)
-    ## Special GroupID for the meta1 range
-
-  META2_RANGE_ID_START* = GroupID(2)
-    ## Starting GroupID for meta2 ranges
-
   DEFAULT_CACHE_TTL_NS* = 60_000_000_000'i64
     ## Default cache TTL: 60 seconds in nanoseconds
 
   MAX_CACHE_ENTRIES* = 10000
     ## Maximum number of entries in the range cache
+
+# Runtime constants - these alias the system_tables values
+proc META1_RANGE_ID*(): GroupID =
+  ## Special GroupID for the meta1 range (same as META_GROUP_ID)
+  META_GROUP_ID
+
+proc META2_RANGE_ID_START*(): GroupID =
+  ## Starting GroupID for meta2 ranges (same as DATA_GROUP_START_ID)
+  DATA_GROUP_START_ID
 
 # ============================================================================
 # Meta Key Encoding
@@ -367,7 +371,7 @@ proc isValid*(info: LeaseholderInfo, nowNs: int64): bool =
 proc toJson*(info: LeaseholderInfo): JsonNode =
   ## Serialize to JSON
   result = %*{
-    "groupId": info.groupId.uint64,
+    "groupId": $(info.groupId),
     "leaseholder": info.leaseholder.uint32,
     "leaseExpirationNs": info.leaseExpirationNs,
     "epoch": info.epoch
@@ -376,7 +380,7 @@ proc toJson*(info: LeaseholderInfo): JsonNode =
 proc parseLeaseholderInfo*(json: JsonNode): LeaseholderInfo =
   ## Parse from JSON
   result = LeaseholderInfo(
-    groupId: GroupID(json["groupId"].getInt()),
+    groupId: parseGroupID(json["groupId"].getStr()),
     leaseholder: NodeID(json["leaseholder"].getInt()),
     leaseExpirationNs: json["leaseExpirationNs"].getInt(),
     epoch: uint64(json["epoch"].getInt())
