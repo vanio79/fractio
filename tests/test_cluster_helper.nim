@@ -211,21 +211,16 @@ type
     storagePath: string
     members: seq[MemberInfo]
     config: TestClusterConfig
-    result: TestNode
     success: bool
     error: string
 
 proc nodeCreationWorker(arg: ptr NodeCreationArg) {.thread.} =
-  ## Worker thread for parallel node creation
+  ## Worker thread for parallel node creation.
+  ## Only prepares storage directory - refs must be allocated on main thread
+  ## to avoid atomicArc cross-thread dealloc crashes.
   try:
-    arg.result = newTestNode(
-      arg.nodeId,
-      arg.host,
-      arg.basePort,
-      arg.storagePath,
-      arg.members,
-      arg.config
-    )
+    cleanDir(arg.storagePath)
+    createDir(arg.storagePath)
     arg.success = true
   except CatchableError as e:
     arg.success = false
@@ -234,6 +229,8 @@ proc nodeCreationWorker(arg: ptr NodeCreationArg) {.thread.} =
 proc createNodesParallel(config: TestClusterConfig, members: seq[
     MemberInfo]): seq[TestNode] =
   ## Create all nodes in parallel using threads.
+  ## Storage directories are created in parallel, but refs are allocated
+  ## on the main thread to avoid atomicArc cross-thread dealloc issues.
 
   var args = newSeq[NodeCreationArg](config.nodeCount)
   var threads = newSeq[Thread[ptr NodeCreationArg]](config.nodeCount)
@@ -253,24 +250,28 @@ proc createNodesParallel(config: TestClusterConfig, members: seq[
       config: config
     )
 
-  # Start all threads
+  # Start all threads to prepare storage dirs in parallel
   for i in 0 ..< config.nodeCount:
     createThread(threads[i], nodeCreationWorker, addr args[i])
 
   # Wait for all threads
   for i in 0 ..< config.nodeCount:
     joinThread(threads[i])
+    if not args[i].success:
+      raise newException(IOError, "Failed to prepare storage for node " & $(i +
+          1) & ": " & args[i].error)
 
-    if args[i].success:
-      result.add(args[i].result)
-    else:
-      # Clean up on failure
-      for j in 0 ..< i:
-        if args[j].success:
-          args[j].result.coord.stop()
-          cleanDir(args[j].result.storagePath)
-      raise newException(IOError, "Failed to create node " & $(i + 1) & ": " &
-          args[i].error)
+  # Now create nodes sequentially on main thread (refs allocated here)
+  for i in 0 ..< config.nodeCount:
+    var node = newTestNode(
+      args[i].nodeId,
+      args[i].host,
+      args[i].basePort,
+      args[i].storagePath,
+      args[i].members,
+      args[i].config
+    )
+    result.add(node)
 
 proc createNodesSequential(config: TestClusterConfig, members: seq[
     MemberInfo]): seq[TestNode] =
