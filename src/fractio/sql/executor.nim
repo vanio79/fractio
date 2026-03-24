@@ -529,178 +529,35 @@ proc execDropTable(op: PlanOp, ctx: ExecutorContext): ExecResult =
 # ---------------------------------------------------------------------------
 
 proc execCreateSpace(op: PlanOp, ctx: ExecutorContext): ExecResult =
-  ## Execute CREATE SPACE with auto-transaction mode for system table writes.
-  ## NOTE: Transaction sessions are node-local, so we can't use a single transaction
-  ## across multiple nodes. We use auto-transaction mode (txnId=0) for each write.
-  ## TODO: Implement distributed transaction coordination for proper multi-node transactions.
+  ## Execute CREATE SPACE via server-side RPC.
+  ## The server handles:
+  ##   - Validation (duplicate names, replica count)
+  ##   - Creating Raft groups on all nodes
+  ##   - Waiting for leaders to be elected
+  ##   - Writing space/group records to sys tables via Raft
+  ## The client receives updated sys table data to update its cache.
 
-  # Check for duplicate by name
-  let startKey = encodeTableKey(SYS_SPACES_TABLE_ID, "")
-  let endKey = encodeTableKey(SYS_SPACES_TABLE_ID + 1, "")
-  let scanRes = ctx.client.kvScan(startKey, endKey, 0, txnId = 0,
-      readTimestamp = 0)
-  if scanRes.isOk:
-    for entry in scanRes.val:
-      let rec = decodeSpaceRecord(entry.value)
-      if rec.name == op.cspName:
-        return errorResult(&"space '{op.cspName}' already exists")
+  # Call server-side createSpace RPC
+  let res = ctx.client.createSpace(op.cspName, int32(op.cspReplicas))
 
-  # Count nodes in the cluster
-  let nodesStart = encodeTableKey(SYS_NODES_TABLE_ID, "")
-  let nodesEnd = encodeTableKey(SYS_NODES_TABLE_ID + 1, "")
-  let nodesRes = ctx.client.kvScan(nodesStart, nodesEnd, 0, txnId = 0,
-      readTimestamp = 0)
-  var nodeCount = 0
-  var nodeIds: seq[int] = @[]
-  if nodesRes.isOk:
-    for entry in nodesRes.val:
-      let rec = decodeNodeRecord(entry.value)
-      nodeIds.add(int(rec.nodeId))
-      inc nodeCount
+  if not res.isOk:
+    return errorResult(&"failed to create space: {res.err}")
 
-  if nodeCount == 0:
-    return errorResult("no nodes in cluster")
-
-  let replicas = if op.cspReplicas == 0: nodeCount else: op.cspReplicas
-  if replicas > nodeCount:
-    return errorResult(&"REPLICAS ({replicas}) exceeds node count ({nodeCount})")
-
-  # Compute group count and placement
-  # For R replicas on N nodes → N groups
-  let groupCount = nodeCount
-  nodeIds.sort()
-
-  # Allocate space ID (scan for max)
-  var spaceId = 1
-  if scanRes.isOk:
-    for entry in scanRes.val:
-      let rec = decodeSpaceRecord(entry.value)
-      if rec.spaceId >= spaceId: spaceId = rec.spaceId + 1
-
-  # Find max existing groupId to allocate new ones
-  let rangesStart = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
-  let rangesEnd = encodeTableKey(SYS_GROUPS_TABLE_ID + 1, "")
-  let rangesRes = ctx.client.kvScan(rangesStart, rangesEnd, 0, txnId = 0,
-      readTimestamp = 0)
-  var maxGroupId: uint64 = 1
-  if rangesRes.isOk:
-    for entry in rangesRes.val:
-      let rec = decodeGroupRecord(entry.value)
-      if rec.groupId > maxGroupId: maxGroupId = rec.groupId
-
-  var groupIds: seq[uint64] = @[]
-  for g in 0 ..< groupCount:
-    let groupId = maxGroupId + uint64(1 + g)
-    groupIds.add(groupId)
-
-    # Compute group members using ring algorithm
-    var members: seq[int] = @[]
-    for j in 0 ..< replicas:
-      members.add(nodeIds[(g + j) mod nodeCount])
-
-    # Write group descriptor to sys.groups using auto-transaction mode (txnId=0)
-    var groupReplicas: seq[GroupReplicaBin] = @[]
-    for m in members:
-      groupReplicas.add(GroupReplicaBin(nodeId: uint32(m),
-          replicaType: rtVoter))
-    let groupRec = GroupRecord(
-      groupId: groupId,
-      spaceId: int32(spaceId),
-      preferredLeader: uint32(members[0]),
-      leader: 0,
-      replicas: groupReplicas
-    )
-    let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupId)
-    # Use txnId = 0 for auto-transaction mode
-    let putRes = ctx.client.kvPut(groupKey, encode(groupRec), txnId = 0)
-    if not putRes.isOk:
-      return errorResult(&"failed to create group {groupId}: {putRes.err}")
-
-    # Note: actual Raft group creation is handled by the server nodes
-    # observing the sys.groups metadata change via applyBatchToSM.
-
-  # Write space record using auto-transaction mode (txnId=0)
-  let spaceRec = SpaceRecord(
-    spaceId: int32(spaceId),
-    name: op.cspName,
-    replicas: int32(op.cspReplicas),
-    groupCount: int32(groupCount),
-    groupIds: groupIds,
-    oldGroupIds: @[],
-    rebalancing: false,
-    createdAtNs: nowNs()
-  )
-  let spaceKey = encodeSpaceKey(spaceId)
-  # Use txnId = 0 for auto-transaction mode
-  let putRes = ctx.client.kvPut(spaceKey, encode(spaceRec), txnId = 0)
-  if not putRes.isOk:
-    return errorResult(&"failed to write space record: {putRes.err}")
-
-  okResult(&"CREATE SPACE ({groupCount} groups)")
+  okResult(&"CREATE SPACE ({res.groupCount} groups)")
 
 proc execDropSpace(op: PlanOp, ctx: ExecutorContext): ExecResult =
-  ## Execute DROP SPACE with internal MVCC transaction for consistency.
-  if op.dspName == "default":
-    return errorResult("cannot drop the default space")
+  ## Execute DROP SPACE via server-side RPC.
+  ## The server handles:
+  ##   - Validation (space exists, not "default")
+  ##   - Marking space/group records as deleted
+  ##   - Stopping Raft groups on all nodes
+  ## The client receives deleted groupIds to update its cache.
 
-  # Create internal transaction
-  let txnRes = ctx.client.beginTxn()
-  if not txnRes.isOk:
-    return errorResult(&"failed to start internal transaction: {txnRes.err}")
-  let internalTxnId = txnRes.val.txnId
-  let internalReadTimestamp = txnRes.val.readTimestamp
+  # Call server-side dropSpace RPC
+  let res = ctx.client.dropSpace(op.dspName)
 
-  # Find space by name and extract spaceId and groupIds (within transaction)
-  let startKey = encodeTableKey(SYS_SPACES_TABLE_ID, "")
-  let endKey = encodeTableKey(SYS_SPACES_TABLE_ID + 1, "")
-  let scanRes = ctx.client.kvScan(startKey, endKey, 0, txnId = internalTxnId,
-      readTimestamp = internalReadTimestamp)
-  var foundKey = ""
-  var spaceId = -1
-  var groupIds: seq[uint64] = @[]
-  if scanRes.isOk:
-    for entry in scanRes.val:
-      let rec = decodeSpaceRecord(entry.value)
-      if rec.name == op.dspName:
-        foundKey = entry.key
-        spaceId = rec.spaceId
-        groupIds = rec.groupIds
-        break
-
-  if foundKey == "":
-    discard ctx.client.rollbackTxn(internalTxnId)
-    return errorResult(&"space '{op.dspName}' does not exist")
-
-  # Check if any tables are using this space (within transaction)
-  let tableStart = encodeTableKey(SYS_TABLES_TABLE_ID, "")
-  let tableEnd = encodeTableKey(SYS_TABLES_TABLE_ID + 1, "")
-  let tableScan = ctx.client.kvScan(tableStart, tableEnd, 0,
-      txnId = internalTxnId, readTimestamp = internalReadTimestamp)
-  if tableScan.isOk:
-    for entry in tableScan.val:
-      let rec = decodeTableRecord(entry.value)
-      if rec.spaceId == spaceId:
-        discard ctx.client.rollbackTxn(internalTxnId)
-        return errorResult(&"cannot drop space '{op.dspName}': table '{rec.name}' is using it")
-
-  # Delete all group records for this space (within transaction)
-  for groupId in groupIds:
-    let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupId)
-    let delGroupRes = ctx.client.kvDelete(groupKey, txnId = internalTxnId)
-    if not delGroupRes.isOk:
-      # Log but continue - group might not exist
-      discard
-
-  # Delete the space record (within transaction)
-  let delRes = ctx.client.kvDelete(foundKey, txnId = internalTxnId)
-  if not delRes.isOk:
-    discard ctx.client.rollbackTxn(internalTxnId)
-    return errorResult(&"failed to drop space: {delRes.err}")
-
-  # Commit the transaction
-  let commitRes = ctx.client.commitTxn(internalTxnId)
-  if not commitRes.isOk:
-    return errorResult(&"failed to commit: {commitRes.err}")
+  if not res.isOk:
+    return errorResult(&"failed to drop space: {res.err}")
 
   okResult("DROP SPACE")
 

@@ -22,6 +22,7 @@ import ./messages/kv
 import ./messages/txn as txnMsgs
 import ./messages/admin as adminMsgs
 import ./messages/cluster as clusterMsgs
+import ./messages/space as spaceMsgs
 
 # ---------------------------------------------------------------------------
 # Safe logging helper (no Logger dep in client to keep it lightweight)
@@ -290,6 +291,25 @@ proc send*(client: ProtocolClient,
     var pos = 2 # skip MessageType prefix
     let codeR = readUint32BE(f.payload, pos)
     let code = if codeR.isOk: codeR.value else: ErrProtocol
+
+    # For NOT_LEADER errors, parse the redirect info
+    if code == ErrNotLeader:
+      # Skip category (1 byte) + msgLen (2 bytes) + msg
+      let catR = readUint8(f.payload, pos)
+      let msgLenR = readUint16BE(f.payload, pos)
+      if msgLenR.isOk:
+        pos += int(msgLenR.value) # skip message
+        # Read details length and details
+        let detailsLenR = readUint16BE(f.payload, pos)
+        if detailsLenR.isOk:
+          let detailsLen = int(detailsLenR.value)
+          if pos + detailsLen <= f.payload.len:
+            let details = f.payload[pos ..< pos + detailsLen]
+            let redirect = decodeLeaderRedirect(details)
+            return peErr(newProtocolError(peNotLeader, "not leader", redirect))
+      return peErr(newProtocolError(peNotLeader,
+          "not leader (no redirect info)"))
+
     return peErr(newProtocolError(peInternal, &"server error 0x{code:08X}"))
 
   peOk(f)
@@ -548,3 +568,38 @@ proc drainNode*(client: ProtocolClient,
   let r = client.send(clusterMsgs.encodeDrainNodeRequest(req))
   if r.isErr: return peErr(r.error)
   clusterMsgs.decodeDrainNodeResponse(r.value.payload)
+
+# ---------------------------------------------------------------------------
+# Space management convenience procs
+# ---------------------------------------------------------------------------
+
+proc createSpace*(client: ProtocolClient, name: string,
+    replicas: int32 = 0): Result[spaceMsgs.CreateSpaceResponse,
+    ProtocolError] {.gcsafe, raises: [].} =
+  ## Send a CREATE SPACE request to the server.
+  ## name: space name (max 65535 bytes)
+  ## replicas: replication factor (0 = ALL nodes)
+  ## The server will:
+  ##   1. Validate the request
+  ##   2. Create Raft groups for the space
+  ##   3. Wait for leaders to be elected
+  ##   4. Write space and group records to sys tables
+  ## Returns CreateSpaceResponse with spaceId, groupCount, and updated sys table data.
+  let req = spaceMsgs.CreateSpaceRequest(name: name, replicas: replicas)
+  let r = client.send(spaceMsgs.encodeCreateSpaceRequest(req))
+  if r.isErr: return peErr(r.error)
+  spaceMsgs.decodeCreateSpaceResponse(r.value.payload)
+
+proc dropSpace*(client: ProtocolClient, name: string): Result[
+    spaceMsgs.DropSpaceResponse, ProtocolError] {.gcsafe, raises: [].} =
+  ## Send a DROP SPACE request to the server.
+  ## name: space name to drop
+  ## The server will:
+  ##   1. Validate the space exists and is not "default"
+  ##   2. Mark space and group records as deleted
+  ##   3. Stop Raft groups on all nodes
+  ## Returns DropSpaceResponse with deleted groupIds.
+  let req = spaceMsgs.DropSpaceRequest(name: name)
+  let r = client.send(spaceMsgs.encodeDropSpaceRequest(req))
+  if r.isErr: return peErr(r.error)
+  spaceMsgs.decodeDropSpaceResponse(r.value.payload)

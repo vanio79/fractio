@@ -28,6 +28,7 @@ import ./messages/kv
 import ./messages/txn as txnMsgs
 import ./messages/admin as adminMsgs
 import ./messages/cluster as clusterMsgs
+import ./messages/space as spaceMsgs
 import ./txn_manager
 import ./raft_store
 import ./mvcc_store
@@ -40,7 +41,9 @@ import ../distributed/raft/group_types as rangeTypes
 import ../distributed/sharedtimer/udptransport as udpXport
 import ../distributed/meta/system_tables
 import ../distributed/meta/system_schemas
+import ../distributed/space_manager
 import ../core/timestamp_provider
+import ../storage/mvcc/types as mvccValueTypes
 import std/json
 
 # ---------------------------------------------------------------------------
@@ -408,6 +411,7 @@ type
     sharedTimer*: SharedTimer     ## Phase 7: P2P clock sync (nil when disabled)
     nodeRegistry*: NodeRegistry   ## Phase 8: in-memory cluster node registry
     raftCoord*: NuRaftCoordinator ## lifecycle owner; nil until setupRaftNode
+    spaceManager*: SpaceManager   ## Space management (CREATE/DROP SPACE)
     # Per-server thread storage
     clientThreadCount*: Atomic[int]
     acceptThreadCount*: Atomic[int]
@@ -542,6 +546,121 @@ proc sendFrame(conn: ClientConnection, payload: string,
 proc sendError(conn: ClientConnection, requestId: uint32,
     errCode: uint32, category: uint8, msg: string) {.gcsafe, raises: [].} =
   sendRaw(conn, encodeErrorFrame(requestId, errCode, category, msg))
+
+# ---------------------------------------------------------------------------
+# Leader redirect helpers
+# ---------------------------------------------------------------------------
+
+proc getLeaderRedirect(server: ProtocolServer,
+    groupId: GroupID): LeaderRedirect {.gcsafe, raises: [].} =
+  ## Get leader redirect info for a group.
+  ## Returns the leader's node ID, host, and client port.
+  ## Returns empty LeaderRedirect if leader is unknown or node info not found.
+  ##
+  ## Strategy:
+  ## 1. Try NuRaft's getLeader() - most accurate but may return -1 if follower
+  ##    hasn't received heartbeats recently
+  ## 2. Fall back to sys.groups table - may be slightly stale but better than nothing
+  if server.raftCoord.isNil:
+    try:
+      {.cast(gcsafe).}:
+        debug("getLeaderRedirect: no raftCoord", {
+            "groupId": $groupId.uint64}.toTable)
+    except:
+      discard
+    return LeaderRedirect(leaderId: 0)
+
+  var leaderId: int32 = -1
+
+  # First try NuRaft's getLeader()
+  leaderId = server.raftCoord.getLeader(groupId)
+
+  # If NuRaft doesn't know, try sys.groups table (may have stale but useful info)
+  if leaderId <= 0 and not server.raftStore.isNil:
+    let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupId.uint64)
+    let groupScan = server.raftStore.raftScan(groupKey, groupKey & "\xFF", 1,
+        includeSystemKeys = true)
+    if groupScan.isOk and groupScan.value.len > 0:
+      var data = groupScan.value[0][1].value
+      # Check for MVCC wrapper
+      if mvccValueTypes.isLikelyMVCCValue(data):
+        try:
+          let mvccVal = mvccValueTypes.decodeMVCCValue(data)
+          if not mvccVal.isDeleted:
+            data = mvccVal.data
+        except CatchableError:
+          discard
+      try:
+        let groupRec = decodeGroupRecord(data)
+        if groupRec.leader > 0:
+          leaderId = int32(groupRec.leader)
+          try:
+            {.cast(gcsafe).}:
+              debug("getLeaderRedirect: found leader from sys.groups", {
+                  "groupId": $groupId.uint64, "leaderId": $leaderId}.toTable)
+          except:
+            discard
+      except CatchableError:
+        discard
+
+  if leaderId <= 0:
+    try:
+      {.cast(gcsafe).}:
+        debug("getLeaderRedirect: no leader found", {"groupId": $groupId.uint64,
+            "leaderId": $leaderId}.toTable)
+    except:
+      discard
+    return LeaderRedirect(leaderId: 0)
+
+  result.leaderId = uint32(leaderId)
+
+  # Look up the leader's host and client port from sys.nodes
+  if not server.raftStore.isNil:
+    let nodeKey = encodeTableKey(SYS_NODES_TABLE_ID, $leaderId)
+    let nodeScan = server.raftStore.raftScan(nodeKey, nodeKey & "\xFF", 1,
+        includeSystemKeys = true)
+    if nodeScan.isOk and nodeScan.value.len > 0:
+      var data = nodeScan.value[0][1].value
+      # Check for MVCC wrapper
+      if mvccValueTypes.isLikelyMVCCValue(data):
+        try:
+          let mvccVal = mvccValueTypes.decodeMVCCValue(data)
+          if not mvccVal.isDeleted:
+            data = mvccVal.data
+          else:
+            return LeaderRedirect(leaderId: 0)
+        except CatchableError:
+          discard
+      try:
+        let nodeRec = decodeNodeRecord(data)
+        result.leaderHost = nodeRec.host
+        result.leaderClientPort = nodeRec.clientPort
+      except CatchableError:
+        discard
+
+proc sendNotLeaderError(conn: ClientConnection, requestId: uint32,
+    msg: string, redirect: LeaderRedirect) {.gcsafe, raises: [].} =
+  ## Send a NOT_LEADER error with leader redirect info.
+  try:
+    {.cast(gcsafe).}:
+      debug("sendNotLeaderError", {"leaderId": $redirect.leaderId,
+          "leaderHost": redirect.leaderHost,
+          "leaderClientPort": $redirect.leaderClientPort}.toTable)
+  except:
+    discard
+  sendRaw(conn, encodeNotLeaderErrorFrame(requestId, msg, redirect))
+
+proc getGroupIdForKey(server: ProtocolServer, key: string): GroupID {.gcsafe,
+    raises: [].} =
+  ## Get the GroupID that a key routes to.
+  ## Falls back to META_GROUP_ID if routing fails.
+  if server.raftStore.isNil:
+    return META_GROUP_ID
+  let gidOpt = server.raftStore.resolveGroupId(key)
+  if gidOpt.isSome:
+    gidOpt.get()
+  else:
+    META_GROUP_ID
 
 # ---------------------------------------------------------------------------
 # Handshake (Phase 4: auth wired in)
@@ -772,7 +891,8 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
         status: PutStatusOK, timestamp: 0, version: 1)), requestId)
     else:
       if writeRes.error.kind == rseNotLeader:
-        sendError(conn, requestId, ErrNotLeader, ErrCatKV, $writeRes.error)
+        let redirect = server.getLeaderRedirect(GroupID(req.groupId))
+        sendNotLeaderError(conn, requestId, $writeRes.error, redirect)
       else:
         sendError(conn, requestId, ErrInternal, ErrCatKV, $writeRes.error)
 
@@ -810,7 +930,9 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
           if res.error.msg.contains("not the leader") or
              res.error.msg.contains("Not the leader") or
              res.error.msg.contains("Raft append failed (code -3)"):
-            sendError(conn, requestId, ErrNotLeader, ErrCatKV, res.error.msg)
+            let groupId = server.getGroupIdForKey(req.key)
+            let redirect = server.getLeaderRedirect(groupId)
+            sendNotLeaderError(conn, requestId, res.error.msg, redirect)
           else:
             sendError(conn, requestId, ErrInternal, ErrCatKV, res.error.msg)
       else:
@@ -832,7 +954,9 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
           if res.error.msg.contains("not the leader") or
              res.error.msg.contains("Not the leader") or
              res.error.msg.contains("Raft append failed (code -3)"):
-            sendError(conn, requestId, ErrNotLeader, ErrCatKV, res.error.msg)
+            let groupId = server.getGroupIdForKey(req.key)
+            let redirect = server.getLeaderRedirect(groupId)
+            sendNotLeaderError(conn, requestId, res.error.msg, redirect)
           else:
             sendError(conn, requestId, ErrInternal, ErrCatKV, res.error.msg)
     else:
@@ -864,7 +988,9 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
         else:
           # Check for "not leader" error and return appropriate error code
           if res.error.msg.contains("not the leader") or res.error.msg.contains("Not the leader"):
-            sendError(conn, requestId, ErrNotLeader, ErrCatKV, res.error.msg)
+            let groupId = server.getGroupIdForKey(req.key)
+            let redirect = server.getLeaderRedirect(groupId)
+            sendNotLeaderError(conn, requestId, res.error.msg, redirect)
           else:
             sendError(conn, requestId, ErrInternal, ErrCatKV, res.error.msg)
       else:
@@ -881,7 +1007,9 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
         else:
           # Check for "not leader" error and return appropriate error code
           if res.error.msg.contains("not the leader") or res.error.msg.contains("Not the leader"):
-            sendError(conn, requestId, ErrNotLeader, ErrCatKV, res.error.msg)
+            let groupId = server.getGroupIdForKey(req.key)
+            let redirect = server.getLeaderRedirect(groupId)
+            sendNotLeaderError(conn, requestId, res.error.msg, redirect)
           else:
             sendError(conn, requestId, ErrInternal, ErrCatKV, res.error.msg)
     else:
@@ -899,7 +1027,7 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
 
     # Use an auto-transaction for the whole batch
     let res = server.mvccStore.withAutoTransactionResult(proc(
-        sid: uint64): MvccResult[seq[BatchOpResult]] =
+        sid: uint64): mvcc_store.MvccResult[seq[BatchOpResult]] =
       var opsResults = newSeq[BatchOpResult](req.operations.len)
       var hasFailure = false
       for i, op in req.operations:
@@ -1259,6 +1387,58 @@ proc handleBuiltinCluster(server: ProtocolServer, conn: ClientConnection,
                else: "node " & $req.nodeId & " not found",
     )
     sendFrame(conn, clusterMsgs.encodeDrainNodeResponse(resp), requestId)
+
+  of uint16(mtCreateSpace):
+    # Handle CREATE SPACE - requires SpaceManager
+    if server.spaceManager.isNil:
+      sendError(conn, requestId, ErrInternal, ErrCatSystem,
+        "space manager not initialized")
+      return
+    let reqR = decodeCreateSpaceRequest(payload)
+    if reqR.isErr:
+      sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
+      return
+    # Execute with error protection
+    var resp: spaceMsgs.CreateSpaceResponse
+    try:
+      resp = server.spaceManager.createSpace(reqR.value)
+    except Exception as e:
+      resp = spaceMsgs.CreateSpaceResponse(
+        success: false,
+        error: "internal error: " & e.msg
+      )
+    # Check for NOT_LEADER error and include redirect info
+    if not resp.success and isNotLeaderError(resp.error):
+      let redirect = server.getLeaderRedirect(META_GROUP_ID)
+      sendNotLeaderError(conn, requestId, resp.error, redirect)
+    else:
+      sendFrame(conn, encodeCreateSpaceResponse(resp), requestId)
+
+  of uint16(mtDropSpace):
+    # Handle DROP SPACE - requires SpaceManager
+    if server.spaceManager.isNil:
+      sendError(conn, requestId, ErrInternal, ErrCatSystem,
+        "space manager not initialized")
+      return
+    let reqR = decodeDropSpaceRequest(payload)
+    if reqR.isErr:
+      sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
+      return
+    # Execute with error protection
+    var resp: spaceMsgs.DropSpaceResponse
+    try:
+      resp = server.spaceManager.dropSpace(reqR.value)
+    except Exception as e:
+      resp = spaceMsgs.DropSpaceResponse(
+        success: false,
+        error: "internal error: " & e.msg
+      )
+    # Check for NOT_LEADER error and include redirect info
+    if not resp.success and isNotLeaderError(resp.error):
+      let redirect = server.getLeaderRedirect(META_GROUP_ID)
+      sendNotLeaderError(conn, requestId, resp.error, redirect)
+    else:
+      sendFrame(conn, encodeDropSpaceResponse(resp), requestId)
 
   else:
     sendError(conn, requestId, ErrProtocol, ErrCatSystem,
@@ -1678,6 +1858,14 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
   store.loadSpaces()
   store.loadTableSpaces()
   store.loadGroupMembers()
+
+  # Initialize SpaceManager for CREATE/DROP SPACE operations
+  server.spaceManager = newSpaceManager(
+    store = store,
+    coord = coord,
+    nodeId = nodeId.uint32,
+    logger = server.logger
+  )
 
   # SharedTimer: enable when we have peers and timer not yet configured
   if peers.len > 0 and server.sharedTimer.isNil:

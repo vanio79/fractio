@@ -152,3 +152,47 @@ proc encodeErrorFrame*(requestId: uint32, errCode: uint32,
   payload.writeUint16BE(0x0000'u16)
   payload.add(encodeErrorPayload(errCode, category, msg, details))
   encodeFrame(payload, requestId, FlagIsResponse or FlagIsError)
+
+# ---------------------------------------------------------------------------
+# Error frame with leader redirect info (for ErrNotLeader)
+# ---------------------------------------------------------------------------
+
+proc encodeNotLeaderErrorFrame*(requestId: uint32, msg: string,
+    redirect: LeaderRedirect): string =
+  ## Encode an error frame with leader redirect info.
+  ## Wire format (after MessageType prefix):
+  ##   [errCode:4][category:1][msgLen:2][msg:N][detailsLen:2]
+  ##   [leaderId:4][leaderHostLen:2][leaderHost:N][leaderClientPort:2]
+  var payload = ""
+  payload.writeUint16BE(0x0000'u16)
+  payload.writeUint32BE(ErrNotLeader)
+  payload.writeUint8(ErrCatSystem)
+  payload.writeUint16BE(uint16(msg.len))
+  payload.add(msg)
+  # Details contains redirect info in binary format
+  var details = ""
+  details.writeUint32BE(redirect.leaderId)
+  details.writeBytes16(redirect.leaderHost)
+  details.writeUint16BE(redirect.leaderClientPort)
+  payload.writeUint16BE(uint16(details.len))
+  payload.add(details)
+  encodeFrame(payload, requestId, FlagIsResponse or FlagIsError)
+
+proc decodeLeaderRedirect*(details: string): LeaderRedirect =
+  ## Decode leader redirect info from error frame details.
+  ## Returns empty LeaderRedirect if details is malformed.
+  if details.len < 8: # 4 (leaderId) + 2 (hostLen) + 2 (port) minimum
+    return LeaderRedirect(leaderId: 0)
+  var pos = 0
+  let idR = readUint32BE(details, pos)
+  if idR.isErr: return LeaderRedirect(leaderId: 0)
+  result.leaderId = idR.value
+
+  let hostR = readBytes16(details, pos)
+  if hostR.isErr: return LeaderRedirect(leaderId: 0)
+  result.leaderHost = hostR.value
+
+  if pos + 2 > details.len: return LeaderRedirect(leaderId: 0)
+  let portR = readUint16BE(details, pos)
+  if portR.isErr: return LeaderRedirect(leaderId: 0)
+  result.leaderClientPort = portR.value

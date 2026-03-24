@@ -29,6 +29,7 @@ import fractio/storage/mvcc/types as mvccTypes
 import fractio/sql/executor
 import fractio/client/fractio_client
 import fractio/client/sql_client
+import fractio/distributed/space_manager
 
 # Import optimized test configuration
 import ../../test_config
@@ -156,6 +157,14 @@ proc makeNode(nodeNum: int, basePort: int,
   srv.raftCoord = coord
   srv.mvccStore = mvccStore
   srv.txnMgr = txnMgr
+
+  # Initialize SpaceManager for CREATE/DROP SPACE operations
+  srv.spaceManager = newSpaceManager(
+    store = store,
+    coord = coord,
+    nodeId = uint32(nodeNum),
+    logger = nil
+  )
 
   # Create FractioClient (will be initialized when node starts)
   let fractioClient = newFractioClient("127.0.0.1", cPort)

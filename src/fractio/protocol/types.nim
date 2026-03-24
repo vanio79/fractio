@@ -88,6 +88,10 @@ type
     mtRebalanceStatus = 0x0706 ## Query rebalance operation status
     mtDrainNode = 0x0707       ## Mark a node as draining (graceful shutdown)
 
+    # Space Management (0x0708-0x0709)
+    mtCreateSpace = 0x0708     ## Create a new space with Raft groups
+    mtDropSpace = 0x0709       ## Drop an existing space and its groups
+
 # ---------------------------------------------------------------------------
 # Authentication methods
 # ---------------------------------------------------------------------------
@@ -120,6 +124,24 @@ const
   ErrOverloaded* = 0x07000003'u32
   ErrInternal* = 0x07000004'u32   ## Phase 5: internal/unexpected server error
   ErrBadRouting* = 0x07000005'u32 ## Key does not hash to the specified group
+
+# ---------------------------------------------------------------------------
+# Leader redirect info (returned with ErrNotLeader)
+# ---------------------------------------------------------------------------
+
+type
+  LeaderRedirect* = object
+    ## Sent by server when it's not the leader for a group.
+    ## Client should retry the request to this node.
+    leaderId*: uint32 ## Node ID of the current leader
+    leaderHost*: string ## Host address (e.g., "127.0.0.1")
+    leaderClientPort*: uint16 ## Client protocol port
+
+proc `$`*(r: LeaderRedirect): string =
+  if r.leaderId == 0:
+    "no leader known"
+  else:
+    &"node {r.leaderId} at {r.leaderHost}:{r.leaderClientPort}"
 
 # ---------------------------------------------------------------------------
 # Error checking helpers
@@ -171,16 +193,19 @@ type
   ProtocolError* = object
     kind*: ProtocolErrorKind
     msg*: string
-    leaderAddr*: string # non-empty when kind == peNotLeader
+    leaderRedirect*: LeaderRedirect ## Set when kind == peNotLeader
 
 proc newProtocolError*(kind: ProtocolErrorKind, msg: string,
-    leaderAddr: string = ""): ProtocolError =
-  ProtocolError(kind: kind, msg: msg, leaderAddr: leaderAddr)
+    redirect: LeaderRedirect = LeaderRedirect()): ProtocolError =
+  ProtocolError(kind: kind, msg: msg, leaderRedirect: redirect)
 
 proc `$`*(e: ProtocolError): string =
   result = &"ProtocolError[{e.kind}]: {e.msg}"
-  if e.leaderAddr.len > 0:
-    result &= &" (leader: {e.leaderAddr})"
+  if e.kind == peNotLeader and e.leaderRedirect.leaderId != 0:
+    result &= &" (redirect to {e.leaderRedirect})"
+
+proc isNotLeader*(e: ProtocolError): bool {.inline.} =
+  e.kind == peNotLeader
 
 # ---------------------------------------------------------------------------
 # Result types — no external dependencies.

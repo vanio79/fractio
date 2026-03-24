@@ -10,7 +10,8 @@
 ## This enables client-side SQL parsing, planning, and execution
 ## with direct KV operations to group leaders, avoiding internal rerouting.
 
-import std/[options, tables, sets, locks, atomics, strutils, hashes, algorithm, os]
+import std/[options, tables, sets, locks, atomics, strutils, hashes, algorithm,
+    os, sequtils]
 import posix
 import ../protocol/client
 import ../protocol/types
@@ -19,6 +20,7 @@ import ../protocol/messages/txn as txnMsgs
 import ../distributed/meta/system_tables
 import ../distributed/meta/system_schemas
 import ../storage/mvcc/types as mvccTypes
+import ../utils/logging
 
 # =============================================================================
 # Types
@@ -418,6 +420,54 @@ proc refreshGroupLeader(client: FractioClient, groupId: uint64): bool =
 
   return true
 
+proc updateLeaderFromRedirect*(client: FractioClient, groupId: uint64,
+    redirect: LeaderRedirect): bool =
+  ## Update the leader connection based on redirect info from a NOT_LEADER error.
+  ## This is faster than refreshing all metadata because we connect directly
+  ## to the new leader.
+  if redirect.leaderId == 0:
+    return false
+
+  # Debug logging
+  try:
+    {.cast(gcsafe).}:
+      debug("updateLeaderFromRedirect", {"groupId": $groupId,
+          "leaderId": $redirect.leaderId,
+          "leaderHost": redirect.leaderHost,
+          "leaderClientPort": $redirect.leaderClientPort}.toTable)
+  except:
+    discard
+
+  withLock client.lock:
+    # Clear old connection if any
+    if groupId in client.leaderConnections:
+      try:
+        client.leaderConnections[groupId].disconnect()
+      except: discard
+      client.leaderConnections.del(groupId)
+
+    # Update group info with new leader
+    if groupId in client.groups:
+      var groupInfo = client.groups[groupId]
+      groupInfo.leaderNodeId = redirect.leaderId
+      client.groups[groupId] = groupInfo
+
+    # Connect to the new leader
+    let connOpt = client.connectToNode(redirect.leaderHost, int(
+        redirect.leaderClientPort))
+    if connOpt.isSome:
+      client.leaderConnections[groupId] = connOpt.get()
+
+      # Also update nodes cache if this node is known
+      if redirect.leaderId in client.nodes:
+        var nodeInfo = client.nodes[redirect.leaderId]
+        nodeInfo.client = connOpt.get()
+        client.nodes[redirect.leaderId] = nodeInfo
+
+      return true
+
+  return false
+
 # =============================================================================
 # Key routing
 # =============================================================================
@@ -531,9 +581,13 @@ proc kvGet*(client: FractioClient, key: string, txnId: uint64 = 0,
       else:
         return kvOpOk(none(string))
 
-    # Check for "not leader" error
+    # Check for "not leader" error with redirect info
     if res.error.kind == peNotLeader:
-      # Refresh leader and retry
+      # Try to use redirect info for faster recovery
+      if res.error.leaderRedirect.leaderId != 0:
+        if client.updateLeaderFromRedirect(groupId, res.error.leaderRedirect):
+          continue
+      # Fall back to metadata refresh if no redirect info
       if not client.refreshGroupLeader(groupId):
         return kvOpErr[Option[string]]("failed to refresh group leader")
       continue
@@ -570,14 +624,26 @@ proc kvPut*(client: FractioClient, key, value: string,
     if res.isOk and res.value.status == kvMsgs.PutStatusOK:
       return kvVoidOk()
 
-    # Check for "not leader" error (use isNotLeaderError to check message content)
-    if res.isErr and isNotLeaderError(res.error.msg):
-      if not client.refreshGroupLeader(groupId):
-        return kvVoidErr("failed to refresh group leader")
-      # Backoff before retry to allow leader election to complete
-      if attempt < maxRetries - 1:
-        sleep(baseBackoffMs + attempt * 5)
-      continue
+    # Check for "not leader" error
+    if res.isErr:
+      if res.error.kind == peNotLeader:
+        # Try to use redirect info for faster recovery
+        if res.error.leaderRedirect.leaderId != 0:
+          if client.updateLeaderFromRedirect(groupId, res.error.leaderRedirect):
+            continue
+        # Fall back to metadata refresh
+        if not client.refreshGroupLeader(groupId):
+          return kvVoidErr("failed to refresh group leader")
+        if attempt < maxRetries - 1:
+          sleep(baseBackoffMs + attempt * 5)
+        continue
+      elif isNotLeaderError(res.error.msg):
+        # Legacy: check message content for backward compatibility
+        if not client.refreshGroupLeader(groupId):
+          return kvVoidErr("failed to refresh group leader")
+        if attempt < maxRetries - 1:
+          sleep(baseBackoffMs + attempt * 5)
+        continue
 
     let errMsg = if res.isOk: "put failed with status " & $res.value.status
                  else: "server error: " & res.error.msg
@@ -606,6 +672,11 @@ proc kvDelete*(client: FractioClient, key: string,
       return kvVoidOk()
 
     if res.isErr and res.error.kind == peNotLeader:
+      # Try to use redirect info for faster recovery
+      if res.error.leaderRedirect.leaderId != 0:
+        if client.updateLeaderFromRedirect(groupId, res.error.leaderRedirect):
+          continue
+      # Fall back to metadata refresh
       if not client.refreshGroupLeader(groupId):
         return kvVoidErr("failed to refresh group leader")
       continue
@@ -729,6 +800,145 @@ proc rollbackTxn*(client: FractioClient, txnId: uint64): KVOpVoidResult =
     return kvVoidOk()
   else:
     return kvVoidErr(res.error.msg)
+
+# =============================================================================
+# Space Management
+# =============================================================================
+
+type
+  SpaceOpResult* = object
+    ## Result type for space operations
+    isOk*: bool
+    err*: string
+    ## On success:
+    spaceId*: int32
+    groupCount*: int32
+    groupIds*: seq[uint64]
+
+proc spaceOpOk(spaceId: int32, groupCount: int32, groupIds: seq[
+    uint64]): SpaceOpResult =
+  SpaceOpResult(isOk: true, spaceId: spaceId, groupCount: groupCount,
+      groupIds: groupIds)
+
+proc spaceOpErr(msg: string): SpaceOpResult =
+  SpaceOpResult(isOk: false, err: msg)
+
+proc createSpace*(client: FractioClient, name: string,
+    replicas: int32 = 0): SpaceOpResult =
+  ## Create a new space on the server.
+  ## This operation:
+  ##   1. Sends a CreateSpace request to the META leader
+  ##   2. Server creates Raft groups and waits for leaders
+  ##   3. Server writes space/group records to sys tables
+  ##   4. Returns updated sys table data for client cache
+  ##
+  ## name: space name (must be unique)
+  ## replicas: replication factor (0 = ALL nodes)
+
+  # Retry loop for leader redirect
+  for attempt in 0 ..< 3:
+    # Get connection to META group leader
+    let connOpt = client.getGroupLeaderConnection(1)
+    if connOpt.isNone:
+      return spaceOpErr("no connection to META group leader")
+
+    let conn = connOpt.get()
+
+    # Send createSpace request
+    let res = conn.createSpace(name, replicas)
+    if res.isErr:
+      # Check for redirect
+      if res.error.kind == peNotLeader and res.error.leaderRedirect.leaderId != 0:
+        if client.updateLeaderFromRedirect(1, res.error.leaderRedirect):
+          continue
+      return spaceOpErr(res.error.msg)
+
+    let resp = res.value
+    if not resp.success:
+      return spaceOpErr(resp.error)
+
+    # Update local cache with new space and group records
+    withLock client.lock:
+      # Parse and cache the space record
+      let spaceRec = decodeSpaceRecord(resp.spaceRecord)
+      client.spaces[spaceRec.spaceId] = SpaceInfo(
+        spaceId: spaceRec.spaceId,
+        name: spaceRec.name,
+        groupIds: spaceRec.groupIds
+      )
+
+      # Parse and cache all group records
+      for gr in resp.groupRecords:
+        let groupRec = decodeGroupRecord(gr.record)
+        var replicaNodeIds: seq[uint32] = @[]
+        for rep in groupRec.replicas:
+          replicaNodeIds.add(rep.nodeId)
+
+        client.groups[groupRec.groupId] = GroupInfo(
+          groupId: groupRec.groupId,
+          spaceId: groupRec.spaceId,
+          leaderNodeId: groupRec.leader,
+          replicaNodeIds: replicaNodeIds
+        )
+
+    return spaceOpOk(resp.spaceId, resp.groupCount,
+      resp.groupRecords.mapIt(it.groupId))
+
+  return spaceOpErr("too many retries")
+
+proc dropSpace*(client: FractioClient, name: string): SpaceOpResult =
+  ## Drop an existing space on the server.
+  ## This operation:
+  ##   1. Sends a DropSpace request to the META leader
+  ##   2. Server marks space/group records as deleted
+  ##   3. Server stops Raft groups on all nodes
+  ##   4. Returns deleted groupIds for client cache cleanup
+
+  # Retry loop for leader redirect
+  for attempt in 0 ..< 3:
+    # Get connection to META group leader
+    let connOpt = client.getGroupLeaderConnection(1)
+    if connOpt.isNone:
+      return spaceOpErr("no connection to META group leader")
+
+    let conn = connOpt.get()
+
+    # Send dropSpace request
+    let res = conn.dropSpace(name)
+    if res.isErr:
+      # Check for redirect
+      if res.error.kind == peNotLeader and res.error.leaderRedirect.leaderId != 0:
+        if client.updateLeaderFromRedirect(1, res.error.leaderRedirect):
+          continue
+      return spaceOpErr(res.error.msg)
+
+    let resp = res.value
+    if not resp.success:
+      return spaceOpErr(resp.error)
+
+    # Update local cache - remove space and groups
+    withLock client.lock:
+      # Find and remove the space
+      var spaceIdToRemove: int32 = resp.spaceId
+      if spaceIdToRemove == 0:
+        # SpaceId wasn't in response, find it by name
+        for sid, sinfo in client.spaces:
+          if sinfo.name == name:
+            spaceIdToRemove = sid
+            break
+
+      if spaceIdToRemove != 0:
+        client.spaces.del(spaceIdToRemove)
+
+      # Remove all deleted groups
+      for gid in resp.deletedGroupIds:
+        client.groups.del(gid)
+        client.leaderConnections.del(gid)
+
+    return spaceOpOk(resp.spaceId, resp.deletedGroupIds.len.int32,
+      resp.deletedGroupIds)
+
+  return spaceOpErr("too many retries")
 
 # =============================================================================
 # Cleanup

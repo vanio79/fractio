@@ -7,17 +7,31 @@
 # Wire formats:
 #   All encode procs prepend a 2-byte MessageType prefix.
 #   Integers are big-endian.
-#   Strings are uint8-length-prefixed (max 255 bytes each).
+#   Strings use uint16 length prefix for longer names.
+#   Binary records use uint32 length prefix.
 #
 # CreateSpace Request:
-#   [MessageType:2][name:1+N][replicas:4]
+#   [MessageType:2][nameLen:2][name:N][replicas:4]
 # CreateSpace Response:
-#   [MessageType:2][success:1][spaceId:4][groupCount:4][message:1+N]
+#   [MessageType:2][success:1]
+#   On success:
+#     [spaceId:4][groupCount:4]
+#     [spaceRecordLen:4][spaceRecord:N]
+#     [groupCount groups, each:]
+#       [groupId:8][groupRecordLen:4][groupRecord:N]
+#   On failure:
+#     [errorLen:2][error:N]
 #
 # DropSpace Request:
-#   [MessageType:2][name:1+N]
+#   [MessageType:2][nameLen:2][name:N]
 # DropSpace Response:
-#   [MessageType:2][success:1][message:1+N]
+#   [MessageType:2][success:1]
+#   On success:
+#     [deletedGroupCount:4]
+#     [deletedGroupCount deleted groupIds, each:]
+#       [groupId:8]
+#   On failure:
+#     [errorLen:2][error:N]
 
 import ../types
 import ../codec
@@ -28,19 +42,28 @@ import ../codec
 
 type
   CreateSpaceRequest* = object
-    name*: string    ## Space name (max 255 bytes)
+    name*: string    ## Space name (max 65535 bytes)
     replicas*: int32 ## Replication factor (0 = ALL nodes)
+
+  GroupRecordData* = object
+    ## A single group record returned in CreateSpaceResponse
+    groupId*: uint64
+    record*: string ## Binary-encoded GroupRecord
 
   CreateSpaceResponse* = object
     success*: bool
-    spaceId*: int32    ## Assigned space ID (0 on failure)
-    groupCount*: int32 ## Number of Raft groups created
-    message*: string   ## Human-readable result or error detail
+    ## On success:
+    spaceId*: int32                     ## Assigned space ID
+    groupCount*: int32                  ## Number of Raft groups created
+    spaceRecord*: string                ## Binary-encoded SpaceRecord for client cache
+    groupRecords*: seq[GroupRecordData] ## All created group records
+                                        ## On failure:
+    error*: string                      ## Error message
 
 proc encodeCreateSpaceRequest*(req: CreateSpaceRequest): string =
   var buf = ""
   buf.writeUint16BE(uint16(mtCreateSpace))
-  buf.writeBytes8(req.name)
+  buf.writeBytes16(req.name)
   buf.writeInt32BE(req.replicas)
   buf
 
@@ -49,7 +72,7 @@ proc decodeCreateSpaceRequest*(payload: string): Result[CreateSpaceRequest,
   var pos = 2 # skip MessageType
   var req: CreateSpaceRequest
 
-  let nameR = readBytes8(payload, pos)
+  let nameR = readBytes16(payload, pos)
   if nameR.isErr: return peErr(nameR.error)
   req.name = nameR.value
 
@@ -63,9 +86,17 @@ proc encodeCreateSpaceResponse*(resp: CreateSpaceResponse): string =
   var buf = ""
   buf.writeUint16BE(uint16(mtCreateSpace))
   buf.writeUint8(if resp.success: 0x01'u8 else: 0x00'u8)
-  buf.writeInt32BE(resp.spaceId)
-  buf.writeInt32BE(resp.groupCount)
-  buf.writeBytes8(resp.message)
+
+  if resp.success:
+    buf.writeInt32BE(resp.spaceId)
+    buf.writeInt32BE(resp.groupCount)
+    buf.writeBytes32(resp.spaceRecord)
+    buf.writeInt32BE(resp.groupRecords.len.int32)
+    for gr in resp.groupRecords:
+      buf.writeUint64BE(gr.groupId)
+      buf.writeBytes32(gr.record)
+  else:
+    buf.writeBytes16(resp.error)
   buf
 
 proc decodeCreateSpaceResponse*(payload: string): Result[CreateSpaceResponse,
@@ -77,17 +108,39 @@ proc decodeCreateSpaceResponse*(payload: string): Result[CreateSpaceResponse,
   if successR.isErr: return peErr(successR.error)
   resp.success = successR.value != 0
 
-  let spaceIdR = readInt32BE(payload, pos)
-  if spaceIdR.isErr: return peErr(spaceIdR.error)
-  resp.spaceId = spaceIdR.value
+  if resp.success:
+    let spaceIdR = readInt32BE(payload, pos)
+    if spaceIdR.isErr: return peErr(spaceIdR.error)
+    resp.spaceId = spaceIdR.value
 
-  let groupCountR = readInt32BE(payload, pos)
-  if groupCountR.isErr: return peErr(groupCountR.error)
-  resp.groupCount = groupCountR.value
+    let groupCountR = readInt32BE(payload, pos)
+    if groupCountR.isErr: return peErr(groupCountR.error)
+    resp.groupCount = groupCountR.value
 
-  let msgR = readBytes8(payload, pos)
-  if msgR.isErr: return peErr(msgR.error)
-  resp.message = msgR.value
+    let spaceRecordR = readBytes32(payload, pos)
+    if spaceRecordR.isErr: return peErr(spaceRecordR.error)
+    resp.spaceRecord = spaceRecordR.value
+
+    let numGroupsR = readInt32BE(payload, pos)
+    if numGroupsR.isErr: return peErr(numGroupsR.error)
+    let numGroups = numGroupsR.value
+
+    resp.groupRecords = newSeqOfCap[GroupRecordData](numGroups.int)
+    for i in 0 ..< numGroups.int:
+      let gidR = readUint64BE(payload, pos)
+      if gidR.isErr: return peErr(gidR.error)
+
+      let recR = readBytes32(payload, pos)
+      if recR.isErr: return peErr(recR.error)
+
+      resp.groupRecords.add(GroupRecordData(
+        groupId: gidR.value,
+        record: recR.value
+      ))
+  else:
+    let errR = readBytes16(payload, pos)
+    if errR.isErr: return peErr(errR.error)
+    resp.error = errR.value
 
   peOk(resp)
 
@@ -97,16 +150,20 @@ proc decodeCreateSpaceResponse*(payload: string): Result[CreateSpaceResponse,
 
 type
   DropSpaceRequest* = object
-    name*: string ## Space name to drop (max 255 bytes)
+    name*: string ## Space name to drop (max 65535 bytes)
 
   DropSpaceResponse* = object
     success*: bool
-    message*: string ## Human-readable result or error detail
+    ## On success:
+    spaceId*: int32               ## ID of deleted space (for client cache cleanup)
+    deletedGroupIds*: seq[uint64] ## GroupIds that were deleted
+                                  ## On failure:
+    error*: string                ## Error message
 
 proc encodeDropSpaceRequest*(req: DropSpaceRequest): string =
   var buf = ""
   buf.writeUint16BE(uint16(mtDropSpace))
-  buf.writeBytes8(req.name)
+  buf.writeBytes16(req.name)
   buf
 
 proc decodeDropSpaceRequest*(payload: string): Result[DropSpaceRequest,
@@ -114,7 +171,7 @@ proc decodeDropSpaceRequest*(payload: string): Result[DropSpaceRequest,
   var pos = 2 # skip MessageType
   var req: DropSpaceRequest
 
-  let nameR = readBytes8(payload, pos)
+  let nameR = readBytes16(payload, pos)
   if nameR.isErr: return peErr(nameR.error)
   req.name = nameR.value
 
@@ -124,7 +181,14 @@ proc encodeDropSpaceResponse*(resp: DropSpaceResponse): string =
   var buf = ""
   buf.writeUint16BE(uint16(mtDropSpace))
   buf.writeUint8(if resp.success: 0x01'u8 else: 0x00'u8)
-  buf.writeBytes8(resp.message)
+
+  if resp.success:
+    buf.writeInt32BE(resp.spaceId)
+    buf.writeInt32BE(resp.deletedGroupIds.len.int32)
+    for gid in resp.deletedGroupIds:
+      buf.writeUint64BE(gid)
+  else:
+    buf.writeBytes16(resp.error)
   buf
 
 proc decodeDropSpaceResponse*(payload: string): Result[DropSpaceResponse,
@@ -136,8 +200,23 @@ proc decodeDropSpaceResponse*(payload: string): Result[DropSpaceResponse,
   if successR.isErr: return peErr(successR.error)
   resp.success = successR.value != 0
 
-  let msgR = readBytes8(payload, pos)
-  if msgR.isErr: return peErr(msgR.error)
-  resp.message = msgR.value
+  if resp.success:
+    let spaceIdR = readInt32BE(payload, pos)
+    if spaceIdR.isErr: return peErr(spaceIdR.error)
+    resp.spaceId = spaceIdR.value
+
+    let numGroupsR = readInt32BE(payload, pos)
+    if numGroupsR.isErr: return peErr(numGroupsR.error)
+    let numGroups = numGroupsR.value
+
+    resp.deletedGroupIds = newSeqOfCap[uint64](numGroups.int)
+    for i in 0 ..< numGroups.int:
+      let gidR = readUint64BE(payload, pos)
+      if gidR.isErr: return peErr(gidR.error)
+      resp.deletedGroupIds.add(gidR.value)
+  else:
+    let errR = readBytes16(payload, pos)
+    if errR.isErr: return peErr(errR.error)
+    resp.error = errR.value
 
   peOk(resp)

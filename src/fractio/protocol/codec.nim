@@ -42,6 +42,24 @@ proc writeBytes8*(buf: var string, data: string) {.inline.} =
   buf.writeUint8(uint8(data.len))
   buf.add(data)
 
+proc writeBytes16*(buf: var string, data: string) {.inline.} =
+  ## Write a length-prefixed byte string with uint16 length (max 65535 bytes).
+  buf.writeUint16BE(uint16(data.len))
+  buf.add(data)
+
+proc writeBytes32*(buf: var string, data: string) {.inline.} =
+  ## Write a length-prefixed byte string with uint32 length.
+  buf.writeUint32BE(uint32(data.len))
+  buf.add(data)
+
+proc writeInt32BE*(buf: var string, v: int32) {.inline.} =
+  ## Write a signed 32-bit integer in big-endian.
+  buf.writeUint32BE(uint32(v))
+
+proc writeInt64BE*(buf: var string, v: int64) {.inline.} =
+  ## Write a signed 64-bit integer in big-endian.
+  buf.writeUint64BE(uint64(v))
+
 # ---------------------------------------------------------------------------
 # Bounds check — returns PResult (void success / ProtocolError failure)
 # ---------------------------------------------------------------------------
@@ -113,5 +131,51 @@ proc readBytes8*(buf: string, pos: var int): Result[string, ProtocolError] =
   if r.isErr: return peErr(r.error)
   result = peOk(buf[pos ..< pos + length])
   pos += length
+
+proc readBytes16*(buf: string, pos: var int): Result[string, ProtocolError] =
+  ## Read a uint16-length-prefixed byte string.
+  let lenR = readUint16BE(buf, pos)
+  if lenR.isErr: return peErr(lenR.error)
+  let length = int(lenR.value)
+  let r = checkBounds(buf, pos, length)
+  if r.isErr: return peErr(r.error)
+  result = peOk(buf[pos ..< pos + length])
+  pos += length
+
+proc readBytes32*(buf: string, pos: var int): Result[string, ProtocolError] =
+  ## Read a uint32-length-prefixed byte string.
+  let lenR = readUint32BE(buf, pos)
+  if lenR.isErr: return peErr(lenR.error)
+  let length = int(lenR.value)
+  let r = checkBounds(buf, pos, length)
+  if r.isErr: return peErr(r.error)
+  result = peOk(buf[pos ..< pos + length])
+  pos += length
+
+proc readInt32BE*(buf: string, pos: var int): Result[int32, ProtocolError] =
+  ## Read a signed 32-bit integer in big-endian.
+  let r = checkBounds(buf, pos, 4)
+  if r.isErr: return peErr(r.error)
+  let v = (int32(buf[pos]) shl 24) or
+          (int32(buf[pos + 1]) shl 16) or
+          (int32(buf[pos + 2]) shl 8) or
+           int32(buf[pos + 3])
+  pos += 4
+  peOk(v)
+
+proc readInt64BE*(buf: string, pos: var int): Result[int64, ProtocolError] =
+  ## Read a signed 64-bit integer in big-endian.
+  let r = checkBounds(buf, pos, 8)
+  if r.isErr: return peErr(r.error)
+  let v = (int64(buf[pos]) shl 56) or
+          (int64(buf[pos + 1]) shl 48) or
+          (int64(buf[pos + 2]) shl 40) or
+          (int64(buf[pos + 3]) shl 32) or
+          (int64(buf[pos + 4]) shl 24) or
+          (int64(buf[pos + 5]) shl 16) or
+          (int64(buf[pos + 6]) shl 8) or
+           int64(buf[pos + 7])
+  pos += 8
+  peOk(v)
 
 

@@ -36,6 +36,7 @@ import fractio/distributed/sharedtimer/types as timerTypes
 import fractio/core/timestamp_provider
 import fractio/sql/executor
 import fractio/storage/mvcc/types as mvccTypes
+import fractio/distributed/space_manager
 
 # Import optimized test configuration
 import ../../test_config
@@ -132,13 +133,22 @@ proc makeNode(nodeNum: int, basePort: int,
   srv.mvccStore = mvccStore
   srv.txnMgr = txnMgr
 
+  # Initialize SpaceManager for CREATE/DROP SPACE operations
+  srv.spaceManager = newSpaceManager(
+    store = store,
+    coord = coord,
+    nodeId = uint32(nodeNum),
+    logger = srv.logger
+  )
+
   TestNode(
     id: nodeNum, basePort: basePort, clientPort: cPort, server: srv,
     coord: coord, store: store, mvccStore: mvccStore, storagePath: storagePath,
   )
 
-proc initClient(n: var TestNode, leaderPort: int) =
-  n.client = newFractioClient("127.0.0.1", leaderPort)
+proc initClient(n: var TestNode) =
+  ## Initialize client connected to this node's own server.
+  n.client = newFractioClient("127.0.0.1", n.clientPort)
   doAssert n.client.initialize()
 
 proc startNode(n: var TestNode) =
@@ -193,16 +203,20 @@ proc waitForReadyLeader(nodes: seq[TestNode], gid: GroupID,
     sleep(TEST_POLL_INTERVAL_MS * 2)
   -1
 
-proc seedSysNodes(nodes: seq[TestNode], maxRetries: int = TEST_MAX_RETRY_ATTEMPTS): bool =
+proc seedSysNodes(nodes: seq[TestNode], maxRetries: int = 20): bool =
   ## Seed sys.nodes table with per-write retry logic. Returns true on success.
   ## Each write independently retries on failure (leader may change between writes).
+  ## Increased retries to handle leader election races in 5-node clusters.
   for n in nodes:
     var success = false
     for retry in 0 ..< maxRetries:
       let leaderIdx = waitForReadyLeader(nodes, META_GROUP_ID)
       if leaderIdx < 0:
-        sleep(TEST_POLL_INTERVAL_MS)
+        sleep(TEST_POLL_INTERVAL_MS * 2)
         continue
+
+      # Brief settle after finding ready leader
+      sleep(TEST_ELECTION_SETTLE_MS)
 
       let key = encodeTableKey(SYS_NODES_TABLE_ID, $n.id)
       let nodeRec = NodeRecord(
@@ -215,6 +229,7 @@ proc seedSysNodes(nodes: seq[TestNode], maxRetries: int = TEST_MAX_RETRY_ATTEMPT
       if nodes[leaderIdx].store.sysTablePut(key, nodeRec.encode()):
         success = true
         break
+      # Leader may have changed - exponential backoff
       sleep(TEST_RETRY_BACKOFF_MS * (retry + 1))
 
     if not success:
@@ -473,10 +488,16 @@ proc makeCluster5(): seq[TestNode] =
   # Brief wait for replication to propagate
   sleep(TEST_REPLICATION_WAIT_MS)
 
-  # Re-find meta leader for client initialization (leader may have changed)
-  let finalLeader = waitForLeaderOnGroup(nodes, META_GROUP_ID)
+  # Re-find meta leader for client initialization using ready probe
+  # (leader may have changed during seeding; waitForReadyLeader probes with a write)
+  let finalLeader = waitForReadyLeader(nodes, META_GROUP_ID,
+      maxAttempts = TEST_MAX_READY_POLL_ATTEMPTS)
   doAssert finalLeader >= 0, "No meta leader after seeding"
-  for i in 0 ..< nodes.len: initClient(nodes[i], nodes[finalLeader].clientPort)
+
+  # Wait for leader to stabilize before client ops
+  sleep(TEST_ELECTION_SETTLE_MS * 2)
+
+  for i in 0 ..< nodes.len: initClient(nodes[i])
 
   nodes
 
@@ -650,7 +671,7 @@ suite "Space multinode — resilience after adding a node":
     startNode(node6)
     nodes.add(node6)
     let metaLeader = waitForLeaderOnGroup(nodes, META_GROUP_ID)
-    initClient(nodes[^1], nodes[metaLeader].clientPort)
+    initClient(nodes[^1])
 
     # Register node 6 with existing nodes' NuRaft groups
     for i in 0 ..< 5:
