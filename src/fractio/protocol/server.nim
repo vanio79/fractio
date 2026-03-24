@@ -14,8 +14,8 @@
 #
 # All shared mutable state is protected by Locks.
 
-import std/[net, tables, strformat, strutils, times, atomics, locks, options,
-    algorithm, os]
+import std/[net, tables as stdtables, strformat, strutils, times, atomics,
+    locks, options, algorithm, os]
 import posix as posixSys
 import nativesockets
 import ./types
@@ -32,6 +32,7 @@ import ./messages/space as spaceMsgs
 import ./txn_manager
 import ./raft_store
 import ./mvcc_store
+import ../core/types
 import ../utils/logging
 import ../utils/socket_utils
 import ../distributed/sharedtimer
@@ -173,12 +174,12 @@ type
     timestamp*: uint64
 
   KVStore* = ref object
-    data*: Table[string, KVEntry]
+    data*: stdtables.Table[string, KVEntry]
     mu*: Lock
     nextVersion*: Atomic[uint64]
 
 proc newKVStore*(): KVStore =
-  result = KVStore(data: initTable[string, KVEntry]())
+  result = KVStore(data: stdtables.initTable[string, KVEntry]())
   initLock(result.mu)
   result.nextVersion.store(1)
 
@@ -246,7 +247,7 @@ type
     status*: uint8 ## clusterMsgs.NodeStatus* constant
 
   NodeRegistry* = ref object
-    nodes*: Table[uint16, ClusterNodeEntry]
+    nodes*: stdtables.Table[uint16, ClusterNodeEntry]
     mu*: Lock
     ## Rebalance operation counters (atomic for lock-free reads)
     rebalancePending*: Atomic[uint32]
@@ -255,7 +256,7 @@ type
     rebalanceFailed*: Atomic[uint32]
 
 proc newNodeRegistry*(): NodeRegistry =
-  result = NodeRegistry(nodes: initTable[uint16, ClusterNodeEntry]())
+  result = NodeRegistry(nodes: stdtables.initTable[uint16, ClusterNodeEntry]())
   initLock(result.mu)
   result.rebalancePending.store(0)
   result.rebalanceInProgress.store(0)
@@ -396,9 +397,9 @@ type
     running*: Atomic[bool]
     startedAt*: int64             ## Unix seconds; set in start()
     acceptSock*: Socket           ## Accept socket, closed in stop() to unblock accept thread
-    clients*: Table[uint32, ClientConnection]
+    clients*: stdtables.Table[uint32, ClientConnection]
     clientsMu*: Lock
-    handlers*: Table[int, MessageHandler]
+    handlers*: stdtables.Table[int, MessageHandler]
     handlersMu*: Lock
     nextClientId*: Atomic[uint32]
     serverFeatures*: uint32
@@ -449,8 +450,8 @@ proc newProtocolServer*(config: ServerConfig): ProtocolServer =
   result = ProtocolServer(
     config: config,
     logger: newLogger("protocol.server"),
-    clients: initTable[uint32, ClientConnection](),
-    handlers: initTable[int, MessageHandler](),
+    clients: stdtables.initTable[uint32, ClientConnection](),
+    handlers: stdtables.initTable[int, MessageHandler](),
     kvStore: newKVStore(),
     txnMgr: newTransactionManager(),
     metrics: newServerMetrics(),
@@ -560,12 +561,12 @@ proc getLeaderRedirect(server: ProtocolServer,
   ## Strategy:
   ## 1. Try NuRaft's getLeader() - most accurate but may return -1 if follower
   ##    hasn't received heartbeats recently
-  ## 2. Fall back to sys.groups table - may be slightly stale but better than nothing
+  ## 2. Fall back to sys.groups table - may have stale but useful info
   if server.raftCoord.isNil:
     try:
       {.cast(gcsafe).}:
         debug("getLeaderRedirect: no raftCoord", {
-            "groupId": $groupId.uint64}.toTable)
+            "groupId": $groupId}.toTable)
     except:
       discard
     return LeaderRedirect(leaderId: 0)
@@ -577,7 +578,7 @@ proc getLeaderRedirect(server: ProtocolServer,
 
   # If NuRaft doesn't know, try sys.groups table (may have stale but useful info)
   if leaderId <= 0 and not server.raftStore.isNil:
-    let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupId.uint64)
+    let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupId)
     let groupScan = server.raftStore.raftScan(groupKey, groupKey & "\xFF", 1,
         includeSystemKeys = true)
     if groupScan.isOk and groupScan.value.len > 0:
@@ -597,7 +598,7 @@ proc getLeaderRedirect(server: ProtocolServer,
           try:
             {.cast(gcsafe).}:
               debug("getLeaderRedirect: found leader from sys.groups", {
-                  "groupId": $groupId.uint64, "leaderId": $leaderId}.toTable)
+                  "groupId": $groupId, "leaderId": $leaderId}.toTable)
           except:
             discard
       except CatchableError:
@@ -606,7 +607,7 @@ proc getLeaderRedirect(server: ProtocolServer,
   if leaderId <= 0:
     try:
       {.cast(gcsafe).}:
-        debug("getLeaderRedirect: no leader found", {"groupId": $groupId.uint64,
+        debug("getLeaderRedirect: no leader found", {"groupId": $groupId,
             "leaderId": $leaderId}.toTable)
     except:
       discard
@@ -885,13 +886,14 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
       sendError(conn, requestId, ErrProtocol, ErrCatKV, "invalid key length")
       return
 
-    let writeRes = raftPutInGroup(server.raftStore, req.key, req.value, GroupID(req.groupId))
+    let writeRes = raftPutInGroup(server.raftStore, req.key, req.value,
+        groupIDFromUint64(req.groupId))
     if writeRes.isOk:
       sendFrame(conn, encodePutResponse(PutResponse(
         status: PutStatusOK, timestamp: 0, version: 1)), requestId)
     else:
       if writeRes.error.kind == rseNotLeader:
-        let redirect = server.getLeaderRedirect(GroupID(req.groupId))
+        let redirect = server.getLeaderRedirect(groupIDFromUint64(req.groupId))
         sendNotLeaderError(conn, requestId, $writeRes.error, redirect)
       else:
         sendError(conn, requestId, ErrInternal, ErrCatKV, $writeRes.error)
@@ -1814,10 +1816,10 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
       discard mvccStore.txnPut(sessionId, nodeKey, encode(nodeRec))
 
       for gid in [META_GROUP_ID, DATA_GROUP_START_ID]:
-        let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
+        let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid)
         let groupRec = GroupRecord(
-          groupId: gid.uint64,
-          spaceId: 0,
+          groupId: groupIDToULID(gid),
+          spaceId: ({.cast(gcsafe).}: genULID()), # TODO: proper space ID for meta/data groups
           preferredLeader: server.config.serverId,
           leader: server.config.serverId,
           replicas: @[GroupReplicaBin(nodeId: server.config.serverId,
@@ -1847,14 +1849,15 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
         createdAtNs: system_schemas.nowNs())
       discard mvccStore.txnPut(sessionId, scKey, encode(scRec))
 
-      # Seed default space (replicas=0 means ALL, single group = Group 1)
-      let spaceKey = encodeTableKey(SYS_SPACES_TABLE_ID, "1")
+      # Seed default space (replicas=0 means ALL, single group = META_GROUP_ID)
+      let defaultSpaceId = ({.cast(gcsafe).}: genULID())
+      let spaceKey = encodeTableKey(SYS_SPACES_TABLE_ID, $defaultSpaceId)
       let spaceRec = SpaceRecord(
-        spaceId: 1,
+        spaceId: defaultSpaceId,
         name: "default",
         replicas: 0,
         groupCount: 1,
-        groupIds: @[1'u64],
+        groupIds: @[groupIDToULID(META_GROUP_ID)],
         oldGroupIds: @[],
         rebalancing: false,
         rebalanceWorker: 0,

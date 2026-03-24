@@ -7,6 +7,7 @@ import std/hashes
 import std/strutils
 import std/json
 import std/options
+import fractio/core/types
 
 # ============================================================================
 # Byte sequence comparison utilities
@@ -45,9 +46,9 @@ type
     ## Unique identifier for a node in the cluster.
     ## Valid range: 1..uint32.high (0 is reserved for invalid/unknown)
 
-  GroupID* = distinct uint64
-    ## Unique identifier for a Raft group.
-    ## Group IDs are monotonically increasing and never reused.
+  GroupID* = distinct ULID
+    ## Unique identifier for a Raft group using ULID.
+    ## ULIDs are lexicographically sortable and globally unique.
 
   ReplicaID* = distinct uint32
     ## Unique identifier for a replica within a group.
@@ -117,34 +118,70 @@ proc isValid*(id: NodeID): bool =
 # ============================================================================
 
 proc `$`*(id: GroupID): string =
-  ## String representation of GroupID
-  result = "r" & $id.uint64
+  ## String representation of GroupID (26-char ULID)
+  result = $id.ULID
 
 proc parseGroupID*(s: string): GroupID =
-  ## Parse GroupID from string format "r<number>"
-  if s.len < 2 or s[0] != 'r':
-    raise newException(ValueError, "Invalid GroupID format: " & s)
-  result = GroupID(parseInt(s[1..^1]))
+  ## Parse GroupID from 26-character ULID string
+  result = GroupID(ulidFromString(s))
 
 proc hash*(id: GroupID): Hash =
   ## Hash for use in tables
-  result = hash(id.uint64)
+  var h: Hash = 0
+  for b in id.ULID.data:
+    h = h !& int(b)
+  result = !$h
 
 proc `==`*(a, b: GroupID): bool =
   ## Equality comparison
-  a.uint64 == b.uint64
+  a.ULID == b.ULID
 
 proc `<`*(a, b: GroupID): bool =
-  ## Less than comparison
-  a.uint64 < b.uint64
+  ## Less than comparison (lexicographic by timestamp)
+  a.ULID < b.ULID
 
 proc `<=`*(a, b: GroupID): bool =
   ## Less than or equal comparison
-  a.uint64 <= b.uint64
+  a.ULID == b.ULID or a.ULID < b.ULID
 
-proc firstGroupID*: GroupID =
-  ## Returns the first valid GroupID
-  GroupID(1)
+proc genGroupID*(): GroupID =
+  ## Generate a new unique GroupID using ULID
+  GroupID(genULID())
+
+proc groupIDFromULID*(u: ULID): GroupID =
+  ## Create GroupID from ULID
+  GroupID(u)
+
+proc groupIDToULID*(id: GroupID): ULID =
+  ## Extract ULID from GroupID
+  id.ULID
+
+proc groupIDToBytes*(id: GroupID): string =
+  ## Convert GroupID to 16-byte binary for storage
+  ulidToBytes(id.ULID)
+
+proc groupIDFromBytes*(data: string): GroupID =
+  ## Parse 16-byte binary to GroupID
+  GroupID(ulidFromBytes(data))
+
+proc groupIDToUint64*(id: GroupID): uint64 =
+  ## Convert GroupID to uint64 for wire protocol compatibility.
+  ## Uses a hash of the ULID bytes for deterministic mapping.
+  ## WARNING: This is a lossy conversion - use only for protocol compatibility.
+  var h: uint64 = 0
+  for i, b in id.ULID.data:
+    h = h xor (uint64(b) shl ((i mod 8) * 8))
+  result = h
+
+proc groupIDFromUint64*(val: uint64): GroupID =
+  ## Create a GroupID from uint64 (for wire protocol compatibility).
+  ## This creates a ULID with the uint64 value embedded - not reversible.
+  ## Used only for decoding legacy wire protocol messages.
+  var ulid: ULID
+  # Embed uint64 in first 8 bytes, rest are zero
+  for i in 0..<8:
+    ulid.data[i] = uint8((val shr (i * 8)) and 0xFF)
+  result = GroupID(ulid)
 
 # ============================================================================
 # ReplicaID operations
@@ -285,7 +322,13 @@ proc getNonVoters*(desc: GroupDescriptor): seq[ReplicaDescriptor] =
 
 proc isInitialized*(desc: GroupDescriptor): bool =
   ## Check if the descriptor is properly initialized
-  desc.groupId.uint64 > 0 and desc.replicas.len > 0
+  ## Check that groupId has non-zero bytes
+  var hasNonZero = false
+  for b in desc.groupId.ULID.data:
+    if b != 0:
+      hasNonZero = true
+      break
+  hasNonZero and desc.replicas.len > 0
 
 proc quorumSize*(desc: GroupDescriptor): int =
   ## Calculate quorum size (majority of voters)
@@ -299,7 +342,7 @@ proc toJson*(desc: GroupDescriptor): JsonNode =
     replicasJson.add(rep.toJson())
 
   result = %*{
-    "groupId": desc.groupId.uint64,
+    "groupId": $(desc.groupId),
     "replicas": replicasJson,
     "nextReplicaId": desc.nextReplicaId.uint32,
     "generation": desc.generation
@@ -312,7 +355,7 @@ proc toJson*(desc: GroupDescriptor): JsonNode =
 proc parseGroupDescriptor*(json: JsonNode): GroupDescriptor =
   ## Parse GroupDescriptor from JSON
   new(result)
-  result.groupId = GroupID(json["groupId"].getBiggestInt().uint64)
+  result.groupId = parseGroupID(json["groupId"].getStr())
 
   # Parse replicas
   for repJson in json["replicas"]:
@@ -332,37 +375,42 @@ proc `$`*(desc: GroupDescriptor): string =
     "replicas=" & $desc.replicas.len & ", " &
     "gen=" & $desc.generation & ")"
 
+# Special ULID for META_GROUP_ID - all zeros except last byte = 1
+# This is a well-known ULID for the meta group
+proc metaGroupULID(): ULID =
+  result.data[15] = 1'u8
+
 proc isMetaGroup*(desc: GroupDescriptor): bool =
   ## Check whether this GroupDescriptor covers the meta group (Group 1).
   ## The meta group stores system catalog tables and is replicated on all nodes.
-  desc.groupId == GroupID(1)
+  desc.groupId.ULID == metaGroupULID()
 
 # ============================================================================
 # Key encoding utilities
 # ============================================================================
 
 proc encodeGroupPrefix*(groupId: GroupID): string =
-  ## Encode group prefix for keys: /range/<group_id>/
-  result = "/range/" & $groupId.uint64 & "/"
+  ## Encode group prefix for keys: /range/<group_ulid>/
+  result = "/range/" & $(groupId) & "/"
 
 proc encodeDataKey*(groupId: GroupID, key: seq[byte]): string =
-  ## Encode a data key with group prefix: /range/<group_id>/data/<key>
+  ## Encode a data key with group prefix: /range/<group_ulid>/data/<key>
   var keyStr = newString(key.len)
   for i, b in key:
     keyStr[i] = char(b)
   result = encodeGroupPrefix(groupId) & "data/" & keyStr
 
 proc encodeLogKey*(groupId: GroupID, index: uint64): string =
-  ## Encode a log key: /raft/<group_id>/log/<index>
-  result = "/raft/" & $groupId.uint64 & "/log/" & $index
+  ## Encode a log key: /raft/<group_ulid>/log/<index>
+  result = "/raft/" & $(groupId) & "/log/" & $index
 
 proc encodeStateKey*(groupId: GroupID): string =
-  ## Encode a state key for persistent Raft state: /raft/<group_id>/state
-  result = "/raft/" & $groupId.uint64 & "/state"
+  ## Encode a state key for persistent Raft state: /raft/<group_ulid>/state
+  result = "/raft/" & $(groupId) & "/state"
 
 proc encodeSnapshotKey*(groupId: GroupID): string =
-  ## Encode a snapshot key: /raft/<group_id>/snapshot
-  result = "/raft/" & $groupId.uint64 & "/snapshot"
+  ## Encode a snapshot key: /raft/<group_ulid>/snapshot
+  result = "/raft/" & $(groupId) & "/snapshot"
 
 proc parseLogIndex*(key: string): uint64 =
   ## Parse log index from a log key

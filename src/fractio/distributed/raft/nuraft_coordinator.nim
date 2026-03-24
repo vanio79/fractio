@@ -466,9 +466,18 @@ proc waitForGroupCreationQueue*(c: NuRaftCoordinator,
 # Group Management
 # ============================================================================
 
+proc hashGroupIDForPort(gid: GroupID): int =
+  ## Hash a GroupID to a port offset (0-999).
+  ## Uses a simple hash of the ULID bytes for deterministic port assignment.
+  var h: uint32 = 0
+  for b in gid.groupIDToULID().data:
+    h = h * 31 + uint32(b)
+  result = int(h mod 1000)
+
 proc computePort*(basePort: int, groupId: GroupID): int {.inline.} =
   ## Compute the ASIO port for a group on a given node.
-  basePort + groupId.int
+  ## Uses a hash of the ULID to get a deterministic port offset.
+  basePort + hashGroupIDForPort(groupId)
 
 proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
     members: seq[tuple[nodeId: uint32, host: string, basePort: int]],
@@ -757,7 +766,7 @@ proc proposeAndWait*(c: NuRaftCoordinator, groupId: GroupID,
   withLock c.groupsLock:
     if not c.groups.hasKey(groupId):
       return RaftResult(success: false,
-          error: "Group not found: " & $groupId.uint64)
+          error: "Group not found: " & $groupId)
     {.cast(raises: []).}:
       inst = c.groups[groupId]
 

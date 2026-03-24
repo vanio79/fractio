@@ -443,13 +443,13 @@ proc seedSystemTables*(cluster: TestCluster) =
   # Build batch of group records
   var groupWrites: seq[tuple[key: string, value: string]] = @[]
   for gid in [META_GROUP_ID, DATA_GROUP_START_ID]:
-    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
+    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid)
     var replicasSeq: seq[GroupReplicaBin] = @[]
     for node in cluster.nodes:
       replicasSeq.add(GroupReplicaBin(nodeId: node.nodeId,
           replicaType: rtVoter))
     let groupRec = GroupRecord(
-      groupId: gid.uint64,
+      groupId: groupIDToULID(gid),
       replicas: replicasSeq,
       preferredLeader: config.preferredLeader,
     )

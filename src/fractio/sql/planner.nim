@@ -185,6 +185,7 @@ proc planError(msg: string): ref PlanError =
 type
   TableDescriptor* = object
     tableId*: uint32
+    ulid*: ULID
     name*: string
     schema*: string
     database*: string
@@ -221,6 +222,7 @@ proc columnDataTypeToDataType(cdt: ColumnDataType): DataType =
   of cdtBytes: dtBytes
   of cdtDate: dtDate
   of cdtDateTime: dtDateTime
+  of cdtULID: dtULID
 
 proc resolveTable*(client: FractioClient,
     database, schema, tableName: string): Option[TableDescriptor] =
@@ -237,6 +239,7 @@ proc resolveTable*(client: FractioClient,
   let rec = decodeTableRecord(raw)
   var desc = TableDescriptor(
     tableId: rec.tableId,
+    ulid: rec.ulid,
     name: rec.name,
     schema: rec.schema,
     database: rec.database,
@@ -281,6 +284,7 @@ proc dataTypeToString*(dt: DataType): string =
   of dtDate: "DATE"
   of dtDateTime: "DATETIME"
   of dtBytes: "BYTES"
+  of dtULID: "ULID"
 
 proc dataTypeToColumnDataType(dt: DataType): ColumnDataType =
   ## Convert core DataType to binary format ColumnDataType
@@ -292,6 +296,7 @@ proc dataTypeToColumnDataType(dt: DataType): ColumnDataType =
   of dtBytes: cdtBytes
   of dtDate: cdtDate
   of dtDateTime: cdtDateTime
+  of dtULID: cdtULID
 
 proc exprToJsonValue*(e: Expr): JsonNode =
   ## Convert a literal expression to a JSON value.
@@ -385,15 +390,19 @@ proc planCreateTable(stmt: Stmt, client: FractioClient,
       if col.primaryKey:
         pk.add(col.name)
 
+  # Allocate numeric table ID for key encoding and ULID for global uniqueness
   let tableId = nextTableId(client)
+  let tableUlid = genULID()
 
-  # Use binary encoding for TableRecord
+  # Note: spaceId will be assigned at execution time - use placeholder
+  var placeholderSpaceId: ULID
   let rec = TableRecord(
     tableId: tableId,
+    ulid: tableUlid,
     name: stmt.ctTable,
     schema: schema,
     database: database,
-    spaceId: -1'i32, # Will be resolved at execution time
+    spaceId: placeholderSpaceId, # Will be resolved at execution time
     primaryKey: pk,
     columns: columns
   )
@@ -542,9 +551,10 @@ proc planDelete(stmt: Stmt, client: FractioClient,
 proc planCreateSpace(stmt: Stmt): Plan =
   let plan = newPlan()
   # Use binary encoding for SpaceRecord
-  # spaceId will be assigned at execution time
+  # spaceId will be assigned at execution time - use placeholder
+  var placeholderSpaceId: ULID
   let rec = SpaceRecord(
-    spaceId: -1'i32, # Will be assigned at execution time
+    spaceId: placeholderSpaceId, # Will be assigned at execution time
     name: stmt.csSpaceName,
     replicas: int32(stmt.csSpaceReplicas),
     groupCount: 0,

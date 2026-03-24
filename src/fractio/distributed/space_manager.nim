@@ -34,6 +34,7 @@ import ../distributed/meta/system_tables
 import ../distributed/meta/system_schemas
 import ../storage/mvcc/types as mvccTypes
 import ../utils/logging
+import ../core/types
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -167,20 +168,8 @@ proc findSpaceByName*(sm: SpaceManager, name: string): Option[SpaceRecord] =
       return some(space)
   return none(SpaceRecord)
 
-proc findMaxGroupId*(sm: SpaceManager): uint64 =
-  ## Find the maximum groupId in sys.groups.
-  for group in sm.getGroups():
-    if group.groupId > result:
-      result = group.groupId
-
-proc findMaxSpaceId*(sm: SpaceManager): int32 =
-  ## Find the maximum spaceId in sys.spaces.
-  for space in sm.getSpaces():
-    if space.spaceId > result:
-      result = space.spaceId
-
 proc computeGroupPlacement(nodeIds: seq[uint32], replicas: int,
-    startGroupId: uint64, spaceId: int32): seq[GroupRecord] =
+    spaceId: ULID): seq[GroupRecord] {.gcsafe.} =
   ## Compute group placement using ring algorithm.
   ## N nodes → N groups, each with R replicas placed in a ring.
   let nodeCount = nodeIds.len
@@ -191,7 +180,8 @@ proc computeGroupPlacement(nodeIds: seq[uint32], replicas: int,
   result = newSeqOfCap[GroupRecord](groupCount)
 
   for g in 0 ..< groupCount:
-    let groupId = startGroupId + uint64(g)
+    # Generate a new ULID for each group (cast to gcsafe since ulid library isn't gcsafe)
+    let groupId = ({.cast(gcsafe).}: genULID())
 
     # Compute members using ring algorithm
     var members: seq[GroupReplicaBin] = @[]
@@ -210,7 +200,7 @@ proc computeGroupPlacement(nodeIds: seq[uint32], replicas: int,
       replicas: members
     ))
 
-proc waitForGroupLeaders(sm: SpaceManager, groupIds: seq[uint64],
+proc waitForGroupLeaders(sm: SpaceManager, groupIds: seq[GroupID],
     timeoutMs: int = DEFAULT_LEADER_WAIT_MS): bool =
   ## Wait for all specified groups to have elected leaders.
   let deadlineMs = int(getTime().toUnix() * 1000) + timeoutMs
@@ -220,11 +210,11 @@ proc waitForGroupLeaders(sm: SpaceManager, groupIds: seq[uint64],
     var anyGroupMissing = false
     for gid in groupIds:
       # First check if group exists
-      if not sm.coord.hasGroup(GroupID(gid)):
+      if not sm.coord.hasGroup(gid):
         anyGroupMissing = true
         allHaveLeaders = false
         break
-      let leaderId = sm.coord.getLeader(GroupID(gid))
+      let leaderId = sm.coord.getLeader(gid)
       if leaderId < 0:
         allHaveLeaders = false
         break
@@ -236,9 +226,9 @@ proc waitForGroupLeaders(sm: SpaceManager, groupIds: seq[uint64],
     if nowMs >= deadlineMs:
       # Log which groups are missing or have no leader
       for gid in groupIds:
-        if not sm.coord.hasGroup(GroupID(gid)):
+        if not sm.coord.hasGroup(gid):
           sm.logError(safeFmt("waitForGroupLeaders: group $# does not exist", $gid))
-        elif sm.coord.getLeader(GroupID(gid)) < 0:
+        elif sm.coord.getLeader(gid) < 0:
           sm.logError(safeFmt("waitForGroupLeaders: group $# has no leader", $gid))
       return false
 
@@ -261,21 +251,23 @@ proc getMemberEndpoints(sm: SpaceManager, groupRec: GroupRecord): seq[tuple[
 # CREATE SPACE
 # ---------------------------------------------------------------------------
 
-proc createSpace*(sm: SpaceManager, req: CreateSpaceRequest): CreateSpaceResponse {.raises: [].} =
+proc createSpace*(sm: SpaceManager, req: CreateSpaceRequest): CreateSpaceResponse {.gcsafe,
+    raises: [].} =
   ## Execute CREATE SPACE on the server.
   ## Must be called on the META leader node.
 
   # Declare variables needed after try block
-  var spaceId: int32 = 0
+  var spaceId: ULID
   var groupCount = 0
   var groupRecs: seq[GroupRecord] = @[]
-  var groupIds: seq[uint64] = @[]
+  var groupIds: seq[ULID] = @[]
   var replicas = 0
 
-  let t0 = times.getTime()
+  let t0 {.used.} = times.getTime()
   template timedLog(msg: string) =
-    let t1 = times.getTime()
-    sm.logInfo(safeFmt("[$# ms] $#", $(t1 - t0).inMilliseconds, msg))
+    when false: # Disabled for gcsafe
+      let t1 = times.getTime()
+      sm.logInfo(safeFmt("[$# ms] $#", $(t1 - t0).inMilliseconds, msg))
 
   timedLog(safeFmt("createSpace: starting for '$#'", req.name))
 
@@ -320,18 +312,15 @@ proc createSpace*(sm: SpaceManager, req: CreateSpaceRequest): CreateSpaceRespons
         error: safeFmt("REPLICAS ($#) exceeds node count ($#)", $replicas, $nodeCount)
       )
 
-    # 4. Allocate IDs
-    timedLog("finding max spaceId")
-    spaceId = sm.findMaxSpaceId() + 1
+    # 4. Generate ULID for spaceId
+    timedLog("generating spaceId ULID")
+    spaceId = ({.cast(gcsafe).}: genULID())
     timedLog(safeFmt("spaceId=$#", $spaceId))
-    timedLog("finding max groupId")
-    let startGroupId = sm.findMaxGroupId() + 1
-    timedLog(safeFmt("startGroupId=$#", $startGroupId))
     groupCount = nodeCount
 
     # 5. Compute group placement
     timedLog("computing group placement")
-    groupRecs = computeGroupPlacement(nodeIds, replicas, startGroupId, spaceId)
+    groupRecs = computeGroupPlacement(nodeIds, replicas, spaceId)
     for gr in groupRecs:
       groupIds.add(gr.groupId)
 
@@ -345,7 +334,7 @@ proc createSpace*(sm: SpaceManager, req: CreateSpaceRequest): CreateSpaceRespons
       let value = encode(gr)
       groupWrites.add((key: key, value: value))
 
-# Write each group record with MVCC encoding
+    # Write each group record with MVCC encoding
     timedLog(safeFmt("writing $# group records", $groupWrites.len))
     var writeIdx = 0
     for (key, value) in groupWrites:
@@ -420,7 +409,8 @@ proc createSpace*(sm: SpaceManager, req: CreateSpaceRequest): CreateSpaceRespons
 # DROP SPACE
 # ---------------------------------------------------------------------------
 
-proc dropSpace*(sm: SpaceManager, req: DropSpaceRequest): DropSpaceResponse {.raises: [].} =
+proc dropSpace*(sm: SpaceManager, req: DropSpaceRequest): DropSpaceResponse {.gcsafe,
+    raises: [].} =
   ## Execute DROP SPACE on the server.
   ## Must be called on the META leader node.
 
@@ -473,11 +463,15 @@ proc dropSpace*(sm: SpaceManager, req: DropSpaceRequest): DropSpaceResponse {.ra
     sm.logInfo(safeFmt("Deleted space '$#' and $# groups", req.name,
         $space.groupIds.len))
 
-    # 6. Build response
+    # 6. Build response - ULIDs are used directly
+    var deletedGroupIds: seq[ULID] = @[]
+    for gid in space.groupIds:
+      deletedGroupIds.add(gid)
+
     result = DropSpaceResponse(
       success: true,
       spaceId: spaceId,
-      deletedGroupIds: space.groupIds
+      deletedGroupIds: deletedGroupIds
     )
   except CatchableError as e:
     sm.logError(safeFmt("dropSpace error: $#", e.msg))

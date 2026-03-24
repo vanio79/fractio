@@ -9,16 +9,17 @@
 #   Integers are big-endian.
 #   Strings use uint16 length prefix for longer names.
 #   Binary records use uint32 length prefix.
+#   ULIDs are 16 bytes binary.
 #
 # CreateSpace Request:
 #   [MessageType:2][nameLen:2][name:N][replicas:4]
 # CreateSpace Response:
 #   [MessageType:2][success:1]
 #   On success:
-#     [spaceId:4][groupCount:4]
+#     [spaceId:16][groupCount:4]
 #     [spaceRecordLen:4][spaceRecord:N]
 #     [groupCount groups, each:]
-#       [groupId:8][groupRecordLen:4][groupRecord:N]
+#       [groupId:16][groupRecordLen:4][groupRecord:N]
 #   On failure:
 #     [errorLen:2][error:N]
 #
@@ -27,14 +28,16 @@
 # DropSpace Response:
 #   [MessageType:2][success:1]
 #   On success:
+#     [spaceId:16]
 #     [deletedGroupCount:4]
 #     [deletedGroupCount deleted groupIds, each:]
-#       [groupId:8]
+#       [groupId:16]
 #   On failure:
 #     [errorLen:2][error:N]
 
 import ../types
 import ../codec
+import ../../core/types
 
 # ---------------------------------------------------------------------------
 # CreateSpace (0x0708)
@@ -47,13 +50,13 @@ type
 
   GroupRecordData* = object
     ## A single group record returned in CreateSpaceResponse
-    groupId*: uint64
+    groupId*: ULID
     record*: string ## Binary-encoded GroupRecord
 
   CreateSpaceResponse* = object
     success*: bool
     ## On success:
-    spaceId*: int32                     ## Assigned space ID
+    spaceId*: ULID                      ## Assigned space ID
     groupCount*: int32                  ## Number of Raft groups created
     spaceRecord*: string                ## Binary-encoded SpaceRecord for client cache
     groupRecords*: seq[GroupRecordData] ## All created group records
@@ -88,12 +91,14 @@ proc encodeCreateSpaceResponse*(resp: CreateSpaceResponse): string =
   buf.writeUint8(if resp.success: 0x01'u8 else: 0x00'u8)
 
   if resp.success:
-    buf.writeInt32BE(resp.spaceId)
+    # Write 16-byte ULID
+    buf.writeBytes(ulidToBytes(resp.spaceId))
     buf.writeInt32BE(resp.groupCount)
     buf.writeBytes32(resp.spaceRecord)
     buf.writeInt32BE(resp.groupRecords.len.int32)
     for gr in resp.groupRecords:
-      buf.writeUint64BE(gr.groupId)
+      # Write 16-byte ULID
+      buf.writeBytes(ulidToBytes(gr.groupId))
       buf.writeBytes32(gr.record)
   else:
     buf.writeBytes16(resp.error)
@@ -109,9 +114,15 @@ proc decodeCreateSpaceResponse*(payload: string): Result[CreateSpaceResponse,
   resp.success = successR.value != 0
 
   if resp.success:
-    let spaceIdR = readInt32BE(payload, pos)
-    if spaceIdR.isErr: return peErr(spaceIdR.error)
-    resp.spaceId = spaceIdR.value
+    # Read 16-byte ULID
+    if pos + 16 > payload.len:
+      return peErr(ProtocolError(kind: peBoundsOverflow,
+          msg: "payload too short for spaceId ULID"))
+    var ulidBytes: string
+    for i in 0..<16:
+      ulidBytes.add(payload[pos])
+      inc pos
+    resp.spaceId = ulidFromBytes(ulidBytes)
 
     let groupCountR = readInt32BE(payload, pos)
     if groupCountR.isErr: return peErr(groupCountR.error)
@@ -127,14 +138,21 @@ proc decodeCreateSpaceResponse*(payload: string): Result[CreateSpaceResponse,
 
     resp.groupRecords = newSeqOfCap[GroupRecordData](numGroups.int)
     for i in 0 ..< numGroups.int:
-      let gidR = readUint64BE(payload, pos)
-      if gidR.isErr: return peErr(gidR.error)
+      # Read 16-byte ULID
+      if pos + 16 > payload.len:
+        return peErr(ProtocolError(kind: peBoundsOverflow,
+            msg: "payload too short for groupId ULID"))
+      var gidBytes: string
+      for j in 0..<16:
+        gidBytes.add(payload[pos])
+        inc pos
+      let gid = ulidFromBytes(gidBytes)
 
       let recR = readBytes32(payload, pos)
       if recR.isErr: return peErr(recR.error)
 
       resp.groupRecords.add(GroupRecordData(
-        groupId: gidR.value,
+        groupId: gid,
         record: recR.value
       ))
   else:
@@ -155,10 +173,10 @@ type
   DropSpaceResponse* = object
     success*: bool
     ## On success:
-    spaceId*: int32               ## ID of deleted space (for client cache cleanup)
-    deletedGroupIds*: seq[uint64] ## GroupIds that were deleted
-                                  ## On failure:
-    error*: string                ## Error message
+    spaceId*: ULID              ## ID of deleted space (for client cache cleanup)
+    deletedGroupIds*: seq[ULID] ## GroupIds that were deleted
+                                ## On failure:
+    error*: string              ## Error message
 
 proc encodeDropSpaceRequest*(req: DropSpaceRequest): string =
   var buf = ""
@@ -183,10 +201,12 @@ proc encodeDropSpaceResponse*(resp: DropSpaceResponse): string =
   buf.writeUint8(if resp.success: 0x01'u8 else: 0x00'u8)
 
   if resp.success:
-    buf.writeInt32BE(resp.spaceId)
+    # Write 16-byte ULID
+    buf.writeBytes(ulidToBytes(resp.spaceId))
     buf.writeInt32BE(resp.deletedGroupIds.len.int32)
     for gid in resp.deletedGroupIds:
-      buf.writeUint64BE(gid)
+      # Write 16-byte ULID
+      buf.writeBytes(ulidToBytes(gid))
   else:
     buf.writeBytes16(resp.error)
   buf
@@ -201,19 +221,31 @@ proc decodeDropSpaceResponse*(payload: string): Result[DropSpaceResponse,
   resp.success = successR.value != 0
 
   if resp.success:
-    let spaceIdR = readInt32BE(payload, pos)
-    if spaceIdR.isErr: return peErr(spaceIdR.error)
-    resp.spaceId = spaceIdR.value
+    # Read 16-byte ULID
+    if pos + 16 > payload.len:
+      return peErr(ProtocolError(kind: peBoundsOverflow,
+          msg: "payload too short for spaceId ULID"))
+    var ulidBytes: string
+    for i in 0..<16:
+      ulidBytes.add(payload[pos])
+      inc pos
+    resp.spaceId = ulidFromBytes(ulidBytes)
 
     let numGroupsR = readInt32BE(payload, pos)
     if numGroupsR.isErr: return peErr(numGroupsR.error)
     let numGroups = numGroupsR.value
 
-    resp.deletedGroupIds = newSeqOfCap[uint64](numGroups.int)
+    resp.deletedGroupIds = newSeqOfCap[ULID](numGroups.int)
     for i in 0 ..< numGroups.int:
-      let gidR = readUint64BE(payload, pos)
-      if gidR.isErr: return peErr(gidR.error)
-      resp.deletedGroupIds.add(gidR.value)
+      # Read 16-byte ULID
+      if pos + 16 > payload.len:
+        return peErr(ProtocolError(kind: peBoundsOverflow,
+            msg: "payload too short for groupId ULID"))
+      var gidBytes: string
+      for j in 0..<16:
+        gidBytes.add(payload[pos])
+        inc pos
+      resp.deletedGroupIds.add(ulidFromBytes(gidBytes))
   else:
     let errR = readBytes16(payload, pos)
     if errR.isErr: return peErr(errR.error)

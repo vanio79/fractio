@@ -466,19 +466,21 @@ proc execCreateTable(op: PlanOp, ctx: ExecutorContext): ExecResult =
     let sEnd = encodeTableKey(SYS_SPACES_TABLE_ID + 1, "")
     let sScan = ctx.client.kvScan(sStart, sEnd, 0, txnId = internalTxnId,
         readTimestamp = internalReadTimestamp)
-    var spaceId = -1
+    var spaceId: ULID
+    var spaceFound = false
     if sScan.isOk:
       for entry in sScan.val:
         let rec = decodeSpaceRecord(entry.value)
         if rec.name == spaceName:
           spaceId = rec.spaceId
+          spaceFound = true
           break
-    if spaceId < 0:
+    if not spaceFound:
       discard ctx.client.rollbackTxn(internalTxnId)
       return errorResult(&"space '{spaceName}' does not exist")
     # Update spaceId in the binary table record
     var rec = decodeTableRecord(tableValue)
-    rec.spaceId = int32(spaceId)
+    rec.spaceId = spaceId
     tableValue = encode(rec)
 
   let putRes = ctx.client.kvPut(key, tableValue, txnId = internalTxnId)

@@ -8,6 +8,7 @@
 
 import std/[times, strutils, json]
 import fractio/utils/binary
+import fractio/core/types
 
 # =============================================================================
 # Constants
@@ -81,6 +82,7 @@ type
     cdtBytes = 4
     cdtDate = 5
     cdtDateTime = 6
+    cdtULID = 7
 
   ColumnFlags* = enum
     cfPrimaryKey
@@ -111,21 +113,23 @@ type
   TableRecord* = object
     ## Record stored in SYS_TABLES_TABLE
     ## Key: /t/0000000003/<database>.<schema>.<tableName>
-    tableId*: uint32
+    tableId*: uint32 ## Numeric table ID for key encoding
+    ulid*: ULID ## Globally unique ULID for this table
     name*: string
     schema*: string
     database*: string
-    spaceId*: int32 # -1 = default space
-    primaryKey*: seq[string] # Column names forming the primary key
+    spaceId*: ULID ## Space this table belongs to
+    primaryKey*: seq[string] ## Column names forming the primary key
     columns*: seq[ColumnDefBin]
 
 proc encode*(rec: TableRecord): string =
   var w = initBinaryWriter()
   w.writeU32(rec.tableId)
+  w.writeBytes(ulidToBytes(rec.ulid))
   w.writeString(rec.name)
   w.writeString(rec.schema)
   w.writeString(rec.database)
-  w.writeI32(rec.spaceId)
+  w.writeBytes(ulidToBytes(rec.spaceId))
   # Primary key columns
   w.writeU32(uint32(rec.primaryKey.len))
   for pk in rec.primaryKey:
@@ -139,10 +143,11 @@ proc encode*(rec: TableRecord): string =
 proc decodeTableRecord*(data: string): TableRecord =
   var r = initBinaryReader(data)
   result.tableId = r.readU32()
+  result.ulid = ulidFromBytes(r.readFixedString(ULID_SIZE))
   result.name = r.readString()
   result.schema = r.readString()
   result.database = r.readString()
-  result.spaceId = r.readI32()
+  result.spaceId = ulidFromBytes(r.readFixedString(ULID_SIZE))
   # Primary key columns
   let pkCount = int(r.readU32())
   result.primaryKey = newSeq[string](pkCount)
@@ -183,16 +188,16 @@ type
   GroupRecord* = object
     ## Record stored in SYS_GROUPS_TABLE
     ## Key: /t/0000000004/<groupId>
-    groupId*: uint64
-    spaceId*: int32
+    groupId*: ULID
+    spaceId*: ULID
     preferredLeader*: uint32
     leader*: uint32 # Current leader (0 = unknown)
     replicas*: seq[GroupReplicaBin]
 
 proc encode*(rec: GroupRecord): string =
   var w = initBinaryWriter()
-  w.writeU64(rec.groupId)
-  w.writeI32(rec.spaceId)
+  w.writeBytes(ulidToBytes(rec.groupId))
+  w.writeBytes(ulidToBytes(rec.spaceId))
   w.writeU32(rec.preferredLeader)
   w.writeU32(rec.leader)
   # Replicas
@@ -203,8 +208,8 @@ proc encode*(rec: GroupRecord): string =
 
 proc decodeGroupRecord*(data: string): GroupRecord =
   var r = initBinaryReader(data)
-  result.groupId = r.readU64()
-  result.spaceId = r.readI32()
+  result.groupId = ulidFromBytes(r.readFixedString(ULID_SIZE))
+  result.spaceId = ulidFromBytes(r.readFixedString(ULID_SIZE))
   result.preferredLeader = r.readU32()
   result.leader = r.readU32()
   # Replicas
@@ -280,12 +285,12 @@ type
   SpaceRecord* = object
     ## Record stored in SYS_SPACES_TABLE
     ## Key: /t/0000000007/<spaceId>
-    spaceId*: int32
+    spaceId*: ULID
     name*: string
     replicas*: int32 # 0 = ALL nodes
     groupCount*: int32
-    groupIds*: seq[uint64]
-    oldGroupIds*: seq[uint64] # Used during rebalancing
+    groupIds*: seq[ULID]
+    oldGroupIds*: seq[ULID] # Used during rebalancing
     rebalancing*: bool
     rebalanceWorker*: int32 # nodeId of the migrating worker
     rebalanceHeartbeat*: int64 # unix epoch seconds of last worker heartbeat
@@ -294,18 +299,18 @@ type
 
 proc encode*(rec: SpaceRecord): string =
   var w = initBinaryWriter()
-  w.writeI32(rec.spaceId)
+  w.writeBytes(ulidToBytes(rec.spaceId))
   w.writeString(rec.name)
   w.writeI32(rec.replicas)
   w.writeI32(rec.groupCount)
   # groupIds
   w.writeU32(uint32(rec.groupIds.len))
   for gid in rec.groupIds:
-    w.writeU64(gid)
+    w.writeBytes(ulidToBytes(gid))
   # oldGroupIds
   w.writeU32(uint32(rec.oldGroupIds.len))
   for gid in rec.oldGroupIds:
-    w.writeU64(gid)
+    w.writeBytes(ulidToBytes(gid))
   # flags
   var flags: uint8 = 0
   if rec.rebalancing:
@@ -320,20 +325,20 @@ proc encode*(rec: SpaceRecord): string =
 
 proc decodeSpaceRecord*(data: string): SpaceRecord =
   var r = initBinaryReader(data)
-  result.spaceId = r.readI32()
+  result.spaceId = ulidFromBytes(r.readFixedString(ULID_SIZE))
   result.name = r.readString()
   result.replicas = r.readI32()
   result.groupCount = r.readI32()
   # groupIds
   let gidCount = int(r.readU32())
-  result.groupIds = newSeq[uint64](gidCount)
+  result.groupIds = newSeq[ULID](gidCount)
   for i in 0..<gidCount:
-    result.groupIds[i] = r.readU64()
+    result.groupIds[i] = ulidFromBytes(r.readFixedString(ULID_SIZE))
   # oldGroupIds
   let oldGidCount = int(r.readU32())
-  result.oldGroupIds = newSeq[uint64](oldGidCount)
+  result.oldGroupIds = newSeq[ULID](oldGidCount)
   for i in 0..<oldGidCount:
-    result.oldGroupIds[i] = r.readU64()
+    result.oldGroupIds[i] = ulidFromBytes(r.readFixedString(ULID_SIZE))
   # flags
   let flags = r.readU8()
   result.rebalancing = (flags and 0x01) != 0
@@ -404,6 +409,7 @@ proc toJson*(rec: TableRecord): JsonNode =
     of cdtBytes: dt = "BLOB"
     of cdtDate: dt = "DATE"
     of cdtDateTime: dt = "DATETIME"
+    of cdtULID: dt = "ULID"
     columns.add(%*{
       "name": col.name,
       "type": dt,
@@ -415,10 +421,11 @@ proc toJson*(rec: TableRecord): JsonNode =
     pkArr.add(%pk)
   result = %*{
     "tableId": rec.tableId,
+    "ulid": $(rec.ulid),
     "name": rec.name,
     "schema": rec.schema,
     "database": rec.database,
-    "spaceId": rec.spaceId,
+    "spaceId": $(rec.spaceId),
     "primaryKey": pkArr,
     "columns": columns
   }
@@ -431,8 +438,8 @@ proc toJson*(rec: GroupRecord): JsonNode =
       "type": if rep.replicaType == rtVoter: "voter" else: "learner"
     })
   result = %*{
-    "groupId": rec.groupId,
-    "spaceId": rec.spaceId,
+    "groupId": $(rec.groupId),
+    "spaceId": $(rec.spaceId),
     "preferredLeader": rec.preferredLeader,
     "leader": rec.leader,
     "replicas": replicas
@@ -453,15 +460,20 @@ proc toJson*(rec: NodeRecord): JsonNode =
     "status": status
   }
 
+proc toJson*(rec: SettingRecord): JsonNode =
+  result = %*{
+    "value": rec.value
+  }
+
 proc toJson*(rec: SpaceRecord): JsonNode =
   var groupIds = newJArray()
   for gid in rec.groupIds:
-    groupIds.add(%gid)
+    groupIds.add(%($gid))
   var oldGroupIds = newJArray()
   for gid in rec.oldGroupIds:
-    oldGroupIds.add(%gid)
+    oldGroupIds.add(%($gid))
   result = %*{
-    "spaceId": rec.spaceId,
+    "spaceId": $(rec.spaceId),
     "name": rec.name,
     "replicas": rec.replicas,
     "groupCount": rec.groupCount,

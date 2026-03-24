@@ -156,6 +156,14 @@ proc writeBytes*(w: var BinaryWriter, value: openArray[byte]) {.inline.} =
     copyMem(addr w.data[w.pos], unsafeAddr value[0], len)
     inc w.pos, len
 
+proc writeBytes*(w: var BinaryWriter, value: string) {.inline.} =
+  ## Write raw bytes from string (no length prefix)
+  let len = value.len
+  if len > 0:
+    w.ensureCapacity(len)
+    copyMem(addr w.data[w.pos], unsafeAddr value[0], len)
+    inc w.pos, len
+
 proc writeSeqU32*(w: var BinaryWriter, values: seq[uint32]) {.inline.} =
   ## Write a length-prefixed sequence of uint32
   writeU32(w, uint32(values.len))
@@ -265,6 +273,16 @@ proc readBytes*(r: var BinaryReader, len: int): seq[byte] {.inline.} =
   if r.pos + len > r.data.len:
     raise newException(ValueError, "BinaryReader: unexpected end of data")
   result = newSeq[byte](len)
+  if len > 0:
+    copyMem(addr result[0], addr r.data[r.pos], len)
+    inc r.pos, len
+
+proc readFixedString*(r: var BinaryReader, len: int): string {.inline.} =
+  ## Read 'len' raw bytes as a string (no length prefix)
+  ## Used for fixed-size binary data like ULIDs
+  if r.pos + len > r.data.len:
+    raise newException(ValueError, "BinaryReader: unexpected end of data")
+  result = newString(len)
   if len > 0:
     copyMem(addr result[0], addr r.data[r.pos], len)
     inc r.pos, len

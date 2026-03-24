@@ -14,6 +14,7 @@ import fractio/sql/parser
 import fractio/sql/ast
 import fractio/sql/planner
 import fractio/sql/executor
+import fractio/core/types except NodeID
 import fractio/distributed/meta/system_tables
 import fractio/distributed/meta/system_schemas
 import fractio/protocol/raft_store
@@ -64,21 +65,21 @@ proc createMultiGroupTestStore(testDir: string,
   coord.start()
 
   # Meta group (Group 1)
-  doAssert coord.createAndStartGroup(GroupID(1), members)
+  doAssert coord.createAndStartGroup(groupIDFromUint64(1), members)
 
   # Data group (Group 2)
-  doAssert coord.createAndStartGroup(GroupID(2), members)
+  doAssert coord.createAndStartGroup(groupIDFromUint64(2), members)
 
   # Space groups (Group 10..10+N-1)
   var groupIds: seq[int] = @[]
   for i in 0 ..< groupCount:
-    let gid = GroupID(uint64(10 + i))
+    let gid = groupIDFromUint64(uint64(10 + i))
     groupIds.add(10 + i)
     doAssert coord.createAndStartGroup(gid, members)
 
   # Wait for all groups to elect a leader (single-node → self-election)
-  let allGroupIds = @[GroupID(1), GroupID(2)] &
-    (0 ..< groupCount).mapIt(GroupID(uint64(10 + it)))
+  let allGroupIds = @[groupIDFromUint64(1), groupIDFromUint64(2)] &
+    (0 ..< groupCount).mapIt(groupIDFromUint64(uint64(10 + it)))
   for attempt in 0 ..< 50: # up to 5 seconds
     var allLeaders = true
     for gid in allGroupIds:
@@ -93,7 +94,7 @@ proc createMultiGroupTestStore(testDir: string,
 
   # Pre-create SMs for space groups
   for i in 0 ..< groupCount:
-    discard store.getOrCreateSM(GroupID(uint64(10 + i)))
+    discard store.getOrCreateSM(groupIDFromUint64(uint64(10 + i)))
 
   # Create MVCC store for DDL operations
   let txnMgr = newTransactionManager()
@@ -108,36 +109,51 @@ proc createMultiGroupTestStore(testDir: string,
     nodeId: 1, host: "127.0.0.1", raftPort: basePort.uint16,
     clientPort: clientPort.uint16, status: nsAlive
   )
+  # Create ULIDs for test groups
+  let metaGroupId = groupIDToULID(META_GROUP_ID)
+  let dataGroupId = groupIDToULID(DATA_GROUP_START_ID)
+
   let metaGroupRec = GroupRecord(
-    groupId: 1, spaceId: 0, leader: 1,
+    groupId: metaGroupId,
+    spaceId: ZeroULID(),
+    preferredLeader: 1,
+    leader: 1,
     replicas: @[GroupReplicaBin(nodeId: 1, replicaType: rtVoter)]
   )
   let dataGroupRec = GroupRecord(
-    groupId: 2, spaceId: 1, leader: 1,
+    groupId: dataGroupId,
+    spaceId: ZeroULID(),
+    preferredLeader: 1,
+    leader: 1,
     replicas: @[GroupReplicaBin(nodeId: 1, replicaType: rtVoter)]
   )
   var sysTableWrites: seq[tuple[key: string, value: string]] = @[
     (key: encodeTableKey(SYS_NODES_TABLE_ID, "1"), value: encode(nodeRec)),
-    (key: encodeTableKey(SYS_GROUPS_TABLE_ID, "1"), value: encode(
+    (key: encodeTableKey(SYS_GROUPS_TABLE_ID, $metaGroupId), value: encode(
         metaGroupRec)),
-    (key: encodeTableKey(SYS_GROUPS_TABLE_ID, "2"), value: encode(dataGroupRec))
+    (key: encodeTableKey(SYS_GROUPS_TABLE_ID, $dataGroupId), value: encode(dataGroupRec))
   ]
   # Add space group records
   for gid in groupIds:
+    let gidUlid = groupIDToULID(groupIDFromUint64(uint64(gid)))
     let spaceGroupRec = GroupRecord(
-      groupId: uint64(gid), spaceId: 2, leader: 1,
+      groupId: gidUlid,
+      spaceId: ZeroULID(),
+      preferredLeader: 1,
+      leader: 1,
       replicas: @[GroupReplicaBin(nodeId: 1, replicaType: rtVoter)]
     )
-    sysTableWrites.add((key: encodeTableKey(SYS_GROUPS_TABLE_ID, $gid),
+    sysTableWrites.add((key: encodeTableKey(SYS_GROUPS_TABLE_ID, $gidUlid),
         value: encode(spaceGroupRec)))
   discard store.sysTablePutBatch(sysTableWrites)
 
-  let spaceKey = encodeSpaceKey(2)
-  var groupIdsSeq: seq[uint64] = @[]
+  let testSpaceUlid = ZeroULID() # Simple test space ID
+  let spaceKey = encodeSpaceKey(testSpaceUlid)
+  var groupIdsSeq: seq[ULID] = @[]
   for gid in groupIds:
-    groupIdsSeq.add(uint64(gid))
+    groupIdsSeq.add(groupIDToULID(groupIDFromUint64(uint64(gid))))
   let spaceRec = SpaceRecord(
-    spaceId: 2,
+    spaceId: testSpaceUlid,
     name: "testspace",
     replicas: 1,
     groupCount: int32(groupCount),
@@ -181,7 +197,7 @@ proc seedSpaceTable(store: RaftKVStoreExt, tableId: uint32,
     name: tableName,
     database: database,
     schema: schema,
-    spaceId: 2,
+    spaceId: ZeroULID(),
     primaryKey: @["id"],
     columns: @[
       ColumnDefBin(name: "id", dataType: cdtInt, flags: 0x01), # primaryKey
@@ -201,7 +217,7 @@ proc seedSpaceTableThreeCol(store: RaftKVStoreExt, tableId: uint32,
     name: tableName,
     database: database,
     schema: schema,
-    spaceId: 2,
+    spaceId: ZeroULID(),
     primaryKey: @["id"],
     columns: @[
       ColumnDefBin(name: "id", dataType: cdtInt, flags: 0x01), # primaryKey
@@ -252,8 +268,9 @@ suite "SQL Executor — space-routed INSERT":
     # Verify data is spread across groups (at least 2 of 3)
     var groupHits: array[3, int]
     for i in 1 .. 5:
-      let rid = routeToGroup($i, @[10'u64, 11, 12])
-      inc groupHits[int(rid.uint64) - 10]
+      let rid = routeToGroup($i, @[groupIDFromUint64(10'u64), groupIDFromUint64(
+          11'u64), groupIDFromUint64(12'u64)])
+      inc groupHits[int(groupIDToUint64(rid)) - 10]
     var nonEmpty = 0
     for c in groupHits:
       if c > 0: inc nonEmpty
@@ -522,8 +539,9 @@ suite "SQL Executor — space routing full round-trip":
     # Verify data distribution: check that at least 3 of 4 groups have data
     var groupHits: array[4, int]
     for i in 1 .. 100:
-      let rid = routeToGroup($i, @[10'u64, 11, 12, 13])
-      inc groupHits[int(rid.uint64) - 10]
+      let rid = routeToGroup($i, @[groupIDFromUint64(10'u64), groupIDFromUint64(
+          11'u64), groupIDFromUint64(12'u64), groupIDFromUint64(13'u64)])
+      inc groupHits[int(groupIDToUint64(rid)) - 10]
     var nonEmpty = 0
     for c in groupHits:
       if c > 0: inc nonEmpty

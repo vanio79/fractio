@@ -9,8 +9,9 @@
 
 import happyx
 import std/[json, strutils, times, os, atomics, random, asyncdispatch,
-    httpclient, tables]
+    tables as stdtables, httpclient]
 import zippy
+import ../core/types as coreTypes except Table
 import ../protocol/server as pserver
 import ../protocol/messages/cluster as clusterMsgs
 import ../sql/executor
@@ -556,7 +557,7 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
           return %* {"error": "server not ready"}
 
         # Build groups lookup from sys.groups (binary -> JSON for enrichment)
-        var groupDescs = initTable[uint64, GroupRecord]()
+        var groupDescs = initTable[coreTypes.ULID, GroupRecord]()
         {.cast(gcsafe).}:
           let gStartKey = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
           let gEndKey = encodeTableKey(SYS_GROUPS_TABLE_ID + 1, "")
@@ -567,7 +568,13 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
               try:
                 let grec = decodeGroupRecord(entry.value)
                 let gid = grec.groupId
-                if gid > 0:
+                # Check if ULID is non-zero
+                var isNonZero = false
+                for b in gid.data:
+                  if b != 0:
+                    isNonZero = true
+                    break
+                if isNonZero:
                   groupDescs[gid] = grec
               except ValueError:
                 discard
@@ -674,12 +681,12 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
       # ---- REST: SQL convenience endpoints ----
       get "/api/sql/databases":
         let srv = getSrv()
-        if srv.isNil or srv.raftStore.isNil:
+        if srv.isNil:
           statusCode = 503
           return %* {"error": "server not ready"}
         var execResult: ExecResult
         {.cast(gcsafe).}:
-          execResult = executeSQL("SHOW DATABASES", srv.raftStore)
+          execResult = getClient().query("SHOW DATABASES")
         if execResult.kind == erkRows:
           var arr = newJArray()
           for row in execResult.rows:
@@ -690,14 +697,14 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
 
       get "/api/sql/schemas":
         let srv = getSrv()
-        if srv.isNil or srv.raftStore.isNil:
+        if srv.isNil:
           statusCode = 503
           return %* {"error": "server not ready"}
         let db = ($headers.getOrDefault("X-Database")).strip()
         let dbName = if db.len > 0: db else: "default"
         var execResult: ExecResult
         {.cast(gcsafe).}:
-          execResult = executeSQL("SHOW SCHEMAS IN " & dbName, srv.raftStore, dbName)
+          execResult = getClient().query("SHOW SCHEMAS IN " & dbName, dbName)
         if execResult.kind == erkRows:
           var arr = newJArray()
           for row in execResult.rows:
@@ -708,7 +715,7 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
 
       get "/api/sql/tables":
         let srv = getSrv()
-        if srv.isNil or srv.raftStore.isNil:
+        if srv.isNil:
           statusCode = 503
           return %* {"error": "server not ready"}
         let db = ($headers.getOrDefault("X-Database")).strip()
@@ -717,8 +724,7 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
         let scName = if sc.len > 0: sc else: "public"
         var execResult: ExecResult
         {.cast(gcsafe).}:
-          execResult = executeSQL("SHOW TABLES IN " & dbName & "." & scName,
-              srv.raftStore, dbName, scName)
+          execResult = getClient().query("SHOW TABLES IN " & dbName & "." & scName, dbName, scName)
         if execResult.kind == erkRows:
           var arr = newJArray()
           for row in execResult.rows:
@@ -861,7 +867,7 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
         # Fires once per WebSocket handshake.
         # Capture wsClient and spawn a 1Hz push loop.
         let capturedWs = wsClient
-        proc pushDrift(ws: AsyncWebSocket) {.async, gcsafe.} =
+        proc pushDrift(ws: typeof(wsClient)) {.async, gcsafe.} =
           {.cast(gcsafe).}:
             var rng = initRand(getTime().toUnix())
             var driftAccum: float = 0.0

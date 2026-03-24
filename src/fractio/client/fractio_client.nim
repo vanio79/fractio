@@ -10,15 +10,17 @@
 ## This enables client-side SQL parsing, planning, and execution
 ## with direct KV operations to group leaders, avoiding internal rerouting.
 
-import std/[options, tables, sets, locks, atomics, strutils, hashes, algorithm,
-    os, sequtils]
+import std/[options, tables as stdtables, sets, locks, atomics, strutils,
+    hashes, algorithm, os, sequtils]
 import posix
+import ../core/types
 import ../protocol/client
 import ../protocol/types
 import ../protocol/messages/kv as kvMsgs
 import ../protocol/messages/txn as txnMsgs
 import ../distributed/meta/system_tables
 import ../distributed/meta/system_schemas
+import ../distributed/raft/group_types
 import ../storage/mvcc/types as mvccTypes
 import ../utils/logging
 
@@ -37,8 +39,8 @@ type
 
   GroupInfo* = object
     ## Cached information about a Raft group
-    groupId*: uint64
-    spaceId*: int32
+    groupId*: GroupID
+    spaceId*: ULID
     leaderNodeId*: uint32
     replicaNodeIds*: seq[uint32]
 
@@ -46,13 +48,13 @@ type
     ## Cached information about a table
     tableId*: uint32
     name*: string
-    spaceId*: int32
+    spaceId*: ULID
 
   SpaceInfo* = object
     ## Cached information about a space
-    spaceId*: int32
+    spaceId*: ULID
     name*: string
-    groupIds*: seq[uint64]
+    groupIds*: seq[GroupID]
 
   FractioClientConfig* = object
     ## Configuration for FractioClient
@@ -68,16 +70,17 @@ type
     config*: FractioClientConfig
 
     # Cached cluster metadata
-    nodes*: Table[uint32, NodeInfo]   # nodeId -> NodeInfo
-    groups*: Table[uint64, GroupInfo] # groupId -> GroupInfo
-    tables*: Table[uint32, TableInfo] # tableId -> TableInfo
-    spaces*: Table[int32, SpaceInfo]  # spaceId -> SpaceInfo
+    nodes*: stdtables.Table[uint32, NodeInfo]    # nodeId -> NodeInfo
+    groups*: stdtables.Table[GroupID, GroupInfo] # groupId -> GroupInfo
+    tables*: stdtables.Table[uint32, TableInfo]  # tableId -> TableInfo
+    spaces*: stdtables.Table[ULID, SpaceInfo]    # spaceId -> SpaceInfo
 
     # Active connections to leaders
-    leaderConnections*: Table[uint64, ProtocolClient] # groupId -> connection to leader
+    leaderConnections*: stdtables.Table[GroupID,
+        ProtocolClient]                          # groupId -> connection to leader
 
     # Key prefix to group mapping (for routing)
-    keyPrefixToGroup*: Table[string, uint64]
+    keyPrefixToGroup*: stdtables.Table[string, GroupID]
 
     # Lock for thread-safe access
     lock*: Lock
@@ -241,8 +244,8 @@ proc fetchGroupsTable(client: FractioClient, conn: ProtocolClient): bool =
         for rep in groupRec.replicas:
           replicaNodeIds.add(rep.nodeId)
 
-        client.groups[groupRec.groupId] = GroupInfo(
-          groupId: groupRec.groupId,
+        client.groups[groupIDFromULID(groupRec.groupId)] = GroupInfo(
+          groupId: groupIDFromULID(groupRec.groupId),
           spaceId: groupRec.spaceId,
           leaderNodeId: groupRec.leader,
           replicaNodeIds: replicaNodeIds
@@ -286,10 +289,14 @@ proc fetchSpacesTable(client: FractioClient, conn: ProtocolClient): bool =
       # Use MVCC decoder
       let (spaceRec, isDeleted) = decodeSpaceRecordFromMVCC(pair.value)
       if not isDeleted:
+        var groupIds: seq[GroupID] = @[]
+        for gid in spaceRec.groupIds:
+          groupIds.add(groupIDFromULID(gid))
+
         client.spaces[spaceRec.spaceId] = SpaceInfo(
           spaceId: spaceRec.spaceId,
           name: spaceRec.name,
-          groupIds: spaceRec.groupIds
+          groupIds: groupIds
         )
 
   return true
@@ -361,7 +368,7 @@ proc refreshMetadata*(client: FractioClient): bool =
 # Leader connection management
 # =============================================================================
 
-proc getGroupLeaderConnection*(client: FractioClient, groupId: uint64): Option[
+proc getGroupLeaderConnection*(client: FractioClient, groupId: GroupID): Option[
     ProtocolClient] =
   ## Get a connection to the leader of a specific group.
   ## Uses cached leader info, falls back to trying all replicas.
@@ -397,7 +404,7 @@ proc getGroupLeaderConnection*(client: FractioClient, groupId: uint64): Option[
 
   return none(ProtocolClient)
 
-proc refreshGroupLeader(client: FractioClient, groupId: uint64): bool =
+proc refreshGroupLeader(client: FractioClient, groupId: GroupID): bool =
   ## Refresh leader info for a specific group after a "not leader" error
 
   # Clear cached connection
@@ -420,7 +427,7 @@ proc refreshGroupLeader(client: FractioClient, groupId: uint64): bool =
 
   return true
 
-proc updateLeaderFromRedirect*(client: FractioClient, groupId: uint64,
+proc updateLeaderFromRedirect*(client: FractioClient, groupId: GroupID,
     redirect: LeaderRedirect): bool =
   ## Update the leader connection based on redirect info from a NOT_LEADER error.
   ## This is faster than refreshing all metadata because we connect directly
@@ -472,22 +479,22 @@ proc updateLeaderFromRedirect*(client: FractioClient, groupId: uint64,
 # Key routing
 # =============================================================================
 
-proc routeToGroup(primaryKey: string, groupIds: seq[uint64]): uint64 =
+proc routeToGroup(primaryKey: string, groupIds: seq[GroupID]): GroupID =
   ## Hash-route a primary key to one of the space's groups.
   ## primaryKey should be the bare key value (e.g., "1" not "/t/0000000100/d/1")
   if groupIds.len == 0:
-    return 1'u64 # META_GROUP_ID
+    return META_GROUP_ID
   if groupIds.len == 1:
     return groupIds[0]
   let h = hash(primaryKey)
   let idx = abs(h) mod groupIds.len
   groupIds[idx]
 
-proc getGroupForKey*(client: FractioClient, key: string): uint64 =
+proc getGroupForKey*(client: FractioClient, key: string): GroupID =
   ## Determine which group owns a given key.
-  ## Returns 0 if the group cannot be determined.
+  ## Returns empty GroupID (all zeros) if the group cannot be determined.
 
-  # System tables (tableId 1-7) are in the meta group (groupId 1)
+  # System tables (tableId 1-7) are in the meta group
   if key.startsWith(TABLE_KEY_PREFIX):
     let afterPrefix = key[TABLE_KEY_PREFIX.len .. ^1]
     if afterPrefix.len >= TABLE_ID_WIDTH:
@@ -495,7 +502,7 @@ proc getGroupForKey*(client: FractioClient, key: string): uint64 =
         let tableIdStr = afterPrefix[0 ..< TABLE_ID_WIDTH]
         let tableId = parseUInt(tableIdStr).uint32
         if tableId <= MAX_META_GROUP_TABLE_ID:
-          return 1'u64 # Meta group
+          return META_GROUP_ID
         else:
           # For data tables, look up table->space->group mapping
           withLock client.lock:
@@ -516,14 +523,14 @@ proc getGroupForKey*(client: FractioClient, key: string): uint64 =
                   let groupId = routeToGroup(pk, spaceInfo.groupIds)
                   return groupId
           # Fall back to default data group
-          return 2'u64
+          return genGroupID() # Generate a new ID as fallback (not ideal)
       except ValueError:
         discard
 
-  # Default to group 2 (data group) for non-table keys or if parsing failed
-  return 2'u64
+  # Default to meta group for non-table keys or if parsing failed
+  return META_GROUP_ID
 
-proc getGroupsForTable*(client: FractioClient, tableId: uint32): seq[uint64] =
+proc getGroupsForTable*(client: FractioClient, tableId: uint32): seq[GroupID] =
   ## Get all groups that store data for a given table.
   ## For multi-group spaces, returns ALL groups in the space.
   ## Returns empty seq if the table is not found.
@@ -536,8 +543,8 @@ proc getGroupsForTable*(client: FractioClient, tableId: uint32): seq[uint64] =
         let spaceInfo = client.spaces[spaceId]
         return spaceInfo.groupIds
 
-  # Fall back to default data group
-  return @[2'u64]
+  # Fall back to meta group
+  return @[META_GROUP_ID]
 
 proc getTableIdFromKey*(client: FractioClient, key: string): uint32 =
   ## Extract tableId from a key, returns 0 if not parseable.
@@ -700,7 +707,7 @@ proc kvScan*(client: FractioClient, startKey, endKey: string,
   let groupIds = client.getGroupsForTable(tableId)
 
   # Collect results from all groups, deduplicating by key
-  var resultMap: Table[string, string] = initTable[string, string]()
+  var resultMap = stdtables.initTable[string, string]()
 
   for groupId in groupIds:
     for attempt in 0 ..< 3:
@@ -753,7 +760,7 @@ proc beginTxn*(client: FractioClient): KVOpResult[tuple[txnId,
       return kvOpErr[tuple[txnId, readTimestamp: uint64]]("failed to initialize client")
 
   # Use meta group leader if possible, otherwise any connection
-  let connOpt = client.getGroupLeaderConnection(1)       # Group 1 is meta
+  let connOpt = client.getGroupLeaderConnection(META_GROUP_ID)
   if connOpt.isNone:
     echo "DEBUG: beginTxn failed: no connection to meta group leader"
     return kvOpErr[tuple[txnId, readTimestamp: uint64]]("no connection for beginTxn")
@@ -771,7 +778,7 @@ proc commitTxn*(client: FractioClient, txnId: uint64): KVOpVoidResult =
   ## Commit a transaction.
   # We should send commit to the node that started it, or any node if they share txn state.
   # For now, use meta group leader.
-  let connOpt = client.getGroupLeaderConnection(1)
+  let connOpt = client.getGroupLeaderConnection(META_GROUP_ID)
   if connOpt.isNone:
     return kvVoidErr("no connection for commitTxn")
 
@@ -790,7 +797,7 @@ proc commitTxn*(client: FractioClient, txnId: uint64): KVOpVoidResult =
 
 proc rollbackTxn*(client: FractioClient, txnId: uint64): KVOpVoidResult =
   ## Rollback a transaction.
-  let connOpt = client.getGroupLeaderConnection(1)
+  let connOpt = client.getGroupLeaderConnection(META_GROUP_ID)
   if connOpt.isNone:
     return kvVoidErr("no connection for rollbackTxn")
 
@@ -811,12 +818,12 @@ type
     isOk*: bool
     err*: string
     ## On success:
-    spaceId*: int32
+    spaceId*: ULID
     groupCount*: int32
-    groupIds*: seq[uint64]
+    groupIds*: seq[GroupID]
 
-proc spaceOpOk(spaceId: int32, groupCount: int32, groupIds: seq[
-    uint64]): SpaceOpResult =
+proc spaceOpOk(spaceId: ULID, groupCount: int32, groupIds: seq[
+    GroupID]): SpaceOpResult =
   SpaceOpResult(isOk: true, spaceId: spaceId, groupCount: groupCount,
       groupIds: groupIds)
 
@@ -838,7 +845,7 @@ proc createSpace*(client: FractioClient, name: string,
   # Retry loop for leader redirect
   for attempt in 0 ..< 3:
     # Get connection to META group leader
-    let connOpt = client.getGroupLeaderConnection(1)
+    let connOpt = client.getGroupLeaderConnection(META_GROUP_ID)
     if connOpt.isNone:
       return spaceOpErr("no connection to META group leader")
 
@@ -849,7 +856,8 @@ proc createSpace*(client: FractioClient, name: string,
     if res.isErr:
       # Check for redirect
       if res.error.kind == peNotLeader and res.error.leaderRedirect.leaderId != 0:
-        if client.updateLeaderFromRedirect(1, res.error.leaderRedirect):
+        if client.updateLeaderFromRedirect(META_GROUP_ID,
+            res.error.leaderRedirect):
           continue
       return spaceOpErr(res.error.msg)
 
@@ -861,10 +869,14 @@ proc createSpace*(client: FractioClient, name: string,
     withLock client.lock:
       # Parse and cache the space record
       let spaceRec = decodeSpaceRecord(resp.spaceRecord)
+      var groupIds: seq[GroupID] = @[]
+      for gid in spaceRec.groupIds:
+        groupIds.add(groupIDFromULID(gid))
+
       client.spaces[spaceRec.spaceId] = SpaceInfo(
         spaceId: spaceRec.spaceId,
         name: spaceRec.name,
-        groupIds: spaceRec.groupIds
+        groupIds: groupIds
       )
 
       # Parse and cache all group records
@@ -874,15 +886,17 @@ proc createSpace*(client: FractioClient, name: string,
         for rep in groupRec.replicas:
           replicaNodeIds.add(rep.nodeId)
 
-        client.groups[groupRec.groupId] = GroupInfo(
-          groupId: groupRec.groupId,
+        client.groups[groupIDFromULID(groupRec.groupId)] = GroupInfo(
+          groupId: groupIDFromULID(groupRec.groupId),
           spaceId: groupRec.spaceId,
           leaderNodeId: groupRec.leader,
           replicaNodeIds: replicaNodeIds
         )
 
-    return spaceOpOk(resp.spaceId, resp.groupCount,
-      resp.groupRecords.mapIt(it.groupId))
+    var resultGroupIds: seq[GroupID] = @[]
+    for gr in resp.groupRecords:
+      resultGroupIds.add(groupIDFromULID(gr.groupId))
+    return spaceOpOk(resp.spaceId, resp.groupCount, resultGroupIds)
 
   return spaceOpErr("too many retries")
 
@@ -897,7 +911,7 @@ proc dropSpace*(client: FractioClient, name: string): SpaceOpResult =
   # Retry loop for leader redirect
   for attempt in 0 ..< 3:
     # Get connection to META group leader
-    let connOpt = client.getGroupLeaderConnection(1)
+    let connOpt = client.getGroupLeaderConnection(META_GROUP_ID)
     if connOpt.isNone:
       return spaceOpErr("no connection to META group leader")
 
@@ -908,7 +922,8 @@ proc dropSpace*(client: FractioClient, name: string): SpaceOpResult =
     if res.isErr:
       # Check for redirect
       if res.error.kind == peNotLeader and res.error.leaderRedirect.leaderId != 0:
-        if client.updateLeaderFromRedirect(1, res.error.leaderRedirect):
+        if client.updateLeaderFromRedirect(META_GROUP_ID,
+            res.error.leaderRedirect):
           continue
       return spaceOpErr(res.error.msg)
 
@@ -918,25 +933,29 @@ proc dropSpace*(client: FractioClient, name: string): SpaceOpResult =
 
     # Update local cache - remove space and groups
     withLock client.lock:
-      # Find and remove the space
-      var spaceIdToRemove: int32 = resp.spaceId
-      if spaceIdToRemove == 0:
-        # SpaceId wasn't in response, find it by name
-        for sid, sinfo in client.spaces:
-          if sinfo.name == name:
-            spaceIdToRemove = sid
-            break
+      # Find and remove the space by name (since resp.spaceId is ULID)
+      var spaceIdToRemove: ULID
+      var found = false
+      for sid, sinfo in client.spaces:
+        if sinfo.name == name:
+          spaceIdToRemove = sid
+          found = true
+          break
 
-      if spaceIdToRemove != 0:
+      if found:
         client.spaces.del(spaceIdToRemove)
 
       # Remove all deleted groups
       for gid in resp.deletedGroupIds:
-        client.groups.del(gid)
-        client.leaderConnections.del(gid)
+        let groupId = groupIDFromULID(gid)
+        client.groups.del(groupId)
+        client.leaderConnections.del(groupId)
 
+    var deletedGroupIds: seq[GroupID] = @[]
+    for gid in resp.deletedGroupIds:
+      deletedGroupIds.add(groupIDFromULID(gid))
     return spaceOpOk(resp.spaceId, resp.deletedGroupIds.len.int32,
-      resp.deletedGroupIds)
+      deletedGroupIds)
 
   return spaceOpErr("too many retries")
 
