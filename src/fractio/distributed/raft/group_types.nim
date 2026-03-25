@@ -169,25 +169,6 @@ proc groupIDFromBytes*(data: string): GroupID =
   ## Parse 16-byte binary to GroupID
   GroupID(ulidFromBytes(data))
 
-proc groupIDToUint64*(id: GroupID): uint64 =
-  ## Convert GroupID to uint64 for wire protocol compatibility.
-  ## Uses a hash of the ULID bytes for deterministic mapping.
-  ## WARNING: This is a lossy conversion - use only for protocol compatibility.
-  var h: uint64 = 0
-  for i, b in id.ULID.data:
-    h = h xor (uint64(b) shl ((i mod 8) * 8))
-  result = h
-
-proc groupIDFromUint64*(val: uint64): GroupID =
-  ## Create a GroupID from uint64 (for wire protocol compatibility).
-  ## This creates a ULID with the uint64 value embedded - not reversible.
-  ## Used only for decoding legacy wire protocol messages.
-  var ulid: ULID
-  # Embed uint64 in first 8 bytes, rest are zero
-  for i in 0..<8:
-    ulid.data[i] = uint8((val shr (i * 8)) and 0xFF)
-  result = GroupID(ulid)
-
 # ============================================================================
 # ReplicaID operations
 # ============================================================================
