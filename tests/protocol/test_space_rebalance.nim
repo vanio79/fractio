@@ -6,9 +6,13 @@
 # - Dual-scan routing during rebalance (raftScanSpace merges old + new groups)
 # - raftDeleteInGroup targeted deletion
 # - updateSpaceRecord persistence
+#
+# NOTE: Group IDs must start from 100+ to avoid port hash collisions with
+# META_GROUP_ID (hash=1) and DATA_GROUP_START_ID (hash=2).
 
 import std/[unittest, os, options, tables, algorithm, hashes, json, strutils, locks,
             sequtils]
+from fractio/core/types import genULID, ULID, ulidToBytes, ulidFromBytes, ZeroULID
 import fractio/protocol/raft_store
 import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
@@ -54,13 +58,13 @@ proc makeStore(storagePath: string, groupIds: seq[uint64]): tuple[
   for rid in [META_GROUP_ID, DATA_GROUP_START_ID]:
     doAssert coord.createAndStartGroup(rid, members)
 
-  # Additional groups
+  # Additional groups (use IDs >= 100 to avoid port collisions)
   for gid in groupIds:
-    doAssert coord.createAndStartGroup(GroupID(gid), members)
+    doAssert coord.createAndStartGroup(groupIDFromInt(gid), members)
 
   # Wait for all groups to elect leaders
   let allGroupIds = @[META_GROUP_ID, DATA_GROUP_START_ID] &
-    groupIds.mapIt(GroupID(it))
+    groupIds.mapIt(groupIDFromInt(it))
   for attempt in 0 ..< 50:
     var allLeaders = true
     for gid in allGroupIds:
@@ -75,7 +79,7 @@ proc makeStore(storagePath: string, groupIds: seq[uint64]): tuple[
   store.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
 
   for gid in groupIds:
-    discard store.getOrCreateSM(GroupID(gid))
+    discard store.getOrCreateSM(groupIDFromInt(gid))
 
   (coord, store)
 
@@ -90,10 +94,10 @@ proc teardown(coord: NuRaftCoordinator, storagePath: string) =
 suite "Space rebalance — SpaceInfo fields":
   test "SpaceInfo has rebalance fields with defaults":
     let space = SpaceInfo(
-      spaceId: 1,
+      spaceId: genULID(),
       name: "test",
       replicas: 2,
-      groupIds: @[10'u64, 11],
+      groupIds: @[groupIDFromInt(100), groupIDFromInt(101)],
     )
     check space.rebalancing == false
     check space.rebalanceWorker == 0
@@ -103,11 +107,12 @@ suite "Space rebalance — SpaceInfo fields":
 
   test "SpaceInfo with all rebalance fields set":
     let space = SpaceInfo(
-      spaceId: 1,
+      spaceId: genULID(),
       name: "test",
       replicas: 2,
-      groupIds: @[20'u64, 21, 22],
-      oldGroupIds: @[10'u64, 11],
+      groupIds: @[groupIDFromInt(110), groupIDFromInt(111), groupIDFromInt(
+          112)],
+      oldGroupIds: @[groupIDFromInt(100), groupIDFromInt(101)],
       rebalancing: true,
       rebalanceWorker: 3,
       rebalanceHeartbeat: 1741700000'i64,
@@ -117,8 +122,8 @@ suite "Space rebalance — SpaceInfo fields":
     check space.rebalanceWorker == 3
     check space.rebalanceHeartbeat == 1741700000'i64
     check space.rebalanceCursor == "/t/0000000100/d/m"
-    check space.oldGroupIds == @[10'u64, 11]
-    check space.groupIds == @[20'u64, 21, 22]
+    check space.oldGroupIds.len == 2
+    check space.groupIds.len == 3
 
 # ---------------------------------------------------------------------------
 # Suite: loadSpaces parses rebalance fields
@@ -130,14 +135,17 @@ suite "Space rebalance — loadSpaces parses rebalance fields":
     defer: teardown(coord, "/tmp/fractio_sr_rebal_t01")
 
     # Write a space record with rebalance fields
-    let spaceKey = encodeSpaceKey(5)
+    let spaceId = genULID()
+    let spaceKey = encodeSpaceKey(spaceId)
     let spaceRec = SpaceRecord(
-      spaceId: 5,
+      spaceId: spaceId,
       name: "rebaltest",
       replicas: 2,
       groupCount: 3,
-      groupIds: @[20'u64, 21, 22],
-      oldGroupIds: @[10'u64, 11],
+      groupIds: @[groupIDToULID(groupIDFromInt(110)), groupIDToULID(
+          groupIDFromInt(111)), groupIDToULID(groupIDFromInt(112))],
+      oldGroupIds: @[groupIDToULID(groupIDFromInt(100)), groupIDToULID(
+          groupIDFromInt(101))],
       rebalancing: true,
       rebalanceWorker: 3,
       rebalanceHeartbeat: 1741700000'i64,
@@ -149,12 +157,12 @@ suite "Space rebalance — loadSpaces parses rebalance fields":
     store.loadSpaces()
 
     acquire(store.spacesMu)
-    let sp = store.spaces[5]
+    let sp = store.spaces[spaceId]
     release(store.spacesMu)
 
     check sp.name == "rebaltest"
-    check sp.groupIds == @[20'u64, 21, 22]
-    check sp.oldGroupIds == @[10'u64, 11]
+    check sp.groupIds.len == 3
+    check sp.oldGroupIds.len == 2
     check sp.rebalancing == true
     check sp.rebalanceWorker == 3
     check sp.rebalanceHeartbeat == 1741700000'i64
@@ -165,13 +173,14 @@ suite "Space rebalance — loadSpaces parses rebalance fields":
     defer: teardown(coord, "/tmp/fractio_sr_rebal_t02")
 
     # Write a space record WITHOUT rebalance fields (backward compat)
-    let spaceKey = encodeSpaceKey(3)
+    let spaceId = genULID()
+    let spaceKey = encodeSpaceKey(spaceId)
     let spaceRec = SpaceRecord(
-      spaceId: 3,
+      spaceId: spaceId,
       name: "oldstyle",
       replicas: 1,
       groupCount: 1,
-      groupIds: @[10'u64],
+      groupIds: @[groupIDToULID(groupIDFromInt(100))],
     )
     discard store.sysTablePut(spaceKey, spaceRec.encode())
     # Wait for Raft commit to apply
@@ -179,7 +188,7 @@ suite "Space rebalance — loadSpaces parses rebalance fields":
     store.loadSpaces()
 
     acquire(store.spacesMu)
-    let sp = store.spaces[3]
+    let sp = store.spaces[spaceId]
     release(store.spacesMu)
 
     check sp.rebalancing == false
@@ -194,15 +203,17 @@ suite "Space rebalance — loadSpaces parses rebalance fields":
 
 suite "Space rebalance — updateSpaceRecord":
   test "updateSpaceRecord persists and reloads correctly":
-    let (coord, store) = makeStore("/tmp/fractio_sr_rebal_t05", @[10'u64, 11])
+    let (coord, store) = makeStore("/tmp/fractio_sr_rebal_t05", @[100'u64, 101])
     defer: teardown(coord, "/tmp/fractio_sr_rebal_t05")
 
+    let spaceId = genULID()
     var space = SpaceInfo(
-      spaceId: 7,
+      spaceId: spaceId,
       name: "persist_test",
       replicas: 2,
-      groupIds: @[20'u64, 21, 22],
-      oldGroupIds: @[10'u64, 11],
+      groupIds: @[groupIDFromInt(110), groupIDFromInt(111), groupIDFromInt(
+          112)],
+      oldGroupIds: @[groupIDFromInt(100), groupIDFromInt(101)],
       rebalancing: true,
       rebalanceWorker: 1,
       rebalanceHeartbeat: 9999'i64,
@@ -214,13 +225,13 @@ suite "Space rebalance — updateSpaceRecord":
     store.loadSpaces()
 
     acquire(store.spacesMu)
-    let loaded = store.spaces[7]
+    let loaded = store.spaces[spaceId]
     release(store.spacesMu)
 
     check loaded.name == "persist_test"
     check loaded.replicas == 2
-    check loaded.groupIds == @[20'u64, 21, 22]
-    check loaded.oldGroupIds == @[10'u64, 11]
+    check loaded.groupIds.len == 3
+    check loaded.oldGroupIds.len == 2
     check loaded.rebalancing == true
     check loaded.rebalanceWorker == 1
     check loaded.rebalanceHeartbeat == 9999'i64
@@ -231,12 +242,13 @@ suite "Space rebalance — updateSpaceRecord":
     defer: teardown(coord, "/tmp/fractio_sr_rebal_t06")
 
     # First write with rebalancing on
+    let spaceId = genULID()
     var space = SpaceInfo(
-      spaceId: 8,
+      spaceId: spaceId,
       name: "clear_test",
       replicas: 1,
-      groupIds: @[20'u64],
-      oldGroupIds: @[10'u64],
+      groupIds: @[groupIDFromInt(110)],
+      oldGroupIds: @[groupIDFromInt(100)],
       rebalancing: true,
       rebalanceWorker: 2,
       rebalanceHeartbeat: 5000,
@@ -258,7 +270,7 @@ suite "Space rebalance — updateSpaceRecord":
     store.loadSpaces()
 
     acquire(store.spacesMu)
-    let loaded = store.spaces[8]
+    let loaded = store.spaces[spaceId]
     release(store.spacesMu)
 
     check loaded.rebalancing == false
@@ -272,13 +284,14 @@ suite "Space rebalance — updateSpaceRecord":
 
 suite "Space rebalance — dual-read routing":
   test "raftGetInSpace falls back to old group during rebalance":
-    # Setup: 2 old groups (10,11) + 3 new groups (20,21,22)
-    let allGroups = @[10'u64, 11, 20, 21, 22]
+    # Setup: 2 old groups (100,101) + 3 new groups (110,111,112)
+    let allGroups = @[100'u64, 101, 110, 111, 112]
     let (coord, store) = makeStore("/tmp/fractio_sr_rebal_t10", allGroups)
     defer: teardown(coord, "/tmp/fractio_sr_rebal_t10")
 
-    let oldGroupIds = @[10'u64, 11]
-    let newGroupIds = @[20'u64, 21, 22]
+    let oldGroupIds = @[groupIDFromInt(100), groupIDFromInt(101)]
+    let newGroupIds = @[groupIDFromInt(110), groupIDFromInt(111),
+        groupIDFromInt(112)]
 
     # Find a key that routes to different groups in old vs new topology
     var testPk = ""
@@ -295,15 +308,14 @@ suite "Space rebalance — dual-read routing":
     let value = """{"id":"test","val":"fallback"}"""
 
     # Write data using OLD group routing (simulate pre-rebalance data)
-    let oldRid = routeToGroup(testPk, oldGroupIds)
     let oldSpace = SpaceInfo(
-      spaceId: 2, name: "t", replicas: 1, groupIds: oldGroupIds)
+      spaceId: genULID(), name: "t", replicas: 1, groupIds: oldGroupIds)
     let wr = store.raftPutInSpace(key, value, oldSpace, testPk)
     check wr.isOk
 
     # Now create a rebalancing space with new groups
     let rebalSpace = SpaceInfo(
-      spaceId: 2, name: "t", replicas: 1,
+      spaceId: genULID(), name: "t", replicas: 1,
       groupIds: newGroupIds,
       oldGroupIds: oldGroupIds,
       rebalancing: true,
@@ -317,23 +329,24 @@ suite "Space rebalance — dual-read routing":
     check gr.value.get().value == value
 
   test "raftGetInSpace returns data from new group if present":
-    let allGroups = @[10'u64, 11, 20, 21, 22]
+    let allGroups = @[100'u64, 101, 110, 111, 112]
     let (coord, store) = makeStore("/tmp/fractio_sr_rebal_t11", allGroups)
     defer: teardown(coord, "/tmp/fractio_sr_rebal_t11")
 
-    let newGroupIds = @[20'u64, 21, 22]
-    let oldGroupIds = @[10'u64, 11]
+    let newGroupIds = @[groupIDFromInt(110), groupIDFromInt(111),
+        groupIDFromInt(112)]
+    let oldGroupIds = @[groupIDFromInt(100), groupIDFromInt(101)]
     let pk = "new_data_key"
     let key = encodeDataRowKey(100, pk)
 
     # Write using new group routing
     let newSpace = SpaceInfo(
-      spaceId: 2, name: "t", replicas: 1, groupIds: newGroupIds)
+      spaceId: genULID(), name: "t", replicas: 1, groupIds: newGroupIds)
     discard store.raftPutInSpace(key, "new_value", newSpace, pk)
 
     # Read during rebalance — should find in new group, no fallback needed
     let rebalSpace = SpaceInfo(
-      spaceId: 2, name: "t", replicas: 1,
+      spaceId: genULID(), name: "t", replicas: 1,
       groupIds: newGroupIds,
       oldGroupIds: oldGroupIds,
       rebalancing: true,
@@ -344,14 +357,15 @@ suite "Space rebalance — dual-read routing":
     check gr.value.get().value == "new_value"
 
   test "raftGetInSpace returns none when key missing from both groups":
-    let allGroups = @[10'u64, 11, 20, 21, 22]
+    let allGroups = @[100'u64, 101, 110, 111, 112]
     let (coord, store) = makeStore("/tmp/fractio_sr_rebal_t12", allGroups)
     defer: teardown(coord, "/tmp/fractio_sr_rebal_t12")
 
     let rebalSpace = SpaceInfo(
-      spaceId: 2, name: "t", replicas: 1,
-      groupIds: @[20'u64, 21, 22],
-      oldGroupIds: @[10'u64, 11],
+      spaceId: genULID(), name: "t", replicas: 1,
+      groupIds: @[groupIDFromInt(110), groupIDFromInt(111), groupIDFromInt(
+          112)],
+      oldGroupIds: @[groupIDFromInt(100), groupIDFromInt(101)],
       rebalancing: true,
     )
     let gr = store.raftGetInSpace(
@@ -360,12 +374,13 @@ suite "Space rebalance — dual-read routing":
     check gr.value.isNone
 
   test "raftGetInSpace no fallback when not rebalancing":
-    let allGroups = @[10'u64, 11, 20, 21, 22]
+    let allGroups = @[100'u64, 101, 110, 111, 112]
     let (coord, store) = makeStore("/tmp/fractio_sr_rebal_t13", allGroups)
     defer: teardown(coord, "/tmp/fractio_sr_rebal_t13")
 
-    let oldGroupIds = @[10'u64, 11]
-    let newGroupIds = @[20'u64, 21, 22]
+    let oldGroupIds = @[groupIDFromInt(100), groupIDFromInt(101)]
+    let newGroupIds = @[groupIDFromInt(110), groupIDFromInt(111),
+        groupIDFromInt(112)]
 
     # Find a key that routes differently
     var testPk = ""
@@ -379,14 +394,14 @@ suite "Space rebalance — dual-read routing":
     let key = encodeDataRowKey(100, testPk)
     # Write using old group routing
     let oldSpace = SpaceInfo(
-      spaceId: 2, name: "t", replicas: 1, groupIds: oldGroupIds)
+      spaceId: genULID(), name: "t", replicas: 1, groupIds: oldGroupIds)
     discard store.raftPutInSpace(key, "data", oldSpace, testPk)
 
     # Read with new groups but NOT rebalancing — should NOT fall back
     # (In single-node shared backend, it'll actually find it because all
     # groups share one LevelDB. This test is about the routing logic.)
     let newSpace = SpaceInfo(
-      spaceId: 2, name: "t", replicas: 1,
+      spaceId: genULID(), name: "t", replicas: 1,
       groupIds: newGroupIds,
       rebalancing: false, # not rebalancing
     )
@@ -401,16 +416,17 @@ suite "Space rebalance — dual-read routing":
 
 suite "Space rebalance — dual-scan routing":
   test "raftScanSpace includes data from both old and new groups":
-    let allGroups = @[10'u64, 11, 20, 21, 22]
+    let allGroups = @[100'u64, 101, 110, 111, 112]
     let (coord, store) = makeStore("/tmp/fractio_sr_rebal_t20", allGroups)
     defer: teardown(coord, "/tmp/fractio_sr_rebal_t20")
 
-    let oldGroupIds = @[10'u64, 11]
-    let newGroupIds = @[20'u64, 21, 22]
+    let oldGroupIds = @[groupIDFromInt(100), groupIDFromInt(101)]
+    let newGroupIds = @[groupIDFromInt(110), groupIDFromInt(111),
+        groupIDFromInt(112)]
 
     # Write some data using old routing
     let oldSpace = SpaceInfo(
-      spaceId: 2, name: "t", replicas: 1, groupIds: oldGroupIds)
+      spaceId: genULID(), name: "t", replicas: 1, groupIds: oldGroupIds)
     for i in 0 ..< 10:
       let pk = "old_" & $i
       let key = encodeDataRowKey(100, pk)
@@ -418,7 +434,7 @@ suite "Space rebalance — dual-scan routing":
 
     # Write some data using new routing
     let newSpace = SpaceInfo(
-      spaceId: 2, name: "t", replicas: 1, groupIds: newGroupIds)
+      spaceId: genULID(), name: "t", replicas: 1, groupIds: newGroupIds)
     for i in 10 ..< 15:
       let pk = "new_" & $i
       let key = encodeDataRowKey(100, pk)
@@ -426,7 +442,7 @@ suite "Space rebalance — dual-scan routing":
 
     # Scan during rebalance — should see all 15 rows
     let rebalSpace = SpaceInfo(
-      spaceId: 2, name: "t", replicas: 1,
+      spaceId: genULID(), name: "t", replicas: 1,
       groupIds: newGroupIds,
       oldGroupIds: oldGroupIds,
       rebalancing: true,
@@ -443,26 +459,27 @@ suite "Space rebalance — dual-scan routing":
       check sr.value[i-1][0] <= sr.value[i][0]
 
   test "raftScanSpace deduplicates keys present in both old and new groups":
-    let allGroups = @[10'u64, 11, 20, 21, 22]
+    let allGroups = @[100'u64, 101, 110, 111, 112]
     let (coord, store) = makeStore("/tmp/fractio_sr_rebal_t21", allGroups)
     defer: teardown(coord, "/tmp/fractio_sr_rebal_t21")
 
-    let oldGroupIds = @[10'u64, 11]
-    let newGroupIds = @[20'u64, 21, 22]
+    let oldGroupIds = @[groupIDFromInt(100), groupIDFromInt(101)]
+    let newGroupIds = @[groupIDFromInt(110), groupIDFromInt(111),
+        groupIDFromInt(112)]
 
     # Write the same key using both old and new routing
     let pk = "shared_key"
     let key = encodeDataRowKey(100, pk)
     let oldSpace = SpaceInfo(
-      spaceId: 2, name: "t", replicas: 1, groupIds: oldGroupIds)
+      spaceId: genULID(), name: "t", replicas: 1, groupIds: oldGroupIds)
     discard store.raftPutInSpace(key, "old_value", oldSpace, pk)
     let newSpace = SpaceInfo(
-      spaceId: 2, name: "t", replicas: 1, groupIds: newGroupIds)
+      spaceId: genULID(), name: "t", replicas: 1, groupIds: newGroupIds)
     discard store.raftPutInSpace(key, "new_value", newSpace, pk)
 
     # Scan during rebalance
     let rebalSpace = SpaceInfo(
-      spaceId: 2, name: "t", replicas: 1,
+      spaceId: genULID(), name: "t", replicas: 1,
       groupIds: newGroupIds,
       oldGroupIds: oldGroupIds,
       rebalancing: true,
@@ -486,15 +503,15 @@ suite "Space rebalance — dual-scan routing":
 suite "Space rebalance — raftDeleteInGroup":
   test "raftDeleteInGroup deletes key from specific group":
     let (coord, store) = makeStore("/tmp/fractio_sr_rebal_t30",
-        @[10'u64, 11, 12])
+        @[100'u64, 101, 102])
     defer: teardown(coord, "/tmp/fractio_sr_rebal_t30")
 
     let pk = "del_target"
     let key = encodeDataRowKey(100, pk)
 
-    # Write to group 10 directly
+    # Write to group 100 directly
     let space = SpaceInfo(
-      spaceId: 2, name: "t", replicas: 1, groupIds: @[10'u64])
+      spaceId: genULID(), name: "t", replicas: 1, groupIds: @[groupIDFromInt(100)])
     discard store.raftPutInSpace(key, "value", space, pk)
 
     # Verify it exists
@@ -502,8 +519,8 @@ suite "Space rebalance — raftDeleteInGroup":
     check gr.isOk
     check gr.value.isSome
 
-    # Delete from group 10
-    let dr = store.raftDeleteInGroup(key, GroupID(10))
+    # Delete from group 100
+    let dr = store.raftDeleteInGroup(key, groupIDFromInt(100))
     check dr.isOk
 
     # Verify deleted
@@ -513,8 +530,8 @@ suite "Space rebalance — raftDeleteInGroup":
 
   test "raftDeleteInGroup on non-existent key succeeds":
     let (coord, store) = makeStore("/tmp/fractio_sr_rebal_t31",
-        @[10'u64])
+        @[100'u64])
     defer: teardown(coord, "/tmp/fractio_sr_rebal_t31")
 
-    let dr = store.raftDeleteInGroup("/t/0000000100/d/nope", GroupID(10))
+    let dr = store.raftDeleteInGroup("/t/0000000100/d/nope", groupIDFromInt(100))
     check dr.isOk

@@ -109,19 +109,19 @@ suite "Preferred leader rebalancing — 3-node cluster":
       node.store.loadGroupMembers()
 
     # Create a space group (gid=100) with preferredLeader = 2
-    let testGid = rangeTypes.GroupID(100)
+    let testGid = rangeTypes.groupIDFromInt(100)
 
     # Find meta leader to write sys.groups
     let metaLeader = cluster.findLeader(META_GROUP_ID)
     doAssert metaLeader >= 0
 
     # Write sys.groups record with preferredLeader = 2
-    let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $testGid.uint64)
+    let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(testGid))
     var replicasSeq: seq[GroupReplicaBin] = @[]
     for n in 1..3:
       replicasSeq.add(GroupReplicaBin(nodeId: uint32(n), replicaType: rtVoter))
     let groupRec = GroupRecord(
-      groupId: testGid.uint64,
+      groupId: groupIDToULID(testGid),
       replicas: replicasSeq,
       preferredLeader: 2,
     )
@@ -187,17 +187,17 @@ suite "Preferred leader rebalancing — 3-node cluster":
       node.store.loadGroupMembers()
 
     # Create group 101 with preferredLeader = node 3
-    let testGid = rangeTypes.GroupID(101)
+    let testGid = rangeTypes.groupIDFromInt(101)
 
     let metaLeader = cluster.findLeader(META_GROUP_ID)
     doAssert metaLeader >= 0
 
-    let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $testGid.uint64)
+    let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(testGid))
     var replicasSeq: seq[GroupReplicaBin] = @[]
     for n in 1..3:
       replicasSeq.add(GroupReplicaBin(nodeId: uint32(n), replicaType: rtVoter))
     let groupRec = GroupRecord(
-      groupId: testGid.uint64,
+      groupId: groupIDToULID(testGid),
       replicas: replicasSeq,
       preferredLeader: 3,
     )

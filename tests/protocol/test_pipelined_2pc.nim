@@ -63,15 +63,15 @@ proc makeMultiShardStore(storagePath: string): tuple[
   ))
   coord.start()
 
-  let rid1 = META_GROUP_ID         # META_GROUP_ID — for coord records / system keys
-  let rid2 = DATA_GROUP_START_ID   # DATA_GROUP_START_ID — where resolveGroupId routes data keys
-  let rid3 = GroupID(3)
+  let rid1 = META_GROUP_ID # META_GROUP_ID — for coord records / system keys
+  let rid2 = DATA_GROUP_START_ID # DATA_GROUP_START_ID — where resolveGroupId routes data keys
+  let rid3 = groupIDFromInt(3)
 
   for rid in [rid1, rid2, rid3]:
     doAssert coord.createAndStartGroup(rid, members)
 
   # Wait for all groups to elect a leader (single-node → self-election)
-  for attempt in 0 ..< 50:  # up to 5 seconds
+  for attempt in 0 ..< 50: # up to 5 seconds
     var allLeaders = true
     for rid in [rid1, rid2, rid3]:
       if not coord.isLeader(rid):

@@ -19,16 +19,16 @@ suite "Preferred leader isolated test":
     for node in cluster.nodes:
       node.store.loadGroupMembers()
 
-    let testGid = rangeTypes.GroupID(101)
+    let testGid = rangeTypes.groupIDFromInt(101)
     let metaLeader = cluster.waitForLeader(META_GROUP_ID)
     doAssert metaLeader >= 0
 
-    let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $testGid.uint64)
+    let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(testGid))
     var replicasSeq: seq[GroupReplicaBin] = @[]
     for n in 1..3:
       replicasSeq.add(GroupReplicaBin(nodeId: uint32(n), replicaType: rtVoter))
     let groupRec = GroupRecord(
-      groupId: testGid.uint64,
+      groupId: groupIDToULID(testGid),
       replicas: replicasSeq,
       preferredLeader: 3,
     )

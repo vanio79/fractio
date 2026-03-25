@@ -366,7 +366,7 @@ proc getSpaceGroupIds(nodes: seq[TestNode]): seq[GroupID] =
         let gid = if data.len > 0 and data[0] != '{':
           # Binary format
           let rec = decodeGroupRecord(data)
-          GroupID(rec.groupId)
+          groupIDFromULID(rec.groupId)
         else:
           # Legacy JSON format - shouldn't happen with new code
           continue
@@ -397,7 +397,7 @@ proc waitForSpaceLeaders(nodes: seq[TestNode]) =
         let gid = if data.len > 0 and data[0] != '{':
           # Binary format
           let rec = decodeGroupRecord(data)
-          GroupID(rec.groupId)
+          groupIDFromULID(rec.groupId)
         else:
           # Legacy JSON format
           continue
@@ -508,7 +508,7 @@ proc ensureStateMachinesForGroups(nodes: seq[TestNode]) =
             discard
         if data.len > 0 and (data[0] != '{' or data.len > 2):
           let rec = decodeGroupRecord(data)
-          let gid = GroupID(rec.groupId)
+          let gid = groupIDFromULID(rec.groupId)
           # Skip META and DATA_GROUP_START
           if gid == META_GROUP_ID or gid == DATA_GROUP_START_ID:
             continue
@@ -544,7 +544,7 @@ proc waitForAllGroupsReady(nodes: seq[TestNode], timeoutMs: int = 10000) =
               discard
           if data.len > 0 and (data[0] != '{' or data.len > 2):
             let rec = decodeGroupRecord(data)
-            let gid = GroupID(rec.groupId)
+            let gid = groupIDFromULID(rec.groupId)
             if gid == META_GROUP_ID or gid == DATA_GROUP_START_ID:
               continue
             # Check if coordinator has this group
