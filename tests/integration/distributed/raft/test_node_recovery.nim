@@ -5,8 +5,9 @@
 import std/[unittest, random, times, options, atomics]
 
 import fractio/distributed/raft/group_types
-import fractio.distributed.raft.multigroup_types
-import fractio.distributed.meta.types
+import fractio/distributed/raft/multigroup_types
+import fractio/distributed/meta/types
+import fractio/distributed/meta/system_tables
 
 type NodeRecoveryStats* = object of RootObj
   crashesSimulated: int64
@@ -23,14 +24,14 @@ suite "NodeRecovery":
     # Simulate a node with 10 ranges
     for i in 0..9:
       let desc = newGroupDescriptor(
-        GroupID(i)
+        groupIDFromInt(i)
       )
       discard desc.addReplica(NodeID(1))
       discard desc.addReplica(NodeID(2))
       discard desc.addReplica(NodeID(3))
 
       let group = newRaftGroup(
-        GroupID(i),
+        groupIDFromInt(i),
         NodeID(1),
         ReplicaID(1),
         desc
@@ -101,14 +102,14 @@ suite "NodeRecovery":
     # Create 5 groups
     for i in 0..4:
       let desc = newGroupDescriptor(
-        GroupID(i)
+        groupIDFromInt(i)
       )
       discard desc.addReplica(NodeID(1))
       discard desc.addReplica(NodeID(2))
       discard desc.addReplica(NodeID(3))
 
       let group = newRaftGroup(
-        GroupID(i),
+        groupIDFromInt(i),
         NodeID(1),
         ReplicaID(1),
         desc
@@ -254,14 +255,14 @@ suite "NodeRecovery":
     # Create 3 groups representing 3 nodes in a cluster
     for i in 0..2:
       let desc = newGroupDescriptor(
-        GroupID(i)
+        groupIDFromInt(i)
       )
       discard desc.addReplica(NodeID(1))
       discard desc.addReplica(NodeID(2))
       discard desc.addReplica(NodeID(3))
 
       let group = newRaftGroup(
-        GroupID(i),
+        groupIDFromInt(i),
         NodeID(i + 1),
         ReplicaID(i + 1),
         desc
@@ -313,13 +314,13 @@ suite "NodeRecovery":
     # Simulate various recovery scenarios
     for i in 0..9:
       let desc = newGroupDescriptor(
-        GroupID(i)
+        groupIDFromInt(i)
       )
       discard desc.addReplica(NodeID(1))
       discard desc.addReplica(NodeID(2))
 
       let group = newRaftGroup(
-        GroupID(i),
+        groupIDFromInt(i),
         NodeID(1),
         ReplicaID(1),
         desc
