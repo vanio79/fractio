@@ -51,6 +51,21 @@ import ../utils/logging
 proc toNodeID*(id: uint32): rangeTypes.NodeID {.inline.} = rangeTypes.NodeID(id)
 
 # ---------------------------------------------------------------------------
+# ULID derivation helper for deterministic group IDs
+# ---------------------------------------------------------------------------
+
+proc deriveULID(base: ULID, index: int): ULID =
+  ## Derive a deterministic ULID from a base ULID and an index.
+  ## This ensures groups created for a space have predictable, collision-free ports.
+  ## The port hash is based on the ULID bytes, so we use the last 8 bytes for the index
+  ## to get distinct port offsets (0-999) for different indices.
+  result = base
+  # XOR the index into the last 8 bytes to create distinct but deterministic IDs
+  let idxBytes = cast[array[8, uint8]](uint64(index))
+  for i in 0 ..< 8:
+    result.data[8 + i] = result.data[8 + i] xor idxBytes[i]
+
+# ---------------------------------------------------------------------------
 # Error type
 # ---------------------------------------------------------------------------
 
@@ -2577,7 +2592,9 @@ proc rebalanceSpaces*(store: RaftKVStoreExt) {.raises: [].} =
         var newGroupIds: seq[GroupID] = @[]
         let coord = store.coordinator
         for g in 0 ..< nodeCount:
-          let groupId = genGroupID()
+          # Use deterministic ULID derived from spaceId + group index
+          # This ensures predictable port assignment and avoids collisions
+          let groupId = groupIDFromULID(deriveULID(spaceId, g))
           newGroupIds.add(groupId)
 
           var members: seq[int] = @[]

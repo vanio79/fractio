@@ -77,10 +77,13 @@ proc createMultiGroupTestStore(testDir: string,
   # Data group - use the well-known DATA_GROUP_START_ID constant
   doAssert coord.createAndStartGroup(DATA_GROUP_START_ID, members)
 
-  # Space groups (generate ULIDs for test groups)
+  # Space groups (use deterministic GroupIDs to avoid port collisions)
+  # META_GROUP_ID hashes to port offset 1, DATA_GROUP_START_ID hashes to 2.
+  # Use groupIDFromInt with values 10, 20, 30, etc. to get distinct port offsets.
   var groupIds: seq[GroupID] = @[]
   for i in 0 ..< groupCount:
-    let gid = genGroupID()
+    # Use multiples of 10 starting at 10 for deterministic, collision-free ports
+    let gid = groupIDFromInt(int64(10 + i * 10))
     groupIds.add(gid)
     doAssert coord.createAndStartGroup(gid, members)
 

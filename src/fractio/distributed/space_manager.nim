@@ -99,6 +99,17 @@ proc safeFmt(fmtStr: string, args: varargs[string, `$`]): string {.raises: [].} 
   except CatchableError:
     result = fmtStr
 
+proc deriveULID(base: ULID, index: int): ULID =
+  ## Derive a deterministic ULID from a base ULID and an index.
+  ## This ensures groups created for a space have predictable, collision-free ports.
+  ## The port hash is based on the ULID bytes, so we use the last 8 bytes for the index
+  ## to get distinct port offsets (0-999) for different indices.
+  result = base
+  # XOR the index into the last 8 bytes to create distinct but deterministic IDs
+  let idxBytes = cast[array[8, uint8]](uint64(index))
+  for i in 0 ..< 8:
+    result.data[8 + i] = result.data[8 + i] xor idxBytes[i]
+
 proc isMetaLeader(sm: SpaceManager): bool =
   ## Check if this node is the leader of the META group.
   sm.coord.isLeader(META_GROUP_ID)
@@ -180,8 +191,9 @@ proc computeGroupPlacement(nodeIds: seq[uint32], replicas: int,
   result = newSeqOfCap[GroupRecord](groupCount)
 
   for g in 0 ..< groupCount:
-    # Generate a new ULID for each group (cast to gcsafe since ulid library isn't gcsafe)
-    let groupId = ({.cast(gcsafe).}: genULID())
+    # Use deterministic ULID derived from spaceId + group index
+    # This ensures predictable port assignment and avoids collisions
+    let groupId = deriveULID(spaceId, g)
 
     # Compute members using ring algorithm
     var members: seq[GroupReplicaBin] = @[]
