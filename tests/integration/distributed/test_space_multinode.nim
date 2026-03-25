@@ -23,6 +23,7 @@ import fractio/client/sql_client
 import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/group_types as rangeTypes
+import fractio/core/types as coreTypes
 import fractio/distributed/meta/system_tables
 import fractio/distributed/meta/system_schemas
 import fractio/protocol/raft_store
@@ -111,7 +112,7 @@ proc makeNode(nodeNum: int, basePort: int,
         success = true
         break
       sleep(TEST_RETRY_BACKOFF_MS)
-    doAssert success, "failed to create group " & $gid.uint64
+    doAssert success, "failed to create group " & $gid
 
   let store = newRaftKVStoreExt(coord, proposeTimeoutMs = 6000)
   store.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
@@ -247,14 +248,15 @@ proc seedSysGroups(nodes: seq[TestNode], nodeNums: seq[int],
         sleep(TEST_POLL_INTERVAL_MS)
         continue
 
-      let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
+      let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid)
       var replicasSeq: seq[GroupReplicaBin] = @[]
       for num in nodeNums:
         replicasSeq.add(GroupReplicaBin(nodeId: uint32(num),
             replicaType: rtVoter))
       let groupRec = GroupRecord(
-        groupId: gid.uint64,
-        spaceId: if gid == META_GROUP_ID: 0 else: 1,
+        groupId: groupIDToULID(gid),
+        spaceId: if gid == META_GROUP_ID: coreTypes.ZeroULID(
+            ) else: coreTypes.genULID(),
         leader: uint32(nodeNums[0]),
         replicas: replicasSeq,
       )
@@ -311,7 +313,7 @@ proc seedDefaults(nodes: seq[TestNode], maxRetries: int = TEST_MAX_RETRY_ATTEMPT
   false
 
 proc waitForAutoDistribution(nodes: seq[TestNode], expectedGroupIds: seq[
-    uint64], replicaCount: int, maxWaitMs: int = 2000) =
+    GroupID], replicaCount: int, maxWaitMs: int = 2000) =
   ## Wait for the onGroupMetadataApplied callback to create space groups on
   ## all peer nodes. Polls until the expected total membership count is reached
   ## or the timeout expires.
@@ -326,7 +328,7 @@ proc waitForAutoDistribution(nodes: seq[TestNode], expectedGroupIds: seq[
     var totalMemberships = 0
     for node in nodes:
       for gid in expectedGroupIds:
-        if node.coord.hasGroup(GroupID(gid)):
+        if node.coord.hasGroup(gid):
           inc totalMemberships
     if totalMemberships >= expectedTotal:
       break
@@ -360,7 +362,7 @@ proc waitForSpaceLeaders(nodes: seq[TestNode]) =
         else:
           # Legacy JSON format
           let j = parseJson(data)
-          GroupID(uint64(j["groupId"].getInt()))
+          groupIDFromInt(j["groupId"].getInt())
         if gid == META_GROUP_ID or gid == DATA_GROUP_START_ID: continue
         # Wait for this group to have a leader
         for attempt in 0 ..< 50:
@@ -376,7 +378,8 @@ proc waitForSpaceLeaders(nodes: seq[TestNode]) =
 proc distributeSpaceGroups(nodes: seq[TestNode], replicaCount: int = 3) =
   ## After CREATE SPACE on the leader: wait for the onGroupMetadataApplied
   ## callback to create space groups on peer nodes, then wait for leaders.
-  waitForAutoDistribution(nodes, @[3'u64, 4, 5, 6, 7], replicaCount)
+  waitForAutoDistribution(nodes, @[groupIDFromInt(3), groupIDFromInt(4),
+      groupIDFromInt(5), groupIDFromInt(6), groupIDFromInt(7)], replicaCount)
   waitForSpaceLeaders(nodes)
 
 # Forward declarations
@@ -535,8 +538,9 @@ suite "Space multinode — CREATE SPACE creates real Raft groups":
 
     # With RF=3, the leader (node 1) has groups it's a member of.
     var leaderGroupCount = 0
-    for gid in 3'u64 .. 7'u64:
-      if nodes[0].coord.hasGroup(GroupID(gid)):
+    for i in 3'u64 .. 7'u64:
+      let gid = groupIDFromInt(i)
+      if nodes[0].coord.hasGroup(gid):
         inc leaderGroupCount
     check leaderGroupCount >= 3
 
@@ -547,12 +551,14 @@ suite "Space multinode — CREATE SPACE creates real Raft groups":
     discard execWithRetry(nodes,
         "CREATE SPACE testspace WITH REPLICAS = 3")
 
-    waitForAutoDistribution(nodes, @[3'u64, 4, 5, 6, 7], 3)
+    waitForAutoDistribution(nodes, @[groupIDFromInt(3), groupIDFromInt(4),
+        groupIDFromInt(5), groupIDFromInt(6), groupIDFromInt(7)], 3)
 
     var totalMemberships = 0
     for i in 0 ..< 5:
-      for gid in 3'u64 .. 7'u64:
-        if nodes[i].coord.hasGroup(GroupID(gid)):
+      for gidInt in 3'u64 .. 7'u64:
+        let gid = groupIDFromInt(gidInt)
+        if nodes[i].coord.hasGroup(gid):
           inc totalMemberships
     check totalMemberships == 15
 

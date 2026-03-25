@@ -148,6 +148,17 @@ proc genGroupID*(): GroupID =
   ## Generate a new unique GroupID using ULID
   GroupID(genULID())
 
+proc groupIDFromInt*(n: int64 | uint64): GroupID =
+  ## Create a deterministic GroupID from an integer.
+  ## This embeds the integer in the ULID bytes for testing purposes.
+  ## NOT for production use - use genGroupID() instead.
+  var ulid: ULID
+  # Embed the integer in the last 8 bytes, first 8 bytes are zero
+  let val = uint64(n)
+  for i in 0..<8:
+    ulid.data[i + 8] = uint8((val shr (i * 8)) and 0xFF)
+  result = GroupID(ulid)
+
 proc ZeroGroupID*(): GroupID =
   ## Return a zero/null GroupID (all bytes = 0)
   ## Used as a sentinel value to indicate "no group specified"

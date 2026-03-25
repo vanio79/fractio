@@ -16,6 +16,7 @@ import std/[unittest, os, options, json, strutils, tables]
 import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/group_types as rangeTypes
+import fractio/core/types as coreTypes
 import fractio/distributed/meta/system_tables
 import fractio/distributed/meta/system_schemas
 import fractio/protocol/raft_store
@@ -81,14 +82,14 @@ proc makeCluster3(): seq[TestNode] =
 
     # Create space groups
     for i in 0 ..< NODE_COUNT:
-      let gid = GroupID(SPACE_GROUP_START + uint64(i))
+      let gid = groupIDFromInt(SPACE_GROUP_START + uint64(i))
       doAssert coord.createAndStartGroup(gid, members)
 
     let store = newRaftKVStoreExt(coord, proposeTimeoutMs = 6000)
     store.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
 
     for i in 0 ..< NODE_COUNT:
-      discard store.getOrCreateSM(GroupID(SPACE_GROUP_START + uint64(i)))
+      discard store.getOrCreateSM(groupIDFromInt(SPACE_GROUP_START + uint64(i)))
 
     let cPort = nextClientPort
     nextClientPort += 1
@@ -129,7 +130,7 @@ proc makeCluster3(): seq[TestNode] =
   for attempt in 0 ..< 50:
     var allLeaders = true
     for i in 0 ..< NODE_COUNT:
-      let gid = GroupID(SPACE_GROUP_START + uint64(i))
+      let gid = groupIDFromInt(SPACE_GROUP_START + uint64(i))
       var hasLeader = false
       for n in nodes:
         if n.coord.isLeader(gid):
@@ -164,18 +165,18 @@ proc makeCluster3(): seq[TestNode] =
   # Seed sys.groups
   let allNums = @[1, 2, 3]
   for gid in [META_GROUP_ID, DATA_GROUP_START_ID]:
-    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
+    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid)
     var replicas: seq[GroupReplicaBin] = @[]
     for num in allNums:
       replicas.add(GroupReplicaBin(nodeId: uint32(num), replicaType: rtVoter))
     let groupRec = GroupRecord(
-      groupId: gid.uint64,
+      groupId: groupIDToULID(gid),
       replicas: replicas,
     )
     discard nodes[leaderIdx].store.raftPut(key, groupRec.encode())
 
   for i in 0 ..< NODE_COUNT:
-    let gid = SPACE_GROUP_START + uint64(i)
+    let gid = groupIDFromInt(SPACE_GROUP_START + uint64(i))
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid)
     var replicas: seq[GroupReplicaBin] = @[]
     for num in allNums:
@@ -183,18 +184,19 @@ proc makeCluster3(): seq[TestNode] =
     # Find who is leader for this group
     var leaderNodeId = 1'u32
     for n in nodes:
-      if n.coord.isLeader(GroupID(gid)):
+      if n.coord.isLeader(gid):
         leaderNodeId = uint32(n.id)
         break
     let groupRec = GroupRecord(
-      groupId: gid,
+      groupId: groupIDToULID(gid),
+      spaceId: coreTypes.ZeroULID(),
       replicas: replicas,
       leader: leaderNodeId,
     )
     discard nodes[leaderIdx].store.raftPut(key, groupRec.encode())
 
   for i in 0 ..< NODE_COUNT:
-    let gid = SPACE_GROUP_START + uint64(i)
+    let gid = groupIDFromInt(SPACE_GROUP_START + uint64(i))
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid)
     var replicasSeq: seq[GroupReplicaBin] = @[]
     for num in allNums:
@@ -203,23 +205,24 @@ proc makeCluster3(): seq[TestNode] =
     # Find who is leader for this group
     var leaderNodeId = 1
     for n in nodes:
-      if n.coord.isLeader(GroupID(gid)):
+      if n.coord.isLeader(gid):
         leaderNodeId = n.id
         break
     let groupRec = GroupRecord(
-      groupId: gid,
+      groupId: groupIDToULID(gid),
+      spaceId: coreTypes.ZeroULID(),
       replicas: replicasSeq,
       leader: uint32(leaderNodeId),
     )
     discard nodes[leaderIdx].store.raftPut(key, groupRec.encode())
 
   # Seed space and table
-  var spaceGroupIds: seq[uint64] = @[]
+  var spaceGroupIds: seq[ULID] = @[]
   for i in 0 ..< NODE_COUNT:
-    spaceGroupIds.add(SPACE_GROUP_START + uint64(i))
-  let spaceKey = encodeSpaceKey(2)
+    spaceGroupIds.add(groupIDToULID(groupIDFromInt(SPACE_GROUP_START + uint64(i))))
+  let spaceKey = encodeSpaceKey(coreTypes.genULID())
   let spaceRec = SpaceRecord(
-    spaceId: 2,
+    spaceId: coreTypes.ZeroULID(),
     name: "space_2",
     replicas: int32(NODE_COUNT),
     groupCount: int32(NODE_COUNT),
@@ -233,7 +236,7 @@ proc makeCluster3(): seq[TestNode] =
     name: "t100",
     schema: "public",
     database: "default",
-    spaceId: 2,
+    spaceId: coreTypes.ZeroULID(),
   )
   discard nodes[leaderIdx].store.raftPut(tableKey, tableRec.encode())
 
@@ -254,9 +257,13 @@ proc stopCluster(nodes: seq[TestNode]) =
     cleanDir(nodes[i].storagePath)
 
 proc spaceInfo(): SpaceInfo =
-  let groupIds = @[SPACE_GROUP_START, SPACE_GROUP_START + 1, SPACE_GROUP_START + 2]
+  let groupIds = @[
+    groupIDFromInt(SPACE_GROUP_START),
+    groupIDFromInt(SPACE_GROUP_START + 1),
+    groupIDFromInt(SPACE_GROUP_START + 2)
+  ]
   SpaceInfo(
-    spaceId: 2,
+    spaceId: coreTypes.ZeroULID(),
     name: "space_2",
     replicas: NODE_COUNT,
     groupIds: groupIds,
@@ -265,12 +272,12 @@ proc spaceInfo(): SpaceInfo =
 proc findKeyForNode(nodes: seq[TestNode], targetGroupIdx: int,
     space: SpaceInfo): string =
   ## Find a bare PK that routes to the group at targetGroupIdx in the space.
-  let targetGid = GroupID(SPACE_GROUP_START + uint64(targetGroupIdx))
+  let targetGid = groupIDFromInt(SPACE_GROUP_START + uint64(targetGroupIdx))
   for i in 0 ..< 1000:
     let pk = "k" & $i
     if routeToGroup(pk, space.groupIds) == targetGid:
       return pk
-  doAssert false, "could not find key routing to group " & $targetGid.uint64
+  doAssert false, "could not find key routing to group " & $targetGid
   ""
 
 proc findLeaderNodeIdx(nodes: seq[TestNode], gid: GroupID): int =
@@ -309,7 +316,7 @@ suite "Multi-node — resolveGroupId consistency with raftPutInSpace":
 
     # Find keys for each group and write from the owning leader
     for groupIdx in 0 ..< NODE_COUNT:
-      let gid = GroupID(SPACE_GROUP_START + uint64(groupIdx))
+      let gid = groupIDFromInt(SPACE_GROUP_START + uint64(groupIdx))
       let leaderIdx = findLeaderNodeIdx(nodes, gid)
       if leaderIdx < 0: continue
 
@@ -330,7 +337,7 @@ suite "Multi-node — resolveGroupId consistency with raftPutInSpace":
     let space = spaceInfo()
 
     for groupIdx in 0 ..< NODE_COUNT:
-      let gid = GroupID(SPACE_GROUP_START + uint64(groupIdx))
+      let gid = groupIDFromInt(SPACE_GROUP_START + uint64(groupIdx))
       let leaderIdx = findLeaderNodeIdx(nodes, gid)
       if leaderIdx < 0: continue
 
@@ -359,7 +366,7 @@ suite "Multi-node — peer store forwarding for space-routed keys":
 
     # Find a key owned by a specific group and try writing from a non-leader
     let pk = findKeyForNode(nodes, 1, space)
-    let gid = GroupID(SPACE_GROUP_START + 1)
+    let gid = groupIDFromInt(SPACE_GROUP_START + 1)
     let leaderIdx = findLeaderNodeIdx(nodes, gid)
     let nonLeaderIdx = if leaderIdx == 0: 1 else: 0
     # Only test if leaderIdx != nonLeaderIdx (non-leader tries to write)
@@ -379,7 +386,7 @@ suite "Multi-node — peer store forwarding for space-routed keys":
     let space = spaceInfo()
 
     let pk = findKeyForNode(nodes, 1, space)
-    let gid = GroupID(SPACE_GROUP_START + 1)
+    let gid = groupIDFromInt(SPACE_GROUP_START + 1)
     let leaderIdx = findLeaderNodeIdx(nodes, gid)
     if leaderIdx >= 0:
       let key = encodeDataRowKey(100, pk)
@@ -398,7 +405,7 @@ suite "Multi-node — peer store forwarding for space-routed keys":
 
     let space = spaceInfo()
     let pk = findKeyForNode(nodes, 2, space)
-    let gid = GroupID(SPACE_GROUP_START + 2)
+    let gid = groupIDFromInt(SPACE_GROUP_START + 2)
     let leaderIdx = findLeaderNodeIdx(nodes, gid)
     if leaderIdx >= 0:
       let nonLeaderIdx = if leaderIdx == 0: 1 else: 0
@@ -425,7 +432,7 @@ suite "Multi-node — peer store forwarding for space-routed keys":
 
     let space = spaceInfo()
     let pk = findKeyForNode(nodes, 2, space)
-    let gid = GroupID(SPACE_GROUP_START + 2)
+    let gid = groupIDFromInt(SPACE_GROUP_START + 2)
     let leaderIdx = findLeaderNodeIdx(nodes, gid)
     if leaderIdx >= 0:
       let nonLeaderIdx = if leaderIdx == 0: 1 else: 0
@@ -448,7 +455,7 @@ suite "Multi-node — peer store forwarding for space-routed keys":
 
     let space = spaceInfo()
     let pk = findKeyForNode(nodes, 1, space)
-    let gid = GroupID(SPACE_GROUP_START + 1)
+    let gid = groupIDFromInt(SPACE_GROUP_START + 1)
     let leaderIdx = findLeaderNodeIdx(nodes, gid)
     if leaderIdx >= 0:
       let nonLeaderIdx = if leaderIdx == 0: 1 else: 0
@@ -483,7 +490,7 @@ suite "Multi-node — routing validation for group-routed requests":
     let key = encodeDataRowKey(100, pk)
 
     # Find leader for group 11 (wrong group for this key)
-    let wrongGid = GroupID(SPACE_GROUP_START + 1)
+    let wrongGid = groupIDFromInt(SPACE_GROUP_START + 1)
     let leaderIdx = findLeaderNodeIdx(nodes, wrongGid)
     if leaderIdx >= 0:
       # Try to put it in group 11 (wrong group) — should fail with rseBadRouting
@@ -499,7 +506,7 @@ suite "Multi-node — routing validation for group-routed requests":
     let pk = findKeyForNode(nodes, 0, space)
     let key = encodeDataRowKey(100, pk)
 
-    let wrongGid = GroupID(SPACE_GROUP_START + 1)
+    let wrongGid = groupIDFromInt(SPACE_GROUP_START + 1)
     let leaderIdx = findLeaderNodeIdx(nodes, wrongGid)
     if leaderIdx >= 0:
       # Try to delete from group 11 (wrong group) — should fail with rseBadRouting
@@ -515,7 +522,7 @@ suite "Multi-node — routing validation for group-routed requests":
     let pk = findKeyForNode(nodes, 0, space)
     let key = encodeDataRowKey(100, pk)
 
-    let wrongGid = GroupID(SPACE_GROUP_START + 1)
+    let wrongGid = groupIDFromInt(SPACE_GROUP_START + 1)
     let leaderIdx = findLeaderNodeIdx(nodes, wrongGid)
     if leaderIdx >= 0:
       # Try to get from group 11 (wrong group) — should fail with rseBadRouting

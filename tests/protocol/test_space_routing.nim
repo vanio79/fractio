@@ -8,11 +8,12 @@
 # space-aware routing through hash(primaryKey) mod numGroups.
 
 import std/[unittest, os, options, tables, algorithm, hashes, json, strutils, locks,
-            sequtils]
+            sequtils, sets]
 import fractio/protocol/raft_store
 import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/group_types as rangeTypes
+import fractio/core/types as coreTypes
 import fractio/distributed/meta/system_tables
 import fractio/distributed/meta/system_schemas
 import fractio/storage/wisckey_backend
@@ -37,7 +38,7 @@ proc makeMultiGroupStore(storagePath: string, groupCount: int): tuple[
   ## Create a store with `groupCount` Raft groups (ranges 10..10+N-1).
   ## Returns a SpaceInfo whose groupIds point to those groups.
   cleanDir(storagePath)
-  let nodeId = NodeID(1)
+  let nodeId = rangeTypes.NodeID(1)
   let basePort = nextBasePort()
   let members = @[(nodeId: 1'u32, host: "127.0.0.1", basePort: basePort)]
 
@@ -56,14 +57,14 @@ proc makeMultiGroupStore(storagePath: string, groupCount: int): tuple[
   doAssert coord.createAndStartGroup(META_GROUP_ID, members)
 
   # Create N space groups starting at groupId 10
-  var groupIds: seq[uint64] = @[]
+  var groupIds: seq[GroupID] = @[]
   for i in 0 ..< groupCount:
-    let rid = GroupID(uint64(10 + i))
-    groupIds.add(rid.uint64)
+    let rid = groupIDFromInt(10 + i)
+    groupIds.add(rid)
     doAssert coord.createAndStartGroup(rid, members)
 
   # Wait for all groups to elect leaders
-  let allGroupIds = @[META_GROUP_ID] & groupIds.mapIt(GroupID(it))
+  let allGroupIds = @[META_GROUP_ID] & groupIds
   for attempt in 0 ..< 50:
     var allLeaders = true
     for gid in allGroupIds:
@@ -76,14 +77,14 @@ proc makeMultiGroupStore(storagePath: string, groupCount: int): tuple[
 
   let store = newRaftKVStoreExt(coord, proposeTimeoutMs = 2000)
   # Bootstrap meta range for system key routing
-  store.bootstrapStore(@[META_GROUP_ID, GroupID(10)])
+  store.bootstrapStore(@[META_GROUP_ID, groupIDFromInt(10)])
 
   # Pre-create state machines for all space groups
-  for rid64 in groupIds:
-    discard store.getOrCreateSM(GroupID(rid64))
+  for gid in groupIds:
+    discard store.getOrCreateSM(gid)
 
   let space = SpaceInfo(
-    spaceId: 2,
+    spaceId: coreTypes.ZeroULID(),
     name: "test_space",
     replicas: 1,
     groupIds: groupIds,
@@ -101,21 +102,21 @@ proc teardown(coord: NuRaftCoordinator, storagePath: string) =
 
 suite "Space routing — routeToGroup":
   test "single group always returns that group":
-    let groupIds = @[42'u64]
+    let groupIds = @[groupIDFromInt(42)]
     for pk in @["a", "b", "c", "key123", "999"]:
-      check routeToGroup(pk, groupIds) == GroupID(42)
+      check routeToGroup(pk, groupIds) == groupIDFromInt(42)
 
   test "empty groupIds returns META_GROUP_ID":
     check routeToGroup("anything", @[]) == META_GROUP_ID
 
   test "multiple groups distribute keys":
-    let groupIds = @[10'u64, 11, 12]
+    let groupIds = @[groupIDFromInt(10), groupIDFromInt(11), groupIDFromInt(12)]
     var buckets: array[3, int]
     # Hash 100 keys and verify they spread across groups
     for i in 0 ..< 100:
       let pk = "key_" & $i
       let rid = routeToGroup(pk, groupIds)
-      let idx = int(rid.uint64) - 10
+      let idx = int(rid.hash mod 3)
       check idx >= 0 and idx < 3
       inc buckets[idx]
     # Each bucket should have at least 1 key (probabilistic but very likely)
@@ -123,7 +124,8 @@ suite "Space routing — routeToGroup":
       check b > 0
 
   test "deterministic routing — same key always same group":
-    let groupIds = @[10'u64, 11, 12, 13]
+    let groupIds = @[groupIDFromInt(10), groupIDFromInt(11), groupIDFromInt(12),
+        groupIDFromInt(13)]
     for pk in @["user_1", "user_2", "order_99"]:
       let r1 = routeToGroup(pk, groupIds)
       let r2 = routeToGroup(pk, groupIds)
@@ -202,15 +204,15 @@ suite "Space routing — put and get with 3 groups":
       check gr.value.isSome
 
     # Check that keys are spread across at least 2 of the 3 groups
-    var groupKeys: array[3, int]
+    var seenGroups: HashSet[int] = initHashSet[int]()
     for i in 0 ..< 30:
       let rid = routeToGroup($i, space.groupIds)
-      let idx = int(rid.uint64) - 10
-      inc groupKeys[idx]
-    var nonEmpty = 0
-    for c in groupKeys:
-      if c > 0: inc nonEmpty
-    check nonEmpty >= 2 # at least 2 groups have data
+      # Find which group index this is
+      for idx, gid in space.groupIds:
+        if gid == rid:
+          seenGroups.incl(idx)
+          break
+    check seenGroups.len >= 2 # at least 2 groups have data
 
 # ---------------------------------------------------------------------------
 # Suite: raftDeleteInSpace
@@ -374,18 +376,21 @@ suite "Space routing — fan-out scan with merge-sort":
 
 suite "Space routing — cache loading":
   test "loadSpaces and getSpaceForTable round-trip":
-    let (coord, store, _) = makeMultiGroupStore(
+    let (coord, store, space) = makeMultiGroupStore(
         "/tmp/fractio_sr_t30", 2)
     defer: teardown(coord, "/tmp/fractio_sr_t30")
 
     # Write a space record into the meta range (binary format)
-    let spaceKey = encodeSpaceKey(5)
+    let spaceKey = encodeSpaceKey(coreTypes.genULID())
+    var groupUlids: seq[ULID] = @[]
+    for gid in space.groupIds:
+      groupUlids.add(groupIDToULID(gid))
     let spaceRec = SpaceRecord(
-      spaceId: 5,
+      spaceId: coreTypes.genULID(),
       name: "myspace",
       replicas: 1,
       groupCount: 2,
-      groupIds: @[10'u64, 11'u64],
+      groupIds: groupUlids,
       oldGroupIds: @[],
       rebalancing: false,
       rebalanceWorker: 0,
@@ -402,7 +407,7 @@ suite "Space routing — cache loading":
       name: "mytable",
       database: "default",
       schema: "public",
-      spaceId: 5,
+      spaceId: coreTypes.genULID(),
       primaryKey: @[],
       columns: @[]
     )
