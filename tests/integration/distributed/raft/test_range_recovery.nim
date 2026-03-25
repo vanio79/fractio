@@ -5,8 +5,9 @@
 import std/[unittest, random, times, options, atomics]
 
 import fractio/distributed/raft/group_types
-import fractio.distributed.raft.multigroup_types
-import fractio.distributed.meta.types
+import fractio/distributed/raft/multigroup_types
+import fractio/distributed/meta/types
+import fractio/distributed/meta/system_tables
 
 type RangeRecoveryStats* = object of RootObj
   rangesTested: int64
@@ -22,14 +23,14 @@ suite "RangeRecovery":
 
     for i in 0..7:
       let desc = newGroupDescriptor(
-        GroupID(i)
+        groupIDFromInt(i)
       )
       discard desc.addReplica(NodeID(1))
       discard desc.addReplica(NodeID(2))
       discard desc.addReplica(NodeID(3))
 
       let group = newRaftGroup(
-        GroupID(i),
+        groupIDFromInt(i),
         NodeID(1),
         ReplicaID(1),
         desc
@@ -100,14 +101,14 @@ suite "RangeRecovery":
 
     for i in 0..3:
       let desc = newGroupDescriptor(
-        GroupID(i)
+        groupIDFromInt(i)
       )
       discard desc.addReplica(NodeID(1))
       discard desc.addReplica(NodeID(2))
       discard desc.addReplica(NodeID(3))
 
       let group = newRaftGroup(
-        GroupID(i),
+        groupIDFromInt(i),
         NodeID(1),
         ReplicaID(1),
         desc
@@ -165,13 +166,13 @@ suite "RangeRecovery":
     # Create groups with different configurations
     for i in 0..5:
       let desc = newGroupDescriptor(
-        GroupID(i)
+        groupIDFromInt(i)
       )
       discard desc.addReplica(NodeID(1))
       discard desc.addReplica(NodeID(2))
 
       let group = newRaftGroup(
-        GroupID(i),
+        groupIDFromInt(i),
         NodeID(1),
         ReplicaID(1),
         desc
@@ -214,13 +215,13 @@ suite "RangeRecovery":
       stats.rangesTested.inc
 
       let desc = newGroupDescriptor(
-        GroupID(i)
+        groupIDFromInt(i)
       )
       discard desc.addReplica(NodeID(1))
       discard desc.addReplica(NodeID(2))
 
       let group = newRaftGroup(
-        GroupID(i),
+        groupIDFromInt(i),
         NodeID(1),
         ReplicaID(1),
         desc
@@ -244,14 +245,14 @@ suite "RangeRecovery":
 
     for i in 0..7:
       let desc = newGroupDescriptor(
-        GroupID(i)
+        groupIDFromInt(i)
       )
       discard desc.addReplica(NodeID(1))
       discard desc.addReplica(NodeID(2))
       discard desc.addReplica(NodeID(3))
 
       let group = newRaftGroup(
-        GroupID(i),
+        groupIDFromInt(i),
         NodeID(1),
         ReplicaID(1),
         desc
