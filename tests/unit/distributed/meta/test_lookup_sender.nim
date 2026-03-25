@@ -12,6 +12,7 @@ import std/strutils
 
 import fractio/distributed/raft/group_types
 import fractio/distributed/meta/types
+import fractio/distributed/meta/system_tables
 import fractio/distributed/meta/lookup
 import fractio/distributed/sender
 

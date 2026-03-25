@@ -6,6 +6,7 @@
 # Port range: 20700-20729
 
 import std/[unittest, os, options, strutils, json, random, times]
+import fractio/core/types except NodeID
 import fractio/protocol/raft_store
 import fractio/protocol/mvcc_store
 import fractio/protocol/txn_manager
@@ -77,18 +78,19 @@ proc makeTestEnv(suiteName: string): tuple[
     clientPort: clientPort.uint16, status: nsAlive
   )
   let metaGroupRec = GroupRecord(
-    groupId: 1, spaceId: 0, leader: 1,
+    groupId: groupIDToULID(META_GROUP_ID), spaceId: ZeroULID(), leader: 1,
     replicas: @[GroupReplicaBin(nodeId: 1, replicaType: rtVoter)]
   )
   let dataGroupRec = GroupRecord(
-    groupId: 2, spaceId: 1, leader: 1,
+    groupId: groupIDToULID(DATA_GROUP_START_ID), spaceId: ZeroULID(), leader: 1,
     replicas: @[GroupReplicaBin(nodeId: 1, replicaType: rtVoter)]
   )
   discard raftStore.sysTablePutBatch(@[
     (key: encodeTableKey(SYS_NODES_TABLE_ID, "1"), value: encode(nodeRec)),
-    (key: encodeTableKey(SYS_GROUPS_TABLE_ID, "1"), value: encode(
+    (key: encodeTableKey(SYS_GROUPS_TABLE_ID, $META_GROUP_ID), value: encode(
         metaGroupRec)),
-    (key: encodeTableKey(SYS_GROUPS_TABLE_ID, "2"), value: encode(dataGroupRec))
+    (key: encodeTableKey(SYS_GROUPS_TABLE_ID, $DATA_GROUP_START_ID),
+        value: encode(dataGroupRec))
   ])
 
   let txnMgr = newTransactionManager()

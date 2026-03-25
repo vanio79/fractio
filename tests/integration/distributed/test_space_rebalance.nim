@@ -11,6 +11,7 @@
 # Temp storage: /tmp/fractio_rebal_<nodeId>/ (cleaned up per test)
 
 import std/[unittest, os, options, json, strutils, tables, locks]
+import fractio/core/types except NodeID
 import fractio/protocol/raft_store
 import fractio/protocol/server
 import fractio/protocol/types
@@ -221,7 +222,7 @@ proc seedSysNodes(leaderStore: RaftKVStoreExt, nodes: seq[TestNode]) =
 proc seedSysGroups(leaderStore: RaftKVStoreExt, nodeNums: seq[int]) =
   let coord = leaderStore.coordinator
   for gid in [META_GROUP_ID, DATA_GROUP_START_ID]:
-    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
+    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(gid))
     var replicas: seq[GroupReplicaBin] = @[]
     for num in nodeNums:
       replicas.add(GroupReplicaBin(nodeId: uint32(num), replicaType: rtVoter))
@@ -233,7 +234,8 @@ proc seedSysGroups(leaderStore: RaftKVStoreExt, nodeNums: seq[int]) =
           leader = uint32(nodeId)
           break
     let groupRec = GroupRecord(
-      groupId: gid.uint64,
+      groupId: groupIDToULID(gid),
+      spaceId: ZeroULID(),
       replicas: replicas,
       leader: leader,
     )
@@ -249,16 +251,16 @@ proc seedDefaults(leaderStore: RaftKVStoreExt) =
         createdAtNs: system_schemas.nowNs()).encode())
   # Seed default space (replicas=0 = ALL, single group = meta group)
   let spaceRec = SpaceRecord(
-    spaceId: 1,
+    spaceId: ZeroULID(),
     name: "default",
     replicas: 0,
     groupCount: 1,
-    groupIds: @[1'u64],
+    groupIds: @[groupIDToULID(META_GROUP_ID)],
   )
-  discard leaderStore.raftPut(encodeSpaceKey(1), spaceRec.encode())
+  discard leaderStore.raftPut(encodeSpaceKey(ZeroULID()), spaceRec.encode())
 
 proc waitForAutoDistribution(nodes: seq[TestNode], expectedGroupIds: seq[
-    uint64], replicaCount: int, maxWaitMs: int = 1500) =
+    GroupID], replicaCount: int, maxWaitMs: int = 1500) =
   # First, wait for all async group creation queues to be empty
   for node in nodes:
     discard node.coord.waitForGroupCreationQueue(maxWaitMs)
@@ -270,7 +272,7 @@ proc waitForAutoDistribution(nodes: seq[TestNode], expectedGroupIds: seq[
     var totalMemberships = 0
     for node in nodes:
       for gid in expectedGroupIds:
-        if node.coord.hasGroup(GroupID(gid)):
+        if node.coord.hasGroup(gid):
           inc totalMemberships
     if totalMemberships >= expectedTotal:
       break
@@ -294,7 +296,7 @@ proc waitForSpaceLeaders(nodes: seq[TestNode]) =
           # Try JSON first
           try:
             let j = parseJson(data)
-            gid = GroupID(uint64(j["groupId"].getInt()))
+            gid = groupIDFromULID(ulidFromString(j["groupId"].getStr()))
             parsed = true
           except:
             discard
@@ -303,7 +305,7 @@ proc waitForSpaceLeaders(nodes: seq[TestNode]) =
           # Try MVCC-aware binary decoding first (handles both MVCC and raw)
           try:
             let (groupRec, _) = decodeGroupRecordFromMVCC(data)
-            gid = GroupID(groupRec.groupId)
+            gid = groupIDFromULID(groupRec.groupId)
             parsed = true
           except:
             discard
@@ -312,7 +314,7 @@ proc waitForSpaceLeaders(nodes: seq[TestNode]) =
           # Fall back to raw binary decoding
           try:
             let groupRec = decodeGroupRecord(data)
-            gid = GroupID(groupRec.groupId)
+            gid = groupIDFromULID(groupRec.groupId)
             parsed = true
           except:
             discard
@@ -354,7 +356,7 @@ proc updateGroupLeaders(nodes: seq[TestNode]) =
         try:
           let (rec, _) = decodeGroupRecordFromMVCC(data)
           groupRec = rec
-          gid = GroupID(groupRec.groupId)
+          gid = groupIDFromULID(groupRec.groupId)
           parsed = true
         except:
           discard
@@ -363,7 +365,7 @@ proc updateGroupLeaders(nodes: seq[TestNode]) =
           # Try raw binary decoding
           try:
             groupRec = decodeGroupRecord(data)
-            gid = GroupID(groupRec.groupId)
+            gid = groupIDFromULID(groupRec.groupId)
             parsed = true
           except:
             discard
@@ -537,7 +539,7 @@ proc stopCluster(nodes: seq[TestNode]) =
   printResourceUsage("stopCluster done")
 
 proc findSpaceId(leaderStore: RaftKVStoreExt,
-    leaderMvccStore: MvccTransactionStore, spaceName: string): int =
+    leaderMvccStore: MvccTransactionStore, spaceName: string): ULID =
   let spacesStart = encodeTableKey(SYS_SPACES_TABLE_ID, "")
   let spacesEnd = encodeTableKey(SYS_SPACES_TABLE_ID + 1, "")
   let sr = leaderMvccStore.latestScan(spacesStart, spacesEnd, 0)
@@ -554,17 +556,17 @@ proc findSpaceId(leaderStore: RaftKVStoreExt,
           # JSON format
           let j = parseJson(v)
           if j["name"].getStr() == spaceName:
-            return j["spaceId"].getInt()
+            return ulidFromString(j["spaceId"].getStr())
       except: discard
   doAssert false, "space '" & spaceName & "' not found"
 
-proc findSpaceGroupIds(leaderStore: RaftKVStoreExt, spaceId: int): seq[uint64] =
+proc findSpaceGroupIds(leaderStore: RaftKVStoreExt, spaceId: ULID): seq[GroupID] =
   leaderStore.loadSpaces()
   acquire(leaderStore.spacesMu)
   result = leaderStore.spaces[spaceId].groupIds
   release(leaderStore.spacesMu)
 
-proc createSpace(leaderNode: TestNode, spaceName: string, replicas: int): int =
+proc createSpace(leaderNode: TestNode, spaceName: string, replicas: int): ULID =
   let csRes = exec(leaderNode,
     "CREATE SPACE " & spaceName & " WITH REPLICAS = " & $replicas)
   doAssert csRes.kind == erkOk, "CREATE SPACE failed: " &
@@ -608,7 +610,7 @@ proc insertRows(nodes: seq[TestNode], spaceName: string, rowCount: int) =
           erkError: insRes.error else: "?")
 
 proc setupSpaceWithData(nodes: seq[TestNode], spaceName: string,
-    replicas: int, rowCount: int): int =
+    replicas: int, rowCount: int): ULID =
   ## Full setup: create space, distribute groups, elect leaders, insert data.
   let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
   doAssert leaderIdx >= 0
@@ -785,7 +787,7 @@ suite "Space rebalance integration — reads during migration":
 # ---------------------------------------------------------------------------
 
 proc triggerRebalanceAndSetup(nodes: var seq[TestNode],
-    leaderStore: RaftKVStoreExt, spaceId: int) =
+    leaderStore: RaftKVStoreExt, spaceId: ULID) =
   addNodeToCluster(nodes, 3)
   leaderStore.rebalanceSpaces()
   sleep(TEST_REPLICATION_WAIT_MS * 2) # Wait for Raft to replicate
@@ -868,7 +870,7 @@ suite "Space rebalance integration — full migration":
       var foundLeader = false
       for attempt in 0 ..< 50:
         for node in nodes:
-          if node.coord.isLeader(GroupID(gid)):
+          if node.coord.isLeader(gid):
             foundLeader = true
             break
         if foundLeader: break
@@ -969,7 +971,7 @@ suite "Space rebalance integration — crash safety":
       var foundLeader = false
       for attempt in 0 ..< 50:
         for node in nodes:
-          if node.coord.isLeader(GroupID(gid)):
+          if node.coord.isLeader(gid):
             foundLeader = true
             break
         if foundLeader: break

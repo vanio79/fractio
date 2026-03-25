@@ -7,6 +7,7 @@ import std/[unittest, random, times, options, atomics, threadpool]
 import fractio/distributed/raft/group_types
 import fractio.distributed.raft.multigroup_types
 import fractio.distributed.meta.types
+import fractio.distributed.meta.system_tables
 
 type StressTestStats* = object of RootObj
   totalOperations: int64
@@ -23,15 +24,14 @@ suite "MultiGroupStress":
 
     # Create many groups rapidly
     for i in 0..99:
-      let desc = newGroupDescriptor(
-        GroupID(i)
-      )
+      let gid = genGroupID()
+      let desc = newGroupDescriptor(gid)
       discard desc.addReplica(NodeID(1))
       discard desc.addReplica(NodeID(2))
       discard desc.addReplica(NodeID(3))
 
       let group = newRaftGroup(
-        GroupID(i),
+        gid,
         NodeID(1),
         ReplicaID(1),
         desc
@@ -57,15 +57,14 @@ suite "MultiGroupStress":
 
     # Create 20 groups
     for i in 0..19:
-      let desc = newGroupDescriptor(
-        GroupID(i)
-      )
+      let gid = genGroupID()
+      let desc = newGroupDescriptor(gid)
       discard desc.addReplica(NodeID(1))
       discard desc.addReplica(NodeID(2))
       discard desc.addReplica(NodeID(3))
 
       let group = newRaftGroup(
-        GroupID(i),
+        gid,
         NodeID(1),
         ReplicaID(1),
         desc
@@ -145,15 +144,14 @@ suite "MultiGroupStress":
 
     # Create 30 groups
     for i in 0..29:
-      let desc = newGroupDescriptor(
-        GroupID(i)
-      )
+      let gid = genGroupID()
+      let desc = newGroupDescriptor(gid)
       discard desc.addReplica(NodeID(1))
       discard desc.addReplica(NodeID(2))
       discard desc.addReplica(NodeID(3))
 
       let group = newRaftGroup(
-        GroupID(i),
+        gid,
         NodeID(1),
         ReplicaID(1),
         desc
@@ -194,15 +192,14 @@ suite "MultiGroupStress":
 
     # Create groups
     for i in 0..9:
-      let desc = newGroupDescriptor(
-        GroupID(i)
-      )
+      let gid = genGroupID()
+      let desc = newGroupDescriptor(gid)
       discard desc.addReplica(NodeID(1))
       discard desc.addReplica(NodeID(2))
       discard desc.addReplica(NodeID(3))
 
       let group = newRaftGroup(
-        GroupID(i),
+        gid,
         NodeID(1),
         ReplicaID(1),
         desc
@@ -256,15 +253,14 @@ suite "MultiGroupStress":
 
     # Create many groups
     for i in 0..NUM_GROUPS - 1:
-      let desc = newGroupDescriptor(
-        GroupID(i)
-      )
+      let gid = genGroupID()
+      let desc = newGroupDescriptor(gid)
       discard desc.addReplica(NodeID(1))
       discard desc.addReplica(NodeID(2))
       discard desc.addReplica(NodeID(3))
 
       let group = newRaftGroup(
-        GroupID(i),
+        gid,
         NodeID(1),
         ReplicaID(1),
         desc

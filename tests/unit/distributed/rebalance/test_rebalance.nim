@@ -10,6 +10,7 @@ import std/unittest
 import std/options
 
 import fractio/distributed/raft/group_types
+import fractio/distributed/meta/system_tables
 import fractio/distributed/rebalance/allocator
 import fractio/distributed/rebalance/scheduler
 
@@ -203,7 +204,8 @@ suite "Allocation Decision":
     check decision.removeTarget == NodeID(2)
 
   test "create transfer lease decision":
-    let decision = newTransferLeaseDecision(META_GROUP_ID, NodeID(1), NodeID(2), 3, "test")
+    let decision = newTransferLeaseDecision(META_GROUP_ID, NodeID(1), NodeID(2),
+        3, "test")
     check decision.kind == adkTransferLease
     check decision.transferGroupId == META_GROUP_ID
     check decision.transferFrom == NodeID(1)
@@ -301,7 +303,8 @@ suite "Rebalance Scheduler":
 
     # Add multiple decisions
     for i in 1..5:
-      let decision = newAddReplicaDecision(GroupID(i), NodeID(2), 10, "test")
+      let gid = genGroupID()
+      let decision = newAddReplicaDecision(gid, NodeID(2), 10, "test")
       discard scheduler.addDecision(decision, 1000)
 
     # Process batch

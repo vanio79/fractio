@@ -91,14 +91,14 @@ proc encodeCreateSpaceResponse*(resp: CreateSpaceResponse): string =
   buf.writeUint8(if resp.success: 0x01'u8 else: 0x00'u8)
 
   if resp.success:
-    # Write 16-byte ULID
-    buf.writeBytes(ulidToBytes(resp.spaceId))
+    # Write 16-byte ULID (no length prefix - fixed size)
+    buf.add(ulidToBytes(resp.spaceId))
     buf.writeInt32BE(resp.groupCount)
     buf.writeBytes32(resp.spaceRecord)
     buf.writeInt32BE(resp.groupRecords.len.int32)
     for gr in resp.groupRecords:
-      # Write 16-byte ULID
-      buf.writeBytes(ulidToBytes(gr.groupId))
+      # Write 16-byte ULID (no length prefix - fixed size)
+      buf.add(ulidToBytes(gr.groupId))
       buf.writeBytes32(gr.record)
   else:
     buf.writeBytes16(resp.error)
@@ -201,12 +201,12 @@ proc encodeDropSpaceResponse*(resp: DropSpaceResponse): string =
   buf.writeUint8(if resp.success: 0x01'u8 else: 0x00'u8)
 
   if resp.success:
-    # Write 16-byte ULID
-    buf.writeBytes(ulidToBytes(resp.spaceId))
+    # Write 16-byte ULID (no length prefix - fixed size)
+    buf.add(ulidToBytes(resp.spaceId))
     buf.writeInt32BE(resp.deletedGroupIds.len.int32)
     for gid in resp.deletedGroupIds:
-      # Write 16-byte ULID
-      buf.writeBytes(ulidToBytes(gid))
+      # Write 16-byte ULID (no length prefix - fixed size)
+      buf.add(ulidToBytes(gid))
   else:
     buf.writeBytes16(resp.error)
   buf
