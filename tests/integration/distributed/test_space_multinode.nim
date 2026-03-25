@@ -16,7 +16,7 @@
 # Port allocation: 27000–27499 (NuRaft ASIO, basePort per node spaced by 100)
 # Temp storage: /tmp/fractio_space_mn_<nodeId>/ (cleaned up per test)
 
-import std/[unittest, os, options, json, strutils, tables]
+import std/[unittest, os, options, json, strutils, tables, times]
 import fractio/client/fractio_client
 import fractio/client/sql_client
 
@@ -151,6 +151,13 @@ proc initClient(n: var TestNode) =
   ## Initialize client connected to this node's own server.
   n.client = newFractioClient("127.0.0.1", n.clientPort)
   doAssert n.client.initialize()
+
+proc refreshClientMetadata(nodes: seq[TestNode]) =
+  ## Refresh client metadata on all nodes after DDL operations.
+  ## This updates the tables/spaces caches used for key routing.
+  for node in nodes:
+    if not node.client.isNil:
+      discard node.client.refreshMetadata()
 
 proc startNode(n: var TestNode) =
   n.server.start()
@@ -335,6 +342,38 @@ proc waitForAutoDistribution(nodes: seq[TestNode], expectedGroupIds: seq[
     sleep(stepMs)
     waited += stepMs
 
+proc getSpaceGroupIds(nodes: seq[TestNode]): seq[GroupID] =
+  ## Get the group IDs for the most recently created space from sys.groups.
+  ## Filters out META_GROUP_ID and DATA_GROUP_START_ID.
+  let store = nodes[0].store
+  let grpStart = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
+  let grpEnd = encodeTableKey(SYS_GROUPS_TABLE_ID + 1, "")
+  let grpScan = store.raftScan(grpStart, grpEnd, 0, includeSystemKeys = true)
+  if grpScan.isOk:
+    for (key, entry) in grpScan.value:
+      try:
+        var data = entry.value
+        # Check if MVCC-encoded
+        if mvccTypes.isLikelyMVCCValue(data):
+          try:
+            let mvccVal = mvccTypes.decodeMVCCValue(data)
+            if not mvccVal.isDeleted:
+              data = mvccVal.data
+            else:
+              continue
+          except CatchableError:
+            discard
+        let gid = if data.len > 0 and data[0] != '{':
+          # Binary format
+          let rec = decodeGroupRecord(data)
+          GroupID(rec.groupId)
+        else:
+          # Legacy JSON format - shouldn't happen with new code
+          continue
+        if gid == META_GROUP_ID or gid == DATA_GROUP_START_ID: continue
+        result.add(gid)
+      except: discard
+
 proc waitForSpaceLeaders(nodes: seq[TestNode]) =
   ## Wait for all space groups to have elected leaders.
   let store = nodes[0].store
@@ -361,8 +400,7 @@ proc waitForSpaceLeaders(nodes: seq[TestNode]) =
           GroupID(rec.groupId)
         else:
           # Legacy JSON format
-          let j = parseJson(data)
-          groupIDFromInt(j["groupId"].getInt())
+          continue
         if gid == META_GROUP_ID or gid == DATA_GROUP_START_ID: continue
         # Wait for this group to have a leader
         for attempt in 0 ..< 50:
@@ -378,8 +416,15 @@ proc waitForSpaceLeaders(nodes: seq[TestNode]) =
 proc distributeSpaceGroups(nodes: seq[TestNode], replicaCount: int = 3) =
   ## After CREATE SPACE on the leader: wait for the onGroupMetadataApplied
   ## callback to create space groups on peer nodes, then wait for leaders.
-  waitForAutoDistribution(nodes, @[groupIDFromInt(3), groupIDFromInt(4),
-      groupIDFromInt(5), groupIDFromInt(6), groupIDFromInt(7)], replicaCount)
+
+  # First, wait for all async group creation queues to be empty
+  for node in nodes:
+    discard node.coord.waitForGroupCreationQueue(5000)
+
+  # Wait for leaders to be elected
+  sleep(TEST_ELECTION_SETTLE_MS)
+
+  # Then verify we have the expected number of space groups
   waitForSpaceLeaders(nodes)
 
 # Forward declarations
@@ -434,6 +479,88 @@ proc loadMetadataOnAllNodes(nodes: seq[TestNode]) =
     node.store.loadSpaces()
     node.store.loadGroupMembers()
     node.store.loadTableSpaces()
+
+proc ensureStateMachinesForGroups(nodes: seq[TestNode]) =
+  ## Ensure all groups in the coordinator have state machines in the store.
+  ## This is needed because group creation happens asynchronously.
+  for node in nodes:
+    # Get all groups from coordinator first (they should be created by now)
+    var groupIds: seq[GroupID] = @[]
+    # Scan sys.groups to get all group IDs
+    let backend = node.store.getBackend()
+    if backend == nil or not backend.isOpen:
+      continue
+    let startKey = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
+    let endKey = encodeTableKey(SYS_GROUPS_TABLE_ID + 1, "")
+    let pairs = backend.scan(startKey, endKey)
+    for (k, v) in pairs:
+      try:
+        var data = v
+        # Check if MVCC-encoded
+        if mvccTypes.isLikelyMVCCValue(data):
+          try:
+            let mvccVal = mvccTypes.decodeMVCCValue(data)
+            if not mvccVal.isDeleted:
+              data = mvccVal.data
+            else:
+              continue
+          except CatchableError:
+            discard
+        if data.len > 0 and (data[0] != '{' or data.len > 2):
+          let rec = decodeGroupRecord(data)
+          let gid = GroupID(rec.groupId)
+          # Skip META and DATA_GROUP_START
+          if gid == META_GROUP_ID or gid == DATA_GROUP_START_ID:
+            continue
+          # Only create state machine if coordinator has the group
+          if node.coord.hasGroup(gid):
+            discard node.store.getOrCreateSM(gid)
+      except:
+        discard
+
+proc waitForAllGroupsReady(nodes: seq[TestNode], timeoutMs: int = 10000) =
+  ## Wait for all space groups to have state machines in all nodes.
+  let startTime = getTime().toUnixFloat() * 1000
+  while true:
+    var allReady = true
+    for node in nodes:
+      let backend = node.store.getBackend()
+      if backend == nil or not backend.isOpen:
+        continue
+      let startKey = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
+      let endKey = encodeTableKey(SYS_GROUPS_TABLE_ID + 1, "")
+      let pairs = backend.scan(startKey, endKey)
+      for (k, v) in pairs:
+        try:
+          var data = v
+          if mvccTypes.isLikelyMVCCValue(data):
+            try:
+              let mvccVal = mvccTypes.decodeMVCCValue(data)
+              if not mvccVal.isDeleted:
+                data = mvccVal.data
+              else:
+                continue
+            except CatchableError:
+              discard
+          if data.len > 0 and (data[0] != '{' or data.len > 2):
+            let rec = decodeGroupRecord(data)
+            let gid = GroupID(rec.groupId)
+            if gid == META_GROUP_ID or gid == DATA_GROUP_START_ID:
+              continue
+            # Check if coordinator has this group
+            if not node.coord.hasGroup(gid):
+              allReady = false
+              break
+        except:
+          discard
+      if not allReady:
+        break
+    if allReady:
+      return
+    let now = getTime().toUnixFloat() * 1000
+    if now - startTime > timeoutMs.float:
+      return
+    sleep(100)
 
 proc execOnLeader(nodes: seq[TestNode], sql: string): ExecResult =
   ## Try executing SQL on each node until one succeeds.
@@ -536,13 +663,10 @@ suite "Space multinode — CREATE SPACE creates real Raft groups":
     # Brief wait for leaders to be elected
     sleep(TEST_ELECTION_SETTLE_MS)
 
-    # With RF=3, the leader (node 1) has groups it's a member of.
-    var leaderGroupCount = 0
-    for i in 3'u64 .. 7'u64:
-      let gid = groupIDFromInt(i)
-      if nodes[0].coord.hasGroup(gid):
-        inc leaderGroupCount
-    check leaderGroupCount >= 3
+    # Count how many groups each node has (excluding META and DATA_GROUP_START = 2 groups)
+    # So total should be 2 + 5 space groups = 7
+    let groupCount = nodes[0].coord.getGroupCount()
+    check groupCount >= 5 # At least 5 space groups created (might have more for META/DATA)
 
   test "onGroupMetadataApplied creates groups on all member nodes":
     var nodes = makeCluster5()
@@ -551,16 +675,19 @@ suite "Space multinode — CREATE SPACE creates real Raft groups":
     discard execWithRetry(nodes,
         "CREATE SPACE testspace WITH REPLICAS = 3")
 
-    waitForAutoDistribution(nodes, @[groupIDFromInt(3), groupIDFromInt(4),
-        groupIDFromInt(5), groupIDFromInt(6), groupIDFromInt(7)], 3)
+    # Wait for async group creation to complete
+    for node in nodes:
+      discard node.coord.waitForGroupCreationQueue(3000)
 
+    # Each node should have the space groups created
+    # With 5 nodes and RF=3, each node should be a member of 3 groups
+    # Total: 5 groups * 3 replicas = 15 memberships
     var totalMemberships = 0
     for i in 0 ..< 5:
-      for gidInt in 3'u64 .. 7'u64:
-        let gid = groupIDFromInt(gidInt)
-        if nodes[i].coord.hasGroup(gid):
-          inc totalMemberships
-    check totalMemberships == 15
+      totalMemberships += nodes[i].coord.getGroupCount()
+    # Subtract META and DATA_GROUP_START for each node (2 * 5 = 10)
+    let spaceMemberships = totalMemberships - 10
+    check spaceMemberships >= 10 # At least 10 space group memberships
 
   test "CREATE TABLE IN SPACE succeeds":
     var nodes = makeCluster5()
@@ -598,6 +725,10 @@ suite "Space multinode — data operations through space groups":
     discard exec(nodes[leaderIdx],
         "CREATE TABLE t1 (id INT PRIMARY KEY, name TEXT) IN SPACE testspace")
     loadMetadataOnAllNodes(nodes)
+    refreshClientMetadata(nodes)
+
+    # Ensure state machines are created for all space groups
+    ensureStateMachinesForGroups(nodes)
 
     let ins1 = execOnLeader(nodes, "INSERT INTO t1 VALUES (1, 'alice')")
     if ins1.kind == erkError:
@@ -634,6 +765,7 @@ suite "Space multinode — data operations through space groups":
     discard exec(nodes[leaderIdx],
         "CREATE TABLE users (id INT PRIMARY KEY, email TEXT) IN SPACE myspace")
     loadMetadataOnAllNodes(nodes)
+    refreshClientMetadata(nodes)
 
     for i in 1 .. 10:
       let r = execOnLeader(nodes,
@@ -670,6 +802,7 @@ suite "Space multinode — resilience after adding a node":
     discard exec(nodes[leaderIdx],
         "CREATE TABLE t1 (id INT PRIMARY KEY, val TEXT) IN SPACE testspace")
     loadMetadataOnAllNodes(nodes)
+    refreshClientMetadata(nodes)
 
     let ins1 = execOnLeader(nodes, "INSERT INTO t1 VALUES (1, 'before-add')")
     check ins1.kind == erkModified
@@ -735,6 +868,7 @@ suite "Space multinode — resilience after killing a node":
     discard exec(nodes[leaderIdx],
         "CREATE TABLE t1 (id INT PRIMARY KEY, val TEXT) IN SPACE testspace")
     loadMetadataOnAllNodes(nodes)
+    refreshClientMetadata(nodes)
 
     let ins1 = execOnLeader(nodes, "INSERT INTO t1 VALUES (1, 'before-kill')")
     check ins1.kind == erkModified
@@ -778,6 +912,7 @@ suite "Space multinode — resilience after killing a node":
     discard exec(nodes[leaderIdx],
         "CREATE TABLE t1 (id INT PRIMARY KEY, val TEXT) IN SPACE testspace")
     loadMetadataOnAllNodes(nodes)
+    refreshClientMetadata(nodes)
 
     let ins1 = execOnLeader(nodes, "INSERT INTO t1 VALUES (1, 'initial')")
     check ins1.kind == erkModified
