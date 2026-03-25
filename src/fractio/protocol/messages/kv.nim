@@ -5,9 +5,14 @@
 # The caller wraps the payload in a Frame via frame.encodeFrame.
 #
 # Wire formats match protocol_design.md §4.2 exactly.
+#
+# GroupID encoding: GroupIDs are 16-byte ULIDs. When the GroupRouted flag is set,
+# the groupId is appended as 16 raw bytes (no length prefix).
 
 import ../types
 import ../codec
+import ../../core/types
+import ../../distributed/raft/group_types
 
 # ---------------------------------------------------------------------------
 # Get  (0x0100)
@@ -17,6 +22,7 @@ import ../codec
 #   TxnId (8 bytes)
 #   ReadTimestamp (8 bytes, 0 for latest)
 #   Key (uint32-prefixed)
+#   GroupId (16 bytes, if GroupRouted flag set)
 #
 # Response (found):
 #   Flags (1 byte):    bit0=Found  bit1=HasTimestamp  bit2=HasVersion
@@ -31,7 +37,7 @@ import ../codec
 const
   GetFlagIncludeTimestamp* = 0x01'u8
   GetFlagIncludeVersion* = 0x02'u8
-  GetFlagGroupRouted* = 0x10'u8  ## groupId appended after key
+  GetFlagGroupRouted* = 0x10'u8 ## groupId appended after key
 
   GetRespFlagFound* = 0x01'u8
   GetRespFlagHasTimestamp* = 0x02'u8
@@ -43,7 +49,7 @@ type
     txnId*: uint64
     readTimestamp*: uint64
     key*: string
-    groupId*: uint64  ## non-zero when GroupRouted flag is set
+    groupId*: GroupID ## non-zero when GroupRouted flag is set
 
   GetResponse* = object
     found*: bool
@@ -57,13 +63,13 @@ proc encodeGetRequest*(req: GetRequest): string =
   var buf = ""
   buf.writeUint16BE(uint16(mtGet))
   var flags = req.flags
-  if req.groupId != 0: flags = flags or GetFlagGroupRouted
+  if req.groupId != ZeroGroupID(): flags = flags or GetFlagGroupRouted
   buf.writeUint8(flags)
   buf.writeUint64BE(req.txnId)
   buf.writeUint64BE(req.readTimestamp)
   buf.writeBytes(req.key)
-  if req.groupId != 0:
-    buf.writeUint64BE(req.groupId)
+  if req.groupId != ZeroGroupID():
+    buf.add(ulidToBytes(groupIDToULID(req.groupId)))
   buf
 
 proc decodeGetRequest*(payload: string): Result[GetRequest, ProtocolError] =
@@ -86,9 +92,14 @@ proc decodeGetRequest*(payload: string): Result[GetRequest, ProtocolError] =
   req.key = keyR.value
 
   if (req.flags and GetFlagGroupRouted) != 0:
-    let gidR = readUint64BE(payload, pos)
-    if gidR.isErr: return peErr(gidR.error)
-    req.groupId = gidR.value
+    if pos + ULID_SIZE > payload.len:
+      return peErr(newProtocolError(peBoundsOverflow,
+          "payload too short for groupId ULID"))
+    var ulidBytes: string
+    for i in 0..<ULID_SIZE:
+      ulidBytes.add(payload[pos])
+      inc pos
+    req.groupId = GroupID(ulidFromBytes(ulidBytes))
 
   peOk(req)
 
@@ -146,6 +157,7 @@ proc decodeGetResponse*(payload: string): Result[GetResponse, ProtocolError] =
 #   ExpectedVersion (8 bytes, for CAS; 0 otherwise)
 #   Key (uint32-prefixed)
 #   Value (uint32-prefixed)
+#   GroupId (16 bytes, if GroupRouted flag set)
 #
 # Response:
 #   Status (1 byte):  0x00=OK  0x01=CASFailed  0x02=TxnAborted
@@ -159,7 +171,7 @@ const
   PutFlagReturnPrev* = 0x01'u8
   PutFlagSyncWrite* = 0x02'u8
   PutFlagCAS* = 0x04'u8
-  PutFlagGroupRouted* = 0x10'u8  ## groupId appended after value
+  PutFlagGroupRouted* = 0x10'u8 ## groupId appended after value
 
   PutStatusOK* = 0x00'u8
   PutStatusCASFailed* = 0x01'u8
@@ -172,7 +184,7 @@ type
     expectedVersion*: uint64
     key*: string
     value*: string
-    groupId*: uint64  ## non-zero when GroupRouted flag is set
+    groupId*: GroupID ## non-zero when GroupRouted flag is set
 
   PutResponse* = object
     status*: uint8
@@ -186,27 +198,28 @@ proc encodeRawPutRequest*(req: PutRequest): string =
   var buf = ""
   buf.writeUint16BE(uint16(mtRawPut))
   var flags = req.flags
-  if req.groupId != 0: flags = flags or PutFlagGroupRouted
+  if req.groupId != ZeroGroupID(): flags = flags or PutFlagGroupRouted
   buf.writeUint8(flags)
   buf.writeUint64BE(req.txnId)
   buf.writeUint64BE(req.expectedVersion)
   buf.writeBytes(req.key)
   buf.writeBytes(req.value)
-  if req.groupId != 0:
-    buf.writeUint64BE(req.groupId)
+  if req.groupId != ZeroGroupID():
+    buf.add(ulidToBytes(groupIDToULID(req.groupId)))
   buf
+
 proc encodePutRequest*(req: PutRequest): string =
   var buf = ""
   buf.writeUint16BE(uint16(mtPut))
   var flags = req.flags
-  if req.groupId != 0: flags = flags or PutFlagGroupRouted
+  if req.groupId != ZeroGroupID(): flags = flags or PutFlagGroupRouted
   buf.writeUint8(flags)
   buf.writeUint64BE(req.txnId)
   buf.writeUint64BE(req.expectedVersion)
   buf.writeBytes(req.key)
   buf.writeBytes(req.value)
-  if req.groupId != 0:
-    buf.writeUint64BE(req.groupId)
+  if req.groupId != ZeroGroupID():
+    buf.add(ulidToBytes(groupIDToULID(req.groupId)))
   buf
 
 proc decodePutRequest*(payload: string): Result[PutRequest, ProtocolError] =
@@ -233,9 +246,14 @@ proc decodePutRequest*(payload: string): Result[PutRequest, ProtocolError] =
   req.value = valR.value
 
   if (req.flags and PutFlagGroupRouted) != 0:
-    let gidR = readUint64BE(payload, pos)
-    if gidR.isErr: return peErr(gidR.error)
-    req.groupId = gidR.value
+    if pos + ULID_SIZE > payload.len:
+      return peErr(newProtocolError(peBoundsOverflow,
+          "payload too short for groupId ULID"))
+    var ulidBytes: string
+    for i in 0..<ULID_SIZE:
+      ulidBytes.add(payload[pos])
+      inc pos
+    req.groupId = GroupID(ulidFromBytes(ulidBytes))
 
   peOk(req)
 
@@ -282,6 +300,7 @@ proc decodePutResponse*(payload: string): Result[PutResponse, ProtocolError] =
 #   Flags (1 byte):  bit0=ReturnPrev  bit1=SyncWrite  bit2=OnlyIfExists
 #   TxnId (8 bytes)
 #   Key (uint32-prefixed)
+#   GroupId (16 bytes, if GroupRouted flag set)
 #
 # Response:
 #   Status (1 byte):  0x00=Deleted  0x01=NotFound  0x02=TxnAborted
@@ -292,7 +311,7 @@ const
   DelFlagReturnPrev* = 0x01'u8
   DelFlagSyncWrite* = 0x02'u8
   DelFlagOnlyIfExists* = 0x04'u8
-  DelFlagGroupRouted* = 0x10'u8  ## groupId appended after key
+  DelFlagGroupRouted* = 0x10'u8 ## groupId appended after key
 
   DelStatusDeleted* = 0x00'u8
   DelStatusNotFound* = 0x01'u8
@@ -303,7 +322,7 @@ type
     flags*: uint8
     txnId*: uint64
     key*: string
-    groupId*: uint64  ## non-zero when GroupRouted flag is set
+    groupId*: GroupID ## non-zero when GroupRouted flag is set
 
   DeleteResponse* = object
     status*: uint8
@@ -314,12 +333,12 @@ proc encodeDeleteRequest*(req: DeleteRequest): string =
   var buf = ""
   buf.writeUint16BE(uint16(mtDelete))
   var flags = req.flags
-  if req.groupId != 0: flags = flags or DelFlagGroupRouted
+  if req.groupId != ZeroGroupID(): flags = flags or DelFlagGroupRouted
   buf.writeUint8(flags)
   buf.writeUint64BE(req.txnId)
   buf.writeBytes(req.key)
-  if req.groupId != 0:
-    buf.writeUint64BE(req.groupId)
+  if req.groupId != ZeroGroupID():
+    buf.add(ulidToBytes(groupIDToULID(req.groupId)))
   buf
 
 proc decodeDeleteRequest*(payload: string): Result[DeleteRequest,
@@ -339,9 +358,14 @@ proc decodeDeleteRequest*(payload: string): Result[DeleteRequest,
   req.key = keyR.value
 
   if (req.flags and DelFlagGroupRouted) != 0:
-    let gidR = readUint64BE(payload, pos)
-    if gidR.isErr: return peErr(gidR.error)
-    req.groupId = gidR.value
+    if pos + ULID_SIZE > payload.len:
+      return peErr(newProtocolError(peBoundsOverflow,
+          "payload too short for groupId ULID"))
+    var ulidBytes: string
+    for i in 0..<ULID_SIZE:
+      ulidBytes.add(payload[pos])
+      inc pos
+    req.groupId = GroupID(ulidFromBytes(ulidBytes))
 
   peOk(req)
 

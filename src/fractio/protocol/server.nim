@@ -887,13 +887,13 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
       return
 
     let writeRes = raftPutInGroup(server.raftStore, req.key, req.value,
-        groupIDFromUint64(req.groupId))
+        req.groupId)
     if writeRes.isOk:
       sendFrame(conn, encodePutResponse(PutResponse(
         status: PutStatusOK, timestamp: 0, version: 1)), requestId)
     else:
       if writeRes.error.kind == rseNotLeader:
-        let redirect = server.getLeaderRedirect(groupIDFromUint64(req.groupId))
+        let redirect = server.getLeaderRedirect(req.groupId)
         sendNotLeaderError(conn, requestId, $writeRes.error, redirect)
       else:
         sendError(conn, requestId, ErrInternal, ErrCatKV, $writeRes.error)

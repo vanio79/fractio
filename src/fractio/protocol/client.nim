@@ -13,6 +13,8 @@
 import std/[net, strformat, atomics, locks]
 import posix
 import ../utils/socket_utils
+import ../core/types
+import ../distributed/raft/group_types
 import ./types
 import ./codec
 import ./frame
@@ -374,7 +376,7 @@ proc kvDelete*(client: ProtocolClient, key: string,
   decodeDeleteResponse(r.value.payload)
 
 proc kvGetInGroup*(client: ProtocolClient, key: string,
-    groupId: uint64,
+    groupId: GroupID,
     flags: uint8 = 0, txnId: uint64 = 0,
     readTimestamp: uint64 = 0): Result[GetResponse, ProtocolError] {.gcsafe,
     raises: [].} =
@@ -387,7 +389,7 @@ proc kvGetInGroup*(client: ProtocolClient, key: string,
   decodeGetResponse(r.value.payload)
 
 proc kvRawPutInGroup*(client: ProtocolClient, key: string, value: string,
-    groupId: uint64,
+    groupId: GroupID,
     flags: uint8 = 0, txnId: uint64 = 0,
     expectedVersion: uint64 = 0): Result[PutResponse, ProtocolError] {.gcsafe,
     raises: [].} =
@@ -400,7 +402,7 @@ proc kvRawPutInGroup*(client: ProtocolClient, key: string, value: string,
   decodePutResponse(r.value.payload)
 
 proc kvPutInGroup*(client: ProtocolClient, key: string, value: string,
-    groupId: uint64,
+    groupId: GroupID,
     flags: uint8 = 0, txnId: uint64 = 0,
     expectedVersion: uint64 = 0): Result[PutResponse, ProtocolError] {.gcsafe,
     raises: [].} =
@@ -414,7 +416,7 @@ proc kvPutInGroup*(client: ProtocolClient, key: string, value: string,
   decodePutResponse(r.value.payload)
 
 proc kvDeleteInGroup*(client: ProtocolClient, key: string,
-    groupId: uint64,
+    groupId: GroupID,
     flags: uint8 = 0,
     txnId: uint64 = 0): Result[DeleteResponse, ProtocolError] {.gcsafe,
     raises: [].} =

@@ -1842,7 +1842,7 @@ proc forwardPutToLeaderRemote(store: RaftKVStoreExt, groupId: GroupID,
         return rsErr[RaftKVEntry](newRSE(rseNotLeader,
             "failed to connect to leader: " & $cr.err))
       defer: pc.disconnect()
-      let pr = pc.kvRawPutInGroup(key, value, groupIDToUint64(groupId))
+      let pr = pc.kvRawPutInGroup(key, value, groupId)
       if not pr.isOk:
         if pr.err.kind == peNotLeader:
           return rsErr[RaftKVEntry](newRSE(rseNotLeader, pr.err.msg))
@@ -1919,7 +1919,7 @@ proc forwardDeleteToLeaderRemote(store: RaftKVStoreExt, groupId: GroupID,
         return rsErr[Option[RaftKVEntry]](newRSE(rseNotLeader,
             "failed to connect to leader: " & $cr.err))
       defer: pc.disconnect()
-      let dr = pc.kvDeleteInGroup(key, groupIDToUint64(groupId))
+      let dr = pc.kvDeleteInGroup(key, groupId)
       if not dr.isOk:
         if dr.err.kind == peNotLeader:
           return rsErr[Option[RaftKVEntry]](newRSE(rseNotLeader, dr.err.msg))
@@ -1999,7 +1999,7 @@ proc forwardGetToLeaderRemote(store: RaftKVStoreExt, groupId: GroupID,
         return rsErr[Option[RaftKVEntry]](newRSE(rseNotLeader,
             "failed to connect to leader: " & $cr.err))
       defer: pc.disconnect()
-      let gr = pc.kvGetInGroup(key, groupIDToUint64(groupId))
+      let gr = pc.kvGetInGroup(key, groupId)
       if not gr.isOk:
         if gr.err.kind == peNotLeader:
           return rsErr[Option[RaftKVEntry]](newRSE(rseNotLeader, gr.err.msg))

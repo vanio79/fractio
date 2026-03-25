@@ -148,6 +148,11 @@ proc genGroupID*(): GroupID =
   ## Generate a new unique GroupID using ULID
   GroupID(genULID())
 
+proc ZeroGroupID*(): GroupID =
+  ## Return a zero/null GroupID (all bytes = 0)
+  ## Used as a sentinel value to indicate "no group specified"
+  GroupID(ZeroULID())
+
 proc groupIDFromULID*(u: ULID): GroupID =
   ## Create GroupID from ULID
   GroupID(u)
