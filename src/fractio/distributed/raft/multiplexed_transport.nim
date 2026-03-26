@@ -265,7 +265,8 @@ proc sendSync*(t: MultiplexedRaftTransport, nodeId: core_types.NodeID,
     data: string, host: string = "", port: int = 0): bool =
   ## Send data synchronously to a peer. Used from C++ callbacks.
   ## If host/port are provided and connection doesn't exist, creates one.
-  echo "DEBUG sendSync: nodeId=", nodeId, " host=", host, " port=", port
+  ## Retries connection up to 3 times with 50ms delay for startup race conditions.
+
   var conn: PeerConnection
   withLock t.connectionsLock:
     conn = t.connections.getOrDefault(nodeId, nil)
@@ -273,28 +274,32 @@ proc sendSync*(t: MultiplexedRaftTransport, nodeId: core_types.NodeID,
   if conn == nil:
     # Try to create connection if host/port provided
     if host.len > 0 and port > 0:
-      echo "DEBUG sendSync: creating new connection to ", host, ":", port
-      if not t.connectToPeer(nodeId, host, port):
-        echo "DEBUG sendSync: failed to connect to ", host, ":", port
+      var connected = false
+      # Retry up to 3 times for startup race conditions
+      for attempt in 0 ..< 3:
+        if t.connectToPeer(nodeId, host, port):
+          connected = true
+          break
+        elif attempt < 2:
+          sleep(50) # 50ms delay between retries
+
+      if not connected:
         return false
+
       withLock t.connectionsLock:
         conn = t.connections.getOrDefault(nodeId, nil)
     else:
-      echo "DEBUG sendSync: no host/port, cannot create connection"
       return false
 
   if conn == nil or conn.syncSocket == nil:
-    echo "DEBUG sendSync: conn or socket is nil"
     return false
 
   withLock conn.sendLock:
     try:
       conn.syncSocket.send(data)
       conn.lastActivity = getTime()
-      echo "DEBUG sendSync: sent ", data.len, " bytes to ", host, ":", port
       return true
     except Exception as e:
-      echo "DEBUG sendSync: exception: ", e.msg
       return false
 
 # =============================================================================
@@ -410,23 +415,24 @@ proc readOneMessage(client: Socket, t: MultiplexedRaftTransport): bool =
   ## Read a single message from a client socket.
   ## Returns true if a complete message was read and processed.
   ## Returns false on error or disconnect.
-  ## Uses select with a short timeout to allow periodic checking of serverRunning.
+  ## For non-blocking sockets, returns true if no data available (caller should retry).
 
   # Use select to wait for data with timeout
   var fds = @[client.getFd()]
-  let ready = nativesockets.selectRead(fds, 20)       # 20ms timeout
+  let ready = nativesockets.selectRead(fds, 0)       # No timeout - just check
   if ready <= 0:
-    # Timeout - return true so caller checks serverRunning and retries
+    # No data available - return true so caller continues polling
     return true
 
-  echo "DEBUG readOneMessage: port=", t.port, " data available"
   try:
     # Read frame header (magic + groupId = 20 bytes)
     var headerBuf = newString(FrameHeaderSize)
     let headerRead = client.recv(headerBuf, FrameHeaderSize)
+    if headerRead == 0:
+      # Connection closed by peer
+      return false
     if headerRead != FrameHeaderSize:
-      echo "DEBUG readOneMessage: port=", t.port, " headerRead=", headerRead,
-          " expected=", FrameHeaderSize, " (client disconnected)"
+      # Incomplete read
       return false
 
     # Check magic
@@ -435,7 +441,6 @@ proc readOneMessage(client: Socket, t: MultiplexedRaftTransport): bool =
                 uint32(headerBuf[2]) shl 8 or
                 uint32(headerBuf[3])
     if magic != RaftMagic:
-      echo "DEBUG readOneMessage: invalid magic"
       return false
 
     # Extract GroupID
@@ -448,7 +453,6 @@ proc readOneMessage(client: Socket, t: MultiplexedRaftTransport): bool =
     var lenBuf = newString(4)
     let lenRead = client.recv(lenBuf, 4)
     if lenRead != 4:
-      echo "DEBUG readOneMessage: failed to read length"
       return false
 
     let payloadLen = int(uint32(lenBuf[0]) shl 24 or
@@ -457,7 +461,6 @@ proc readOneMessage(client: Socket, t: MultiplexedRaftTransport): bool =
                          uint32(lenBuf[3]))
 
     if payloadLen > 10 * 1024 * 1024: # 10MB max
-      echo "DEBUG readOneMessage: payload too large"
       return false
 
     # Read payload
@@ -465,16 +468,13 @@ proc readOneMessage(client: Socket, t: MultiplexedRaftTransport): bool =
     if payloadLen > 0:
       let payloadRead = client.recv(payload, payloadLen)
       if payloadRead != payloadLen:
-        echo "DEBUG readOneMessage: failed to read payload"
         return false
 
     # Deliver to coordinator
     if t.coordinatorCb != nil:
-      echo "DEBUG transport: delivering groupId=", groupId, " payloadLen=",
-          payloadLen, " to coordinator"
       t.coordinatorCb(groupId, cstring(payload), csize_t(payloadLen))
     else:
-      echo "DEBUG transport: no coordinatorCb set!"
+      discard
 
     return true
   except:
@@ -483,23 +483,45 @@ proc readOneMessage(client: Socket, t: MultiplexedRaftTransport): bool =
 proc acceptLoop(t: MultiplexedRaftTransport) {.thread.} =
   ## Accept incoming connections.
   ## Each connection can carry multiple RPC messages.
-  ## We accept, read messages until disconnect or shutdown, then accept next.
+  ## We use non-blocking mode and poll all connections to handle concurrent clients.
+
+  var activeClients: seq[Socket] = @[]
+
   while t.serverRunning.load():
     try:
-      # Use select with timeout to periodically check serverRunning flag
-      var fds = @[t.serverSocket.getFd()]
-      let ready = nativesockets.selectRead(fds, 50) # 50ms timeout
-      if ready <= 0:
-        continue
+      # Check for new connections (with short timeout)
+      var listenFds = @[t.serverSocket.getFd()]
+      let listenReady = nativesockets.selectRead(listenFds, 10) # 10ms timeout
 
-      var client: Socket
-      t.serverSocket.accept(client)
+      if listenReady > 0:
+        var client: Socket
+        t.serverSocket.accept(client)
+        # Set non-blocking mode for polling
+        setBlocking(client.getFd(), false)
+        activeClients.add(client)
 
-      # Handle client - read messages until disconnect or shutdown
-      while t.serverRunning.load():
-        if not readOneMessage(client, t):
-          break
-      client.close()
+      # Poll all active clients for data
+      if activeClients.len > 0:
+        var toRemove: seq[int] = @[]
+        for i, client in activeClients:
+          var fds = @[client.getFd()]
+          let ready = nativesockets.selectRead(fds, 0) # No timeout - just check
+          if ready > 0:
+            # Data available - try to read a message
+            if not readOneMessage(client, t):
+              # Connection closed or error
+              toRemove.add(i)
+
+        # Remove closed connections (in reverse order to preserve indices)
+        for i in countdown(toRemove.len - 1, 0):
+          try:
+            activeClients[toRemove[i]].close()
+          except:
+            discard
+          activeClients.del(toRemove[i])
+
+      sleep(1) # Small yield to prevent busy-waiting
+
     except:
       if t.serverRunning.load():
         sleep(10)
