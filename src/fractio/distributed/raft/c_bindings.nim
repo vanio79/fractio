@@ -33,6 +33,10 @@ type
   NuRaftServer* = distinct pointer
     ## Reference to the underlying raft_server
 
+  MultiplexedContext* = distinct pointer
+    ## Multiplexed RPC context for sharing single port across groups
+    ## Defined here to avoid circular imports
+
 # ============================================
 # Callback types
 # ============================================
@@ -62,6 +66,7 @@ proc isNil*(p: NuRaftSM): bool {.inline.} = pointer(p) == nil
 proc isNil*(p: NuRaftSMgr): bool {.inline.} = pointer(p) == nil
 proc isNil*(p: NuRaftLauncher): bool {.inline.} = pointer(p) == nil
 proc isNil*(p: NuRaftServer): bool {.inline.} = pointer(p) == nil
+proc isNil*(p: MultiplexedContext): bool {.inline.} = pointer(p) == nil
 proc `==`*(p: NuRaftServer, n: typeof(nil)): bool {.inline.} = pointer(p) == nil
 proc `!=`*(p: NuRaftServer, n: typeof(nil)): bool {.inline.} = pointer(p) != nil
 
@@ -145,7 +150,8 @@ proc nuraftServerRemoveSrv*(server: NuRaftServer,
 proc nuraftServerSetPriority*(server: NuRaftServer, srvId: int32,
     priority: int32): int32 {.importc: "nuraft_server_set_priority".}
 proc nuraftServerYieldLeadership*(
-    server: NuRaftServer, immediateYield: bool, successorId: int32) {.importc: "nuraft_server_yield_leadership".}
+    server: NuRaftServer, immediateYield: bool,
+        successorId: int32) {.importc: "nuraft_server_yield_leadership".}
 proc nuraftServerGetTerm*(
     server: NuRaftServer): uint64 {.importc: "nuraft_server_get_term".}
 proc nuraftServerGetCommittedLogIdx*(
@@ -155,5 +161,22 @@ proc nuraftServerGetLastLogIdx*(
 proc nuraftServerGetSrvLastMatchIdx*(
     server: NuRaftServer, srvId: int32): uint64 {.importc: "nuraft_server_get_srv_last_match_idx".}
 proc nuraftServerIsInitialized*(
-
     server: NuRaftServer): bool {.importc: "nuraft_server_is_initialized".}
+
+# ============================================
+# Custom Context Raft Server (bypasses ASIO)
+# ============================================
+
+type
+  NuRaftEventCb* = proc(ctx: pointer, eventType: int32,
+      leaderId: int32, term: uint64) {.cdecl.}
+
+proc nuraftServerCreateWithContext*(
+    multiplexedCtx: MultiplexedContext,
+    sm: NuRaftSM,
+    smgr: NuRaftSMgr,
+    params: NuRaftParams,
+    eventCb: NuRaftEventCb,
+    eventCtx: pointer): NuRaftServer {.importc: "nuraft_server_create_with_context".}
+proc nuraftServerDestroy*(server: NuRaftServer) {.importc: "nuraft_server_destroy".}
+proc nuraftServerShutdown*(server: NuRaftServer) {.importc: "nuraft_server_shutdown".}

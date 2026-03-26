@@ -620,9 +620,13 @@ proc applyBatchToSM*(storePtr: pointer, rid: GroupID,
   ## The WiscKey write here uses writeBatchNoSync (no second fdatasync) — it
   ## keeps committed data readable after a clean restart.  On a crash the Raft
   ## log is replayed from lastApplied to reconstruct any missing SM state.
-  if storePtr == nil or data == nil or len == 0: return
+  if storePtr == nil or data == nil or len == 0:
+    echo "DEBUG: applyBatchToSM - nil params, returning early"
+    return
 
   let store = cast[RaftKVStoreExt](storePtr)
+  let nodeId = store.coordinator.nodeId.uint32
+  echo "DEBUG: applyBatchToSM START node=", nodeId, " groupId=", rid, " len=", len
 
   # Copy C data into Nim-managed string (safe to allocate here)
   let payload = newString(len)
@@ -633,24 +637,35 @@ proc applyBatchToSM*(storePtr: pointer, rid: GroupID,
   try:
     batch = nuraft_coordinator.deserializeWriteBatch(payload)
   except CatchableError:
+    echo "DEBUG: applyBatchToSM - deserialize failed"
     return
 
-  if batch == nil: return
+  if batch == nil:
+    echo "DEBUG: applyBatchToSM - batch is nil"
+    return
+
+  echo "DEBUG: applyBatchToSM - batch.puts.len=", batch.puts.len,
+      " batch.deletes.len=", batch.deletes.len
 
   # --- Persist to WiscKey (no fdatasync — Raft log is the durability guarantee) ---
   let backend = store.coordinator.store
+  echo "DEBUG: applyBatchToSM node=", nodeId, " backend is nil=", backend.isNil
+  if backend != nil:
+    echo "DEBUG: applyBatchToSM node=", nodeId, " backend.isOpen=", backend.isOpen
   if backend != nil and backend.isOpen:
     {.cast(raises: []).}:
       var pairs: seq[KeyValuePair] = @[]
       var delKeys: seq[string] = @[]
 
-      let now = int64(getTime().toUnixFloat() * 1_000_000_000)
-
       for (k, v) in batch.puts:
-        pairs.add((key: fromBytes(k), value: fromBytes(v)))
+        let keyStr = fromBytes(k)
+        echo "DEBUG: applyBatchToSM node=", nodeId, " writing key='", keyStr, "'"
+        pairs.add((key: keyStr, value: fromBytes(v)))
       for k in batch.deletes:
         delKeys.add(fromBytes(k))
-      discard backend.writeBatchNoSync(pairs, delKeys)
+      let ok = backend.writeBatchNoSync(pairs, delKeys)
+      echo "DEBUG: applyBatchToSM node=", nodeId, " writeBatchNoSync=", ok,
+          " pairs=", pairs.len
 
   # No in-memory state machine to update — reads go through WiscKey directly.
 
@@ -823,7 +838,7 @@ proc wireApplyCallback*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
         try:
           var gid: GroupID
           var members: seq[tuple[nodeId: uint32, host: string,
-              basePort: int]] = @[]
+              port: int]] = @[]
           var preferredLeader: uint32 = 0
 
           # Binary decoding (GroupRecord)
@@ -832,9 +847,9 @@ proc wireApplyCallback*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
           for rep in groupRec.replicas:
             let nid = rep.nodeId
             let peerInfo = coord.peerInfo.getOrDefault(nid,
-                (host: coord.host, basePort: coord.basePort))
+                (host: coord.host, port: coord.port))
             members.add((nodeId: nid, host: peerInfo.host,
-                basePort: peerInfo.basePort))
+                port: peerInfo.port))
           preferredLeader = groupRec.preferredLeader
 
           if gid == META_GROUP_ID or gid == DATA_GROUP_START_ID: return
@@ -2620,12 +2635,12 @@ proc rebalanceSpaces*(store: RaftKVStoreExt) {.raises: [].} =
           # Create Raft group in coordinator
           if not coord.hasGroup(groupId):
             var nuraftMembers: seq[tuple[nodeId: uint32, host: string,
-                basePort: int]] = @[]
+                port: int]] = @[]
             for m in members:
               let peerInfo = coord.peerInfo.getOrDefault(uint32(m),
-                  (host: coord.host, basePort: coord.basePort))
+                  (host: coord.host, port: coord.port))
               nuraftMembers.add((nodeId: uint32(m), host: peerInfo.host,
-                  basePort: peerInfo.basePort))
+                  port: peerInfo.port))
             let preferredLeader = uint32(members[0])
             try:
               discard coord.createAndStartGroup(groupId, nuraftMembers, preferredLeader)

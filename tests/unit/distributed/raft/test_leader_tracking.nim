@@ -33,10 +33,10 @@ proc makeStore(storagePath: string): tuple[
     coord: NuRaftCoordinator, store: RaftKVStoreExt] =
   cleanDir(storagePath)
   let nodeId = NodeID(1)
-  let basePort = nextBasePort()
-  let members = @[(nodeId: 1'u32, host: "127.0.0.1", basePort: basePort)]
+  let port = nextBasePort()
+  let members = @[(nodeId: 1'u32, host: "127.0.0.1", port: port)]
   let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
-    nodeId: nodeId, basePort: basePort, host: "127.0.0.1", dataDir: storagePath,
+    nodeId: nodeId, port: port, host: "127.0.0.1", dataDir: storagePath,
     electionTimeoutLowerMs: 200, electionTimeoutUpperMs: 400,
     heartbeatIntervalMs: 100,
   ))

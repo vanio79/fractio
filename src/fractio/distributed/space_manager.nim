@@ -247,7 +247,7 @@ proc waitForGroupLeaders(sm: SpaceManager, groupIds: seq[GroupID],
     sleep(LEADER_POLL_INTERVAL_MS)
 
 proc getMemberEndpoints(sm: SpaceManager, groupRec: GroupRecord): seq[tuple[
-    nodeId: uint32, host: string, basePort: int]] =
+    nodeId: uint32, host: string, port: int]] =
   ## Get endpoints for all members of a group.
   let nodes = sm.getNodes()
   var nodeMap = initTable[uint32, NodeRecord]()
@@ -257,7 +257,7 @@ proc getMemberEndpoints(sm: SpaceManager, groupRec: GroupRecord): seq[tuple[
   for rep in groupRec.replicas:
     if rep.nodeId in nodeMap:
       let n = nodeMap[rep.nodeId]
-      result.add((nodeId: n.nodeId, host: n.host, basePort: int(n.raftPort)))
+      result.add((nodeId: n.nodeId, host: n.host, port: int(n.raftPort)))
 
 # ---------------------------------------------------------------------------
 # CREATE SPACE

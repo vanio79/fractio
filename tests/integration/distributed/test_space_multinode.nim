@@ -64,8 +64,8 @@ var nextClientPort = 19200 ## incremented per node to avoid port conflicts betwe
 
 type
   TestNode = object
-    id*: int ## 1-based node number
-    basePort*: int
+    id*: int   ## 1-based node number
+    port*: int ## Single port for all Raft groups (multiplexed)
     clientPort*: int
     server*: ProtocolServer
     coord*: NURAFT_COORDINATOR
@@ -77,9 +77,9 @@ type
 proc cleanDir(p: string) =
   try: removeDir(p) except CatchableError: discard
 
-proc makeNode(nodeNum: int, basePort: int,
+proc makeNode(nodeNum: int, port: int,
     members: seq[tuple[nodeId: uint32, host: string,
-        basePort: int]]): TestNode =
+        port: int]]): TestNode =
   let nodeId = rangeTypes.NodeID(uint32(nodeNum))
   let cPort = nextClientPort
   nextClientPort += 1
@@ -91,7 +91,7 @@ proc makeNode(nodeNum: int, basePort: int,
 
   let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
     nodeId: nodeId,
-    basePort: basePort,
+    port: port,
     host: "127.0.0.1",
     dataDir: storagePath,
     electionTimeoutLowerMs: TEST_ELECTION_TIMEOUT_LOWER_MS_MULTINODE,
@@ -100,7 +100,7 @@ proc makeNode(nodeNum: int, basePort: int,
   ))
 
   for m in members:
-    coord.peerInfo[m.nodeId] = (host: m.host, basePort: m.basePort)
+    coord.peerInfo[m.nodeId] = (host: m.host, port: m.port)
 
   coord.start()
 
@@ -143,7 +143,7 @@ proc makeNode(nodeNum: int, basePort: int,
   )
 
   TestNode(
-    id: nodeNum, basePort: basePort, clientPort: cPort, server: srv,
+    id: nodeNum, port: port, clientPort: cPort, server: srv,
     coord: coord, store: store, mvccStore: mvccStore, storagePath: storagePath,
   )
 
@@ -230,7 +230,7 @@ proc seedSysNodes(nodes: seq[TestNode], maxRetries: int = 20): bool =
       let nodeRec = NodeRecord(
         nodeId: uint32(n.id),
         host: "127.0.0.1",
-        raftPort: uint16(n.basePort),
+        raftPort: uint16(n.port),
         clientPort: uint16(n.clientPort),
         status: nsAlive,
       )
@@ -584,16 +584,16 @@ proc makeCluster5(): seq[TestNode] =
   let p4 = nextBasePort()
   let p5 = nextBasePort()
   let members = @[
-    (nodeId: 1'u32, host: "127.0.0.1", basePort: p1),
-    (nodeId: 2'u32, host: "127.0.0.1", basePort: p2),
-    (nodeId: 3'u32, host: "127.0.0.1", basePort: p3),
-    (nodeId: 4'u32, host: "127.0.0.1", basePort: p4),
-    (nodeId: 5'u32, host: "127.0.0.1", basePort: p5),
+    (nodeId: 1'u32, host: "127.0.0.1", port: p1),
+    (nodeId: 2'u32, host: "127.0.0.1", port: p2),
+    (nodeId: 3'u32, host: "127.0.0.1", port: p3),
+    (nodeId: 4'u32, host: "127.0.0.1", port: p4),
+    (nodeId: 5'u32, host: "127.0.0.1", port: p5),
   ]
 
   var nodes: seq[TestNode]
   for i, m in members:
-    nodes.add(makeNode(int(m.nodeId), m.basePort, members))
+    nodes.add(makeNode(int(m.nodeId), m.port, members))
     # Stagger node starts to reduce election conflicts
     # First node gets a head start to become leader
     if i == 0:
@@ -810,12 +810,12 @@ suite "Space multinode — resilience after adding a node":
     # Add node 6
     let p6 = nextBasePort()
     let node6Members = @[
-      (nodeId: 1'u32, host: "127.0.0.1", basePort: nodes[0].basePort),
-      (nodeId: 2'u32, host: "127.0.0.1", basePort: nodes[1].basePort),
-      (nodeId: 3'u32, host: "127.0.0.1", basePort: nodes[2].basePort),
-      (nodeId: 4'u32, host: "127.0.0.1", basePort: nodes[3].basePort),
-      (nodeId: 5'u32, host: "127.0.0.1", basePort: nodes[4].basePort),
-      (nodeId: 6'u32, host: "127.0.0.1", basePort: p6),
+      (nodeId: 1'u32, host: "127.0.0.1", port: nodes[0].port),
+      (nodeId: 2'u32, host: "127.0.0.1", port: nodes[1].port),
+      (nodeId: 3'u32, host: "127.0.0.1", port: nodes[2].port),
+      (nodeId: 4'u32, host: "127.0.0.1", port: nodes[3].port),
+      (nodeId: 5'u32, host: "127.0.0.1", port: nodes[4].port),
+      (nodeId: 6'u32, host: "127.0.0.1", port: p6),
     ]
     var node6 = makeNode(6, p6, node6Members)
     startNode(node6)

@@ -86,7 +86,7 @@ proc printResourceUsage(label: string) =
 type
   TestNode = object
     id*: int
-    basePort*: int
+    port*: int ## Single port for all Raft groups (multiplexed)
     clientPort*: int
     server*: ProtocolServer
     coord*: NuRaftCoordinator
@@ -98,9 +98,9 @@ type
 proc cleanDir(p: string) =
   try: removeDir(p) except CatchableError: discard
 
-proc makeNode(nodeNum: int, basePort: int,
+proc makeNode(nodeNum: int, port: int,
     members: seq[tuple[nodeId: uint32, host: string,
-        basePort: int]]): TestNode =
+        port: int]]): TestNode =
   let nodeId = rangeTypes.NodeID(uint32(nodeNum))
   let cPort = nextClientPort
   nextClientPort += 1
@@ -112,7 +112,7 @@ proc makeNode(nodeNum: int, basePort: int,
 
   let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
     nodeId: nodeId,
-    basePort: basePort,
+    port: port,
     host: "127.0.0.1",
     dataDir: storagePath,
     electionTimeoutLowerMs: TEST_ELECTION_TIMEOUT_LOWER_MS,
@@ -122,7 +122,7 @@ proc makeNode(nodeNum: int, basePort: int,
 
   # Populate peerInfo so dynamic group creation knows peer ports
   for m in members:
-    coord.peerInfo[m.nodeId] = (host: m.host, basePort: m.basePort)
+    coord.peerInfo[m.nodeId] = (host: m.host, port: m.port)
 
   coord.start()
 
@@ -171,7 +171,7 @@ proc makeNode(nodeNum: int, basePort: int,
   let fractioClient = newFractioClient("127.0.0.1", cPort)
 
   TestNode(
-    id: nodeNum, basePort: basePort, clientPort: cPort, server: srv,
+    id: nodeNum, port: port, clientPort: cPort, server: srv,
     coord: coord, store: store, mvccStore: mvccStore, storagePath: storagePath,
     client: fractioClient,
   )
@@ -212,7 +212,7 @@ proc seedSysNodes(leaderStore: RaftKVStoreExt, nodes: seq[TestNode]) =
     let nodeRec = NodeRecord(
       nodeId: uint32(n.id),
       host: "127.0.0.1",
-      raftPort: uint16(n.basePort),
+      raftPort: uint16(n.port),
       clientPort: uint16(n.clientPort),
       status: nsAlive,
     )
@@ -405,13 +405,13 @@ proc makeCluster2(): seq[TestNode] =
   let p1 = nextBasePort()
   let p2 = nextBasePort()
   let members = @[
-    (nodeId: 1'u32, host: "127.0.0.1", basePort: p1),
-    (nodeId: 2'u32, host: "127.0.0.1", basePort: p2),
+    (nodeId: 1'u32, host: "127.0.0.1", port: p1),
+    (nodeId: 2'u32, host: "127.0.0.1", port: p2),
   ]
 
   var nodes: seq[TestNode]
   for i, m in members:
-    nodes.add(makeNode(int(m.nodeId), m.basePort, members))
+    nodes.add(makeNode(int(m.nodeId), m.port, members))
   for n in nodes:
     startNode(n)
 
@@ -482,22 +482,22 @@ proc waitForNodeInSysNodes(store: RaftKVStoreExt, nodeId: int,
 
 proc addNodeToCluster(nodes: var seq[TestNode], newNodeNum: int) =
   ## Add a new node to the cluster.
-  let newBasePort = 28000 + (newNodeNum - 1) * 1000
+  let newPort = 28000 + (newNodeNum - 1) * 1000
 
   # Build members list including all existing + new
-  var allMembers: seq[tuple[nodeId: uint32, host: string, basePort: int]]
+  var allMembers: seq[tuple[nodeId: uint32, host: string, port: int]]
   for n in nodes:
     allMembers.add((nodeId: uint32(n.id), host: "127.0.0.1",
-        basePort: n.basePort))
+        port: n.port))
   allMembers.add((nodeId: uint32(newNodeNum), host: "127.0.0.1",
-      basePort: newBasePort))
+      port: newPort))
 
-  let newNode = makeNode(newNodeNum, newBasePort, allMembers)
+  let newNode = makeNode(newNodeNum, newPort, allMembers)
   startNode(newNode)
 
   # Add new node to existing nodes' NuRaft groups
   for n in nodes:
-    n.server.addPeerToRaft(uint32(newNodeNum), "127.0.0.1", newBasePort)
+    n.server.addPeerToRaft(uint32(newNodeNum), "127.0.0.1", newPort)
 
   nodes.add(newNode)
 
@@ -508,7 +508,7 @@ proc addNodeToCluster(nodes: var seq[TestNode], newNodeNum: int) =
     let nodeRec = NodeRecord(
       nodeId: uint32(newNodeNum),
       host: "127.0.0.1",
-      raftPort: uint16(newBasePort),
+      raftPort: uint16(newPort),
       clientPort: uint16(newNode.clientPort),
       status: nsAlive,
     )

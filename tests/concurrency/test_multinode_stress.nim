@@ -36,16 +36,16 @@ type
     store*: RaftKVStoreExt
     storagePath*: string
 
-proc makeNode(nodeNum: int, basePort: int,
-              members: seq[tuple[nodeId: uint32, host: string, basePort: int]],
+proc makeNode(nodeNum: int, port: int,
+              members: seq[tuple[nodeId: uint32, host: string, port: int]],
               groupId: GroupID): NodeSetup =
   let nodeId = NodeID(uint32(nodeNum))
-  let storagePath = "/tmp/fractio_mn_stress_" & $basePort
+  let storagePath = "/tmp/fractio_mn_stress_" & $port
   cleanDir(storagePath)
 
   let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
     nodeId: nodeId,
-    basePort: basePort,
+    port: port,
     host: "127.0.0.1",
     dataDir: storagePath,
     electionTimeoutLowerMs: 200,
@@ -80,39 +80,39 @@ proc waitForLeader(nodes: seq[NodeSetup], groupId: GroupID,
 # Cluster factories
 # ---------------------------------------------------------------------------
 
-proc make3NodeCluster(basePort: int): (seq[NodeSetup], GroupID) =
+proc make3NodeCluster(port: int): (seq[NodeSetup], GroupID) =
   ## 3-node cluster — NuRaft handles quorum automatically.
   let rid = DATA_GROUP_START_ID
   let members = @[
-    (nodeId: 1'u32, host: "127.0.0.1", basePort: basePort),
-    (nodeId: 2'u32, host: "127.0.0.1", basePort: basePort + 100),
-    (nodeId: 3'u32, host: "127.0.0.1", basePort: basePort + 200),
+    (nodeId: 1'u32, host: "127.0.0.1", port: port),
+    (nodeId: 2'u32, host: "127.0.0.1", port: port + 100),
+    (nodeId: 3'u32, host: "127.0.0.1", port: port + 200),
   ]
 
   let nodes = @[
-    makeNode(1, basePort, members, rid),
-    makeNode(2, basePort + 100, members, rid),
-    makeNode(3, basePort + 200, members, rid),
+    makeNode(1, port, members, rid),
+    makeNode(2, port + 100, members, rid),
+    makeNode(3, port + 200, members, rid),
   ]
   (nodes, rid)
 
-proc make5NodeCluster(basePort: int): (seq[NodeSetup], GroupID) =
+proc make5NodeCluster(port: int): (seq[NodeSetup], GroupID) =
   ## 5-node cluster — NuRaft handles quorum automatically.
   let rid = DATA_GROUP_START_ID
   let members = @[
-    (nodeId: 1'u32, host: "127.0.0.1", basePort: basePort),
-    (nodeId: 2'u32, host: "127.0.0.1", basePort: basePort + 100),
-    (nodeId: 3'u32, host: "127.0.0.1", basePort: basePort + 200),
-    (nodeId: 4'u32, host: "127.0.0.1", basePort: basePort + 300),
-    (nodeId: 5'u32, host: "127.0.0.1", basePort: basePort + 400),
+    (nodeId: 1'u32, host: "127.0.0.1", port: port),
+    (nodeId: 2'u32, host: "127.0.0.1", port: port + 100),
+    (nodeId: 3'u32, host: "127.0.0.1", port: port + 200),
+    (nodeId: 4'u32, host: "127.0.0.1", port: port + 300),
+    (nodeId: 5'u32, host: "127.0.0.1", port: port + 400),
   ]
 
   let nodes = @[
-    makeNode(1, basePort, members, rid),
-    makeNode(2, basePort + 100, members, rid),
-    makeNode(3, basePort + 200, members, rid),
-    makeNode(4, basePort + 300, members, rid),
-    makeNode(5, basePort + 400, members, rid),
+    makeNode(1, port, members, rid),
+    makeNode(2, port + 100, members, rid),
+    makeNode(3, port + 200, members, rid),
+    makeNode(4, port + 300, members, rid),
+    makeNode(5, port + 400, members, rid),
   ]
   (nodes, rid)
 
@@ -356,7 +356,7 @@ suite "MultiNode stress — 5-node cluster":
   test "8 writers, distinct keys — quorum-committed":
     const numThreads = 8
     const numOps = 100
-    let (nodes, rid) = make5NodeCluster(25000)
+    let (nodes, rid) = make5NodeCluster(26000)
     let leaderIdx = waitForLeader(nodes, rid)
     doAssert leaderIdx >= 0
     defer:
@@ -387,7 +387,7 @@ suite "MultiNode stress — 5-node cluster":
     const numThreads = 8
     const numOps = 150
     const numKeys = 50
-    let (nodes, rid) = make5NodeCluster(25000)
+    let (nodes, rid) = make5NodeCluster(26500)
     let leaderIdx = waitForLeader(nodes, rid)
     doAssert leaderIdx >= 0
     defer:
@@ -417,7 +417,7 @@ suite "MultiNode stress — 5-node cluster":
   test "concurrent puts then verify replication to all voters":
     const numThreads = 4
     const numOps = 50
-    let (nodes, rid) = make5NodeCluster(25000)
+    let (nodes, rid) = make5NodeCluster(27000)
     let leaderIdx = waitForLeader(nodes, rid)
     doAssert leaderIdx >= 0
     defer:
@@ -465,7 +465,7 @@ suite "MultiNode stress — 5-node cluster":
     const numThreads = 8
     const numOps = 200
     const numKeys = 100
-    let (nodes, rid) = make5NodeCluster(25000)
+    let (nodes, rid) = make5NodeCluster(26000)
     let leaderIdx = waitForLeader(nodes, rid)
     doAssert leaderIdx >= 0
     defer:

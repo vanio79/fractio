@@ -40,7 +40,7 @@ var nextClientPort = 9100 ## incremented per node to avoid port conflicts betwee
 type
   TestNode = object
     id*: int
-    basePort*: int
+    port*: int ## Single port for all Raft groups (multiplexed)
     clientPort*: int
     server*: ProtocolServer
     coord*: NuRaftCoordinator
@@ -52,22 +52,22 @@ proc cleanDir(p: string) =
 
 proc makeCluster3(): seq[TestNode] =
   let members = @[
-    (nodeId: 1'u32, host: "127.0.0.1", basePort: 26000),
-    (nodeId: 2'u32, host: "127.0.0.1", basePort: 26100),
-    (nodeId: 3'u32, host: "127.0.0.1", basePort: 26200),
+    (nodeId: 1'u32, host: "127.0.0.1", port: 26000),
+    (nodeId: 2'u32, host: "127.0.0.1", port: 26100),
+    (nodeId: 3'u32, host: "127.0.0.1", port: 26200),
   ]
 
   var nodes: seq[TestNode]
   for nodeNum in 1 .. NODE_COUNT:
     let nodeId = rangeTypes.NodeID(uint32(nodeNum))
-    let basePort = 26000 + (nodeNum - 1) * 100
+    let port = 26000 + (nodeNum - 1) * 100
     let storagePath = TMP_DIR & $nodeNum
     cleanDir(storagePath)
     createDir(storagePath)
 
     let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
       nodeId: nodeId,
-      basePort: basePort,
+      port: port,
       host: "127.0.0.1",
       dataDir: storagePath,
       electionTimeoutLowerMs: 200,
@@ -104,7 +104,7 @@ proc makeCluster3(): seq[TestNode] =
     srv.raftCoord = coord
 
     nodes.add(TestNode(
-      id: nodeNum, basePort: basePort, clientPort: cPort, server: srv,
+      id: nodeNum, port: port, clientPort: cPort, server: srv,
       coord: coord, store: store, storagePath: storagePath,
     ))
 
@@ -155,7 +155,7 @@ proc makeCluster3(): seq[TestNode] =
     let nodeRec = NodeRecord(
       nodeId: uint32(n.id),
       host: "127.0.0.1",
-      raftPort: uint16(n.basePort),
+      raftPort: uint16(n.port),
       clientPort: uint16(n.clientPort),
       status: nsAlive,
     )

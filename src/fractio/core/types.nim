@@ -1,6 +1,7 @@
 # Core types for Fractio distributed database
 # Thread-safe by design - immutable structs and atomic operations
 
+import hashes
 import tables
 import sets
 import times
@@ -302,3 +303,19 @@ proc ulidTimestamp*(u: ULID): int64 =
 
 proc newValueRef*(u: ULID): ValueRef =
   result = ValueRef(kind: dtULID, ulidValue: u)
+
+# =============================================================================
+# NodeID Operations
+# =============================================================================
+
+proc `$`*(id: NodeID): string =
+  ## String representation of NodeID
+  string(id)
+
+proc `==`*(a, b: NodeID): bool =
+  ## Equality comparison
+  string(a) == string(b)
+
+proc hash*(id: NodeID): Hash =
+  ## Hash for use in tables
+  hash(string(id))

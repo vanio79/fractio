@@ -4,6 +4,8 @@
 import std/endians
 import types
 import ../../core/types
+from ../raft/group_types import GroupID, groupIDToULID, groupIDFromULID,
+    ZeroGroupID
 
 # =============================================================================
 # CRC32 Implementation
@@ -150,6 +152,14 @@ proc writeString*(w: var BinaryWriter, val: string) =
 proc writeNodeID*(w: var BinaryWriter, val: NodeID) =
   w.writeString(string(val))
 
+proc writeGroupID*(w: var BinaryWriter, val: GroupID) =
+  ## Write GroupID as 16-byte ULID
+  let ulid = groupIDToULID(val)
+  w.ensureCapacity(16)
+  for i in 0..<16:
+    w.data[w.pos] = ulid.data[i]
+    w.pos += 1
+
 proc getBytes*(w: BinaryWriter): seq[byte] =
   result = newSeq[byte](w.pos)
   if w.pos > 0:
@@ -213,6 +223,16 @@ proc readString*(r: var BinaryReader): string =
 proc readNodeID*(r: var BinaryReader): NodeID =
   result = NodeID(r.readString())
 
+proc readGroupID*(r: var BinaryReader): GroupID =
+  ## Read GroupID as 16-byte ULID
+  if r.pos + 16 > r.data.len:
+    raise newException(SerializationError, "Not enough data to read GroupID")
+  var ulid: ULID
+  for i in 0..<16:
+    ulid.data[i] = r.data[r.pos].byte
+    r.pos += 1
+  result = groupIDFromULID(ulid)
+
 # =============================================================================
 # Frame Encoding/Decoding
 # =============================================================================
@@ -270,6 +290,7 @@ proc encodeHeader*(header: MessageHeader): string =
   w.writeNodeID(header.targetNodeId)
   w.writeUint64BE(header.term)
   w.writeUint64BE(header.timestamp)
+  w.writeGroupID(header.groupId)
   result = w.getString()
 
 proc decodeHeader*(data: string): MessageHeader =
@@ -282,6 +303,7 @@ proc decodeHeader*(data: string): MessageHeader =
   result.targetNodeId = r.readNodeID()
   result.term = r.readUint64BE()
   result.timestamp = r.readUint64BE()
+  result.groupId = r.readGroupID()
 
 # =============================================================================
 # KVRequest/KVResponse Encoding/Decoding

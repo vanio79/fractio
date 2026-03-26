@@ -54,11 +54,11 @@ proc startAdminServer(port: int, clusterName: string = "test-cluster",
 
   let nodeId = rangeTypes.NodeID(1)
   let raftPort = nextRaftPort()
-  let members = @[(nodeId: 1'u32, host: "127.0.0.1", basePort: raftPort)]
+  let members = @[(nodeId: 1'u32, host: "127.0.0.1", port: raftPort)]
 
   let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
     nodeId: nodeId,
-    basePort: raftPort,
+    port: raftPort,
     host: "127.0.0.1",
     dataDir: storagePath,
     electionTimeoutLowerMs: 200,

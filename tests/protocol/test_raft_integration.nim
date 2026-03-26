@@ -41,17 +41,19 @@ proc makeRaftServer(port: int, storagePath: string): ProtocolServer =
   ## Spin up a ProtocolServer with Raft-backed KV store.
   cleanDir(storagePath)
   let nodeId = NodeID(1)
-  let basePort = nextBasePort()
-  let members = @[(nodeId: 1'u32, host: "127.0.0.1", basePort: basePort)]
+  let raftPort = nextBasePort()
+  let members = @[(nodeId: 1'u32, host: "127.0.0.1", port: raftPort)]
   let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
-    nodeId: nodeId, basePort: basePort, host: "127.0.0.1", dataDir: storagePath,
-    electionTimeoutLowerMs: 200, electionTimeoutUpperMs: 400, heartbeatIntervalMs: 100,
+    nodeId: nodeId, port: raftPort, host: "127.0.0.1", dataDir: storagePath,
+    electionTimeoutLowerMs: 200, electionTimeoutUpperMs: 400,
+    heartbeatIntervalMs: 100,
   ))
   coord.start()
   for rid in [META_GROUP_ID, DATA_GROUP_START_ID]:
     doAssert coord.createAndStartGroup(rid, members)
   for attempt in 0 ..< 50:
-    if coord.isLeader(META_GROUP_ID) and coord.isLeader(DATA_GROUP_START_ID): break
+    if coord.isLeader(META_GROUP_ID) and coord.isLeader(
+        DATA_GROUP_START_ID): break
     os.sleep(100)
 
   let raftSt = newRaftKVStoreExt(coord, proposeTimeoutMs = 3000)

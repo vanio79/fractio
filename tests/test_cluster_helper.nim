@@ -39,12 +39,12 @@ type
   MemberInfo* = tuple
     nodeId: uint32
     host: string
-    basePort: int
+    port: int ## Single port for all Raft groups (multiplexed)
 
   TestClusterConfig* = object
     ## Configuration for a test cluster
     nodeCount*: int
-    basePort*: int               ## Starting port (each node uses basePort + (nodeId-1)*1000)
+    port*: int                   ## Starting port (each node uses port + (nodeId-1)*1000)
     portOffset*: int             ## Additional offset to avoid port conflicts between tests
     preferredLeader*: uint32     ## Which node should be preferred leader (default: 1)
     electionTimeoutLowerMs*: int32
@@ -58,7 +58,7 @@ type
     ## A single test node with its coordinator and store
     id*: int
     nodeId*: uint32
-    basePort*: int
+    port*: int ## Single port for all Raft groups (multiplexed)
     coord*: NuRaftCoordinator
     store*: RaftKVStoreExt
     storagePath*: string
@@ -81,7 +81,7 @@ type
 proc defaultTestClusterConfig*(): TestClusterConfig =
   result = TestClusterConfig(
     nodeCount: 3,
-    basePort: 29000,
+    port: 29000,
     portOffset: 0,
     preferredLeader: 1,
     electionTimeoutLowerMs: TEST_ELECTION_TIMEOUT_LOWER_MS_MULTINODE,
@@ -120,8 +120,8 @@ proc getMemberInfo(config: TestClusterConfig): seq[MemberInfo] =
   ## Generate member info for all nodes in the cluster
   for i in 1 .. config.nodeCount:
     let nodeId = uint32(i)
-    let basePort = config.basePort + config.portOffset + (i - 1) * 1000
-    result.add((nodeId: nodeId, host: "127.0.0.1", basePort: basePort))
+    let port = config.port + config.portOffset + (i - 1) * 1000
+    result.add((nodeId: nodeId, host: "127.0.0.1", port: port))
 
 proc getStoragePath(nodeId: uint32, portOffset: int): string =
   "/tmp/fractio_test_node" & $nodeId & "_" & $portOffset
@@ -133,7 +133,7 @@ proc getStoragePath(nodeId: uint32, portOffset: int): string =
 proc newTestNode(
   nodeId: uint32,
   host: string,
-  basePort: int,
+  port: int,
   storagePath: string,
   members: seq[MemberInfo],
   config: TestClusterConfig
@@ -146,7 +146,7 @@ proc newTestNode(
   # Create coordinator
   let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
     nodeId: rangeTypes.NodeID(nodeId),
-    basePort: basePort,
+    port: port,
     host: host,
     dataDir: storagePath,
     electionTimeoutLowerMs: config.electionTimeoutLowerMs,
@@ -156,7 +156,7 @@ proc newTestNode(
 
   # Populate peer info
   for m in members:
-    coord.peerInfo[m.nodeId] = (host: m.host, basePort: m.basePort)
+    coord.peerInfo[m.nodeId] = (host: m.host, port: m.port)
 
   # Start coordinator (just sets running flag)
   coord.start()
@@ -164,7 +164,7 @@ proc newTestNode(
   result = TestNode(
     id: int(nodeId),
     nodeId: nodeId,
-    basePort: basePort,
+    port: port,
     coord: coord,
     storagePath: storagePath
   )
@@ -207,7 +207,7 @@ type
   NodeCreationArg = object
     nodeId: uint32
     host: string
-    basePort: int
+    port: int
     storagePath: string
     members: seq[MemberInfo]
     config: TestClusterConfig
@@ -238,13 +238,13 @@ proc createNodesParallel(config: TestClusterConfig, members: seq[
   # Initialize arguments
   for i in 0 ..< config.nodeCount:
     let nodeId = uint32(i + 1)
-    let basePort = config.basePort + config.portOffset + i * 1000
+    let port = config.port + config.portOffset + i * 1000
     let storagePath = getStoragePath(nodeId, config.portOffset)
 
     args[i] = NodeCreationArg(
       nodeId: nodeId,
       host: "127.0.0.1",
-      basePort: basePort,
+      port: port,
       storagePath: storagePath,
       members: members,
       config: config
@@ -266,7 +266,7 @@ proc createNodesParallel(config: TestClusterConfig, members: seq[
     var node = newTestNode(
       args[i].nodeId,
       args[i].host,
-      args[i].basePort,
+      args[i].port,
       args[i].storagePath,
       args[i].members,
       args[i].config
@@ -279,10 +279,10 @@ proc createNodesSequential(config: TestClusterConfig, members: seq[
 
   for i in 0 ..< config.nodeCount:
     let nodeId = uint32(i + 1)
-    let basePort = config.basePort + config.portOffset + i * 1000
+    let port = config.port + config.portOffset + i * 1000
     let storagePath = getStoragePath(nodeId, config.portOffset)
 
-    var node = newTestNode(nodeId, "127.0.0.1", basePort, storagePath, members, config)
+    var node = newTestNode(nodeId, "127.0.0.1", port, storagePath, members, config)
     result.add(node)
 
 # ============================================================================
@@ -434,7 +434,7 @@ proc seedSystemTables*(cluster: TestCluster) =
     let nodeRec = NodeRecord(
       nodeId: node.nodeId,
       host: "127.0.0.1",
-      raftPort: uint16(node.basePort),
+      raftPort: uint16(node.port),
       clientPort: uint16(19000 + i),
       status: nsAlive,
     )

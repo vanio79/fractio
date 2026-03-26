@@ -1618,7 +1618,7 @@ proc saveClusterState*(server: ProtocolServer) =
     peersArr.add( %* {
       "nodeId": nid.int,
       "host": info.host,
-      "raftPort": info.basePort,
+      "raftPort": info.port,
     })
 
   let j = %* {
@@ -1656,7 +1656,7 @@ proc addPeerToRaft*(server: ProtocolServer, peerNodeId: uint32,
   if coord.isNil: return
 
   # Register peer info for future group creation
-  coord.peerInfo[peerNodeId] = (host: host, basePort: raftPort)
+  coord.peerInfo[peerNodeId] = (host: host, port: raftPort)
 
   # Add the peer as a server to all existing NuRaft groups
   var gids: seq[GroupID]
@@ -1681,8 +1681,8 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
 
   createDir(raftDir)
 
-  # Peer info: (nodeId, host, basePort) tuples
-  type PeerInfo = tuple[nodeId: uint32, host: string, basePort: int]
+  # Peer info: (nodeId, host, port) tuples
+  type PeerInfo = tuple[nodeId: uint32, host: string, port: int]
   var peers: seq[PeerInfo] = @[]
 
   # Check for saved cluster state (from a previous run as part of a cluster).
@@ -1699,14 +1699,14 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
           let pHost = p.getOrDefault("host").getStr("")
           let pRaftPort = p.getOrDefault("raftPort").getInt(0)
           if pNodeId > 0 and pHost != "" and pRaftPort > 0:
-            peers.add((nodeId: pNodeId, host: pHost, basePort: pRaftPort))
+            peers.add((nodeId: pNodeId, host: pHost, port: pRaftPort))
         if peers.len > 0:
           echo "recovered cluster membership from disk: " & $peers.len & " peers"
 
   # NuRaft Coordinator
   let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
     nodeId: nodeId,
-    basePort: raftPort,
+    port: raftPort,
     host: server.config.host,
     dataDir: raftDir,
     electionTimeoutLowerMs: 200,
@@ -1723,16 +1723,16 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
 
   # Register peer info in coordinator
   for p in peers:
-    coord.peerInfo[p.nodeId] = (host: p.host, basePort: p.basePort)
+    coord.peerInfo[p.nodeId] = (host: p.host, port: p.port)
 
   # Build member lists for the initial Raft groups
   # Each group includes self + all known peers
   var initialMembers: seq[tuple[nodeId: uint32, host: string,
-      basePort: int]] = @[]
+      port: int]] = @[]
   initialMembers.add((nodeId: nodeId.uint32, host: server.config.host,
-      basePort: raftPort))
+      port: raftPort))
   for p in peers:
-    initialMembers.add((nodeId: p.nodeId, host: p.host, basePort: p.basePort))
+    initialMembers.add((nodeId: p.nodeId, host: p.host, port: p.port))
 
   # KV store MUST be created before groups start, otherwise log replay from
   # leader will be dropped by nuraftCommitCb because kvStorePtr is nil!
@@ -1775,13 +1775,13 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
 
           # Build member list from replicas
           var members: seq[tuple[nodeId: uint32, host: string,
-              basePort: int]] = @[]
+              port: int]] = @[]
           for rep in rec.replicas:
             let nid = rep.nodeId
             let peerInfo = coord.peerInfo.getOrDefault(nid,
-                (host: coord.host, basePort: coord.basePort))
+                (host: coord.host, port: coord.port))
             members.add((nodeId: nid, host: peerInfo.host,
-                basePort: peerInfo.basePort))
+                port: peerInfo.port))
 
           var isMember = false
           for m in members:
@@ -1832,7 +1832,7 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
         let peerRec = NodeRecord(
           nodeId: p.nodeId,
           host: p.host,
-          raftPort: uint16(p.basePort),
+          raftPort: uint16(p.port),
           clientPort: 0,
           status: nsAlive
         )
@@ -1890,7 +1890,7 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
       timerPeers.add(PeerConfig(
         peerId: $p.nodeId,
         address: p.host,
-        port: uint16(p.basePort + 1),
+        port: uint16(p.port + 1),
         weight: 1.0,
       ))
     let selfTimerPort = uint16(raftPort + 1)

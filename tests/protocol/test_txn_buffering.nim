@@ -49,12 +49,12 @@ proc makeStore(storagePath: string): tuple[
     coord: NuRaftCoordinator, store: RaftKVStoreExt, rid: GroupID] =
   cleanDir(storagePath)
   let nodeId = NodeID(1)
-  let basePort = nextBasePort()
-  let members = @[(nodeId: 1'u32, host: "127.0.0.1", basePort: basePort)]
+  let port = nextBasePort()
+  let members = @[(nodeId: 1'u32, host: "127.0.0.1", port: port)]
 
   let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
     nodeId: nodeId,
-    basePort: basePort,
+    port: port,
     host: "127.0.0.1",
     dataDir: storagePath,
     electionTimeoutLowerMs: 200,
@@ -95,12 +95,12 @@ proc smGetVal(store: RaftKVStoreExt, rid: GroupID, key: string): string =
 
 proc makeRaftServer(port: int, storagePath: string): ProtocolServer =
   let nodeId = NodeID(1)
-  let basePort = nextBasePort()
-  let members = @[(nodeId: 1'u32, host: "127.0.0.1", basePort: basePort)]
+  let raftPort = nextBasePort()
+  let members = @[(nodeId: 1'u32, host: "127.0.0.1", port: raftPort)]
 
   let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
     nodeId: nodeId,
-    basePort: basePort,
+    port: raftPort,
     host: "127.0.0.1",
     dataDir: storagePath,
     electionTimeoutLowerMs: 200,

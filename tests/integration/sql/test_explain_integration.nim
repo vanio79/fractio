@@ -43,13 +43,13 @@ proc makeTestEnv(testDir: string): tuple[client: FractioClient,
   if dirExists(testDir): removeDir(testDir)
   createDir(testDir)
   let nodeId = NodeID(1)
-  let basePort = nextBasePort()
+  let port = nextBasePort()
   let clientPort = nextBasePort()
-  let members = @[(nodeId: 1'u32, host: "127.0.0.1", basePort: basePort)]
+  let members = @[(nodeId: 1'u32, host: "127.0.0.1", port: port)]
 
   let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
     nodeId: nodeId,
-    basePort: basePort,
+    port: port,
     host: "127.0.0.1",
     dataDir: testDir,
     electionTimeoutLowerMs: 200,
@@ -74,7 +74,7 @@ proc makeTestEnv(testDir: string): tuple[client: FractioClient,
 
   # Seed system tables via batch write for efficiency
   let nodeRec = NodeRecord(
-    nodeId: 1, host: "127.0.0.1", raftPort: basePort.uint16,
+    nodeId: 1, host: "127.0.0.1", raftPort: port.uint16,
     clientPort: clientPort.uint16, status: nsAlive
   )
   let metaGroupRec = GroupRecord(

@@ -40,12 +40,12 @@ proc makeStore(storagePath: string, groupIds: seq[uint64]): tuple[
   ## Create a store with meta group + data group + the specified groups.
   cleanDir(storagePath)
   let nodeId = NodeID(1)
-  let basePort = nextBasePort()
-  let members = @[(nodeId: 1'u32, host: "127.0.0.1", basePort: basePort)]
+  let port = nextBasePort()
+  let members = @[(nodeId: 1'u32, host: "127.0.0.1", port: port)]
 
   let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
     nodeId: nodeId,
-    basePort: basePort,
+    port: port,
     host: "127.0.0.1",
     dataDir: storagePath,
     electionTimeoutLowerMs: 200,

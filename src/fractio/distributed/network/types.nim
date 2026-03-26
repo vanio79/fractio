@@ -2,6 +2,8 @@
 # TCP-based network communication for distributed Fractio
 
 import ../../core/types
+from ../raft/group_types import GroupID, groupIDToULID, groupIDFromULID,
+    ZeroGroupID, `$`
 
 type
   # ==========================================================================
@@ -16,6 +18,7 @@ type
     targetNodeId*: NodeID # Target node ID
     term*: uint64         # Raft term (0 for non-Raft messages)
     timestamp*: uint64    # HLC timestamp for ordering
+    groupId*: GroupID     # Raft group ID (for multiplexing) - serialized as 16-byte ULID
 
   # ==========================================================================
   # Raft Message Types - Used for consensus (Port + 0)
@@ -364,7 +367,7 @@ type
 const
   # Frame sizes
   FRAME_HEADER_SIZE* = 8               # 4 bytes len + 4 bytes checksum
-  MESSAGE_HEADER_SIZE* = 32            # Size of MessageHeader when encoded
+  MESSAGE_HEADER_SIZE* = 48 # Size of MessageHeader when encoded (32 + 16 bytes for GroupID ULID)
 
   # Message size limits
   MAX_MESSAGE_SIZE* = 16 * 1024 * 1024 # 16MB max message
@@ -390,7 +393,8 @@ const
 
 proc newMessageHeader*(msgType: uint16, msgId: uint64,
                        source, target: NodeID,
-                           term: uint64 = 0): MessageHeader =
+                           term: uint64 = 0,
+                           groupId: GroupID = ZeroGroupID()): MessageHeader =
   ## Create a new message header
   result.messageType = msgType
   result.messageId = msgId
@@ -398,6 +402,7 @@ proc newMessageHeader*(msgType: uint16, msgId: uint64,
   result.targetNodeId = target
   result.term = term
   result.timestamp = 0 # Set by sender
+  result.groupId = groupId
 
 proc newNetworkError*(code: NetworkErrorCode, msg: string): NetworkError =
   ## Create a new network error
@@ -412,4 +417,5 @@ proc `$`*(header: MessageHeader): string =
            ", id=" & $header.messageId &
            ", src=" & string(header.sourceNodeId) &
            ", dst=" & string(header.targetNodeId) &
-           ", term=" & $header.term & ")"
+           ", term=" & $header.term &
+           ", groupId=" & $header.groupId & ")"

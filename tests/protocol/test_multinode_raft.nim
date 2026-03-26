@@ -63,9 +63,9 @@ proc makeCluster(): (seq[NodeSetup], GroupID) =
   let rid = DATA_GROUP_START_ID
   let (bp1, bp2, bp3) = nextClusterPorts()
   let members = @[
-    (nodeId: 1'u32, host: "127.0.0.1", basePort: bp1),
-    (nodeId: 2'u32, host: "127.0.0.1", basePort: bp2),
-    (nodeId: 3'u32, host: "127.0.0.1", basePort: bp3),
+    (nodeId: 1'u32, host: "127.0.0.1", port: bp1),
+    (nodeId: 2'u32, host: "127.0.0.1", port: bp2),
+    (nodeId: 3'u32, host: "127.0.0.1", port: bp3),
   ]
 
   # Create all coordinators first (don't wait for init between nodes)
@@ -78,7 +78,7 @@ proc makeCluster(): (seq[NodeSetup], GroupID) =
 
     let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
       nodeId: nodeId,
-      basePort: members[i].basePort,
+      port: members[i].port,
       host: "127.0.0.1",
       dataDir: storagePath,
       electionTimeoutLowerMs: 200,
@@ -162,13 +162,30 @@ suite "MultiNode Raft — log replication":
 
     let leaderIdx = waitForLeader(nodes, rid)
     check leaderIdx >= 0
+    echo "DEBUG: Leader is node ", leaderIdx + 1
 
     # Write on leader
     let putRes = nodes[leaderIdx].store.raftPut("replkey", "replval")
     check putRes.isOk
+    echo "DEBUG: Put succeeded on leader"
 
-    # Give replication time to propagate
-    sleep(300)
+    # Give replication time to propagate - need more time for first replication
+    # Also poll for the value to appear on followers
+    var allReplicated = false
+    for attempt in 0 ..< 20: # 10 seconds max
+      sleep(500)
+      allReplicated = true
+      for i in 0 ..< 3:
+        if i == leaderIdx: continue
+        let getRes = nodes[i].store.raftGet("replkey")
+        echo "DEBUG: Attempt ", attempt, " node ", i + 1, " getRes.isOk=",
+            getRes.isOk, " isNone=", getRes.isOk and getRes.value.isNone
+        if not getRes.isOk or getRes.value.isNone:
+          allReplicated = false
+          break
+      if allReplicated:
+        echo "DEBUG: All replicated at attempt ", attempt
+        break
 
     # Read on followers — should see the value if applyBatchCallback fired
     for i in 0 ..< 3:

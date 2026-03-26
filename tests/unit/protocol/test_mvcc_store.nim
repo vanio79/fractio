@@ -43,12 +43,12 @@ proc makeMvccStore(storagePath: string): tuple[
     mvccStore: MvccTransactionStore, txnMgr: TransactionManager] =
   cleanDir(storagePath)
   let nodeId = rangeTypes.NodeID(1)
-  let basePort = nextBasePort()
-  let members = @[(nodeId: 1'u32, host: "127.0.0.1", basePort: basePort)]
+  let port = nextBasePort()
+  let members = @[(nodeId: 1'u32, host: "127.0.0.1", port: port)]
 
   let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
     nodeId: nodeId,
-    basePort: basePort,
+    port: port,
     host: "127.0.0.1",
     dataDir: storagePath,
     electionTimeoutLowerMs: 200,
