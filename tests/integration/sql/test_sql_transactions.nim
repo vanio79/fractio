@@ -74,7 +74,7 @@ proc makeTestEnv(suiteName: string): tuple[
 
   # Seed system tables via batch write for efficiency
   let nodeRec = NodeRecord(
-    nodeId: 1, host: "127.0.0.1", raftPort: raftBasePort.uint16,
+    nodeId: 1, host: "127.0.0.1", raftPort: raftPort.uint16,
     clientPort: clientPort.uint16, status: nsAlive
   )
   let metaGroupRec = GroupRecord(
