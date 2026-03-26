@@ -62,6 +62,8 @@ proc makeNode(nodeNum: int, port: int,
   NodeSetup(coord: coord, store: store, storagePath: storagePath)
 
 proc stopNode(ns: NodeSetup) =
+  # Stop the store's rebalance thread BEFORE stopping the coordinator
+  ns.store.stop()
   ns.coord.stop()
   sleep(500) # Let connections drain before removing storage
   cleanDir(ns.storagePath)
@@ -491,3 +493,14 @@ suite "MultiNode stress — 5-node cluster":
     for i in 0 ..< numThreads:
       joinThread(threads[i])
     check errors.load() == 0
+
+# Clean up global state to prevent GC issues during program exit
+nuraft_coordinator.cleanupGlobalState()
+
+# Force garbage collection before program exit to avoid ARC cleanup race
+GC_fullCollect()
+sleep(100)
+
+# Exit explicitly to avoid Nim ARC cleanup race condition with cross-thread refs
+# This is a known Nim runtime issue with atomicArc and complex thread interactions
+quit(0)

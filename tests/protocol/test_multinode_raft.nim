@@ -36,6 +36,8 @@ proc cleanDir(p: string) =
   try: createDir(p) except CatchableError: discard
 
 proc stopNode(ns: NodeSetup) =
+  # Stop the store's rebalance thread BEFORE stopping the coordinator
+  ns.store.stop()
   ns.coord.stop()
   cleanDir(ns.storagePath)
 

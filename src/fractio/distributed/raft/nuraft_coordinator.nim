@@ -147,6 +147,15 @@ proc clearModuleCallbacks*() {.gcsafe, raises: [].} =
     getPreferredLeaderCallback = nil
     onGroupCreatedCallback = nil
 
+# Forward declaration
+proc clearPendingMessages() {.gcsafe, raises: [].}
+
+proc cleanupGlobalState*() {.gcsafe, raises: [].} =
+  ## Clear all global state (call at program exit to avoid GC issues).
+  ## This must be called after all coordinators have been stopped.
+  clearModuleCallbacks()
+  clearPendingMessages()
+
 # ============================================================================
 # WriteBatch Serialization (Binary)
 # ============================================================================
@@ -337,8 +346,18 @@ proc deliverBufferedMessages(listener: MultiplexedListener,
           nuraftMultiplexedDeliverMessage(listener, cstring(data), csize_t(len))
         pendingMessages.del(groupId)
 
+proc clearPendingMessages() {.gcsafe, raises: [].} =
+  ## Clear all pending messages (called during shutdown)
+  {.cast(gcsafe).}:
+    withLock pendingMessagesLock:
+      pendingMessages.clear()
+
 proc deliverMessageToGroup(c: NuRaftCoordinator, groupId: GroupID,
     msgData: cstring, msgLen: csize_t) =
+  # Check if coordinator is still running
+  if not c.running.load(moRelaxed):
+    return
+
   var listener: MultiplexedListener
   var shouldBuffer = false
 
@@ -363,7 +382,7 @@ proc deliverMessageToGroup(c: NuRaftCoordinator, groupId: GroupID,
 proc deliverMessageWrapper(coordPtr: pointer, groupId: GroupID,
     msgData: cstring, msgLen: csize_t) {.gcsafe, cdecl.} =
   let c = cast[NuRaftCoordinator](coordPtr)
-  if c != nil:
+  if c != nil and c.running.load(moRelaxed):
     {.cast(gcsafe).}:
       c.deliverMessageToGroup(groupId, msgData, msgLen)
 
@@ -502,6 +521,14 @@ proc stop*(c: NuRaftCoordinator) =
   # This is critical: callbacks may still be executing in NuRaft threads
   sleep(500)
 
+  # CRITICAL: Stop transport FIRST before destroying instances
+  # The transport's coordinatorCb may still try to deliver messages
+  if c.transport != nil:
+    # Clear the callback first to prevent new message deliveries
+    c.transport.setCoordinatorCallback(nil)
+    # Now stop the server - this closes all connections and stops the accept loop
+    c.transport.stopServer()
+
   # Collect instances to destroy while holding lock, then release lock before destroying
   # This prevents deadlock where destruction waits for threads that need the lock
   var instancesToDestroy: seq[NuRaftGroupInstancePtr] = @[]
@@ -521,13 +548,15 @@ proc stop*(c: NuRaftCoordinator) =
       nuraftMultiplexedDestroy(inst.rpcContext)
     freeInstance(inst)
 
-  # Stop transport
+  # Fully destroy transport
   if c.transport != nil:
-    c.transport.stopServer()
     c.transport.destroy()
 
   if c.store != nil:
     c.store.close()
+
+  # Clear global pending messages (prevent GC access during final cleanup)
+  clearPendingMessages()
 
   deinitLock(c.groupsLock)
   deinitLock(c.groupCreationLock)
