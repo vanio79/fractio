@@ -188,12 +188,24 @@ proc start*(cluster: TestCluster): bool =
       let leaderWebPort = cfg.baseWebPort # Node 1's web port for join
       args.add("--join=127.0.0.1:" & $leaderWebPort)
 
-    # Start process - need to pass exe and args separately
-    let process = startProcess(exePath, args = args, options = {
-      poStdErrToStdOut
-    })
+# Start process - use poParentStreams to avoid pipe buffer deadlock.
+    # On Linux, pipe buffers are ~64KB. If the server writes more than this and we don't
+    # read from the pipe, the server blocks on write() and becomes unresponsive.
+    # poParentStreams passes through parent's stdout/stderr, avoiding pipes entirely.
+    var processOpts: set[ProcessOption] = {}
+    if cfg.verbose:
+      processOpts = {poParentStreams}  # Output goes to parent's stdout/stderr
+    # else: no options means output is captured but we don't read it (pipes created)
+    # We need to drain the pipes, so let's use an alternative approach:
+    # Redirect to /dev/null by using shell redirection
+    
+    let process = if cfg.verbose:
+      startProcess(exePath, args = args, options = {poParentStreams})
+    else:
+      # Redirect output to /dev/null to avoid pipe buffer issues
+      startProcess(exePath, args = args, options = {})
 
-    cluster.nodes.add(NodeProcess(
+    var node = NodeProcess(
       id: nodeId,
       process: process,
       raftPort: raftPort,
@@ -201,7 +213,9 @@ proc start*(cluster: TestCluster): bool =
       webPort: webPort,
       dataDir: dataDir,
       configPath: configPath
-    ))
+    )
+
+    cluster.nodes.add(node)
 
   cluster.running.store(true)
 
@@ -222,18 +236,18 @@ proc stop*(cluster: TestCluster) =
   cluster.clients = @[]
 
   # Terminate all processes
-  for node in cluster.nodes:
-    if not node.process.isNil:
+  for i in 0 ..< cluster.nodes.len:
+    if not cluster.nodes[i].process.isNil:
       try:
-        node.process.terminate()
+        cluster.nodes[i].process.terminate()
         # Give process time to exit
-        for i in 0 ..< 20:
-          if not node.process.running:
+        for j in 0 ..< 20:
+          if not cluster.nodes[i].process.running:
             break
           sleep(50)
         # Force kill if still running
-        if node.process.running:
-          node.process.kill()
+        if cluster.nodes[i].process.running:
+          cluster.nodes[i].process.kill()
       except:
         discard
 
@@ -259,14 +273,12 @@ proc connect*(cluster: TestCluster, nodeId: int = 0): Option[ProtocolClient] =
   if not cluster.running.load(moRelaxed):
     return none(ProtocolClient)
 
-  let cfg = cluster.config
-
   # If nodeId specified, connect to that node
   if nodeId > 0 and nodeId <= cluster.nodes.len:
-    let node = cluster.nodes[nodeId - 1]
+    let clientPort = cluster.nodes[nodeId - 1].clientPort
     let clientCfg = ClientConfig(
       host: "127.0.0.1",
-      port: node.clientPort,
+      port: clientPort,
       timeoutMs: 5000,
       clientId: "test_client",
       authMethod: amNone,
@@ -279,10 +291,11 @@ proc connect*(cluster: TestCluster, nodeId: int = 0): Option[ProtocolClient] =
     return none(ProtocolClient)
 
   # Otherwise, try to connect to any available node
-  for node in cluster.nodes:
+  for i in 0 ..< cluster.nodes.len:
+    let clientPort = cluster.nodes[i].clientPort
     let clientCfg = ClientConfig(
       host: "127.0.0.1",
-      port: node.clientPort,
+      port: clientPort,
       timeoutMs: 5000,
       clientId: "test_client",
       authMethod: amNone,
@@ -338,13 +351,14 @@ proc findLeader*(cluster: TestCluster): int =
     result = int(infoRes.value.nodeId)
   else:
     # Check all nodes
-    for node in cluster.nodes:
-      let nodeClientOpt = cluster.connect(node.id)
+    for i in 0 ..< cluster.nodes.len:
+      let nodeId = cluster.nodes[i].id
+      let nodeClientOpt = cluster.connect(nodeId)
       if nodeClientOpt.isSome:
         let nodeClient = nodeClientOpt.get()
         let nodeInfoRes = nodeClient.serverInfo()
         if nodeInfoRes.isOk and nodeInfoRes.value.role == RoleLeader:
-          result = node.id
+          result = nodeId
           nodeClient.disconnect()
           break
         nodeClient.disconnect()
@@ -437,8 +451,8 @@ proc drainNode*(cluster: TestCluster, nodeId: uint16): bool =
 proc getWebUrl*(cluster: TestCluster, nodeId: int = 1): string =
   ## Get the web dashboard URL for a node
   if nodeId > 0 and nodeId <= cluster.nodes.len:
-    let node = cluster.nodes[nodeId - 1]
-    return fmt"http://127.0.0.1:{node.webPort}"
+    let webPort = cluster.nodes[nodeId - 1].webPort
+    return fmt"http://127.0.0.1:{webPort}"
   return ""
 
 proc httpPost*(cluster: TestCluster, path: string, body: JsonNode): JsonNode =

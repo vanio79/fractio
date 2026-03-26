@@ -13,7 +13,6 @@
 import std/[net, strformat, atomics, locks]
 import posix
 import ../utils/socket_utils
-import ../core/types
 import ../distributed/raft/group_types
 import ./types
 import ./codec
@@ -297,7 +296,7 @@ proc send*(client: ProtocolClient,
     # For NOT_LEADER errors, parse the redirect info
     if code == ErrNotLeader:
       # Skip category (1 byte) + msgLen (2 bytes) + msg
-      let catR = readUint8(f.payload, pos)
+      discard readUint8(f.payload, pos) # category byte, unused
       let msgLenR = readUint16BE(f.payload, pos)
       if msgLenR.isOk:
         pos += int(msgLenR.value) # skip message
