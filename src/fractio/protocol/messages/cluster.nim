@@ -337,3 +337,214 @@ proc decodeDrainNodeResponse*(payload: string): Result[DrainNodeResponse,
   resp.message = msgR.value
 
   peOk(resp)
+
+# ---------------------------------------------------------------------------
+# CreateGroup (0x070A) — Directed group creation
+# ---------------------------------------------------------------------------
+# Meta leader sends CreateGroupRequest to the preferred leader node.
+# The preferred leader creates the group and wins election unopposed.
+# Then the preferred leader (or meta leader) sends JoinGroupRequest to other nodes.
+#
+# Wire format:
+# CreateGroup Request:
+#   [MessageType:2][groupId:16][preferredLeaderId:2][memberCount:2]
+#   [memberCount members, each:]
+#     [nodeId:2][host:1+N][raftPort:2][clientPort:2]
+# CreateGroup Response:
+#   [MessageType:2][success:1]
+#   On success: [groupId:16]
+#   On failure: [errorLen:2][error:N]
+#
+# JoinGroup Request:
+#   [MessageType:2][groupId:16][creatorNodeId:2][creatorHost:1+N][creatorPort:2]
+# JoinGroup Response:
+#   [MessageType:2][success:1]
+#   On success: [groupId:16]
+#   On failure: [errorLen:2][error:N]
+
+type
+  CreateGroupMember* = object
+    ## Member info for CreateGroupRequest
+    nodeId*: uint16
+    host*: string
+    raftPort*: uint16
+    clientPort*: uint16
+
+  CreateGroupRequest* = object
+    ## Request for a specific node to create a Raft group and become leader.
+    groupId*: string                 ## 16-byte ULID as binary string
+    preferredLeaderId*: uint16       ## Node that should become leader (usually the recipient)
+    members*: seq[CreateGroupMember] ## All group members
+
+  CreateGroupResponse* = object
+    success*: bool
+    groupId*: string ## 16-byte ULID as binary string (on success)
+    error*: string   ## Error message (on failure)
+
+  JoinGroupRequest* = object
+    ## Request for a node to join an existing Raft group.
+    groupId*: string       ## 16-byte ULID as binary string
+    creatorNodeId*: uint16 ## Node that created the group (to connect to)
+    creatorHost*: string   ## Host address of creator
+    creatorPort*: uint16   ## Raft port of creator
+
+  JoinGroupResponse* = object
+    success*: bool
+    groupId*: string ## 16-byte ULID as binary string (on success)
+    error*: string   ## Error message (on failure)
+
+proc encodeCreateGroupRequest*(req: CreateGroupRequest): string =
+  var buf = ""
+  buf.writeUint16BE(uint16(mtCreateGroup))
+  # GroupId is 16 bytes binary (no length prefix)
+  buf.add(req.groupId)
+  buf.writeUint16BE(req.preferredLeaderId)
+  buf.writeUint16BE(uint16(req.members.len))
+  for m in req.members:
+    buf.writeUint16BE(m.nodeId)
+    buf.writeBytes8(m.host)
+    buf.writeUint16BE(m.raftPort)
+    buf.writeUint16BE(m.clientPort)
+  buf
+
+proc decodeCreateGroupRequest*(payload: string): Result[CreateGroupRequest,
+    ProtocolError] =
+  var pos = 2 # skip MessageType
+  var req: CreateGroupRequest
+
+  # GroupId is 16 bytes binary
+  if pos + 16 > payload.len:
+    return peErr(ProtocolError(kind: peBoundsOverflow,
+        msg: "payload too short for groupId"))
+  req.groupId = payload[pos..pos+15]
+  pos += 16
+
+  let prefLeaderR = readUint16BE(payload, pos)
+  if prefLeaderR.isErr: return peErr(prefLeaderR.error)
+  req.preferredLeaderId = prefLeaderR.value
+
+  let memberCountR = readUint16BE(payload, pos)
+  if memberCountR.isErr: return peErr(memberCountR.error)
+  let memberCount = int(memberCountR.value)
+
+  req.members = newSeqOfCap[CreateGroupMember](memberCount)
+  for i in 0..<memberCount:
+    var m: CreateGroupMember
+
+    let nodeIdR = readUint16BE(payload, pos)
+    if nodeIdR.isErr: return peErr(nodeIdR.error)
+    m.nodeId = nodeIdR.value
+
+    let hostR = readBytes8(payload, pos)
+    if hostR.isErr: return peErr(hostR.error)
+    m.host = hostR.value
+
+    let raftPortR = readUint16BE(payload, pos)
+    if raftPortR.isErr: return peErr(raftPortR.error)
+    m.raftPort = raftPortR.value
+
+    let clientPortR = readUint16BE(payload, pos)
+    if clientPortR.isErr: return peErr(clientPortR.error)
+    m.clientPort = clientPortR.value
+
+    req.members.add(m)
+
+  peOk(req)
+
+proc encodeCreateGroupResponse*(resp: CreateGroupResponse): string =
+  var buf = ""
+  buf.writeUint16BE(uint16(mtCreateGroup))
+  buf.writeUint8(if resp.success: 0x01'u8 else: 0x00'u8)
+  if resp.success:
+    buf.add(resp.groupId)
+  else:
+    buf.writeBytes16(resp.error)
+  buf
+
+proc decodeCreateGroupResponse*(payload: string): Result[CreateGroupResponse,
+    ProtocolError] =
+  var pos = 2
+  var resp: CreateGroupResponse
+
+  let successR = readUint8(payload, pos)
+  if successR.isErr: return peErr(successR.error)
+  resp.success = successR.value != 0
+
+  if resp.success:
+    if pos + 16 > payload.len:
+      return peErr(ProtocolError(kind: peBoundsOverflow,
+          msg: "payload too short for groupId"))
+    resp.groupId = payload[pos..pos+15]
+  else:
+    let errR = readBytes16(payload, pos)
+    if errR.isErr: return peErr(errR.error)
+    resp.error = errR.value
+
+  peOk(resp)
+
+proc encodeJoinGroupRequest*(req: JoinGroupRequest): string =
+  var buf = ""
+  buf.writeUint16BE(uint16(mtJoinGroup))
+  # GroupId is 16 bytes binary (no length prefix)
+  buf.add(req.groupId)
+  buf.writeUint16BE(req.creatorNodeId)
+  buf.writeBytes8(req.creatorHost)
+  buf.writeUint16BE(req.creatorPort)
+  buf
+
+proc decodeJoinGroupRequest*(payload: string): Result[JoinGroupRequest,
+    ProtocolError] =
+  var pos = 2 # skip MessageType
+  var req: JoinGroupRequest
+
+  # GroupId is 16 bytes binary
+  if pos + 16 > payload.len:
+    return peErr(ProtocolError(kind: peBoundsOverflow,
+        msg: "payload too short for groupId"))
+  req.groupId = payload[pos..pos+15]
+  pos += 16
+
+  let creatorNodeIdR = readUint16BE(payload, pos)
+  if creatorNodeIdR.isErr: return peErr(creatorNodeIdR.error)
+  req.creatorNodeId = creatorNodeIdR.value
+
+  let creatorHostR = readBytes8(payload, pos)
+  if creatorHostR.isErr: return peErr(creatorHostR.error)
+  req.creatorHost = creatorHostR.value
+
+  let creatorPortR = readUint16BE(payload, pos)
+  if creatorPortR.isErr: return peErr(creatorPortR.error)
+  req.creatorPort = creatorPortR.value
+
+  peOk(req)
+
+proc encodeJoinGroupResponse*(resp: JoinGroupResponse): string =
+  var buf = ""
+  buf.writeUint16BE(uint16(mtJoinGroup))
+  buf.writeUint8(if resp.success: 0x01'u8 else: 0x00'u8)
+  if resp.success:
+    buf.add(resp.groupId)
+  else:
+    buf.writeBytes16(resp.error)
+  buf
+
+proc decodeJoinGroupResponse*(payload: string): Result[JoinGroupResponse,
+    ProtocolError] =
+  var pos = 2
+  var resp: JoinGroupResponse
+
+  let successR = readUint8(payload, pos)
+  if successR.isErr: return peErr(successR.error)
+  resp.success = successR.value != 0
+
+  if resp.success:
+    if pos + 16 > payload.len:
+      return peErr(ProtocolError(kind: peBoundsOverflow,
+          msg: "payload too short for groupId"))
+    resp.groupId = payload[pos..pos+15]
+  else:
+    let errR = readBytes16(payload, pos)
+    if errR.isErr: return peErr(errR.error)
+    resp.error = errR.value
+
+  peOk(resp)

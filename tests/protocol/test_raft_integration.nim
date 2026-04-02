@@ -15,6 +15,7 @@ import fractio/protocol/client
 import fractio/protocol/raft_store
 import fractio/protocol/raft_txn
 import fractio/protocol/txn_manager
+import fractio/protocol/mvcc_store
 import fractio/protocol/messages/kv
 import fractio/protocol/messages/txn as txnMsgs
 import fractio/protocol/messages/admin as adminMsgs
@@ -22,6 +23,8 @@ import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
+import fractio/distributed/sharedtimer/mock
+import fractio/core/timestamp_provider
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -67,6 +70,14 @@ proc makeRaftServer(port: int, storagePath: string): ProtocolServer =
   let srv = newProtocolServer(cfg)
   srv.raftStore = raftSt
   srv.raftCoord = coord
+
+# Initialize MvccTransactionStore for full MVCC semantics
+  let mockTimer = MockTimeProvider(currentTime: int64(getTime().toUnixFloat() *
+      1_000_000_000))
+  let tsProvider = newTimestampProvider(mockTimer, 1'u16)
+  let mvccStore = newMvccTransactionStore(raftSt, srv.txnMgr, tsProvider)
+  srv.mvccStore = mvccStore
+
   srv.start()
   sleep(80)
   srv

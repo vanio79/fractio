@@ -3,7 +3,7 @@
 # TCP transport that multiplexes all Raft groups over a single port.
 # Messages are prefixed with GroupID for demuxing.
 
-import std/[asyncdispatch, asyncnet, locks, nativesockets, net, os, hashes]
+import std/[asyncdispatch, asyncnet, locks, nativesockets, net, os, hashes, strutils]
 import std/atomics
 import std/typedthreads
 import std/tables as nimtables
@@ -17,7 +17,6 @@ import fractio/core/types as core_types
 import fractio/distributed/network/types as network_types
 import fractio/distributed/network/serialization
 import fractio/distributed/raft/group_types
-from fractio/distributed/raft/multiplexed_bindings import MultiplexedRpc, destroy
 
 # =============================================================================
 # Message Types for Internal Routing
@@ -111,9 +110,6 @@ type
     pendingResponses*: nimtables.Table[uint64, PendingResponse]
     pendingLock*: Lock
     nextMsgId*: uint64
-
-    # Callback context for C++ RPC
-    rpcContext*: MultiplexedRpc
 
     # Message queue for async processing
     messageQueue*: seq[tuple[groupId: GroupID, conn: PeerConnection, data: string]]
@@ -209,6 +205,8 @@ proc decodeRaftFrame(data: string): tuple[groupId: GroupID, payload: string] =
 proc connectToPeer*(t: MultiplexedRaftTransport, nodeId: core_types.NodeID,
     host: string, port: int): bool =
   ## Connect to a peer node.
+  echo "DEBUG connectToPeer: connecting to nodeId=", nodeId, " host=", host,
+      ":", port
   var conn: PeerConnection
   new(conn)
   conn.nodeId = nodeId
@@ -224,8 +222,12 @@ proc connectToPeer*(t: MultiplexedRaftTransport, nodeId: core_types.NodeID,
     waitFor conn.socket.connect(host, Port(port))
     withLock t.connectionsLock:
       t.connections[nodeId] = conn
+    echo "DEBUG connectToPeer: SUCCESS connected to nodeId=", nodeId, " host=",
+        host, ":", port
     return true
-  except:
+  except Exception as e:
+    echo "DEBUG connectToPeer: FAILED to connect to nodeId=", nodeId, " host=",
+        host, ":", port, " error=", e.msg
     return false
 
 proc disconnectPeer*(t: MultiplexedRaftTransport, nodeId: core_types.NodeID) =
@@ -274,9 +276,13 @@ proc sendSync*(t: MultiplexedRaftTransport, nodeId: core_types.NodeID,
   if conn == nil:
     # Try to create connection if host/port provided
     if host.len > 0 and port > 0:
+      echo "DEBUG sendSync: no existing connection to nodeId=", nodeId,
+          ", creating new one to ", host, ":", port
       var connected = false
       # Retry up to 3 times for startup race conditions
       for attempt in 0 ..< 3:
+        echo "DEBUG sendSync: connection attempt ", attempt + 1,
+            "/3 to nodeId=", nodeId
         if t.connectToPeer(nodeId, host, port):
           connected = true
           break
@@ -284,22 +290,28 @@ proc sendSync*(t: MultiplexedRaftTransport, nodeId: core_types.NodeID,
           sleep(50) # 50ms delay between retries
 
       if not connected:
+        echo "DEBUG sendSync: FAILED to connect to peer ", nodeId, " at ", host,
+            ":", port, " after 3 attempts"
         return false
 
       withLock t.connectionsLock:
         conn = t.connections.getOrDefault(nodeId, nil)
     else:
+      echo "DEBUG sendSync: FAILED - no host/port provided for peer ", nodeId
       return false
 
   if conn == nil or conn.syncSocket == nil:
+    echo "DEBUG sendSync: FAILED - conn or syncSocket is nil for peer ", nodeId
     return false
 
   withLock conn.sendLock:
     try:
       conn.syncSocket.send(data)
       conn.lastActivity = getTime()
+      echo "DEBUG sendSync: SUCCESS sent ", data.len, " bytes to peer ", nodeId
       return true
     except Exception as e:
+      echo "DEBUG sendSync: FAILED to send data to peer ", nodeId, ": ", e.msg
       return false
 
 # =============================================================================
@@ -358,6 +370,8 @@ proc handleMessage(t: MultiplexedRaftTransport, conn: PeerConnection,
   ## Handle a received message.
   try:
     let (groupId, payload) = decodeRaftFrame(data)
+    # Debug output disabled
+    # echo "DEBUG: handleMessage received groupId=", groupId, " payloadLen=", payload.len
 
     # If we have a coordinator callback, deliver directly
     if t.coordinatorCb != nil:
@@ -424,6 +438,8 @@ proc readOneMessage(client: Socket, t: MultiplexedRaftTransport): bool =
     # No data available - return true so caller continues polling
     return true
 
+  echo "DEBUG readOneMessage: data available on socket, reading header..."
+
   try:
     # Read frame header (magic + groupId = 20 bytes)
     var headerBuf = newString(FrameHeaderSize)
@@ -471,10 +487,12 @@ proc readOneMessage(client: Socket, t: MultiplexedRaftTransport): bool =
         return false
 
     # Deliver to coordinator
+    echo "DEBUG readOneMessage: successfully read message groupId=", groupId,
+        " payloadLen=", payloadLen
     if t.coordinatorCb != nil:
       t.coordinatorCb(groupId, cstring(payload), csize_t(payloadLen))
     else:
-      discard
+      echo "DEBUG readOneMessage: WARNING - no coordinatorCb set!"
 
     return true
   except:
@@ -496,6 +514,7 @@ proc acceptLoop(t: MultiplexedRaftTransport) {.thread.} =
       if listenReady > 0:
         var client: Socket
         t.serverSocket.accept(client)
+        echo "DEBUG acceptLoop: accepted new connection from client"
         # Set non-blocking mode for polling
         setBlocking(client.getFd(), false)
         activeClients.add(client)
@@ -529,23 +548,28 @@ proc acceptLoop(t: MultiplexedRaftTransport) {.thread.} =
 proc startServer*(t: MultiplexedRaftTransport): bool =
   ## Start the TCP server.
   if t.serverRunning.load():
+    echo "DEBUG startServer: server already running on port ", t.port
     return true
 
   try:
+    echo "DEBUG startServer: creating socket for port ", t.port
     t.serverSocket = newSocket()
     t.serverSocket.setSockOpt(OptReuseAddr, true)
     t.serverSocket.bindAddr(Port(t.port), t.host)
     t.serverSocket.listen()
     t.serverRunning.store(true)
+    echo "DEBUG startServer: SUCCESS - server listening on ", t.host, ":", t.port
 
     # Start accept thread
     createThread(t.acceptThread, proc(p: pointer) {.thread.} =
       let transport = cast[MultiplexedRaftTransport](p)
+      echo "DEBUG acceptThread: starting for port ", transport.port
       transport.acceptLoop()
     , cast[pointer](t))
 
     return true
-  except:
+  except Exception as e:
+    echo "DEBUG startServer: FAILED to start server on port ", t.port, ": ", e.msg
     return false
 
 proc stopServer*(t: MultiplexedRaftTransport) =
@@ -618,9 +642,6 @@ proc unregisterGroupHandler*(t: MultiplexedRaftTransport, groupId: GroupID) =
 proc destroy*(t: MultiplexedRaftTransport) =
   ## Clean up the transport.
   t.stopServer()
-
-  if t.rpcContext != nil:
-    t.rpcContext.destroy()
 
   deinitLock(t.connectionsLock)
   deinitLock(t.handlersLock)

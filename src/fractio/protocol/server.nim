@@ -28,6 +28,7 @@ import ./messages/kv
 import ./messages/txn as txnMsgs
 import ./messages/admin as adminMsgs
 import ./messages/cluster as clusterMsgs
+import ./client
 import ./messages/space as spaceMsgs
 import ./txn_manager
 import ./raft_store
@@ -38,6 +39,7 @@ import ../utils/socket_utils
 import ../distributed/sharedtimer
 import ../distributed/raft/nuraft_coordinator
 import ../distributed/raft/multigroup_types
+import ../distributed/raft/group_types
 import ../distributed/raft/group_types as rangeTypes
 import ../distributed/sharedtimer/udptransport as udpXport
 import ../distributed/meta/system_tables
@@ -604,10 +606,10 @@ proc getLeaderRedirect(server: ProtocolServer,
       except CatchableError:
         discard
 
-  if leaderId <= 0:
+  if leaderId <= 0 or leaderId == int32(server.config.serverId):
     try:
       {.cast(gcsafe).}:
-        debug("getLeaderRedirect: no leader found", {"groupId": $groupId,
+        debug("getLeaderRedirect: no useful leader found", {"groupId": $groupId,
             "leaderId": $leaderId}.toTable)
     except:
       discard
@@ -1086,19 +1088,28 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
       sendError(conn, requestId, ErrInternal, ErrCatKV, res.error.msg)
 
   of uint16(mtScan):
+    echo "DEBUG server: mtScan received startKey=", payload.len
     let reqR = decodeScanRequest(payload)
     if reqR.isErr:
       sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
       return
     let req = reqR.value
+    echo "DEBUG server: mtScan startKey='", req.startKey, "' endKey='",
+        req.endKey, "' txnId=", req.txnId
 
     if not server.mvccStore.isNil:
       let res = if req.txnId != 0:
                   server.mvccStore.txnScan(req.txnId, req.startKey, req.endKey, req.limit)
                 else:
+                  echo "DEBUG server: calling latestScan"
                   server.mvccStore.latestScan(req.startKey, req.endKey, req.limit)
 
+      echo "DEBUG server: mtScan result isOk=", res.isOk, " len=", (
+        if res.isOk: res.value.len else: 0)
       if res.isOk:
+        echo "DEBUG server: mtScan returning entries..."
+        for i, p in res.value:
+          echo "DEBUG server: mtScan entry ", i, " key='", p.key, "'"
         let currentTs = server.mvccStore.getCurrentTimestamp()
         var scanPairs = newSeq[ScanPair](res.value.len)
         for i, p in res.value:
@@ -1455,6 +1466,171 @@ proc handleBuiltinCluster(server: ProtocolServer, conn: ClientConnection,
     else:
       sendFrame(conn, encodeDropSpaceResponse(resp), requestId)
 
+  of uint16(mtCreateGroup):
+    # Handle CreateGroup - directed group creation request
+    # The meta leader sends this to the preferred leader node
+    let reqR = clusterMsgs.decodeCreateGroupRequest(payload)
+    if reqR.isErr:
+      sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
+      return
+    let req = reqR.value
+
+    # Check if we have the raftStore
+    if server.raftStore.isNil:
+      let resp = clusterMsgs.CreateGroupResponse(
+        success: false,
+        error: "raft store not initialized"
+      )
+      sendFrame(conn, clusterMsgs.encodeCreateGroupResponse(resp), requestId)
+      return
+
+    # Convert groupId bytes to GroupID
+    let groupId = groupIDFromULID(ulidFromBytes(req.groupId))
+
+    # Check if group already exists
+    if server.raftStore.coordinator.hasGroup(groupId):
+      let resp = clusterMsgs.CreateGroupResponse(
+        success: true,
+        groupId: req.groupId
+      )
+      sendFrame(conn, clusterMsgs.encodeCreateGroupResponse(resp), requestId)
+      return
+
+    # Build member list for coordinator
+    var nuraftMembers: seq[tuple[nodeId: uint32, host: string, port: int]] = @[]
+    for m in req.members:
+      nuraftMembers.add((nodeId: uint32(m.nodeId), host: m.host, port: int(m.raftPort)))
+
+    # Create the group - this node becomes leader by winning unopposed election
+    var resp: clusterMsgs.CreateGroupResponse
+    try:
+      let ok = server.raftStore.coordinator.createAndStartGroup(
+        groupId, nuraftMembers, uint32(req.preferredLeaderId))
+      if ok:
+        server.raftStore.registerGroup(groupId)
+        # Wait for election to complete
+        sleep(200)
+
+        # CRITICAL: Send JoinGroup RPCs to all other members so they create their local instances
+        # Without this, the group only exists on this node and can't form quorum
+        let myNodeId = server.config.serverId
+        for m in req.members:
+          if uint32(m.nodeId) == uint32(req.preferredLeaderId):
+            continue # Skip ourselves (we just created it)
+          if m.host.len == 0:
+            continue
+          try:
+            let joinReq = clusterMsgs.JoinGroupRequest(
+              groupId: req.groupId,
+              creatorNodeId: uint16(req.preferredLeaderId),
+              creatorHost: server.config.host,
+              creatorPort: uint16(server.raftCoord.port)
+            )
+            let cfg = ClientConfig(
+              host: m.host,
+              port: int(m.clientPort),
+              timeoutMs: 5000
+            )
+            let pc = newProtocolClient(cfg)
+            let cr = pc.connect()
+            if cr.isOk:
+              defer: pc.disconnect()
+              discard pc.joinGroup(joinReq)
+          except CatchableError:
+            discard # Ignore errors - best effort
+
+        resp = clusterMsgs.CreateGroupResponse(
+          success: true,
+          groupId: req.groupId
+        )
+      else:
+        resp = clusterMsgs.CreateGroupResponse(
+          success: false,
+          error: "failed to create Raft group"
+        )
+    except Exception as e:
+      resp = clusterMsgs.CreateGroupResponse(
+        success: false,
+        error: "exception: " & e.msg
+      )
+
+    sendFrame(conn, clusterMsgs.encodeCreateGroupResponse(resp), requestId)
+
+  of uint16(mtJoinGroup):
+    # Handle JoinGroup - request to join an existing Raft group
+    # The preferred leader sends this to other member nodes
+    let reqR = clusterMsgs.decodeJoinGroupRequest(payload)
+    if reqR.isErr:
+      sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
+      return
+    let req = reqR.value
+
+    # Check if we have the raftStore
+    if server.raftStore.isNil:
+      let resp = clusterMsgs.JoinGroupResponse(
+        success: false,
+        error: "raft store not initialized"
+      )
+      sendFrame(conn, clusterMsgs.encodeJoinGroupResponse(resp), requestId)
+      return
+
+    # Convert groupId bytes to GroupID
+    let groupId = groupIDFromULID(ulidFromBytes(req.groupId))
+
+    # Check if group already exists
+    if server.raftStore.coordinator.hasGroup(groupId):
+      let resp = clusterMsgs.JoinGroupResponse(
+        success: true,
+        groupId: req.groupId
+      )
+      sendFrame(conn, clusterMsgs.encodeJoinGroupResponse(resp), requestId)
+      return
+
+    # Build member list - we join the existing group created by creatorNodeId
+    # For joining, we need all members info (we get creator info from request,
+    # but need to lookup our own and other members' info)
+    var nuraftMembers: seq[tuple[nodeId: uint32, host: string, port: int]] = @[]
+
+    # Add the creator node
+    nuraftMembers.add((nodeId: uint32(req.creatorNodeId),
+                       host: req.creatorHost,
+                       port: int(req.creatorPort)))
+
+    # Add ourselves
+    let myNodeId = server.config.serverId
+    let myRaftPort = server.raftCoord.port
+    nuraftMembers.add((nodeId: uint32(myNodeId),
+                       host: server.config.host,
+                       port: myRaftPort))
+
+    echo "DEBUG mtJoinGroup: myNodeId=", myNodeId, " creatorNodeId=", req.creatorNodeId,
+         " creatorHost=", req.creatorHost, " creatorPort=", req.creatorPort,
+         " myHost=", server.config.host, " myRaftPort=", myRaftPort
+
+    # Create the group - we join as a follower
+    var resp: clusterMsgs.JoinGroupResponse
+    try:
+      let ok = server.raftStore.coordinator.createAndStartGroup(
+        groupId, nuraftMembers, uint32(req.creatorNodeId))
+      if ok:
+        server.raftStore.registerGroup(groupId)
+        resp = clusterMsgs.JoinGroupResponse(
+          success: true,
+          groupId: req.groupId
+        )
+      else:
+        resp = clusterMsgs.JoinGroupResponse(
+          success: false,
+          error: "failed to join Raft group"
+        )
+    except Exception as e:
+      resp = clusterMsgs.JoinGroupResponse(
+        success: false,
+        error: "exception: " & e.msg
+      )
+
+    sendFrame(conn, clusterMsgs.encodeJoinGroupResponse(resp), requestId)
+
   else:
     sendError(conn, requestId, ErrProtocol, ErrCatSystem,
       &"unknown cluster message type 0x{typeVal:04X}")
@@ -1650,7 +1826,7 @@ proc loadClusterState(dataDir: string): Option[JsonNode] =
 
 proc addPeerToRaft*(server: ProtocolServer, peerNodeId: uint32,
                      host: string, raftPort: int) =
-  ## Dynamically add a peer to the NuRaft coordinator and all existing groups.
+  ## Dynamically add a peer to the NuRaft coordinator for system groups.
   ## Called when a new node joins the cluster.
   let coord = server.raftCoord
   if coord.isNil: return
@@ -1658,14 +1834,9 @@ proc addPeerToRaft*(server: ProtocolServer, peerNodeId: uint32,
   # Register peer info for future group creation
   coord.peerInfo[peerNodeId] = (host: host, port: raftPort)
 
-  # Add the peer as a server to all existing NuRaft groups
-  var gids: seq[GroupID]
-  withLock coord.groupsLock:
-    for gid in coord.groups.keys:
-      gids.add(gid)
-
-  for gid in gids:
-    discard coord.addServerToGroup(gid, peerNodeId, host, raftPort)
+  # Add the peer as a server to the meta and default data groups only
+  discard coord.addServerToGroup(META_GROUP_ID, peerNodeId, host, raftPort)
+  discard coord.addServerToGroup(DATA_GROUP_START_ID, peerNodeId, host, raftPort)
 
   # Persist membership so restarts can rejoin without --join
   server.saveClusterState()
@@ -2020,6 +2191,11 @@ proc stop*(server: ProtocolServer) {.raises: [].} =
     if server.acceptThreadCount.load() == 0:
       break
     sleep(100)
+
+  # Stop the Raft coordinator if it was set
+  if not server.raftCoord.isNil:
+    try: server.raftCoord.stop()
+    except Exception as e: server.logger.logError("RaftCoord stop failed: " & e.msg)
 
   # Stop and join global rebalance monitor thread
   gRebalRunning.store(false)

@@ -458,19 +458,25 @@ proc execCreateTable(op: PlanOp, ctx: ExecutorContext): ExecResult =
       return okResult("table already exists (IF NOT EXISTS)")
     return errorResult(&"table '{op.ctName}' already exists")
 
-  # Resolve space name to spaceId (within transaction snapshot)
+# Resolve space name to spaceId
+  # Note: We do NOT use the transaction's read timestamp for this lookup.
+  # CREATE SPACE writes the space record, and we need to see that write immediately.
+  # Using the transaction's read timestamp would cause us to not see the newly created space.
   var tableValue = op.ctValue
   if op.ctSpaceName.isSome:
     let spaceName = op.ctSpaceName.get()
     let sStart = encodeTableKey(SYS_SPACES_TABLE_ID, "")
     let sEnd = encodeTableKey(SYS_SPACES_TABLE_ID + 1, "")
-    let sScan = ctx.client.kvScan(sStart, sEnd, 0, txnId = internalTxnId,
-        readTimestamp = internalReadTimestamp)
+    # Use a fresh scan WITHOUT the transaction's read timestamp to see recent writes
+    echo "DEBUG: scanning sys.spaces for '", spaceName, "' txnReadTs=", internalReadTimestamp
+    let sScan = ctx.client.kvScan(sStart, sEnd, 0, txnId = 0, readTimestamp = 0)
+    echo "DEBUG: scan returned ", sScan.val.len, " entries"
     var spaceId: ULID
     var spaceFound = false
     if sScan.isOk:
       for entry in sScan.val:
         let rec = decodeSpaceRecord(entry.value)
+        echo "DEBUG: found space '", rec.name, "' spaceId=", $rec.spaceId
         if rec.name == spaceName:
           spaceId = rec.spaceId
           spaceFound = true

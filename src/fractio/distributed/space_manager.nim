@@ -28,6 +28,8 @@
 import std/[tables, options, os, times, sequtils, strutils]
 import ../protocol/raft_store
 import ../protocol/messages/space
+import ../protocol/messages/cluster as clusterMsgs
+import ../protocol/client
 import ../distributed/raft/nuraft_coordinator
 import ../distributed/raft/group_types
 import ../distributed/meta/system_tables
@@ -191,9 +193,11 @@ proc computeGroupPlacement(nodeIds: seq[uint32], replicas: int,
   result = newSeqOfCap[GroupRecord](groupCount)
 
   for g in 0 ..< groupCount:
-    # Use deterministic ULID derived from spaceId + group index
-    # This ensures predictable port assignment and avoids collisions
-    let groupId = deriveULID(spaceId, g)
+    # Generate a new random ULID for each group
+    # This ensures each group has a unique ID that won't collide with others
+    var groupId: ULID
+    {.cast(gcsafe).}:
+      groupId = genULID()
 
     # Compute members using ring algorithm
     var members: seq[GroupReplicaBin] = @[]
@@ -207,7 +211,7 @@ proc computeGroupPlacement(nodeIds: seq[uint32], replicas: int,
     result.add(GroupRecord(
       groupId: groupId,
       spaceId: spaceId,
-      preferredLeader: members[0].nodeId,
+      preferredLeader: members[0].nodeId, # First member is preferred leader
       leader: 0,
       replicas: members
     ))
@@ -364,9 +368,108 @@ proc createSpace*(sm: SpaceManager, req: CreateSpaceRequest): CreateSpaceRespons
         )
     timedLog("group records written")
 
-    # 7. Groups are created asynchronously via onGroupMetadataApplied callback
-    #    when the Raft entries are committed. We return immediately because
-    #    waiting would block the handler thread.
+# 7. Send directed CreateGroup/JoinGroup RPCs to create Raft groups
+    # CRITICAL: NuRaft ASIO requires all members to be configured together at creation time.
+    # Only the preferred leader should create the group with ALL members.
+    # Other members will join via the CreateGroup RPC handler on the preferred leader.
+    timedLog("creating Raft groups via directed RPCs")
+    
+    # Build a map of nodeId -> clientPort from sys.nodes
+    var nodeClientPorts = initTable[uint32, int]()
+    for n in nodes:
+      nodeClientPorts[n.nodeId] = int(n.clientPort)
+    
+    try:
+      let coord = sm.store.coordinator
+      let myNodeId = int(coord.nodeId)
+
+      for gr in groupRecs:
+        let groupId = groupIDFromULID(gr.groupId)
+        let preferredLeader = gr.preferredLeader
+
+        # Build member list
+        var createMembers: seq[clusterMsgs.CreateGroupMember] = @[]
+        var nuraftMembers: seq[tuple[nodeId: uint32, host: string, port: int]] = @[]
+        for rep in gr.replicas:
+          let peerInfo = coord.peerInfo.getOrDefault(rep.nodeId,
+              (host: coord.host, port: coord.port))
+          let clientPort = nodeClientPorts.getOrDefault(rep.nodeId, peerInfo.port + 100)
+          createMembers.add(clusterMsgs.CreateGroupMember(
+            nodeId: uint16(rep.nodeId),
+            host: peerInfo.host,
+            raftPort: uint16(peerInfo.port),
+            clientPort: uint16(clientPort)
+          ))
+          nuraftMembers.add((nodeId: uint32(rep.nodeId), host: peerInfo.host,
+              port: int(peerInfo.port)))
+
+        let createReq = clusterMsgs.CreateGroupRequest(
+          groupId: groupIDToBytes(groupId),
+          preferredLeaderId: uint16(preferredLeader),
+          members: createMembers
+        )
+
+        if preferredLeader == uint32(myNodeId):
+          # We are the preferred leader - create the group with ALL members
+          let ok = coord.createAndStartGroup(groupId, nuraftMembers, preferredLeader)
+          if ok:
+            sm.store.registerGroup(groupId)
+            # CRITICAL: Stagger group creation to avoid identical election timeout seeds
+            # NuRaft's seed = time * id_, so groups created at the same microsecond
+            # on the same node get identical seeds → identical timeouts → split votes
+            sleep(100)
+            
+            # Now send JoinGroup RPCs to all other members so they create their local instances
+            for rep in gr.replicas:
+              let memberId = rep.nodeId
+              if memberId == preferredLeader:
+                continue
+              let memberPeerInfo = coord.peerInfo.getOrDefault(memberId, (host: "", port: 0))
+              let memberClientPort = nodeClientPorts.getOrDefault(memberId, memberPeerInfo.port + 100)
+              if memberPeerInfo.host.len > 0:
+                try:
+                  let joinReq = clusterMsgs.JoinGroupRequest(
+                    groupId: groupIDToBytes(groupId),
+                    creatorNodeId: uint16(preferredLeader),
+                    creatorHost: coord.host,
+                    creatorPort: uint16(coord.port)
+                  )
+                  let cfg = ClientConfig(
+                    host: memberPeerInfo.host,
+                    port: memberClientPort,
+                    timeoutMs: 5000
+                  )
+                  let pc = newProtocolClient(cfg)
+                  let cr = pc.connect()
+                  if cr.isOk:
+                    defer: pc.disconnect()
+                    discard pc.joinGroup(joinReq)
+                    # Stagger after sending JoinGroup to allow time seed to differ
+                    sleep(50)
+                except CatchableError:
+                  discard
+        else:
+          # We are NOT the preferred leader - send CreateGroup RPC to preferred leader
+          # The preferred leader will create the group and send us a JoinGroup RPC
+          let peerInfo = coord.peerInfo.getOrDefault(preferredLeader, (host: "", port: 0))
+          let clientPort = nodeClientPorts.getOrDefault(preferredLeader, peerInfo.port + 100)
+          if peerInfo.host.len > 0:
+            try:
+              let cfg = ClientConfig(
+                host: peerInfo.host,
+                port: clientPort,
+                timeoutMs: 5000
+              )
+              let pc = newProtocolClient(cfg)
+              let cr = pc.connect()
+              if cr.isOk:
+                defer: pc.disconnect()
+                discard pc.createGroup(createReq)
+            except CatchableError:
+              discard
+    except Exception:
+      # Ignore errors during group creation - groups will be created on demand
+      discard
 
     # 8. Write space record to sys.spaces via Raft
     timedLog("writing space record")

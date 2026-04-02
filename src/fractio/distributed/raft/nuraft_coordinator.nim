@@ -18,6 +18,7 @@ import std/strutils
 import std/tables as nimtables
 import std/times
 import std/typedthreads
+import std/algorithm
 import std/logging
 
 import fractio/core/types as core_types
@@ -29,6 +30,7 @@ import fractio/distributed/raft/multiplexed_transport
 import fractio/utils/binary
 import fractio/storage/wisckey_backend
 import fractio/storage/backend
+from fractio/distributed/raft/multiplexed_bindings import deliverMessage
 
 # ============================================================================
 # Types
@@ -42,11 +44,13 @@ type
     smgr*: NuRaftSMgr
     ## Per-group RPC context
     rpcContext*: MultiplexedContext
+    ## Listener handle (for cleanup)
+    listener*: MultiplexedListener
     ## Back-reference to coordinator (raw pointer to break cycles)
     coordPtr*: pointer
     ## Set to true during shutdown to prevent callbacks from accessing freed memory
     stopped*: bool
-    ## Set to true after nuraftMultiplexedListen() is called - before that, buffer messages
+    ## Set to true after listener is set up - before that, buffer messages
     ## Uses atomic for thread-safe access from transport accept thread
     ready*: Atomic[bool]
 
@@ -100,6 +104,10 @@ type
     nextTimerId*: int32
     timerLock*: Lock
 
+    ## Pending messages for groups that aren't ready yet
+    pendingMessages*: nimtables.Table[GroupID, seq[tuple[data: string, len: int]]]
+    pendingMessagesLock*: Lock
+
 # Use C malloc/free to avoid atomicArc cross-thread dealloc crashes.
 proc c_malloc(size: csize_t): pointer {.importc: "malloc",
     header: "<stdlib.h>".}
@@ -147,14 +155,10 @@ proc clearModuleCallbacks*() {.gcsafe, raises: [].} =
     getPreferredLeaderCallback = nil
     onGroupCreatedCallback = nil
 
-# Forward declaration
-proc clearPendingMessages() {.gcsafe, raises: [].}
-
 proc cleanupGlobalState*() {.gcsafe, raises: [].} =
   ## Clear all global state (call at program exit to avoid GC issues).
   ## This must be called after all coordinators have been stopped.
   clearModuleCallbacks()
-  clearPendingMessages()
 
 # ============================================================================
 # WriteBatch Serialization (Binary)
@@ -225,8 +229,6 @@ proc nuraftCommitCb(ctx: pointer, logIdx: uint64,
 
 proc nuraftEventCb(ctx: pointer, eventType: int32,
     leaderId: int32, term: uint64) {.cdecl, gcsafe.} =
-  discard leaderId
-  discard term
   if ctx == nil: return
 
   {.cast(gcsafe).}:
@@ -234,6 +236,12 @@ proc nuraftEventCb(ctx: pointer, eventType: int32,
     if inst.stopped: return
     let coord = cast[NuRaftCoordinator](inst.coordPtr)
     if coord == nil: return
+
+    # Log all events: 1=became leader, 2=became follower, 3=leader changed
+    echo "DEBUG nuraftEventCb: groupId=", inst.groupId, " eventType=", eventType,
+         " (1=leader, 2=follower, 3=leaderChange) leaderId=", leaderId,
+             " term=", term,
+         " myNodeId=", coord.nodeId.uint32
 
     if eventType == NuRaftBecomeLeader:
       if onLeaderChanged != nil and coord.kvStorePtr != nil:
@@ -246,20 +254,27 @@ proc nuraftEventCb(ctx: pointer, eventType: int32,
 proc multiplexedSendCb(ctx: pointer, groupIdBytes: cstring, srcNodeId: int32,
     dstNodeId: int32, msgData: cstring, msgLen: csize_t): int32 {.cdecl, gcsafe.} =
   if ctx == nil or msgData == nil or msgLen == 0:
+    echo "DEBUG multiplexedSendCb: EARLY RETURN ctx=", (if ctx == nil: "NIL" else: "OK"),
+         " msgData=", (if msgData == nil: "NIL" else: "OK"), " msgLen=", msgLen
     return -1
 
   let inst = cast[NuRaftGroupInstancePtr](ctx)
   if inst.stopped:
+    echo "DEBUG multiplexedSendCb: EARLY RETURN inst.stopped=true groupId=", inst.groupId
     return -1
 
   let coord = cast[NuRaftCoordinator](inst.coordPtr)
   if coord == nil or coord.transport == nil:
+    echo "DEBUG multiplexedSendCb: EARLY RETURN coord=", (if coord == nil: "NIL" else: "OK"),
+         " transport=", (if coord == nil or coord.transport ==
+             nil: "NIL" else: "OK")
     return -1
-
 
   # Use the instance's groupId (C++ passes a placeholder of zeros)
   let groupId = inst.groupId
   let ulid = groupIDToULID(groupId)
+  echo "DEBUG multiplexedSendCb: groupId=", groupId, " srcNodeId=", srcNodeId,
+       " dstNodeId=", dstNodeId, " msgLen=", msgLen
 
   # Look up peer info
   var peerHost = ""
@@ -270,6 +285,11 @@ proc multiplexedSendCb(ctx: pointer, groupIdBytes: cstring, srcNodeId: int32,
       (peerHost, peerPort) = coord.peerInfo[uint32(dstNodeId)]
 
   if peerHost == "":
+    echo "DEBUG: multiplexedSendCb PEER NOT FOUND groupId=", inst.groupId,
+        " dstNodeId=", dstNodeId
+    echo "DEBUG:   available peerInfo keys: "
+    for k, v in coord.peerInfo:
+      echo "DEBUG:     ", k, " -> ", v
     return -1
 
   # Build frame: magic(4) + groupId(16) + length(4) + payload
@@ -304,80 +324,193 @@ proc multiplexedSendCb(ctx: pointer, groupIdBytes: cstring, srcNodeId: int32,
   let corePeerId = core_types.NodeID("n" & $dstNodeId)
 
   # Use synchronous send (for callback context) - pass host/port to create connection if needed
-  if coord.transport.sendSync(corePeerId, frame, peerHost, peerPort):
+  let sendResult = coord.transport.sendSync(corePeerId, frame, peerHost, peerPort)
+  echo "DEBUG multiplexedSendCb: sendSync result=", sendResult, " peerHost=",
+      peerHost, ":", peerPort
+  if sendResult:
     return 0
   return -1
 
-# Timer callbacks (simplified - handled internally by C++ timer thread)
-proc multiplexedScheduleTimerCb(ctx: pointer, groupIdHash: int32,
-    timerType: int32, delayMs: int32) {.cdecl, gcsafe.} =
-  discard
+# ============================================================================
+# Global Timer Management
+# ============================================================================
 
-proc multiplexedCancelTimerCb(ctx: pointer, groupIdHash: int32,
-    timerId: int32) {.cdecl, gcsafe.} =
-  discard
+# Global timer management (simpler than per-coordinator)
+# Key is (timerId, rpcCtx) to avoid collisions between groups
+var gActiveTimers: nimtables.Table[tuple[timerId: int32, rpcCtx: pointer],
+    tuple[expireNs: int64]]
+var gTimerLock: Lock
+var gTimerThread: Thread[void]
+var gTimerThreadRunning: Atomic[bool]
+var gTimerThreadRefCount: int32 # Reference count for timer thread
+
+initLock(gTimerLock)
+gTimerThreadRunning.store(false)
+gTimerThreadRefCount = 0
+
+# Timer callbacks - actually schedule timers
+# The ctx is the rpcContext (MultiplexedContext) pointer
+proc multiplexedScheduleTimerCb(ctx: pointer, timerId: int32,
+    delayMs: int32) {.cdecl, gcsafe.} =
+  # ctx is the rpcContext (MultiplexedContext) pointer
+  let rpcCtx = cast[MultiplexedContext](ctx)
+  if rpcCtx.isNil:
+    echo "DEBUG ScheduleTimer: rpcCtx is nil!"
+    return
+  echo "DEBUG ScheduleTimer: timerId=", timerId, " delayMs=", delayMs, " ctx=", ctx.repr
+
+  # Schedule actual timer in Nim - when it fires, call nuraftMpInvokeTimer
+  {.cast(gcsafe).}:
+    withLock gTimerLock:
+      let nowNs = int64(getTime().toUnixFloat() * 1_000_000_000)
+      let expireNs = nowNs + delayMs.int64 * 1_000_000
+      # Use (timerId, ctx) as key to avoid collisions between groups
+      gActiveTimers[(timerId: timerId, rpcCtx: ctx)] = (expireNs: expireNs)
+      echo "DEBUG ScheduleTimer: added timer ", timerId, " gActiveTimers.len=",
+          gActiveTimers.len
+
+proc multiplexedCancelTimerCb(ctx: pointer, timerId: int32) {.cdecl, gcsafe.} =
+  echo "DEBUG CancelTimer: timerId=", timerId
+  {.cast(gcsafe).}:
+    withLock gTimerLock:
+      gActiveTimers.del((timerId: timerId, rpcCtx: ctx))
+
+# Timer thread that polls for expired timers and invokes them
+proc timerThreadProc() {.thread, gcsafe.} =
+  echo "DEBUG TimerThread: started"
+  while gTimerThreadRunning.load(moRelaxed):
+    sleep(5) # 5ms poll interval
+
+    # Collect expired timers under lock
+    var expiredTimers: seq[tuple[timerId: int32, rpcCtx: pointer]] = @[]
+    {.cast(gcsafe).}:
+      withLock gTimerLock:
+        let nowNs = int64(getTime().toUnixFloat() * 1_000_000_000)
+        let activeLen = gActiveTimers.len
+        if activeLen > 0:
+          echo "DEBUG TimerThread: checking ", activeLen, " active timers"
+        # Collect all expired timers
+        for key, entry in gActiveTimers:
+          if entry.expireNs <= nowNs:
+            expiredTimers.add(key)
+        # Delete expired timers
+        for key in expiredTimers:
+          gActiveTimers.del(key)
+
+    # Invoke timers WITHOUT holding the lock to avoid deadlock
+    # (NuRaft's task->execute() may call back into scheduleTimerCb)
+    for item in expiredTimers:
+      echo "DEBUG TimerThread: invoking timer ", item.timerId
+      try:
+        let rpcCtx = cast[MultiplexedContext](item.rpcCtx)
+        let result = nuraftMpInvokeTimer(rpcCtx, item.timerId)
+        echo "DEBUG TimerThread: invoke timer ", item.timerId, " result=", result
+      except:
+        echo "DEBUG TimerThread: exception invoking timer ", item.timerId
+
+  echo "DEBUG TimerThread: stopped"
+
+proc startTimerThread() =
+  {.cast(gcsafe).}:
+    withLock gTimerLock:
+      inc gTimerThreadRefCount
+      echo "DEBUG startTimerThread: refCount=", gTimerThreadRefCount
+      if not gTimerThreadRunning.load(moRelaxed):
+        gTimerThreadRunning.store(true)
+        createThread(gTimerThread, timerThreadProc)
+
+proc stopTimerThread() =
+  {.cast(gcsafe).}:
+    withLock gTimerLock:
+      echo "DEBUG stopTimerThread: refCount=", gTimerThreadRefCount
+      if gTimerThreadRefCount > 0:
+        dec gTimerThreadRefCount
+        if gTimerThreadRefCount == 0:
+          # Last reference - actually stop the thread
+          gTimerThreadRunning.store(false)
+  # Join outside lock to avoid deadlock
+  if gTimerThreadRefCount == 0:
+    joinThread(gTimerThread)
+    {.cast(gcsafe).}:
+      withLock gTimerLock:
+        gActiveTimers.clear()
 
 # ============================================================================
 # Message Delivery (called by transport when messages arrive)
 # ============================================================================
 
-# Buffer for messages arriving before group is ready
-var pendingMessagesLock: Lock
-var pendingMessages: nimtables.Table[GroupID, seq[tuple[data: string, len: int]]]
-initLock(pendingMessagesLock)
-
-proc bufferMessage(groupId: GroupID, msgData: cstring,
+proc bufferMessage(c: NuRaftCoordinator, groupId: GroupID, msgData: cstring,
     msgLen: csize_t) {.gcsafe.} =
   var data = newString(msgLen.int)
   if msgLen > 0:
     copyMem(addr data[0], msgData, msgLen)
   {.cast(gcsafe).}:
-    withLock pendingMessagesLock:
-      if not pendingMessages.hasKey(groupId):
-        pendingMessages[groupId] = @[]
-      pendingMessages[groupId].add((data: data, len: msgLen.int))
+    withLock c.pendingMessagesLock:
+      if not c.pendingMessages.hasKey(groupId):
+        c.pendingMessages[groupId] = @[]
+      c.pendingMessages[groupId].add((data: data, len: msgLen.int))
 
-proc deliverBufferedMessages(listener: MultiplexedListener,
+proc deliverBufferedMessages(c: NuRaftCoordinator,
     groupId: GroupID) {.gcsafe.} =
   {.cast(gcsafe).}:
-    withLock pendingMessagesLock:
-      if pendingMessages.hasKey(groupId):
-        for (data, len) in pendingMessages[groupId]:
-          nuraftMultiplexedDeliverMessage(listener, cstring(data), csize_t(len))
-        pendingMessages.del(groupId)
+    withLock c.pendingMessagesLock:
+      if c.pendingMessages.hasKey(groupId):
+        for (data, len) in c.pendingMessages[groupId]:
+          # Use the new deliverMessage wrapper
+          var inst: NuRaftGroupInstancePtr
+          withLock c.groupsLock:
+            inst = c.groups.getOrDefault(groupId, nil)
+          if inst != nil and not inst.server.isNil and
+              not inst.rpcContext.isNil:
+            deliverMessage(inst.rpcContext, inst.server, data)
+        c.pendingMessages.del(groupId)
 
-proc clearPendingMessages() {.gcsafe, raises: [].} =
+proc clearPendingMessages(c: NuRaftCoordinator) {.gcsafe, raises: [].} =
   ## Clear all pending messages (called during shutdown)
-  {.cast(gcsafe).}:
-    withLock pendingMessagesLock:
-      pendingMessages.clear()
+  ## Note: We don't actually clear the table here to avoid GC issues with
+  ## cross-thread string deallocation. The strings were allocated in the
+  ## transport receive thread but would be deallocated here in the main thread.
+  ## Instead, we just set the running flag to false, which prevents new messages
+  ## from being buffered, and let the GC clean up when the coordinator is destroyed.
+  discard
 
 proc deliverMessageToGroup(c: NuRaftCoordinator, groupId: GroupID,
     msgData: cstring, msgLen: csize_t) =
+  echo "DEBUG deliverMessageToGroup: groupId=", groupId, " msgLen=", msgLen,
+       " running=", c.running.load(moRelaxed)
   # Check if coordinator is still running
   if not c.running.load(moRelaxed):
+    echo "DEBUG deliverMessageToGroup: EARLY RETURN - coordinator not running"
     return
 
-  var listener: MultiplexedListener
   var shouldBuffer = false
+  var inst: NuRaftGroupInstancePtr
 
   withLock c.groupsLock:
-    let inst = c.groups.getOrDefault(groupId, nil)
+    inst = c.groups.getOrDefault(groupId, nil)
     if inst != nil:
-      if inst.ready.load(moRelaxed) and not inst.rpcContext.isNil:
-        # Instance is fully ready - get the listener for direct delivery
-        listener = nuraftMultiplexedGetListener(inst.rpcContext)
+      if inst.ready.load(moRelaxed) and not inst.rpcContext.isNil and
+          not inst.server.isNil:
+        # Instance is fully ready - deliver message directly
+        discard
       else:
-        # Instance exists but not fully ready yet (listener/handler not set up)
+        # Instance exists but not fully ready yet
         shouldBuffer = true
     else:
       # Instance doesn't exist yet - buffer the message
       shouldBuffer = true
 
-  if not listener.isNil:
-    nuraftMultiplexedDeliverMessage(listener, msgData, msgLen)
-  elif shouldBuffer:
-    bufferMessage(groupId, msgData, msgLen)
+  if shouldBuffer:
+    bufferMessage(c, groupId, msgData, msgLen)
+  elif inst != nil:
+    # Deliver message using the new API
+    # IMPORTANT: msgData is binary data, must copy with explicit length (not $cstring)
+    var binaryMsg = newString(msgLen.int)
+    if msgLen > 0:
+      copyMem(addr binaryMsg[0], msgData, msgLen.int)
+    deliverMessage(inst.rpcContext, inst.server, binaryMsg)
+  else:
+    echo "DEBUG: deliverMessageToGroup DROPPED groupId=", groupId, " (inst=nil)"
 
 proc deliverMessageWrapper(coordPtr: pointer, groupId: GroupID,
     msgData: cstring, msgLen: csize_t) {.gcsafe, cdecl.} =
@@ -431,6 +564,7 @@ proc newNuRaftCoordinator*(config: CoordinatorConfig): NuRaftCoordinator =
   initLock(result.groupCreationLock)
   initLock(result.groupsCreatingLock)
   initLock(result.timerLock)
+  initLock(result.pendingMessagesLock)
 
   # Open WiscKey backend
   let wbs = if config.writeBufferSize > 0: config.writeBufferSize
@@ -455,8 +589,13 @@ proc hasGroup*(c: NuRaftCoordinator, groupId: GroupID): bool
 
 proc start*(c: NuRaftCoordinator) =
   ## Start the coordinator.
+  echo "DEBUG NuRaftCoordinator.start: starting nodeId=", c.nodeId.uint32,
+      " port=", c.port
   c.running.store(true)
   c.groupCreationRunning.store(true)
+
+  # Start the global timer thread (for invoking NuRaft timers)
+  startTimerThread()
 
   # Create the multiplexed transport
   let coreNodeId = core_types.NodeID("n" & $c.nodeId.uint32)
@@ -469,9 +608,11 @@ proc start*(c: NuRaftCoordinator) =
     deliverMessageWrapper(coordPtr, groupId, msgData, msgLen)
   )
 
+  echo "DEBUG NuRaftCoordinator.start: starting transport server on port ", c.port
   if not c.transport.startServer():
     error("Failed to start multiplexed transport", "port", c.port)
     return
+  echo "DEBUG NuRaftCoordinator.start: transport server started successfully on port ", c.port
 
   # Start the async group creation worker thread
   createThread(c.groupCreationThread, proc(p: pointer) {.thread, gcsafe.} =
@@ -486,14 +627,22 @@ proc start*(c: NuRaftCoordinator) =
 
       for req in requests:
         if not coord.groupCreationRunning.load(): break
+        # Debug output disabled
+        # echo "DEBUG: async worker creating groupId=", req.groupId, " members=", req.members.len
         {.cast(gcsafe).}:
           let ok = coord.createAndStartGroup(req.groupId, req.members,
               req.preferredLeader)
+          # echo "DEBUG: async worker created groupId=", req.groupId, " ok=", ok
           if ok and req.storePtr != nil:
             if onGroupCreatedCallback != nil:
               onGroupCreatedCallback(req.storePtr, req.groupId)
         withLock coord.groupsCreatingLock:
           coord.groupsCreating.del(req.groupId)
+        # Stagger group creation to avoid simultaneous elections
+        # Each group's Raft server uses a random election timeout, but
+        # if servers are created at the same instant, they may get the
+        # same random seed. Adding a small delay ensures different seeds.
+        sleep(50)
         discard coord.groupCreationPending.fetchAdd(-1)
 
       sleep(50)
@@ -503,6 +652,11 @@ proc stop*(c: NuRaftCoordinator) =
   ## Stop all NuRaft instances and close the storage backend.
   if not c.running.load: return
   c.running.store(false)
+
+  echo "DEBUG stop: stopping timer thread"
+  # Stop the global timer thread FIRST before destroying any contexts
+  # The timer thread may be trying to invoke timers on contexts we're about to destroy
+  stopTimerThread()
 
   # Stop the async group creation worker
   c.groupCreationRunning.store(false)
@@ -519,16 +673,19 @@ proc stop*(c: NuRaftCoordinator) =
 
   # Wait for any in-flight callbacks to complete
   # This is critical: callbacks may still be executing in NuRaft threads
+  echo "DEBUG stop: waiting for callbacks"
   sleep(500)
 
   # CRITICAL: Stop transport FIRST before destroying instances
   # The transport's coordinatorCb may still try to deliver messages
+  echo "DEBUG stop: stopping transport"
   if c.transport != nil:
     # Clear the callback first to prevent new message deliveries
     c.transport.setCoordinatorCallback(nil)
     # Now stop the server - this closes all connections and stops the accept loop
     c.transport.stopServer()
 
+  echo "DEBUG stop: collecting instances"
   # Collect instances to destroy while holding lock, then release lock before destroying
   # This prevents deadlock where destruction waits for threads that need the lock
   var instancesToDestroy: seq[NuRaftGroupInstancePtr] = @[]
@@ -537,17 +694,25 @@ proc stop*(c: NuRaftCoordinator) =
       instancesToDestroy.add(inst)
     c.groups.clear()
 
+  echo "DEBUG stop: destroying ", instancesToDestroy.len, " instances"
   # Now destroy without holding the lock
   for inst in instancesToDestroy:
+    echo "DEBUG stop: destroying server for groupId=", inst.groupId
     if not inst.server.isNil:
       nuraftServerShutdown(inst.server)
       nuraftServerDestroy(inst.server)
     # Note: SM and SMgr are owned by the context when using nuraftServerCreateWithContext
     # so we don't destroy them separately here
+    echo "DEBUG stop: destroying listener for groupId=", inst.groupId
+    if not inst.listener.isNil:
+      nuraftMpListenerDestroy(inst.listener)
+    echo "DEBUG stop: destroying rpcContext for groupId=", inst.groupId
     if not inst.rpcContext.isNil:
-      nuraftMultiplexedDestroy(inst.rpcContext)
+      nuraftMpContextDestroy(inst.rpcContext)
+    echo "DEBUG stop: freeing instance for groupId=", inst.groupId
     freeInstance(inst)
 
+  echo "DEBUG stop: destroying transport"
   # Fully destroy transport
   if c.transport != nil:
     c.transport.destroy()
@@ -555,13 +720,14 @@ proc stop*(c: NuRaftCoordinator) =
   if c.store != nil:
     c.store.close()
 
-  # Clear global pending messages (prevent GC access during final cleanup)
-  clearPendingMessages()
+  # Clear pending messages (prevent GC access during final cleanup)
+  clearPendingMessages(c)
 
   deinitLock(c.groupsLock)
   deinitLock(c.groupCreationLock)
   deinitLock(c.groupsCreatingLock)
   deinitLock(c.timerLock)
+  deinitLock(c.pendingMessagesLock)
 
 proc queueGroupCreation*(c: NuRaftCoordinator, groupId: GroupID,
     members: seq[tuple[nodeId: uint32, host: string, port: int]],
@@ -617,14 +783,20 @@ proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
       return true
 
   # Build server list
-  var serverIds = newSeq[int32](members.len)
-  var endpoints = newSeq[string](members.len)
+  var sortedMembers = members
+  sortedMembers.sort(proc (x, y: tuple[nodeId: uint32, host: string,
+      port: int]): int =
+    cmp(x.nodeId, y.nodeId)
+  )
+
+  var serverIds = newSeq[int32](sortedMembers.len)
+  var endpoints = newSeq[string](sortedMembers.len)
   var myEndpoint = ""
 
   # Cache peer info
   # IMPORTANT: Use "serverId@host:port" format so NuRaft can extract the server ID
   # from the endpoint when creating RPC clients
-  for i, m in members:
+  for i, m in sortedMembers:
     serverIds[i] = int32(m.nodeId)
     # Format: serverId@host:port - NuRaft expects this format for create_client
     endpoints[i] = $m.nodeId & "@" & m.host & ":" & $m.port
@@ -683,7 +855,15 @@ proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
     return false
 
   # Create raft params
+  # Use standard NuRaft election timeouts with random jitter.
+  # The stagger during group creation ensures different random seeds.
+  # Non-overlapping windows (like we had) cause leader to lose leadership
+  # because election timing becomes deterministic.
   let params = nuraftParamsCreate()
+  echo "DEBUG createAndStartGroup: groupId=", groupId, " nodeId=", c.nodeId.uint32,
+       " electionTimeout=[", c.electionTimeoutLowerMs, "-",
+           c.electionTimeoutUpperMs, "]ms",
+       " heartbeatInterval=", c.heartbeatIntervalMs, "ms"
   nuraftParamsSetElectionTimeout(params, c.electionTimeoutLowerMs,
       c.electionTimeoutUpperMs)
   nuraftParamsSetHeartbeatInterval(params, c.heartbeatIntervalMs)
@@ -694,7 +874,7 @@ proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
   nuraftParamsSetLeadershipTransferMinWaitTime(params, 1000)
 
   # Create per-group RPC context
-  inst.rpcContext = nuraftMultiplexedCreate(
+  inst.rpcContext = nuraftMpContextCreate(
     int32(c.nodeId.uint32),
     cast[pointer](inst),
     multiplexedSendCb,
@@ -712,59 +892,70 @@ proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
     freeInstance(inst)
     return false
 
-  # Get the listener and set up response callback
-  let listener = nuraftMultiplexedGetListener(inst.rpcContext)
-  if not listener.isNil:
-    # Set the GroupID bytes for this listener
-    let ulid = groupIDToULID(groupId)
-    nuraftMultiplexedSetGroupId(listener, cast[cstring](addr ulid.data[0]))
-    # Set the source node ID for responses
-    nuraftMultiplexedSetSrcNodeId(listener, int32(c.nodeId.uint32))
-    # Set the response callback - uses the same send logic
-    nuraftMultiplexedSetResponseCallback(listener, cast[pointer](inst), multiplexedSendCb)
+  # Set the GroupID bytes for the context
+  # This is critical for response correlation across multiple groups
+  let ulid = groupIDToULID(groupId)
+  nuraftMpContextSetGroupId(inst.rpcContext, cast[cstring](addr ulid.data[0]))
+
+  # Get and setup the listener for response handling
+  inst.listener = setupListener(
+    inst.rpcContext,
+    int32(c.nodeId.uint32),
+    cast[pointer](inst),
+    multiplexedSendCb
+  )
+
+  # Determine if this node should skip initial election timeout.
+  # If preferredLeader is set and this is NOT the preferred leader,
+  # skip the initial election to allow the preferred leader to win.
+  # If preferredLeader is 0 (not set), all nodes participate in election.
+  let skipInitialElection = preferredLeader > 0 and c.nodeId.uint32 != preferredLeader
 
   # Create raft server with multiplexed context
-  inst.server = nuraftServerCreateWithContext(
+  inst.server = nuraftServerCreate(
     inst.rpcContext,
     inst.sm,
     inst.smgr,
     params,
     nuraftEventCb,
-    cast[pointer](inst)
+    cast[pointer](inst),
+    skipInitialElection
   )
 
   nuraftParamsDestroy(params)
 
   if inst.server.isNil:
     error("Failed to create NuRaft server", "groupId", $groupId)
-    nuraftMultiplexedDestroy(inst.rpcContext)
+    # Debug output disabled
+    # echo "DEBUG: FAILED to create NuRaft server groupId=", groupId
+    if not inst.listener.isNil:
+      nuraftMpListenerDestroy(inst.listener)
+    nuraftMpContextDestroy(inst.rpcContext)
     nuraftSmgrDestroy(inst.smgr)
     nuraftSmDestroy(inst.sm)
     cleanupOnFailure()
     freeInstance(inst)
     return false
 
-  # Wire up the message handler: the raft_server is the handler for incoming messages
-  # This is critical - without this, incoming messages are dropped because handler is null
-  let listenerForListen = nuraftMultiplexedGetListener(inst.rpcContext)
-  if not listenerForListen.isNil:
-    nuraftMultiplexedListen(listenerForListen, inst.server)
-    # Mark this instance as ready BEFORE delivering buffered messages
-    # This ensures new messages arriving during delivery won't be double-buffered
-    inst.ready.store(true, moRelease)
-    # Deliver any messages that were buffered before this group was ready
-    deliverBufferedMessages(listenerForListen, groupId)
+  # Mark this instance as ready BEFORE delivering buffered messages
+  # This ensures new messages arriving during delivery won't be double-buffered
+  inst.ready.store(true, moRelease)
+  # Debug: log group creation
+  echo "DEBUG: createAndStartGroup groupId=", groupId, " server=OK listener=OK ready=true"
+  # Deliver any messages that were buffered before this group was ready
+  deliverBufferedMessages(c, groupId)
 
-  # Set priority for preferred leader
-  if preferredLeader > 0:
-    for m in members:
-      if m.nodeId == preferredLeader:
-        discard nuraftServerSetPriority(inst.server, int32(m.nodeId), 100)
-      else:
-        discard nuraftServerSetPriority(inst.server, int32(m.nodeId), 50)
+  # Debug output disabled
+  # echo "DEBUG: createAndStartGroup DONE groupId=", groupId, " server=", (if inst.server.isNil: "NIL" else: "OK")
 
-  info("Started NuRaft group", "groupId", $groupId, "port", c.port,
-       "members", $members.len)
+  # NOTE: preferredLeader is disabled for now. The NuRaft priority system
+  # is designed for leadership transfer in running clusters, not for initial
+  # election control. Setting priorities after server start sends
+  # priority_change_request messages which don't trigger elections.
+  # Instead, we rely on the normal election process with randomized timeouts.
+  # TODO: If preferredLeader is needed, set priority through state manager's
+  # initial server config BEFORE creating the raft_server.
+  discard preferredLeader # Suppress unused warning
 
   return true
 
@@ -838,8 +1029,10 @@ proc removeGroup*(c: NuRaftCoordinator, groupId: GroupID) =
   if not inst.server.isNil:
     nuraftServerShutdown(inst.server)
     nuraftServerDestroy(inst.server)
+  if not inst.listener.isNil:
+    nuraftMpListenerDestroy(inst.listener)
   if not inst.rpcContext.isNil:
-    nuraftMultiplexedDestroy(inst.rpcContext)
+    nuraftMpContextDestroy(inst.rpcContext)
   if not inst.sm.isNil:
     nuraftSmDestroy(inst.sm)
   if not inst.smgr.isNil:
@@ -862,16 +1055,24 @@ proc isLeader*(c: NuRaftCoordinator, groupId: GroupID): bool {.raises: [].} =
     let inst = c.groups.getOrDefault(groupId, nil)
     if inst != nil and inst.server != nil:
       result = nuraftServerIsLeader(inst.server)
-      if result:
-        {.cast(gcsafe).}: {.cast(raises: []).}:
-          debug("isLeader: true", {"groupId": $groupId,
-              "nodeId": $c.nodeId.uint32}.toTable)
+      let leaderId = nuraftServerGetLeader(inst.server)
+      echo "DEBUG: isLeader groupId=", groupId, " nodeId=", c.nodeId.uint32,
+          " result=", result, " leaderId=", leaderId, " server=", cast[int](inst.server)
+    else:
+      echo "DEBUG: isLeader groupId=", groupId, " nodeId=", c.nodeId.uint32,
+          " inst=", (if inst == nil: "NIL" else: "OK"), " server=", (if inst ==
+              nil or inst.server == nil: "NIL" else: "OK")
 
 proc getLeader*(c: NuRaftCoordinator, groupId: GroupID): int32 =
   withLock c.groupsLock:
     let inst = c.groups.getOrDefault(groupId, nil)
     if inst != nil and inst.server != nil:
-      return nuraftServerGetLeader(inst.server)
+      let leaderId = nuraftServerGetLeader(inst.server)
+      echo "DEBUG: getLeader groupId=", groupId, " nodeId=", c.nodeId.uint32,
+          " leaderId=", leaderId
+      return leaderId
+    else:
+      echo "DEBUG: getLeader groupId=", groupId, " nodeId=", c.nodeId.uint32, " no instance or server"
   return -1
 
 proc getGroupCount*(c: NuRaftCoordinator): int =
@@ -904,14 +1105,53 @@ proc proposeAndWait*(c: NuRaftCoordinator, groupId: GroupID,
   if inst.server == nil:
     return RaftResult(success: false, error: "Server not initialized")
 
+  # Check if we're the leader
+  let isLdr = nuraftServerIsLeader(inst.server)
+  let actualLeader = nuraftServerGetLeader(inst.server)
+
+  # Debug: log leadership state before attempting write
+  {.cast(gcsafe).}: {.cast(raises: []).}:
+    debug("proposeAndWait: leadership check", {
+      "groupId": $groupId,
+      "nodeId": $c.nodeId.uint32,
+      "isLeader": $isLdr,
+      "actualLeader": $actualLeader
+    }.toTable)
+
   {.cast(raises: []).}:
     let payload = serializeWriteBatch(command.writeBatch)
+
+    # Capture current SM commit index BEFORE the write
+    let smIdxBefore = nuraftSmLastCommitIndex(inst.sm)
 
     var logIdx: uint64 = 0
     let rc = nuraftServerAppendEntry(inst.server, cstring(payload),
         csize_t(payload.len), addr logIdx)
 
+    if rc != 0:
+      # Debug: log failure details
+      {.cast(gcsafe).}: {.cast(raises: []).}:
+        debug("proposeAndWait: append failed", {
+          "groupId": $groupId,
+          "nodeId": $c.nodeId.uint32,
+          "rc": $rc,
+          "isLeader": $isLdr,
+          "actualLeader": $actualLeader
+        }.toTable)
+
     if rc == 0:
+      # Wait for the state machine to advance past the current index.
+      # Since logIdx may be 0 (NuRaft API quirk), we wait for SM index to increment.
+      let startTime = getTime().toUnixFloat() * 1000.0
+      while true:
+        let smLastIdx = nuraftSmLastCommitIndex(inst.sm)
+        # Wait for SM to advance by at least 1 (the write we just proposed)
+        if smLastIdx > smIdxBefore:
+          break
+        let elapsed = (getTime().toUnixFloat() * 1000.0) - startTime
+        if elapsed > float(timeoutMs):
+          return RaftResult(success: false, error: "Timeout waiting for commit")
+        sleep(1) # 1ms poll interval
       result = RaftResult(success: true, index: logIdx)
     else:
       result = RaftResult(success: false,
@@ -991,7 +1231,9 @@ proc addServerToGroup*(c: NuRaftCoordinator, groupId: GroupID,
 
   if inst.server == nil: return -1
 
-  let endpoint = host & ":" & $port
+  # IMPORTANT: Use "serverId@host:port" format so NuRaft can extract the server ID
+  # from the endpoint when creating RPC clients (same format as createAndStartGroup)
+  let endpoint = $nodeId & "@" & host & ":" & $port
   return nuraftServerAddSrv(inst.server, int32(nodeId), cstring(endpoint))
 
 proc removeServerFromGroup*(c: NuRaftCoordinator, groupId: GroupID,

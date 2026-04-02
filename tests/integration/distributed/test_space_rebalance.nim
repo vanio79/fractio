@@ -10,7 +10,7 @@
 # Port allocation: 28000–28299 (NuRaft ASIO, basePort per node spaced by 100)
 # Temp storage: /tmp/fractio_rebal_<nodeId>/ (cleaned up per test)
 
-import std/[unittest, os, options, json, strutils, tables, locks]
+import std/[unittest, os, options, json, strutils, tables, locks, times]
 import fractio/core/types except NodeID
 import fractio/protocol/raft_store
 import fractio/protocol/server
@@ -110,13 +110,20 @@ proc makeNode(nodeNum: int, port: int,
   cleanDir(storagePath)
   createDir(storagePath)
 
+  # Use the SAME election timeout range for ALL nodes.
+  # NuRaft internally randomizes within the range to avoid election collisions.
+  # Using different ranges per node creates overlapping boundaries that cause
+  # both nodes' timers to fire simultaneously, leading to leader instability.
+  let lowerMs = int32(300)
+  let upperMs = int32(500)
+
   let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
     nodeId: nodeId,
     port: port,
     host: "127.0.0.1",
     dataDir: storagePath,
-    electionTimeoutLowerMs: TEST_ELECTION_TIMEOUT_LOWER_MS,
-    electionTimeoutUpperMs: TEST_ELECTION_TIMEOUT_UPPER_MS,
+    electionTimeoutLowerMs: lowerMs,
+    electionTimeoutUpperMs: upperMs,
     heartbeatIntervalMs: TEST_HEARTBEAT_INTERVAL_MS,
   ))
 
@@ -127,10 +134,12 @@ proc makeNode(nodeNum: int, port: int,
   coord.start()
 
   # Create meta + data groups with retries
+  # Use the first member as the preferred leader to avoid election races
+  let preferredLeader = if members.len > 0: members[0].nodeId else: 0'u32
   for gid in [META_GROUP_ID, DATA_GROUP_START_ID]:
     var success = false
     for attempt in 0 ..< TEST_MAX_RETRY_ATTEMPTS:
-      if coord.createAndStartGroup(gid, members):
+      if coord.createAndStartGroup(gid, members, preferredLeader):
         success = true
         break
       sleep(TEST_RETRY_BACKOFF_MS)
@@ -206,7 +215,37 @@ proc waitForLeaderOnGroup(nodes: seq[TestNode], gid: GroupID,
     sleep(TEST_POLL_INTERVAL_MS)
   -1
 
+proc seedSysNodesWithRetry(nodes: seq[TestNode]) =
+  ## Seed sys.nodes with retry on leadership changes.
+  ## The leader may change during the initial sleep, so we retry if writes fail.
+  for attempt in 0 ..< 5:
+    let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
+    if leaderIdx < 0:
+      sleep(TEST_POLL_INTERVAL_MS)
+      continue
+    let leaderStore = nodes[leaderIdx].store
+    var allSuccess = true
+    for n in nodes:
+      let key = encodeTableKey(SYS_NODES_TABLE_ID, $n.id)
+      let nodeRec = NodeRecord(
+        nodeId: uint32(n.id),
+        host: "127.0.0.1",
+        raftPort: uint16(n.port),
+        clientPort: uint16(n.clientPort),
+        status: nsAlive,
+      )
+      let r = leaderStore.sysTablePut(key, nodeRec.encode())
+      if not r:
+        allSuccess = false
+        echo "DEBUG: seedSysNodes attempt ", attempt, " failed for node ", n.id
+        break
+    if allSuccess:
+      return
+    sleep(TEST_POLL_INTERVAL_MS * 5) # Wait for leader to stabilize
+  doAssert false, "failed to seed sys.nodes after retries"
+
 proc seedSysNodes(leaderStore: RaftKVStoreExt, nodes: seq[TestNode]) =
+  ## Legacy proc - kept for compatibility but prefer seedSysNodesWithRetry.
   for n in nodes:
     let key = encodeTableKey(SYS_NODES_TABLE_ID, $n.id)
     let nodeRec = NodeRecord(
@@ -280,6 +319,7 @@ proc waitForAutoDistribution(nodes: seq[TestNode], expectedGroupIds: seq[
     waited += stepMs
 
 proc waitForSpaceLeaders(nodes: seq[TestNode]) =
+  echo "DEBUG: waitForSpaceLeaders called with ", nodes.len, " nodes"
   let store = nodes[0].store
   let grpStart = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
   let grpEnd = encodeTableKey(SYS_GROUPS_TABLE_ID + 1, "")
@@ -323,14 +363,19 @@ proc waitForSpaceLeaders(nodes: seq[TestNode]) =
           continue
 
         if gid == META_GROUP_ID or gid == DATA_GROUP_START_ID: continue
-        for attempt in 0 ..< 50:
+        echo "DEBUG: waitForSpaceLeaders checking groupId=", gid
+        for attempt in 0 ..< 200:
           var hasLeader = false
           for node in nodes:
             if node.coord.isLeader(gid):
+              echo "DEBUG:   found leader for groupId=", gid, " on node=", node.id
               hasLeader = true
               break
           if hasLeader: break
+          echo "DEBUG:   waiting for leader groupId=", gid, " attempt=", attempt
           sleep(TEST_POLL_INTERVAL_MS)
+          if attempt == 199 and not hasLeader:
+            doAssert false, "Failed to elect leader for group " & $gid
       except: discard
 
 proc updateGroupLeaders(nodes: seq[TestNode]) =
@@ -388,7 +433,9 @@ proc updateGroupLeaders(nodes: seq[TestNode]) =
         if actualLeader != 0 and groupRec.leader != actualLeader:
           groupRec.leader = actualLeader
           let encoded = encode(groupRec)
-          discard leaderStore.sysTablePut(key, encoded)
+          let ts = int64(epochTime() * 1_000_000_000)
+          let mvccEncoded = mvccTypes.encodeMVCCValue(encoded, ts, false)
+          discard leaderStore.raftPut(key, mvccEncoded)
       except:
         discard
 
@@ -401,7 +448,11 @@ proc exec(node: TestNode, sql: string, database = "default",
 # ---------------------------------------------------------------------------
 
 proc makeCluster2(): seq[TestNode] =
-  ## 2-node cluster.
+  ## 2-node cluster with staggered election timeouts.
+  ## CRITICAL: The coordinator applies node-specific offsets to election timeouts:
+  ## - Node 1: [150, 300]ms (shorter - will become leader first)
+  ## - Node 2: [350, 500]ms (longer - will vote for node 1)
+  ## Both nodes must start simultaneously so node 1 can get node 2's vote.
   let p1 = nextBasePort()
   let p2 = nextBasePort()
   let members = @[
@@ -410,18 +461,97 @@ proc makeCluster2(): seq[TestNode] =
   ]
 
   var nodes: seq[TestNode]
+
+  # Create both nodes first (this populates peerInfo and creates groups)
   for i, m in members:
     nodes.add(makeNode(int(m.nodeId), m.port, members))
+
+  # Start both nodes simultaneously - node 1 has shorter election timeout
+  # so it will become candidate first and win the election
+  for n in nodes:
+    startNode(n)
+
+  # Wait for leader election and verify stability
+  let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
+  doAssert leaderIdx >= 0, "no leader found for META_GROUP_ID"
+  # Verify leader stability - check that the same node is leader for 3 consecutive polls
+  var stableCount = 0
+  for i in 0 ..< 10:
+    let currentLeaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID,
+        maxAttempts = 3)
+    if currentLeaderIdx == leaderIdx:
+      inc stableCount
+      if stableCount >= 3:
+        break
+    else:
+      stableCount = 0
+    sleep(TEST_POLL_INTERVAL_MS)
+  doAssert stableCount >= 3, "leader not stable"
+
+  let allNums = @[1, 2]
+  seedSysNodesWithRetry(nodes) # Use retry-based seeding
+  seedSysGroups(nodes[leaderIdx].store, allNums)
+  seedDefaults(nodes[leaderIdx].store)
+  sleep(TEST_REPLICATION_WAIT_MS * 2)
+  for i in 0 ..< nodes.len: initClient(nodes[i], nodes[leaderIdx].clientPort)
+
+  # Load space caches
+  for n in nodes:
+    n.store.loadSpaces()
+    n.store.loadTableSpaces()
+    n.store.loadGroupMembers()
+
+  # Refresh client metadata after seeding system tables
+  for n in nodes:
+    discard n.client.refreshMetadata()
+
+  nodes
+
+proc makeCluster3(): seq[TestNode] =
+  ## 3-node cluster with staggered election timeouts.
+  ## CRITICAL: The coordinator applies node-specific offsets to election timeouts:
+  ## - Node 1: [150, 300]ms (shortest - will become leader first)
+  ## - Node 2: [350, 500]ms
+  ## - Node 3: [550, 700]ms (longest)
+  let p1 = nextBasePort()
+  let p2 = nextBasePort()
+  let p3 = nextBasePort()
+  let members = @[
+    (nodeId: 1'u32, host: "127.0.0.1", port: p1),
+    (nodeId: 2'u32, host: "127.0.0.1", port: p2),
+    (nodeId: 3'u32, host: "127.0.0.1", port: p3),
+  ]
+
+  var nodes: seq[TestNode]
+
+  # Create all nodes first
+  for i, m in members:
+    nodes.add(makeNode(int(m.nodeId), m.port, members))
+
+  # Start all nodes simultaneously - node 1 has shortest election timeout
   for n in nodes:
     startNode(n)
 
   # Wait for leader election
   let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
-  doAssert leaderIdx >= 0
-  sleep(TEST_CLUSTER_STARTUP_MS)
+  doAssert leaderIdx >= 0, "no leader found for META_GROUP_ID"
+  # Node 1 should be the leader (shortest election timeout)
+  # Verify leader stability - check that the same node is leader for 3 consecutive polls
+  var stableCount = 0
+  for i in 0 ..< 10:
+    let currentLeaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID,
+        maxAttempts = 3)
+    if currentLeaderIdx == leaderIdx:
+      inc stableCount
+      if stableCount >= 3:
+        break
+    else:
+      stableCount = 0
+    sleep(TEST_POLL_INTERVAL_MS)
+  doAssert stableCount >= 3, "leader not stable"
 
-  let allNums = @[1, 2]
-  seedSysNodes(nodes[leaderIdx].store, nodes)
+  let allNums = @[1, 2, 3]
+  seedSysNodesWithRetry(nodes) # Use retry-based seeding
   seedSysGroups(nodes[leaderIdx].store, allNums)
   seedDefaults(nodes[leaderIdx].store)
   sleep(TEST_REPLICATION_WAIT_MS * 2)

@@ -604,3 +604,32 @@ proc dropSpace*(client: ProtocolClient, name: string): Result[
   let r = client.send(spaceMsgs.encodeDropSpaceRequest(req))
   if r.isErr: return peErr(r.error)
   spaceMsgs.decodeDropSpaceResponse(r.value.payload)
+
+# ---------------------------------------------------------------------------
+# Directed Group Creation convenience procs
+# ---------------------------------------------------------------------------
+
+proc createGroup*(client: ProtocolClient,
+    req: clusterMsgs.CreateGroupRequest): Result[
+        clusterMsgs.CreateGroupResponse,
+    ProtocolError] {.gcsafe, raises: [].} =
+  ## Send a CreateGroup request to the server.
+  ## The server (if it's the preferred leader) will:
+  ##   1. Create the Raft group
+  ##   2. Start the server and wait for election (wins unopposed)
+  ##   3. Return success with the groupId
+  let r = client.send(clusterMsgs.encodeCreateGroupRequest(req))
+  if r.isErr: return peErr(r.error)
+  clusterMsgs.decodeCreateGroupResponse(r.value.payload)
+
+proc joinGroup*(client: ProtocolClient,
+    req: clusterMsgs.JoinGroupRequest): Result[clusterMsgs.JoinGroupResponse,
+    ProtocolError] {.gcsafe, raises: [].} =
+  ## Send a JoinGroup request to the server.
+  ## The server will:
+  ##   1. Connect to the creator node
+  ##   2. Add itself as a member to the existing Raft group
+  ##   3. Return success with the groupId
+  let r = client.send(clusterMsgs.encodeJoinGroupRequest(req))
+  if r.isErr: return peErr(r.error)
+  clusterMsgs.decodeJoinGroupResponse(r.value.payload)

@@ -155,10 +155,12 @@ proc newFractioClient*(host: string, port: int): FractioClient =
 proc connectToNode(client: FractioClient, host: string, port: int): Option[
     ProtocolClient] =
   ## Connect to a specific node
+  ## Use requestTimeoutMs for socket operations since requests (like CREATE SPACE)
+  ## can take longer than connection establishment.
   let cfg = ClientConfig(
     host: host,
     port: port,
-    timeoutMs: client.config.connectionTimeoutMs,
+    timeoutMs: client.config.requestTimeoutMs,
     clientId: "fractio-client",
     authMethod: amNone,
     authData: ""
@@ -404,6 +406,20 @@ proc getGroupLeaderConnection*(client: FractioClient, groupId: GroupID): Option[
 
   return none(ProtocolClient)
 
+proc invalidateGroupLeader*(client: FractioClient, groupId: GroupID) =
+  ## Invalidate the leader for a group, forcing getGroupLeaderConnection
+  ## to try all replicas.
+  withLock client.lock:
+    if groupId in client.leaderConnections:
+      try:
+        client.leaderConnections[groupId].disconnect()
+      except: discard
+      client.leaderConnections.del(groupId)
+    if groupId in client.groups:
+      var info = client.groups[groupId]
+      info.leaderNodeId = 0
+      client.groups[groupId] = info
+
 proc refreshGroupLeader(client: FractioClient, groupId: GroupID): bool =
   ## Refresh leader info for a specific group after a "not leader" error
 
@@ -573,10 +589,17 @@ proc kvGet*(client: FractioClient, key: string, txnId: uint64 = 0,
 
   let groupId = client.getGroupForKey(key)
 
-  # Try up to 3 times (in case of leader changes)
-  for attempt in 0 ..< 3:
+  const maxRetries = 100
+  const baseBackoffMs = 50
+
+  # Try multiple times (in case of leader changes)
+  for attempt in 0 ..< maxRetries:
     let connOpt = client.getGroupLeaderConnection(groupId)
     if connOpt.isNone:
+      if attempt < maxRetries - 1:
+        discard client.refreshMetadata()
+        sleep(baseBackoffMs + attempt * 5)
+        continue
       return kvOpErr[Option[string]]("no connection to group leader")
 
     let conn = connOpt.get()
@@ -597,6 +620,8 @@ proc kvGet*(client: FractioClient, key: string, txnId: uint64 = 0,
       # Fall back to metadata refresh if no redirect info
       if not client.refreshGroupLeader(groupId):
         return kvOpErr[Option[string]]("failed to refresh group leader")
+      if attempt < maxRetries - 1:
+        sleep(baseBackoffMs + attempt * 5)
       continue
 
     return kvOpErr[Option[string]](res.error.msg)
@@ -613,8 +638,8 @@ proc kvPut*(client: FractioClient, key, value: string,
 
   # Retry with backoff to handle leader election races during group creation.
   # New groups may need time for leader election, especially during CREATE SPACE.
-  const maxRetries = 20
-  const baseBackoffMs = 10
+  const maxRetries = 100
+  const baseBackoffMs = 50
 
   for attempt in 0 ..< maxRetries:
     let connOpt = client.getGroupLeaderConnection(groupId)
@@ -666,9 +691,16 @@ proc kvDelete*(client: FractioClient, key: string,
 
   let groupId = client.getGroupForKey(key)
 
-  for attempt in 0 ..< 3:
+  const maxRetries = 100
+  const baseBackoffMs = 50
+
+  for attempt in 0 ..< maxRetries:
     let connOpt = client.getGroupLeaderConnection(groupId)
     if connOpt.isNone:
+      if attempt < maxRetries - 1:
+        discard client.refreshMetadata()
+        sleep(baseBackoffMs + attempt * 5)
+        continue
       return kvVoidErr("no connection to group leader")
 
     let conn = connOpt.get()
@@ -686,6 +718,8 @@ proc kvDelete*(client: FractioClient, key: string,
       # Fall back to metadata refresh
       if not client.refreshGroupLeader(groupId):
         return kvVoidErr("failed to refresh group leader")
+      if attempt < maxRetries - 1:
+        sleep(baseBackoffMs + attempt * 5)
       continue
 
     let errMsg = if res.isOk: "delete failed" else: res.error.msg
@@ -706,13 +740,18 @@ proc kvScan*(client: FractioClient, startKey, endKey: string,
   let tableId = client.getTableIdFromKey(startKey)
   let groupIds = client.getGroupsForTable(tableId)
 
+  echo "DEBUG kvScan: tableId=", tableId, " groupIds=", groupIds.len,
+      " startKey=", startKey, " endKey=", endKey
+
   # Collect results from all groups, deduplicating by key
   var resultMap = stdtables.initTable[string, string]()
 
   for groupId in groupIds:
+    echo "DEBUG kvScan: scanning groupId=", groupId
     for attempt in 0 ..< 3:
       let connOpt = client.getGroupLeaderConnection(groupId)
       if connOpt.isNone:
+        echo "DEBUG kvScan: no connection for groupId=", groupId
         # Skip this group if we can't connect - it may not have data for this range
         break
 
@@ -721,6 +760,7 @@ proc kvScan*(client: FractioClient, startKey, endKey: string,
                             readTimestamp = readTimestamp)
 
       if res.isOk:
+        echo "DEBUG kvScan: scan succeeded, entries=", res.value.pairs.len
         for pair in res.value.pairs:
           # Deduplicate: keep first occurrence
           if pair.key notin resultMap:
@@ -728,10 +768,12 @@ proc kvScan*(client: FractioClient, startKey, endKey: string,
         break # Success, move to next group
 
       if res.error.kind == peNotLeader:
+        echo "DEBUG kvScan: not leader for groupId=", groupId
         if not client.refreshGroupLeader(groupId):
           break # Give up on this group
         continue # Retry this group
 
+      echo "DEBUG kvScan: error for groupId=", groupId, " error=", res.error.msg
       break # Other error, skip this group
 
   # Convert to result sequence

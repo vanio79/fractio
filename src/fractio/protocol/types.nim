@@ -92,6 +92,10 @@ type
     mtCreateSpace = 0x0708     ## Create a new space with Raft groups
     mtDropSpace = 0x0709       ## Drop an existing space and its groups
 
+    # Directed Group Creation (0x070A-0x070B)
+    mtCreateGroup = 0x070A     ## Request a node to create a Raft group as leader
+    mtJoinGroup = 0x070B       ## Request a node to join an existing Raft group
+
 # ---------------------------------------------------------------------------
 # Authentication methods
 # ---------------------------------------------------------------------------
