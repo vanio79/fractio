@@ -706,11 +706,12 @@ proc applyBatchToSM*(storePtr: pointer, rid: GroupID,
 proc forwardPutToLeader(store: RaftKVStoreExt, groupId: GroupID,
     key, value: string): RSResult[RaftKVEntry] {.gcsafe, raises: [].}
 
-proc processLeaderPersistReq(s: RaftKVStoreExt,
+proc processLeaderPersistReq*(s: RaftKVStoreExt,
     req: LeaderPersistReq) {.gcsafe, raises: [].} =
   ## Process a queued leader persistence request from the async channel.
   ## This runs in the background rebalance thread, avoiding deadlock with
   ## ongoing proposeAndWait calls in the main client threads.
+  ## Exported for testing purposes.
   try:
     let groupId = req.groupId
     let leaderNodeId = req.leaderNodeId
@@ -1881,7 +1882,8 @@ proc forwardPutToLeaderRemote(store: RaftKVStoreExt, groupId: GroupID,
       let pr = pc.kvRawPutInGroup(key, value, groupId)
       if not pr.isOk:
         if pr.err.kind == peNotLeader:
-          return rsErr[RaftKVEntry](newRSE(rseNotLeader, pr.err.msg, pr.err.leaderRedirect.leaderId))
+          return rsErr[RaftKVEntry](newRSE(rseNotLeader, pr.err.msg,
+              pr.err.leaderRedirect.leaderId))
         return rsErr[RaftKVEntry](newRSE(rseInternal, pr.err.msg))
       let resp = pr.val
       if resp.status != PutStatusOK:
@@ -1958,7 +1960,8 @@ proc forwardDeleteToLeaderRemote(store: RaftKVStoreExt, groupId: GroupID,
       let dr = pc.kvDeleteInGroup(key, groupId)
       if not dr.isOk:
         if dr.err.kind == peNotLeader:
-          return rsErr[Option[RaftKVEntry]](newRSE(rseNotLeader, dr.err.msg, dr.err.leaderRedirect.leaderId))
+          return rsErr[Option[RaftKVEntry]](newRSE(rseNotLeader, dr.err.msg,
+              dr.err.leaderRedirect.leaderId))
         return rsErr[Option[RaftKVEntry]](newRSE(rseInternal, dr.err.msg))
       let resp = dr.val
       if resp.status == DelStatusDeleted:
@@ -2038,7 +2041,8 @@ proc forwardGetToLeaderRemote(store: RaftKVStoreExt, groupId: GroupID,
       let gr = pc.kvGetInGroup(key, groupId)
       if not gr.isOk:
         if gr.err.kind == peNotLeader:
-          return rsErr[Option[RaftKVEntry]](newRSE(rseNotLeader, gr.err.msg, gr.err.leaderRedirect.leaderId))
+          return rsErr[Option[RaftKVEntry]](newRSE(rseNotLeader, gr.err.msg,
+              gr.err.leaderRedirect.leaderId))
         return rsErr[Option[RaftKVEntry]](newRSE(rseInternal, gr.err.msg))
       let resp = gr.val
       if resp.found:
@@ -2954,7 +2958,8 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: ULID) {.raises: [].}
             var retries = 0
             while not writeResult.isOk and retries < 20:
               if not store.coordinator.running.load(): return
-              if writeResult.error.kind == rseNotLeader and writeResult.error.leaderHint > 0:
+              if writeResult.error.kind == rseNotLeader and
+                  writeResult.error.leaderHint > 0:
                 withLock store.groupMu:
                   store.groupLeaders[newRid] = writeResult.error.leaderHint
               sleep(100)

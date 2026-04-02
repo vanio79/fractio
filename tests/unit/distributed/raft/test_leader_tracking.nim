@@ -209,6 +209,12 @@ suite "onLeaderChanged callback":
     let storePtr = cast[pointer](store)
     nuraft_coordinator.onLeaderChanged(storePtr, gid, NodeID(20))
 
+    # Process the queued persistence request synchronously (background thread would
+    # do this normally, but for testing we process directly)
+    let reqOpt = store.leaderPersistChan.tryRecv()
+    if reqOpt.dataAvailable:
+      store.processLeaderPersistReq(reqOpt.msg)
+
     # Read back the sys.groups record and verify the leader field
     let gr = store.raftGet(key)
     check gr.isOk
@@ -241,6 +247,11 @@ suite "onLeaderChanged callback":
     let storePtr = cast[pointer](store)
     nuraft_coordinator.onLeaderChanged(storePtr, gid, NodeID(30))
 
+    # Process the queued persistence request synchronously
+    let reqOpt = store.leaderPersistChan.tryRecv()
+    if reqOpt.dataAvailable:
+      store.processLeaderPersistReq(reqOpt.msg)
+
     let gr = store.raftGet(key)
     check gr.isOk
     var rawVal = gr.value.get().value
@@ -266,6 +277,11 @@ suite "onLeaderChanged callback":
     # Fire callback for META_GROUP_ID
     let storePtr = cast[pointer](store)
     nuraft_coordinator.onLeaderChanged(storePtr, META_GROUP_ID, NodeID(10))
+
+    # Process the queued persistence request synchronously
+    let reqOpt = store.leaderPersistChan.tryRecv()
+    if reqOpt.dataAvailable:
+      store.processLeaderPersistReq(reqOpt.msg)
 
     # Leader SHOULD be updated (clients need to route to meta leader)
     let gr = store.raftGet(key)
