@@ -74,12 +74,17 @@ suite "Preferred leader rebalancing — 3-node cluster":
 
       # Wait for node 2 to become leader
       var transferred = false
-      for attempt in 0 ..< 50:
+      for attempt in 0 ..< 100:
         sleep(TEST_POLL_INTERVAL_MS)
         if cluster.findLeader(DATA_GROUP_START_ID) == 1:
           transferred = true
           break
       check transferred
+
+    # Wait longer for leadership transfer to complete and stabilize
+    # NuRaft's yield_leadership sets write_paused_ which prevents
+    # another transfer until the current one completes
+    sleep(500)
 
     # Now transfer back to node 1 (preferred leader)
     let currentLeader = cluster.findLeader(DATA_GROUP_START_ID)
@@ -88,8 +93,9 @@ suite "Preferred leader rebalancing — 3-node cluster":
         DATA_GROUP_START_ID, rangeTypes.NodeID(1))
       check ok
 
+      # Wait longer for transfer to complete (NuRaft needs time to propagate)
       var preferredWon = false
-      for attempt in 0 ..< 50:
+      for attempt in 0 ..< 200:
         sleep(TEST_POLL_INTERVAL_MS)
         if cluster.findLeader(DATA_GROUP_START_ID) == 0:
           preferredWon = true

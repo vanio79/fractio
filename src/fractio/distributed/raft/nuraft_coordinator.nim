@@ -1219,7 +1219,34 @@ proc transferLeadership*(c: NuRaftCoordinator, groupId: GroupID,
 
   if inst == nil or inst.server == nil: return false
 
-  nuraftServerYieldLeadership(inst.server, false, int32(targetNodeId.uint32))
+  # NuRaft leadership transfer strategy:
+  # 1. Use priority system to bias election toward target
+  # 2. Use graceful handoff (immediate=false) which nominates successor
+  #
+  # Priority values: 0 = never leader, higher = more likely to win
+  # Graceful handoff waits for election timeout before stepping down,
+  # giving the successor time to prepare and win.
+
+  let myNodeId = int32(c.nodeId.uint32)
+  let targetId = int32(targetNodeId.uint32)
+
+  # Set target node priority to highest (100) - ensures it wins election
+  let rc1 = nuraftServerSetPriority(inst.server, targetId, 100)
+  if rc1 != 0:
+    warn("Failed to set target priority", "groupId", $groupId, "target",
+        targetId, "rc", rc1)
+
+  # Set current leader (self) priority to low (1) to prevent re-election
+  let rc2 = nuraftServerSetPriority(inst.server, myNodeId, 1)
+  if rc2 != 0:
+    warn("Failed to set self priority", "groupId", $groupId, "self", myNodeId,
+        "rc", rc2)
+
+  # Use graceful handoff (immediate=false):
+  # - Leader pauses writes and waits for election timeout
+  # - Nominates successor (targetId) which combined with priority boost
+  #   should win the election
+  nuraftServerYieldLeadership(inst.server, false, targetId)
   return true
 
 proc addServerToGroup*(c: NuRaftCoordinator, groupId: GroupID,

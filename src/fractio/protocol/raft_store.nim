@@ -881,13 +881,54 @@ proc wireApplyCallback*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
     nuraft_coordinator.onGroupMetadataApplied = proc(
         storePtr: pointer,
         groupKey: string, groupValue: string) {.gcsafe, raises: [].} =
-      ## When sys.groups metadata replicates, just update the local cache.
-      ## Group creation is now handled via directed CreateGroup/JoinGroup RPCs
-      ## from the meta leader (see rebalanceSpaces).
+      ## When sys.groups metadata replicates, ensure group is started and trigger rebal.
       if storePtr == nil: return
       let s = cast[RaftKVStoreExt](storePtr)
+      let coord = s.coordinator
+      {.cast(gcsafe).}:
+        try:
+          var gid: GroupID
+          var members: seq[tuple[nodeId: uint32, host: string,
+              port: int]] = @[]
+          var preferredLeader: uint32 = 0
 
-      # Just trigger a rebalance check - the meta leader handles group creation
+          # Binary decoding (GroupRecord)
+          let groupRec = decodeGroupRecord(groupValue)
+          gid = GroupID(groupRec.groupId)
+          for rep in groupRec.replicas:
+            let nid = rep.nodeId
+            let peerInfo = coord.peerInfo.getOrDefault(nid,
+                (host: coord.host, port: coord.port))
+            members.add((nodeId: nid, host: peerInfo.host,
+                port: peerInfo.port))
+          preferredLeader = groupRec.preferredLeader
+
+          if gid == META_GROUP_ID or gid == DATA_GROUP_START_ID: return
+
+          if not coord.hasGroup(gid):
+            var isMember = false
+            for m in members:
+              if m.nodeId == coord.nodeId.uint32:
+                isMember = true
+                break
+
+            if isMember:
+              # Use async queue instead of blocking createAndStartGroup
+              # The callback runs on NuRaft's ASIO thread and must not block
+              discard coord.queueGroupCreation(gid, members, preferredLeader, storePtr)
+
+          # Refresh caches in background
+          s.triggerRebal.store(true)
+        except:
+          discard
+
+    # --- Async group creation callback ---
+    nuraft_coordinator.onGroupCreatedCallback = proc(
+        storePtr: pointer, groupId: GroupID) {.gcsafe, raises: [].} =
+      ## Called when a group is successfully created asynchronously.
+      if storePtr == nil: return
+      let s = cast[RaftKVStoreExt](storePtr)
+      s.registerGroup(groupId)
       s.triggerRebal.store(true)
 
     # --- Leader tracking and persistence ---
