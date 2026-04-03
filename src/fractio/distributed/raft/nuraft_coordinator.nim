@@ -333,7 +333,7 @@ proc multiplexedSendCb(ctx: pointer, groupIdBytes: cstring, srcNodeId: int32,
 
 # ============================================================================
 # Global Timer Management
-# ============================================================================
+# =============================================================================
 
 # Global timer management (simpler than per-coordinator)
 # Key is (timerId, rpcCtx) to avoid collisions between groups
@@ -344,7 +344,12 @@ var gTimerThread: Thread[void]
 var gTimerThreadRunning: Atomic[bool]
 var gTimerThreadRefCount: int32 # Reference count for timer thread
 
+# Track valid contexts to prevent timer invocation on destroyed contexts
+var gValidContexts: nimtables.Table[pointer, bool]
+var gValidContextsLock: Lock
+
 initLock(gTimerLock)
+initLock(gValidContextsLock)
 gTimerThreadRunning.store(false)
 gTimerThreadRefCount = 0
 
@@ -374,6 +379,25 @@ proc multiplexedCancelTimerCb(ctx: pointer, timerId: int32) {.cdecl, gcsafe.} =
   {.cast(gcsafe).}:
     withLock gTimerLock:
       gActiveTimers.del((timerId: timerId, rpcCtx: ctx))
+
+proc registerValidContext(ctx: pointer) =
+  ## Register a context as valid for timer invocation.
+  {.cast(gcsafe).}:
+    withLock gValidContextsLock:
+      gValidContexts[ctx] = true
+
+proc unregisterValidContext(ctx: pointer) =
+  ## Mark a context as invalid (about to be destroyed).
+  ## Prevents timer callbacks from accessing freed memory.
+  {.cast(gcsafe).}:
+    withLock gValidContextsLock:
+      gValidContexts.del(ctx)
+
+proc isValidContext(ctx: pointer): bool =
+  ## Check if a context is still valid for timer invocation.
+  {.cast(gcsafe).}:
+    withLock gValidContextsLock:
+      result = gValidContexts.hasKey(ctx)
 
 proc cancelAllTimersForContext(ctx: pointer) =
   ## Cancel all timers associated with a specific rpcCtx.
@@ -414,6 +438,10 @@ proc timerThreadProc() {.thread, gcsafe.} =
     # Invoke timers WITHOUT holding the lock to avoid deadlock
     # (NuRaft's task->execute() may call back into scheduleTimerCb)
     for item in expiredTimers:
+      # Check if context is still valid before invoking
+      if not isValidContext(item.rpcCtx):
+        echo "DEBUG TimerThread: skipping timer ", item.timerId, " - context destroyed"
+        continue
       echo "DEBUG TimerThread: invoking timer ", item.timerId
       try:
         let rpcCtx = cast[MultiplexedContext](item.rpcCtx)
@@ -722,6 +750,8 @@ proc stop*(c: NuRaftCoordinator) =
       nuraftMpListenerDestroy(inst.listener)
     echo "DEBUG stop: destroying rpcContext for groupId=", inst.groupId
     if not inst.rpcContext.isNil:
+      # Unregister context to prevent timer callbacks on destroyed memory
+      unregisterValidContext(cast[pointer](inst.rpcContext))
       # Cancel all timers for this context before destroying it
       # This prevents stale timer callbacks from accessing destroyed memory
       cancelAllTimersForContext(cast[pointer](inst.rpcContext))
@@ -909,6 +939,9 @@ proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
     freeInstance(inst)
     return false
 
+  # Register context as valid for timer callbacks
+  registerValidContext(cast[pointer](inst.rpcContext))
+
   # Set the GroupID bytes for the context
   # This is critical for response correlation across multiple groups
   let ulid = groupIDToULID(groupId)
@@ -948,6 +981,7 @@ proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
     if not inst.listener.isNil:
       nuraftMpListenerDestroy(inst.listener)
     if not inst.rpcContext.isNil:
+      unregisterValidContext(cast[pointer](inst.rpcContext))
       cancelAllTimersForContext(cast[pointer](inst.rpcContext))
       nuraftMpContextDestroy(inst.rpcContext)
     nuraftSmgrDestroy(inst.smgr)
@@ -1051,6 +1085,7 @@ proc removeGroup*(c: NuRaftCoordinator, groupId: GroupID) =
   if not inst.listener.isNil:
     nuraftMpListenerDestroy(inst.listener)
   if not inst.rpcContext.isNil:
+    unregisterValidContext(cast[pointer](inst.rpcContext))
     cancelAllTimersForContext(cast[pointer](inst.rpcContext))
     nuraftMpContextDestroy(inst.rpcContext)
   if not inst.sm.isNil:
