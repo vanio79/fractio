@@ -375,6 +375,20 @@ proc multiplexedCancelTimerCb(ctx: pointer, timerId: int32) {.cdecl, gcsafe.} =
     withLock gTimerLock:
       gActiveTimers.del((timerId: timerId, rpcCtx: ctx))
 
+proc cancelAllTimersForContext(ctx: pointer) =
+  ## Cancel all timers associated with a specific rpcCtx.
+  ## Called when a context is destroyed to prevent stale timer callbacks.
+  echo "DEBUG cancelAllTimersForContext: ctx=", ctx.repr
+  {.cast(gcsafe).}:
+    withLock gTimerLock:
+      var keysToDelete: seq[tuple[timerId: int32, rpcCtx: pointer]] = @[]
+      for key, entry in gActiveTimers:
+        if key.rpcCtx == ctx:
+          keysToDelete.add(key)
+      for key in keysToDelete:
+        gActiveTimers.del(key)
+      echo "DEBUG cancelAllTimersForContext: cancelled ", keysToDelete.len, " timers"
+
 # Timer thread that polls for expired timers and invokes them
 proc timerThreadProc() {.thread, gcsafe.} =
   echo "DEBUG TimerThread: started"
@@ -708,6 +722,9 @@ proc stop*(c: NuRaftCoordinator) =
       nuraftMpListenerDestroy(inst.listener)
     echo "DEBUG stop: destroying rpcContext for groupId=", inst.groupId
     if not inst.rpcContext.isNil:
+      # Cancel all timers for this context before destroying it
+      # This prevents stale timer callbacks from accessing destroyed memory
+      cancelAllTimersForContext(cast[pointer](inst.rpcContext))
       nuraftMpContextDestroy(inst.rpcContext)
     echo "DEBUG stop: freeing instance for groupId=", inst.groupId
     freeInstance(inst)
@@ -930,7 +947,9 @@ proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
     # echo "DEBUG: FAILED to create NuRaft server groupId=", groupId
     if not inst.listener.isNil:
       nuraftMpListenerDestroy(inst.listener)
-    nuraftMpContextDestroy(inst.rpcContext)
+    if not inst.rpcContext.isNil:
+      cancelAllTimersForContext(cast[pointer](inst.rpcContext))
+      nuraftMpContextDestroy(inst.rpcContext)
     nuraftSmgrDestroy(inst.smgr)
     nuraftSmDestroy(inst.sm)
     cleanupOnFailure()
@@ -1032,6 +1051,7 @@ proc removeGroup*(c: NuRaftCoordinator, groupId: GroupID) =
   if not inst.listener.isNil:
     nuraftMpListenerDestroy(inst.listener)
   if not inst.rpcContext.isNil:
+    cancelAllTimersForContext(cast[pointer](inst.rpcContext))
     nuraftMpContextDestroy(inst.rpcContext)
   if not inst.sm.isNil:
     nuraftSmDestroy(inst.sm)

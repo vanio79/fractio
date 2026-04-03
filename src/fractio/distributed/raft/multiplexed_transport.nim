@@ -19,6 +19,24 @@ import fractio/distributed/network/serialization
 import fractio/distributed/raft/group_types
 
 # =============================================================================
+# Socket Options Helpers
+# =============================================================================
+
+type TLinger = object
+  ## POSIX linger structure for SO_LINGER option
+  l_onoff: cint
+  l_linger: cint
+
+proc setZeroLinger(socket: SocketHandle) =
+  ## Set zero linger on socket to avoid TIME_WAIT state on close.
+  ## This is aggressive and should only be used for test/ephemeral sockets.
+  var linger = TLinger(l_onoff: 1, l_linger: 0)
+  if setsockopt(socket, SOL_SOCKET, SO_LINGER, addr linger,
+                sizeof(linger).SockLen) < 0:
+    # Non-critical - just log warning
+    echo "DEBUG: failed to set SO_LINGER on socket"
+
+# =============================================================================
 # Message Types for Internal Routing
 # =============================================================================
 
@@ -216,9 +234,17 @@ proc connectToPeer*(t: MultiplexedRaftTransport, nodeId: core_types.NodeID,
   try:
     # Create synchronous socket first (for sending from callbacks)
     conn.syncSocket = newSocket()
+    # Enable address/port reuse and zero linger for quick cleanup
+    conn.syncSocket.setSockOpt(OptReuseAddr, true)
+    conn.syncSocket.setSockOpt(OptReusePort, true)
+    setZeroLinger(conn.syncSocket.getFd())
     conn.syncSocket.connect(host, Port(port))
     # Also create async socket for async operations
     conn.socket = newAsyncSocket()
+    # Same options for async socket
+    conn.socket.setSockOpt(OptReuseAddr, true)
+    conn.socket.setSockOpt(OptReusePort, true)
+    setZeroLinger(conn.socket.getFd())
     waitFor conn.socket.connect(host, Port(port))
     withLock t.connectionsLock:
       t.connections[nodeId] = conn
@@ -554,7 +580,12 @@ proc startServer*(t: MultiplexedRaftTransport): bool =
   try:
     echo "DEBUG startServer: creating socket for port ", t.port
     t.serverSocket = newSocket()
+    # Enable address reuse to allow quick rebinding after shutdown
     t.serverSocket.setSockOpt(OptReuseAddr, true)
+    # Enable port reuse (Linux) to allow multiple binds to same port
+    t.serverSocket.setSockOpt(OptReusePort, true)
+    # Set zero linger to avoid TIME_WAIT on close (aggressive for tests)
+    setZeroLinger(t.serverSocket.getFd())
     t.serverSocket.bindAddr(Port(t.port), t.host)
     t.serverSocket.listen()
     t.serverRunning.store(true)
