@@ -71,9 +71,9 @@ proc startAdminServer(port: int, clusterName: string = "test-cluster",
   for gid in [META_GROUP_ID, DATA_GROUP_START_ID]:
     discard coord.createAndStartGroup(gid, members)
 
-  # Wait for leader election
+  # Wait for leader election on both groups
   for attempt in 0 ..< 30:
-    if coord.isLeader(META_GROUP_ID):
+    if coord.isLeader(META_GROUP_ID) and coord.isLeader(DATA_GROUP_START_ID):
       break
     sleep(100)
 

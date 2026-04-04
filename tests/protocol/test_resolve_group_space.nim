@@ -96,12 +96,13 @@ proc seedSpaceAndTable(store: RaftKVStoreExt, spaceId: int,
     tableId: uint32, groupIds: seq[GroupID]) =
   ## Write a space record and a table record into the meta range, then
   ## reload the caches.
-  let spaceKey = encodeSpaceKey(coreTypes.genULID())
+  let spaceUid = coreTypes.genULID()
+  let spaceKey = encodeSpaceKey(spaceUid)
   var ulidGroupIds: seq[ULID] = @[]
   for gid in groupIds:
     ulidGroupIds.add(groupIDToULID(gid))
   let spaceRec = SpaceRecord(
-    spaceId: coreTypes.ZeroULID(),
+    spaceId: spaceUid, # Use the same ULID as the key
     name: "space_" & $spaceId,
     replicas: 1,
     groupCount: int32(groupIds.len),
@@ -115,7 +116,7 @@ proc seedSpaceAndTable(store: RaftKVStoreExt, spaceId: int,
     name: "t" & $tableId,
     schema: "public",
     database: "default",
-    spaceId: coreTypes.ZeroULID(),
+    spaceId: spaceUid, # Use the same spaceId as the space record
   )
   discard store.raftPut(tableKey, tableRec.encode())
 

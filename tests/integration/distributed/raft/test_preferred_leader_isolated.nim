@@ -12,7 +12,6 @@ import ../../../test_cluster_helper
 suite "Preferred leader isolated test":
   test "non-preferred leader is replaced exactly once":
     var cfg = defaultTestClusterConfig()
-    cfg.portOffset = 40000
     var cluster = newTestCluster(cfg)
     defer: cluster.stop()
 

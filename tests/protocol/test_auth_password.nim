@@ -16,10 +16,26 @@ import fractio/protocol/server
 import fractio/protocol/client
 import fractio/protocol/auth
 import fractio/protocol/messages/admin as adminMsgs
+import fractio/protocol/mvcc_store
+import fractio/protocol/raft_store
+import fractio/protocol/txn_manager
+import fractio/distributed/raft/nuraft_coordinator
+import fractio/distributed/raft/group_types as rangeTypes
+import fractio/distributed/raft/multigroup_types
+import fractio/distributed/meta/system_tables
+import fractio/distributed/sharedtimer/mock
+import fractio/distributed/sharedtimer/types as timerTypes
+import fractio/core/timestamp_provider
 
 # ---------------------------------------------------------------------------
 # Helper: start a server with password auth and register a test user
 # ---------------------------------------------------------------------------
+
+var testRaftPort {.global.} = 22000
+
+proc nextRaftPort(): int =
+  result = testRaftPort
+  testRaftPort += 10
 
 proc startPasswordServer(port: int, username,
     password: string): ProtocolServer =
@@ -30,8 +46,52 @@ proc startPasswordServer(port: int, username,
   cfg.authMethod = amPassword
   result = newProtocolServer(cfg)
   result.authenticator.addUser(username, password)
+
+  # Set up MVCC store for KV operations (requires single-node Raft)
+  let storagePath = "/tmp/fractio_authpw_test_" & $port
+  try: removeDir(storagePath) except CatchableError: discard
+  createDir(storagePath)
+
+  let nodeId = rangeTypes.NodeID(1)
+  let raftPort = nextRaftPort()
+  let members = @[(nodeId: 1'u32, host: "127.0.0.1", port: raftPort)]
+
+  let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
+    nodeId: nodeId,
+    port: raftPort,
+    host: "127.0.0.1",
+    dataDir: storagePath,
+    electionTimeoutLowerMs: 200,
+    electionTimeoutUpperMs: 400,
+    heartbeatIntervalMs: 100,
+  ))
+  coord.start()
+
+  # Create meta + data groups
+  for gid in [META_GROUP_ID, DATA_GROUP_START_ID]:
+    discard coord.createAndStartGroup(gid, members)
+
+  # Wait for leader election on both groups
+  for attempt in 0 ..< 30:
+    if coord.isLeader(META_GROUP_ID) and coord.isLeader(DATA_GROUP_START_ID):
+      break
+    sleep(100)
+
+  let raftStore = newRaftKVStoreExt(coord, proposeTimeoutMs = 2000)
+  raftStore.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
+
+  let txnMgr = newTransactionManager()
+  let mockTimer = MockTimeProvider(currentTime: timerTypes.Timestamp(1_000_000_000))
+  let tsProvider = newTimestampProvider(mockTimer, nodeId.uint16)
+  let mvccStore = newMvccTransactionStore(raftStore, txnMgr, tsProvider)
+
+  result.raftStore = raftStore
+  result.raftCoord = coord
+  result.mvccStore = mvccStore
+  result.txnMgr = txnMgr
+
   result.start()
-  sleep(60)
+  sleep(100)
 
 proc connectWithPassword(port: int, username, password: string,
     expectOK: bool = true): ProtocolClient =

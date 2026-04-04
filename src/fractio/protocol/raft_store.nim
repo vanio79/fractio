@@ -1173,9 +1173,10 @@ proc validateKeyRouting(store: RaftKVStoreExt, key: string,
             if oldExpected == groupId:
               # Key routes to an old group during rebalancing - this is valid
               return none(RaftStoreError)
-            return some(newRSE(rseBadRouting,
-                "key routes to group " & $expected &
-                " not " & $groupId))
+          # Key routes to wrong group - return error (unless rebalancing matched old group)
+          return some(newRSE(rseBadRouting,
+              "key routes to group " & $expected &
+              " not " & $groupId))
       else:
         release(store.spacesMu)
     except:
@@ -2219,18 +2220,44 @@ proc raftGetInSpaceFromGroup*(store: RaftKVStoreExt, key: string,
   ## Internal helper: read `key` from a specific group.
   ## If this node is the leader, reads locally.
   ## Otherwise, forwards to the group leader over the network.
+  ## Handles MVCC-encoded values (tombstones are returned as None).
   {.cast(raises: []).}:
     if store.coordinator.isLeader(rid):
       let backend = store.getBackend()
       if backend != nil and backend.isOpen:
         let valOpt = backend.get(key)
         if valOpt.isSome:
-          let entry = RaftKVEntry(
-            value: valOpt.get(),
-            version: 1'u64,
-            timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
-          )
-          return rsOk[Option[RaftKVEntry]](some(entry))
+          let rawValue = valOpt.get()
+          # Check if this is an MVCC-encoded value
+          if mvccTypes.isLikelyMVCCValue(rawValue):
+            try:
+              let decoded = mvccTypes.decodeMVCCValue(rawValue)
+              if decoded.isDeleted:
+                # Tombstone - return None
+                return rsOk[Option[RaftKVEntry]](none(RaftKVEntry))
+              # Not deleted - return the actual data
+              let entry = RaftKVEntry(
+                value: decoded.data,
+                version: 1'u64,
+                timestamp: uint64(decoded.timestamp),
+              )
+              return rsOk[Option[RaftKVEntry]](some(entry))
+            except:
+              # Failed to decode - treat as raw value
+              let entry = RaftKVEntry(
+                value: rawValue,
+                version: 1'u64,
+                timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
+              )
+              return rsOk[Option[RaftKVEntry]](some(entry))
+          else:
+            # Raw value (non-MVCC)
+            let entry = RaftKVEntry(
+              value: rawValue,
+              version: 1'u64,
+              timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
+            )
+            return rsOk[Option[RaftKVEntry]](some(entry))
       return rsOk[Option[RaftKVEntry]](none(RaftKVEntry))
     # Not leader — forward to the group leader via network
     return store.forwardGetToLeader(rid, key)

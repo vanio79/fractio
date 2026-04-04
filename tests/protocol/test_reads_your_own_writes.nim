@@ -28,6 +28,7 @@ import fractio/protocol/server
 import fractio/protocol/client
 import fractio/protocol/raft_store
 import fractio/protocol/txn_manager
+import fractio/protocol/mvcc_store
 import fractio/protocol/messages/kv
 import fractio/protocol/messages/txn as txnMsgs
 import fractio/distributed/raft/nuraft_coordinator
@@ -35,6 +36,9 @@ import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
 import fractio/distributed/raft/state_machine
+import fractio/distributed/sharedtimer/mock
+import fractio/distributed/sharedtimer/types as timerTypes
+import fractio/core/timestamp_provider
 
 # ---------------------------------------------------------------------------
 # Helpers (same pattern as test_txn_buffering.nim)
@@ -95,6 +99,13 @@ proc makeRaftServer(port: int, storagePath: string): ProtocolServer =
     os.sleep(100)
   let raftSt = newRaftKVStoreExt(coord, proposeTimeoutMs = 3000)
   raftSt.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
+
+  # Set up MVCC store for transactional KV operations
+  let txnMgr = newTransactionManager()
+  let mockTimer = MockTimeProvider(currentTime: timerTypes.Timestamp(1_000_000_000))
+  let tsProvider = newTimestampProvider(mockTimer, nodeId.uint16)
+  let mvccStore = newMvccTransactionStore(raftSt, txnMgr, tsProvider)
+
   var cfg = defaultServerConfig()
   cfg.host = "127.0.0.1"
   cfg.port = port
@@ -102,6 +113,8 @@ proc makeRaftServer(port: int, storagePath: string): ProtocolServer =
   let srv = newProtocolServer(cfg)
   srv.raftStore = raftSt
   srv.raftCoord = coord
+  srv.mvccStore = mvccStore
+  srv.txnMgr = txnMgr
   srv.start()
   sleep(80)
   srv

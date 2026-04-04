@@ -21,6 +21,11 @@ import fractio/distributed/meta/system_tables
 import fractio/distributed/meta/system_schemas
 import fractio/protocol/raft_store
 import fractio/protocol/server
+import fractio/protocol/mvcc_store
+import fractio/protocol/txn_manager
+import fractio/distributed/sharedtimer/mock
+import fractio/distributed/sharedtimer/types as timerTypes
+import fractio/core/timestamp_provider
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -31,14 +36,16 @@ const
   NODE_COUNT = 3
   SPACE_GROUP_START = 10'u64 # space groups 10, 11, 12
 
-var nextClientPort = 9100 ## incremented per node to avoid port conflicts between tests
+var
+  nextClientPort = 9100 ## incremented per node to avoid port conflicts between tests
+  seededSpaceUid: ULID ## the spaceUid that was seeded in makeCluster3
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 type
-  TestNode = object
+  TestNode = ref object
     id*: int
     port*: int ## Single port for all Raft groups (multiplexed)
     clientPort*: int
@@ -58,6 +65,8 @@ proc makeCluster3(): seq[TestNode] =
   ]
 
   var nodes: seq[TestNode]
+
+  # Phase 1: Create all coordinators first (without starting)
   for nodeNum in 1 .. NODE_COUNT:
     let nodeId = rangeTypes.NodeID(uint32(nodeNum))
     let port = 26000 + (nodeNum - 1) * 100
@@ -74,18 +83,31 @@ proc makeCluster3(): seq[TestNode] =
       electionTimeoutUpperMs: 400,
       heartbeatIntervalMs: 100,
     ))
-    coord.start()
 
+    nodes.add(TestNode(
+      id: nodeNum, port: port, clientPort: 0, server: nil,
+      coord: coord, store: nil, storagePath: storagePath,
+    ))
+
+  # Phase 2: Start all coordinators simultaneously
+  for n in nodes:
+    n.coord.start()
+
+  # Phase 3: Create groups on all nodes
+  for n in nodes:
     # Create meta + data groups
-    doAssert coord.createAndStartGroup(META_GROUP_ID, members)
-    doAssert coord.createAndStartGroup(DATA_GROUP_START_ID, members)
+    doAssert n.coord.createAndStartGroup(META_GROUP_ID, members)
+    doAssert n.coord.createAndStartGroup(DATA_GROUP_START_ID, members)
 
     # Create space groups
     for i in 0 ..< NODE_COUNT:
       let gid = groupIDFromInt(SPACE_GROUP_START + uint64(i))
-      doAssert coord.createAndStartGroup(gid, members)
+      doAssert n.coord.createAndStartGroup(gid, members)
 
-    let store = newRaftKVStoreExt(coord, proposeTimeoutMs = 6000)
+  # Phase 4: Create stores and bootstrap
+  for idx, n in nodes:
+    let nodeNum = idx + 1
+    let store = newRaftKVStoreExt(n.coord, proposeTimeoutMs = 6000)
     store.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
 
     for i in 0 ..< NODE_COUNT:
@@ -98,15 +120,21 @@ proc makeCluster3(): seq[TestNode] =
     cfg.host = "127.0.0.1"
     cfg.port = cPort
     cfg.serverId = uint16(nodeNum)
-    cfg.dataDir = storagePath
+    cfg.dataDir = n.storagePath
     let srv = newProtocolServer(cfg)
     srv.raftStore = store
-    srv.raftCoord = coord
+    srv.raftCoord = n.coord
 
-    nodes.add(TestNode(
-      id: nodeNum, port: port, clientPort: cPort, server: srv,
-      coord: coord, store: store, storagePath: storagePath,
-    ))
+    # Set up MVCC store for transaction support
+    let txnMgr = newTransactionManager()
+    let mockTimer = MockTimeProvider(currentTime: timerTypes.Timestamp(1_000_000_000))
+    let tsProvider = newTimestampProvider(mockTimer, uint16(nodeNum))
+    let mvccStore = newMvccTransactionStore(store, txnMgr, tsProvider)
+    srv.mvccStore = mvccStore
+
+    n.clientPort = cPort
+    n.server = srv
+    n.store = store
 
   for n in nodes:
     n.server.start()
@@ -220,9 +248,10 @@ proc makeCluster3(): seq[TestNode] =
   var spaceGroupIds: seq[ULID] = @[]
   for i in 0 ..< NODE_COUNT:
     spaceGroupIds.add(groupIDToULID(groupIDFromInt(SPACE_GROUP_START + uint64(i))))
-  let spaceKey = encodeSpaceKey(coreTypes.genULID())
+  seededSpaceUid = coreTypes.genULID()
+  let spaceKey = encodeSpaceKey(seededSpaceUid)
   let spaceRec = SpaceRecord(
-    spaceId: coreTypes.ZeroULID(),
+    spaceId: seededSpaceUid,
     name: "space_2",
     replicas: int32(NODE_COUNT),
     groupCount: int32(NODE_COUNT),
@@ -236,11 +265,14 @@ proc makeCluster3(): seq[TestNode] =
     name: "t100",
     schema: "public",
     database: "default",
-    spaceId: coreTypes.ZeroULID(),
+    spaceId: seededSpaceUid,
   )
   discard nodes[leaderIdx].store.raftPut(tableKey, tableRec.encode())
 
-  sleep(200)
+  # Wait for replication and state machine application
+  # The Raft log entries need to be applied to the state machine before
+  # loadSpaces/loadTableSpaces can see them via backend.scan()
+  sleep(1000)
 
   for n in nodes:
     n.store.loadGroupMembers()
@@ -263,7 +295,7 @@ proc spaceInfo(): SpaceInfo =
     groupIDFromInt(SPACE_GROUP_START + 2)
   ]
   SpaceInfo(
-    spaceId: coreTypes.ZeroULID(),
+    spaceId: seededSpaceUid,
     name: "space_2",
     replicas: NODE_COUNT,
     groupIds: groupIds,
@@ -437,11 +469,18 @@ suite "Multi-node — peer store forwarding for space-routed keys":
     if leaderIdx >= 0:
       let nonLeaderIdx = if leaderIdx == 0: 1 else: 0
       let key = encodeDataRowKey(100, pk)
-      discard nodes[leaderIdx].store.raftPutInSpace(key, "to_del", space, pk)
+      let putRes = nodes[leaderIdx].store.raftPutInSpace(key, "to_del", space, pk)
+      check putRes.isOk
+
+      # Wait for replication
+      sleep(200)
 
       # Delete from non-leader — should succeed via forwarding
       let dr = nodes[nonLeaderIdx].store.raftDeleteInSpace(key, space, pk)
       check dr.isOk
+
+      # Wait for replication
+      sleep(200)
 
       # Verify the key is gone from the owning leader
       let gr = nodes[leaderIdx].store.raftGetInSpaceFromGroup(key, gid)
@@ -465,6 +504,9 @@ suite "Multi-node — peer store forwarding for space-routed keys":
       # Write on the owning leader
       let wr = nodes[leaderIdx].store.raftPutInSpace(key, val, space, pk)
       check wr.isOk
+
+      # Wait for replication
+      sleep(200)
 
       # Read from non-leader — should forward to leader
       let gr = nodes[nonLeaderIdx].store.raftGetInSpace(key, space, pk)
@@ -496,7 +538,8 @@ suite "Multi-node — routing validation for group-routed requests":
       # Try to put it in group 11 (wrong group) — should fail with rseBadRouting
       let wr = nodes[leaderIdx].store.raftPutInGroup(key, "bad", wrongGid)
       check not wr.isOk
-      check wr.error.kind == rseBadRouting
+      if not wr.isOk:
+        check wr.error.kind == rseBadRouting
 
   test "raftDeleteInGroupExplicit rejects key routed to wrong group":
     var nodes = makeCluster3()

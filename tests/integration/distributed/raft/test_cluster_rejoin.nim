@@ -17,10 +17,11 @@ import ../../../test_config
 const
   BinaryPath = "bin/fractio_web"
   TestHost = "127.0.0.1"
-  # Use high port range to avoid conflicts with other tests.
+  # Use port range below ephemeral (32768) to avoid conflicts.
   # Each node needs space for its raft groups.
   # Space them 1000 apart to be safe.
-  BaseRaftPort = 27000
+  # Uses same ports since SO_REUSEADDR/SO_REUSEPORT/SO_LINGER=0 allow immediate reuse
+  BaseRaftPort = 29000
   BaseClientPort = 19001
   BaseWebPort = 19876
 

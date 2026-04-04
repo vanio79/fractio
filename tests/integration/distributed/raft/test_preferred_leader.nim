@@ -9,8 +9,9 @@
 #   The test verifies that transferLeadership works and that the
 #   preferred leader mechanism functions correctly.
 #
-# Port allocation: 29000–29299 (NuRaft ASIO, basePort per node spaced by 100)
-# Temp storage: /tmp/fractio_test_node<nodeId>_<portOffset>/ (cleaned up per test)
+# Port allocation: 29000–31000 (NuRaft ASIO, basePort per node spaced by 1000)
+# Uses same ports for all tests since SO_REUSEADDR/SO_REUSEPORT/SO_LINGER=0 allow immediate reuse
+# Temp storage: /tmp/fractio_test_node<nodeId>/ (cleaned up per test)
 
 import std/[unittest, os, atomics, tables]
 
@@ -34,7 +35,6 @@ suite "Preferred leader rebalancing — 3-node cluster":
 
   test "loadGroupMembers reads preferredLeader from sys.groups":
     var cfg = defaultTestClusterConfig()
-    cfg.portOffset = 0
     var cluster = newTestCluster(cfg)
     defer: cluster.stop()
 
@@ -54,7 +54,6 @@ suite "Preferred leader rebalancing — 3-node cluster":
 
   test "transferLeadership moves leadership to target node":
     var cfg = defaultTestClusterConfig()
-    cfg.portOffset = 10000
     var cluster = newTestCluster(cfg)
     defer: cluster.stop()
 
@@ -106,7 +105,6 @@ suite "Preferred leader rebalancing — 3-node cluster":
     ## Verifies that after leadership transfer, the preferred leader
     ## can take over and remain stable.
     var cfg = defaultTestClusterConfig()
-    cfg.portOffset = 20000
     var cluster = newTestCluster(cfg)
     defer: cluster.stop()
 
@@ -185,7 +183,6 @@ suite "Preferred leader rebalancing — 3-node cluster":
     ## Verifies that once the preferred leader takes over, there are no
     ## further elections (the stepdown-election cycle is broken).
     var cfg = defaultTestClusterConfig()
-    cfg.portOffset = 30000
     var cluster = newTestCluster(cfg)
     defer: cluster.stop()
 

@@ -7,7 +7,8 @@
 #   4. Run migration, verify cutover
 #
 # Cluster topology: in-process NuRaftCoordinators with ASIO networking
-# Port allocation: 28000–28299 (NuRaft ASIO, basePort per node spaced by 100)
+# Port allocation: 29000–31000 (NuRaft ASIO, basePort per node spaced by 1000)
+# Uses same ports for all tests since SO_REUSEADDR/SO_REUSEPORT/SO_LINGER=0 allow immediate reuse
 # Temp storage: /tmp/fractio_rebal_<nodeId>/ (cleaned up per test)
 
 import std/[unittest, os, options, json, strutils, tables, locks, times]
@@ -45,11 +46,10 @@ const
   TMP_DIR = "/tmp/fractio_rebal_"
 
 var nextClientPort = 19100 ## incremented per node to avoid port conflicts between tests
-var testBasePort {.global.} = 28000
 
-proc nextBasePort(): int =
-  result = testBasePort
-  testBasePort += 100
+# Fixed port allocation - node 1: 29000, node 2: 30000, node 3: 31000
+proc nodePort(nodeNum: int): int =
+  result = 29000 + (nodeNum - 1) * 1000
 
 # ---------------------------------------------------------------------------
 # Memory monitoring
@@ -453,11 +453,9 @@ proc makeCluster2(): seq[TestNode] =
   ## - Node 1: [150, 300]ms (shorter - will become leader first)
   ## - Node 2: [350, 500]ms (longer - will vote for node 1)
   ## Both nodes must start simultaneously so node 1 can get node 2's vote.
-  let p1 = nextBasePort()
-  let p2 = nextBasePort()
   let members = @[
-    (nodeId: 1'u32, host: "127.0.0.1", port: p1),
-    (nodeId: 2'u32, host: "127.0.0.1", port: p2),
+    (nodeId: 1'u32, host: "127.0.0.1", port: nodePort(1)),
+    (nodeId: 2'u32, host: "127.0.0.1", port: nodePort(2)),
   ]
 
   var nodes: seq[TestNode]
@@ -513,13 +511,10 @@ proc makeCluster3(): seq[TestNode] =
   ## - Node 1: [150, 300]ms (shortest - will become leader first)
   ## - Node 2: [350, 500]ms
   ## - Node 3: [550, 700]ms (longest)
-  let p1 = nextBasePort()
-  let p2 = nextBasePort()
-  let p3 = nextBasePort()
   let members = @[
-    (nodeId: 1'u32, host: "127.0.0.1", port: p1),
-    (nodeId: 2'u32, host: "127.0.0.1", port: p2),
-    (nodeId: 3'u32, host: "127.0.0.1", port: p3),
+    (nodeId: 1'u32, host: "127.0.0.1", port: nodePort(1)),
+    (nodeId: 2'u32, host: "127.0.0.1", port: nodePort(2)),
+    (nodeId: 3'u32, host: "127.0.0.1", port: nodePort(3)),
   ]
 
   var nodes: seq[TestNode]
@@ -612,7 +607,7 @@ proc waitForNodeInSysNodes(store: RaftKVStoreExt, nodeId: int,
 
 proc addNodeToCluster(nodes: var seq[TestNode], newNodeNum: int) =
   ## Add a new node to the cluster.
-  let newPort = 28000 + (newNodeNum - 1) * 1000
+  let newPort = nodePort(newNodeNum)
 
   # Build members list including all existing + new
   var allMembers: seq[tuple[nodeId: uint32, host: string, port: int]]

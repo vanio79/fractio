@@ -41,6 +41,18 @@ proc stopNode(ns: NodeSetup) =
   ns.coord.stop()
   cleanDir(ns.storagePath)
 
+proc stopAllNodes(nodes: seq[NodeSetup]) =
+  ## Stop all nodes and wait for cleanup
+  for ns in nodes:
+    ns.store.stop()
+    ns.coord.stop()
+  # Wait for sockets to fully close with SO_LINGER zero
+  # and any background threads to terminate
+  # Need sufficient time for TimerThread cleanup and socket release
+  sleep(300)
+  for ns in nodes:
+    cleanDir(ns.storagePath)
+
 proc waitForLeader(nodes: seq[NodeSetup], groupId: GroupID,
     maxAttempts: int = 100): int =
   ## Wait for a leader to be elected. Returns leader index or -1.
@@ -54,20 +66,18 @@ proc waitForLeader(nodes: seq[NodeSetup], groupId: GroupID,
 # ---------------------------------------------------------------------------
 # Shared cluster fixture — creates all nodes before waiting for init
 # ---------------------------------------------------------------------------
+# Use fixed ports: SO_REUSE and SO_LINGER zero allow reuse between tests
 
-var testBasePort {.global.} = 24000
-
-proc nextClusterPorts(): (int, int, int) =
-  result = (testBasePort, testBasePort + 100, testBasePort + 200)
-  testBasePort += 300
+const
+  BASE_PORT = 24000
+  PORT_SPACING = 100
 
 proc makeCluster(): (seq[NodeSetup], GroupID) =
   let rid = DATA_GROUP_START_ID
-  let (bp1, bp2, bp3) = nextClusterPorts()
   let members = @[
-    (nodeId: 1'u32, host: "127.0.0.1", port: bp1),
-    (nodeId: 2'u32, host: "127.0.0.1", port: bp2),
-    (nodeId: 3'u32, host: "127.0.0.1", port: bp3),
+    (nodeId: 1'u32, host: "127.0.0.1", port: BASE_PORT),
+    (nodeId: 2'u32, host: "127.0.0.1", port: BASE_PORT + PORT_SPACING),
+    (nodeId: 3'u32, host: "127.0.0.1", port: BASE_PORT + 2 * PORT_SPACING),
   ]
 
   # Create all coordinators first (don't wait for init between nodes)
@@ -106,13 +116,16 @@ proc makeCluster(): (seq[NodeSetup], GroupID) =
 suite "MultiNode Raft — leader election":
 
   test "exactly one leader after startup":
+    # First test needs extra time for system initialization
+    sleep(100)
+
     let (nodes, rid) = makeCluster()
 
     # Wait for leader election
     let leaderIdx = waitForLeader(nodes, rid)
     check leaderIdx >= 0
 
-    for ns in nodes: stopNode(ns)
+    stopAllNodes(nodes)
 
   test "only one node is leader at any time":
     let (nodes, rid) = makeCluster()
@@ -124,7 +137,7 @@ suite "MultiNode Raft — leader election":
       if ns.coord.isLeader(rid): inc leaderCount
     check leaderCount == 1
 
-    for ns in nodes: stopNode(ns)
+    stopAllNodes(nodes)
 
 suite "MultiNode Raft — quorum write":
 
@@ -140,7 +153,7 @@ suite "MultiNode Raft — quorum write":
     if putRes.isOk:
       check putRes.value.value == "world"
 
-    for ns in nodes: stopNode(ns)
+    stopAllNodes(nodes)
 
   test "proposeAndWait on follower returns Not the leader":
     let (nodes, rid) = makeCluster()
@@ -155,7 +168,7 @@ suite "MultiNode Raft — quorum write":
     if not putRes.isOk:
       check putRes.error.kind == rseNotLeader
 
-    for ns in nodes: stopNode(ns)
+    stopAllNodes(nodes)
 
 suite "MultiNode Raft — log replication":
 
@@ -199,7 +212,7 @@ suite "MultiNode Raft — log replication":
         if getRes.value.isSome:
           check getRes.value.get.value == "replval"
 
-    for ns in nodes: stopNode(ns)
+    stopAllNodes(nodes)
 
   test "multiple writes are replicated in order":
     let (nodes, rid) = makeCluster()
@@ -226,7 +239,7 @@ suite "MultiNode Raft — log replication":
       if res.isOk and res.value.isSome:
         check res.value.get.value == expected
 
-    for ns in nodes: stopNode(ns)
+    stopAllNodes(nodes)
 
 suite "MultiNode Raft — scan":
 
@@ -245,4 +258,4 @@ suite "MultiNode Raft — scan":
     if scanRes.isOk:
       check scanRes.value.len == 3
 
-    for ns in nodes: stopNode(ns)
+    stopAllNodes(nodes)

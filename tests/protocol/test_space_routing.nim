@@ -116,9 +116,14 @@ suite "Space routing — routeToGroup":
     for i in 0 ..< 100:
       let pk = "key_" & $i
       let rid = routeToGroup(pk, groupIds)
-      let idx = int(rid.hash mod 3)
-      check idx >= 0 and idx < 3
-      inc buckets[idx]
+      # Find which group index this routed to
+      var foundIdx = -1
+      for idx, gid in groupIds:
+        if gid == rid:
+          foundIdx = idx
+          break
+      check foundIdx >= 0 and foundIdx < 3
+      inc buckets[foundIdx]
     # Each bucket should have at least 1 key (probabilistic but very likely)
     for b in buckets:
       check b > 0
@@ -381,12 +386,13 @@ suite "Space routing — cache loading":
     defer: teardown(coord, "/tmp/fractio_sr_t30")
 
     # Write a space record into the meta range (binary format)
-    let spaceKey = encodeSpaceKey(coreTypes.genULID())
+    let spaceId = coreTypes.genULID()
+    let spaceKey = encodeSpaceKey(spaceId)
     var groupUlids: seq[ULID] = @[]
     for gid in space.groupIds:
       groupUlids.add(groupIDToULID(gid))
     let spaceRec = SpaceRecord(
-      spaceId: coreTypes.genULID(),
+      spaceId: spaceId,
       name: "myspace",
       replicas: 1,
       groupCount: 2,
@@ -401,13 +407,14 @@ suite "Space routing — cache loading":
     discard store.raftPut(spaceKey, encode(spaceRec))
 
     # Write a table record with spaceId (binary format)
+    # Must use the SAME spaceId as the space record above
     let tableKey = encodeTableKey(SYS_TABLES_TABLE_ID, "default.public.mytable")
     let tableRec = TableRecord(
       tableId: 100,
       name: "mytable",
       database: "default",
       schema: "public",
-      spaceId: coreTypes.genULID(),
+      spaceId: spaceId, # Use the same spaceId
       primaryKey: @[],
       columns: @[]
     )

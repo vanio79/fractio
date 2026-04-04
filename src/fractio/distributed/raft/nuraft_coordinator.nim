@@ -382,6 +382,7 @@ proc multiplexedCancelTimerCb(ctx: pointer, timerId: int32) {.cdecl, gcsafe.} =
 
 proc registerValidContext(ctx: pointer) =
   ## Register a context as valid for timer invocation.
+  echo "DEBUG registerValidContext: ctx=", ctx.repr
   {.cast(gcsafe).}:
     withLock gValidContextsLock:
       gValidContexts[ctx] = true
@@ -389,6 +390,7 @@ proc registerValidContext(ctx: pointer) =
 proc unregisterValidContext(ctx: pointer) =
   ## Mark a context as invalid (about to be destroyed).
   ## Prevents timer callbacks from accessing freed memory.
+  echo "DEBUG unregisterValidContext: ctx=", ctx.repr
   {.cast(gcsafe).}:
     withLock gValidContextsLock:
       gValidContexts.del(ctx)

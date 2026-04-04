@@ -1165,7 +1165,9 @@ proc handleBuiltinTxn(server: ProtocolServer, conn: ClientConnection,
       if res.isOk:
         # Register in txnMgr as well so recordRead/recordWrite can work if needed
         # We use sessionId as the transaction ID for simplicity.
-        discard server.txnMgr.beginTransaction(req.flags, 300_000'u32,
+        # Use the requested timeout or a default if 0.
+        let timeout = if req.timeoutMs > 0: req.timeoutMs else: 300_000'u32
+        discard server.txnMgr.beginTransaction(req.flags, timeout,
                                               forcedId = some(sessionId))
 
         let resp = txnMsgs.BeginTxnResponse(
@@ -1193,21 +1195,46 @@ proc handleBuiltinTxn(server: ProtocolServer, conn: ClientConnection,
       return
     let txnId = reqR.value.txnId
 
+    # First check txnMgr for idempotency (already committed txns)
+    let preCheck = server.txnMgr.getTransactionStatus(txnId)
+    if preCheck.status == txnMsgs.TxnStatusCommitted:
+      # Already committed - return idempotent OK with same timestamp
+      sendFrame(conn, txnMsgs.encodeCommitTxnResponse(
+        txnMsgs.CommitTxnResponse(
+          status: txnMsgs.TxnCommitOK,
+          commitTimestamp: preCheck.commitTimestamp)), requestId)
+      return
+
     if not server.mvccStore.isNil:
       let res = server.mvccStore.commitTransaction(txnId)
       # Also update txnMgr state for this txnId
-      discard server.txnMgr.commitTransaction(txnId)
+      let txnMgrResp = server.txnMgr.commitTransaction(txnId)
 
       if res.isOk:
         discard server.metrics.committedTxns.fetchAdd(1)
         sendFrame(conn, txnMsgs.encodeCommitTxnResponse(
-          txnMsgs.CommitTxnResponse(status: txnMsgs.TxnCommitOK)), requestId)
+          txnMsgs.CommitTxnResponse(
+            status: txnMsgs.TxnCommitOK,
+            commitTimestamp: uint64(res.value))), requestId)
         server.mvccStore.closeSession(txnId)
       else:
-        discard server.metrics.abortedTxns.fetchAdd(1)
-        sendFrame(conn, txnMsgs.encodeCommitTxnResponse(
-          txnMsgs.CommitTxnResponse(status: txnMsgs.TxnCommitConflict)), requestId)
-        server.mvccStore.closeSession(txnId)
+        # Use txnMgr response for idempotency check
+        if txnMgrResp.status == txnMsgs.TxnCommitOK:
+          discard server.metrics.committedTxns.fetchAdd(1)
+          sendFrame(conn, txnMsgs.encodeCommitTxnResponse(txnMgrResp), requestId)
+        else:
+          discard server.metrics.abortedTxns.fetchAdd(1)
+          # Determine proper status based on error kind
+          let status = if res.error.kind == mseTransactionNotFound:
+                         txnMsgs.TxnCommitNotFound
+                       elif res.error.kind == mseTimeout:
+                         txnMsgs.TxnCommitTimeout
+                       else:
+                         txnMsgs.TxnCommitConflict
+          sendFrame(conn, txnMsgs.encodeCommitTxnResponse(
+            txnMsgs.CommitTxnResponse(status: status)), requestId)
+          if res.error.kind != mseTransactionNotFound:
+            server.mvccStore.closeSession(txnId)
     else:
       let resp = server.txnMgr.commitTransaction(txnId)
       if resp.status == txnMsgs.TxnCommitOK:
@@ -1224,11 +1251,21 @@ proc handleBuiltinTxn(server: ProtocolServer, conn: ClientConnection,
     let txnId = reqR.value.txnId
 
     if not server.mvccStore.isNil:
-      discard server.mvccStore.rollbackTransaction(txnId)
+      let res = server.mvccStore.rollbackTransaction(txnId)
       discard server.txnMgr.rollbackTransaction(txnId)
-      server.mvccStore.closeSession(txnId)
-      sendFrame(conn, txnMsgs.encodeRollbackTxnResponse(
-        txnMsgs.RollbackTxnResponse(status: 0)), requestId)
+      if res.isOk:
+        server.mvccStore.closeSession(txnId)
+        sendFrame(conn, txnMsgs.encodeRollbackTxnResponse(
+          txnMsgs.RollbackTxnResponse(status: txnMsgs.TxnRollbackOK)), requestId)
+      else:
+        # Determine proper status based on error kind
+        let status = if res.error.kind == mseTransactionNotFound or
+                        res.error.kind == mseNotInTransaction:
+                       txnMsgs.TxnRollbackNotFound
+                     else:
+                       txnMsgs.TxnRollbackOK # Other errors still return OK for idempotency
+        sendFrame(conn, txnMsgs.encodeRollbackTxnResponse(
+          txnMsgs.RollbackTxnResponse(status: status)), requestId)
     else:
       discard server.metrics.abortedTxns.fetchAdd(1)
       let resp = server.txnMgr.rollbackTransaction(txnId)
