@@ -54,8 +54,9 @@ proc stopAllNodes(nodes: seq[NodeSetup]) =
     cleanDir(ns.storagePath)
 
 proc waitForLeader(nodes: seq[NodeSetup], groupId: GroupID,
-    maxAttempts: int = 100): int =
+    maxAttempts: int = 200): int =
   ## Wait for a leader to be elected. Returns leader index or -1.
+  ## Uses 200 attempts * 100ms = 20s max wait time for reliability.
   for attempt in 0 ..< maxAttempts:
     for i, ns in nodes:
       if ns.coord.isLeader(groupId):
@@ -80,6 +81,9 @@ proc makeCluster(): (seq[NodeSetup], GroupID) =
     (nodeId: 3'u32, host: "127.0.0.1", port: BASE_PORT + 2 * PORT_SPACING),
   ]
 
+  # Use node 1 as preferred leader to avoid election races
+  let preferredLeader = members[0].nodeId
+
   # Create all coordinators first (don't wait for init between nodes)
   var nodes: seq[NodeSetup] = @[]
   for i in 0 ..< 3:
@@ -99,7 +103,7 @@ proc makeCluster(): (seq[NodeSetup], GroupID) =
     ))
     coord.start()
 
-    doAssert coord.createAndStartGroup(rid, members),
+    doAssert coord.createAndStartGroup(rid, members, preferredLeader),
         "Failed to create group on node " & $nodeNum
 
     let store = newRaftKVStoreExt(coord, proposeTimeoutMs = 6000)
