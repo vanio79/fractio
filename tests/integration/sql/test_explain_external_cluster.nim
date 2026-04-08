@@ -5,7 +5,7 @@
 #
 # Port range: Uses dynamic ports assigned by test_cluster
 
-import std/[unittest, json, strutils, sequtils, os]
+import std/[unittest, json, strutils, sequtils]
 import ../../test_cluster
 
 # ---------------------------------------------------------------------------
@@ -14,6 +14,7 @@ import ../../test_cluster
 
 proc checkExplainResult(res: JsonNode, expectedOp: string) =
   ## Check that an EXPLAIN result contains the expected operation
+  check res.hasKey("kind")
   check res["kind"].getStr == "rows"
   check "plan" in res["columns"].getElems.mapIt(it.getStr)
   check res["rows"].len >= 1

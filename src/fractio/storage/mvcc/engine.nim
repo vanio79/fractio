@@ -28,9 +28,7 @@ type
     currentValue*: Option[MVCCValue]
     exhausted*: bool
 
-const
-  InvalidTransactionID*: TransactionID = TransactionID(0)
-
+# Use InvalidTransactionID from types module (already imported)
 # Helper to convert MVCCResult
 proc ok*(value: Option[MVCCValue]): MVCCResult =
   MVCCResult(success: true, value: value)

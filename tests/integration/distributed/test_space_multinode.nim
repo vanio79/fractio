@@ -899,6 +899,10 @@ suite "Space multinode — resilience after adding a node":
     discard nodes[leaderIdx].store.sysTablePut(nodeKey, nodeRec.encode())
     sleep(TEST_REPLICATION_WAIT_MS)
 
+    # Refresh client metadata on all nodes (including node 6)
+    # This ensures routing tables are updated after topology change
+    refreshClientMetadata(nodes)
+
     # Verify space still works — insert via client-side retry
     let ins2 = execOnLeader(nodes, "INSERT INTO t1 VALUES (2, 'after-add')")
     if ins2.kind == erkError:
@@ -943,6 +947,11 @@ suite "Space multinode — resilience after killing a node":
     reelectLeaders(nodes, @[5])
 
     let aliveNodes = nodes[0 ..< 4]
+
+    # Refresh client metadata on remaining nodes
+    # This ensures routing tables are updated after topology change
+    refreshClientMetadata(aliveNodes)
+
     var postKillSuccess = 0
     let ins2 = execOnLeader(aliveNodes, "INSERT INTO t1 VALUES (2, 'after-kill')")
     if ins2.kind == erkModified: inc postKillSuccess

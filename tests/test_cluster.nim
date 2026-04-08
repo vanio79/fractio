@@ -390,6 +390,10 @@ proc put*(cluster: TestCluster, key, value: string): bool =
   let client = cluster.getClient()
   let res = client.kvPut(key, value)
   client.disconnect()
+  if res.isErr:
+    echo "  put error: ", res.error.msg
+  elif res.value.status != kvMsgs.PutStatusOK:
+    echo "  put status: ", res.value.status
   res.isOk and res.value.status == kvMsgs.PutStatusOK
 
 proc get*(cluster: TestCluster, key: string): Option[string] =
@@ -527,16 +531,23 @@ proc waitForLeader*(cluster: TestCluster, timeoutMs: int = 10000): int =
   return 0
 
 proc waitForWeb*(cluster: TestCluster, timeoutMs: int = 10000): bool =
-  ## Wait for the web dashboard to be ready.
+  ## Wait for the web dashboard and NuRaft meta group leader to be ready.
   let deadline = getTime().toUnixFloat() * 1000 + float(timeoutMs)
   while getTime().toUnixFloat() * 1000 < deadline:
     try:
       let client = newHttpClient(timeout = 1000)
       let resp = client.get(cluster.getWebUrl() & "/api/health")
+      let respBody = resp.body
       client.close()
-      # Any response means the web server is running
-      if resp.status.contains("200") or resp.status.contains("503"):
-        return true
+      # Check that both HTTP is OK and meta leader is ready
+      if resp.status.contains("200"):
+        let health = parseJson(respBody)
+        # status=0 and metaLeaderOK=true means ready for SQL operations
+        if health.hasKey("metaLeaderOK") and health["metaLeaderOK"].getBool:
+          return true
+        elif health.hasKey("status") and health["status"].getInt == 0:
+          # Fallback for older health endpoint without metaLeaderOK
+          return true
     except CatchableError:
       discard
     sleep(POLL_INTERVAL_MS)

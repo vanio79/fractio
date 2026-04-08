@@ -253,10 +253,16 @@ proc toJson*(rep: ReplicaDescriptor): JsonNode =
 
 proc parseReplicaDescriptor*(json: JsonNode): ReplicaDescriptor =
   ## Parse ReplicaDescriptor from JSON
+  let typeVal = json["replicaType"].getInt()
+  # Validate replica type - default to rtVoter for unknown values
+  let repType = if typeVal >= 0 and typeVal <= ord(rtNonVoter):
+                  ReplicaType(typeVal)
+                else:
+                  rtVoter
   result = ReplicaDescriptor(
     nodeId: NodeID(json["nodeId"].getInt()),
     replicaId: ReplicaID(json["replicaId"].getInt()),
-    replicaType: ReplicaType(json["replicaType"].getInt())
+    replicaType: repType
   )
 
 # ============================================================================

@@ -140,7 +140,7 @@ suite "Conflict Detection":
     let conflict = ConflictInfo(
       conflictType: ctWriteWrite,
       key: "test_key",
-      conflictingTxnId: TransactionID(123),
+      conflictingTxnId: genTransactionID(),
       timestamp: Timestamp(1000),
       retryable: true
     )
@@ -240,7 +240,7 @@ suite "Conflict Resolution":
 
   test "resolve conflict with committed transaction":
     var txn1 = MVCCTransaction(
-      id: TransactionID(1),
+      id: genTransactionID(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -255,7 +255,7 @@ suite "Conflict Resolution":
     )
 
     var txn2 = MVCCTransaction(
-      id: TransactionID(2),
+      id: genTransactionID(),
       status: TXN_COMMITTED,
       startTimestamp: Timestamp(50),
       commitTimestamp: Timestamp(200),
@@ -272,7 +272,7 @@ suite "Conflict Resolution":
     let conflict = ConflictInfo(
       conflictType: ctWriteWrite,
       key: "key1",
-      conflictingTxnId: TransactionID(2),
+      conflictingTxnId: genTransactionID(),
       timestamp: Timestamp(200),
       retryable: true
     )
@@ -285,7 +285,7 @@ suite "Conflict Resolution":
 
   test "resolve conflict with aborted transaction":
     var txn1 = MVCCTransaction(
-      id: TransactionID(1),
+      id: genTransactionID(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -300,7 +300,7 @@ suite "Conflict Resolution":
     )
 
     var txn2 = MVCCTransaction(
-      id: TransactionID(2),
+      id: genTransactionID(),
       status: TXN_ABORTED,
       startTimestamp: Timestamp(50),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -317,7 +317,7 @@ suite "Conflict Resolution":
     let conflict = ConflictInfo(
       conflictType: ctWriteWrite,
       key: "key1",
-      conflictingTxnId: TransactionID(2),
+      conflictingTxnId: genTransactionID(),
       timestamp: Timestamp(150),
       retryable: true
     )
@@ -330,7 +330,7 @@ suite "Conflict Resolution":
 
   test "resolve conflict with priority - higher priority wins":
     var txn1 = MVCCTransaction(
-      id: TransactionID(1),
+      id: genTransactionID(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -345,7 +345,7 @@ suite "Conflict Resolution":
     )
 
     var txn2 = MVCCTransaction(
-      id: TransactionID(2),
+      id: genTransactionID(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(50),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -362,7 +362,7 @@ suite "Conflict Resolution":
     let conflict = ConflictInfo(
       conflictType: ctWriteWrite,
       key: "key1",
-      conflictingTxnId: TransactionID(2),
+      conflictingTxnId: genTransactionID(),
       timestamp: Timestamp(150),
       retryable: true
     )
@@ -375,7 +375,7 @@ suite "Conflict Resolution":
 suite "Transaction Push Mechanism":
   test "push transaction timestamp":
     var txn1 = MVCCTransaction(
-      id: TransactionID(1),
+      id: genTransactionID(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -390,7 +390,7 @@ suite "Transaction Push Mechanism":
     )
 
     var txn2 = MVCCTransaction(
-      id: TransactionID(2),
+      id: genTransactionID(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(50),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -411,7 +411,7 @@ suite "Transaction Push Mechanism":
 
   test "push aborted transaction":
     var txn1 = MVCCTransaction(
-      id: TransactionID(1),
+      id: genTransactionID(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -426,7 +426,7 @@ suite "Transaction Push Mechanism":
     )
 
     var txn2 = MVCCTransaction(
-      id: TransactionID(2),
+      id: genTransactionID(),
       status: TXN_ABORTED,
       startTimestamp: Timestamp(50),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -446,7 +446,7 @@ suite "Transaction Push Mechanism":
 
   test "push committed transaction":
     var txn1 = MVCCTransaction(
-      id: TransactionID(1),
+      id: genTransactionID(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -461,7 +461,7 @@ suite "Transaction Push Mechanism":
     )
 
     var txn2 = MVCCTransaction(
-      id: TransactionID(2),
+      id: genTransactionID(),
       status: TXN_COMMITTED,
       startTimestamp: Timestamp(50),
       commitTimestamp: Timestamp(200),
@@ -481,7 +481,7 @@ suite "Transaction Push Mechanism":
 
   test "can push check":
     var txn1 = MVCCTransaction(
-      id: TransactionID(1),
+      id: genTransactionID(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -496,7 +496,7 @@ suite "Transaction Push Mechanism":
     )
 
     var txn2 = MVCCTransaction(
-      id: TransactionID(2),
+      id: genTransactionID(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(50),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -518,7 +518,7 @@ suite "Transaction Push Mechanism":
 suite "Wait-Die Deadlock Prevention":
   test "younger waits for older":
     var txn1 = MVCCTransaction(
-      id: TransactionID(1),
+      id: genTransactionID(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(200), # Younger
       commitTimestamp: INVALID_TIMESTAMP,
@@ -533,7 +533,7 @@ suite "Wait-Die Deadlock Prevention":
     )
 
     var txn2 = MVCCTransaction(
-      id: TransactionID(2),
+      id: genTransactionID(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(100), # Older
       commitTimestamp: INVALID_TIMESTAMP,
@@ -553,7 +553,7 @@ suite "Wait-Die Deadlock Prevention":
 
   test "should abort transaction":
     var txn1 = MVCCTransaction(
-      id: TransactionID(1),
+      id: genTransactionID(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(100), # Older
       commitTimestamp: INVALID_TIMESTAMP,
@@ -568,7 +568,7 @@ suite "Wait-Die Deadlock Prevention":
     )
 
     var txn2 = MVCCTransaction(
-      id: TransactionID(2),
+      id: genTransactionID(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(200), # Younger
       commitTimestamp: INVALID_TIMESTAMP,
@@ -588,7 +588,7 @@ suite "Wait-Die Deadlock Prevention":
 
   test "committed transaction doesn't cause abort":
     var txn1 = MVCCTransaction(
-      id: TransactionID(1),
+      id: genTransactionID(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -603,7 +603,7 @@ suite "Wait-Die Deadlock Prevention":
     )
 
     var txn2 = MVCCTransaction(
-      id: TransactionID(2),
+      id: genTransactionID(),
       status: TXN_COMMITTED,
       startTimestamp: Timestamp(50),
       commitTimestamp: Timestamp(200),

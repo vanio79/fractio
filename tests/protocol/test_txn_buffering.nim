@@ -33,6 +33,7 @@ import fractio/distributed/meta/system_tables
 import fractio/distributed/sharedtimer/mock
 import fractio/distributed/sharedtimer/types as timerTypes
 import fractio/core/timestamp_provider
+import fractio/core/types as coreTypes
 import fractio/storage/wisckey_backend
 
 # ---------------------------------------------------------------------------
@@ -52,7 +53,7 @@ proc nextBasePort(): int =
 proc makeStore(storagePath: string): tuple[
     coord: NuRaftCoordinator, store: RaftKVStoreExt, rid: GroupID] =
   cleanDir(storagePath)
-  let nodeId = NodeID(1)
+  let nodeId = rangeTypes.NodeID(1)
   let port = nextBasePort()
   let members = @[(nodeId: 1'u32, host: "127.0.0.1", port: port)]
 
@@ -98,7 +99,7 @@ proc smGetVal(store: RaftKVStoreExt, rid: GroupID, key: string): string =
   ""
 
 proc makeRaftServer(port: int, storagePath: string): ProtocolServer =
-  let nodeId = NodeID(1)
+  let nodeId = rangeTypes.NodeID(1)
   let raftPort = nextBasePort()
   let members = @[(nodeId: 1'u32, host: "127.0.0.1", port: raftPort)]
 
@@ -176,7 +177,7 @@ suite "TxnManager - getWriteSet":
 
   test "getWriteSet returns empty seq for unknown txnId":
     let mgr = newTransactionManager()
-    let ws = mgr.getWriteSet(9999'u64)
+    let ws = mgr.getWriteSet(coreTypes.genTransactionID())
     check ws.len == 0
 
   test "getWriteSet returns empty seq for txn with no writes":

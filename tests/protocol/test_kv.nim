@@ -25,6 +25,7 @@ import fractio/distributed/meta/system_tables
 import fractio/distributed/sharedtimer/mock
 import fractio/distributed/sharedtimer/types as timerTypes
 import fractio/core/timestamp_provider
+import fractio/core/types as coreTypes
 
 # ---------------------------------------------------------------------------
 # Helpers (mirrors test_core.nim conventions)
@@ -113,19 +114,20 @@ proc withServer(port: int, body: proc(srv: ProtocolServer,
 
 suite "kv codec - GetRequest round-trip":
   test "basic get request encodes and decodes":
-    let req = GetRequest(flags: 0x03, txnId: 42, readTimestamp: 100,
+    let testTxnId = genTransactionID()
+    let req = GetRequest(flags: 0x03, txnId: testTxnId, readTimestamp: 100,
                          key: "hello")
     let payload = encodeGetRequest(req)
     let r = decodeGetRequest(payload)
     check r.isOk
     let got = r.value
     check got.flags == 0x03
-    check got.txnId == 42
+    check got.txnId == testTxnId
     check got.readTimestamp == 100
     check got.key == "hello"
 
   test "get request with empty key":
-    let req = GetRequest(flags: 0, txnId: 0, readTimestamp: 0, key: "")
+    let req = GetRequest(flags: 0, txnId: zeroTransactionID(), readTimestamp: 0, key: "")
     let payload = encodeGetRequest(req)
     let r = decodeGetRequest(payload)
     check r.isOk
@@ -133,7 +135,7 @@ suite "kv codec - GetRequest round-trip":
 
   test "get request with binary key":
     let bk = "\x00\xFF\x42\x00"
-    let req = GetRequest(flags: 0, txnId: 0, readTimestamp: 0, key: bk)
+    let req = GetRequest(flags: 0, txnId: zeroTransactionID(), readTimestamp: 0, key: bk)
     let payload = encodeGetRequest(req)
     let r = decodeGetRequest(payload)
     check r.isOk
@@ -183,7 +185,7 @@ suite "kv codec - GetRequest round-trip":
 
 suite "kv codec - PutRequest round-trip":
   test "basic put request":
-    let req = PutRequest(flags: PutFlagReturnPrev, txnId: 0,
+    let req = PutRequest(flags: PutFlagReturnPrev, txnId: zeroTransactionID(),
                          expectedVersion: 0, key: "k", value: "v")
     let payload = encodePutRequest(req)
     let r = decodePutRequest(payload)
@@ -194,18 +196,19 @@ suite "kv codec - PutRequest round-trip":
     check got.value == "v"
 
   test "put request with CAS flag and expected version":
-    let req = PutRequest(flags: PutFlagCAS, txnId: 10,
+    let testTxnId = genTransactionID()
+    let req = PutRequest(flags: PutFlagCAS, txnId: testTxnId,
                          expectedVersion: 42, key: "cas_key", value: "new")
     let payload = encodePutRequest(req)
     let r = decodePutRequest(payload)
     check r.isOk
     check r.value.flags == PutFlagCAS
-    check r.value.txnId == 10
+    check r.value.txnId == testTxnId
     check r.value.expectedVersion == 42
 
   test "put request with large value":
     let bigVal = repeat("X", 65536)
-    let req = PutRequest(flags: 0, txnId: 0, expectedVersion: 0,
+    let req = PutRequest(flags: 0, txnId: zeroTransactionID(), expectedVersion: 0,
                          key: "big", value: bigVal)
     let payload = encodePutRequest(req)
     let r = decodePutRequest(payload)
@@ -247,19 +250,21 @@ suite "kv codec - PutRequest round-trip":
 
 suite "kv codec - DeleteRequest round-trip":
   test "basic delete request":
-    let req = DeleteRequest(flags: 0, txnId: 0, key: "del_key")
+    let req = DeleteRequest(flags: 0, txnId: zeroTransactionID(),
+        key: "del_key")
     let payload = encodeDeleteRequest(req)
     let r = decodeDeleteRequest(payload)
     check r.isOk
     check r.value.key == "del_key"
 
   test "delete request return previous":
-    let req = DeleteRequest(flags: DelFlagReturnPrev, txnId: 5, key: "x")
+    let testTxnId = genTransactionID()
+    let req = DeleteRequest(flags: DelFlagReturnPrev, txnId: testTxnId, key: "x")
     let payload = encodeDeleteRequest(req)
     let r = decodeDeleteRequest(payload)
     check r.isOk
     check r.value.flags == DelFlagReturnPrev
-    check r.value.txnId == 5
+    check r.value.txnId == testTxnId
 
   test "delete response deleted with previous value":
     let resp = DeleteResponse(status: DelStatusDeleted,
@@ -286,7 +291,7 @@ suite "kv codec - DeleteRequest round-trip":
 
 suite "kv codec - BatchRequest round-trip":
   test "empty batch":
-    let req = BatchRequest(flags: 0, txnId: 0, operations: @[])
+    let req = BatchRequest(flags: 0, txnId: zeroTransactionID(), operations: @[])
     let payload = encodeBatchRequest(req)
     let r = decodeBatchRequest(payload)
     check r.isOk
@@ -315,14 +320,15 @@ suite "kv codec - BatchRequest round-trip":
     opDelBuf.writeBytes("dkey")
     opDel.data = opDelBuf
 
-    let req = BatchRequest(flags: BatchFlagAllOrNothing, txnId: 7,
+    let testTxnId = genTransactionID()
+    let req = BatchRequest(flags: BatchFlagAllOrNothing, txnId: testTxnId,
                            operations: @[opGet, opPut, opDel])
     let payload = encodeBatchRequest(req)
     let r = decodeBatchRequest(payload)
     check r.isOk
     let got = r.value
     check got.flags == BatchFlagAllOrNothing
-    check got.txnId == 7
+    check got.txnId == testTxnId
     check got.operations.len == 3
     check got.operations[0].kind == BatchOpGet
     check got.operations[1].kind == BatchOpPut
@@ -363,7 +369,7 @@ suite "kv codec - BatchRequest round-trip":
 
 suite "kv codec - ScanRequest round-trip":
   test "basic scan request":
-    let req = ScanRequest(flags: 0, txnId: 0, readTimestamp: 0,
+    let req = ScanRequest(flags: 0, txnId: zeroTransactionID(), readTimestamp: 0,
                           startKey: "a", endKey: "z", limit: 100)
     let payload = encodeScanRequest(req)
     let r = decodeScanRequest(payload)
@@ -374,7 +380,7 @@ suite "kv codec - ScanRequest round-trip":
     check got.limit == 100
 
   test "scan request full range (empty keys)":
-    let req = ScanRequest(flags: 0, txnId: 0, readTimestamp: 0,
+    let req = ScanRequest(flags: 0, txnId: zeroTransactionID(), readTimestamp: 0,
                           startKey: "", endKey: "", limit: 0)
     let payload = encodeScanRequest(req)
     let r = decodeScanRequest(payload)
@@ -386,7 +392,7 @@ suite "kv codec - ScanRequest round-trip":
   test "scan request with flags":
     let req = ScanRequest(
       flags: ScanFlagIncludeTimestamp or ScanFlagIncludeVersion,
-      txnId: 0, readTimestamp: 999,
+      txnId: zeroTransactionID(), readTimestamp: 999,
       startKey: "start", endKey: "end", limit: 50,
     )
     let payload = encodeScanRequest(req)
@@ -687,7 +693,7 @@ suite "integration - Batch":
       op2Data.writeBytes("bv2")
       let batchReq = BatchRequest(
         flags: 0,
-        txnId: 0,
+        txnId: zeroTransactionID(),
         operations: @[
           BatchOp(kind: BatchOpPut, flags: 0, data: op1Data),
           BatchOp(kind: BatchOpPut, flags: 0, data: op2Data),
@@ -716,7 +722,7 @@ suite "integration - Batch":
       op2Data.writeBytes("kg2")
       let batchReq = BatchRequest(
         flags: 0,
-        txnId: 0,
+        txnId: zeroTransactionID(),
         operations: @[
           BatchOp(kind: BatchOpGet, flags: 0, data: op1Data),
           BatchOp(kind: BatchOpGet, flags: 0, data: op2Data),
@@ -736,7 +742,7 @@ suite "integration - Batch":
       op2Data.writeBytes("missing")
       let batchReq = BatchRequest(
         flags: 0,
-        txnId: 0,
+        txnId: zeroTransactionID(),
         operations: @[
           BatchOp(kind: BatchOpGet, flags: 0, data: op1Data),
           BatchOp(kind: BatchOpGet, flags: 0, data: op2Data),
@@ -761,7 +767,7 @@ suite "integration - Batch":
       op2Data.writeBytes("bd2")
       let batchReq = BatchRequest(
         flags: 0,
-        txnId: 0,
+        txnId: zeroTransactionID(),
         operations: @[
           BatchOp(kind: BatchOpDelete, flags: 0, data: op1Data),
           BatchOp(kind: BatchOpDelete, flags: 0, data: op2Data),
@@ -777,7 +783,8 @@ suite "integration - Batch":
 
   test "empty batch returns all OK":
     withServer(19824, proc(srv: ProtocolServer, cli: ProtocolClient) =
-      let br = cli.kvBatch(BatchRequest(flags: 0, txnId: 0, operations: @[]))
+      let br = cli.kvBatch(BatchRequest(flags: 0, txnId: zeroTransactionID(),
+          operations: @[]))
       check br.isOk
       check br.value.status == BatchStatusAllOK
       check br.value.results.len == 0

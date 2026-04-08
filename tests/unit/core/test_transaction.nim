@@ -23,8 +23,9 @@ suite "MVCCTransaction":
     var mockTime: int64 = 1000
 
   test "transaction creation":
+    let txnId = genTransactionID()
     let txn = MVCCTransaction(
-      id: TransactionID(1),
+      id: txnId,
       status: TXN_PENDING,
       startTimestamp: Timestamp(1000),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -38,15 +39,16 @@ suite "MVCCTransaction":
       epoch: 0
     )
 
-    check txn.id == TransactionID(1)
+    check txn.id == txnId
     check txn.status == TXN_PENDING
     check txn.startTimestamp == Timestamp(1000)
     check txn.priority == DEFAULT_PRIORITY
     check txn.epoch == 0
 
   test "add write entry":
+    let txnId = genTransactionID()
     var txn = MVCCTransaction(
-      id: TransactionID(1),
+      id: txnId,
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -69,8 +71,9 @@ suite "MVCCTransaction":
     check txn.writeSet.entries[1].isDelete == true
 
   test "add read entry":
+    let txnId = genTransactionID()
     var txn = MVCCTransaction(
-      id: TransactionID(1),
+      id: txnId,
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -93,8 +96,9 @@ suite "MVCCTransaction":
     check txn.getReadTimestamp("nonexistent") == INVALID_TIMESTAMP
 
   test "transaction state checks":
+    let txnId = genTransactionID()
     var txn = MVCCTransaction(
-      id: TransactionID(1),
+      id: txnId,
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -123,8 +127,9 @@ suite "MVCCTransaction":
     check txn.isActive() == false
 
   test "has write and has read":
+    let txnId2 = genTransactionID()
     var txn = MVCCTransaction(
-      id: TransactionID(1),
+      id: txnId2,
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -149,8 +154,9 @@ suite "MVCCTransaction":
     check txn.hasWrite("key2") == false
 
   test "get write and read counts":
+    let txnId3 = genTransactionID()
     var txn = MVCCTransaction(
-      id: TransactionID(1),
+      id: txnId3,
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -176,8 +182,9 @@ suite "MVCCTransaction":
     check txn.getReadCount() == 2
 
   test "clear read set":
+    let txnId4 = genTransactionID()
     var txn = MVCCTransaction(
-      id: TransactionID(1),
+      id: txnId4,
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -202,8 +209,9 @@ suite "MVCCTransaction":
     check txn.readSet.keys.len == 0
 
   test "transaction epoch and retry tracking":
+    let txnId5 = genTransactionID()
     var txn = MVCCTransaction(
-      id: TransactionID(1),
+      id: txnId5,
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -231,8 +239,9 @@ suite "MVCCTransaction":
     check txn.canRetry(DEFAULT_MAX_RETRIES) == false
 
   test "reset for retry":
+    let txnId6 = genTransactionID()
     var txn = MVCCTransaction(
-      id: TransactionID(1),
+      id: txnId6,
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -264,8 +273,9 @@ suite "MVCCTransaction":
     check txn.epoch == 1
 
   test "deadline checking":
+    let txnId7 = genTransactionID()
     var txn = MVCCTransaction(
-      id: TransactionID(1),
+      id: txnId7,
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,

@@ -128,14 +128,14 @@ suite "MVCC Transactions - Basic":
     let encoded = makeVersionKey(key, ts)
     check encoded.len > key.len
 
-    let intentKey = makeIntentKey(key, TransactionID(100))
+    let intentKey = makeIntentKey(key, genTransactionID())
     check intentKey.len > key.len
 
   test "MVCC value encoding":
     let value = "test_value"
     # Use a realistic nanosecond timestamp (year 2024)
     let ts: Timestamp = 1_700_000_000_000_000_000
-    let txnId = TransactionID(999)
+    let txnId = genTransactionID()
 
     let encoded = encodeMVCCValue(value, ts, false, txnId)
     check encoded.len > value.len

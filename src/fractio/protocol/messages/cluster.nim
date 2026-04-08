@@ -387,6 +387,7 @@ type
     creatorNodeId*: uint16 ## Node that created the group (to connect to)
     creatorHost*: string   ## Host address of creator
     creatorPort*: uint16   ## Raft port of creator
+    members*: seq[CreateGroupMember] ## All group members (added so receiver knows the full membership)
 
   JoinGroupResponse* = object
     success*: bool
@@ -490,6 +491,13 @@ proc encodeJoinGroupRequest*(req: JoinGroupRequest): string =
   buf.writeUint16BE(req.creatorNodeId)
   buf.writeBytes8(req.creatorHost)
   buf.writeUint16BE(req.creatorPort)
+  # Members list
+  buf.writeUint16BE(uint16(req.members.len))
+  for m in req.members:
+    buf.writeUint16BE(m.nodeId)
+    buf.writeBytes8(m.host)
+    buf.writeUint16BE(m.raftPort)
+    buf.writeUint16BE(m.clientPort)
   buf
 
 proc decodeJoinGroupRequest*(payload: string): Result[JoinGroupRequest,
@@ -515,6 +523,34 @@ proc decodeJoinGroupRequest*(payload: string): Result[JoinGroupRequest,
   let creatorPortR = readUint16BE(payload, pos)
   if creatorPortR.isErr: return peErr(creatorPortR.error)
   req.creatorPort = creatorPortR.value
+
+  # Members list (optional for backward compatibility)
+  if pos + 2 <= payload.len:
+    let memberCountR = readUint16BE(payload, pos)
+    if memberCountR.isErr: return peErr(memberCountR.error)
+    let memberCount = int(memberCountR.value)
+
+    req.members = newSeqOfCap[CreateGroupMember](memberCount)
+    for i in 0..<memberCount:
+      var m: CreateGroupMember
+
+      let nodeIdR = readUint16BE(payload, pos)
+      if nodeIdR.isErr: return peErr(nodeIdR.error)
+      m.nodeId = nodeIdR.value
+
+      let hostR = readBytes8(payload, pos)
+      if hostR.isErr: return peErr(hostR.error)
+      m.host = hostR.value
+
+      let raftPortR = readUint16BE(payload, pos)
+      if raftPortR.isErr: return peErr(raftPortR.error)
+      m.raftPort = raftPortR.value
+
+      let clientPortR = readUint16BE(payload, pos)
+      if clientPortR.isErr: return peErr(clientPortR.error)
+      m.clientPort = clientPortR.value
+
+      req.members.add(m)
 
   peOk(req)
 

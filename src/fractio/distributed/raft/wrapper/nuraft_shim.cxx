@@ -576,16 +576,13 @@ public:
             std::lock_guard<std::mutex> lock(tasks_lock_);
             auto it = tasks_.find(timer_id);
             if (it == tasks_.end()) {
-                std::cerr << "DEBUG invoke_timer: timer_id=" << timer_id << " NOT FOUND" << std::endl;
                 return false;
             }
             task = it->second;
             tasks_.erase(it);
         }
         if (task) {
-            std::cerr << "DEBUG invoke_timer: timer_id=" << timer_id << " EXECUTING task..." << std::endl;
             task->execute();
-            std::cerr << "DEBUG invoke_timer: timer_id=" << timer_id << " EXECUTE DONE" << std::endl;
             return true;
         }
         return false;
@@ -805,30 +802,21 @@ void* nuraft_mp_context_create(
 void nuraft_mp_context_destroy(void* ctx) {
     if (ctx) {
         auto* mp_ctx = static_cast<mp_context_t*>(ctx);
-        std::cerr << "DEBUG nuraft_mp_context_destroy: ctx=" << ctx 
-                  << " client_factory=" << mp_ctx->client_factory.get()
-                  << " timer=" << mp_ctx->timer.get()
-                  << " listener=" << mp_ctx->listener.get() << std::endl;
         try {
             if (mp_ctx->client_factory) {
-                std::cerr << "DEBUG nuraft_mp_context_destroy: calling abandon_all" << std::endl;
                 mp_ctx->client_factory->abandon_all();
             }
             if (mp_ctx->timer) {
-                std::cerr << "DEBUG nuraft_mp_context_destroy: stopping timer" << std::endl;
                 mp_ctx->timer->stop();
             }
             if (mp_ctx->listener) {
-                std::cerr << "DEBUG nuraft_mp_context_destroy: stopping listener" << std::endl;
                 mp_ctx->listener->stop();
             }
-            std::cerr << "DEBUG nuraft_mp_context_destroy: deleting mp_ctx" << std::endl;
             delete mp_ctx;
-            std::cerr << "DEBUG nuraft_mp_context_destroy: done" << std::endl;
         } catch (const std::exception& e) {
-            std::cerr << "DEBUG nuraft_mp_context_destroy: exception: " << e.what() << std::endl;
+            std::cerr << "nuraft_mp_context_destroy: exception: " << e.what() << std::endl;
         } catch (...) {
-            std::cerr << "DEBUG nuraft_mp_context_destroy: unknown exception" << std::endl;
+            std::cerr << "nuraft_mp_context_destroy: unknown exception" << std::endl;
         }
     }
 }
@@ -877,22 +865,11 @@ void nuraft_mp_listener_destroy(void* listener_ptr) {
 void nuraft_mp_deliver_message(void* mp_context, void* server,
                                const char* msg_data, size_t msg_len) {
     if (!mp_context || !msg_data || msg_len == 0) {
-        std::cerr << "DEBUG deliver_message: invalid params" << std::endl;
         return;
     }
 
     auto* mp_ctx = static_cast<mp_context_t*>(mp_context);
     auto* wrapper = static_cast<server_wrapper*>(server);
-
-    std::cerr << "DEBUG deliver_message: msg_len=" << msg_len 
-              << " server_id=" << mp_ctx->server_id << std::endl;
-
-    // Dump first 8 bytes of message for debugging
-    std::cerr << "DEBUG deliver_message: first 8 bytes: ";
-    for (size_t i = 0; i < 8 && i < msg_len; i++) {
-        std::cerr << std::hex << (int)(unsigned char)msg_data[i] << " ";
-    }
-    std::cerr << std::dec << std::endl;
 
     // Deserialize message - allocate buffer and copy data
     // IMPORTANT: buffer::alloc creates buffer with given size, and pos=0
@@ -900,11 +877,7 @@ void nuraft_mp_deliver_message(void* mp_context, void* server,
     std::memcpy(msg_buf->data_begin(), msg_data, msg_len);
     msg_buf->pos(0);  // Reset position for reading
 
-    std::cerr << "DEBUG deliver_message: buffer allocated, size=" << msg_buf->size() 
-              << " pos=" << msg_buf->pos() << std::endl;
-
     msg_type type = get_msg_type(*msg_buf);
-    std::cerr << "DEBUG deliver_message: msg_type=" << static_cast<int>(type) << std::endl;
 
     // Build group_id hex for handler lookup
     std::string gid_hex;
@@ -967,20 +940,14 @@ void nuraft_mp_deliver_message(void* mp_context, void* server,
 
 bool nuraft_mp_invoke_timer(void* mp_context, int32_t timer_id) {
     if (!mp_context) {
-        std::cerr << "DEBUG invoke_timer: mp_context is null" << std::endl;
         return false;
     }
 
     auto* mp_ctx = static_cast<mp_context_t*>(mp_context);
-    std::cerr << "DEBUG invoke_timer: timer_id=" << timer_id 
-              << " mp_ctx=" << mp_context
-              << " timer=" << mp_ctx->timer.get() << std::endl;
     if (mp_ctx->timer) {
         bool result = mp_ctx->timer->invoke_timer(timer_id);
-        std::cerr << "DEBUG invoke_timer: result=" << result << std::endl;
         return result;
     }
-    std::cerr << "DEBUG invoke_timer: timer is null!" << std::endl;
     return false;
 }
 

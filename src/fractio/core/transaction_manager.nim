@@ -110,7 +110,7 @@ proc commitTransaction*(manager: TransactionManager,
       if latest.timestamp > readTs and latest.timestamp < commitTs:
         # Check if it's from a different transaction
         if latest.txnId != txn.id and latest.txnId !=
-            engine.InvalidTransactionID:
+            InvalidTransactionID:
           manager.abortedCount += 1
           return commitError(ceSerializationFailure,
             "Serialization failure: key " & key & " modified after read")

@@ -15,6 +15,7 @@ import std/times
 
 import fractio/distributed/raft/group_types
 import fractio/distributed/rebalance/allocator
+import fractio/core/types
 
 # ============================================================================
 # Constants
@@ -51,8 +52,7 @@ type
 
   RebalanceOp* = ref object
     ## A single rebalance operation
-    id*: int64
-      ## Unique operation ID
+    id*: TransactionID ## ULID-based unique operation ID
     decision*: AllocationDecision
       ## The allocation decision
     state*: RebalanceOpState
@@ -68,11 +68,11 @@ type
     lastError*: string
       ## Last error message
 
-proc newRebalanceOp*(id: int64, decision: AllocationDecision,
+proc newRebalanceOp*(decision: AllocationDecision,
                      nowNs: int64): RebalanceOp =
-  ## Create a new rebalance operation
+  ## Create a new rebalance operation with ULID ID
   new(result)
-  result.id = id
+  result.id = genTransactionID()
   result.decision = decision
   result.state = rosPending
   result.createdAtNs = nowNs
@@ -126,7 +126,6 @@ type
     pending*: seq[RebalanceOp]
     inProgress*: seq[RebalanceOp]
     completed*: seq[RebalanceOp]
-    nextId*: int64
     lock*: Lock
 
 proc newRebalanceQueue*(): RebalanceQueue =
@@ -135,7 +134,6 @@ proc newRebalanceQueue*(): RebalanceQueue =
   result.pending = @[]
   result.inProgress = @[]
   result.completed = @[]
-  result.nextId = 1
   initLock(result.lock)
 
 proc destroy*(queue: RebalanceQueue) =
@@ -144,10 +142,9 @@ proc destroy*(queue: RebalanceQueue) =
 
 proc enqueue*(queue: RebalanceQueue, decision: AllocationDecision,
               nowNs: int64): RebalanceOp =
-  ## Add a new operation to the queue
+  ## Add a new operation to the queue (auto-generates ULID ID)
   withLock queue.lock:
-    let op = newRebalanceOp(queue.nextId, decision, nowNs)
-    inc queue.nextId
+    let op = newRebalanceOp(decision, nowNs)
     queue.pending.add(op)
 
     # Sort by priority (descending)
@@ -336,7 +333,7 @@ proc processBatch*(scheduler: RebalanceScheduler, nowNs: int64): int =
 proc checkGroupForRebalance*(scheduler: RebalanceScheduler,
                               groupId: GroupID,
                               replicas: seq[ReplicaDescriptor],
-                              leaseholder: NodeID,
+                              leaseholder: group_types.NodeID,
                               nowNs: int64): seq[RebalanceOp] =
   ## Check a range for rebalancing and add decisions to queue
 

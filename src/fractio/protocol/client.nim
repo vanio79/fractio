@@ -14,9 +14,11 @@ import std/[net, strformat, atomics, locks]
 import posix
 import ../utils/socket_utils
 import ../distributed/raft/group_types
+import ../core/types
 import ./types
 import ./codec
 import ./frame
+import ./messages/kv as kvMsgs
 import ./handshake
 import ./messages/core
 import ./messages/kv
@@ -342,7 +344,7 @@ proc closeConn*(client: ProtocolClient, reason: string = "") {.gcsafe, raises: [
 # ---------------------------------------------------------------------------
 
 proc kvGet*(client: ProtocolClient, key: string,
-    flags: uint8 = 0, txnId: uint64 = 0,
+    flags: uint8 = 0, txnId: TransactionID = zeroTransactionID(),
     readTimestamp: uint64 = 0): Result[GetResponse, ProtocolError] {.gcsafe,
     raises: [].} =
   ## Send a Get request and return the decoded response.
@@ -353,7 +355,7 @@ proc kvGet*(client: ProtocolClient, key: string,
   decodeGetResponse(r.value.payload)
 
 proc kvPut*(client: ProtocolClient, key: string, value: string,
-    flags: uint8 = 0, txnId: uint64 = 0,
+    flags: uint8 = 0, txnId: TransactionID = zeroTransactionID(),
     expectedVersion: uint64 = 0): Result[PutResponse, ProtocolError] {.gcsafe,
     raises: [].} =
   ## Send a Put request and return the decoded response.
@@ -366,7 +368,8 @@ proc kvPut*(client: ProtocolClient, key: string, value: string,
 
 proc kvDelete*(client: ProtocolClient, key: string,
     flags: uint8 = 0,
-    txnId: uint64 = 0): Result[DeleteResponse, ProtocolError] {.gcsafe,
+    txnId: TransactionID = zeroTransactionID()): Result[DeleteResponse,
+        ProtocolError] {.gcsafe,
     raises: [].} =
   ## Send a Delete request and return the decoded response.
   let req = DeleteRequest(flags: flags, txnId: txnId, key: key)
@@ -376,7 +379,7 @@ proc kvDelete*(client: ProtocolClient, key: string,
 
 proc kvGetInGroup*(client: ProtocolClient, key: string,
     groupId: GroupID,
-    flags: uint8 = 0, txnId: uint64 = 0,
+    flags: uint8 = 0, txnId: TransactionID = zeroTransactionID(),
     readTimestamp: uint64 = 0): Result[GetResponse, ProtocolError] {.gcsafe,
     raises: [].} =
   ## Send a Get request routed to a specific Raft group.
@@ -389,7 +392,7 @@ proc kvGetInGroup*(client: ProtocolClient, key: string,
 
 proc kvRawPutInGroup*(client: ProtocolClient, key: string, value: string,
     groupId: GroupID,
-    flags: uint8 = 0, txnId: uint64 = 0,
+    flags: uint8 = 0, txnId: TransactionID = zeroTransactionID(),
     expectedVersion: uint64 = 0): Result[PutResponse, ProtocolError] {.gcsafe,
     raises: [].} =
   let req = PutRequest(flags: flags, txnId: txnId,
@@ -402,7 +405,7 @@ proc kvRawPutInGroup*(client: ProtocolClient, key: string, value: string,
 
 proc kvPutInGroup*(client: ProtocolClient, key: string, value: string,
     groupId: GroupID,
-    flags: uint8 = 0, txnId: uint64 = 0,
+    flags: uint8 = 0, txnId: TransactionID = zeroTransactionID(),
     expectedVersion: uint64 = 0): Result[PutResponse, ProtocolError] {.gcsafe,
     raises: [].} =
   ## Send a Put request routed to a specific Raft group.
@@ -417,7 +420,8 @@ proc kvPutInGroup*(client: ProtocolClient, key: string, value: string,
 proc kvDeleteInGroup*(client: ProtocolClient, key: string,
     groupId: GroupID,
     flags: uint8 = 0,
-    txnId: uint64 = 0): Result[DeleteResponse, ProtocolError] {.gcsafe,
+    txnId: TransactionID = zeroTransactionID()): Result[DeleteResponse,
+        ProtocolError] {.gcsafe,
     raises: [].} =
   ## Send a Delete request routed to a specific Raft group.
   let req = DeleteRequest(flags: flags, txnId: txnId, key: key,
@@ -436,21 +440,28 @@ proc kvBatch*(client: ProtocolClient,
 
 proc kvScan*(client: ProtocolClient, startKey: string = "",
     endKey: string = "", limit: uint32 = 0,
-    flags: uint8 = 0, txnId: uint64 = 0,
-    readTimestamp: uint64 = 0): Result[ScanResponseFrame, ProtocolError] {.
+    flags: uint8 = 0, txnId: TransactionID = zeroTransactionID(),
+    readTimestamp: uint64 = 0,
+    groupId: GroupID = ZeroGroupID()): Result[ScanResponseFrame,
+        ProtocolError] {.
     gcsafe, raises: [].} =
   ## Send a Scan request and return the first (and only, in Phase 2) response frame.
+  ## If groupId is provided, sets the GroupRouted flag for server-side routing filter.
+  var actualFlags = flags
+  if groupId != ZeroGroupID():
+    actualFlags = actualFlags or kvMsgs.ScanFlagGroupRouted
   let req = ScanRequest(
-    flags: flags,
+    flags: actualFlags,
     txnId: txnId,
     readTimestamp: readTimestamp,
     startKey: startKey,
     endKey: endKey,
     limit: limit,
+    groupId: groupId,
   )
   let r = client.send(encodeScanRequest(req))
   if r.isErr: return peErr(r.error)
-  decodeScanResponseFrame(r.value.payload, flags)
+  decodeScanResponseFrame(r.value.payload, actualFlags)
 
 # ---------------------------------------------------------------------------
 # Transaction convenience procs (Phase 3)
@@ -466,7 +477,7 @@ proc beginTxn*(client: ProtocolClient, flags: uint8 = 0,
   txnMsgs.decodeBeginTxnResponse(r.value.payload)
 
 proc commitTxn*(client: ProtocolClient,
-    txnId: uint64): Result[txnMsgs.CommitTxnResponse,
+    txnId: TransactionID): Result[txnMsgs.CommitTxnResponse,
     ProtocolError] {.gcsafe, raises: [].} =
   ## Commit txnId. Check .status for TxnCommitOK / conflict / timeout.
   let req = txnMsgs.CommitTxnRequest(txnId: txnId)
@@ -475,7 +486,7 @@ proc commitTxn*(client: ProtocolClient,
   txnMsgs.decodeCommitTxnResponse(r.value.payload)
 
 proc rollbackTxn*(client: ProtocolClient,
-    txnId: uint64): Result[txnMsgs.RollbackTxnResponse,
+    txnId: TransactionID): Result[txnMsgs.RollbackTxnResponse,
     ProtocolError] {.gcsafe, raises: [].} =
   ## Roll back txnId.
   let req = txnMsgs.RollbackTxnRequest(txnId: txnId)
@@ -484,7 +495,7 @@ proc rollbackTxn*(client: ProtocolClient,
   txnMsgs.decodeRollbackTxnResponse(r.value.payload)
 
 proc txnStatus*(client: ProtocolClient,
-    txnId: uint64): Result[txnMsgs.TxnStatusResponse,
+    txnId: TransactionID): Result[txnMsgs.TxnStatusResponse,
     ProtocolError] {.gcsafe, raises: [].} =
   ## Query the status of txnId.
   let req = txnMsgs.TxnStatusRequest(txnId: txnId)

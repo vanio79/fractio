@@ -3,12 +3,13 @@
 # Implements BeginTxn (0x0200), CommitTxn (0x0201), RollbackTxn (0x0202),
 # and TxnStatus (0x0203).
 #
-# Wire formats match protocol_design.md §4.3 exactly.
+# Wire formats use ULID-based TransactionID (16 bytes).
 # All encode procs emit a 2-byte MessageType prefix followed by fields.
 # The caller wraps the result in a Frame via frame.encodeFrame.
 
 import ../types
 import ../codec
+import ../../core/types as coreTypes
 
 # ---------------------------------------------------------------------------
 # Status constants (shared across Commit, Rollback, TxnStatus responses)
@@ -43,7 +44,7 @@ const
 #   Timeout (4 bytes uint32 BE): milliseconds; 0 = server default
 #
 # Response:
-#   TxnId         (8 bytes uint64)
+#   TxnId         (16 bytes ULID)
 #   ReadTimestamp (8 bytes uint64): MVCC snapshot timestamp
 # ---------------------------------------------------------------------------
 
@@ -53,7 +54,7 @@ type
     timeoutMs*: uint32
 
   BeginTxnResponse* = object
-    txnId*: uint64
+    txnId*: TransactionID
     readTimestamp*: uint64
 
 proc encodeBeginTxnRequest*(req: BeginTxnRequest): string =
@@ -81,7 +82,7 @@ proc decodeBeginTxnRequest*(payload: string): Result[BeginTxnRequest,
 proc encodeBeginTxnResponse*(resp: BeginTxnResponse): string =
   var buf = ""
   buf.writeUint16BE(uint16(mtBeginTxn))
-  buf.writeUint64BE(resp.txnId)
+  buf.add(transactionIDToBytes(resp.txnId))
   buf.writeUint64BE(resp.readTimestamp)
   buf
 
@@ -90,9 +91,13 @@ proc decodeBeginTxnResponse*(payload: string): Result[BeginTxnResponse,
   var pos = 2
   var resp: BeginTxnResponse
 
-  let idR = readUint64BE(payload, pos)
-  if idR.isErr: return peErr(idR.error)
-  resp.txnId = idR.value
+  # Read 16-byte ULID
+  if pos + 16 > payload.len:
+    return peErr(newProtocolError(peBoundsOverflow,
+        "BeginTxnResponse: txnId truncated"))
+  let txnBytes = payload[pos ..< pos + 16]
+  resp.txnId = transactionIDFromBytes(txnBytes)
+  pos += 16
 
   let tsR = readUint64BE(payload, pos)
   if tsR.isErr: return peErr(tsR.error)
@@ -104,7 +109,7 @@ proc decodeBeginTxnResponse*(payload: string): Result[BeginTxnResponse,
 # CommitTxn  (0x0201)
 #
 # Request:
-#   TxnId (8 bytes uint64)
+#   TxnId (16 bytes ULID)
 #
 # Response:
 #   Status          (1 byte): TxnCommit*
@@ -113,7 +118,7 @@ proc decodeBeginTxnResponse*(payload: string): Result[BeginTxnResponse,
 
 type
   CommitTxnRequest* = object
-    txnId*: uint64
+    txnId*: TransactionID
 
   CommitTxnResponse* = object
     status*: uint8
@@ -122,15 +127,18 @@ type
 proc encodeCommitTxnRequest*(req: CommitTxnRequest): string =
   var buf = ""
   buf.writeUint16BE(uint16(mtCommitTxn))
-  buf.writeUint64BE(req.txnId)
+  buf.add(transactionIDToBytes(req.txnId))
   buf
 
 proc decodeCommitTxnRequest*(payload: string): Result[CommitTxnRequest,
     ProtocolError] =
   var pos = 2
-  let r = readUint64BE(payload, pos)
-  if r.isErr: return peErr(r.error)
-  peOk(CommitTxnRequest(txnId: r.value))
+  # Read 16-byte ULID
+  if pos + 16 > payload.len:
+    return peErr(newProtocolError(peBoundsOverflow,
+        "CommitTxnRequest: txnId truncated"))
+  let txnBytes = payload[pos ..< pos + 16]
+  peOk(CommitTxnRequest(txnId: transactionIDFromBytes(txnBytes)))
 
 proc encodeCommitTxnResponse*(resp: CommitTxnResponse): string =
   var buf = ""
@@ -158,7 +166,7 @@ proc decodeCommitTxnResponse*(payload: string): Result[CommitTxnResponse,
 # RollbackTxn  (0x0202)
 #
 # Request:
-#   TxnId (8 bytes uint64)
+#   TxnId (16 bytes ULID)
 #
 # Response:
 #   Status (1 byte): TxnRollback*
@@ -166,7 +174,7 @@ proc decodeCommitTxnResponse*(payload: string): Result[CommitTxnResponse,
 
 type
   RollbackTxnRequest* = object
-    txnId*: uint64
+    txnId*: TransactionID
 
   RollbackTxnResponse* = object
     status*: uint8
@@ -174,15 +182,18 @@ type
 proc encodeRollbackTxnRequest*(req: RollbackTxnRequest): string =
   var buf = ""
   buf.writeUint16BE(uint16(mtRollbackTxn))
-  buf.writeUint64BE(req.txnId)
+  buf.add(transactionIDToBytes(req.txnId))
   buf
 
 proc decodeRollbackTxnRequest*(payload: string): Result[RollbackTxnRequest,
     ProtocolError] =
   var pos = 2
-  let r = readUint64BE(payload, pos)
-  if r.isErr: return peErr(r.error)
-  peOk(RollbackTxnRequest(txnId: r.value))
+  # Read 16-byte ULID
+  if pos + 16 > payload.len:
+    return peErr(newProtocolError(peBoundsOverflow,
+        "RollbackTxnRequest: txnId truncated"))
+  let txnBytes = payload[pos ..< pos + 16]
+  peOk(RollbackTxnRequest(txnId: transactionIDFromBytes(txnBytes)))
 
 proc encodeRollbackTxnResponse*(resp: RollbackTxnResponse): string =
   var buf = ""
@@ -201,7 +212,7 @@ proc decodeRollbackTxnResponse*(payload: string): Result[RollbackTxnResponse,
 # TxnStatus  (0x0203)
 #
 # Request:
-#   TxnId (8 bytes uint64)
+#   TxnId (16 bytes ULID)
 #
 # Response:
 #   Status          (1 byte): TxnStatus*
@@ -210,7 +221,7 @@ proc decodeRollbackTxnResponse*(payload: string): Result[RollbackTxnResponse,
 
 type
   TxnStatusRequest* = object
-    txnId*: uint64
+    txnId*: TransactionID
 
   TxnStatusResponse* = object
     status*: uint8
@@ -219,15 +230,18 @@ type
 proc encodeTxnStatusRequest*(req: TxnStatusRequest): string =
   var buf = ""
   buf.writeUint16BE(uint16(mtTxnStatus))
-  buf.writeUint64BE(req.txnId)
+  buf.add(transactionIDToBytes(req.txnId))
   buf
 
 proc decodeTxnStatusRequest*(payload: string): Result[TxnStatusRequest,
     ProtocolError] =
   var pos = 2
-  let r = readUint64BE(payload, pos)
-  if r.isErr: return peErr(r.error)
-  peOk(TxnStatusRequest(txnId: r.value))
+  # Read 16-byte ULID
+  if pos + 16 > payload.len:
+    return peErr(newProtocolError(peBoundsOverflow,
+        "TxnStatusRequest: txnId truncated"))
+  let txnBytes = payload[pos ..< pos + 16]
+  peOk(TxnStatusRequest(txnId: transactionIDFromBytes(txnBytes)))
 
 proc encodeTxnStatusResponse*(resp: TxnStatusResponse): string =
   var buf = ""

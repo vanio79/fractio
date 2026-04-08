@@ -2,11 +2,12 @@
 # Tests actual UDP communication, thread safety, and synchronization correctness
 
 import unittest
-import std/[times, os, tables, math, net]
+import std/[times, os, tables, math, net, sets]
 
 import fractio/utils/logging
 import fractio/distributed/sharedtimer
 import fractio/distributed/sharedtimer/udptransport
+import fractio/core/types as coreTypes
 
 # Helper to get an ephemeral port by binding a temporary socket
 proc getEphemeralPort(): uint16 =
@@ -378,15 +379,15 @@ suite "SharedTimer UDP Integration Tests":
 
     # If both synchronized, check uniqueness
     if timersSmall[0].getState() == tssSynchronized and timersSmall[1].getState() == tssSynchronized:
-      var idSet: Table[int64, bool]
-      idSet = initTable[int64, bool]()
+      var idSet: HashSet[coreTypes.TransactionID]
+      idSet = initHashSet[coreTypes.TransactionID]()
 
       # Generate 100 IDs from each node
       for t in timersSmall:
         for i in 0..<100:
-          let id = t.getTransactionID().int64
-          check not (id in idSet) # Must be globally unique
-          idSet[id] = true
+          let id = t.getTransactionID()
+          check id notin idSet # Must be globally unique
+          idSet.incl(id)
 
   test "Scale test: 200 nodes with real UDP (stress)":
     # This test may take a few seconds - it creates 200 nodes, each with 5 random peers.

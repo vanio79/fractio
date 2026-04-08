@@ -126,7 +126,7 @@ suite "MvccTransactionStore - Transaction lifecycle":
     let beginRes = mvccStore.beginTransaction(sessionId)
 
     check beginRes.isOk
-    check beginRes.value != coreTypes.TransactionID(0)
+    check beginRes.value != coreTypes.zeroTransactionID()
 
     let statusRes = mvccStore.getTransactionStatus(sessionId)
     check statusRes.isOk

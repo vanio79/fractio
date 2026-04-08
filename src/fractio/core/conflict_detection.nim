@@ -214,7 +214,7 @@ proc resolveConflict*(resolver: ConflictResolver,
     return ConflictResult(
       resolution: crPush,
       newTimestamp: INVALID_TIMESTAMP,
-      waitForTxn: engine.InvalidTransactionID,
+      waitForTxn: InvalidTransactionID,
       shouldAbort: false
     )
 
@@ -223,7 +223,7 @@ proc resolveConflict*(resolver: ConflictResolver,
     return ConflictResult(
       resolution: crRetry,
       newTimestamp: conflictingTxn.commitTimestamp + 1,
-      waitForTxn: engine.InvalidTransactionID,
+      waitForTxn: InvalidTransactionID,
       shouldAbort: false
     )
 
@@ -232,7 +232,7 @@ proc resolveConflict*(resolver: ConflictResolver,
     return ConflictResult(
       resolution: crRetry,
       newTimestamp: txn.startTimestamp,
-      waitForTxn: engine.InvalidTransactionID,
+      waitForTxn: InvalidTransactionID,
       shouldAbort: false
     )
 
@@ -243,7 +243,7 @@ proc resolveConflict*(resolver: ConflictResolver,
       return ConflictResult(
         resolution: crPush,
         newTimestamp: INVALID_TIMESTAMP,
-        waitForTxn: engine.InvalidTransactionID,
+        waitForTxn: InvalidTransactionID,
         shouldAbort: false
       )
 
@@ -259,7 +259,7 @@ proc resolveConflict*(resolver: ConflictResolver,
   return ConflictResult(
     resolution: crRetry,
     newTimestamp: conflict.timestamp + 1,
-    waitForTxn: engine.InvalidTransactionID,
+    waitForTxn: InvalidTransactionID,
     shouldAbort: false
   )
 

@@ -152,7 +152,8 @@ proc `$`*(r: LeaderRedirect): string =
 # ---------------------------------------------------------------------------
 
 proc isNotLeaderError*(errorMsg: string): bool {.inline.} =
-  ## Check if an error message indicates a "not leader" error.
+  ## Check if an error message indicates a "not leader" error or a routing error
+  ## that should trigger retry on a different node.
   ## Handles wire error codes, string messages, and NuRaft internal codes.
   let msgLower = errorMsg.toLowerAscii()
   if "not leader" in msgLower or "not the leader" in msgLower:
@@ -162,6 +163,11 @@ proc isNotLeaderError*(errorMsg: string): bool {.inline.} =
     return true
   # NuRaft internal error code
   if "code -3" in errorMsg:
+    return true
+  # "Group not found" indicates the target node doesn't have the group
+  # This can happen when topology changes (new node added, node killed)
+  # and the client connected to a node that isn't part of the group
+  if "group not found" in msgLower:
     return true
   false
 
@@ -190,6 +196,7 @@ type
     peVersionMismatch
     peAuthFailed
     peNotLeader
+    peGroupNotFound ## Target node doesn't have the group (topology change)
     peTimeout
     peBoundsOverflow
     peInternal
@@ -209,7 +216,9 @@ proc `$`*(e: ProtocolError): string =
     result &= &" (redirect to {e.leaderRedirect})"
 
 proc isNotLeader*(e: ProtocolError): bool {.inline.} =
-  e.kind == peNotLeader
+  ## Check if this is a "not leader" error or a routing error that should
+  ## trigger retry on a different node.
+  e.kind == peNotLeader or e.kind == peGroupNotFound
 
 # ---------------------------------------------------------------------------
 # Result types — no external dependencies.

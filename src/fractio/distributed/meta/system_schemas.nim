@@ -178,7 +178,17 @@ proc encodeGroupReplica*(rep: GroupReplicaBin, w: var BinaryWriter) =
 
 proc decodeGroupReplica*(r: var BinaryReader): GroupReplicaBin =
   result.nodeId = r.readU32()
-  result.replicaType = ReplicaType(r.readU8())
+  let typeByte = r.readU8()
+  # Handle both our enum values and NuRaft's srv_config flags
+  # Our values: rtVoter=0, rtLearner=1
+  # NuRaft flags: LEARNER_FLAG=0x1, NEW_JOINER_FLAG=0x2
+  # Any unknown value defaults to rtVoter for safety
+  if typeByte <= 1:
+    result.replicaType = ReplicaType(typeByte)
+  else:
+    # Unknown value - default to voter (most common case)
+    # This handles corrupted data or version mismatches gracefully
+    result.replicaType = rtVoter
 
 # =============================================================================
 # Group Record (sys.groups)
@@ -257,13 +267,13 @@ proc decodeNodeRecord*(data: string): NodeRecord =
 
 proc stripMVCCHeader*(data: string): tuple[payload: string, isDeleted: bool] =
   ## Internal helper to strip MVCC header from a value.
-  ## MVCC format: <MAGIC (4 bytes)><8 bytes timestamp><8 bytes txn_id><1 byte delete flag><payload>
+  ## MVCC format: <MAGIC (4 bytes)><8 bytes timestamp><16 bytes txn_id ULID><1 byte delete flag><payload>
 
-  const MVCC_HEADER_SIZE = 21
+  const MVCC_HEADER_SIZE = 29 # 4 (magic) + 8 (ts) + 16 (txn ULID) + 1 (del)
   const MVCC_MAGIC = "MVCC"
 
   if data.len >= MVCC_HEADER_SIZE and data.startsWith(MVCC_MAGIC):
-    let isDeleted = data[20] == '1'
+    let isDeleted = data[28] == '1'
     return (data[MVCC_HEADER_SIZE..^1], isDeleted)
 
   return (data, false)
@@ -498,7 +508,6 @@ proc decodeGroupRecordFromMVCC*(data: string): tuple[record: GroupRecord,
   try:
     return (decodeGroupRecord(payload), false)
   except CatchableError as e:
-    echo "DEBUG: decodeGroupRecordFromMVCC failed: ", e.msg, " len=", payload.len
     raise e
 
 proc decodeTableRecordFromMVCC*(data: string): tuple[record: TableRecord,
@@ -509,7 +518,6 @@ proc decodeTableRecordFromMVCC*(data: string): tuple[record: TableRecord,
   try:
     return (decodeTableRecord(payload), false)
   except CatchableError as e:
-    echo "DEBUG: decodeTableRecordFromMVCC failed: ", e.msg, " len=", payload.len
     raise e
 
 proc decodeDatabaseRecordFromMVCC*(data: string): tuple[record: DatabaseRecord,
@@ -519,7 +527,6 @@ proc decodeDatabaseRecordFromMVCC*(data: string): tuple[record: DatabaseRecord,
   try:
     return (decodeDatabaseRecord(payload), false)
   except CatchableError as e:
-    echo "DEBUG: decodeDatabaseRecordFromMVCC failed: ", e.msg, " len=", payload.len
     raise e
 
 proc decodeSpaceRecordFromMVCC*(data: string): tuple[record: SpaceRecord,
@@ -529,7 +536,6 @@ proc decodeSpaceRecordFromMVCC*(data: string): tuple[record: SpaceRecord,
   try:
     return (decodeSpaceRecord(payload), false)
   except CatchableError as e:
-    echo "DEBUG: decodeSpaceRecordFromMVCC failed: ", e.msg, " len=", payload.len
     raise e
 
 proc decodeSchemaRecordFromMVCC*(data: string): tuple[record: SchemaRecord,
@@ -540,5 +546,4 @@ proc decodeSchemaRecordFromMVCC*(data: string): tuple[record: SchemaRecord,
   try:
     return (decodeSchemaRecord(payload), false)
   except CatchableError as e:
-    echo "DEBUG: decodeSchemaRecordFromMVCC failed: ", e.msg, " len=", payload.len
     raise e

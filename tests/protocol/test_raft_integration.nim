@@ -25,6 +25,7 @@ import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
 import fractio/distributed/sharedtimer/mock
 import fractio/core/timestamp_provider
+import fractio/core/types as coreTypes
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -43,7 +44,7 @@ proc cleanDir(path: string) =
 proc makeRaftServer(port: int, storagePath: string): ProtocolServer =
   ## Spin up a ProtocolServer with Raft-backed KV store.
   cleanDir(storagePath)
-  let nodeId = NodeID(1)
+  let nodeId = rangeTypes.NodeID(1)
   let raftPort = nextBasePort()
   let members = @[(nodeId: 1'u32, host: "127.0.0.1", port: raftPort)]
   let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
@@ -206,7 +207,7 @@ suite "Raft integration - batch":
         op2Data.writeBytes("b_v2")
         let batchReq = BatchRequest(
           flags: 0,
-          txnId: 0,
+          txnId: zeroTransactionID(),
           operations: @[
             BatchOp(kind: BatchOpPut, flags: 0, data: op1Data),
             BatchOp(kind: BatchOpPut, flags: 0, data: op2Data),
@@ -266,7 +267,7 @@ suite "Raft integration - transactions":
         let br = cli.beginTxn(0, 30_000)
         check br.isOk
         let txnId = br.value.txnId
-        check txnId > 0'u64
+        check txnId != zeroTransactionID()
 
         discard cli.kvPut("txn_key", "txn_val")
         let cr = cli.commitTxn(txnId)

@@ -21,9 +21,10 @@
 #     coordinator to durably commit / rollback write-intents through Raft
 #     consensus.  When nil (Phase 3 compat), pure in-memory behaviour is kept.
 
-import std/[tables, sets, locks, times, atomics, strformat, options]
+import std/[tables as stdtables, sets, locks, times, atomics, strformat, options]
 import ./types
 import ./messages/txn as txnMsgs
+import fractio/core/types as coreTypes
 import fractio/distributed/sharedtimer/timeprovider as tp
 
 export txnMsgs # re-export status constants
@@ -35,26 +36,26 @@ export txnMsgs # re-export status constants
 type
   TxnRecord* = object
     ## Everything the manager needs to know about one transaction.
-    id*: uint64
-    flags*: uint8              ## TxnFlagReadOnly, TxnFlagSerializable
-    readTimestamp*: uint64     ## MVCC snapshot timestamp (ns since epoch)
-    commitTimestamp*: uint64   ## non-zero once committed
+    ## Uses ULID-based TransactionID for globally unique IDs.
+    id*: coreTypes.TransactionID
+    flags*: uint8 ## TxnFlagReadOnly, TxnFlagSerializable
+    readTimestamp*: uint64 ## MVCC snapshot timestamp (ns since epoch)
+    commitTimestamp*: uint64 ## non-zero once committed
     writeSet*: HashSet[string] ## keys written during this transaction
-    readSet*: HashSet[string]  ## keys read (used for future SI validation)
-    state*: uint8              ## TxnStatus* constants
-    createdAtMs*: int64        ## wall-clock ms at begin time
-    timeoutMs*: uint32         ## 0 = server default (DEFAULT_TXN_TIMEOUT_MS)
+    readSet*: HashSet[string] ## keys read (used for future SI validation)
+    state*: uint8 ## TxnStatus* constants
+    createdAtMs*: int64 ## wall-clock ms at begin time
+    timeoutMs*: uint32 ## 0 = server default (DEFAULT_TXN_TIMEOUT_MS)
 
   TransactionManager* = ref object
-    txns*: Table[uint64, TxnRecord] ## all known transactions
+    txns*: stdtables.Table[coreTypes.TransactionID, TxnRecord] ## all known transactions
     mu*: Lock
-    nextTxnId*: Atomic[uint64]
-    nextTimestamp*: Atomic[uint64]  ## monotonic counter (nanoseconds)
-                                    ## commitIndex: tracks (key → commitTs) for conflict detection.
-                                    ## Maps each key to the highest commit timestamp that wrote it.
-    commitIndex*: Table[string, uint64]
+    nextTimestamp*: Atomic[uint64] ## monotonic counter (nanoseconds)
+                                   ## commitIndex: tracks (key → commitTs) for conflict detection.
+                                   ## Maps each key to the highest commit timestamp that wrote it.
+    commitIndex*: stdtables.Table[string, uint64]
     ## Phase 5 optional integrations:
-    timeProvider*: tp.TimeProvider  ## when non-nil, use cluster time for timestamps
+    timeProvider*: tp.TimeProvider ## when non-nil, use cluster time for timestamps
     raftCoordPtr*: pointer ## when non-nil, points to RaftTxnCoordinator (void ptr to avoid circular import)
 
 const
@@ -66,13 +67,12 @@ const
 
 proc newTransactionManager*(): TransactionManager =
   result = TransactionManager(
-    txns: initTable[uint64, TxnRecord](),
-    commitIndex: initTable[string, uint64](),
+    txns: stdtables.initTable[coreTypes.TransactionID, TxnRecord](),
+    commitIndex: stdtables.initTable[string, uint64](),
     timeProvider: nil,
     raftCoordPtr: nil,
   )
   initLock(result.mu)
-  result.nextTxnId.store(1)
   # Seed timestamp from wall clock (ns)
   let nowNs = uint64(getTime().toUnixFloat() * 1_000_000_000)
   result.nextTimestamp.store(nowNs)
@@ -126,14 +126,22 @@ proc isExpired(rec: TxnRecord): bool {.gcsafe, raises: [].} =
   rec.state == TxnStatusActive and
   (nowMs() - rec.createdAtMs) > int64(rec.effectiveTimeout)
 
+proc isZeroTxnId(id: coreTypes.TransactionID): bool {.inline.} =
+  ## Check if a TransactionID is the zero/invalid value
+  coreTypes.ULID(id) == coreTypes.ZeroULID()
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 proc beginTransaction*(mgr: TransactionManager, flags: uint8 = 0,
-    timeoutMs: uint32 = 0, forcedId: Option[uint64] = none(uint64)): TxnRecord {.gcsafe, raises: [].} =
+    timeoutMs: uint32 = 0,
+    forcedId: Option[coreTypes.TransactionID] = none(
+        coreTypes.TransactionID)): TxnRecord {.gcsafe, raises: [].} =
   ## Create a new transaction and return its record.
-  let id = if forcedId.isSome: forcedId.get() else: mgr.nextTxnId.fetchAdd(1)
+  ## Uses ULID-based TransactionID for globally unique IDs.
+  let id = if forcedId.isSome: forcedId.get()
+           else: {.cast(gcsafe).}: coreTypes.genTransactionID()
   let readTs = mgr.allocTimestamp()
   let rec = TxnRecord(
     id: id,
@@ -151,13 +159,13 @@ proc beginTransaction*(mgr: TransactionManager, flags: uint8 = 0,
   release(mgr.mu)
   rec
 
-proc recordRead*(mgr: TransactionManager, txnId: uint64,
+proc recordRead*(mgr: TransactionManager, txnId: coreTypes.TransactionID,
     key: string): PResult {.gcsafe, raises: [].} =
   ## Register a key as read by this transaction (for future SI validation).
   acquire(mgr.mu)
   defer: release(mgr.mu)
   var rec = mgr.txns.getOrDefault(txnId)
-  if rec.id == 0:
+  if isZeroTxnId(rec.id):
     return pErr(newProtocolError(peInternal, &"txn {txnId} not found"))
   if rec.state != TxnStatusActive:
     return pErr(newProtocolError(peInternal,
@@ -170,13 +178,13 @@ proc recordRead*(mgr: TransactionManager, txnId: uint64,
   mgr.txns[txnId] = rec
   pOk()
 
-proc recordWrite*(mgr: TransactionManager, txnId: uint64,
+proc recordWrite*(mgr: TransactionManager, txnId: coreTypes.TransactionID,
     key: string): PResult {.gcsafe, raises: [].} =
   ## Register a key as written (tentatively) by this transaction.
   acquire(mgr.mu)
   defer: release(mgr.mu)
   var rec = mgr.txns.getOrDefault(txnId)
-  if rec.id == 0:
+  if isZeroTxnId(rec.id):
     return pErr(newProtocolError(peInternal, &"txn {txnId} not found"))
   if rec.state != TxnStatusActive:
     return pErr(newProtocolError(peInternal,
@@ -190,14 +198,14 @@ proc recordWrite*(mgr: TransactionManager, txnId: uint64,
   pOk()
 
 proc commitTransaction*(mgr: TransactionManager,
-    txnId: uint64): CommitTxnResponse {.gcsafe, raises: [].} =
+    txnId: coreTypes.TransactionID): CommitTxnResponse {.gcsafe, raises: [].} =
   ## Attempt to commit txnId.
   ## Returns CommitTxnResponse with appropriate status and commitTimestamp.
   acquire(mgr.mu)
   defer: release(mgr.mu)
 
   var rec = mgr.txns.getOrDefault(txnId)
-  if rec.id == 0:
+  if isZeroTxnId(rec.id):
     return CommitTxnResponse(status: TxnCommitNotFound, commitTimestamp: 0)
 
   if rec.state != TxnStatusActive:
@@ -242,13 +250,13 @@ proc commitTransaction*(mgr: TransactionManager,
   CommitTxnResponse(status: TxnCommitOK, commitTimestamp: commitTs)
 
 proc rollbackTransaction*(mgr: TransactionManager,
-    txnId: uint64): RollbackTxnResponse {.gcsafe, raises: [].} =
+    txnId: coreTypes.TransactionID): RollbackTxnResponse {.gcsafe, raises: [].} =
   ## Abort txnId.  Idempotent — rolling back an already-aborted txn returns OK.
   acquire(mgr.mu)
   defer: release(mgr.mu)
 
   var rec = mgr.txns.getOrDefault(txnId)
-  if rec.id == 0:
+  if isZeroTxnId(rec.id):
     return RollbackTxnResponse(status: TxnRollbackNotFound)
 
   if rec.state == TxnStatusActive or rec.state == TxnStatusAborted:
@@ -262,13 +270,13 @@ proc rollbackTransaction*(mgr: TransactionManager,
   RollbackTxnResponse(status: TxnRollbackNotFound)
 
 proc getTransactionStatus*(mgr: TransactionManager,
-    txnId: uint64): TxnStatusResponse {.gcsafe, raises: [].} =
+    txnId: coreTypes.TransactionID): TxnStatusResponse {.gcsafe, raises: [].} =
   ## Query the current status of txnId.
   acquire(mgr.mu)
   defer: release(mgr.mu)
 
   var rec = mgr.txns.getOrDefault(txnId)
-  if rec.id == 0:
+  if isZeroTxnId(rec.id):
     return TxnStatusResponse(status: TxnStatusNotFound, commitTimestamp: 0)
 
   # Lazily mark expired active txns as aborted on status query
@@ -289,13 +297,13 @@ proc expireTimedOutTxns*(mgr: TransactionManager) {.gcsafe, raises: [].} =
       rec.state = TxnStatusAborted
 
 proc getWriteSet*(mgr: TransactionManager,
-    txnId: uint64): seq[string] {.gcsafe, raises: [].} =
+    txnId: coreTypes.TransactionID): seq[string] {.gcsafe, raises: [].} =
   ## Return a snapshot of the write-set for txnId.
   ## Returns an empty seq when the transaction is not found.
   acquire(mgr.mu)
   defer: release(mgr.mu)
   let rec = mgr.txns.getOrDefault(txnId)
-  if rec.id == 0:
+  if isZeroTxnId(rec.id):
     return @[]
   result = @[]
   for k in rec.writeSet:

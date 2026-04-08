@@ -317,7 +317,7 @@ proc collectVersionsForTransaction*(gc: GarbageCollector,
   ## Useful after transaction commit/abort
 
   gc.logger.info("Collecting versions for transaction",
-    {"transactionId": $int64(transactionId)}.toTable)
+    {"transactionId": $transactionId}.toTable)
 
   result = GCResult(
     success: false,
@@ -355,7 +355,7 @@ proc collectVersionsForTransaction*(gc: GarbageCollector,
             bytesCollected += encodedKey.len + valueResult.get().len
 
             gc.logger.debug("Collected intent for transaction",
-              {"transactionId": $int64(transactionId),
+              {"transactionId": $transactionId,
                "key": mvccKey.userKey}.toTable)
 
       discard scanIter.next()
@@ -365,14 +365,14 @@ proc collectVersionsForTransaction*(gc: GarbageCollector,
     result.success = true
 
     gc.logger.info("Collected versions for transaction",
-      {"transactionId": $int64(transactionId),
+      {"transactionId": $transactionId,
        "versionsCollected": $versionsCollected,
        "bytesCollected": $bytesCollected}.toTable)
 
   except Exception as e:
     result.error = "Failed to collect versions for transaction: " & e.msg
     gc.logger.error("Failed to collect versions for transaction",
-      {"transactionId": $int64(transactionId),
+      {"transactionId": $transactionId,
        "error": e.msg}.toTable)
 
 proc startGC*(gc: GarbageCollector) =

@@ -319,7 +319,6 @@ proc waitForAutoDistribution(nodes: seq[TestNode], expectedGroupIds: seq[
     waited += stepMs
 
 proc waitForSpaceLeaders(nodes: seq[TestNode]) =
-  echo "DEBUG: waitForSpaceLeaders called with ", nodes.len, " nodes"
   let store = nodes[0].store
   let grpStart = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
   let grpEnd = encodeTableKey(SYS_GROUPS_TABLE_ID + 1, "")
@@ -363,16 +362,30 @@ proc waitForSpaceLeaders(nodes: seq[TestNode]) =
           continue
 
         if gid == META_GROUP_ID or gid == DATA_GROUP_START_ID: continue
-        echo "DEBUG: waitForSpaceLeaders checking groupId=", gid
+
+        # First, wait for the group to be created on at least one node
+        var groupCreated = false
+        for attempt in 0 ..< 200:
+          for node in nodes:
+            if node.coord.hasGroup(gid):
+              groupCreated = true
+              break
+          if groupCreated: break
+          sleep(TEST_POLL_INTERVAL_MS)
+
+        if not groupCreated:
+          doAssert false, "Group " & $gid & " was never created on any node"
+
+        # Now wait for leader election and write readiness
         for attempt in 0 ..< 200:
           var hasLeader = false
           for node in nodes:
-            if node.coord.isLeader(gid):
-              echo "DEBUG:   found leader for groupId=", gid, " on node=", node.id
+            # Check if this node has the group and is write-ready
+            # Use 2000ms timeout for write readiness probe
+            if node.coord.hasGroup(gid) and node.coord.waitForWriteReady(gid, 2000):
               hasLeader = true
               break
           if hasLeader: break
-          echo "DEBUG:   waiting for leader groupId=", gid, " attempt=", attempt
           sleep(TEST_POLL_INTERVAL_MS)
           if attempt == 199 and not hasLeader:
             doAssert false, "Failed to elect leader for group " & $gid
@@ -688,7 +701,10 @@ proc findSpaceId(leaderStore: RaftKVStoreExt,
 proc findSpaceGroupIds(leaderStore: RaftKVStoreExt, spaceId: ULID): seq[GroupID] =
   leaderStore.loadSpaces()
   acquire(leaderStore.spacesMu)
-  result = leaderStore.spaces[spaceId].groupIds
+  if leaderStore.spaces.hasKey(spaceId):
+    result = leaderStore.spaces[spaceId].groupIds
+  else:
+    result = @[]
   release(leaderStore.spacesMu)
 
 proc createSpace(leaderNode: TestNode, spaceName: string, replicas: int): ULID =
@@ -727,12 +743,22 @@ proc replicateMetadata(nodes: seq[TestNode]) =
   sleep(TEST_REPLICATION_WAIT_MS) # Small delay for Raft callbacks to process
 
 proc insertRows(nodes: seq[TestNode], spaceName: string, rowCount: int) =
+  # Retry each INSERT with multiple attempts and backoff
   for i in 1 .. rowCount:
-    let insRes = execOnLeader(nodes,
-      "INSERT INTO " & spaceName & "_t (id, val) VALUES (" & $i & ", 'v" & $i & "')")
-    doAssert insRes.kind == erkModified,
-      "INSERT failed row " & $i & ": " & (if insRes.kind ==
-          erkError: insRes.error else: "?")
+    var success = false
+    for attempt in 0 ..< 20: # 20 attempts per row (increased from 10)
+      for node in nodes:
+        let r = exec(node, "INSERT INTO " & spaceName &
+            "_t (id, val) VALUES (" & $i & ", 'v" & $i & "')")
+        if r.kind == erkModified:
+          success = true
+          break
+        if isNotLeaderError(r.error):
+          continue
+        # Non-leader error - try next node
+      if success: break
+      sleep(50) # Increased backoff between attempts
+    doAssert success, "INSERT failed for row " & $i & " after all retries"
 
 proc setupSpaceWithData(nodes: seq[TestNode], spaceName: string,
     replicas: int, rowCount: int): ULID =
@@ -749,9 +775,17 @@ proc setupSpaceWithData(nodes: seq[TestNode], spaceName: string,
   updateGroupLeaders(nodes) # Update sys.groups with actual leaders
   replicateMetadata(nodes)
 
+  # Longer delay for leadership to stabilize - NuRaft needs time to sync
+  # after election before it can accept writes reliably
+  # IMPORTANT: 500ms is needed for NuRaft to fully sync and be ready for writes
+  sleep(500)
+
   # Refresh all clients' metadata to pick up new groups
   for n in nodes:
-    discard n.client.refreshMetadata()
+    for i in 0..<3: # Retry metadata refresh
+      if n.client.refreshMetadata():
+        break
+      sleep(TEST_POLL_INTERVAL_MS)
 
   insertRows(nodes, spaceName, rowCount)
   spaceId

@@ -16,8 +16,8 @@ const
   MIN_TIMESTAMP*: Timestamp = low(Timestamp)
   INTENT_TOMBSTONE*: Timestamp = -1
 
-  # Special transaction ID
-  InvalidTransactionID*: TransactionID = TransactionID(0)
+  # Special transaction ID (zero ULID)
+  InvalidTransactionID* = zeroTransactionID()
 
 type
   MVCCKey* = object
@@ -158,22 +158,21 @@ proc decodeMVCCKey*(encodedKey: string): MVCCKey =
 
 const
   MVCC_MAGIC* = "MVCC"
-  MVCC_HEADER_SIZE* = 21 # 4 (magic) + 8 (ts) + 8 (txn) + 1 (del)
+  MVCC_HEADER_SIZE* = 29 # 4 (magic) + 8 (ts) + 16 (txn ULID) + 1 (del)
 
 proc encodeMVCCValue*(value: string, timestamp: Timestamp,
     isDeleted: bool = false, txnId: TransactionID = InvalidTransactionID): string =
   ## Encode MVCC value with metadata
-  ## Format: <MAGIC (4 bytes)><timestamp (8 bytes)><txn_id (8 bytes)><is_deleted (1 byte)><value>
+  ## Format: <MAGIC (4 bytes)><timestamp (8 bytes)><txn_id ULID (16 bytes)><is_deleted (1 byte)><value>
   var tsBytes = toBigEndian64(timestamp)
-  var txnBytes = toBigEndian64(int64(txnId))
+  var txnBytes = ulidToBytes(ULID(txnId))
   var delByte = if isDeleted: "1" else: "0"
 
   # Build result string manually
   result = MVCC_MAGIC
   for i in 0..7:
     result.add(chr(int(tsBytes[i])))
-  for i in 0..7:
-    result.add(chr(int(txnBytes[i])))
+  result.add(txnBytes)
   result.add(delByte)
   result.add(value)
 
@@ -184,10 +183,10 @@ proc isLikelyMVCCValue*(data: string): bool {.inline.} =
 proc decodeMVCCValueFast*(encodedValue: string): MVCCValue {.inline.} =
   ## Fast decode MVCC value - assumes caller already validated with isLikelyMVCCValue.
   if encodedValue.len < MVCC_HEADER_SIZE:
-    return MVCCValue(timestamp: 0, txnId: TransactionID(0), isDeleted: false,
-        data: encodedValue)
+    return MVCCValue(timestamp: 0, txnId: InvalidTransactionID,
+        isDeleted: false, data: encodedValue)
 
-  # Direct big-endian to host conversion, offset by magic length
+  # Direct big-endian to host conversion for timestamp, offset by magic length
   result.timestamp = Timestamp(
     (uint64(uint8(encodedValue[4])) shl 56) or
     (uint64(uint8(encodedValue[5])) shl 48) or
@@ -198,17 +197,10 @@ proc decodeMVCCValueFast*(encodedValue: string): MVCCValue {.inline.} =
     (uint64(uint8(encodedValue[10])) shl 8) or
     uint64(uint8(encodedValue[11]))
   )
-  result.txnId = TransactionID(
-    (int64(uint8(encodedValue[12])) shl 56) or
-    (int64(uint8(encodedValue[13])) shl 48) or
-    (int64(uint8(encodedValue[14])) shl 40) or
-    (int64(uint8(encodedValue[15])) shl 32) or
-    (int64(uint8(encodedValue[16])) shl 24) or
-    (int64(uint8(encodedValue[17])) shl 16) or
-    (int64(uint8(encodedValue[18])) shl 8) or
-    int64(uint8(encodedValue[19]))
-  )
-  result.isDeleted = encodedValue[20] == '1'
+  # Extract 16-byte ULID for txnId (bytes 12-27)
+  var txnUlidBytes = encodedValue[12..27]
+  result.txnId = TransactionID(ulidFromBytes(txnUlidBytes))
+  result.isDeleted = encodedValue[28] == '1'
   result.data = encodedValue[MVCC_HEADER_SIZE ..< encodedValue.len]
 
 proc decodeMVCCValue*(encodedValue: string): MVCCValue =
@@ -218,7 +210,8 @@ proc decodeMVCCValue*(encodedValue: string): MVCCValue =
   if encodedValue.len < MVCC_HEADER_SIZE:
     raise newException(MVCCError, "Invalid MVCC value: too short")
 
-  let delByte = encodedValue[20]
+  # Delete flag is at position 28: 4 (magic) + 8 (timestamp) + 16 (txn ULID)
+  let delByte = encodedValue[28]
 
   # Validate delete flag - must be '0' or '1'
   if delByte != '0' and delByte != '1':
@@ -229,27 +222,28 @@ proc decodeMVCCValue*(encodedValue: string): MVCCValue =
 
 proc encodeIntentKey*(userKey: string, txnId: TransactionID): string =
   ## Encode intent key for transaction resolution
-  ## Format: <user_key><INTENT_SUFFIX><txn_id (big-endian)>
-  var txnBytes = toBigEndian64(int64(txnId))
-  var txnStr = ""
-  for i in 0..7:
-    txnStr.add(chr(int(txnBytes[i])))
-  result = userKey & INTENT_SUFFIX & txnStr
+  ## Format: <user_key><INTENT_SUFFIX><txn_id ULID (16 bytes)>
+  result = userKey & INTENT_SUFFIX & ulidToBytes(ULID(txnId))
 
 proc decodeIntentKey*(encodedKey: string): tuple[userKey: string,
     txnId: TransactionID] =
   ## Decode intent key
-  if encodedKey.len < 10:
+  ## Format: <user_key><INTENT_SUFFIX><txn_id ULID (16 bytes)>
+  # INTENT_SUFFIX is 2 bytes, ULID is 16 bytes = 18 bytes at end
+  if encodedKey.len < 18:
     raise newException(MVCCError, "Invalid intent key: too short")
 
-  let userKeyEnd = encodedKey.len - 10
+  let userKeyEnd = encodedKey.len - 18
 
-  var txnArr: array[8, uint8]
-  for i in 0..7:
-    txnArr[i] = uint8(encodedKey[encodedKey.len - 8 + i])
+  # Verify suffix
+  let suffix = encodedKey[userKeyEnd ..< userKeyEnd + 2]
+  if suffix != INTENT_SUFFIX:
+    raise newException(MVCCError, "Invalid intent key: missing INTENT_SUFFIX")
 
   result.userKey = encodedKey[0 ..< userKeyEnd]
-  result.txnId = TransactionID(fromBigEndian64(int64, txnArr))
+  # Extract 16-byte ULID
+  var txnUlidBytes = encodedKey[userKeyEnd + 2 ..< encodedKey.len]
+  result.txnId = TransactionID(ulidFromBytes(txnUlidBytes))
 
 proc makeMetadataKey*(userKey: string): string =
   ## Create metadata key for a user key
@@ -272,8 +266,7 @@ proc `$`*(key: MVCCKey): string =
 
 proc `$`*(value: MVCCValue): string =
   result = "MVCCValue(data: " & value.data & ", timestamp: " & $value.timestamp &
-           ", isDeleted: " & $value.isDeleted & ", txnId: " & $int64(
-               value.txnId) & ")"
+           ", isDeleted: " & $value.isDeleted & ", txnId: " & $value.txnId & ")"
 
 proc `==`*(a, b: MVCCKey): bool =
   result = a.userKey == b.userKey and a.timestamp == b.timestamp and
@@ -296,7 +289,7 @@ proc keyNotFound*(key: string): MVCCError =
 
 proc intentConflict*(key: string, txnId: TransactionID): MVCCError =
   mvccError(mvccIntentConflict, "Intent conflict for key: " & key & ", txn: " &
-      $int64(txnId))
+      $txnId)
 
 proc writeTooOld*(key: string, existingTs: Timestamp): MVCCError =
   mvccError(mvccWriteTooOld, "Write too old for key: " & key &
@@ -318,9 +311,9 @@ when isMainModule:
       check decoded.timestamp == timestamp
       check decoded.isIntent == false
 
-    test "encode and decode intent key":
+    test "encode and decode intent key with ULID":
       let userKey = "test_key"
-      let txnId = TransactionID(12345)
+      let txnId = genTransactionID()
 
       let encoded = makeIntentKey(userKey, txnId)
       let decoded = decodeIntentKey(encoded)
@@ -328,10 +321,10 @@ when isMainModule:
       check decoded.userKey == userKey
       check decoded.txnId == txnId
 
-    test "encode and decode MVCC value":
+    test "encode and decode MVCC value with ULID":
       let value = "test_value"
       let timestamp: Timestamp = 9876543210
-      let txnId = TransactionID(999)
+      let txnId = genTransactionID()
 
       let encoded = encodeMVCCValue(value, timestamp, false, txnId)
       let decoded = decodeMVCCValue(encoded)

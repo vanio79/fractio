@@ -229,9 +229,15 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
           return %* {"error": "server not ready"}
         let nodes = srv.nodeRegistry.listNodes()
         let rc = nodes.len
+        # Check if NuRaft meta group has a leader
+        var metaLeaderOK = false
+        if not srv.raftStore.isNil and not srv.raftStore.coordinator.isNil:
+          metaLeaderOK = srv.raftStore.coordinator.isLeader(META_GROUP_ID) or
+              srv.raftStore.coordinator.getLeader(META_GROUP_ID) > 0
         return %* {
-          "status": 0,
+          "status": if metaLeaderOK: 0 else: 1,
           "leaderOK": true,
+          "metaLeaderOK": metaLeaderOK,
           "replicaCount": rc,
           "healthyReplicas": rc,
           "clusterName": srv.config.clusterName,
@@ -882,7 +888,7 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
                   "nodeId": 0,
                   "offsetUs": driftAccum * 1000.0,
                 }
-                await ws.sendText(msg)
+                await ws.send(msg)
                 await sleepAsync(1000)
               except CatchableError:
                 break

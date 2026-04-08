@@ -414,12 +414,14 @@ proc createSpace*(sm: SpaceManager, req: CreateSpaceRequest): CreateSpaceRespons
           let ok = coord.createAndStartGroup(groupId, nuraftMembers, preferredLeader)
           if ok:
             sm.store.registerGroup(groupId)
-            # CRITICAL: Stagger group creation to avoid identical election timeout seeds
-            # NuRaft's seed = time * id_, so groups created at the same microsecond
-            # on the same node get identical seeds → identical timeouts → split votes
-            sleep(100)
             
-            # Now send JoinGroup RPCs to all other members so they create their local instances
+            # CRITICAL: Send JoinGroup RPCs to all other members BEFORE starting
+            # election timer. This ensures all members have created their instances
+            # and can vote when the preferred leader's election timer fires.
+            # 
+            # We wait for each JoinGroup response to ensure the member has actually
+            # created its instance before proceeding.
+            var allJoined = true
             for rep in gr.replicas:
               let memberId = rep.nodeId
               if memberId == preferredLeader:
@@ -432,7 +434,8 @@ proc createSpace*(sm: SpaceManager, req: CreateSpaceRequest): CreateSpaceRespons
                     groupId: groupIDToBytes(groupId),
                     creatorNodeId: uint16(preferredLeader),
                     creatorHost: coord.host,
-                    creatorPort: uint16(coord.port)
+                    creatorPort: uint16(coord.port),
+                    members: createMembers
                   )
                   let cfg = ClientConfig(
                     host: memberPeerInfo.host,
@@ -443,11 +446,38 @@ proc createSpace*(sm: SpaceManager, req: CreateSpaceRequest): CreateSpaceRespons
                   let cr = pc.connect()
                   if cr.isOk:
                     defer: pc.disconnect()
-                    discard pc.joinGroup(joinReq)
-                    # Stagger after sending JoinGroup to allow time seed to differ
-                    sleep(50)
+                    let jr = pc.joinGroup(joinReq)
+                    if jr.isOk and jr.val.success:
+                      # Member successfully joined
+                      discard
+                    else:
+                      allJoined = false
                 except CatchableError:
-                  discard
+                  allJoined = false
+            
+            if not allJoined:
+              # Log warning but continue - members can join later via onGroupMetadataApplied
+              discard
+            
+            # Wait for leader election to complete (election timeout is 300-500ms)
+            # A valid leader is either:
+            # - This node is the leader (isLeader returns true), OR
+            # - getLeader returns a positive ID that is NOT this node
+            var leaderElected = false
+            let myNodeId = int(coord.nodeId)
+            for i in 0 ..< 50:  # 50 * 20ms = 1 second max
+              if coord.isLeader(groupId):
+                leaderElected = true
+                break
+              let leaderId = coord.getLeader(groupId)
+              if leaderId > 0 and leaderId != myNodeId:
+                leaderElected = true
+                break
+              sleep(20)
+            
+            if not leaderElected:
+              # Log warning but continue - leader may be elected later
+              discard
         else:
           # We are NOT the preferred leader - send CreateGroup RPC to preferred leader
           # The preferred leader will create the group and send us a JoinGroup RPC

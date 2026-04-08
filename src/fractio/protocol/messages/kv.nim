@@ -4,10 +4,10 @@
 # Every encode proc produces a complete payload with a 2-byte MessageType prefix.
 # The caller wraps the payload in a Frame via frame.encodeFrame.
 #
-# Wire formats match protocol_design.md §4.2 exactly.
-#
-# GroupID encoding: GroupIDs are 16-byte ULIDs. When the GroupRouted flag is set,
-# the groupId is appended as 16 raw bytes (no length prefix).
+# Wire format changes for ULID-based IDs:
+# - GroupID: 16-byte ULIDs. When the GroupRouted flag is set,
+#   the groupId is appended as 16 raw bytes (no length prefix).
+# - TransactionID: 16-byte ULIDs appended after flags.
 
 import ../types
 import ../codec
@@ -19,7 +19,7 @@ import ../../distributed/raft/group_types
 #
 # Request:
 #   Flags (1 byte):    bit0=IncludeTimestamp  bit1=IncludeVersion
-#   TxnId (8 bytes)
+#   TxnId (16 bytes ULID)
 #   ReadTimestamp (8 bytes, 0 for latest)
 #   Key (uint32-prefixed)
 #   GroupId (16 bytes, if GroupRouted flag set)
@@ -46,7 +46,7 @@ const
 type
   GetRequest* = object
     flags*: uint8
-    txnId*: uint64
+    txnId*: TransactionID
     readTimestamp*: uint64
     key*: string
     groupId*: GroupID ## non-zero when GroupRouted flag is set
@@ -65,7 +65,7 @@ proc encodeGetRequest*(req: GetRequest): string =
   var flags = req.flags
   if req.groupId != ZeroGroupID(): flags = flags or GetFlagGroupRouted
   buf.writeUint8(flags)
-  buf.writeUint64BE(req.txnId)
+  buf.add(transactionIDToBytes(req.txnId))
   buf.writeUint64BE(req.readTimestamp)
   buf.writeBytes(req.key)
   if req.groupId != ZeroGroupID():
@@ -79,9 +79,13 @@ proc decodeGetRequest*(payload: string): Result[GetRequest, ProtocolError] =
   if flagsR.isErr: return peErr(flagsR.error)
   req.flags = flagsR.value
 
-  let txnR = readUint64BE(payload, pos)
-  if txnR.isErr: return peErr(txnR.error)
-  req.txnId = txnR.value
+  # Read 16-byte ULID for txnId
+  if pos + ULID_SIZE > payload.len:
+    return peErr(newProtocolError(peBoundsOverflow,
+        "payload too short for txnId ULID"))
+  let txnBytes = payload[pos ..< pos + ULID_SIZE]
+  req.txnId = transactionIDFromBytes(txnBytes)
+  pos += ULID_SIZE
 
   let tsR = readUint64BE(payload, pos)
   if tsR.isErr: return peErr(tsR.error)
@@ -95,10 +99,7 @@ proc decodeGetRequest*(payload: string): Result[GetRequest, ProtocolError] =
     if pos + ULID_SIZE > payload.len:
       return peErr(newProtocolError(peBoundsOverflow,
           "payload too short for groupId ULID"))
-    var ulidBytes: string
-    for i in 0..<ULID_SIZE:
-      ulidBytes.add(payload[pos])
-      inc pos
+    let ulidBytes = payload[pos ..< pos + ULID_SIZE]
     req.groupId = GroupID(ulidFromBytes(ulidBytes))
 
   peOk(req)
@@ -153,7 +154,7 @@ proc decodeGetResponse*(payload: string): Result[GetResponse, ProtocolError] =
 #
 # Request:
 #   Flags (1 byte):  bit0=ReturnPrev  bit1=SyncWrite  bit2=CAS
-#   TxnId (8 bytes)
+#   TxnId (16 bytes ULID)
 #   ExpectedVersion (8 bytes, for CAS; 0 otherwise)
 #   Key (uint32-prefixed)
 #   Value (uint32-prefixed)
@@ -180,7 +181,7 @@ const
 type
   PutRequest* = object
     flags*: uint8
-    txnId*: uint64
+    txnId*: TransactionID
     expectedVersion*: uint64
     key*: string
     value*: string
@@ -200,7 +201,7 @@ proc encodeRawPutRequest*(req: PutRequest): string =
   var flags = req.flags
   if req.groupId != ZeroGroupID(): flags = flags or PutFlagGroupRouted
   buf.writeUint8(flags)
-  buf.writeUint64BE(req.txnId)
+  buf.add(transactionIDToBytes(req.txnId))
   buf.writeUint64BE(req.expectedVersion)
   buf.writeBytes(req.key)
   buf.writeBytes(req.value)
@@ -214,7 +215,7 @@ proc encodePutRequest*(req: PutRequest): string =
   var flags = req.flags
   if req.groupId != ZeroGroupID(): flags = flags or PutFlagGroupRouted
   buf.writeUint8(flags)
-  buf.writeUint64BE(req.txnId)
+  buf.add(transactionIDToBytes(req.txnId))
   buf.writeUint64BE(req.expectedVersion)
   buf.writeBytes(req.key)
   buf.writeBytes(req.value)
@@ -229,9 +230,13 @@ proc decodePutRequest*(payload: string): Result[PutRequest, ProtocolError] =
   if flagsR.isErr: return peErr(flagsR.error)
   req.flags = flagsR.value
 
-  let txnR = readUint64BE(payload, pos)
-  if txnR.isErr: return peErr(txnR.error)
-  req.txnId = txnR.value
+  # Read 16-byte ULID for txnId
+  if pos + ULID_SIZE > payload.len:
+    return peErr(newProtocolError(peBoundsOverflow,
+        "payload too short for txnId ULID"))
+  let txnBytes = payload[pos ..< pos + ULID_SIZE]
+  req.txnId = transactionIDFromBytes(txnBytes)
+  pos += ULID_SIZE
 
   let evR = readUint64BE(payload, pos)
   if evR.isErr: return peErr(evR.error)
@@ -249,10 +254,7 @@ proc decodePutRequest*(payload: string): Result[PutRequest, ProtocolError] =
     if pos + ULID_SIZE > payload.len:
       return peErr(newProtocolError(peBoundsOverflow,
           "payload too short for groupId ULID"))
-    var ulidBytes: string
-    for i in 0..<ULID_SIZE:
-      ulidBytes.add(payload[pos])
-      inc pos
+    let ulidBytes = payload[pos ..< pos + ULID_SIZE]
     req.groupId = GroupID(ulidFromBytes(ulidBytes))
 
   peOk(req)
@@ -298,7 +300,7 @@ proc decodePutResponse*(payload: string): Result[PutResponse, ProtocolError] =
 #
 # Request:
 #   Flags (1 byte):  bit0=ReturnPrev  bit1=SyncWrite  bit2=OnlyIfExists
-#   TxnId (8 bytes)
+#   TxnId (16 bytes ULID)
 #   Key (uint32-prefixed)
 #   GroupId (16 bytes, if GroupRouted flag set)
 #
@@ -320,7 +322,7 @@ const
 type
   DeleteRequest* = object
     flags*: uint8
-    txnId*: uint64
+    txnId*: TransactionID
     key*: string
     groupId*: GroupID ## non-zero when GroupRouted flag is set
 
@@ -335,7 +337,7 @@ proc encodeDeleteRequest*(req: DeleteRequest): string =
   var flags = req.flags
   if req.groupId != ZeroGroupID(): flags = flags or DelFlagGroupRouted
   buf.writeUint8(flags)
-  buf.writeUint64BE(req.txnId)
+  buf.add(transactionIDToBytes(req.txnId))
   buf.writeBytes(req.key)
   if req.groupId != ZeroGroupID():
     buf.add(ulidToBytes(groupIDToULID(req.groupId)))
@@ -349,9 +351,13 @@ proc decodeDeleteRequest*(payload: string): Result[DeleteRequest,
   if flagsR.isErr: return peErr(flagsR.error)
   req.flags = flagsR.value
 
-  let txnR = readUint64BE(payload, pos)
-  if txnR.isErr: return peErr(txnR.error)
-  req.txnId = txnR.value
+  # Read 16-byte ULID for txnId
+  if pos + ULID_SIZE > payload.len:
+    return peErr(newProtocolError(peBoundsOverflow,
+        "payload too short for txnId ULID"))
+  let txnBytes = payload[pos ..< pos + ULID_SIZE]
+  req.txnId = transactionIDFromBytes(txnBytes)
+  pos += ULID_SIZE
 
   let keyR = readBytes(payload, pos)
   if keyR.isErr: return peErr(keyR.error)
@@ -361,10 +367,7 @@ proc decodeDeleteRequest*(payload: string): Result[DeleteRequest,
     if pos + ULID_SIZE > payload.len:
       return peErr(newProtocolError(peBoundsOverflow,
           "payload too short for groupId ULID"))
-    var ulidBytes: string
-    for i in 0..<ULID_SIZE:
-      ulidBytes.add(payload[pos])
-      inc pos
+    let ulidBytes = payload[pos ..< pos + ULID_SIZE]
     req.groupId = GroupID(ulidFromBytes(ulidBytes))
 
   peOk(req)
@@ -404,7 +407,7 @@ proc decodeDeleteResponse*(payload: string): Result[DeleteResponse,
 #
 # Request:
 #   Flags (1 byte):  bit0=AllOrNothing  bit1=ContinueOnError
-#   TxnId (8 bytes)
+#   TxnId (16 bytes ULID)
 #   OpCount (4 bytes)
 #   For each op:
 #     OpType (1 byte):  0x00=Get  0x01=Put  0x02=Delete
@@ -443,7 +446,7 @@ type
 
   BatchRequest* = object
     flags*: uint8
-    txnId*: uint64
+    txnId*: TransactionID
     operations*: seq[BatchOp]
 
   BatchResponse* = object
@@ -454,7 +457,7 @@ proc encodeBatchRequest*(req: BatchRequest): string =
   var buf = ""
   buf.writeUint16BE(uint16(mtBatch))
   buf.writeUint8(req.flags)
-  buf.writeUint64BE(req.txnId)
+  buf.add(transactionIDToBytes(req.txnId))
   buf.writeUint32BE(uint32(req.operations.len))
   for op in req.operations:
     buf.writeUint8(op.kind)
@@ -469,9 +472,13 @@ proc decodeBatchRequest*(payload: string): Result[BatchRequest, ProtocolError] =
   if flagsR.isErr: return peErr(flagsR.error)
   req.flags = flagsR.value
 
-  let txnR = readUint64BE(payload, pos)
-  if txnR.isErr: return peErr(txnR.error)
-  req.txnId = txnR.value
+  # Read 16-byte ULID for txnId
+  if pos + ULID_SIZE > payload.len:
+    return peErr(newProtocolError(peBoundsOverflow,
+        "payload too short for txnId ULID"))
+  let txnBytes = payload[pos ..< pos + ULID_SIZE]
+  req.txnId = transactionIDFromBytes(txnBytes)
+  pos += ULID_SIZE
 
   let cntR = readUint32BE(payload, pos)
   if cntR.isErr: return peErr(cntR.error)
@@ -536,7 +543,7 @@ proc decodeBatchResponse*(payload: string): Result[BatchResponse,
 # Request:
 #   Flags (1 byte):  bit0=IncludeTimestamp  bit1=IncludeVersion
 #                    bit2=KeysOnly          bit3=Reverse
-#   TxnId (8 bytes)
+#   TxnId (16 bytes ULID)
 #   ReadTimestamp (8 bytes)
 #   StartKey (uint32-prefixed, 0 length = beginning of keyspace)
 #   EndKey (uint32-prefixed, 0 length = end of keyspace)
@@ -557,6 +564,7 @@ const
   ScanFlagIncludeVersion* = 0x02'u8
   ScanFlagKeysOnly* = 0x04'u8
   ScanFlagReverse* = 0x08'u8
+  ScanFlagGroupRouted* = 0x10'u8 ## groupId appended for routing filter
 
   ScanRespFlagHasMore* = 0x01'u8
   ScanRespFlagEndOfScan* = 0x02'u8
@@ -564,11 +572,12 @@ const
 type
   ScanRequest* = object
     flags*: uint8
-    txnId*: uint64
+    txnId*: TransactionID
     readTimestamp*: uint64
     startKey*: string ## empty = beginning of keyspace
     endKey*: string   ## empty = end of keyspace
     limit*: uint32    ## 0 = no limit
+    groupId*: GroupID ## non-zero when GroupRouted flag is set - for server-side routing filter
 
   ScanPair* = object
     key*: string
@@ -588,11 +597,13 @@ proc encodeScanRequest*(req: ScanRequest): string =
   var buf = ""
   buf.writeUint16BE(uint16(mtScan))
   buf.writeUint8(req.flags)
-  buf.writeUint64BE(req.txnId)
+  buf.add(transactionIDToBytes(req.txnId))
   buf.writeUint64BE(req.readTimestamp)
   buf.writeBytes(req.startKey)
   buf.writeBytes(req.endKey)
   buf.writeUint32BE(req.limit)
+  if req.groupId != ZeroGroupID():
+    buf.add(ulidToBytes(groupIDToULID(req.groupId)))
   buf
 
 proc decodeScanRequest*(payload: string): Result[ScanRequest, ProtocolError] =
@@ -602,9 +613,13 @@ proc decodeScanRequest*(payload: string): Result[ScanRequest, ProtocolError] =
   if flagsR.isErr: return peErr(flagsR.error)
   req.flags = flagsR.value
 
-  let txnR = readUint64BE(payload, pos)
-  if txnR.isErr: return peErr(txnR.error)
-  req.txnId = txnR.value
+  # Read 16-byte ULID for txnId
+  if pos + ULID_SIZE > payload.len:
+    return peErr(newProtocolError(peBoundsOverflow,
+        "payload too short for txnId ULID"))
+  let txnBytes = payload[pos ..< pos + ULID_SIZE]
+  req.txnId = transactionIDFromBytes(txnBytes)
+  pos += ULID_SIZE
 
   let tsR = readUint64BE(payload, pos)
   if tsR.isErr: return peErr(tsR.error)
@@ -621,6 +636,15 @@ proc decodeScanRequest*(payload: string): Result[ScanRequest, ProtocolError] =
   let limR = readUint32BE(payload, pos)
   if limR.isErr: return peErr(limR.error)
   req.limit = limR.value
+
+  # Read groupId if GroupRouted flag is set
+  if (req.flags and ScanFlagGroupRouted) != 0:
+    if pos + ULID_SIZE > payload.len:
+      return peErr(newProtocolError(peBoundsOverflow,
+          "payload too short for groupId ULID"))
+    let gidBytes = payload[pos ..< pos + ULID_SIZE]
+    req.groupId = GroupID(ulidFromBytes(gidBytes))
+    pos += ULID_SIZE
 
   peOk(req)
 

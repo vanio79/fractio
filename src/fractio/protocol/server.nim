@@ -557,89 +557,10 @@ proc sendError(conn: ClientConnection, requestId: uint32,
 proc getLeaderRedirect(server: ProtocolServer,
     groupId: GroupID): LeaderRedirect {.gcsafe, raises: [].} =
   ## Get leader redirect info for a group.
-  ## Returns the leader's node ID, host, and client port.
-  ## Returns empty LeaderRedirect if leader is unknown or node info not found.
-  ##
-  ## Strategy:
-  ## 1. Try NuRaft's getLeader() - most accurate but may return -1 if follower
-  ##    hasn't received heartbeats recently
-  ## 2. Fall back to sys.groups table - may have stale but useful info
-  if server.raftCoord.isNil:
-    try:
-      {.cast(gcsafe).}:
-        debug("getLeaderRedirect: no raftCoord", {
-            "groupId": $groupId}.toTable)
-    except:
-      discard
-    return LeaderRedirect(leaderId: 0)
-
-  var leaderId: int32 = -1
-
-  # First try NuRaft's getLeader()
-  leaderId = server.raftCoord.getLeader(groupId)
-
-  # If NuRaft doesn't know, try sys.groups table (may have stale but useful info)
-  if leaderId <= 0 and not server.raftStore.isNil:
-    let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupId)
-    let groupScan = server.raftStore.raftScan(groupKey, groupKey & "\xFF", 1,
-        includeSystemKeys = true)
-    if groupScan.isOk and groupScan.value.len > 0:
-      var data = groupScan.value[0][1].value
-      # Check for MVCC wrapper
-      if mvccValueTypes.isLikelyMVCCValue(data):
-        try:
-          let mvccVal = mvccValueTypes.decodeMVCCValue(data)
-          if not mvccVal.isDeleted:
-            data = mvccVal.data
-        except CatchableError:
-          discard
-      try:
-        let groupRec = decodeGroupRecord(data)
-        if groupRec.leader > 0:
-          leaderId = int32(groupRec.leader)
-          try:
-            {.cast(gcsafe).}:
-              debug("getLeaderRedirect: found leader from sys.groups", {
-                  "groupId": $groupId, "leaderId": $leaderId}.toTable)
-          except:
-            discard
-      except CatchableError:
-        discard
-
-  if leaderId <= 0 or leaderId == int32(server.config.serverId):
-    try:
-      {.cast(gcsafe).}:
-        debug("getLeaderRedirect: no useful leader found", {"groupId": $groupId,
-            "leaderId": $leaderId}.toTable)
-    except:
-      discard
-    return LeaderRedirect(leaderId: 0)
-
-  result.leaderId = uint32(leaderId)
-
-  # Look up the leader's host and client port from sys.nodes
-  if not server.raftStore.isNil:
-    let nodeKey = encodeTableKey(SYS_NODES_TABLE_ID, $leaderId)
-    let nodeScan = server.raftStore.raftScan(nodeKey, nodeKey & "\xFF", 1,
-        includeSystemKeys = true)
-    if nodeScan.isOk and nodeScan.value.len > 0:
-      var data = nodeScan.value[0][1].value
-      # Check for MVCC wrapper
-      if mvccValueTypes.isLikelyMVCCValue(data):
-        try:
-          let mvccVal = mvccValueTypes.decodeMVCCValue(data)
-          if not mvccVal.isDeleted:
-            data = mvccVal.data
-          else:
-            return LeaderRedirect(leaderId: 0)
-        except CatchableError:
-          discard
-      try:
-        let nodeRec = decodeNodeRecord(data)
-        result.leaderHost = nodeRec.host
-        result.leaderClientPort = nodeRec.clientPort
-      except CatchableError:
-        discard
+  ## Simplified: returns empty redirect. Client will refresh metadata to find leader.
+  ## This removes the complexity of server-side leader tracking which can be stale.
+  discard groupId
+  LeaderRedirect(leaderId: 0)
 
 proc sendNotLeaderError(conn: ClientConnection, requestId: uint32,
     msg: string, redirect: LeaderRedirect) {.gcsafe, raises: [].} =
@@ -833,9 +754,9 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
       sendError(conn, requestId, ErrProtocol, ErrCatKV, "invalid key length")
       return
     # Transactional read: register the key as read by the transaction manager
-    if req.txnId != 0:
+    if not isZero(req.txnId):
       if not server.mvccStore.isNil:
-        let rr = server.mvccStore.recordRead(req.txnId, req.key)
+        let rr = server.mvccStore.recordReadByTxnId(req.txnId, req.key)
         if not rr.isOk:
           sendError(conn, requestId, ErrTxnAborted, ErrCatTransaction,
             "txn expired or not found: " & rr.error.msg)
@@ -852,8 +773,8 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
     if not server.mvccStore.isNil:
       # Use metadata-aware get for timestamps and versions
       # If in a transaction, check intents first
-      let metaRes = if req.txnId != 0:
-                      server.mvccStore.txnGetWithMeta(req.txnId, req.key)
+      let metaRes = if not isZero(req.txnId):
+                      server.mvccStore.txnGetWithMetaByTxnId(req.txnId, req.key)
                     else:
                       server.mvccStore.latestGetWithMeta(req.key)
 
@@ -915,8 +836,8 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
       return
 
     if not server.mvccStore.isNil:
-      if req.txnId != 0:
-        let res = server.mvccStore.txnPutWithResult(req.txnId, req.key, req.value,
+      if not isZero(req.txnId):
+        let res = server.mvccStore.txnPutWithResultByTxnId(req.txnId, req.key, req.value,
                     req.flags, req.expectedVersion)
         if res.isOk:
           let pr = res.value
@@ -934,6 +855,12 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
           if res.error.msg.contains("not the leader") or
              res.error.msg.contains("Not the leader") or
              res.error.msg.contains("Raft append failed (code -3)"):
+            let groupId = server.getGroupIdForKey(req.key)
+            let redirect = server.getLeaderRedirect(groupId)
+            sendNotLeaderError(conn, requestId, res.error.msg, redirect)
+          elif res.error.msg.contains("Group not found"):
+            # Group not found - node doesn't have this group (topology change)
+            # Return not leader error to trigger retry on different node
             let groupId = server.getGroupIdForKey(req.key)
             let redirect = server.getLeaderRedirect(groupId)
             sendNotLeaderError(conn, requestId, res.error.msg, redirect)
@@ -961,6 +888,12 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
             let groupId = server.getGroupIdForKey(req.key)
             let redirect = server.getLeaderRedirect(groupId)
             sendNotLeaderError(conn, requestId, res.error.msg, redirect)
+          elif res.error.msg.contains("Group not found"):
+            # Group not found - node doesn't have this group (topology change)
+            # Return not leader error to trigger retry on different node
+            let groupId = server.getGroupIdForKey(req.key)
+            let redirect = server.getLeaderRedirect(groupId)
+            sendNotLeaderError(conn, requestId, res.error.msg, redirect)
           else:
             sendError(conn, requestId, ErrInternal, ErrCatKV, res.error.msg)
     else:
@@ -978,8 +911,9 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
       return
 
     if not server.mvccStore.isNil:
-      if req.txnId != 0:
-        let res = server.mvccStore.txnDeleteWithResult(req.txnId, req.key, req.flags)
+      if not isZero(req.txnId):
+        let res = server.mvccStore.txnDeleteWithResultByTxnId(req.txnId,
+            req.key, req.flags)
         if res.isOk:
           let dr = res.value
           var resp = DeleteResponse(
@@ -992,6 +926,11 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
         else:
           # Check for "not leader" error and return appropriate error code
           if res.error.msg.contains("not the leader") or res.error.msg.contains("Not the leader"):
+            let groupId = server.getGroupIdForKey(req.key)
+            let redirect = server.getLeaderRedirect(groupId)
+            sendNotLeaderError(conn, requestId, res.error.msg, redirect)
+          elif res.error.msg.contains("Group not found"):
+            # Group not found - node doesn't have this group (topology change)
             let groupId = server.getGroupIdForKey(req.key)
             let redirect = server.getLeaderRedirect(groupId)
             sendNotLeaderError(conn, requestId, res.error.msg, redirect)
@@ -1011,6 +950,11 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
         else:
           # Check for "not leader" error and return appropriate error code
           if res.error.msg.contains("not the leader") or res.error.msg.contains("Not the leader"):
+            let groupId = server.getGroupIdForKey(req.key)
+            let redirect = server.getLeaderRedirect(groupId)
+            sendNotLeaderError(conn, requestId, res.error.msg, redirect)
+          elif res.error.msg.contains("Group not found"):
+            # Group not found - node doesn't have this group (topology change)
             let groupId = server.getGroupIdForKey(req.key)
             let redirect = server.getLeaderRedirect(groupId)
             sendNotLeaderError(conn, requestId, res.error.msg, redirect)
@@ -1088,31 +1032,55 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
       sendError(conn, requestId, ErrInternal, ErrCatKV, res.error.msg)
 
   of uint16(mtScan):
-    echo "DEBUG server: mtScan received startKey=", payload.len
     let reqR = decodeScanRequest(payload)
     if reqR.isErr:
       sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
       return
     let req = reqR.value
-    echo "DEBUG server: mtScan startKey='", req.startKey, "' endKey='",
-        req.endKey, "' txnId=", req.txnId
 
     if not server.mvccStore.isNil:
-      let res = if req.txnId != 0:
-                  server.mvccStore.txnScan(req.txnId, req.startKey, req.endKey, req.limit)
+      let res = if not isZero(req.txnId):
+                  server.mvccStore.txnScanByTxnId(req.txnId, req.startKey,
+                      req.endKey, req.limit)
                 else:
-                  echo "DEBUG server: calling latestScan"
                   server.mvccStore.latestScan(req.startKey, req.endKey, req.limit)
 
-      echo "DEBUG server: mtScan result isOk=", res.isOk, " len=", (
-        if res.isOk: res.value.len else: 0)
       if res.isOk:
-        echo "DEBUG server: mtScan returning entries..."
-        for i, p in res.value:
-          echo "DEBUG server: mtScan entry ", i, " key='", p.key, "'"
         let currentTs = server.mvccStore.getCurrentTimestamp()
-        var scanPairs = newSeq[ScanPair](res.value.len)
-        for i, p in res.value:
+
+        # Filter by group routing if groupId is provided
+        var filteredPairs: seq[tuple[key: string, value: string]] = @[]
+        let needGroupFilter = req.groupId != ZeroGroupID()
+
+        # Debug: Log raw scan count for data tables
+        if res.value.len > 0 and res.value[0].key.startsWith("/t/0000000100"):
+          try:
+            {.cast(gcsafe).}:
+              {.cast(raises: []).}:
+                debug("handleScan: raw scan for data table", {
+                  "rawPairs": $res.value.len,
+                  "needGroupFilter": $needGroupFilter,
+                  "requestedGroupId": $req.groupId
+                }.toTable)
+          except:
+            discard
+
+        for p in res.value:
+          # If groupId is specified, only include keys that route to this group
+          # During rebalancing, use dual-read mode to accept keys that route to
+          # either old or new groups
+          if needGroupFilter:
+            # Use the dual-read-aware routing check
+            let routesToGroup = server.raftStore.keyRoutesToGroupIdDuringRebalance(
+              p.key, req.groupId)
+            if routesToGroup:
+              filteredPairs.add(p)
+            # else: key doesn't route to this group, skip it
+          else:
+            filteredPairs.add(p)
+
+        var scanPairs = newSeq[ScanPair](filteredPairs.len)
+        for i, p in filteredPairs:
           # Get version for this key
           var ver: uint64 = 1
           withLock server.mvccStore.keyVersionsMu:
@@ -1163,16 +1131,18 @@ proc handleBuiltinTxn(server: ProtocolServer, conn: ClientConnection,
       let sessionId = server.mvccStore.createSession()
       let res = server.mvccStore.beginTransaction(sessionId)
       if res.isOk:
-        # Register in txnMgr as well so recordRead/recordWrite can work if needed
-        # We use sessionId as the transaction ID for simplicity.
+        # The TransactionID is generated by beginTransaction
+        let txnId = res.value
+
         # Use the requested timeout or a default if 0.
         let timeout = if req.timeoutMs > 0: req.timeoutMs else: 300_000'u32
+        # Register in txnMgr as well so recordRead/recordWrite can work if needed
         discard server.txnMgr.beginTransaction(req.flags, timeout,
-                                              forcedId = some(sessionId))
+                                              forcedId = some(txnId))
 
         let resp = txnMsgs.BeginTxnResponse(
-          txnId: sessionId,
-          readTimestamp: uint64(res.value),
+          txnId: txnId,
+          readTimestamp: uint64(server.mvccStore.getCurrentTimestamp()),
         )
         sendFrame(conn, txnMsgs.encodeBeginTxnResponse(resp), requestId)
       else:
@@ -1206,7 +1176,7 @@ proc handleBuiltinTxn(server: ProtocolServer, conn: ClientConnection,
       return
 
     if not server.mvccStore.isNil:
-      let res = server.mvccStore.commitTransaction(txnId)
+      let res = server.mvccStore.commitTransactionByTxnId(txnId)
       # Also update txnMgr state for this txnId
       let txnMgrResp = server.txnMgr.commitTransaction(txnId)
 
@@ -1216,7 +1186,7 @@ proc handleBuiltinTxn(server: ProtocolServer, conn: ClientConnection,
           txnMsgs.CommitTxnResponse(
             status: txnMsgs.TxnCommitOK,
             commitTimestamp: uint64(res.value))), requestId)
-        server.mvccStore.closeSession(txnId)
+        server.mvccStore.closeSessionByTxnId(txnId)
       else:
         # Use txnMgr response for idempotency check
         if txnMgrResp.status == txnMsgs.TxnCommitOK:
@@ -1234,7 +1204,7 @@ proc handleBuiltinTxn(server: ProtocolServer, conn: ClientConnection,
           sendFrame(conn, txnMsgs.encodeCommitTxnResponse(
             txnMsgs.CommitTxnResponse(status: status)), requestId)
           if res.error.kind != mseTransactionNotFound:
-            server.mvccStore.closeSession(txnId)
+            server.mvccStore.closeSessionByTxnId(txnId)
     else:
       let resp = server.txnMgr.commitTransaction(txnId)
       if resp.status == txnMsgs.TxnCommitOK:
@@ -1251,10 +1221,10 @@ proc handleBuiltinTxn(server: ProtocolServer, conn: ClientConnection,
     let txnId = reqR.value.txnId
 
     if not server.mvccStore.isNil:
-      let res = server.mvccStore.rollbackTransaction(txnId)
+      let res = server.mvccStore.rollbackTransactionByTxnId(txnId)
       discard server.txnMgr.rollbackTransaction(txnId)
       if res.isOk:
-        server.mvccStore.closeSession(txnId)
+        server.mvccStore.closeSessionByTxnId(txnId)
         sendFrame(conn, txnMsgs.encodeRollbackTxnResponse(
           txnMsgs.RollbackTxnResponse(status: txnMsgs.TxnRollbackOK)), requestId)
       else:
@@ -1538,19 +1508,18 @@ proc handleBuiltinCluster(server: ProtocolServer, conn: ClientConnection,
     for m in req.members:
       nuraftMembers.add((nodeId: uint32(m.nodeId), host: m.host, port: int(m.raftPort)))
 
-    # Create the group - this node becomes leader by winning unopposed election
+    # Create the group - this node becomes leader by winning election
     var resp: clusterMsgs.CreateGroupResponse
     try:
       let ok = server.raftStore.coordinator.createAndStartGroup(
         groupId, nuraftMembers, uint32(req.preferredLeaderId))
       if ok:
         server.raftStore.registerGroup(groupId)
-        # Wait for election to complete
-        sleep(200)
 
-        # CRITICAL: Send JoinGroup RPCs to all other members so they create their local instances
-        # Without this, the group only exists on this node and can't form quorum
-        let myNodeId = server.config.serverId
+        # CRITICAL: Send JoinGroup RPCs to all other members BEFORE election timer fires.
+        # Wait for each response to ensure the member has created its instance.
+        # This ensures all members can vote when the preferred leader's election timer fires.
+        let myNodeIdForJoin = server.config.serverId
         for m in req.members:
           if uint32(m.nodeId) == uint32(req.preferredLeaderId):
             continue # Skip ourselves (we just created it)
@@ -1561,7 +1530,8 @@ proc handleBuiltinCluster(server: ProtocolServer, conn: ClientConnection,
               groupId: req.groupId,
               creatorNodeId: uint16(req.preferredLeaderId),
               creatorHost: server.config.host,
-              creatorPort: uint16(server.raftCoord.port)
+              creatorPort: uint16(server.raftCoord.port),
+              members: req.members
             )
             let cfg = ClientConfig(
               host: m.host,
@@ -1572,9 +1542,31 @@ proc handleBuiltinCluster(server: ProtocolServer, conn: ClientConnection,
             let cr = pc.connect()
             if cr.isOk:
               defer: pc.disconnect()
-              discard pc.joinGroup(joinReq)
+              let jr = pc.joinGroup(joinReq)
+              # Wait for response - member must have created instance before we continue
+              discard jr
           except CatchableError:
-            discard # Ignore errors - best effort
+            discard # Ignore errors - members can join later
+
+        # Wait for leader election to complete (election timeout is 150-500ms)
+        # A valid leader is either:
+        # - This node is the leader (isLeader returns true), OR
+        # - getLeader returns a positive ID that is NOT this node
+        var leaderElected = false
+        let myNodeId = int(server.config.serverId)
+        for i in 0 ..< 50: # 50 * 20ms = 1 second max
+          if server.raftCoord.isLeader(groupId):
+            leaderElected = true
+            break
+          let leaderId = server.raftCoord.getLeader(groupId)
+          if leaderId > 0 and leaderId != myNodeId:
+            leaderElected = true
+            break
+          sleep(20)
+
+        if not leaderElected:
+          # Log warning but continue - leader may be elected later
+          discard
 
         resp = clusterMsgs.CreateGroupResponse(
           success: true,
@@ -1624,25 +1616,65 @@ proc handleBuiltinCluster(server: ProtocolServer, conn: ClientConnection,
       return
 
     # Build member list - we join the existing group created by creatorNodeId
-    # For joining, we need all members info (we get creator info from request,
-    # but need to lookup our own and other members' info)
+    # IMPORTANT: First try to use the members from the request (most reliable).
+    # If not available, fall back to looking up from sys.groups.
     var nuraftMembers: seq[tuple[nodeId: uint32, host: string, port: int]] = @[]
 
-    # Add the creator node
-    nuraftMembers.add((nodeId: uint32(req.creatorNodeId),
-                       host: req.creatorHost,
-                       port: int(req.creatorPort)))
-
-    # Add ourselves
     let myNodeId = server.config.serverId
     let myRaftPort = server.raftCoord.port
-    nuraftMembers.add((nodeId: uint32(myNodeId),
-                       host: server.config.host,
-                       port: myRaftPort))
 
-    echo "DEBUG mtJoinGroup: myNodeId=", myNodeId, " creatorNodeId=", req.creatorNodeId,
-         " creatorHost=", req.creatorHost, " creatorPort=", req.creatorPort,
-         " myHost=", server.config.host, " myRaftPort=", myRaftPort
+    # First, try to use members from the request (if provided)
+    if req.members.len > 0:
+      for m in req.members:
+        nuraftMembers.add((nodeId: uint32(m.nodeId),
+                           host: m.host,
+                           port: int(m.raftPort)))
+
+    # If no members in request, look up the group record from sys.groups
+    if nuraftMembers.len == 0:
+      let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupId)
+      let groupRes = server.raftStore.raftGet(groupKey)
+
+      if groupRes.isOk and groupRes.value.isSome:
+        # Found the group record - use all members from it
+        let groupEntry = groupRes.value.get()
+        let groupData = groupEntry.value
+        var groupRec: GroupRecord
+        var decoded = false
+
+        # Try MVCC-aware binary decoding first
+        try:
+          let (rec, _) = decodeGroupRecordFromMVCC(groupData)
+          groupRec = rec
+          decoded = true
+        except:
+          discard
+
+        if not decoded:
+          # Try raw binary decoding
+          try:
+            groupRec = decodeGroupRecord(groupData)
+            decoded = true
+          except:
+            discard
+
+        if decoded:
+          # Build member list from group record
+          for rep in groupRec.replicas:
+            let peerInfo = server.raftCoord.peerInfo.getOrDefault(rep.nodeId,
+                (host: server.config.host, port: myRaftPort))
+            nuraftMembers.add((nodeId: rep.nodeId,
+                               host: peerInfo.host,
+                               port: peerInfo.port))
+
+    if nuraftMembers.len == 0:
+      # Fallback: use creator + ourselves (this should not happen if sys.groups is correct)
+      nuraftMembers.add((nodeId: uint32(req.creatorNodeId),
+                         host: req.creatorHost,
+                         port: int(req.creatorPort)))
+      nuraftMembers.add((nodeId: uint32(myNodeId),
+                         host: server.config.host,
+                         port: myRaftPort))
 
     # Create the group - we join as a follower
     var resp: clusterMsgs.JoinGroupResponse
@@ -2006,6 +2038,14 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
 
   # Reload group membership cache after space group recovery
   store.loadGroupMembers()
+
+# Wait for meta group leader before seeding (max 5 seconds)
+  if startAsLeader and not isRejoining:
+    let waitDeadline = getTime().toUnixFloat() * 1000 + 5000.0
+    while getTime().toUnixFloat() * 1000 < waitDeadline:
+      if coord.isLeader(META_GROUP_ID) or coord.getLeader(META_GROUP_ID) > 0:
+        break
+      sleep(100)
 
 # Seed system tables: sys.nodes (table 5) and sys.groups (table 4)
   # Only seed when starting as fresh leader (not rejoining and not joining)

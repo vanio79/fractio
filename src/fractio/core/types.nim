@@ -19,163 +19,8 @@ type
     ## String representation: 26 characters (Crockford's base32)
     data*: array[ULID_SIZE, uint8]
 
-  # Basic data types
-  DataType* = enum
-    dtInt, dtFloat, dtString, dtBool, dtDate, dtDateTime, dtBytes, dtULID
-
-  Timestamp* = int64
-    ## Nanosecond-precision Unix timestamp
-
-  Constraint* = object
-    nullable*: bool
-    unique*: bool
-    primaryKey*: bool
-    defaultValue*: ValueRef
-
-  ValueRef* = ref object
-    case kind*: DataType
-    of dtInt:
-      intValue*: int64
-    of dtFloat:
-      floatValue*: float64
-    of dtString:
-      strValue*: string
-    of dtBool:
-      boolValue*: bool
-    of dtDate:
-      dateValue*: int64
-    of dtDateTime:
-      datetimeValue*: int64
-    of dtBytes:
-      bytesValue*: seq[uint8]
-    of dtULID:
-      ulidValue*: ULID
-
-  ColumnDef* = object
-    name*: string
-    dataType*: DataType
-    constraints*: Constraint
-    isShardKey*: bool
-
-  RowID* = distinct int64
-
-  Row* = ref object
-    id*: RowID
-    values*: seq[ValueRef]
-    createdAt*: int64
-    updatedAt*: int64
-    version*: int64
-
-  Table* = ref object
-    name*: string
-    columns*: seq[ColumnDef]
-    rows*: seq[Row]
-    indexes*: TableIndexes
-    mutex*: pointer
-    version*: int64
-
-  TableIndexes* = object
-    columnIndices*: tables.Table[string, int]
-
-  Schema* = ref object
-    tables*: tables.Table[string, Table]
-    mutex*: pointer
-    version*: int64
-
-  TransactionID* = distinct int64
-
-  Transaction* = ref object
-    id*: TransactionID
-    timestamp*: int64
-    status*: TransactionStatus
-    readSnapshot*: int64
-    mutatedTables*: HashSet[string]
-    mutex*: pointer
-
-  TransactionStatus* = enum
-    tsActive, tsCommitted, tsAborted
-
-  ShardID* = distinct int64
-
-  Shard* = ref object
-    id*: ShardID
-    rangeStart*: uint64
-    rangeEnd*: uint64
-    replicas*: seq[ReplicaInfo]
-    primaryReplica*: int
-    table*: string
-
-  ReplicaInfo* = object
-    nodeId*: string
-    address*: string
-    port*: uint16
-    lastSeen*: int64
-
-  NodeID* = distinct string
-
-  NodeInfo* = object
-    id*: NodeID
-    address*: string
-    port*: uint16
-    role*: NodeRole
-    capacity*: int
-    used*: int
-    load*: int
-
-  NodeRole* = enum
-    nrCoordinator, nrPrimary, nrSecondary, nrClient
-
-# Helper templates for safe type conversions
-template int64Value*(v: ValueRef): int64 =
-  case v.kind
-  of dtInt: v.intValue
-  else: 0
-
-template float64Value*(v: ValueRef): float64 =
-  case v.kind
-  of dtFloat: v.floatValue
-  else: 0.0
-
-template stringValue*(v: ValueRef): string =
-  case v.kind
-  of dtString: v.strValue
-  else: ""
-
-template boolValue*(v: ValueRef): bool =
-  case v.kind
-  of dtBool: v.boolValue
-  else: false
-
-# Constructors for ValueRef
-proc newValueRef*(i: int64): ValueRef =
-  result = ValueRef(kind: dtInt, intValue: i)
-
-proc newValueRef*(f: float64): ValueRef =
-  result = ValueRef(kind: dtFloat, floatValue: f)
-
-proc newValueRef*(s: string): ValueRef =
-  result = ValueRef(kind: dtString, strValue: s)
-
-proc newValueRef*(b: bool): ValueRef =
-  result = ValueRef(kind: dtBool, boolValue: b)
-
-proc newValueRef*(bytes: seq[uint8]): ValueRef =
-  result = ValueRef(kind: dtBytes, bytesValue: bytes)
-
-proc newRow*(id: RowID = RowID(0)): Row =
-  Row(id: id, values: @[], createdAt: getTime().toUnix * 1000,
-       updatedAt: getTime().toUnix * 1000, version: 1)
-
-proc `==`*(a, b: TransactionID): bool = a.int64 == b.int64
-proc `!=`*(a, b: TransactionID): bool = not (a == b)
-
-# Transaction ID generation (legacy - will be replaced by P2PTimeSynchronizer)
-# Row ID generation
-proc genRowID*(): RowID =
-  RowID(getTime().toUnix * 1000000 + (getTime().toUnix*1000000 mod 1000000).int64)
-
 # ============================================================================
-# ULID Operations
+# ULID Operations (must come first as other types depend on these)
 # ============================================================================
 
 proc ZeroULID*(): ULID =
@@ -301,8 +146,213 @@ proc ulidTimestamp*(u: ULID): int64 =
   for i in 0 ..< 6:
     result = (result shl 8) or int64(u.data[i])
 
+type
+  # Basic data types
+  DataType* = enum
+    dtInt, dtFloat, dtString, dtBool, dtDate, dtDateTime, dtBytes, dtULID
+
+  Timestamp* = int64
+    ## Nanosecond-precision Unix timestamp
+
+  Constraint* = object
+    nullable*: bool
+    unique*: bool
+    primaryKey*: bool
+    defaultValue*: ValueRef
+
+  ValueRef* = ref object
+    case kind*: DataType
+    of dtInt:
+      intValue*: int64
+    of dtFloat:
+      floatValue*: float64
+    of dtString:
+      strValue*: string
+    of dtBool:
+      boolValue*: bool
+    of dtDate:
+      dateValue*: int64
+    of dtDateTime:
+      datetimeValue*: int64
+    of dtBytes:
+      bytesValue*: seq[uint8]
+    of dtULID:
+      ulidValue*: ULID
+
+  ColumnDef* = object
+    name*: string
+    dataType*: DataType
+    constraints*: Constraint
+    isShardKey*: bool
+
+  RowID* = distinct ULID
+    ## Row identifier - ULID for globally unique, sortable row IDs
+
+  Row* = ref object
+    id*: RowID
+    values*: seq[ValueRef]
+    createdAt*: int64
+    updatedAt*: int64
+    version*: int64
+
+  Table* = ref object
+    name*: string
+    columns*: seq[ColumnDef]
+    rows*: seq[Row]
+    indexes*: TableIndexes
+    mutex*: pointer
+    version*: int64
+
+  TableIndexes* = object
+    columnIndices*: tables.Table[string, int]
+
+  Schema* = ref object
+    tables*: tables.Table[string, Table]
+    mutex*: pointer
+    version*: int64
+
+  TransactionID* = distinct ULID
+    ## Transaction identifier - ULID for globally unique, sortable transaction IDs
+
+  Transaction* = ref object
+    id*: TransactionID
+    timestamp*: int64
+    status*: TransactionStatus
+    readSnapshot*: int64
+    mutatedTables*: HashSet[string]
+    mutex*: pointer
+
+  TransactionStatus* = enum
+    tsActive, tsCommitted, tsAborted
+
+  ShardID* = distinct ULID
+    ## Shard identifier - ULID for globally unique, sortable shard IDs
+
+  Shard* = ref object
+    id*: ShardID
+    rangeStart*: uint64
+    rangeEnd*: uint64
+    replicas*: seq[ReplicaInfo]
+    primaryReplica*: int
+    table*: string
+
+  ReplicaInfo* = object
+    nodeId*: string
+    address*: string
+    port*: uint16
+    lastSeen*: int64
+
+  NodeID* = distinct string
+
+  NodeInfo* = object
+    id*: NodeID
+    address*: string
+    port*: uint16
+    role*: NodeRole
+    capacity*: int
+    used*: int
+    load*: int
+
+  NodeRole* = enum
+    nrCoordinator, nrPrimary, nrSecondary, nrClient
+
+# Helper templates for safe type conversions
+template int64Value*(v: ValueRef): int64 =
+  case v.kind
+  of dtInt: v.intValue
+  else: 0
+
+template float64Value*(v: ValueRef): float64 =
+  case v.kind
+  of dtFloat: v.floatValue
+  else: 0.0
+
+template stringValue*(v: ValueRef): string =
+  case v.kind
+  of dtString: v.strValue
+  else: ""
+
+template boolValue*(v: ValueRef): bool =
+  case v.kind
+  of dtBool: v.boolValue
+  else: false
+
+# Constructors for ValueRef
+proc newValueRef*(i: int64): ValueRef =
+  result = ValueRef(kind: dtInt, intValue: i)
+
+proc newValueRef*(f: float64): ValueRef =
+  result = ValueRef(kind: dtFloat, floatValue: f)
+
+proc newValueRef*(s: string): ValueRef =
+  result = ValueRef(kind: dtString, strValue: s)
+
+proc newValueRef*(b: bool): ValueRef =
+  result = ValueRef(kind: dtBool, boolValue: b)
+
+proc newValueRef*(bytes: seq[uint8]): ValueRef =
+  result = ValueRef(kind: dtBytes, bytesValue: bytes)
+
 proc newValueRef*(u: ULID): ValueRef =
   result = ValueRef(kind: dtULID, ulidValue: u)
+
+proc newRow*(id: RowID = RowID(ZeroULID())): Row =
+  Row(id: id, values: @[], createdAt: getTime().toUnix * 1000,
+       updatedAt: getTime().toUnix * 1000, version: 1)
+
+# TransactionID operations (ULID-based)
+proc `==`*(a, b: TransactionID): bool = ULID(a) == ULID(b)
+proc `!=`*(a, b: TransactionID): bool = not (a == b)
+proc `<`*(a, b: TransactionID): bool = ULID(a) < ULID(b)
+proc `$`*(id: TransactionID): string = $ULID(id)
+proc hash*(id: TransactionID): Hash = hash($ULID(id))
+
+# RowID operations (ULID-based)
+proc `==`*(a, b: RowID): bool = ULID(a) == ULID(b)
+proc `!=`*(a, b: RowID): bool = not (a == b)
+proc `<`*(a, b: RowID): bool = ULID(a) < ULID(b)
+proc `$`*(id: RowID): string = $ULID(id)
+proc hash*(id: RowID): Hash = hash($ULID(id))
+
+# ShardID operations (ULID-based)
+proc `==`*(a, b: ShardID): bool = ULID(a) == ULID(b)
+proc `!=`*(a, b: ShardID): bool = not (a == b)
+proc `<`*(a, b: ShardID): bool = ULID(a) < ULID(b)
+proc `$`*(id: ShardID): string = $ULID(id)
+proc hash*(id: ShardID): Hash = hash($ULID(id))
+
+# Transaction ID generation - uses ULID for globally unique IDs
+proc genTransactionID*(): TransactionID =
+  TransactionID(genULID())
+
+# Row ID generation - uses ULID for globally unique IDs
+proc genRowID*(): RowID =
+  RowID(genULID())
+
+# Shard ID generation - uses ULID for globally unique IDs
+proc genShardID*(): ShardID =
+  ShardID(genULID())
+
+# Convenience conversions for TransactionID
+proc transactionIDFromBytes*(data: string): TransactionID =
+  TransactionID(ulidFromBytes(data))
+
+proc transactionIDFromString*(s: string): TransactionID =
+  TransactionID(ulidFromString(s))
+
+proc transactionIDToBytes*(id: TransactionID): string =
+  ulidToBytes(ULID(id))
+
+# Zero/invalid ID constants (procs must be defined first)
+# These are template-based to avoid compile-time evaluation issues
+template zeroTransactionID*(): TransactionID = TransactionID(ZeroULID())
+template zeroRowID*(): RowID = RowID(ZeroULID())
+template zeroShardID*(): ShardID = ShardID(ZeroULID())
+
+# isZero checks for comparing against zero IDs
+template isZero*(id: TransactionID): bool = id == zeroTransactionID()
+template isZero*(id: RowID): bool = id == zeroRowID()
+template isZero*(id: ShardID): bool = id == zeroShardID()
 
 # =============================================================================
 # NodeID Operations

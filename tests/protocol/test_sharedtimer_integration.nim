@@ -21,6 +21,7 @@ import fractio/protocol/server
 import fractio/protocol/txn_manager
 import fractio/distributed/sharedtimer
 import fractio/distributed/sharedtimer/timeprovider as tp
+import fractio/core/types as coreTypes
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -72,7 +73,7 @@ suite "SharedTimer integration — disabled (single-node fallback)":
     srv.start()
     waitForServer(20401)
     let txn = srv.txnMgr.beginTransaction()
-    check txn.id > 0
+    check txn.id != zeroTransactionID()
     # Timestamp should be a reasonable Unix nanosecond value (after year 2020)
     let minTs = uint64(1_577_836_800) * 1_000_000_000'u64 # 2020-01-01 in ns
     check txn.readTimestamp > minTs
@@ -131,7 +132,7 @@ suite "SharedTimer integration — enabled":
     srv.start()
     waitForServer(20414)
     let txn = srv.txnMgr.beginTransaction()
-    check txn.id > 0
+    check txn.id != zeroTransactionID()
     let minTs = uint64(1_577_836_800) * 1_000_000_000'u64 # 2020-01-01 in ns
     check txn.readTimestamp > minTs
     srv.stop()

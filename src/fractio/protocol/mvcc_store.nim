@@ -105,6 +105,8 @@ type
     # Version tracking for CAS operations
     keyVersions*: tables.Table[string, uint64]
     keyVersionsMu*: Lock
+    # Reverse mapping: TransactionID -> sessionId for wire protocol lookups
+    txnToSession*: tables.Table[coreTypes.TransactionID, uint64]
 
 # ---------------------------------------------------------------------------
 # Key encoding helpers
@@ -117,10 +119,11 @@ proc encodeVersionKey(userKey: string, timestamp: Timestamp): string =
     result.add(chr(int(tsBytes[i])))
 
 proc encodeIntentKey(userKey: string, txnId: coreTypes.TransactionID): string =
+  # Intent key format: <userKey>\x00\x01<16 bytes ULID txnId>
+  # Total length = userKey.len + 18
   result = userKey & mvccTypes.INTENT_SUFFIX
-  var txnBytes = mvccTypes.toBigEndian64(int64(txnId))
-  for i in 0..7:
-    result.add(chr(int(txnBytes[i])))
+  let txnBytes = coreTypes.transactionIDToBytes(txnId)
+  result.add(txnBytes)
 
 proc isVersionKey*(key: string): bool =
   # Version key format: <userKey>\x00\x00<8 bytes timestamp>
@@ -131,11 +134,11 @@ proc isVersionKey*(key: string): bool =
   result = key[sepPos .. sepPos+1] == mvccTypes.VERSION_SEPARATOR
 
 proc isIntentKeyMvcc*(key: string): bool =
-  # Intent key format: <userKey>\x00\x01<8 bytes txnId>
-  # Total length = userKey.len + 10
-  # INTENT_SUFFIX is at positions [key.len - 10, key.len - 9]
-  if key.len < 10: return false
-  let sepPos = key.len - 10
+  # Intent key format: <userKey>\x00\x01<16 bytes ULID txnId>
+  # Total length = userKey.len + 18
+  # INTENT_SUFFIX is at positions [key.len - 18, key.len - 17]
+  if key.len < 18: return false
+  let sepPos = key.len - 18
   result = key[sepPos .. sepPos+1] == mvccTypes.INTENT_SUFFIX
 
 proc decodeVersionKey(encoded: string): tuple[userKey: string,
@@ -164,6 +167,7 @@ proc newMvccTransactionStore*(raftStore: RaftKVStoreExt,
     tsProvider: tsProvider,
     sessions: initTable[uint64, SessionTxnState](),
     keyVersions: initTable[string, uint64](),
+    txnToSession: initTable[coreTypes.TransactionID, uint64](),
     logger: newLogger("protocol.mvcc_store"),
   )
   initLock(result.sessionsMu)
@@ -190,7 +194,7 @@ proc closeSession*(store: MvccTransactionStore, sessionId: uint64) {.gcsafe,
     let state = store.sessions.getOrDefault(sessionId)
     if not state.isNil:
       if state.txn != nil and state.txn.status == mvccTypes.TXN_PENDING:
-        discard store.txnManager.rollbackTransaction(uint64(state.txn.id))
+        discard store.txnManager.rollbackTransaction(state.txn.id)
       store.sessions.del(sessionId)
 
 proc getSessionState*(store: MvccTransactionStore,
@@ -218,7 +222,7 @@ proc beginTransaction*(store: MvccTransactionStore,
 
     let txnRec = store.txnManager.beginTransaction()
     state.txn = coreTxn.MVCCTransaction(
-      id: coreTypes.TransactionID(txnRec.id),
+      id: txnRec.id,
       status: mvccTypes.TXN_PENDING,
       startTimestamp: coreTypes.Timestamp(txnRec.readTimestamp),
       commitTimestamp: coreTypes.Timestamp(0),
@@ -227,7 +231,18 @@ proc beginTransaction*(store: MvccTransactionStore,
       readSet: coreTxn.ReadSet(keys: @[], timestamps: @[]),
     )
     state.intents = initTable[string, coreTxn.WriteEntry]()
+    # Store the reverse mapping
+    store.txnToSession[txnRec.id] = sessionId
     return mvccOk(state.txn.id)
+
+proc getSessionIdByTxnId*(store: MvccTransactionStore,
+    txnId: coreTypes.TransactionID): Option[uint64] {.gcsafe, raises: [].} =
+  ## Look up sessionId from TransactionID
+  withLock store.sessionsMu:
+    let sessionId = store.txnToSession.getOrDefault(txnId)
+    if sessionId != 0:
+      return some(sessionId)
+    return none(uint64)
 
 proc commitTransaction*(store: MvccTransactionStore,
     sessionId: uint64): MvccResult[coreTypes.Timestamp] {.gcsafe, raises: [].} =
@@ -245,7 +260,7 @@ proc commitTransaction*(store: MvccTransactionStore,
       return mvccErr[coreTypes.Timestamp](MvccStoreError(
         kind: mseTransactionNotActive, msg: "Transaction is not active"))
 
-    let commitResp = store.txnManager.commitTransaction(uint64(state.txn.id))
+    let commitResp = store.txnManager.commitTransaction(state.txn.id)
 
     case commitResp.status:
     of TxnCommitOK:
@@ -307,7 +322,7 @@ proc rollbackTransaction*(store: MvccTransactionStore,
       return mvccVErr(MvccStoreError(
         kind: mseNotInTransaction, msg: "No active transaction"))
 
-    discard store.txnManager.rollbackTransaction(uint64(state.txn.id))
+    discard store.txnManager.rollbackTransaction(state.txn.id)
 
     for key, entry in state.intents.pairs:
       discard store.raftStore.raftDelete(encodeIntentKey(key, state.txn.id))
@@ -471,7 +486,7 @@ proc recordRead*(store: MvccTransactionStore, sessionId: uint64,
       return mvccVErr(MvccStoreError(
         kind: mseNotInTransaction, msg: "No active transaction"))
 
-    let res = store.txnManager.recordRead(uint64(state.txn.id), key)
+    let res = store.txnManager.recordRead(state.txn.id, key)
     if not res.isOk:
       return mvccVErr(MvccStoreError(
         kind: mseStorageError, msg: "Failed to record read"))
@@ -551,7 +566,7 @@ proc txnPut*(store: MvccTransactionStore, sessionId: uint64,
       return mvccVErr(MvccStoreError(
         kind: mseTransactionNotActive, msg: "Transaction is not active"))
 
-    let recordRes = store.txnManager.recordWrite(uint64(state.txn.id), key)
+    let recordRes = store.txnManager.recordWrite(state.txn.id, key)
     if not recordRes.isOk:
       return mvccVErr(MvccStoreError(
         kind: mseTransactionNotActive, msg: "Failed to record write"))
@@ -586,7 +601,7 @@ proc txnDelete*(store: MvccTransactionStore, sessionId: uint64,
       return mvccVErr(MvccStoreError(
         kind: mseTransactionNotActive, msg: "Transaction is not active"))
 
-    let recordRes = store.txnManager.recordWrite(uint64(state.txn.id), key)
+    let recordRes = store.txnManager.recordWrite(state.txn.id, key)
     if not recordRes.isOk:
       return mvccVErr(MvccStoreError(
         kind: mseTransactionNotActive, msg: "Failed to record write"))
@@ -1121,3 +1136,115 @@ proc getActiveTransactionCount*(store: MvccTransactionStore): int {.gcsafe,
 proc getSessionCount*(store: MvccTransactionStore): int {.gcsafe, raises: [].} =
   withLock store.sessionsMu:
     result = store.sessions.len
+
+# ---------------------------------------------------------------------------
+# Wire protocol convenience procs (work with TransactionID directly)
+# ---------------------------------------------------------------------------
+
+proc commitTransactionByTxnId*(store: MvccTransactionStore,
+    txnId: coreTypes.TransactionID): MvccResult[coreTypes.Timestamp] {.gcsafe,
+        raises: [].} =
+  ## Commit a transaction by its TransactionID (for wire protocol)
+  let sessionIdOpt = store.getSessionIdByTxnId(txnId)
+  if sessionIdOpt.isNone:
+    return mvccErr[coreTypes.Timestamp](MvccStoreError(
+      kind: mseTransactionNotFound, msg: "Transaction not found"))
+  store.commitTransaction(sessionIdOpt.get())
+
+proc rollbackTransactionByTxnId*(store: MvccTransactionStore,
+    txnId: coreTypes.TransactionID): MvccVoidResult {.gcsafe, raises: [].} =
+  ## Rollback a transaction by its TransactionID (for wire protocol)
+  let sessionIdOpt = store.getSessionIdByTxnId(txnId)
+  if sessionIdOpt.isNone:
+    return mvccVErr(MvccStoreError(
+      kind: mseTransactionNotFound, msg: "Transaction not found"))
+  store.rollbackTransaction(sessionIdOpt.get())
+
+proc closeSessionByTxnId*(store: MvccTransactionStore,
+    txnId: coreTypes.TransactionID) {.gcsafe, raises: [].} =
+  ## Close a session by its TransactionID (for wire protocol)
+  let sessionIdOpt = store.getSessionIdByTxnId(txnId)
+  if sessionIdOpt.isSome:
+    store.closeSession(sessionIdOpt.get())
+
+proc recordReadByTxnId*(store: MvccTransactionStore,
+    txnId: coreTypes.TransactionID, key: string): MvccVoidResult {.gcsafe,
+        raises: [].} =
+  ## Record a read within a transaction by TransactionID (for wire protocol)
+  let sessionIdOpt = store.getSessionIdByTxnId(txnId)
+  if sessionIdOpt.isNone:
+    return mvccVErr(MvccStoreError(
+      kind: mseTransactionNotFound, msg: "Transaction not found"))
+  store.recordRead(sessionIdOpt.get(), key)
+
+proc txnGetByTxnId*(store: MvccTransactionStore, txnId: coreTypes.TransactionID,
+    key: string): MvccResult[Option[string]] {.gcsafe, raises: [].} =
+  ## Get a value within a transaction by TransactionID (for wire protocol)
+  let sessionIdOpt = store.getSessionIdByTxnId(txnId)
+  if sessionIdOpt.isNone:
+    return mvccErr[Option[string]](MvccStoreError(
+      kind: mseTransactionNotFound, msg: "Transaction not found"))
+  store.txnGet(sessionIdOpt.get(), key)
+
+proc txnPutByTxnId*(store: MvccTransactionStore, txnId: coreTypes.TransactionID,
+    key: string, value: string): MvccVoidResult {.gcsafe, raises: [].} =
+  ## Put a value within a transaction by TransactionID (for wire protocol)
+  let sessionIdOpt = store.getSessionIdByTxnId(txnId)
+  if sessionIdOpt.isNone:
+    return mvccVErr(MvccStoreError(
+      kind: mseTransactionNotFound, msg: "Transaction not found"))
+  store.txnPut(sessionIdOpt.get(), key, value)
+
+proc txnDeleteByTxnId*(store: MvccTransactionStore,
+    txnId: coreTypes.TransactionID, key: string): MvccVoidResult {.gcsafe,
+        raises: [].} =
+  ## Delete a value within a transaction by TransactionID (for wire protocol)
+  let sessionIdOpt = store.getSessionIdByTxnId(txnId)
+  if sessionIdOpt.isNone:
+    return mvccVErr(MvccStoreError(
+      kind: mseTransactionNotFound, msg: "Transaction not found"))
+  store.txnDelete(sessionIdOpt.get(), key)
+
+proc txnGetWithMetaByTxnId*(store: MvccTransactionStore,
+    txnId: coreTypes.TransactionID,
+
+key: string): MvccResult[Option[MvccValueWithMeta]] {.gcsafe, raises: [].} =
+  ## Get a value with metadata within a transaction by TransactionID (for wire protocol)
+  let sessionIdOpt = store.getSessionIdByTxnId(txnId)
+  if sessionIdOpt.isNone:
+    return mvccErr[Option[MvccValueWithMeta]](MvccStoreError(
+      kind: mseTransactionNotFound, msg: "Transaction not found"))
+  store.txnGetWithMeta(sessionIdOpt.get(), key)
+
+proc txnPutWithResultByTxnId*(store: MvccTransactionStore,
+    txnId: coreTypes.TransactionID, key: string, value: string,
+    flags: uint8 = 0, expectedVersion: uint64 = 0): MvccResult[MvccPutResult] {.
+    gcsafe, raises: [].} =
+  ## Put with result within a transaction by TransactionID (for wire protocol)
+  let sessionIdOpt = store.getSessionIdByTxnId(txnId)
+  if sessionIdOpt.isNone:
+    return mvccErr[MvccPutResult](MvccStoreError(
+      kind: mseTransactionNotFound, msg: "Transaction not found"))
+  store.txnPutWithResult(sessionIdOpt.get(), key, value, flags, expectedVersion)
+
+proc txnDeleteWithResultByTxnId*(store: MvccTransactionStore,
+    txnId: coreTypes.TransactionID, key: string, flags: uint8 = 0): MvccResult[
+        MvccDeleteResult] {.
+    gcsafe, raises: [].} =
+  ## Delete with result within a transaction by TransactionID (for wire protocol)
+  let sessionIdOpt = store.getSessionIdByTxnId(txnId)
+  if sessionIdOpt.isNone:
+    return mvccErr[MvccDeleteResult](MvccStoreError(
+      kind: mseTransactionNotFound, msg: "Transaction not found"))
+  store.txnDeleteWithResult(sessionIdOpt.get(), key, flags)
+
+proc txnScanByTxnId*(store: MvccTransactionStore,
+    txnId: coreTypes.TransactionID, startKey: string, endKey: string,
+    limit: uint32 = 0): MvccResult[seq[tuple[key: string, value: string]]] {.
+    gcsafe, raises: [].} =
+  ## Scan within a transaction by TransactionID (for wire protocol)
+  let sessionIdOpt = store.getSessionIdByTxnId(txnId)
+  if sessionIdOpt.isNone:
+    return mvccErr[seq[tuple[key: string, value: string]]](MvccStoreError(
+      kind: mseTransactionNotFound, msg: "Transaction not found"))
+  store.txnScan(sessionIdOpt.get(), startKey, endKey, limit)

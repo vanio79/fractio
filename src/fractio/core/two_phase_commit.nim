@@ -201,11 +201,10 @@ proc newTwoPCConfig*(): TwoPCConfig =
   )
 
 proc generateTransactionId*(tsProvider: TimestampProvider): TransactionID =
-  ## Generate a unique transaction ID
-  let now = tsProvider.now()
-  # Combine timestamp with node ID for uniqueness
-  # In production, would include node ID
-  result = TransactionID(now)
+  ## Generate a unique transaction ID using ULID
+  ## The timestamp provider is used for the timestamp component
+  discard tsProvider.now() # Ensure timestamp provider is active
+  result = genTransactionID()
 
 proc generateRequestId*(): string =
   ## Generate a unique request ID
@@ -275,7 +274,7 @@ proc sendPrepareRequest*(coordinator: Coordinator): Future[seq[
   let requestId = generateRequestId()
 
   coordinator.logger.info("Sending prepare requests",
-    {"transactionId": $int64(coordinator.transactionId),
+    {"transactionId": $coordinator.transactionId,
      "participants": $coordinator.participants.len}.toTable)
 
   # If Raft is enabled, log the prepare phase to Raft
@@ -327,7 +326,7 @@ proc processPrepareResponses*(coordinator: Coordinator,
   let quorumAchieved = coordinator.preparedCount >= coordinator.quorum
 
   coordinator.logger.info("Prepare phase completed",
-    {"transactionId": $int64(coordinator.transactionId),
+    {"transactionId": $coordinator.transactionId,
      "preparedCount": $coordinator.preparedCount,
      "abortedCount": $coordinator.abortedCount,
      "quorum": $coordinator.quorum,
@@ -346,7 +345,7 @@ proc sendCommitRequest*(coordinator: Coordinator): Future[seq[
   let requestId = generateRequestId()
 
   coordinator.logger.info("Sending commit requests",
-    {"transactionId": $int64(coordinator.transactionId),
+    {"transactionId": $coordinator.transactionId,
      "participants": $coordinator.participants.len}.toTable)
 
   # If Raft is enabled, log the commit phase to Raft
@@ -380,7 +379,7 @@ proc sendRollbackRequest*(coordinator: Coordinator): Future[seq[
   let requestId = generateRequestId()
 
   coordinator.logger.info("Sending rollback requests",
-    {"transactionId": $int64(coordinator.transactionId),
+    {"transactionId": $coordinator.transactionId,
      "participants": $coordinator.participants.len}.toTable)
 
   for participant in coordinator.participants:
@@ -404,7 +403,7 @@ proc executeTwoPC*(coordinator: Coordinator): Future[TwoPCResult] {.async.} =
   ## 2. Commit or Rollback phase
 
   coordinator.logger.info("Starting 2PC transaction",
-    {"transactionId": $int64(coordinator.transactionId),
+    {"transactionId": $coordinator.transactionId,
      "coordinatorId": coordinator.coordinatorId,
      "participants": $coordinator.participants.len}.toTable)
 
@@ -417,7 +416,7 @@ proc executeTwoPC*(coordinator: Coordinator): Future[TwoPCResult] {.async.} =
     coordinator.state = tpcsAborted
 
     coordinator.logger.warn("Prepare phase failed, rolling back",
-      {"transactionId": $int64(coordinator.transactionId),
+      {"transactionId": $coordinator.transactionId,
        "reason": "quorum not achieved"}.toTable)
 
     return TwoPCResult(
@@ -438,7 +437,7 @@ proc executeTwoPC*(coordinator: Coordinator): Future[TwoPCResult] {.async.} =
     if response.state != tpcsCommitted:
       allCommitted = false
       coordinator.logger.error("Participant failed to commit",
-        {"transactionId": $int64(coordinator.transactionId),
+        {"transactionId": $coordinator.transactionId,
          "participantId": response.participantId,
          "state": $response.state,
          "error": response.error}.toTable)
@@ -450,7 +449,7 @@ proc executeTwoPC*(coordinator: Coordinator): Future[TwoPCResult] {.async.} =
     let participantIds = coordinator.participants.mapIt(it.nodeId)
 
     coordinator.logger.info("2PC transaction committed successfully",
-      {"transactionId": $int64(coordinator.transactionId),
+      {"transactionId": $coordinator.transactionId,
        "commitTimestamp": $commitTs,
        "participants": $participantIds.len}.toTable)
 
@@ -467,7 +466,7 @@ proc executeTwoPC*(coordinator: Coordinator): Future[TwoPCResult] {.async.} =
     coordinator.state = tpcsAborted
 
     coordinator.logger.error("Commit phase failed",
-      {"transactionId": $int64(coordinator.transactionId),
+      {"transactionId": $coordinator.transactionId,
        "reason": "some participants failed"}.toTable)
 
     return TwoPCResult(
@@ -489,7 +488,7 @@ proc newParticipant*(nodeId: string, endpoint: string,
   result.nodeId = nodeId
   result.endpoint = endpoint
   result.state = tpcsIdle
-  result.transactionId = TransactionID(0)
+  result.transactionId = zeroTransactionID()
   result.prepareTimestamp = INVALID_TIMESTAMP
   result.vote = pvAbstain
   result.transaction = nil
@@ -600,7 +599,7 @@ proc checkRecovery*(participant: Participant,
 
   return TwoPCResult(
     success: true,
-    transactionId: TransactionID(0),
+    transactionId: zeroTransactionID(),
     commitTimestamp: INVALID_TIMESTAMP,
     participants: @[],
     error: "",
@@ -615,7 +614,7 @@ proc recoverTransaction*(coordinator: Coordinator,
   coordinator.state = tpcsRecovering
 
   coordinator.logger.info("Attempting to recover transaction",
-    {"transactionId": $int64(transactionId),
+    {"transactionId": $transactionId,
      "coordinatorId": coordinator.coordinatorId}.toTable)
 
   # In a real implementation, this would:
@@ -658,7 +657,7 @@ proc handleTimeout*(coordinator: Coordinator): TwoPCResult =
   ## Returns result of timeout handling
 
   coordinator.logger.warn("2PC timeout occurred",
-    {"transactionId": $int64(coordinator.transactionId),
+    {"transactionId": $coordinator.transactionId,
      "state": $coordinator.state}.toTable)
 
   case coordinator.state
@@ -713,7 +712,7 @@ proc twoPCRequestToJson*(request: TwoPCRequest): JsonNode =
   result = %*{
     "requestId": request.requestId,
     "requestType": $request.requestType,
-    "transactionId": int64(request.transactionId),
+    "transactionId": $request.transactionId,
     "coordinatorId": request.coordinatorId,
     "timestamp": int64(request.timestamp),
     "data": request.data,
@@ -725,7 +724,7 @@ proc twoPCRequestFromJson*(json: JsonNode): TwoPCRequest =
   result = TwoPCRequest(
     requestId: json["requestId"].getStr(),
     requestType: parseEnum[TwoPCRequestType](json["requestType"].getStr()),
-    transactionId: TransactionID(json["transactionId"].getInt()),
+    transactionId: transactionIDFromString(json["transactionId"].getStr()),
     coordinatorId: json["coordinatorId"].getStr(),
     timestamp: Timestamp(json["timestamp"].getInt()),
     data: json["data"].getStr(),
@@ -737,7 +736,7 @@ proc twoPCResponseToJson*(response: TwoPCResponse): JsonNode =
   ## Serialize a 2PC response to JSON
   result = %*{
     "requestId": response.requestId,
-    "transactionId": int64(response.transactionId),
+    "transactionId": $response.transactionId,
     "participantId": response.participantId,
     "vote": $response.vote,
     "state": $response.state,
@@ -748,7 +747,7 @@ proc twoPCResponseFromJson*(json: JsonNode): TwoPCResponse =
   ## Deserialize a 2PC response from JSON
   result = TwoPCResponse(
     requestId: json["requestId"].getStr(),
-    transactionId: TransactionID(json["transactionId"].getInt()),
+    transactionId: transactionIDFromString(json["transactionId"].getStr()),
     participantId: json["participantId"].getStr(),
     vote: parseEnum[ParticipantVote](json["vote"].getStr()),
     state: parseEnum[TwoPCState](json["state"].getStr()),

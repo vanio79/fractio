@@ -46,7 +46,7 @@ type
   ExecutorContext* = ref object
     ## Execution context for a session, holding transaction state
     client*: FractioClient
-    txnId*: uint64
+    txnId*: TransactionID
     readTimestamp*: uint64
     hasActiveTransaction*: bool
     database*: string
@@ -80,7 +80,7 @@ proc newExecutorContext*(client: FractioClient, database: string = "default",
     client: client,
     txnId: client.activeTxnId,
     readTimestamp: client.activeReadTs,
-    hasActiveTransaction: client.activeTxnId != 0,
+    hasActiveTransaction: not isZero(client.activeTxnId),
     database: database,
     schema: schema
   )
@@ -468,15 +468,13 @@ proc execCreateTable(op: PlanOp, ctx: ExecutorContext): ExecResult =
     let sStart = encodeTableKey(SYS_SPACES_TABLE_ID, "")
     let sEnd = encodeTableKey(SYS_SPACES_TABLE_ID + 1, "")
     # Use a fresh scan WITHOUT the transaction's read timestamp to see recent writes
-    echo "DEBUG: scanning sys.spaces for '", spaceName, "' txnReadTs=", internalReadTimestamp
-    let sScan = ctx.client.kvScan(sStart, sEnd, 0, txnId = 0, readTimestamp = 0)
-    echo "DEBUG: scan returned ", sScan.val.len, " entries"
+    let sScan = ctx.client.kvScan(sStart, sEnd, 0, txnId = zeroTransactionID(),
+        readTimestamp = 0)
     var spaceId: ULID
     var spaceFound = false
     if sScan.isOk:
       for entry in sScan.val:
         let rec = decodeSpaceRecord(entry.value)
-        echo "DEBUG: found space '", rec.name, "' spaceId=", $rec.spaceId
         if rec.name == spaceName:
           spaceId = rec.spaceId
           spaceFound = true
@@ -716,7 +714,7 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
     let res = ctx.client.commitTxn(ctx.txnId)
     if res.isOk:
       ctx.hasActiveTransaction = false
-      ctx.txnId = 0
+      ctx.txnId = zeroTransactionID()
       ctx.readTimestamp = 0
       true
     else:
@@ -726,7 +724,7 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
     ## Rollback an implicit transaction.
     discard ctx.client.rollbackTxn(ctx.txnId)
     ctx.hasActiveTransaction = false
-    ctx.txnId = 0
+    ctx.txnId = zeroTransactionID()
     ctx.readTimestamp = 0
 
   var lastResult = okResult("empty plan")
@@ -946,9 +944,9 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
         let res = ctx.client.commitTxn(ctx.txnId)
         if res.isOk:
           ctx.hasActiveTransaction = false
-          ctx.txnId = 0
+          ctx.txnId = zeroTransactionID()
           ctx.readTimestamp = 0
-          ctx.client.activeTxnId = 0
+          ctx.client.activeTxnId = zeroTransactionID()
           ctx.client.activeReadTs = 0
           okResult("COMMIT")
         else:
@@ -961,9 +959,9 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
         let res = ctx.client.rollbackTxn(ctx.txnId)
         if res.isOk:
           ctx.hasActiveTransaction = false
-          ctx.txnId = 0
+          ctx.txnId = zeroTransactionID()
           ctx.readTimestamp = 0
-          ctx.client.activeTxnId = 0
+          ctx.client.activeTxnId = zeroTransactionID()
           ctx.client.activeReadTs = 0
           okResult("ROLLBACK")
         else:

@@ -326,30 +326,6 @@ proc isSynchronized*(self: SharedTimer): bool =
   self.getState() == tssSynchronized
 
 proc getTransactionID*(self: SharedTimer): TransactionID =
-  ## Generate a globally unique transaction ID.
-  ## Format: synchronized mode -> [42-bit time][10-bit nodeId][12-bit counter]
-  ##         unsynchronized mode -> [16-bit nodeId][48-bit counter]
-  let state = self.getState()
-  if state == tssSynchronized:
-    let syncTime = self.getSynchronizedTime()
-    let timeMs = (syncTime div 1_000_000'i64).uint64
-    let time42 = timeMs and ((1'u64 shl 42) - 1)
-    let timePart = time42 shl 22
-    let node10 = self.numericNodeId.uint64 and ((1'u64 shl 10) - 1)
-    let nodePart = node10 shl 12
-    var rawCounter: int
-    withLock(self.mutex):
-      inc(self.txCounter)
-      rawCounter = self.txCounter
-    let counter12 = rawCounter.uint64 and ((1'u64 shl 12) - 1)
-    let combined = timePart or nodePart or counter12
-    result = TransactionID(combined.int64)
-  else:
-    var rawCounter: int
-    withLock(self.mutex):
-      inc(self.txCounter)
-      rawCounter = self.txCounter
-    let counter48 = rawCounter.uint64 and ((1'u64 shl 48) - 1)
-    let node16 = self.numericNodeId.uint64 and ((1'u64 shl 16) - 1)
-    let combined = (node16 shl 48) or counter48
-    result = TransactionID(combined.int64)
+  ## Generate a globally unique transaction ID using ULID.
+  ## The ULID provides timestamp-based ordering and global uniqueness.
+  genTransactionID()

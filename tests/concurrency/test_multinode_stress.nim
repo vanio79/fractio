@@ -124,7 +124,7 @@ proc make5NodeCluster(port: int): (seq[NodeSetup], GroupID) =
 
 type
   WriteWorkerArgs = object
-    store: ptr RaftKVStoreExt ## raw ptr — avoids ORC cross-thread ref
+    store: RaftKVStoreExt ## ref passed directly for ORC cross-thread safety
     threadId: int
     numOps: int
     startLatch: ptr Atomic[int]
@@ -132,7 +132,7 @@ type
     completed: ptr Atomic[int]
 
   ReadWriteWorkerArgs = object
-    store: ptr RaftKVStoreExt
+    store: RaftKVStoreExt ## ref passed directly for ORC cross-thread safety
     threadId: int
     numOps: int
     numKeys: int
@@ -149,12 +149,11 @@ proc writeWorker(args: WriteWorkerArgs) {.thread, gcsafe.} =
   while args.startLatch[].load() > 0:
     discard
 
-  let store = args.store[]
   for i in 0 ..< args.numOps:
     let key = "t" & $args.threadId & "_k" & $i
     let val = "v" & $args.threadId & "_" & $i
     {.cast(gcsafe).}:
-      let r = store.raftPut(key, val)
+      let r = args.store.raftPut(key, val)
       if not r.isOk:
         discard args.errors[].fetchAdd(1)
 
@@ -169,17 +168,16 @@ proc readWriteWorker(args: ReadWriteWorkerArgs) {.thread, gcsafe.} =
   while args.startLatch[].load() > 0:
     discard
 
-  let store = args.store[]
   for i in 0 ..< args.numOps:
     let keyIdx = (args.threadId * args.numOps + i) mod args.numKeys
     let key = "shared_" & $keyIdx
     {.cast(gcsafe).}:
       if i mod 3 == 0:
-        let r = store.raftPut(key, "val_" & $args.threadId & "_" & $i)
+        let r = args.store.raftPut(key, "val_" & $args.threadId & "_" & $i)
         if not r.isOk:
           discard args.errors[].fetchAdd(1)
       else:
-        let r = store.raftGet(key)
+        let r = args.store.raftGet(key)
         if not r.isOk:
           discard args.errors[].fetchAdd(1)
 
@@ -223,7 +221,7 @@ suite "MultiNode stress — 3-node cluster":
     var threads: array[numThreads, Thread[WriteWorkerArgs]]
     for i in 0 ..< numThreads:
       let args = WriteWorkerArgs(
-        store: addr nodes[leaderIdx].store,
+        store: nodes[leaderIdx].store,
         threadId: i, numOps: numOps,
         startLatch: addr latch, errors: addr errors,
         completed: addr completed)
@@ -254,7 +252,7 @@ suite "MultiNode stress — 3-node cluster":
     var threads: array[numThreads, Thread[ReadWriteWorkerArgs]]
     for i in 0 ..< numThreads:
       let args = ReadWriteWorkerArgs(
-        store: addr nodes[leaderIdx].store,
+        store: nodes[leaderIdx].store,
         threadId: i, numOps: numOps, numKeys: numKeys,
         startLatch: addr latch, errors: addr errors,
         completed: addr completed)
@@ -284,7 +282,7 @@ suite "MultiNode stress — 3-node cluster":
     var threads: array[numThreads, Thread[WriteWorkerArgs]]
     for i in 0 ..< numThreads:
       let args = WriteWorkerArgs(
-        store: addr nodes[leaderIdx].store,
+        store: nodes[leaderIdx].store,
         threadId: i, numOps: numOps,
         startLatch: addr latch, errors: addr errors,
         completed: addr completed)
@@ -333,7 +331,7 @@ suite "MultiNode stress — 3-node cluster":
     var threads: array[numThreads, Thread[ReadWriteWorkerArgs]]
     for i in 0 ..< numThreads:
       let args = ReadWriteWorkerArgs(
-        store: addr nodes[leaderIdx].store,
+        store: nodes[leaderIdx].store,
         threadId: i, numOps: numOps, numKeys: numKeys,
         startLatch: addr latch, errors: addr errors,
         completed: addr completed)
@@ -374,7 +372,7 @@ suite "MultiNode stress — 5-node cluster":
     var threads: array[numThreads, Thread[WriteWorkerArgs]]
     for i in 0 ..< numThreads:
       let args = WriteWorkerArgs(
-        store: addr nodes[leaderIdx].store,
+        store: nodes[leaderIdx].store,
         threadId: i, numOps: numOps,
         startLatch: addr latch, errors: addr errors,
         completed: addr completed)
@@ -405,7 +403,7 @@ suite "MultiNode stress — 5-node cluster":
     var threads: array[numThreads, Thread[ReadWriteWorkerArgs]]
     for i in 0 ..< numThreads:
       let args = ReadWriteWorkerArgs(
-        store: addr nodes[leaderIdx].store,
+        store: nodes[leaderIdx].store,
         threadId: i, numOps: numOps, numKeys: numKeys,
         startLatch: addr latch, errors: addr errors,
         completed: addr completed)
@@ -435,7 +433,7 @@ suite "MultiNode stress — 5-node cluster":
     var threads: array[numThreads, Thread[WriteWorkerArgs]]
     for i in 0 ..< numThreads:
       let args = WriteWorkerArgs(
-        store: addr nodes[leaderIdx].store,
+        store: nodes[leaderIdx].store,
         threadId: i, numOps: numOps,
         startLatch: addr latch, errors: addr errors,
         completed: addr completed)
@@ -483,7 +481,7 @@ suite "MultiNode stress — 5-node cluster":
     var threads: array[numThreads, Thread[ReadWriteWorkerArgs]]
     for i in 0 ..< numThreads:
       let args = ReadWriteWorkerArgs(
-        store: addr nodes[leaderIdx].store,
+        store: nodes[leaderIdx].store,
         threadId: i, numOps: numOps, numKeys: numKeys,
         startLatch: addr latch, errors: addr errors,
         completed: addr completed)
