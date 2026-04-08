@@ -46,13 +46,13 @@ type
 
   TableInfo* = object
     ## Cached information about a table
-    tableId*: uint32
+    tableId*: TableId
     name*: string
-    spaceId*: ULID
+    spaceId*: SpaceID
 
   SpaceInfo* = object
     ## Cached information about a space
-    spaceId*: ULID
+    spaceId*: SpaceID
     name*: string
     groupIds*: seq[GroupID] ## Current (new) groups for the space
     oldGroupIds*: seq[GroupID] ## Old groups during rebalancing (empty if not rebalancing)
@@ -72,10 +72,10 @@ type
     config*: FractioClientConfig
 
     # Cached cluster metadata
-    nodes*: stdtables.Table[uint32, NodeInfo]    # nodeId -> NodeInfo
+    nodes*: stdtables.Table[uint32, NodeInfo] # nodeId -> NodeInfo (legacy uint32 for NuRaft)
     groups*: stdtables.Table[GroupID, GroupInfo] # groupId -> GroupInfo
-    tables*: stdtables.Table[uint32, TableInfo]  # tableId -> TableInfo
-    spaces*: stdtables.Table[ULID, SpaceInfo]    # spaceId -> SpaceInfo
+    tables*: stdtables.Table[TableId, TableInfo] # tableId -> TableInfo
+    spaces*: stdtables.Table[SpaceID, SpaceInfo] # spaceId -> SpaceInfo
 
     # Active connections to leaders
     leaderConnections*: stdtables.Table[GroupID,
@@ -209,7 +209,7 @@ proc getNodeConnection(client: FractioClient, nodeId: uint32): Option[
 proc fetchNodesTable(client: FractioClient, conn: ProtocolClient): bool =
   ## Fetch the sys.nodes table and update the cache
   let startKey = encodeTableKey(SYS_NODES_TABLE_ID, "")
-  let endKey = encodeTableKey(SYS_NODES_TABLE_ID + 1, "")
+  let endKey = makeScanEndKey(SYS_NODES_TABLE_ID)
 
   let scanRes = conn.kvScan(startKey, endKey, limit = 1000)
   if scanRes.isErr:
@@ -233,7 +233,7 @@ proc fetchNodesTable(client: FractioClient, conn: ProtocolClient): bool =
 proc fetchGroupsTable(client: FractioClient, conn: ProtocolClient): bool =
   ## Fetch the sys.groups table and update the cache
   let startKey = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
-  let endKey = encodeTableKey(SYS_GROUPS_TABLE_ID + 1, "")
+  let endKey = makeScanEndKey(SYS_GROUPS_TABLE_ID)
 
   let scanRes = conn.kvScan(startKey, endKey, limit = 1000)
   if scanRes.isErr:
@@ -260,7 +260,7 @@ proc fetchGroupsTable(client: FractioClient, conn: ProtocolClient): bool =
 proc fetchTablesTable(client: FractioClient, conn: ProtocolClient): bool =
   ## Fetch the sys.tables table and update the cache
   let startKey = encodeTableKey(SYS_TABLES_TABLE_ID, "")
-  let endKey = encodeTableKey(SYS_TABLES_TABLE_ID + 1, "")
+  let endKey = makeScanEndKey(SYS_TABLES_TABLE_ID)
 
   let scanRes = conn.kvScan(startKey, endKey, limit = 1000)
   if scanRes.isErr:
@@ -282,7 +282,7 @@ proc fetchTablesTable(client: FractioClient, conn: ProtocolClient): bool =
 proc fetchSpacesTable(client: FractioClient, conn: ProtocolClient): bool =
   ## Fetch the sys.spaces table and update the cache
   let startKey = encodeTableKey(SYS_SPACES_TABLE_ID, "")
-  let endKey = encodeTableKey(SYS_SPACES_TABLE_ID + 1, "")
+  let endKey = makeScanEndKey(SYS_SPACES_TABLE_ID)
 
   let scanRes = conn.kvScan(startKey, endKey, limit = 1000)
   if scanRes.isErr:
@@ -300,8 +300,8 @@ proc fetchSpacesTable(client: FractioClient, conn: ProtocolClient): bool =
         for gid in spaceRec.oldGroupIds:
           oldGroupIds.add(groupIDFromULID(gid))
 
-        client.spaces[spaceRec.spaceId] = SpaceInfo(
-          spaceId: spaceRec.spaceId,
+        client.spaces[SpaceID(spaceRec.spaceId)] = SpaceInfo(
+          spaceId: SpaceID(spaceRec.spaceId),
           name: spaceRec.name,
           groupIds: groupIds,
           oldGroupIds: oldGroupIds,
@@ -475,8 +475,8 @@ proc getGroupForKey*(client: FractioClient, key: string): GroupID =
     if afterPrefix.len >= TABLE_ID_WIDTH:
       try:
         let tableIdStr = afterPrefix[0 ..< TABLE_ID_WIDTH]
-        let tableId = parseUInt(tableIdStr).uint32
-        if tableId <= MAX_META_GROUP_TABLE_ID:
+        let tableId = tableIdFromString(tableIdStr)
+        if isMetaGroupTableId(tableId):
           return META_GROUP_ID
         else:
           # For data tables, look up table->space->group mapping
@@ -487,7 +487,7 @@ proc getGroupForKey*(client: FractioClient, key: string): GroupID =
               # ZeroULID() means the table is not assigned to any space
               # Only look up the space if spaceId is non-zero
               var spaceIdValid = false
-              for b in spaceId.data:
+              for b in ULID(spaceId).data:
                 if b != 0:
                   spaceIdValid = true
                   break
@@ -512,7 +512,7 @@ proc getGroupForKey*(client: FractioClient, key: string): GroupID =
   # Default to meta group for non-table keys or if parsing failed
   return META_GROUP_ID
 
-proc getGroupsForTable*(client: FractioClient, tableId: uint32): seq[GroupID] =
+proc getGroupsForTable*(client: FractioClient, tableId: TableId): seq[GroupID] =
   ## Get all groups that store data for a given table.
   ## For multi-group spaces, returns ALL groups in the space.
   ## During rebalancing, includes BOTH old and new groups for dual-read mode.
@@ -525,7 +525,7 @@ proc getGroupsForTable*(client: FractioClient, tableId: uint32): seq[GroupID] =
       # ZeroULID() means the table is not assigned to any space
       # Only look up the space if spaceId is non-zero
       var spaceIdValid = false
-      for b in spaceId.data:
+      for b in ULID(spaceId).data:
         if b != 0:
           spaceIdValid = true
           break
@@ -545,26 +545,26 @@ proc getGroupsForTable*(client: FractioClient, tableId: uint32): seq[GroupID] =
           return spaceInfo.groupIds
 
   # System tables (1-7) are in META_GROUP_ID
-  if tableId >= 1'u32 and tableId <= MAX_META_GROUP_TABLE_ID:
+  if isMetaGroupTableId(tableId):
     return @[META_GROUP_ID]
 
   # Fall back to default data group for tables without space assignment
   return @[DATA_GROUP_START_ID]
 
-proc getTableIdFromKey*(client: FractioClient, key: string): uint32 =
-  ## Extract tableId from a key, returns 0 if not parseable.
+proc getTableIdFromKey*(client: FractioClient, key: string): TableId =
+  ## Extract tableId from a key, returns zeroTableId if not parseable.
   if not key.startsWith(TABLE_KEY_PREFIX):
-    return 0
+    return zeroTableId()
 
   let afterPrefix = key[TABLE_KEY_PREFIX.len .. ^1]
   if afterPrefix.len < TABLE_ID_WIDTH:
-    return 0
+    return zeroTableId()
 
   try:
     let tableIdStr = afterPrefix[0 ..< TABLE_ID_WIDTH]
-    return parseUInt(tableIdStr).uint32
+    return tableIdFromString(tableIdStr)
   except ValueError:
-    return 0
+    return zeroTableId()
 
 # =============================================================================
 # KV Operations
@@ -889,8 +889,8 @@ proc createSpace*(client: FractioClient, name: string,
       for gid in spaceRec.oldGroupIds:
         oldGroupIds.add(groupIDFromULID(gid))
 
-      client.spaces[spaceRec.spaceId] = SpaceInfo(
-        spaceId: spaceRec.spaceId,
+      client.spaces[SpaceID(spaceRec.spaceId)] = SpaceInfo(
+        spaceId: SpaceID(spaceRec.spaceId),
         name: spaceRec.name,
         groupIds: groupIds,
         oldGroupIds: oldGroupIds,
@@ -951,7 +951,7 @@ proc dropSpace*(client: FractioClient, name: string): SpaceOpResult =
     # Update local cache - remove space and groups
     withLock client.lock:
       # Find and remove the space by name (since resp.spaceId is ULID)
-      var spaceIdToRemove: ULID
+      var spaceIdToRemove: SpaceID
       var found = false
       for sid, sinfo in client.spaces:
         if sinfo.name == name:

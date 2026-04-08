@@ -23,6 +23,19 @@ import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/group_types
 import fractio/distributed/raft/multigroup_types
 
+# Helper for tests: create a deterministic test table ID
+var testTableIdCounter {.global.} = 0
+proc testTableId(): TableId =
+  inc testTableIdCounter
+  # Use a deterministic ULID for test purposes
+  var ulid: ULID
+  for i in 0..<5:
+    ulid.data[i] = 0'u8 # timestamp part (zero for testing)
+  for i in 5..<15:
+    ulid.data[i] = 0'u8 # randomness part (zero for testing)
+  ulid.data[15] = uint8(testTableIdCounter) # test number
+  TableId(ulid)
+
 # ---------------------------------------------------------------------------
 # Test helpers
 # ---------------------------------------------------------------------------
@@ -119,7 +132,7 @@ proc exec(client: FractioClient, sql: string, database = "default",
   client.query(sql, database, schema)
 
 proc seedTable(store: RaftKVStoreExt, database, schema, name: string,
-    tableId: uint32, columns: seq[tuple[name: string, typ: string]],
+    tableId: TableId, columns: seq[tuple[name: string, typ: string]],
     pk: seq[string]) =
   # Build binary TableRecord
   var cols: seq[ColumnDefBin] = @[]
@@ -142,7 +155,7 @@ proc seedTable(store: RaftKVStoreExt, database, schema, name: string,
     name: name,
     database: database,
     schema: schema,
-    spaceId: ZeroULID(), # default space (zero ULID)
+    spaceId: zeroSpaceID(), # default space (zero SpaceID)
     primaryKey: pk,
     columns: cols,
   )
@@ -393,14 +406,15 @@ suite "EXPLAIN — formatExpr":
 suite "EXPLAIN — formatPlanOp":
 
   test "format Scan op":
+    let tid = testTableId()
     let op = PlanOp(kind: poScan,
-      scTableId: 100,
+      scTableId: tid,
       scColumns: @["id", "name"],
       scFilter: none(Expr),
       scLimit: 0)
     let s = formatPlanOp(op)
     check "Scan" in s
-    check "table_id=100" in s
+    check "table_id" in s
     check "id" in s
     check "name" in s
 
@@ -410,7 +424,7 @@ suite "EXPLAIN — formatPlanOp":
       binRight: Expr(kind: exLiteral, litValue: ValueRef(kind: dtInt,
           intValue: 21)))
     let op = PlanOp(kind: poScan,
-      scTableId: 100,
+      scTableId: testTableId(),
       scColumns: @["name"],
       scFilter: some(filter),
       scLimit: 0)
@@ -419,7 +433,7 @@ suite "EXPLAIN — formatPlanOp":
 
   test "format Scan op with limit":
     let op = PlanOp(kind: poScan,
-      scTableId: 100,
+      scTableId: testTableId(),
       scColumns: @["id"],
       scFilter: none(Expr),
       scLimit: 50)
@@ -427,7 +441,7 @@ suite "EXPLAIN — formatPlanOp":
 
   test "format PointGet op":
     let op = PlanOp(kind: poPointGet,
-      pgTableId: 100,
+      pgTableId: testTableId(),
       pgKey: "42",
       pgColumns: @["id", "name"])
     let s = formatPlanOp(op)
@@ -436,7 +450,7 @@ suite "EXPLAIN — formatPlanOp":
 
   test "format Insert op":
     let op = PlanOp(kind: poInsert,
-      insTableId: 100,
+      insTableId: testTableId(),
       insTableName: "users",
       insRows: @["{}", "{}"])
     let s = formatPlanOp(op)
@@ -449,7 +463,7 @@ suite "EXPLAIN — formatPlanOp":
       binLeft: Expr(kind: exColumn, colTable: "", colName: "id"),
       binRight: Expr(kind: exLiteral, litValue: ValueRef(kind: dtInt, intValue: 1)))
     let op = PlanOp(kind: poUpdate,
-      upTableId: 100,
+      upTableId: testTableId(),
       upTableName: "users",
       upFilter: some(filter),
       upSets: @[("name", Expr(kind: exLiteral, litValue: ValueRef(
@@ -461,7 +475,7 @@ suite "EXPLAIN — formatPlanOp":
 
   test "format Delete op":
     let op = PlanOp(kind: poDelete,
-      delTableId: 100,
+      delTableId: testTableId(),
       delTableName: "users",
       delFilter: none(Expr))
     let s = formatPlanOp(op)
@@ -474,7 +488,7 @@ suite "EXPLAIN — formatPlanOp":
       binRight: Expr(kind: exLiteral, litValue: ValueRef(kind: dtInt,
           intValue: 18)))
     let op = PlanOp(kind: poDelete,
-      delTableId: 100,
+      delTableId: testTableId(),
       delTableName: "users",
       delFilter: some(filter))
     check "filter=(age < 18)" in formatPlanOp(op)
@@ -569,7 +583,7 @@ suite "EXPLAIN — planner with store":
     cleanupTestDir(testDir)
 
   test "EXPLAIN SELECT generates poExplain wrapping poScan":
-    seedTable(store, "default", "public", "users", 100,
+    seedTable(store, "default", "public", "users", testTableId(),
       @[("id", "INT"), ("name", "TEXT")], @["id"])
     let stmt = parseStatement("EXPLAIN SELECT * FROM users")
     let plan = planStatement(stmt, client)
@@ -579,7 +593,7 @@ suite "EXPLAIN — planner with store":
     check plan.ops[0].exInnerPlan.ops[0].kind == poScan
 
   test "EXPLAIN SELECT WHERE pk=val generates poExplain wrapping poPointGet":
-    seedTable(store, "default", "public", "users", 100,
+    seedTable(store, "default", "public", "users", testTableId(),
       @[("id", "INT"), ("name", "TEXT")], @["id"])
     let stmt = parseStatement("EXPLAIN SELECT * FROM users WHERE id = 1")
     let plan = planStatement(stmt, client)
@@ -588,7 +602,7 @@ suite "EXPLAIN — planner with store":
     check plan.ops[0].exInnerPlan.ops[0].pgKey == "1"
 
   test "EXPLAIN UPDATE generates poExplain wrapping poUpdate":
-    seedTable(store, "default", "public", "users", 100,
+    seedTable(store, "default", "public", "users", testTableId(),
       @[("id", "INT"), ("name", "TEXT")], @["id"])
     let stmt = parseStatement("EXPLAIN UPDATE users SET name = 'X' WHERE id = 1")
     let plan = planStatement(stmt, client)
@@ -597,7 +611,7 @@ suite "EXPLAIN — planner with store":
     check plan.ops[0].exInnerPlan.ops[0].upTableName == "users"
 
   test "EXPLAIN DELETE generates poExplain wrapping poDelete":
-    seedTable(store, "default", "public", "users", 100,
+    seedTable(store, "default", "public", "users", testTableId(),
       @[("id", "INT"), ("name", "TEXT")], @["id"])
     let stmt = parseStatement("EXPLAIN DELETE FROM users WHERE id = 1")
     let plan = planStatement(stmt, client)
@@ -605,7 +619,7 @@ suite "EXPLAIN — planner with store":
     check plan.ops[0].exInnerPlan.ops[0].kind == poDelete
 
   test "EXPLAIN INSERT with multiple rows":
-    seedTable(store, "default", "public", "users", 100,
+    seedTable(store, "default", "public", "users", testTableId(),
       @[("id", "INT"), ("name", "TEXT")], @["id"])
     let stmt = parseStatement(
         "EXPLAIN INSERT INTO users (id, name) VALUES (1, 'A'), (2, 'B'), (3, 'C')")
@@ -621,11 +635,11 @@ suite "EXPLAIN — planner with store":
       discard planStatement(stmt, client)
 
   test "EXPLAIN CREATE TABLE does not consume a table ID":
-    let id1 = nextTableId(client)
+    let id1 = genTableId()
     let stmt = parseStatement("EXPLAIN CREATE TABLE t (id INT PRIMARY KEY)")
     let plan = planStatement(stmt, client)
     check plan.ops[0].kind == poExplain
-    # nextTableId should return the same ID — EXPLAIN planning consumed one
+    # genTableId should return the same ID — EXPLAIN planning consumed one
     # but we verify the table was NOT actually created
     let showRes = exec(client, "SHOW TABLES")
     check showRes.rows.len == 0

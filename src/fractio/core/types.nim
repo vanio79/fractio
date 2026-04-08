@@ -228,6 +228,13 @@ type
   ShardID* = distinct ULID
     ## Shard identifier - ULID for globally unique, sortable shard IDs
 
+  TableId* = distinct ULID
+    ## Table identifier - ULID for globally unique table IDs
+    ## Enables distributed table creation without ID conflicts
+
+  SpaceID* = distinct ULID
+    ## Space identifier - ULID for globally unique space IDs
+
   Shard* = ref object
     id*: ShardID
     rangeStart*: uint64
@@ -321,6 +328,20 @@ proc `<`*(a, b: ShardID): bool = ULID(a) < ULID(b)
 proc `$`*(id: ShardID): string = $ULID(id)
 proc hash*(id: ShardID): Hash = hash($ULID(id))
 
+# TableId operations (ULID-based)
+proc `==`*(a, b: TableId): bool = ULID(a) == ULID(b)
+proc `!=`*(a, b: TableId): bool = not (a == b)
+proc `<`*(a, b: TableId): bool = ULID(a) < ULID(b)
+proc `$`*(id: TableId): string = $ULID(id)
+proc hash*(id: TableId): Hash = hash($ULID(id))
+
+# SpaceID operations (ULID-based)
+proc `==`*(a, b: SpaceID): bool = ULID(a) == ULID(b)
+proc `!=`*(a, b: SpaceID): bool = not (a == b)
+proc `<`*(a, b: SpaceID): bool = ULID(a) < ULID(b)
+proc `$`*(id: SpaceID): string = $ULID(id)
+proc hash*(id: SpaceID): Hash = hash($ULID(id))
+
 # Transaction ID generation - uses ULID for globally unique IDs
 proc genTransactionID*(): TransactionID =
   TransactionID(genULID())
@@ -333,6 +354,14 @@ proc genRowID*(): RowID =
 proc genShardID*(): ShardID =
   ShardID(genULID())
 
+# TableId generation - uses ULID for globally unique IDs
+proc genTableId*(): TableId =
+  TableId(genULID())
+
+# SpaceID generation - uses ULID for globally unique IDs
+proc genSpaceID*(): SpaceID =
+  SpaceID(genULID())
+
 # Convenience conversions for TransactionID
 proc transactionIDFromBytes*(data: string): TransactionID =
   TransactionID(ulidFromBytes(data))
@@ -343,16 +372,40 @@ proc transactionIDFromString*(s: string): TransactionID =
 proc transactionIDToBytes*(id: TransactionID): string =
   ulidToBytes(ULID(id))
 
+# Convenience conversions for TableId
+proc tableIdFromBytes*(data: string): TableId =
+  TableId(ulidFromBytes(data))
+
+proc tableIdFromString*(s: string): TableId =
+  TableId(ulidFromString(s))
+
+proc tableIdToBytes*(id: TableId): string =
+  ulidToBytes(ULID(id))
+
+# Convenience conversions for SpaceID
+proc spaceIDFromBytes*(data: string): SpaceID =
+  SpaceID(ulidFromBytes(data))
+
+proc spaceIDFromString*(s: string): SpaceID =
+  SpaceID(ulidFromString(s))
+
+proc spaceIDToBytes*(id: SpaceID): string =
+  ulidToBytes(ULID(id))
+
 # Zero/invalid ID constants (procs must be defined first)
 # These are template-based to avoid compile-time evaluation issues
 template zeroTransactionID*(): TransactionID = TransactionID(ZeroULID())
 template zeroRowID*(): RowID = RowID(ZeroULID())
 template zeroShardID*(): ShardID = ShardID(ZeroULID())
+template zeroTableId*(): TableId = TableId(ZeroULID())
+template zeroSpaceID*(): SpaceID = SpaceID(ZeroULID())
 
 # isZero checks for comparing against zero IDs
 template isZero*(id: TransactionID): bool = id == zeroTransactionID()
 template isZero*(id: RowID): bool = id == zeroRowID()
 template isZero*(id: ShardID): bool = id == zeroShardID()
+template isZero*(id: TableId): bool = id == zeroTableId()
+template isZero*(id: SpaceID): bool = id == zeroSpaceID()
 
 # =============================================================================
 # NodeID Operations

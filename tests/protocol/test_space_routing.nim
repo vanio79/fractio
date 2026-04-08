@@ -84,7 +84,7 @@ proc makeMultiGroupStore(storagePath: string, groupCount: int): tuple[
     discard store.getOrCreateSM(gid)
 
   let space = SpaceInfo(
-    spaceId: coreTypes.ZeroULID(),
+    spaceId: coreTypes.zeroSpaceID(),
     name: "test_space",
     replicas: 1,
     groupIds: groupIds,
@@ -95,6 +95,14 @@ proc makeMultiGroupStore(storagePath: string, groupCount: int): tuple[
 proc teardown(coord: NuRaftCoordinator, storagePath: string) =
   coord.stop()
   try: removeDir(storagePath) except CatchableError: discard
+
+# Fixed table ID for tests that need a consistent ID across operations
+const testTableId = coreTypes.TableId(ULID(data: [0'u8, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 100, 0]))
+const testTableId2 = coreTypes.TableId(ULID(data: [0'u8, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 200, 0]))
+const testTableId3 = coreTypes.TableId(ULID(data: [0'u8, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 101, 0]))
 
 # ---------------------------------------------------------------------------
 # Suite: routeToGroup
@@ -195,7 +203,7 @@ suite "Space routing — put and get with 3 groups":
     # Insert 30 keys
     for i in 0 ..< 30:
       let pk = $i
-      let key = encodeDataRowKey(100, pk)
+      let key = encodeDataRowKey(testTableId, pk)
       let val = $ %*{"id": i, "val": "v" & $i}
       let wr = store.raftPutInSpace(key, val, space, pk)
       check wr.isOk
@@ -203,7 +211,7 @@ suite "Space routing — put and get with 3 groups":
     # Verify each key is retrievable
     for i in 0 ..< 30:
       let pk = $i
-      let key = encodeDataRowKey(100, pk)
+      let key = encodeDataRowKey(testTableId, pk)
       let gr = store.raftGetInSpace(key, space, pk)
       check gr.isOk
       check gr.value.isSome
@@ -230,7 +238,7 @@ suite "Space routing — delete with multiple groups":
     defer: teardown(coord, "/tmp/fractio_sr_t10")
 
     let pk = "del_key"
-    let key = encodeDataRowKey(100, pk)
+    let key = encodeDataRowKey(testTableId, pk)
     discard store.raftPutInSpace(key, "value", space, pk)
 
     let dr = store.raftDeleteInSpace(key, space, pk)
@@ -263,8 +271,8 @@ suite "Space routing — fan-out scan with merge-sort":
     defer: teardown(coord, "/tmp/fractio_sr_t20")
 
     let sr = store.raftScanSpace(
-        encodeDataRowKey(100, ""),
-        encodeDataRowKey(101, ""),
+        encodeDataRowKey(testTableId, ""),
+        encodeDataRowKey(testTableId3, ""),
         space, 0, includeSystemKeys = true)
     check sr.isOk
     check sr.value.len == 0
@@ -277,12 +285,12 @@ suite "Space routing — fan-out scan with merge-sort":
     # Insert 20 keys that will be distributed across 3 groups
     for i in 0 ..< 20:
       let pk = $i
-      let key = encodeDataRowKey(100, pk)
+      let key = encodeDataRowKey(testTableId, pk)
       let val = $ %*{"id": i}
       discard store.raftPutInSpace(key, val, space, pk)
 
-    let startKey = encodeDataRowKey(100, "")
-    let endKey = encodeDataRowKey(101, "")
+    let startKey = encodeDataRowKey(testTableId, "")
+    let endKey = encodeDataRowKey(testTableId3, "")
     let sr = store.raftScanSpace(startKey, endKey, space, 0,
         includeSystemKeys = true)
     check sr.isOk
@@ -299,12 +307,12 @@ suite "Space routing — fan-out scan with merge-sort":
 
     for i in 0 ..< 15:
       let pk = $i
-      let key = encodeDataRowKey(100, pk)
+      let key = encodeDataRowKey(testTableId, pk)
       discard store.raftPutInSpace(key, $ %*{"id": i}, space, pk)
 
     let sr = store.raftScanSpace(
-        encodeDataRowKey(100, ""),
-        encodeDataRowKey(101, ""),
+        encodeDataRowKey(testTableId, ""),
+        encodeDataRowKey(testTableId3, ""),
         space, 5, includeSystemKeys = true)
     check sr.isOk
     check sr.value.len == 5
@@ -318,23 +326,25 @@ suite "Space routing — fan-out scan with merge-sort":
         "/tmp/fractio_sr_t23", 3)
     defer: teardown(coord, "/tmp/fractio_sr_t23")
 
-    # Insert keys for table 100 and table 200
+    # Insert keys for testTableId and testTableId2
     for i in 0 ..< 5:
       let pk = $i
       discard store.raftPutInSpace(
-          encodeDataRowKey(100, pk), $ %*{"id": i, "t": 100}, space, pk)
+          encodeDataRowKey(testTableId, pk), $ %*{"id": i, "t": 100}, space, pk)
       discard store.raftPutInSpace(
-          encodeDataRowKey(200, pk), $ %*{"id": i, "t": 200}, space, pk)
+          encodeDataRowKey(testTableId2, pk), $ %*{"id": i, "t": 200}, space, pk)
 
-    # Scan only table 100
+    # Scan only testTableId (range from testTableId to testTableId3, which excludes testTableId2)
     let sr = store.raftScanSpace(
-        encodeDataRowKey(100, ""),
-        encodeDataRowKey(101, ""),
+        encodeDataRowKey(testTableId, ""),
+        encodeDataRowKey(testTableId3, ""),
         space, 0, includeSystemKeys = true)
     check sr.isOk
     check sr.value.len == 5
+    # Verify all keys are from testTableId (not testTableId2)
+    let tableId2Str = "/" & formatTableId(testTableId2) & "/"
     for (k, _) in sr.value:
-      check k.contains("/0000000100/")
+      check not k.contains(tableId2Str)
 
   test "scan single-group space works (fast path)":
     let (coord, store, space1) = makeMultiGroupStore(
@@ -343,12 +353,12 @@ suite "Space routing — fan-out scan with merge-sort":
 
     for i in 0 ..< 5:
       let pk = $i
-      let key = encodeDataRowKey(100, pk)
+      let key = encodeDataRowKey(testTableId, pk)
       discard store.raftPutInSpace(key, $ %*{"id": i}, space1, pk)
 
     let sr = store.raftScanSpace(
-        encodeDataRowKey(100, ""),
-        encodeDataRowKey(101, ""),
+        encodeDataRowKey(testTableId, ""),
+        encodeDataRowKey(testTableId3, ""),
         space1, 0, includeSystemKeys = true)
     check sr.isOk
     check sr.value.len == 5
@@ -360,7 +370,7 @@ suite "Space routing — fan-out scan with merge-sort":
 
     # Insert a real key
     let pk = "real"
-    let key = encodeDataRowKey(100, pk)
+    let key = encodeDataRowKey(testTableId, pk)
     discard store.raftPutInSpace(key, "value", space, pk)
 
     # Inject intent key directly into the backend
@@ -386,13 +396,13 @@ suite "Space routing — cache loading":
     defer: teardown(coord, "/tmp/fractio_sr_t30")
 
     # Write a space record into the meta range (binary format)
-    let spaceId = coreTypes.genULID()
+    let spaceId = coreTypes.genSpaceID()
     let spaceKey = encodeSpaceKey(spaceId)
     var groupUlids: seq[ULID] = @[]
     for gid in space.groupIds:
       groupUlids.add(groupIDToULID(gid))
     let spaceRec = SpaceRecord(
-      spaceId: spaceId,
+      spaceId: ULID(spaceId), # SpaceRecord.spaceId is ULID
       name: "myspace",
       replicas: 1,
       groupCount: 2,
@@ -410,11 +420,11 @@ suite "Space routing — cache loading":
     # Must use the SAME spaceId as the space record above
     let tableKey = encodeTableKey(SYS_TABLES_TABLE_ID, "default.public.mytable")
     let tableRec = TableRecord(
-      tableId: 100,
+      tableId: testTableId,
       name: "mytable",
       database: "default",
       schema: "public",
-      spaceId: spaceId, # Use the same spaceId
+      spaceId: spaceId, # TableRecord.spaceId is SpaceID
       primaryKey: @[],
       columns: @[]
     )
@@ -425,7 +435,7 @@ suite "Space routing — cache loading":
     store.loadTableSpaces()
 
     # Verify lookup
-    let spaceOpt = store.getSpaceForTable(100)
+    let spaceOpt = store.getSpaceForTable(testTableId)
     check spaceOpt.isSome
     check spaceOpt.get().name == "myspace"
     check spaceOpt.get().groupIds.len == 2
@@ -438,5 +448,5 @@ suite "Space routing — cache loading":
     store.loadSpaces()
     store.loadTableSpaces()
 
-    let spaceOpt = store.getSpaceForTable(999)
+    let spaceOpt = store.getSpaceForTable(genTableId())
     check spaceOpt.isNone

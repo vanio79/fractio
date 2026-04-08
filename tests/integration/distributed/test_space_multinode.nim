@@ -342,7 +342,7 @@ proc getSpaceGroupIds(nodes: seq[TestNode]): seq[GroupID] =
   ## Filters out META_GROUP_ID and DATA_GROUP_START_ID.
   let store = nodes[0].store
   let grpStart = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
-  let grpEnd = encodeTableKey(SYS_GROUPS_TABLE_ID + 1, "")
+  let grpEnd = makeScanEndKey(SYS_GROUPS_TABLE_ID)
   let grpScan = store.raftScan(grpStart, grpEnd, 0, includeSystemKeys = true)
   if grpScan.isOk:
     for (key, entry) in grpScan.value:
@@ -373,7 +373,7 @@ proc waitForSpaceLeaders(nodes: seq[TestNode]) =
   ## Wait for all space groups to have elected leaders.
   let store = nodes[0].store
   let grpStart = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
-  let grpEnd = encodeTableKey(SYS_GROUPS_TABLE_ID + 1, "")
+  let grpEnd = makeScanEndKey(SYS_GROUPS_TABLE_ID)
   let grpScan = store.raftScan(grpStart, grpEnd, 0, includeSystemKeys = true)
   if grpScan.isOk:
     for (key, entry) in grpScan.value:
@@ -445,7 +445,7 @@ proc reelectLeaders(nodes: seq[TestNode], deadNodeIds: seq[int]) =
   # Get the space group IDs from sys.groups and check which can still form quorum
   let store = nodes[0].store
   let grpStart = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
-  let grpEnd = encodeTableKey(SYS_GROUPS_TABLE_ID + 1, "")
+  let grpEnd = makeScanEndKey(SYS_GROUPS_TABLE_ID)
   let grpScan = store.raftScan(grpStart, grpEnd, 0, includeSystemKeys = true)
 
   var quorumGroups: seq[GroupID] = @[]
@@ -526,7 +526,7 @@ proc loadMetadataOnAllNodes(nodes: seq[TestNode]) =
   for sysTableId in [SYS_TABLES_TABLE_ID, SYS_SPACES_TABLE_ID,
                       SYS_GROUPS_TABLE_ID, SYS_NODES_TABLE_ID]:
     let startKey = encodeTableKey(sysTableId, "")
-    let endKey = encodeTableKey(sysTableId + 1, "")
+    let endKey = makeScanEndKey(sysTableId)
     let pairs = leaderBackend.scan(startKey, endKey)
     for (k, v) in pairs:
       for i in 0 ..< nodes.len:
@@ -550,7 +550,7 @@ proc ensureStateMachinesForGroups(nodes: seq[TestNode]) =
     if backend == nil or not backend.isOpen:
       continue
     let startKey = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
-    let endKey = encodeTableKey(SYS_GROUPS_TABLE_ID + 1, "")
+    let endKey = makeScanEndKey(SYS_GROUPS_TABLE_ID)
     let pairs = backend.scan(startKey, endKey)
     for (k, v) in pairs:
       try:
@@ -587,7 +587,7 @@ proc waitForAllGroupsReady(nodes: seq[TestNode], timeoutMs: int = 10000) =
       if backend == nil or not backend.isOpen:
         continue
       let startKey = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
-      let endKey = encodeTableKey(SYS_GROUPS_TABLE_ID + 1, "")
+      let endKey = makeScanEndKey(SYS_GROUPS_TABLE_ID)
       let pairs = backend.scan(startKey, endKey)
       for (k, v) in pairs:
         try:

@@ -214,7 +214,7 @@ proc newRaftKVStore*(coord: NuRaftCoordinator,
 
 type
   SpaceInfo* = object
-    spaceId*: ULID
+    spaceId*: SpaceID
     name*: string
     replicas*: int             ## 0 = ALL nodes
     groupIds*: seq[GroupID]
@@ -234,8 +234,8 @@ type
   RaftKVStoreExt* = ref object of RaftKVStore
     stateMachines*: tables.Table[GroupID, KVStateMachine] ## lightweight index tracking only
     smMu*: Lock                              ## guards stateMachines table
-    spaces*: tables.Table[ULID, SpaceInfo]   ## spaceId → SpaceInfo
-    tableSpaces*: tables.Table[uint32, ULID] ## tableId → spaceId
+    spaces*: tables.Table[SpaceID, SpaceInfo]   ## spaceId → SpaceInfo
+    tableSpaces*: tables.Table[TableId, SpaceID] ## tableId → spaceId
     spacesMu*: Lock
     groupLeaders*: tables.Table[GroupID, uint32] ## groupId → leader nodeId from sys.groups
     groupMembers*: tables.Table[GroupID, seq[uint32]] ## groupId → member nodeIds
@@ -258,8 +258,8 @@ proc newRaftKVStoreExt*(coord: NuRaftCoordinator,
     proposeTimeout: proposeTimeoutMs,
     logger: newLogger("protocol.raft_store"),
     stateMachines: tables.initTable[GroupID, KVStateMachine](),
-    spaces: tables.initTable[ULID, SpaceInfo](),
-    tableSpaces: tables.initTable[uint32, ULID](),
+    spaces: tables.initTable[SpaceID, SpaceInfo](),
+    tableSpaces: tables.initTable[TableId, SpaceID](),
     groupMembers: tables.initTable[GroupID, seq[uint32]](),
     preferredLeaders: tables.initTable[GroupID, uint32](),
     nodeInfoCache: tables.initTable[uint32, NodeInfo](),
@@ -306,7 +306,7 @@ proc resolveGroupId*(store: RaftKVStoreExt, key: string): Option[
     {.cast(raises: []).}:
       try:
         let (tableId, primaryKey) = decodeTableKey(routingKey)
-        if tableId >= FIRST_USER_TABLE_ID:
+        if isUserTableId(tableId):
           var groupIds: seq[GroupID] = @[]
           withLock store.spacesMu:
             # Only use the spaceId if the table is explicitly in the mapping
@@ -316,7 +316,7 @@ proc resolveGroupId*(store: RaftKVStoreExt, key: string): Option[
               # ZeroULID() means the table is not assigned to any space
               # Only look up the space if spaceId is non-zero
               var spaceIdValid = false
-              for b in spaceId.data:
+              for b in ULID(spaceId).data:
                 if b != 0:
                   spaceIdValid = true
                   break
@@ -354,7 +354,7 @@ proc keyRoutesToGroupIdDuringRebalance*(store: RaftKVStoreExt, key: string,
     {.cast(raises: []).}:
       try:
         let (tableId, primaryKey) = decodeTableKey(routingKey)
-        if tableId >= FIRST_USER_TABLE_ID:
+        if isUserTableId(tableId):
           var newGroupIds: seq[GroupID] = @[]
           var oldGroupIds: seq[GroupID] = @[]
           var rebalancing: bool = false
@@ -367,7 +367,7 @@ proc keyRoutesToGroupIdDuringRebalance*(store: RaftKVStoreExt, key: string,
               # ZeroULID() means the table is not assigned to any space
               # Only look up the space if spaceId is non-zero
               var spaceIdValid = false
-              for b in spaceId.data:
+              for b in ULID(spaceId).data:
                 if b != 0:
                   spaceIdValid = true
                   break
@@ -462,8 +462,8 @@ proc loadGroupMembers*(store: RaftKVStoreExt,
           if nuraftSmLastCommitIndex(inst.sm) >= committed: break
           sleep(100)
 
-  let startKey = "/t/" & align($SYS_GROUPS_TABLE_ID, 10, '0') & "/"
-  let endKey = "/t/" & align($(SYS_GROUPS_TABLE_ID + 1), 10, '0') & "/"
+  let startKey = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
+  let endKey = makeScanEndKey(SYS_GROUPS_TABLE_ID)
   let backend = store.getBackend()
   var entries: seq[KeyValuePair] = @[]
   if backend != nil and backend.isOpen:
@@ -1241,13 +1241,14 @@ proc validateKeyRouting(store: RaftKVStoreExt, key: string,
   {.cast(raises: []).}:
     try:
       let (tableId, primaryKey) = decodeTableKey(key)
-      if tableId < FIRST_USER_TABLE_ID:
+      if isSystemTableId(tableId):
         return none(RaftStoreError)
       acquire(store.spacesMu)
-      let sid = store.tableSpaces.getOrDefault(tableId, ULID())
+      let sid = store.tableSpaces.getOrDefault(tableId, zeroSpaceID())
       # Check if sid is non-empty (has non-zero bytes)
+      let sidUlid = ULID(sid)
       var hasNonZero = false
-      for b in sid.data:
+      for b in sidUlid.data:
         if b != 0:
           hasNonZero = true
           break
@@ -1680,7 +1681,7 @@ proc parseSpaceInfoFromBinary*(data: string): Option[SpaceInfo] {.gcsafe,
       # Binary decoding (SpaceRecord)
       let spaceRec = decodeSpaceRecord(value)
       var info = SpaceInfo(
-        spaceId: spaceRec.spaceId,
+        spaceId: SpaceID(spaceRec.spaceId),
         name: spaceRec.name,
         replicas: spaceRec.replicas,
         groupIds: @[],
@@ -1737,8 +1738,8 @@ proc loadSpaces*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
   ## Call after bootstrap/recovery when the state machine is populated.
   ## This is now a full reload from backend - no preservation needed since
   ## in-memory cache is updated via applyBatchToSM when Raft commits changes.
-  let startKey = "/t/" & align($SYS_SPACES_TABLE_ID, 10, '0') & "/"
-  let endKey = "/t/" & align($(SYS_SPACES_TABLE_ID + 1), 10, '0') & "/"
+  let startKey = encodeTableKey(SYS_SPACES_TABLE_ID, "")
+  let endKey = makeScanEndKey(SYS_SPACES_TABLE_ID)
   let backend = store.getBackend()
   var entries: seq[KeyValuePair] = @[]
   if backend != nil and backend.isOpen:
@@ -1786,7 +1787,7 @@ proc loadSpaces*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
         if not latestVersions.hasKey(k):
           latestVersions[k] = (v, 0'i64)
 
-  var newSpaces = tables.initTable[ULID, SpaceInfo]()
+  var newSpaces = tables.initTable[SpaceID, SpaceInfo]()
   for (k, entry) in latestVersions.pairs:
     let infoOpt = parseSpaceInfoFromBinary(entry.value)
     if infoOpt.isSome:
@@ -1798,8 +1799,8 @@ proc loadSpaces*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
 proc loadTableSpaces*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
   ## Scan sys.tables and populate the tableId → spaceId mapping.
   ## Handles both raw JSON values and MVCC-encoded values.
-  let startKey = "/t/" & align($SYS_TABLES_TABLE_ID, 10, '0') & "/"
-  let endKey = "/t/" & align($(SYS_TABLES_TABLE_ID + 1), 10, '0') & "/"
+  let startKey = encodeTableKey(SYS_TABLES_TABLE_ID, "")
+  let endKey = makeScanEndKey(SYS_TABLES_TABLE_ID)
   let backend = store.getBackend()
   var entries: seq[KeyValuePair] = @[]
   if backend != nil and backend.isOpen:
@@ -1847,7 +1848,7 @@ proc loadTableSpaces*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
         if not latestVersions.hasKey(k):
           latestVersions[k] = (v, 0'i64)
 
-  var newTableSpaces = tables.initTable[uint32, ULID]()
+  var newTableSpaces = tables.initTable[TableId, SpaceID]()
   for (k, entry) in latestVersions.pairs:
     {.cast(raises: []).}:
       try:
@@ -1861,10 +1862,10 @@ proc loadTableSpaces*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
     store.tableSpaces = newTableSpaces
 
 proc getSpaceForTable*(store: RaftKVStoreExt,
-    tableId: uint32): Option[SpaceInfo] {.gcsafe, raises: [].} =
+    tableId: TableId): Option[SpaceInfo] {.gcsafe, raises: [].} =
   acquire(store.spacesMu)
   defer: release(store.spacesMu)
-  let sid = store.tableSpaces.getOrDefault(tableId, ULID())
+  let sid = store.tableSpaces.getOrDefault(tableId, zeroSpaceID())
   if store.spaces.hasKey(sid):
     return some(store.spaces.getOrDefault(sid))
   none(SpaceInfo)
@@ -2629,7 +2630,7 @@ proc updateSpaceRecord*(store: RaftKVStoreExt, space: SpaceInfo): bool {.gcsafe,
 
   # Create binary-encoded SpaceRecord
   let spaceRec = SpaceRecord(
-    spaceId: space.spaceId,
+    spaceId: ULID(space.spaceId),
     name: space.name,
     replicas: int32(space.replicas),
     groupCount: int32(space.groupIds.len),
@@ -2657,7 +2658,7 @@ proc rebalanceSpaces*(store: RaftKVStoreExt) {.raises: [].} =
   {.cast(raises: []).}:
     # Count nodes
     let nodesStart = encodeTableKey(SYS_NODES_TABLE_ID, "")
-    let nodesEnd = encodeTableKey(SYS_NODES_TABLE_ID + 1, "")
+    let nodesEnd = makeScanEndKey(SYS_NODES_TABLE_ID)
     let nodesRes = store.raftScan(nodesStart, nodesEnd, 0,
         includeSystemKeys = true)
     var nodeIds: seq[int] = @[]
@@ -2688,15 +2689,15 @@ proc rebalanceSpaces*(store: RaftKVStoreExt) {.raises: [].} =
 
     # Scan spaces
     let spacesStart = encodeTableKey(SYS_SPACES_TABLE_ID, "")
-    let spacesEnd = encodeTableKey(SYS_SPACES_TABLE_ID + 1, "")
+    let spacesEnd = makeScanEndKey(SYS_SPACES_TABLE_ID)
     let spacesRes = store.raftScan(spacesStart, spacesEnd, 0,
         includeSystemKeys = true)
     if not spacesRes.isOk:
       return
 
     # Group entries by user key, tracking latest version (same as loadSpaces)
-    var latestSpaces: tables.Table[ULID, tuple[info: SpaceInfo,
-        ts: int64]] = tables.initTable[ULID, tuple[info: SpaceInfo, ts: int64]]()
+    var latestSpaces: tables.Table[SpaceID, tuple[info: SpaceInfo,
+        ts: int64]] = tables.initTable[SpaceID, tuple[info: SpaceInfo, ts: int64]]()
     for (key, entry) in spacesRes.value:
       try:
         var userKey = key
@@ -2763,7 +2764,7 @@ proc rebalanceSpaces*(store: RaftKVStoreExt) {.raises: [].} =
 
         # Find max existing groupId - we generate ULIDs now, so just count
         let grpStart = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
-        let grpEnd = encodeTableKey(SYS_GROUPS_TABLE_ID + 1, "")
+        let grpEnd = makeScanEndKey(SYS_GROUPS_TABLE_ID)
         let grpRes = store.raftScan(grpStart, grpEnd, 0,
             includeSystemKeys = true)
         var existingGroupCount = 0
@@ -2800,7 +2801,7 @@ proc rebalanceSpaces*(store: RaftKVStoreExt) {.raises: [].} =
         for g in 0 ..< nodeCount:
           # Use deterministic ULID derived from spaceId + group index
           # This ensures predictable port assignment and avoids collisions
-          let groupId = groupIDFromULID(deriveULID(spaceId, g))
+          let groupId = groupIDFromULID(deriveULID(ULID(spaceId), g))
           newGroupIds.add(groupId)
 
           var members: seq[int] = @[]
@@ -2814,7 +2815,7 @@ proc rebalanceSpaces*(store: RaftKVStoreExt) {.raises: [].} =
                 replicaType: rtVoter))
           let groupRec = GroupRecord(
             groupId: groupId.ULID,
-            spaceId: spaceId,
+            spaceId: ULID(spaceId),
             preferredLeader: uint32(members[0]),
             leader: 0,
             replicas: replicasList,
@@ -3015,13 +3016,14 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: ULID) {.raises: [].}
   ##   2. At end, remove old group definitions (data is accessible via new groups)
   ##
   ## During migration, raftGetInSpace handles dual-read from both old and new groups.
+  let spaceIdTyped = SpaceID(spaceId)
   {.cast(raises: []).}:
     # Read current space state
     acquire(store.spacesMu)
     var space: SpaceInfo
     var found = false
-    if store.spaces.hasKey(spaceId):
-      space = store.spaces[spaceId]
+    if store.spaces.hasKey(spaceIdTyped):
+      space = store.spaces[spaceIdTyped]
       found = true
     release(store.spacesMu)
     if not found or not space.rebalancing: return
@@ -3046,10 +3048,10 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: ULID) {.raises: [].}
 
     # Find all tables in this space
     let tablesStart = encodeTableKey(SYS_TABLES_TABLE_ID, "")
-    let tablesEnd = encodeTableKey(SYS_TABLES_TABLE_ID + 1, "")
+    let tablesEnd = makeScanEndKey(SYS_TABLES_TABLE_ID)
     let tablesRes = store.raftScan(tablesStart, tablesEnd, 0,
         includeSystemKeys = true)
-    var tableIds: seq[uint32] = @[]
+    var tableIds: seq[TableId] = @[]
 
     if tablesRes.isOk:
       for (key, entry) in tablesRes.value:
@@ -3068,7 +3070,7 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: ULID) {.raises: [].}
 
           # Binary decoding (TableRecord)
           let tableRec = decodeTableRecord(tblVal)
-          if tableRec.spaceId == spaceId:
+          if tableRec.spaceId == spaceIdTyped:
             tableIds.add(tableRec.tableId)
         except: discard
 
@@ -3170,8 +3172,8 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: ULID) {.raises: [].}
             let curNow = getTime().toUnix()
             # Re-read space to check if we're still the worker
             acquire(store.spacesMu)
-            if store.spaces.hasKey(spaceId):
-              let curSpace = store.spaces[spaceId]
+            if store.spaces.hasKey(spaceIdTyped):
+              let curSpace = store.spaces[spaceIdTyped]
               if curSpace.rebalanceWorker != myNodeId:
                 release(store.spacesMu)
                 return # Another node took over

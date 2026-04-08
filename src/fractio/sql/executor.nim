@@ -337,7 +337,7 @@ proc execDropDatabase(op: PlanOp, ctx: ExecutorContext): ExecResult =
 
   # Find and delete all tables and their data rows
   let tableStart = encodeTableKey(SYS_TABLES_TABLE_ID, "")
-  let tableEnd = encodeTableKey(SYS_TABLES_TABLE_ID + 1, "")
+  let tableEnd = makeScanEndKey(SYS_TABLES_TABLE_ID)
   let tableScan = ctx.client.kvScan(tableStart, tableEnd, 0,
       txnId = internalTxnId, readTimestamp = internalReadTimestamp)
   if tableScan.isOk:
@@ -347,7 +347,7 @@ proc execDropDatabase(op: PlanOp, ctx: ExecutorContext): ExecResult =
         let tableId = rec.tableId
         # Delete all data rows for this table
         let dataStart = encodeDataRowKey(tableId, "")
-        let dataEnd = encodeDataRowKey(tableId + 1, "")
+        let dataEnd = makeDataRowScanEndKey(tableId)
         let dataScan = ctx.client.kvScan(dataStart, dataEnd, 0,
             txnId = internalTxnId, readTimestamp = internalReadTimestamp)
         if dataScan.isOk:
@@ -466,17 +466,17 @@ proc execCreateTable(op: PlanOp, ctx: ExecutorContext): ExecResult =
   if op.ctSpaceName.isSome:
     let spaceName = op.ctSpaceName.get()
     let sStart = encodeTableKey(SYS_SPACES_TABLE_ID, "")
-    let sEnd = encodeTableKey(SYS_SPACES_TABLE_ID + 1, "")
+    let sEnd = makeScanEndKey(SYS_SPACES_TABLE_ID)
     # Use a fresh scan WITHOUT the transaction's read timestamp to see recent writes
     let sScan = ctx.client.kvScan(sStart, sEnd, 0, txnId = zeroTransactionID(),
         readTimestamp = 0)
-    var spaceId: ULID
+    var spaceId: SpaceID
     var spaceFound = false
     if sScan.isOk:
       for entry in sScan.val:
         let rec = decodeSpaceRecord(entry.value)
         if rec.name == spaceName:
-          spaceId = rec.spaceId
+          spaceId = SpaceID(rec.spaceId) # Convert ULID to SpaceID
           spaceFound = true
           break
     if not spaceFound:
@@ -588,7 +588,7 @@ proc execTxnScan(ctx: ExecutorContext, startKey, endKey: string,
 
 proc execShowDatabasesTxn(ctx: ExecutorContext): ExecResult =
   let startKey = encodeTableKey(SYS_DATABASES_TABLE_ID, "")
-  let endKey = encodeTableKey(SYS_DATABASES_TABLE_ID + 1, "")
+  let endKey = makeScanEndKey(SYS_DATABASES_TABLE_ID)
   let res = execTxnScan(ctx, startKey, endKey, 0)
   if not res.isOk:
     return errorResult(&"failed to scan databases: {res.err}")
@@ -603,7 +603,7 @@ proc execShowDatabasesTxn(ctx: ExecutorContext): ExecResult =
 
 proc execShowSchemasTxn(op: PlanOp, ctx: ExecutorContext): ExecResult =
   let startKey = encodeTableKey(SYS_SCHEMAS_TABLE_ID, "")
-  let endKey = encodeTableKey(SYS_SCHEMAS_TABLE_ID + 1, "")
+  let endKey = makeScanEndKey(SYS_SCHEMAS_TABLE_ID)
   let res = execTxnScan(ctx, startKey, endKey, 0)
   if not res.isOk:
     return errorResult(&"failed to scan schemas: {res.err}")
@@ -618,7 +618,7 @@ proc execShowSchemasTxn(op: PlanOp, ctx: ExecutorContext): ExecResult =
 
 proc execShowTablesTxn(op: PlanOp, ctx: ExecutorContext): ExecResult =
   let startKey = encodeTableKey(SYS_TABLES_TABLE_ID, "")
-  let endKey = encodeTableKey(SYS_TABLES_TABLE_ID + 1, "")
+  let endKey = makeScanEndKey(SYS_TABLES_TABLE_ID)
   let res = execTxnScan(ctx, startKey, endKey, 0)
   if not res.isOk:
     return errorResult(&"failed to scan tables: {res.err}")
@@ -636,7 +636,7 @@ proc execShowTablesTxn(op: PlanOp, ctx: ExecutorContext): ExecResult =
 proc execShowSpacesTxn(ctx: ExecutorContext): ExecResult =
   ## Transaction-aware SHOW SPACES that can see MVCC-encoded space records.
   let startKey = encodeTableKey(SYS_SPACES_TABLE_ID, "")
-  let endKey = encodeTableKey(SYS_SPACES_TABLE_ID + 1, "")
+  let endKey = makeScanEndKey(SYS_SPACES_TABLE_ID)
   let res = execTxnScan(ctx, startKey, endKey, 0)
   if not res.isOk:
     return errorResult(&"failed to scan spaces: {res.err}")
@@ -838,7 +838,7 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
     of poUpdate:
       # MVCC-aware UPDATE
       let startKey = encodeDataRowKey(op.upTableId, "")
-      let endKey = encodeDataRowKey(op.upTableId + 1, "")
+      let endKey = makeDataRowScanEndKey(op.upTableId)
       # Use transaction context for consistent scan
       let res = ctx.client.kvScan(startKey, endKey, 0, txnId = ctx.txnId,
           readTimestamp = ctx.readTimestamp)
@@ -873,7 +873,7 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
     of poDelete:
       # MVCC-aware DELETE
       let startKey = encodeDataRowKey(op.delTableId, "")
-      let endKey = encodeDataRowKey(op.delTableId + 1, "")
+      let endKey = makeDataRowScanEndKey(op.delTableId)
       # Use transaction context for consistent scan
       let res = ctx.client.kvScan(startKey, endKey, 0, txnId = ctx.txnId,
           readTimestamp = ctx.readTimestamp)

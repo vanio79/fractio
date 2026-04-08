@@ -19,6 +19,7 @@ import fractio/distributed/sharedtimer/types as timerTypes
 import fractio/core/timestamp_provider
 import fractio/core/types as coreTypes
 import fractio/storage/wisckey_backend
+import fractio/distributed/meta/system_schemas
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -76,13 +77,13 @@ proc teardownMvccStore(coord: NuRaftCoordinator, storagePath: string) =
   try: removeDir(storagePath) except CatchableError: discard
 
 # System table key helpers
-proc tableKey(tableId: uint32): string =
+proc tableKey(tableId: TableId): string =
   result = "/t/" & formatTableId(tableId) & "/meta"
 
-proc columnKey(tableId: uint32, colName: string): string =
+proc columnKey(tableId: TableId, colName: string): string =
   result = "/t/" & formatTableId(tableId) & "/col/" & colName
 
-proc indexKey(tableId: uint32, idxName: string): string =
+proc indexKey(tableId: TableId, idxName: string): string =
   result = "/t/" & formatTableId(tableId) & "/idx/" & idxName
 
 # ---------------------------------------------------------------------------
@@ -94,7 +95,7 @@ suite "MVCC System Tables - Basic Operations":
     let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_st01")
     defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_st01")
 
-    let tableId = 1'u32
+    let tableId = genTableId()
     let key = tableKey(tableId)
     let value = """{"name": "users", "columns": 3}"""
 
@@ -117,7 +118,7 @@ suite "MVCC System Tables - Basic Operations":
     let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_st02")
     defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_st02")
 
-    let tableId = 2'u32
+    let tableId = genTableId()
     let sessionId = mvccStore.createSession()
     discard mvccStore.beginTransaction(sessionId)
 
@@ -152,7 +153,7 @@ suite "MVCC System Tables - Basic Operations":
     let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_st03")
     defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_st03")
 
-    let tableId = 3'u32
+    let tableId = genTableId()
     let sessionId = mvccStore.createSession()
     discard mvccStore.beginTransaction(sessionId)
 
@@ -172,7 +173,7 @@ suite "MVCC System Tables - Basic Operations":
     let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_st04")
     defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_st04")
 
-    let tableId = 4'u32
+    let tableId = genTableId()
     let key = tableKey(tableId)
 
     # Initial write
@@ -204,7 +205,7 @@ suite "MVCC System Tables - Isolation":
     let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_iso01")
     defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_iso01")
 
-    let tableId = 10'u32
+    let tableId = genTableId()
     let key = tableKey(tableId)
 
     # Initial write
@@ -241,7 +242,7 @@ suite "MVCC System Tables - Isolation":
     let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_iso02")
     defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_iso02")
 
-    let tableId = 11'u32
+    let tableId = genTableId()
     let key = tableKey(tableId)
 
     # Initial write
@@ -279,7 +280,7 @@ suite "MVCC System Tables - Index Operations":
     let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_idx01")
     defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_idx01")
 
-    let tableId = 20'u32
+    let tableId = genTableId()
     let sessionId = mvccStore.createSession()
     discard mvccStore.beginTransaction(sessionId)
 
@@ -306,7 +307,7 @@ suite "MVCC System Tables - Index Operations":
     let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_idx02")
     defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_idx02")
 
-    let tableId = 21'u32
+    let tableId = genTableId()
     let idxKey = indexKey(tableId, "temp_idx")
 
     # Create index
@@ -342,6 +343,9 @@ suite "MVCC System Tables - Persistence":
   test "data survives restart":
     let storagePath = "/tmp/fractio_mvcc_persist01"
     cleanDir(storagePath)
+    let tableId = genTableId() # Use same tableId across both instances
+    let key = tableKey(tableId)
+    let value = """{"name": "persistent_table"}"""
 
     # First instance
     block:
@@ -376,10 +380,6 @@ suite "MVCC System Tables - Persistence":
       let tsProvider = newTimestampProvider(mockTimer, nodeId.uint16)
 
       let mvccStore = newMvccTransactionStore(raftStore, txnMgr, tsProvider)
-
-      let tableId = 30'u32
-      let key = tableKey(tableId)
-      let value = """{"name": "persistent_table"}"""
 
       let sessionId = mvccStore.createSession()
       discard mvccStore.beginTransaction(sessionId)
@@ -425,9 +425,6 @@ suite "MVCC System Tables - Persistence":
       let tsProvider = newTimestampProvider(mockTimer, nodeId.uint16)
 
       let mvccStore = newMvccTransactionStore(raftStore, txnMgr, tsProvider)
-
-      let tableId = 30'u32
-      let key = tableKey(tableId)
 
       let getRes = mvccStore.latestGet(key)
       check getRes.isOk

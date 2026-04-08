@@ -119,7 +119,7 @@ proc isMetaLeader(sm: SpaceManager): bool =
 proc getNodes*(sm: SpaceManager): seq[NodeRecord] =
   ## Get all nodes from sys.nodes.
   let startKey = encodeTableKey(SYS_NODES_TABLE_ID, "")
-  let endKey = encodeTableKey(SYS_NODES_TABLE_ID + 1, "")
+  let endKey = makeScanEndKey(SYS_NODES_TABLE_ID)
   let scanRes = sm.store.raftScan(startKey, endKey, 0, includeSystemKeys = true)
   if scanRes.isOk:
     for (key, entry) in scanRes.value:
@@ -139,7 +139,7 @@ proc getNodes*(sm: SpaceManager): seq[NodeRecord] =
 proc getGroups*(sm: SpaceManager): seq[GroupRecord] =
   ## Get all groups from sys.groups.
   let startKey = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
-  let endKey = encodeTableKey(SYS_GROUPS_TABLE_ID + 1, "")
+  let endKey = makeScanEndKey(SYS_GROUPS_TABLE_ID)
   let scanRes = sm.store.raftScan(startKey, endKey, 0, includeSystemKeys = true)
   if scanRes.isOk:
     for (key, entry) in scanRes.value:
@@ -158,7 +158,7 @@ proc getGroups*(sm: SpaceManager): seq[GroupRecord] =
 proc getSpaces*(sm: SpaceManager): seq[SpaceRecord] =
   ## Get all spaces from sys.spaces.
   let startKey = encodeTableKey(SYS_SPACES_TABLE_ID, "")
-  let endKey = encodeTableKey(SYS_SPACES_TABLE_ID + 1, "")
+  let endKey = makeScanEndKey(SYS_SPACES_TABLE_ID)
   let scanRes = sm.store.raftScan(startKey, endKey, 0, includeSystemKeys = true)
   if scanRes.isOk:
     for (key, entry) in scanRes.value:

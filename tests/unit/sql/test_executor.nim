@@ -25,6 +25,19 @@ import fractio/protocol/server
 import fractio/client/fractio_client
 import fractio/client/sql_client
 
+# Helper for tests: create a deterministic test table ID
+var testTableIdCounter {.global.} = 0
+proc testTableId(): TableId =
+  inc testTableIdCounter
+  # Use a deterministic ULID for test purposes
+  var ulid: ULID
+  for i in 0..<5:
+    ulid.data[i] = 0'u8 # timestamp part (zero for testing)
+  for i in 5..<15:
+    ulid.data[i] = 0'u8 # randomness part (zero for testing)
+  ulid.data[15] = uint8(testTableIdCounter) # test number
+  TableId(ulid)
+
 # ---------------------------------------------------------------------------
 # Test helper: create a single-node environment
 # ---------------------------------------------------------------------------
@@ -278,15 +291,12 @@ suite "SQL Executor — DML":
     check res.kind == erkModified
     check res.count == 1
 
-    # Verify data row exists via client
-    # User tables start at 100. Table 'users' should be 100.
-    let key = encodeDataRowKey(100, "1")
-    let got = client.kvGet(key)
-    check got.isOk
-    check got.val.isSome
-    let row = parseJson(got.val.get())
-    check row["name"].getStr == "Alice"
-    check row["age"].getInt == 30
+    # Verify data row exists via SELECT
+    let sel = client.exec("SELECT * FROM users WHERE id = 1")
+    check sel.kind == erkRows
+    check sel.rows.len == 1
+    check sel.rows[0][1] == "Alice" # name column
+    check sel.rows[0][2] == "30" # age column
 
   test "INSERT multiple rows":
     let res = client.exec(

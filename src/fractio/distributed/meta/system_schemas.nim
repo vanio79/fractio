@@ -112,24 +112,22 @@ proc decodeColumnDef*(r: var BinaryReader): ColumnDefBin =
 type
   TableRecord* = object
     ## Record stored in SYS_TABLES_TABLE
-    ## Key: /t/0000000003/<database>.<schema>.<tableName>
-    tableId*: uint32 ## Numeric table ID for key encoding
-    ulid*: ULID ## Globally unique ULID for this table
+    ## Key: /t/<SYS_TABLES_TABLE_ID>/<database>.<schema>.<tableName>
+    tableId*: TableId ## ULID-based table ID for globally unique, sortable IDs
     name*: string
     schema*: string
     database*: string
-    spaceId*: ULID ## Space this table belongs to
+    spaceId*: SpaceID ## Space this table belongs to
     primaryKey*: seq[string] ## Column names forming the primary key
     columns*: seq[ColumnDefBin]
 
 proc encode*(rec: TableRecord): string =
   var w = initBinaryWriter()
-  w.writeU32(rec.tableId)
-  w.writeBytes(ulidToBytes(rec.ulid))
+  w.writeBytes(tableIdToBytes(rec.tableId))
   w.writeString(rec.name)
   w.writeString(rec.schema)
   w.writeString(rec.database)
-  w.writeBytes(ulidToBytes(rec.spaceId))
+  w.writeBytes(spaceIDToBytes(rec.spaceId))
   # Primary key columns
   w.writeU32(uint32(rec.primaryKey.len))
   for pk in rec.primaryKey:
@@ -142,12 +140,11 @@ proc encode*(rec: TableRecord): string =
 
 proc decodeTableRecord*(data: string): TableRecord =
   var r = initBinaryReader(data)
-  result.tableId = r.readU32()
-  result.ulid = ulidFromBytes(r.readFixedString(ULID_SIZE))
+  result.tableId = tableIdFromBytes(r.readFixedString(ULID_SIZE))
   result.name = r.readString()
   result.schema = r.readString()
   result.database = r.readString()
-  result.spaceId = ulidFromBytes(r.readFixedString(ULID_SIZE))
+  result.spaceId = spaceIDFromBytes(r.readFixedString(ULID_SIZE))
   # Primary key columns
   let pkCount = int(r.readU32())
   result.primaryKey = newSeq[string](pkCount)
@@ -430,8 +427,7 @@ proc toJson*(rec: TableRecord): JsonNode =
   for pk in rec.primaryKey:
     pkArr.add(%pk)
   result = %*{
-    "tableId": rec.tableId,
-    "ulid": $(rec.ulid),
+    "tableId": $(rec.tableId),
     "name": rec.name,
     "schema": rec.schema,
     "database": rec.database,

@@ -297,7 +297,7 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
         var arr = newJArray()
         if not srv.raftStore.isNil:
           let startKey = encodeTableKey(SYS_NODES_TABLE_ID, "")
-          let endKey = encodeTableKey(SYS_NODES_TABLE_ID + 1, "")
+          let endKey = makeScanEndKey(SYS_NODES_TABLE_ID)
           {.cast(gcsafe).}:
             let sr = srv.raftStore.raftScan(startKey, endKey, 0,
                 includeSystemKeys = true)
@@ -504,7 +504,7 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
       var members = newJArray()
       if not srv.raftStore.isNil and not srv.mvccStore.isNil:
         let startKey = encodeTableKey(SYS_NODES_TABLE_ID, "")
-        let endKey = encodeTableKey(SYS_NODES_TABLE_ID + 1, "")
+        let endKey = makeScanEndKey(SYS_NODES_TABLE_ID)
         {.cast(gcsafe).}:
           let sr = srv.mvccStore.latestScan(startKey, endKey, 0)
           if sr.isOk:
@@ -566,7 +566,7 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
         var groupDescs = initTable[coreTypes.ULID, GroupRecord]()
         {.cast(gcsafe).}:
           let gStartKey = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
-          let gEndKey = encodeTableKey(SYS_GROUPS_TABLE_ID + 1, "")
+          let gEndKey = makeScanEndKey(SYS_GROUPS_TABLE_ID)
           let gsr = srv.raftStore.raftScan(gStartKey, gEndKey, 0,
               includeSystemKeys = true)
           if gsr.isOk:
@@ -586,7 +586,7 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
                 discard
 
         let startKey = encodeTableKey(SYS_SPACES_TABLE_ID, "")
-        let endKey = encodeTableKey(SYS_SPACES_TABLE_ID + 1, "")
+        let endKey = makeScanEndKey(SYS_SPACES_TABLE_ID)
         var arr = newJArray()
         {.cast(gcsafe).}:
           let sr = srv.raftStore.raftScan(startKey, endKey, 0,
@@ -767,15 +767,17 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
         var arr = newJArray()
         for st in sysTables:
           let startKey = encodeTableKey(st.id, "")
-          let endKey = encodeTableKey(st.id + 1, "")
+          let endKey = makeScanEndKey(st.id)
           var rowCount = 0
           {.cast(gcsafe).}:
             let sr = srv.raftStore.raftScan(startKey, endKey, 0,
                 includeSystemKeys = true)
             if sr.isOk:
               rowCount = sr.value.len
+          # Show system table number for ID display
+          let tableNum = systemTableNumFromId(st.id)
           arr.add( %* {
-            "id": int(st.id),
+            "id": int(tableNum),
             "name": st.name,
             "description": st.desc,
             "rowCount": rowCount,
@@ -788,12 +790,14 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
         if srv.isNil or srv.raftStore.isNil:
           statusCode = 503
           return %* {"error": "server not ready"}
-        let tid = uint32(tableId)
-        if tid < 1 or tid > MAX_SYSTEM_TABLE_ID:
+        let tid = uint8(tableId)
+        if tid < 1 or tid > MAX_SYSTEM_TABLE_NUM:
           statusCode = 400
           return %* {"error": "invalid system table ID"}
-        let startKey = encodeTableKey(tid, "")
-        let endKey = encodeTableKey(tid + 1, "")
+        # Convert system table number to well-known TableId
+        let tableIdObj = TableId(systemTableULID(tid))
+        let startKey = encodeTableKey(tableIdObj, "")
+        let endKey = makeScanEndKey(tableIdObj)
         var rows = newJArray()
         {.cast(gcsafe).}:
           let sr = srv.raftStore.raftScan(startKey, endKey, 0,
@@ -806,25 +810,25 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
                 # Decode binary records based on table ID
                 var j: JsonNode
                 case tid
-                of SYS_DATABASES_TABLE_ID:
+                of SYS_DATABASES_TABLE_NUM:
                   let rec = decodeDatabaseRecord(entry.value)
                   j = system_schemas.toJson(rec)
-                of SYS_SCHEMAS_TABLE_ID:
+                of SYS_SCHEMAS_TABLE_NUM:
                   let rec = decodeSchemaRecord(entry.value)
                   j = system_schemas.toJson(rec)
-                of SYS_TABLES_TABLE_ID:
+                of SYS_TABLES_TABLE_NUM:
                   let rec = decodeTableRecord(entry.value)
                   j = system_schemas.toJson(rec)
-                of SYS_GROUPS_TABLE_ID:
+                of SYS_GROUPS_TABLE_NUM:
                   let rec = decodeGroupRecord(entry.value)
                   j = system_schemas.toJson(rec)
-                of SYS_NODES_TABLE_ID:
+                of SYS_NODES_TABLE_NUM:
                   let rec = decodeNodeRecord(entry.value)
                   j = system_schemas.toJson(rec)
-                of SYS_SETTINGS_TABLE_ID:
+                of SYS_SETTINGS_TABLE_NUM:
                   let rec = decodeSettingRecord(entry.value)
                   j = system_schemas.toJson(rec)
-                of SYS_SPACES_TABLE_ID:
+                of SYS_SPACES_TABLE_NUM:
                   let rec = decodeSpaceRecord(entry.value)
                   j = system_schemas.toJson(rec)
                 else:
@@ -843,22 +847,22 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
         else:
           # Hardcoded schemas for empty system tables
           let sysColumns = case tid
-            of SYS_DATABASES_TABLE_ID: @["_key", "name", "createdAt"]
-            of SYS_SCHEMAS_TABLE_ID: @["_key", "name", "database", "createdAt"]
-            of SYS_TABLES_TABLE_ID: @["_key", "tableId", "name", "schema", "database",
+            of SYS_DATABASES_TABLE_NUM: @["_key", "name", "createdAt"]
+            of SYS_SCHEMAS_TABLE_NUM: @["_key", "name", "database", "createdAt"]
+            of SYS_TABLES_TABLE_NUM: @["_key", "tableId", "name", "schema", "database",
                 "spaceId", "primaryKey", "columns"]
-            of SYS_GROUPS_TABLE_ID: @["_key", "groupId", "spaceId", "preferredLeader",
+            of SYS_GROUPS_TABLE_NUM: @["_key", "groupId", "spaceId", "preferredLeader",
                 "leader", "replicas"]
-            of SYS_NODES_TABLE_ID: @["_key", "nodeId", "host", "raftPort",
+            of SYS_NODES_TABLE_NUM: @["_key", "nodeId", "host", "raftPort",
                 "clientPort", "status"]
-            of SYS_SETTINGS_TABLE_ID: @["_key", "value"]
-            of SYS_SPACES_TABLE_ID: @["_key", "spaceId", "name", "replicas", "groupCount",
+            of SYS_SETTINGS_TABLE_NUM: @["_key", "value"]
+            of SYS_SPACES_TABLE_NUM: @["_key", "spaceId", "name", "replicas", "groupCount",
                 "groupIds", "oldGroupIds", "rebalancing"]
-            of SYS_NODE_METRICS_ID: @["_key", "nodeId", "cpuPercent",
+            of SYS_NODE_METRICS_NUM: @["_key", "nodeId", "cpuPercent",
                 "memUsedBytes", "diskUsedBytes"]
-            of SYS_GROUP_METRICS_ID: @["_key", "groupId", "keyCount",
+            of SYS_GROUP_METRICS_NUM: @["_key", "groupId", "keyCount",
                 "sizeBytes", "readQps", "writeQps"]
-            of SYS_EVENTS_TABLE_ID: @["_key", "timestamp", "eventType",
+            of SYS_EVENTS_TABLE_NUM: @["_key", "timestamp", "eventType",
                 "nodeId", "message"]
             else: @["_key", "_value"]
           for c in sysColumns:

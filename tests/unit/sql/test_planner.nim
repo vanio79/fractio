@@ -19,6 +19,19 @@ import fractio/distributed/raft/group_types
 import fractio/protocol/server
 import fractio/client/fractio_client
 
+# Helper for tests: create a deterministic test table ID
+var testTableIdCounter {.global.} = 0
+proc testTableId(): TableId =
+  inc testTableIdCounter
+  # Use a deterministic ULID for test purposes
+  var ulid: ULID
+  for i in 0..<5:
+    ulid.data[i] = 0'u8 # timestamp part (zero for testing)
+  for i in 5..<15:
+    ulid.data[i] = 0'u8 # randomness part (zero for testing)
+  ulid.data[15] = uint8(testTableIdCounter) # test number
+  TableId(ulid)
+
 # ---------------------------------------------------------------------------
 # Test helper: create a single-node test environment
 # ---------------------------------------------------------------------------
@@ -123,7 +136,7 @@ proc cleanupTestDir(testDir: string) =
 # ---------------------------------------------------------------------------
 
 proc seedTable(client: FractioClient, database, schema, name: string,
-    tableId: uint32, columns: seq[tuple[name: string, typ: string]],
+    tableId: TableId, columns: seq[tuple[name: string, typ: string]],
     pk: seq[string]) =
   # Build binary TableRecord
   var cols: seq[ColumnDefBin] = @[]
@@ -146,7 +159,7 @@ proc seedTable(client: FractioClient, database, schema, name: string,
     name: name,
     database: database,
     schema: schema,
-    spaceId: ZeroULID(), # default space (zero ULID)
+    spaceId: zeroSpaceID(), # default space (zero SpaceID)
     primaryKey: pk,
     columns: cols,
   )
@@ -238,7 +251,8 @@ suite "SQL Planner":
     let rec = decodeTableRecord(plan.ops[0].ctValue)
     check rec.name == "users"
     check rec.columns.len == 3
-    check rec.tableId >= FIRST_USER_TABLE_ID
+    # tableId is now a ULID, just verify it's set (non-zero or valid)
+    check rec.tableId != zeroTableId()
 
   test "plan CREATE TABLE IF NOT EXISTS":
     let stmt = parseStatement(
@@ -254,21 +268,23 @@ suite "SQL Planner":
     check plan.ops[0].dtName == "users"
 
   test "plan INSERT":
-    seedTable(client, "default", "public", "users", 100,
+    let tid = testTableId()
+    seedTable(client, "default", "public", "users", tid,
       @[("id", "INT"), ("name", "TEXT")], @["id"])
     let stmt = parseStatement(
         "INSERT INTO users (id, name) VALUES (1, 'Alice')")
     let plan = planStatement(stmt, client)
     check plan.ops.len == 1
     check plan.ops[0].kind == poInsert
-    check plan.ops[0].insTableId == 100'u32
+    check plan.ops[0].insTableId == tid
     check plan.ops[0].insRows.len == 1
     let row = parseJson(plan.ops[0].insRows[0])
     check row["id"].getInt == 1
     check row["name"].getStr == "Alice"
 
   test "plan INSERT multiple rows":
-    seedTable(client, "default", "public", "items", 101,
+    let tid = testTableId()
+    seedTable(client, "default", "public", "items", tid,
       @[("id", "INT"), ("val", "TEXT")], @["id"])
     let stmt = parseStatement(
         "INSERT INTO items (id, val) VALUES (1, 'a'), (2, 'b')")
@@ -281,27 +297,30 @@ suite "SQL Planner":
       discard planStatement(stmt, client)
 
   test "plan SELECT with point get":
-    seedTable(client, "default", "public", "users", 100,
+    let tid = testTableId()
+    seedTable(client, "default", "public", "users", tid,
       @[("id", "INT"), ("name", "TEXT")], @["id"])
     let stmt = parseStatement("SELECT * FROM users WHERE id = 42")
     let plan = planStatement(stmt, client)
     check plan.ops.len == 1
     check plan.ops[0].kind == poPointGet
-    check plan.ops[0].pgTableId == 100'u32
+    check plan.ops[0].pgTableId == tid
     check plan.ops[0].pgKey == "42"
 
   test "plan SELECT full scan":
-    seedTable(client, "default", "public", "users", 100,
+    let tid = testTableId()
+    seedTable(client, "default", "public", "users", tid,
       @[("id", "INT"), ("name", "TEXT")], @["id"])
     let stmt = parseStatement("SELECT * FROM users")
     let plan = planStatement(stmt, client)
     check plan.ops.len == 1
     check plan.ops[0].kind == poScan
-    check plan.ops[0].scTableId == 100'u32
+    check plan.ops[0].scTableId == tid
     check plan.ops[0].scFilter.isNone
 
   test "plan SELECT with filter (not point get)":
-    seedTable(client, "default", "public", "users", 100,
+    let tid = testTableId()
+    seedTable(client, "default", "public", "users", tid,
       @[("id", "INT"), ("name", "TEXT"), ("age", "INT")], @["id"])
     let stmt = parseStatement("SELECT * FROM users WHERE age > 21")
     let plan = planStatement(stmt, client)
@@ -309,7 +328,8 @@ suite "SQL Planner":
     check plan.ops[0].scFilter.isSome
 
   test "plan SELECT with LIMIT":
-    seedTable(client, "default", "public", "users", 100,
+    let tid = testTableId()
+    seedTable(client, "default", "public", "users", tid,
       @[("id", "INT"), ("name", "TEXT")], @["id"])
     let stmt = parseStatement("SELECT * FROM users LIMIT 10")
     let plan = planStatement(stmt, client)
@@ -317,31 +337,34 @@ suite "SQL Planner":
     check plan.ops[0].scLimit == 10'u32
 
   test "plan SELECT specific columns":
-    seedTable(client, "default", "public", "users", 100,
+    let tid = testTableId()
+    seedTable(client, "default", "public", "users", tid,
       @[("id", "INT"), ("name", "TEXT"), ("age", "INT")], @["id"])
     let stmt = parseStatement("SELECT name, age FROM users")
     let plan = planStatement(stmt, client)
     check plan.ops[0].scColumns == @["name", "age"]
 
   test "plan UPDATE":
-    seedTable(client, "default", "public", "users", 100,
+    let tid = testTableId()
+    seedTable(client, "default", "public", "users", tid,
       @[("id", "INT"), ("name", "TEXT")], @["id"])
     let stmt = parseStatement("UPDATE users SET name = 'Bob' WHERE id = 1")
     let plan = planStatement(stmt, client)
     check plan.ops.len == 1
     check plan.ops[0].kind == poUpdate
-    check plan.ops[0].upTableId == 100'u32
+    check plan.ops[0].upTableId == tid
     check plan.ops[0].upSets.len == 1
     check plan.ops[0].upSets[0].col == "name"
 
   test "plan DELETE":
-    seedTable(client, "default", "public", "users", 100,
+    let tid = testTableId()
+    seedTable(client, "default", "public", "users", tid,
       @[("id", "INT"), ("name", "TEXT")], @["id"])
     let stmt = parseStatement("DELETE FROM users WHERE id = 1")
     let plan = planStatement(stmt, client)
     check plan.ops.len == 1
     check plan.ops[0].kind == poDelete
-    check plan.ops[0].delTableId == 100'u32
+    check plan.ops[0].delTableId == tid
 
   test "plan BEGIN":
     let stmt = parseStatement("BEGIN")
@@ -421,7 +444,8 @@ suite "SQL Planner":
     check plan.ops[0].usName == "myschema"
 
   test "plan EXPLAIN SELECT":
-    seedTable(client, "default", "public", "users", 100,
+    let tid = testTableId()
+    seedTable(client, "default", "public", "users", tid,
       @[("id", "INT"), ("name", "TEXT")], @["id"])
     let stmt = parseStatement("EXPLAIN SELECT * FROM users")
     let plan = planStatement(stmt, client)
@@ -431,7 +455,8 @@ suite "SQL Planner":
     check plan.ops[0].exInnerPlan.ops[0].kind == poScan
 
   test "plan EXPLAIN SELECT point get":
-    seedTable(client, "default", "public", "users", 100,
+    let tid = testTableId()
+    seedTable(client, "default", "public", "users", tid,
       @[("id", "INT"), ("name", "TEXT")], @["id"])
     let stmt = parseStatement("EXPLAIN SELECT * FROM users WHERE id = 1")
     let plan = planStatement(stmt, client)
@@ -439,7 +464,8 @@ suite "SQL Planner":
     check plan.ops[0].exInnerPlan.ops[0].kind == poPointGet
 
   test "plan EXPLAIN INSERT":
-    seedTable(client, "default", "public", "users", 100,
+    let tid = testTableId()
+    seedTable(client, "default", "public", "users", tid,
       @[("id", "INT"), ("name", "TEXT")], @["id"])
     let stmt = parseStatement("EXPLAIN INSERT INTO users (id, name) VALUES (1, 'Alice')")
     let plan = planStatement(stmt, client)
@@ -452,12 +478,7 @@ suite "SQL Planner":
     check plan.ops[0].kind == poExplain
     check plan.ops[0].exInnerPlan.ops[0].kind == poCreateTable
 
-  test "nextTableId allocates incrementally":
-    let id1 = nextTableId(client)
-    check id1 == FIRST_USER_TABLE_ID
-
-    # Seed a table and check the next ID
-    seedTable(client, "default", "public", "t1", id1,
-      @[("id", "INT")], @["id"])
-    let id2 = nextTableId(client)
-    check id2 == id1 + 1
+  test "genTableId allocates unique IDs":
+    let id1 = genTableId()
+    let id2 = genTableId()
+    check id1 != id2 # Each call should generate a unique ULID

@@ -290,13 +290,13 @@ proc seedDefaults(leaderStore: RaftKVStoreExt) =
         createdAtNs: system_schemas.nowNs()).encode())
   # Seed default space (replicas=0 = ALL, single group = meta group)
   let spaceRec = SpaceRecord(
-    spaceId: ZeroULID(),
+    spaceId: ULID(zeroSpaceID()),
     name: "default",
     replicas: 0,
     groupCount: 1,
     groupIds: @[groupIDToULID(META_GROUP_ID)],
   )
-  discard leaderStore.raftPut(encodeSpaceKey(ZeroULID()), spaceRec.encode())
+  discard leaderStore.raftPut(encodeSpaceKey(zeroSpaceID()), spaceRec.encode())
 
 proc waitForAutoDistribution(nodes: seq[TestNode], expectedGroupIds: seq[
     GroupID], replicaCount: int, maxWaitMs: int = 1500) =
@@ -321,7 +321,7 @@ proc waitForAutoDistribution(nodes: seq[TestNode], expectedGroupIds: seq[
 proc waitForSpaceLeaders(nodes: seq[TestNode]) =
   let store = nodes[0].store
   let grpStart = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
-  let grpEnd = encodeTableKey(SYS_GROUPS_TABLE_ID + 1, "")
+  let grpEnd = makeScanEndKey(SYS_GROUPS_TABLE_ID)
   let grpScan = store.raftScan(grpStart, grpEnd, 0, includeSystemKeys = true)
   if grpScan.isOk:
     for (key, entry) in grpScan.value:
@@ -399,7 +399,7 @@ proc updateGroupLeaders(nodes: seq[TestNode]) =
   let leaderStore = nodes[leaderIdx].store
 
   let grpStart = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
-  let grpEnd = encodeTableKey(SYS_GROUPS_TABLE_ID + 1, "")
+  let grpEnd = makeScanEndKey(SYS_GROUPS_TABLE_ID)
   let grpScan = leaderStore.raftScan(grpStart, grpEnd, 0,
       includeSystemKeys = true)
   if grpScan.isOk:
@@ -582,7 +582,7 @@ proc waitForNodeInSysNodes(store: RaftKVStoreExt, nodeId: int,
   ## Wait for a node to appear in sys.nodes via raftScan.
   ## Returns true if found, false if timeout.
   let nodesStart = encodeTableKey(SYS_NODES_TABLE_ID, "")
-  let nodesEnd = encodeTableKey(SYS_NODES_TABLE_ID + 1, "")
+  let nodesEnd = makeScanEndKey(SYS_NODES_TABLE_ID)
   for attempt in 0 ..< maxAttempts:
     let nodesRes = store.raftScan(nodesStart, nodesEnd, 0,
         includeSystemKeys = true)
@@ -679,7 +679,7 @@ proc stopCluster(nodes: seq[TestNode]) =
 proc findSpaceId(leaderStore: RaftKVStoreExt,
     leaderMvccStore: MvccTransactionStore, spaceName: string): ULID =
   let spacesStart = encodeTableKey(SYS_SPACES_TABLE_ID, "")
-  let spacesEnd = encodeTableKey(SYS_SPACES_TABLE_ID + 1, "")
+  let spacesEnd = makeScanEndKey(SYS_SPACES_TABLE_ID)
   let sr = leaderMvccStore.latestScan(spacesStart, spacesEnd, 0)
   if sr.isOk:
     for (k, v) in sr.value:
@@ -700,9 +700,10 @@ proc findSpaceId(leaderStore: RaftKVStoreExt,
 
 proc findSpaceGroupIds(leaderStore: RaftKVStoreExt, spaceId: ULID): seq[GroupID] =
   leaderStore.loadSpaces()
+  let sid = SpaceID(spaceId) # Convert ULID to SpaceID for table lookup
   acquire(leaderStore.spacesMu)
-  if leaderStore.spaces.hasKey(spaceId):
-    result = leaderStore.spaces[spaceId].groupIds
+  if leaderStore.spaces.hasKey(sid):
+    result = leaderStore.spaces[sid].groupIds
   else:
     result = @[]
   release(leaderStore.spacesMu)
@@ -805,7 +806,7 @@ suite "Space rebalance integration — rebalanceSpaces":
 
     # Verify: 2 groups, not rebalancing
     acquire(leaderStore.spacesMu)
-    let sp1 = leaderStore.spaces[spaceId]
+    let sp1 = leaderStore.spaces[SpaceID(spaceId)]
     release(leaderStore.spacesMu)
     check sp1.groupIds.len == 2
     check sp1.rebalancing == false
@@ -828,7 +829,7 @@ suite "Space rebalance integration — rebalanceSpaces":
     leaderStore.loadSpaces() # Reload cache after Raft replication
 
     acquire(leaderStore.spacesMu)
-    let sp2 = leaderStore.spaces[spaceId]
+    let sp2 = leaderStore.spaces[SpaceID(spaceId)]
     release(leaderStore.spacesMu)
     check sp2.rebalancing == true
     check sp2.groupIds.len == 3 # 3 nodes -> 3 new groups
@@ -848,7 +849,7 @@ suite "Space rebalance integration — rebalanceSpaces":
     leaderStore.loadSpaces() # Reload cache after rebalance
 
     acquire(leaderStore.spacesMu)
-    let firstNewGroups = leaderStore.spaces[spaceId].groupIds
+    let firstNewGroups = leaderStore.spaces[SpaceID(spaceId)].groupIds
     release(leaderStore.spacesMu)
 
     # Call again — should not create more groups
@@ -856,7 +857,7 @@ suite "Space rebalance integration — rebalanceSpaces":
     sleep(TEST_REPLICATION_WAIT_MS)
 
     acquire(leaderStore.spacesMu)
-    let secondNewGroups = leaderStore.spaces[spaceId].groupIds
+    let secondNewGroups = leaderStore.spaces[SpaceID(spaceId)].groupIds
     release(leaderStore.spacesMu)
     check secondNewGroups == firstNewGroups
 
@@ -873,7 +874,7 @@ suite "Space rebalance integration — rebalanceSpaces":
     sleep(TEST_REPLICATION_WAIT_MS)
 
     acquire(leaderStore.spacesMu)
-    let sp = leaderStore.spaces[spaceId]
+    let sp = leaderStore.spaces[SpaceID(spaceId)]
     release(leaderStore.spacesMu)
     check sp.rebalancing == false
 
@@ -904,7 +905,7 @@ suite "Space rebalance integration — reads during migration":
 
     # Wait for new groups and leaders
     acquire(leaderStore.spacesMu)
-    let newGids = leaderStore.spaces[spaceId].groupIds
+    let newGids = leaderStore.spaces[SpaceID(spaceId)].groupIds
     release(leaderStore.spacesMu)
     waitForAutoDistribution(nodes, newGids, 2, 1500)
     waitForSpaceLeaders(nodes)
@@ -927,7 +928,7 @@ suite "Space rebalance integration — reads during migration":
     leaderStore.rebalanceSpaces()
     sleep(TEST_REPLICATION_WAIT_MS)
     acquire(leaderStore.spacesMu)
-    let newGids = leaderStore.spaces[spaceId].groupIds
+    let newGids = leaderStore.spaces[SpaceID(spaceId)].groupIds
     release(leaderStore.spacesMu)
     waitForAutoDistribution(nodes, newGids, 2, 1500)
     waitForSpaceLeaders(nodes)
@@ -953,7 +954,7 @@ proc triggerRebalanceAndSetup(nodes: var seq[TestNode],
   leaderStore.loadSpaces() # Reload cache after rebalance
 
   acquire(leaderStore.spacesMu)
-  let newGids = leaderStore.spaces[spaceId].groupIds
+  let newGids = leaderStore.spaces[SpaceID(spaceId)].groupIds
   release(leaderStore.spacesMu)
 
   waitForAutoDistribution(nodes, newGids, 2, 2000)
@@ -980,7 +981,7 @@ suite "Space rebalance integration — full migration":
 
     # Verify rebalancing is active
     acquire(leaderStore.spacesMu)
-    var sp = leaderStore.spaces[spaceId]
+    var sp = leaderStore.spaces[SpaceID(spaceId)]
     release(leaderStore.spacesMu)
     check sp.rebalancing == true
 
@@ -991,7 +992,7 @@ suite "Space rebalance integration — full migration":
 
     # Verify rebalance is complete - check in-memory cache directly
     acquire(leaderStore.spacesMu)
-    sp = leaderStore.spaces[spaceId]
+    sp = leaderStore.spaces[SpaceID(spaceId)]
     release(leaderStore.spacesMu)
     check sp.rebalancing == false
     check sp.oldGroupIds.len == 0
@@ -1000,7 +1001,7 @@ suite "Space rebalance integration — full migration":
     # Reload from backend to verify persistence
     leaderStore.loadSpaces()
     acquire(leaderStore.spacesMu)
-    sp = leaderStore.spaces[spaceId]
+    sp = leaderStore.spaces[SpaceID(spaceId)]
     release(leaderStore.spacesMu)
     check sp.rebalancing == false
     check sp.oldGroupIds.len == 0
@@ -1025,7 +1026,7 @@ suite "Space rebalance integration — full migration":
     sleep(TEST_REPLICATION_WAIT_MS)
 
     # Wait for leaders on all new space groups
-    for gid in leaderStore.spaces[spaceId].groupIds:
+    for gid in leaderStore.spaces[SpaceID(spaceId)].groupIds:
       var foundLeader = false
       for attempt in 0 ..< 50:
         for node in nodes:
@@ -1058,8 +1059,8 @@ suite "Space rebalance integration — full migration":
     leaderStore.loadSpaces() # Reload cache after rebalance
 
     acquire(leaderStore.spacesMu)
-    let oldGids = leaderStore.spaces[spaceId].oldGroupIds
-    let newGids = leaderStore.spaces[spaceId].groupIds
+    let oldGids = leaderStore.spaces[SpaceID(spaceId)].oldGroupIds
+    let newGids = leaderStore.spaces[SpaceID(spaceId)].groupIds
     release(leaderStore.spacesMu)
     check oldGids.len > 0
 
@@ -1106,7 +1107,7 @@ suite "Space rebalance integration — crash safety":
     leaderStore.loadSpaces()
 
     acquire(leaderStore.spacesMu)
-    let sp = leaderStore.spaces[spaceId]
+    let sp = leaderStore.spaces[SpaceID(spaceId)]
     release(leaderStore.spacesMu)
     check sp.rebalancing == true
     check sp.oldGroupIds.len > 0
@@ -1126,7 +1127,7 @@ suite "Space rebalance integration — crash safety":
     leaderStore.loadSpaces()
 
     # Wait for leaders on all new space groups
-    for gid in leaderStore.spaces[spaceId].groupIds:
+    for gid in leaderStore.spaces[SpaceID(spaceId)].groupIds:
       var foundLeader = false
       for attempt in 0 ..< 50:
         for node in nodes:

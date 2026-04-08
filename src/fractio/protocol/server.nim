@@ -2003,7 +2003,7 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
   # Recovery: re-create NuRaft groups for spaces from sys.groups metadata
   block spaceGroupRecovery:
     let grpStart = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
-    let grpEnd = encodeTableKey(SYS_GROUPS_TABLE_ID + 1, "")
+    let grpEnd = makeScanEndKey(SYS_GROUPS_TABLE_ID)
     let grpScan = store.raftScan(grpStart, grpEnd, 0, includeSystemKeys = true)
     if grpScan.isOk:
       for (key, entry) in grpScan.value:
@@ -2184,10 +2184,10 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
             let heartbeatAge = nowSecs - sp.rebalanceHeartbeat
             if sp.rebalanceWorker == myNodeId:
               # We are the worker — continue migration
-              rstoreRef.runRebalanceMigration(sp.spaceId)
+              rstoreRef.runRebalanceMigration(ULID(sp.spaceId))
             elif sp.rebalanceWorker == 0 or heartbeatAge > staleHeartbeatSecs:
               # No worker or stale heartbeat — claim and run
-              rstoreRef.runRebalanceMigration(sp.spaceId)
+              rstoreRef.runRebalanceMigration(ULID(sp.spaceId))
         except:
           discard
 

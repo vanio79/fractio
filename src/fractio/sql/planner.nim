@@ -80,20 +80,20 @@ type
       dtDatabase*: string
 
     of poInsert:
-      insTableId*: uint32
+      insTableId*: TableId
       insTableName*: string
       insColumns*: seq[string]     # column names in order
       insPkColumn*: string         # primary key column name
       insRows*: seq[string]        # JSON-encoded row objects
 
     of poPointGet:
-      pgTableId*: uint32
+      pgTableId*: TableId
       pgKey*: string               # primary key value
       pgColumns*: seq[string]      # columns to return (empty = all)
       pgAllColumns*: seq[string]   # all table columns for decoding
 
     of poScan:
-      scTableId*: uint32
+      scTableId*: TableId
       scStartKey*: string
       scEndKey*: string
       scLimit*: uint32
@@ -102,7 +102,7 @@ type
       scAllColumns*: seq[string]   # all table columns for decoding
 
     of poUpdate:
-      upTableId*: uint32
+      upTableId*: TableId
       upTableName*: string
       upFilter*: Option[Expr]
       upSets*: seq[tuple[col: string, val: Expr]]
@@ -110,7 +110,7 @@ type
       upPkColumn*: string
 
     of poDelete:
-      delTableId*: uint32
+      delTableId*: TableId
       delTableName*: string
       delFilter*: Option[Expr]
       delAllColumns*: seq[string]
@@ -184,13 +184,13 @@ proc planError(msg: string): ref PlanError =
 
 type
   TableDescriptor* = object
-    tableId*: uint32
-    ulid*: ULID
+    tableId*: TableId
     name*: string
     schema*: string
     database*: string
     columns*: seq[ColDef]
     primaryKey*: seq[string]
+    spaceId*: SpaceID
 
 proc findPkColumn*(desc: TableDescriptor): string =
   ## Find the primary key column name. Returns the first PK column or
@@ -239,10 +239,10 @@ proc resolveTable*(client: FractioClient,
   let rec = decodeTableRecord(raw)
   var desc = TableDescriptor(
     tableId: rec.tableId,
-    ulid: rec.ulid,
     name: rec.name,
     schema: rec.schema,
     database: rec.database,
+    spaceId: rec.spaceId,
   )
   # Copy primary key columns
   for pk in rec.primaryKey:
@@ -256,20 +256,10 @@ proc resolveTable*(client: FractioClient,
     desc.columns.add(cd)
   some(desc)
 
-proc nextTableId*(client: FractioClient): uint32 =
-  ## Allocate the next available user table ID by scanning existing tables.
-  let startKey = encodeTableKey(SYS_TABLES_TABLE_ID, "")
-  let endKey = encodeTableKey(SYS_TABLES_TABLE_ID + 1, "")
-  var maxId = FIRST_USER_TABLE_ID - 1
-
-  let scanRes = client.kvScan(startKey, endKey, limit = 1000)
-  if scanRes.isOk:
-    for item in scanRes.val:
-      let rec = decodeTableRecord(item.value)
-      if rec.tableId >= FIRST_USER_TABLE_ID and rec.tableId > maxId:
-        maxId = rec.tableId
-
-  maxId + 1
+proc genNewTableId*(): TableId =
+  ## Generate a new globally unique TableId using ULID.
+  ## ULID-based table IDs are globally unique and lexicographically sortable.
+  genTableId()
 
 # ---------------------------------------------------------------------------
 # Serialization helpers
@@ -390,15 +380,13 @@ proc planCreateTable(stmt: Stmt, client: FractioClient,
       if col.primaryKey:
         pk.add(col.name)
 
-  # Allocate numeric table ID for key encoding and ULID for global uniqueness
-  let tableId = nextTableId(client)
-  let tableUlid = genULID()
+  # Generate globally unique TableId using ULID
+  let tableId = genNewTableId()
 
   # Note: spaceId will be assigned at execution time - use placeholder
-  var placeholderSpaceId: ULID
+  let placeholderSpaceId = zeroSpaceID()
   let rec = TableRecord(
     tableId: tableId,
-    ulid: tableUlid,
     name: stmt.ctTable,
     schema: schema,
     database: database,
@@ -490,7 +478,7 @@ proc planSelect(stmt: Stmt, client: FractioClient,
 
   # Full scan with optional filter
   let startKey = encodeDataRowKey(desc.tableId, "")
-  let endKey = encodeDataRowKey(desc.tableId + 1, "")
+  let endKey = makeDataRowScanEndKey(desc.tableId)
   var limit: uint32 = 0
   if stmt.selLimit.isSome:
     let limExpr = stmt.selLimit.get()

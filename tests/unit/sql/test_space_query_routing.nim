@@ -158,7 +158,7 @@ proc createMultiGroupTestStore(testDir: string,
   discard store.sysTablePutBatch(sysTableWrites)
 
   let testSpaceUlid = ULID() # Generate proper ULID for test space
-  let spaceKey = encodeSpaceKey(testSpaceUlid)
+  let spaceKey = encodeSpaceKey(SpaceID(testSpaceUlid))
   var groupIdsSeq: seq[ULID] = @[]
   for gid in groupIds:
     groupIdsSeq.add(groupIDToULID(gid))
@@ -198,7 +198,7 @@ proc createMultiGroupTestStore(testDir: string,
   result = (client, server, store, groupIds, testSpaceUlid)
 
 proc seedSpaceTable(client: FractioClient, store: RaftKVStoreExt,
-    tableId: uint32, tableName: string, spaceId: ULID, database = "default",
+    tableId: TableId, tableName: string, spaceId: ULID, database = "default",
         schema = "public") =
   ## Register a table in sys.tables and refresh client metadata.
   let fullName = database & "." & schema & "." & tableName
@@ -208,7 +208,7 @@ proc seedSpaceTable(client: FractioClient, store: RaftKVStoreExt,
     name: tableName,
     database: database,
     schema: schema,
-    spaceId: spaceId,
+    spaceId: SpaceID(spaceId),
     primaryKey: @["id"],
     columns: @[
       ColumnDefBin(name: "id", dataType: cdtInt, flags: 0x01), # primaryKey
@@ -221,7 +221,7 @@ proc seedSpaceTable(client: FractioClient, store: RaftKVStoreExt,
   discard client.refreshMetadata()
 
 proc seedSpaceTableThreeCol(client: FractioClient, store: RaftKVStoreExt,
-    tableId: uint32, tableName: string, spaceId: ULID, database = "default",
+    tableId: TableId, tableName: string, spaceId: ULID, database = "default",
         schema = "public") =
   ## Register a table with 3 columns (id, name, score) and refresh client metadata.
   let fullName = database & "." & schema & "." & tableName
@@ -231,7 +231,7 @@ proc seedSpaceTableThreeCol(client: FractioClient, store: RaftKVStoreExt,
     name: tableName,
     database: database,
     schema: schema,
-    spaceId: spaceId,
+    spaceId: SpaceID(spaceId),
     primaryKey: @["id"],
     columns: @[
       ColumnDefBin(name: "id", dataType: cdtInt, flags: 0x01), # primaryKey
@@ -269,7 +269,7 @@ suite "SQL Executor — space-routed INSERT":
     cleanupTestDir(testDir)
     (client, server, store, spaceGroupIds,
         testSpaceUlid) = createMultiGroupTestStore(testDir, 3)
-    seedSpaceTable(client, store, 100, "items", testSpaceUlid)
+    seedSpaceTable(client, store, genTableId(), "items", testSpaceUlid)
 
   teardown:
     client.close()
@@ -321,7 +321,7 @@ suite "SQL Executor — space-routed SELECT":
     cleanupTestDir(testDir)
     (client, server, store, spaceGroupIds,
         testSpaceUlid) = createMultiGroupTestStore(testDir, 3)
-    seedSpaceTable(client, store, 100, "items", testSpaceUlid)
+    seedSpaceTable(client, store, genTableId(), "items", testSpaceUlid)
     # Insert 10 rows distributed across groups
     for i in 1 .. 10:
       discard exec(client,
@@ -369,7 +369,7 @@ suite "SQL Executor — space-routed SELECT":
 
   test "SELECT from empty space-routed table":
     # Create a second table in the same space, don't insert data
-    seedSpaceTable(client, store, 200, "empty_items", testSpaceUlid)
+    seedSpaceTable(client, store, genTableId(), "empty_items", testSpaceUlid)
     let res = exec(client, "SELECT * FROM empty_items")
     check res.kind == erkRows
     check res.rows.len == 0
@@ -396,7 +396,7 @@ suite "SQL Executor — space-routed UPDATE":
     cleanupTestDir(testDir)
     (client, server, store, spaceGroupIds,
         testSpaceUlid) = createMultiGroupTestStore(testDir, 3)
-    seedSpaceTable(client, store, 100, "items", testSpaceUlid)
+    seedSpaceTable(client, store, genTableId(), "items", testSpaceUlid)
     for i in 1 .. 5:
       discard exec(client,
           "INSERT INTO items (id, val) VALUES (" & $i & ", 'orig')")
@@ -456,7 +456,7 @@ suite "SQL Executor — space-routed DELETE":
     cleanupTestDir(testDir)
     (client, server, store, spaceGroupIds,
         testSpaceUlid) = createMultiGroupTestStore(testDir, 3)
-    seedSpaceTable(client, store, 100, "items", testSpaceUlid)
+    seedSpaceTable(client, store, genTableId(), "items", testSpaceUlid)
     for i in 1 .. 5:
       discard exec(client,
           "INSERT INTO items (id, val) VALUES (" & $i & ", 'v" & $i & "')")
@@ -515,7 +515,7 @@ suite "SQL Executor — space routing full round-trip":
     cleanupTestDir(testDir)
     (client, server, store, spaceGroupIds,
         testSpaceUlid) = createMultiGroupTestStore(testDir, 4)
-    seedSpaceTableThreeCol(client, store, 100, "products", testSpaceUlid)
+    seedSpaceTableThreeCol(client, store, genTableId(), "products", testSpaceUlid)
 
   teardown:
     client.close()
@@ -634,7 +634,7 @@ suite "SQL Executor — space routing backward compat":
         "INSERT INTO plain (id, val) VALUES (1, 'plain1')")
 
     # Space-routed table
-    seedSpaceTable(client, store, 200, "spaced", testSpaceUlid)
+    seedSpaceTable(client, store, genTableId(), "spaced", testSpaceUlid)
     discard exec(client,
         "INSERT INTO spaced (id, val) VALUES (1, 'spaced1')")
 

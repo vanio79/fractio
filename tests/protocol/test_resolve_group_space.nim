@@ -4,10 +4,9 @@
 # creates meta + data + N space groups, seeds tableSpaces/spaces
 # caches via loadSpaces()/loadTableSpaces().
 
-import std/[unittest, os, options, tables, json, sequtils]
+import std/[unittest, os, options, tables]
 import fractio/protocol/raft_store
 import fractio/distributed/raft/nuraft_coordinator
-import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/group_types as rangeTypes
 import fractio/core/types as coreTypes
 import fractio/distributed/meta/system_tables
@@ -27,6 +26,10 @@ proc nextBasePort(): int =
 proc cleanDir(path: string) =
   try: removeDir(path) except CatchableError: discard
   try: createDir(path) except CatchableError: discard
+
+# Fixed table ID for tests that need a consistent ID across operations
+const testTableId = coreTypes.TableId(ULID(data: [0'u8, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 100, 0]))
 
 proc makeMultiGroupStore(storagePath: string, groupCount: int): tuple[
     coord: NuRaftCoordinator, store: RaftKVStoreExt,
@@ -80,7 +83,7 @@ proc makeMultiGroupStore(storagePath: string, groupCount: int): tuple[
     discard store.getOrCreateSM(gid)
 
   let space = SpaceInfo(
-    spaceId: coreTypes.ZeroULID(),
+    spaceId: coreTypes.zeroSpaceID(),
     name: "test_space",
     replicas: 1,
     groupIds: groupIds,
@@ -92,18 +95,18 @@ proc teardown(coord: NuRaftCoordinator, storagePath: string) =
   coord.stop()
   try: removeDir(storagePath) except CatchableError: discard
 
-proc seedSpaceAndTable(store: RaftKVStoreExt, spaceId: int,
-    tableId: uint32, groupIds: seq[GroupID]) =
+proc seedSpaceAndTable(store: RaftKVStoreExt, spaceIdNum: int,
+    tableId: TableId, groupIds: seq[GroupID]) =
   ## Write a space record and a table record into the meta range, then
   ## reload the caches.
-  let spaceUid = coreTypes.genULID()
-  let spaceKey = encodeSpaceKey(spaceUid)
+  let spaceId = coreTypes.genSpaceID()
+  let spaceKey = encodeSpaceKey(spaceId)
   var ulidGroupIds: seq[ULID] = @[]
   for gid in groupIds:
     ulidGroupIds.add(groupIDToULID(gid))
   let spaceRec = SpaceRecord(
-    spaceId: spaceUid, # Use the same ULID as the key
-    name: "space_" & $spaceId,
+    spaceId: ULID(spaceId), # SpaceRecord.spaceId is ULID
+    name: "space_" & $spaceIdNum,
     replicas: 1,
     groupCount: int32(groupIds.len),
     groupIds: ulidGroupIds,
@@ -116,7 +119,7 @@ proc seedSpaceAndTable(store: RaftKVStoreExt, spaceId: int,
     name: "t" & $tableId,
     schema: "public",
     database: "default",
-    spaceId: spaceUid, # Use the same spaceId as the space record
+    spaceId: spaceId, # TableRecord.spaceId is SpaceID
   )
   discard store.raftPut(tableKey, tableRec.encode())
 
@@ -133,15 +136,24 @@ suite "resolveGroupId — space-aware routing":
     let (coord, store, _) = makeMultiGroupStore("/tmp/fractio_rgs_t01", 3)
     defer: teardown(coord, "/tmp/fractio_rgs_t01")
 
-    # /sys/meta1/* keys
-    let r1 = store.resolveGroupId("/sys/meta1/foo")
+    # System table keys within meta range (tableId 1-7)
+    # SYS_DATABASES_TABLE_ID (num=1), SYS_SCHEMAS_TABLE_ID (num=2),
+    # SYS_TABLES_TABLE_ID (num=3), SYS_GROUPS_TABLE_ID (num=4),
+    # SYS_NODES_TABLE_ID (num=5), SYS_SETTINGS_TABLE_ID (num=6),
+    # SYS_SPACES_TABLE_ID (num=7) all route to META_GROUP_ID
+    let r1 = store.resolveGroupId(encodeTableKey(SYS_NODES_TABLE_ID, "1"))
     check r1.isSome
     check r1.get() == META_GROUP_ID
 
-    # System table keys within meta range (tableId 1-6)
-    let r2 = store.resolveGroupId(encodeTableKey(SYS_NODES_TABLE_ID, "1"))
+    let r2 = store.resolveGroupId(encodeTableKey(SYS_TABLES_TABLE_ID,
+        "default.public.mytable"))
     check r2.isSome
     check r2.get() == META_GROUP_ID
+
+    let r3 = store.resolveGroupId(encodeTableKey(SYS_SPACES_TABLE_ID,
+        "somespaceid"))
+    check r3.isSome
+    check r3.get() == META_GROUP_ID
 
   test "system table keys route to DATA_GROUP_START_ID":
     let (coord, store, _) = makeMultiGroupStore("/tmp/fractio_rgs_t02", 3)
@@ -149,7 +161,7 @@ suite "resolveGroupId — space-aware routing":
 
     # SYS_NODES_TABLE_ID = 5, which is in meta range (1-6), so actually META_GROUP_ID
     # Table ID > 6 but < 100 is a system table in data range
-    let key = encodeTableKey(10'u32, "some_metric")
+    let key = encodeTableKey(genTableId(), "some_metric")
     let r = store.resolveGroupId(key)
     check r.isSome
     check r.get() == DATA_GROUP_START_ID
@@ -161,8 +173,8 @@ suite "resolveGroupId — space-aware routing":
     store.loadSpaces()
     store.loadTableSpaces()
 
-    # tableId=100, no space mapping exists
-    let key = encodeDataRowKey(100, "42")
+    # tableId not in any space, no space mapping exists
+    let key = encodeDataRowKey(genTableId(), "42")
     let r = store.resolveGroupId(key)
     check r.isSome
     check r.get() == DATA_GROUP_START_ID
@@ -171,10 +183,10 @@ suite "resolveGroupId — space-aware routing":
     let (coord, store, space) = makeMultiGroupStore("/tmp/fractio_rgs_t04", 3)
     defer: teardown(coord, "/tmp/fractio_rgs_t04")
 
-    seedSpaceAndTable(store, 2, 100, space.groupIds)
+    seedSpaceAndTable(store, 2, testTableId, space.groupIds)
 
     let pk = "42"
-    let key = encodeDataRowKey(100, pk)
+    let key = encodeDataRowKey(testTableId, pk)
     let r = store.resolveGroupId(key)
     check r.isSome
 
@@ -187,13 +199,12 @@ suite "resolveGroupId — space-aware routing":
     let (coord, store, space) = makeMultiGroupStore("/tmp/fractio_rgs_t05", 3)
     defer: teardown(coord, "/tmp/fractio_rgs_t05")
 
-    seedSpaceAndTable(store, 2, 100, space.groupIds)
+    seedSpaceAndTable(store, 2, testTableId, space.groupIds)
 
-    # Hash 50 keys, check distribution across groups
-    var seen: set[uint8] = {}
+    # Hash 50 keys, check that routing works
     for i in 0 ..< 50:
       let pk = "key_" & $i
-      let key = encodeDataRowKey(100, pk)
+      let key = encodeDataRowKey(testTableId, pk)
       let r = store.resolveGroupId(key)
       check r.isSome
       let gid = r.get()
@@ -283,9 +294,10 @@ suite "raftPut/raftDelete via resolveGroupId for space keys":
     let (coord, store, space) = makeMultiGroupStore("/tmp/fractio_rgs_t20", 3)
     defer: teardown(coord, "/tmp/fractio_rgs_t20")
 
-    seedSpaceAndTable(store, 2, 100, space.groupIds)
+    let putTableId = genTableId()
+    seedSpaceAndTable(store, 2, putTableId, space.groupIds)
 
-    let key = encodeDataRowKey(100, "42")
+    let key = encodeDataRowKey(putTableId, "42")
     let val = """{"id":42,"name":"test"}"""
     let wr = store.raftPut(key, val)
     check wr.isOk
@@ -301,9 +313,10 @@ suite "raftPut/raftDelete via resolveGroupId for space keys":
     let (coord, store, space) = makeMultiGroupStore("/tmp/fractio_rgs_t21", 3)
     defer: teardown(coord, "/tmp/fractio_rgs_t21")
 
-    seedSpaceAndTable(store, 2, 100, space.groupIds)
+    let delTableId = genTableId()
+    seedSpaceAndTable(store, 2, delTableId, space.groupIds)
 
-    let key = encodeDataRowKey(100, "99")
+    let key = encodeDataRowKey(delTableId, "99")
     let val = """{"id":99}"""
     discard store.raftPut(key, val)
 
