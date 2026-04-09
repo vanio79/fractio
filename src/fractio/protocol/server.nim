@@ -33,6 +33,7 @@ import ./messages/space as spaceMsgs
 import ./txn_manager
 import ./raft_store
 import ./mvcc_store
+import ./cluster_state_binary
 import ../core/types
 import ../utils/logging
 import ../utils/socket_utils
@@ -47,7 +48,6 @@ import ../distributed/meta/system_schemas
 import ../distributed/space_manager
 import ../core/timestamp_provider
 import ../storage/mvcc/types as mvccValueTypes
-import std/json
 
 # ---------------------------------------------------------------------------
 # Safe logging helper — swallows any logger exception so callers can be raises:[]
@@ -1840,54 +1840,39 @@ proc acceptLoop(args: AcceptLoopArgs) {.thread.} =
 # Cluster membership persistence
 # ---------------------------------------------------------------------------
 
-type
-  ClusterMember = object
-    nodeId: uint32
-    host: string
-    raftPort: int
-    clientPort: int
-    webPort: int
-
 proc clusterStatePath(server: ProtocolServer): string =
-  server.config.dataDir / "cluster.json"
+  server.config.dataDir / "cluster.bin"
 
 proc saveClusterState*(server: ProtocolServer) =
   ## Persist current cluster membership to disk so a restarted node can
   ## rejoin as a follower without requiring --join.
+  ## Uses binary serialization for efficiency.
   if server.config.dataDir == "": return
   let coord = server.raftCoord
   if coord.isNil: return
 
-  var peersArr = newJArray()
-  for nid, info in coord.peerInfo:
-    peersArr.add( %* {
-      "nodeId": nid.int,
-      "host": info.host,
-      "raftPort": info.port,
-    })
+  # Build persisted cluster state
+  var state = newPersistedClusterState()
+  state.self = SelfNodeInfo(
+    nodeId: uint32(server.config.serverId),
+    host: server.config.host,
+    clientPort: server.config.port,
+    webPort: server.config.webPort
+  )
 
-  let j = %* {
-    "self": {
-      "nodeId": server.config.serverId.int,
-      "host": server.config.host,
-      "clientPort": server.config.port,
-      "webPort": server.config.webPort,
-    },
-    "peers": peersArr,
-  }
+  for nid, info in coord.peerInfo:
+    state.peers[nid] = (host: info.host, port: info.port)
 
   try:
-    writeFile(server.clusterStatePath, $j)
+    saveClusterStateToFile(state, server.clusterStatePath)
   except CatchableError: discard
 
-proc loadClusterState(dataDir: string): Option[JsonNode] =
-  ## Load saved cluster membership. Returns none if no state exists.
-  let path = dataDir / "cluster.json"
-  if not fileExists(path): return none(JsonNode)
-  try:
-    result = some(parseJson(readFile(path)))
-  except CatchableError:
-    result = none(JsonNode)
+proc loadClusterStateFromBinary(dataDir: string): Option[
+    PersistedClusterState] =
+  ## Load saved cluster membership from binary file.
+  ## Returns none if no state exists or file is invalid.
+  let path = dataDir / "cluster.bin"
+  loadClusterStateFromFile(path)
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -1928,18 +1913,14 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
   # Check for saved cluster state (from a previous run as part of a cluster).
   var isRejoining = false
   if startAsLeader:
-    let saved = loadClusterState(server.config.dataDir)
+    let saved = loadClusterStateFromBinary(server.config.dataDir)
     if saved.isSome:
-      let sj = saved.get
-      let savedPeers = sj.getOrDefault("peers")
-      if not savedPeers.isNil and savedPeers.kind == JArray and savedPeers.len > 0:
+      let ss = saved.get
+      if ss.peers.len > 0:
         isRejoining = true
-        for p in savedPeers:
-          let pNodeId = uint32(p.getOrDefault("nodeId").getInt(0))
-          let pHost = p.getOrDefault("host").getStr("")
-          let pRaftPort = p.getOrDefault("raftPort").getInt(0)
-          if pNodeId > 0 and pHost != "" and pRaftPort > 0:
-            peers.add((nodeId: pNodeId, host: pHost, port: pRaftPort))
+        for nid, info in ss.peers.pairs():
+          if nid > 0 and info.host != "" and info.port > 0:
+            peers.add((nodeId: nid, host: info.host, port: info.port))
         if peers.len > 0:
           echo "recovered cluster membership from disk: " & $peers.len & " peers"
 
