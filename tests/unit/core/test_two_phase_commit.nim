@@ -498,16 +498,16 @@ suite "Two-Phase Commit - Serialization":
       participantEndpoints: @["node1:8000", "node2:8001"]
     )
 
-    let json = request.twoPCRequestToJson()
-    let deserialized = twoPCRequestFromJson(json)
+    let encoded = encodeTwoPCRequest(request)
+    let decoded = decodeTwoPCRequest(encoded)
 
-    check deserialized.requestId == request.requestId
-    check deserialized.requestType == request.requestType
-    check deserialized.transactionId == request.transactionId
-    check deserialized.coordinatorId == request.coordinatorId
-    check deserialized.timestamp == request.timestamp
-    check deserialized.data == request.data
-    check deserialized.participantEndpoints == request.participantEndpoints
+    check decoded.requestId == request.requestId
+    check decoded.requestType == request.requestType
+    check decoded.transactionId == request.transactionId
+    check decoded.coordinatorId == request.coordinatorId
+    check decoded.timestamp == request.timestamp
+    check decoded.data == request.data
+    check decoded.participantEndpoints == request.participantEndpoints
 
   test "serialize and deserialize response":
     let response = TwoPCResponse(
@@ -519,15 +519,15 @@ suite "Two-Phase Commit - Serialization":
       error: ""
     )
 
-    let json = response.twoPCResponseToJson()
-    let deserialized = twoPCResponseFromJson(json)
+    let encoded = encodeTwoPCResponse(response)
+    let decoded = decodeTwoPCResponse(encoded)
 
-    check deserialized.requestId == response.requestId
-    check deserialized.transactionId == response.transactionId
-    check deserialized.participantId == response.participantId
-    check deserialized.vote == response.vote
-    check deserialized.state == response.state
-    check deserialized.error == response.error
+    check decoded.requestId == response.requestId
+    check decoded.transactionId == response.transactionId
+    check decoded.participantId == response.participantId
+    check decoded.vote == response.vote
+    check decoded.state == response.state
+    check decoded.error == response.error
 
 suite "Two-Phase Commit - Error Handling":
   test "create 2PC error":
