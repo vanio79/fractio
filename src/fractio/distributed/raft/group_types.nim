@@ -5,9 +5,9 @@
 
 import std/hashes
 import std/strutils
-import std/json
 import std/options
 import fractio/core/types
+import fractio/utils/binary
 
 # ============================================================================
 # Byte sequence comparison utilities
@@ -243,27 +243,59 @@ proc hash*(rep: ReplicaDescriptor): Hash =
   h = h !& hash(rep.replicaId)
   result = !$h
 
-proc toJson*(rep: ReplicaDescriptor): JsonNode =
-  ## Serialize ReplicaDescriptor to JSON
-  result = %*{
-    "nodeId": rep.nodeId.uint32,
-    "replicaId": rep.replicaId.uint32,
-    "replicaType": ord(rep.replicaType)
-  }
+# =============================================================================
+# ReplicaDescriptor Binary Serialization
+# =============================================================================
 
-proc parseReplicaDescriptor*(json: JsonNode): ReplicaDescriptor =
-  ## Parse ReplicaDescriptor from JSON
-  let typeVal = json["replicaType"].getInt()
-  # Validate replica type - default to rtVoter for unknown values
-  let repType = if typeVal >= 0 and typeVal <= ord(rtNonVoter):
-                  ReplicaType(typeVal)
-                else:
-                  rtVoter
-  result = ReplicaDescriptor(
-    nodeId: NodeID(json["nodeId"].getInt()),
-    replicaId: ReplicaID(json["replicaId"].getInt()),
-    replicaType: repType
-  )
+const
+  REPLICA_DESC_MAGIC* = [0x52'u8, 0x50'u8, 0x44'u8] # "RPD" - Replica Descriptor
+  REPLICA_DESC_VERSION* = 0x01'u8
+
+proc encodeReplicaDescriptor*(rep: ReplicaDescriptor): string =
+  ## Encode a ReplicaDescriptor to binary format.
+  ##
+  ## Binary format (little-endian):
+  ## - Magic: 3 bytes ("RPD")
+  ## - Version: 1 byte
+  ## - NodeId: 4 bytes (uint32)
+  ## - ReplicaId: 4 bytes (uint32)
+  ## - ReplicaType: 1 byte (uint8 ordinal)
+  ## Total: 13 bytes
+  var w = initBinaryWriter()
+  w.writeBytes(REPLICA_DESC_MAGIC)
+  w.writeU8(REPLICA_DESC_VERSION)
+  w.writeU32(rep.nodeId.uint32)
+  w.writeU32(rep.replicaId.uint32)
+  w.writeU8(uint8(ord(rep.replicaType)))
+  w.finish()
+
+proc decodeReplicaDescriptor*(data: string): ReplicaDescriptor =
+  ## Decode binary data to a ReplicaDescriptor.
+  ## Raises ValueError if data is invalid.
+  if data.len < 13:
+    raise newException(ValueError, "ReplicaDescriptor: data too small")
+  var r = initBinaryReader(data)
+
+  # Verify magic header
+  let magic0 = r.readU8()
+  let magic1 = r.readU8()
+  let magic2 = r.readU8()
+  if magic0 != REPLICA_DESC_MAGIC[0] or magic1 != REPLICA_DESC_MAGIC[1] or
+     magic2 != REPLICA_DESC_MAGIC[2]:
+    raise newException(ValueError, "ReplicaDescriptor: invalid magic header")
+
+  # Verify version
+  let version = r.readU8()
+  if version != REPLICA_DESC_VERSION:
+    raise newException(ValueError, "ReplicaDescriptor: unsupported version " & $version)
+
+  result.nodeId = NodeID(r.readU32())
+  result.replicaId = ReplicaID(r.readU32())
+  let typeVal = int(r.readU8())
+  result.replicaType = if typeVal >= 0 and typeVal <= ord(rtNonVoter):
+                         ReplicaType(typeVal)
+                       else:
+                         rtVoter
 
 # ============================================================================
 # GroupDescriptor operations
@@ -338,39 +370,73 @@ proc quorumSize*(desc: GroupDescriptor): int =
   let voters = desc.getVoters()
   result = (voters.len div 2) + 1
 
-proc toJson*(desc: GroupDescriptor): JsonNode =
-  ## Serialize GroupDescriptor to JSON
-  var replicasJson = newJArray()
+# =============================================================================
+# GroupDescriptor Binary Serialization
+# =============================================================================
+
+const
+  GROUP_DESC_MAGIC* = [0x47'u8, 0x50'u8, 0x44'u8] # "GPD" - Group Descriptor
+  GROUP_DESC_VERSION* = 0x01'u8
+
+proc encodeGroupDescriptor*(desc: GroupDescriptor): string =
+  ## Encode a GroupDescriptor to binary format.
+  ##
+  ## Binary format (little-endian):
+  ## - Magic: 3 bytes ("GPD")
+  ## - Version: 1 byte
+  ## - GroupId: 16 bytes (ULID)
+  ## - Generation: 8 bytes (uint64)
+  ## - NextReplicaId: 4 bytes (uint32)
+  ## - PreferredLeader: 4 bytes (uint32, 0 if invalid)
+  ## - Leader: 4 bytes (uint32, 0 if invalid)
+  ## - Replica count: 4 bytes (uint32)
+  ## - Replicas: N * 13 bytes (each ReplicaDescriptor)
+  var w = initBinaryWriter()
+  w.writeBytes(GROUP_DESC_MAGIC)
+  w.writeU8(GROUP_DESC_VERSION)
+  w.writeBytes(groupIDToBytes(desc.groupId))
+  w.writeU64(desc.generation)
+  w.writeU32(desc.nextReplicaId.uint32)
+  w.writeU32(desc.preferredLeader.uint32)
+  w.writeU32(desc.leader.uint32)
+  w.writeU32(uint32(desc.replicas.len))
   for rep in desc.replicas:
-    replicasJson.add(rep.toJson())
+    w.writeBytes(encodeReplicaDescriptor(rep))
+  w.finish()
 
-  result = %*{
-    "groupId": $(desc.groupId),
-    "replicas": replicasJson,
-    "nextReplicaId": desc.nextReplicaId.uint32,
-    "generation": desc.generation
-  }
-  if desc.preferredLeader.isValid:
-    result["preferredLeader"] = newJInt(int(desc.preferredLeader.uint32))
-  if desc.leader.isValid:
-    result["leader"] = newJInt(int(desc.leader.uint32))
+proc decodeGroupDescriptor*(data: string): GroupDescriptor =
+  ## Decode binary data to a GroupDescriptor.
+  ## Raises ValueError if data is invalid.
+  if data.len < 44: # 3 + 1 + 16 + 8 + 4 + 4 + 4 + 4 = 44 minimum
+    raise newException(ValueError, "GroupDescriptor: data too small")
+  var r = initBinaryReader(data)
 
-proc parseGroupDescriptor*(json: JsonNode): GroupDescriptor =
-  ## Parse GroupDescriptor from JSON
+  # Verify magic header
+  let magic0 = r.readU8()
+  let magic1 = r.readU8()
+  let magic2 = r.readU8()
+  if magic0 != GROUP_DESC_MAGIC[0] or magic1 != GROUP_DESC_MAGIC[1] or
+     magic2 != GROUP_DESC_MAGIC[2]:
+    raise newException(ValueError, "GroupDescriptor: invalid magic header")
+
+  # Verify version
+  let version = r.readU8()
+  if version != GROUP_DESC_VERSION:
+    raise newException(ValueError, "GroupDescriptor: unsupported version " & $version)
+
   new(result)
-  result.groupId = parseGroupID(json["groupId"].getStr())
+  let groupIdBytes = r.readFixedString(16)
+  result.groupId = groupIDFromBytes(groupIdBytes)
+  result.generation = r.readU64()
+  result.nextReplicaId = ReplicaID(r.readU32())
+  result.preferredLeader = NodeID(r.readU32())
+  result.leader = NodeID(r.readU32())
 
-  # Parse replicas
-  for repJson in json["replicas"]:
-    result.replicas.add(parseReplicaDescriptor(repJson))
-
-  result.nextReplicaId = ReplicaID(json["nextReplicaId"].getInt())
-  result.generation = uint64(json["generation"].getBiggestInt())
-
-  if json.hasKey("preferredLeader"):
-    result.preferredLeader = NodeID(uint32(json["preferredLeader"].getInt()))
-  if json.hasKey("leader"):
-    result.leader = NodeID(uint32(json["leader"].getInt()))
+  let replicaCount = int(r.readU32())
+  result.replicas = newSeq[ReplicaDescriptor](replicaCount)
+  for i in 0..<replicaCount:
+    let repBytes = r.readFixedString(13)
+    result.replicas[i] = decodeReplicaDescriptor(repBytes)
 
 proc `$`*(desc: GroupDescriptor): string =
   ## String representation of GroupDescriptor

@@ -1,7 +1,6 @@
 # Unit tests for Group Types
 
 import std/unittest
-import std/json
 import std/strutils
 import std/tables
 import std/options
@@ -116,19 +115,18 @@ suite "ReplicaDescriptor":
     check rep1 == rep2
     check rep1 != rep3
 
-  test "JSON serialization":
+  test "binary serialization":
     let rep = newReplicaDescriptor(NodeID(42), ReplicaID(7), rtNonVoter)
-    let json = rep.toJson()
-    check json["nodeId"].getInt() == 42
-    check json["replicaId"].getInt() == 7
-    check json["replicaType"].getInt() == ord(rtNonVoter)
+    let encoded = encodeReplicaDescriptor(rep)
+    check encoded.len == 13 # Fixed size
 
-  test "JSON deserialization":
-    let json = %*{"nodeId": 42, "replicaId": 7, "replicaType": 1}
-    let rep = parseReplicaDescriptor(json)
-    check rep.nodeId == NodeID(42)
-    check rep.replicaId == ReplicaID(7)
-    check rep.replicaType == rtNonVoter
+  test "binary deserialization":
+    let rep = newReplicaDescriptor(NodeID(42), ReplicaID(7), rtNonVoter)
+    let encoded = encodeReplicaDescriptor(rep)
+    let decoded = decodeReplicaDescriptor(encoded)
+    check decoded.nodeId == NodeID(42)
+    check decoded.replicaId == ReplicaID(7)
+    check decoded.replicaType == rtNonVoter
 
 suite "GroupDescriptor":
   test "create basic descriptor":
@@ -207,19 +205,19 @@ suite "GroupDescriptor":
     discard desc.addReplica(NodeID(1))
     check desc.isInitialized()
 
-  test "JSON round-trip":
+  test "binary round-trip":
     let gid = genGroupID()
     let desc = newGroupDescriptor(gid)
     discard desc.addReplica(NodeID(1))
     discard desc.addReplica(NodeID(2))
     discard desc.addReplica(NodeID(3))
 
-    let json = desc.toJson()
-    let parsed = parseGroupDescriptor(json)
+    let encoded = encodeGroupDescriptor(desc)
+    let decoded = decodeGroupDescriptor(encoded)
 
-    check parsed.groupId == desc.groupId
-    check parsed.replicas.len == desc.replicas.len
-    check parsed.generation == desc.generation
+    check decoded.groupId == desc.groupId
+    check decoded.replicas.len == desc.replicas.len
+    check decoded.generation == desc.generation
 
 suite "Key Encoding":
   test "group prefix":
