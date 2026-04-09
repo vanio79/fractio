@@ -9,33 +9,46 @@
 # - Length-prefixed strings/sequences for variable-length data
 # - No type tags (caller knows the schema)
 # - No alignment requirements (packed)
+# - Optimized for little-endian architectures (direct memory copy)
 
 # =============================================================================
-# Byte Order Helpers
+# Byte Order Helpers (optimized for LE systems)
 # =============================================================================
 
 proc toBytesLE*(value: uint16): array[2, byte] {.inline.} =
-  ## Convert uint16 to little-endian bytes
-  result[0] = byte(value and 0xFF'u16)
-  result[1] = byte((value shr 8) and 0xFF'u16)
+  ## Convert uint16 to little-endian bytes.
+  ## On LE systems, uses direct memory copy for performance.
+  when defined(littleEndian):
+    copyMem(addr result[0], unsafeAddr value, 2)
+  else:
+    result[0] = byte(value and 0xFF'u16)
+    result[1] = byte((value shr 8) and 0xFF'u16)
 
 proc toBytesLE*(value: uint32): array[4, byte] {.inline.} =
-  ## Convert uint32 to little-endian bytes
-  result[0] = byte(value and 0xFF'u32)
-  result[1] = byte((value shr 8) and 0xFF'u32)
-  result[2] = byte((value shr 16) and 0xFF'u32)
-  result[3] = byte((value shr 24) and 0xFF'u32)
+  ## Convert uint32 to little-endian bytes.
+  ## On LE systems, uses direct memory copy for performance.
+  when defined(littleEndian):
+    copyMem(addr result[0], unsafeAddr value, 4)
+  else:
+    result[0] = byte(value and 0xFF'u32)
+    result[1] = byte((value shr 8) and 0xFF'u32)
+    result[2] = byte((value shr 16) and 0xFF'u32)
+    result[3] = byte((value shr 24) and 0xFF'u32)
 
 proc toBytesLE*(value: uint64): array[8, byte] {.inline.} =
-  ## Convert uint64 to little-endian bytes
-  result[0] = byte(value and 0xFF'u64)
-  result[1] = byte((value shr 8) and 0xFF'u64)
-  result[2] = byte((value shr 16) and 0xFF'u64)
-  result[3] = byte((value shr 24) and 0xFF'u64)
-  result[4] = byte((value shr 32) and 0xFF'u64)
-  result[5] = byte((value shr 40) and 0xFF'u64)
-  result[6] = byte((value shr 48) and 0xFF'u64)
-  result[7] = byte((value shr 56) and 0xFF'u64)
+  ## Convert uint64 to little-endian bytes.
+  ## On LE systems, uses direct memory copy for performance.
+  when defined(littleEndian):
+    copyMem(addr result[0], unsafeAddr value, 8)
+  else:
+    result[0] = byte(value and 0xFF'u64)
+    result[1] = byte((value shr 8) and 0xFF'u64)
+    result[2] = byte((value shr 16) and 0xFF'u64)
+    result[3] = byte((value shr 24) and 0xFF'u64)
+    result[4] = byte((value shr 32) and 0xFF'u64)
+    result[5] = byte((value shr 40) and 0xFF'u64)
+    result[6] = byte((value shr 48) and 0xFF'u64)
+    result[7] = byte((value shr 56) and 0xFF'u64)
 
 proc toBytesLE*(value: int32): array[4, byte] {.inline.} =
   toBytesLE(cast[uint32](value))
@@ -44,26 +57,38 @@ proc toBytesLE*(value: int64): array[8, byte] {.inline.} =
   toBytesLE(cast[uint64](value))
 
 proc fromBytesU16*(bytes: openArray[byte]): uint16 {.inline.} =
-  ## Convert little-endian bytes to uint16
-  result = uint16(bytes[0]) or (uint16(bytes[1]) shl 8)
+  ## Convert little-endian bytes to uint16.
+  ## On LE systems, uses direct memory copy for performance.
+  when defined(littleEndian):
+    copyMem(addr result, unsafeAddr bytes[0], 2)
+  else:
+    result = uint16(bytes[0]) or (uint16(bytes[1]) shl 8)
 
 proc fromBytesU32*(bytes: openArray[byte]): uint32 {.inline.} =
-  ## Convert little-endian bytes to uint32
-  result = uint32(bytes[0]) or
-           (uint32(bytes[1]) shl 8) or
-           (uint32(bytes[2]) shl 16) or
-           (uint32(bytes[3]) shl 24)
+  ## Convert little-endian bytes to uint32.
+  ## On LE systems, uses direct memory copy for performance.
+  when defined(littleEndian):
+    copyMem(addr result, unsafeAddr bytes[0], 4)
+  else:
+    result = uint32(bytes[0]) or
+             (uint32(bytes[1]) shl 8) or
+             (uint32(bytes[2]) shl 16) or
+             (uint32(bytes[3]) shl 24)
 
 proc fromBytesU64*(bytes: openArray[byte]): uint64 {.inline.} =
-  ## Convert little-endian bytes to uint64
-  result = uint64(bytes[0]) or
-           (uint64(bytes[1]) shl 8) or
-           (uint64(bytes[2]) shl 16) or
-           (uint64(bytes[3]) shl 24) or
-           (uint64(bytes[4]) shl 32) or
-           (uint64(bytes[5]) shl 40) or
-           (uint64(bytes[6]) shl 48) or
-           (uint64(bytes[7]) shl 56)
+  ## Convert little-endian bytes to uint64.
+  ## On LE systems, uses direct memory copy for performance.
+  when defined(littleEndian):
+    copyMem(addr result, unsafeAddr bytes[0], 8)
+  else:
+    result = uint64(bytes[0]) or
+             (uint64(bytes[1]) shl 8) or
+             (uint64(bytes[2]) shl 16) or
+             (uint64(bytes[3]) shl 24) or
+             (uint64(bytes[4]) shl 32) or
+             (uint64(bytes[5]) shl 40) or
+             (uint64(bytes[6]) shl 48) or
+             (uint64(bytes[7]) shl 56)
 
 proc fromBytesI32*(bytes: openArray[byte]): int32 {.inline.} =
   cast[int32](fromBytesU32(bytes))
@@ -104,27 +129,39 @@ proc writeU8*(w: var BinaryWriter, value: uint8) {.inline.} =
   inc w.pos
 
 proc writeU16*(w: var BinaryWriter, value: uint16) {.inline.} =
-  ## Write a uint16 (little-endian)
+  ## Write a uint16 (little-endian).
+  ## On LE systems, uses direct memory copy for performance.
   w.ensureCapacity(2)
-  let bytes = toBytesLE(value)
-  w.data[w.pos] = bytes[0]
-  w.data[w.pos + 1] = bytes[1]
+  when defined(littleEndian):
+    copyMem(addr w.data[w.pos], unsafeAddr value, 2)
+  else:
+    let bytes = toBytesLE(value)
+    w.data[w.pos] = bytes[0]
+    w.data[w.pos + 1] = bytes[1]
   inc w.pos, 2
 
 proc writeU32*(w: var BinaryWriter, value: uint32) {.inline.} =
-  ## Write a uint32 (little-endian)
+  ## Write a uint32 (little-endian).
+  ## On LE systems, uses direct memory copy for performance.
   w.ensureCapacity(4)
-  let bytes = toBytesLE(value)
-  for i in 0..<4:
-    w.data[w.pos + i] = bytes[i]
+  when defined(littleEndian):
+    copyMem(addr w.data[w.pos], unsafeAddr value, 4)
+  else:
+    let bytes = toBytesLE(value)
+    for i in 0..<4:
+      w.data[w.pos + i] = bytes[i]
   inc w.pos, 4
 
 proc writeU64*(w: var BinaryWriter, value: uint64) {.inline.} =
-  ## Write a uint64 (little-endian)
+  ## Write a uint64 (little-endian).
+  ## On LE systems, uses direct memory copy for performance.
   w.ensureCapacity(8)
-  let bytes = toBytesLE(value)
-  for i in 0..<8:
-    w.data[w.pos + i] = bytes[i]
+  when defined(littleEndian):
+    copyMem(addr w.data[w.pos], unsafeAddr value, 8)
+  else:
+    let bytes = toBytesLE(value)
+    for i in 0..<8:
+      w.data[w.pos + i] = bytes[i]
   inc w.pos, 8
 
 proc writeI32*(w: var BinaryWriter, value: int32) {.inline.} =
@@ -215,34 +252,46 @@ proc readU8*(r: var BinaryReader): uint8 {.inline.} =
   inc r.pos
 
 proc readU16*(r: var BinaryReader): uint16 {.inline.} =
-  ## Read a uint16 (little-endian) using direct memory access
+  ## Read a uint16 (little-endian).
+  ## On LE systems, uses direct memory copy for performance.
   if r.pos + 2 > r.data.len:
     raise newException(ValueError, "BinaryReader: unexpected end of data")
-  result = uint16(uint8(r.data[r.pos])) or (uint16(uint8(r.data[r.pos + 1])) shl 8)
+  when defined(littleEndian):
+    copyMem(addr result, addr r.data[r.pos], 2)
+  else:
+    result = uint16(uint8(r.data[r.pos])) or (uint16(uint8(r.data[r.pos + 1])) shl 8)
   inc r.pos, 2
 
 proc readU32*(r: var BinaryReader): uint32 {.inline.} =
-  ## Read a uint32 (little-endian) using direct computation
+  ## Read a uint32 (little-endian).
+  ## On LE systems, uses direct memory copy for performance.
   if r.pos + 4 > r.data.len:
     raise newException(ValueError, "BinaryReader: unexpected end of data")
-  result = uint32(uint8(r.data[r.pos])) or
-           (uint32(uint8(r.data[r.pos + 1])) shl 8) or
-           (uint32(uint8(r.data[r.pos + 2])) shl 16) or
-           (uint32(uint8(r.data[r.pos + 3])) shl 24)
+  when defined(littleEndian):
+    copyMem(addr result, addr r.data[r.pos], 4)
+  else:
+    result = uint32(uint8(r.data[r.pos])) or
+             (uint32(uint8(r.data[r.pos + 1])) shl 8) or
+             (uint32(uint8(r.data[r.pos + 2])) shl 16) or
+             (uint32(uint8(r.data[r.pos + 3])) shl 24)
   inc r.pos, 4
 
 proc readU64*(r: var BinaryReader): uint64 {.inline.} =
-  ## Read a uint64 (little-endian) using direct computation
+  ## Read a uint64 (little-endian).
+  ## On LE systems, uses direct memory copy for performance.
   if r.pos + 8 > r.data.len:
     raise newException(ValueError, "BinaryReader: unexpected end of data")
-  result = uint64(uint8(r.data[r.pos])) or
-           (uint64(uint8(r.data[r.pos + 1])) shl 8) or
-           (uint64(uint8(r.data[r.pos + 2])) shl 16) or
-           (uint64(uint8(r.data[r.pos + 3])) shl 24) or
-           (uint64(uint8(r.data[r.pos + 4])) shl 32) or
-           (uint64(uint8(r.data[r.pos + 5])) shl 40) or
-           (uint64(uint8(r.data[r.pos + 6])) shl 48) or
-           (uint64(uint8(r.data[r.pos + 7])) shl 56)
+  when defined(littleEndian):
+    copyMem(addr result, addr r.data[r.pos], 8)
+  else:
+    result = uint64(uint8(r.data[r.pos])) or
+             (uint64(uint8(r.data[r.pos + 1])) shl 8) or
+             (uint64(uint8(r.data[r.pos + 2])) shl 16) or
+             (uint64(uint8(r.data[r.pos + 3])) shl 24) or
+             (uint64(uint8(r.data[r.pos + 4])) shl 32) or
+             (uint64(uint8(r.data[r.pos + 5])) shl 40) or
+             (uint64(uint8(r.data[r.pos + 6])) shl 48) or
+             (uint64(uint8(r.data[r.pos + 7])) shl 56)
   inc r.pos, 8
 
 proc readI32*(r: var BinaryReader): int32 {.inline.} =
