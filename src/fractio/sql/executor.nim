@@ -8,6 +8,7 @@ import std/[options, json, strutils, strformat, tables, algorithm]
 import ./ast
 import ./parser
 import ./planner
+import ./data_row
 import ../distributed/meta/system_tables
 import ../distributed/meta/system_schemas
 import ../distributed/raft/group_types
@@ -90,8 +91,119 @@ proc newExecutorContext*(client: FractioClient, database: string = "default",
 # Expression evaluator (in-memory, for WHERE filters)
 # ---------------------------------------------------------------------------
 
+proc evalExprDataRow*(expr: Expr, row: DataRow): DataRowValue =
+  ## Evaluate an expression against a DataRow.
+  case expr.kind
+  of exLiteral:
+    if expr.litValue == nil:
+      return newRowValue()
+    case expr.litValue.kind
+    of dtInt: return newRowValue(expr.litValue.intValue)
+    of dtFloat: return newRowValue(expr.litValue.floatValue)
+    of dtString: return newRowValue(expr.litValue.strValue)
+    of dtBool: return newRowValue(expr.litValue.boolValue)
+    else: return newRowValue()
+
+  of exColumn:
+    let name = expr.colName
+    if row.hasColumn(name):
+      return row[name]
+    return newRowValue()
+
+  of exBinOp:
+    let left = evalExprDataRow(expr.binLeft, row)
+    let right = evalExprDataRow(expr.binRight, row)
+
+    case expr.binOp
+    of boEq:
+      return newRowValue(left == right)
+    of boNeq:
+      return newRowValue(left != right)
+    of boLt:
+      return newRowValue(left < right)
+    of boLte:
+      return newRowValue(left <= right)
+    of boGt:
+      return newRowValue(left > right)
+    of boGte:
+      return newRowValue(left >= right)
+    of boAnd:
+      return left and right
+    of boOr:
+      return left or right
+    of boAdd:
+      return left + right
+    of boSub:
+      return left - right
+    of boMul:
+      return left * right
+    of boDiv:
+      return left div right
+    of boMod:
+      return left mod right
+
+  of exUnaryOp:
+    let inner = evalExprDataRow(expr.unaryExpr, row)
+    case expr.unaryOp
+    of uoNot:
+      return not inner
+    of uoNeg:
+      return -inner
+
+  of exIsNull:
+    let inner = evalExprDataRow(expr.isNullExpr, row)
+    let isNull = inner.kind == drvkNull
+    return newRowValue(if expr.isNullNot: not isNull else: isNull)
+
+  of exIn:
+    let val = evalExprDataRow(expr.inExpr, row)
+    var found = false
+    for item in expr.inList:
+      if evalExprDataRow(item, row) == val:
+        found = true
+        break
+    return newRowValue(if expr.inNot: not found else: found)
+
+  of exBetween:
+    let val = evalExprDataRow(expr.betweenExpr, row)
+    let lo = evalExprDataRow(expr.betweenLo, row)
+    let hi = evalExprDataRow(expr.betweenHi, row)
+    var inRange = val >= lo and val <= hi
+    return newRowValue(if expr.betweenNot: not inRange else: inRange)
+
+  of exLike:
+    # Simple LIKE: only handle % wildcard at start/end
+    let val = evalExprDataRow(expr.likeExpr, row)
+    let pat = evalExprDataRow(expr.likePattern, row)
+    if val.kind == drvkString and pat.kind == drvkString:
+      let s = val.strVal
+      let p = pat.strVal
+      var matches = false
+      if p.startsWith("%") and p.endsWith("%"):
+        matches = p[1..^2] in s
+      elif p.startsWith("%"):
+        matches = s.endsWith(p[1..^1])
+      elif p.endsWith("%"):
+        matches = s.startsWith(p[0..^2])
+      else:
+        matches = s == p
+      return newRowValue(if expr.likeNot: not matches else: matches)
+    return newRowValue()
+
+  of exStar, exParam, exList:
+    return newRowValue()
+
+proc matchesFilterDataRow*(filter: Option[Expr], row: DataRow): bool =
+  ## Check if a DataRow passes the WHERE filter.
+  if filter.isNone:
+    return true
+  let result = evalExprDataRow(filter.get(), row)
+  result.kind == drvkBool and result.boolVal
+
+# Legacy JSON-based evaluators (kept for backward compatibility with external code)
 proc evalExpr*(expr: Expr, row: JsonNode): JsonNode =
   ## Evaluate an expression against a JSON row object.
+  ## DEPRECATED: Use evalExprDataRow with DataRow instead.
   case expr.kind
   of exLiteral:
     if expr.litValue == nil:
@@ -218,6 +330,7 @@ proc evalExpr*(expr: Expr, row: JsonNode): JsonNode =
 
 proc matchesFilter*(filter: Option[Expr], row: JsonNode): bool =
   ## Check if a row passes the WHERE filter.
+  ## DEPRECATED: Use matchesFilterDataRow with DataRow instead.
   if filter.isNone:
     return true
   let result = evalExpr(filter.get(), row)
@@ -227,6 +340,22 @@ proc matchesFilter*(filter: Option[Expr], row: JsonNode): bool =
 # Row helpers
 # ---------------------------------------------------------------------------
 
+proc extractColumnsFromDataRow(row: DataRow, columns: seq[string]): seq[string] =
+  ## Extract column values from a DataRow as strings
+  for col in columns:
+    result.add(row[col].toStringValue())
+
+proc getPkValueFromDataRow(row: DataRow, pkColumn: string): string =
+  ## Get primary key value from a DataRow
+  if row.hasColumn(pkColumn):
+    let v = row[pkColumn]
+    case v.kind
+    of drvkString: return v.strVal
+    of drvkInt: return $v.intVal
+    else: return v.toStringValue()
+  ""
+
+# Legacy JSON helpers (kept for backward compatibility)
 proc jsonToStringValue(j: JsonNode): string =
   case j.kind
   of JString: j.getStr
@@ -786,15 +915,15 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
     of poInsert:
       var count = 0
       var error: string = ""
-      for rowJson in op.insRows:
-        let row = parseJson(rowJson)
-        let pkVal = getPkValue(row, op.insPkColumn)
+      for rowBinary in op.insRows:
+        let row = decodeDataRow(rowBinary)
+        let pkVal = getPkValueFromDataRow(row, op.insPkColumn)
         if pkVal.len == 0:
           error = "INSERT requires a primary key value"
           break
         let key = encodeDataRowKey(op.insTableId, pkVal)
         # Use active transaction if available, otherwise auto-transaction
-        let res = ctx.client.kvPut(key, rowJson, txnId = ctx.txnId)
+        let res = ctx.client.kvPut(key, rowBinary, txnId = ctx.txnId)
         if not res.isOk:
           error = &"failed to insert row: {res.err}"
           break
@@ -812,8 +941,8 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
         return errorResult(&"failed to read: {res.err}")
       if res.val.isNone:
         return rowsResult(op.pgColumns, @[])
-      let row = parseJson(res.val.get())
-      let vals = extractColumns(row, op.pgColumns)
+      let row = decodeDataRow(res.val.get())
+      let vals = extractColumnsFromDataRow(row, op.pgColumns)
       rowsResult(op.pgColumns, @[vals])
 
     of poScan:
@@ -825,13 +954,13 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
       var count = 0
       for entry in res.val:
         try:
-          let row = parseJson(entry.value)
-          if matchesFilter(op.scFilter, row):
-            resultRows.add(extractColumns(row, op.scColumns))
+          let row = decodeDataRow(entry.value)
+          if matchesFilterDataRow(op.scFilter, row):
+            resultRows.add(extractColumnsFromDataRow(row, op.scColumns))
             inc count
             if op.scLimit > 0 and count >= int(op.scLimit):
               break
-        except JsonParsingError:
+        except ValueError:
           discard # skip malformed rows
 
       rowsResult(op.scColumns, resultRows)
@@ -851,19 +980,18 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
       var error: string = ""
       for entry in res.val:
         try:
-          let row = parseJson(entry.value)
-          if matchesFilter(op.upFilter, row):
-            var updated = row.copy()
+          var row = decodeDataRow(entry.value)
+          if matchesFilterDataRow(op.upFilter, row):
             for (col, valExpr) in op.upSets:
-              updated[col] = evalExpr(valExpr, row)
+              row[col] = evalExprDataRow(valExpr, row)
             # Use active transaction if available
-            let putRes = ctx.client.kvPut(entry.key, $updated,
+            let putRes = ctx.client.kvPut(entry.key, encodeDataRow(row),
                 txnId = ctx.txnId)
             if not putRes.isOk:
               error = &"failed to update row: {putRes.err}"
               break
             inc count
-        except JsonParsingError:
+        except ValueError:
           discard
 
       if error.len > 0:
@@ -886,15 +1014,15 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
       var error: string = ""
       for entry in res.val:
         try:
-          let row = parseJson(entry.value)
-          if matchesFilter(op.delFilter, row):
+          let row = decodeDataRow(entry.value)
+          if matchesFilterDataRow(op.delFilter, row):
             # Use active transaction if available
             let delRes = ctx.client.kvDelete(entry.key, txnId = ctx.txnId)
             if not delRes.isOk:
               error = &"failed to delete row: {delRes.err}"
               break
             inc count
-        except JsonParsingError:
+        except ValueError:
           discard
 
       if error.len > 0:

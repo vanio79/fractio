@@ -6,6 +6,7 @@
 
 import std/[options, json, strutils, strformat]
 import ./ast
+import ./data_row
 import ../distributed/meta/system_tables
 import ../distributed/meta/system_schemas
 import ../client/fractio_client
@@ -84,7 +85,7 @@ type
       insTableName*: string
       insColumns*: seq[string]     # column names in order
       insPkColumn*: string         # primary key column name
-      insRows*: seq[string]        # JSON-encoded row objects
+      insRows*: seq[string]        # binary-encoded DataRow objects
 
     of poPointGet:
       pgTableId*: TableId
@@ -288,8 +289,22 @@ proc dataTypeToColumnDataType(dt: DataType): ColumnDataType =
   of dtDateTime: cdtDateTime
   of dtULID: cdtULID
 
+proc exprToDataRowValue*(e: Expr): DataRowValue =
+  ## Convert a literal expression to a DataRowValue.
+  if e.kind != exLiteral:
+    return newRowValue()
+  if e.litValue == nil:
+    return newRowValue()
+  case e.litValue.kind
+  of dtInt: newRowValue(e.litValue.intValue)
+  of dtFloat: newRowValue(e.litValue.floatValue)
+  of dtString: newRowValue(e.litValue.strValue)
+  of dtBool: newRowValue(e.litValue.boolValue)
+  else: newRowValue()
+
 proc exprToJsonValue*(e: Expr): JsonNode =
   ## Convert a literal expression to a JSON value.
+  ## Kept for backward compatibility with some utility functions.
   if e.kind != exLiteral:
     return newJNull()
   if e.litValue == nil:
@@ -418,11 +433,11 @@ proc planInsert(stmt: Stmt, client: FractioClient,
 
   var rows: seq[string]
   for row in stmt.intoValues:
-    var rowObj = newJObject()
+    var dataRow = newDataRow()
     for i, expr in row:
       if i < colNames.len:
-        rowObj[colNames[i]] = exprToJsonValue(expr)
-    rows.add($rowObj)
+        dataRow[colNames[i]] = exprToDataRowValue(expr)
+    rows.add(encodeDataRow(dataRow))
 
   plan.add(PlanOp(kind: poInsert,
     insTableId: desc.tableId,

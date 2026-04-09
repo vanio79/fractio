@@ -1,14 +1,25 @@
 # Raft Cluster Management
 
-import std/sets
 import std/tables
 import std/sequtils
-import std/json
 import std/options
 import std/strutils
 
 import fractio/utils/logging
+import fractio/utils/binary
 import fractio/distributed/raft/types
+
+# =============================================================================
+# Binary Serialization Constants
+# =============================================================================
+
+const
+  CLUSTER_MAGIC* = [0x52'u8, 0x43'u8, 0x4C'u8] # "RCL" - Raft Cluster binary marker
+  CLUSTER_VERSION* = 0x01'u8 # Current binary format version
+
+# =============================================================================
+# Raft Cluster Type
+# =============================================================================
 
 type
   RaftCluster* = ref object
@@ -78,50 +89,106 @@ proc getSelfEndpoint*(cluster: RaftCluster): Option[string] =
   ## Get the endpoint for the self server
   return cluster.getServerEndpoint(cluster.selfId)
 
-proc serializeCluster*(cluster: RaftCluster): string =
-  ## Serialize the cluster configuration
-  var jsonNodes: seq[JsonNode] = @[]
+proc encodeCluster*(cluster: RaftCluster): string =
+  ## Encode a RaftCluster to binary format.
+  ##
+  ## Binary format (little-endian):
+  ## - Magic: 3 bytes (0x52 0x43 0x4C = "RCL")
+  ## - Version: 1 byte (0x01)
+  ## - Self ID: 4 bytes (int32)
+  ## - Config:
+  ##   - ServerId: 4 bytes (int32)
+  ##   - ElectionTimeout: 4 bytes (int32)
+  ##   - HeartbeatInterval: 4 bytes (int32)
+  ##   - SnapshotEnabled: 1 byte (bool: 0 or 1)
+  ##   - SnapshotDistance: 4 bytes (int32)
+  ##   - MaxAppendSize: 4 bytes (int32)
+  ##   - Endpoint: length-prefixed string
+  ##   - LogStoragePath: length-prefixed string
+  ## - Servers:
+  ##   - Server count: 4 bytes (uint32)
+  ##   - For each server:
+  ##     - ServerId: 4 bytes (int32)
+  ##     - Endpoint: length-prefixed string
+  ##
+  ## Total minimum: 34 bytes (empty endpoints/paths, 0 servers)
+  var w = initBinaryWriter()
+  w.writeBytes(CLUSTER_MAGIC)
+  w.writeU8(CLUSTER_VERSION)
+  w.writeI32(cluster.selfId)
 
+  # Config fields (fixed-size first, then variable)
+  w.writeI32(cluster.config.serverId)
+  w.writeI32(int32(cluster.config.electionTimeout))
+  w.writeI32(int32(cluster.config.heartbeatInterval))
+  w.writeU8(if cluster.config.snapshotEnabled: 1'u8 else: 0'u8)
+  w.writeI32(int32(cluster.config.snapshotDistance))
+  w.writeI32(int32(cluster.config.maxAppendSize))
+  w.writeString(cluster.config.endpoint)
+  w.writeString(cluster.config.logStoragePath)
+
+  # Servers
+  w.writeU32(uint32(cluster.servers.len))
   for serverId, endpoint in cluster.servers.pairs():
-    jsonNodes.add( %* {
-      "server_id": serverId,
-      "endpoint": endpoint
-    })
+    w.writeI32(serverId)
+    w.writeString(endpoint)
 
-  return $( %* {
-    "servers": %jsonNodes,
-    "self_id": cluster.selfId,
-    "config": %* {
-      "server_id": cluster.config.serverId,
-      "endpoint": cluster.config.endpoint,
-      "election_timeout": cluster.config.electionTimeout,
-      "heartbeat_interval": cluster.config.heartbeatInterval,
-      "log_storage_path": cluster.config.logStoragePath,
-      "snapshot_enabled": cluster.config.snapshotEnabled,
-      "snapshot_distance": cluster.config.snapshotDistance
-    }
-  })
+  w.finish()
 
-proc deserializeCluster*(jsonData: string): RaftCluster =
-  ## Deserialize a cluster configuration
-  let jsonNode = parseJson(jsonData)
-  result = newRaftCluster(RaftConfig())
+proc decodeCluster*(data: string): RaftCluster =
+  ## Decode binary data to a RaftCluster.
+  ## Raises ValueError if data is invalid or not binary format.
+  var r = initBinaryReader(data)
 
-  for serverNode in jsonNode["servers"].getElems():
-    let serverId = serverNode["server_id"].getInt().int32
-    let endpoint = serverNode["endpoint"].getStr()
-    result.servers[serverId] = endpoint
+  # Verify magic header
+  if r.remaining < 4:
+    raise newException(ValueError, "Cluster: data too small for header")
+  let magic0 = r.readU8()
+  let magic1 = r.readU8()
+  let magic2 = r.readU8()
+  if magic0 != CLUSTER_MAGIC[0] or magic1 != CLUSTER_MAGIC[1] or magic2 !=
+      CLUSTER_MAGIC[2]:
+    raise newException(ValueError, "Cluster: invalid magic header")
 
-  result.selfId = jsonNode["self_id"].getInt().int32
-  result.config = RaftConfig(
-    serverId: result.selfId,
-    endpoint: jsonNode["config"]["endpoint"].getStr(),
-    electionTimeout: jsonNode["config"]["election_timeout"].getInt(),
-    heartbeatInterval: jsonNode["config"]["heartbeat_interval"].getInt(),
-    logStoragePath: jsonNode["config"]["log_storage_path"].getStr(),
-    snapshotEnabled: jsonNode["config"]["snapshot_enabled"].getBool(),
-    snapshotDistance: jsonNode["config"]["snapshot_distance"].getInt()
+  # Verify version
+  let version = r.readU8()
+  if version != CLUSTER_VERSION:
+    raise newException(ValueError, "Cluster: unsupported version " & $version)
+
+  # Read self ID
+  let selfId = r.readI32()
+
+  # Read config
+  let configServerId = r.readI32()
+  let electionTimeout = r.readI32()
+  let heartbeatInterval = r.readI32()
+  let snapshotEnabled = r.readU8() != 0
+  let snapshotDistance = r.readI32()
+  let maxAppendSize = r.readI32()
+  let endpoint = r.readString()
+  let logStoragePath = r.readString()
+
+  # Create config
+  let config = RaftConfig(
+    serverId: configServerId,
+    endpoint: endpoint,
+    electionTimeout: electionTimeout,
+    heartbeatInterval: heartbeatInterval,
+    logStoragePath: logStoragePath,
+    snapshotEnabled: snapshotEnabled,
+    snapshotDistance: snapshotDistance,
+    maxAppendSize: maxAppendSize
   )
+
+  result = newRaftCluster(config)
+  result.selfId = selfId
+
+  # Read servers
+  let serverCount = int(r.readU32())
+  for i in 0..<serverCount:
+    let serverId = r.readI32()
+    let serverEndpoint = r.readString()
+    result.servers[serverId] = serverEndpoint
 
 proc getClusterInfo*(cluster: RaftCluster): string =
   ## Get human-readable cluster information

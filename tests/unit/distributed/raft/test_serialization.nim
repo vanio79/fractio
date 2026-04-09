@@ -121,9 +121,9 @@ suite "Log Entry Serialization Tests":
     check entry.isNone
 
 
-suite "Cluster Configuration Serialization Tests":
+suite "Cluster Configuration Binary Serialization Tests":
 
-  test "Serialize cluster configuration":
+  test "Encode cluster configuration":
     let cluster = newRaftCluster(RaftConfig(
       serverId: 1,
       endpoint: "127.0.0.1:9000",
@@ -138,11 +138,14 @@ suite "Cluster Configuration Serialization Tests":
     discard cluster.addServer(2, "127.0.0.1:9001")
     discard cluster.addServer(3, "127.0.0.1:9002")
 
-    let serialized = cluster.serializeCluster()
-    check "\"servers\"" in serialized
-    check "\"self_id\":1" in serialized
+    let encoded = cluster.encodeCluster()
+    # Check magic header
+    check encoded[0] == 'R'
+    check encoded[1] == 'C'
+    check encoded[2] == 'L'
+    check encoded[3].ord == 1 # version
 
-  test "Deserialize cluster configuration":
+  test "Decode cluster configuration":
     let cluster = newRaftCluster(RaftConfig(
       serverId: 1,
       endpoint: "127.0.0.1:9000",
@@ -156,13 +159,16 @@ suite "Cluster Configuration Serialization Tests":
     discard cluster.addServer(1, "127.0.0.1:9000")
     discard cluster.addServer(2, "127.0.0.1:9001")
 
-    let serialized = cluster.serializeCluster()
-    let restored = deserializeCluster(serialized)
+    let encoded = cluster.encodeCluster()
+    let restored = decodeCluster(encoded)
 
     check restored.selfId == cluster.selfId
     check restored.getServerCount() == cluster.getServerCount()
+    check restored.config.serverId == cluster.config.serverId
+    check restored.config.electionTimeout == cluster.config.electionTimeout
+    check restored.config.heartbeatInterval == cluster.config.heartbeatInterval
 
-  test "Cluster round-trip serialization":
+  test "Cluster round-trip binary serialization":
     let original = newRaftCluster(RaftConfig(
       serverId: 1,
       endpoint: "127.0.0.1:9000",
@@ -179,12 +185,48 @@ suite "Cluster Configuration Serialization Tests":
     discard original.addServer(4, "127.0.0.1:9003")
     discard original.addServer(5, "127.0.0.1:9004")
 
-    let serialized = original.serializeCluster()
-    let restored = deserializeCluster(serialized)
+    let encoded = original.encodeCluster()
+    let restored = decodeCluster(encoded)
 
     check restored.selfId == original.selfId
     check restored.getServerCount() == original.getServerCount()
     check restored.getServerCount() == 5
+    check restored.config.snapshotEnabled == original.config.snapshotEnabled
+    check restored.config.logStoragePath == original.config.logStoragePath
+
+    # Verify all servers
+    for serverId in original.getServers():
+      let origEndpoint = original.getServerEndpoint(serverId)
+      let restEndpoint = restored.getServerEndpoint(serverId)
+      check origEndpoint.isSome
+      check restEndpoint.isSome
+      check origEndpoint.get == restEndpoint.get
+
+  test "Cluster binary with invalid magic":
+    let invalidData = "INVALID"
+    var raised = false
+    try:
+      discard decodeCluster(invalidData)
+    except ValueError:
+      raised = true
+    check raised
+
+  test "Cluster binary with empty servers":
+    let cluster = newRaftCluster(RaftConfig(
+      serverId: 1,
+      endpoint: "127.0.0.1:9000",
+      electionTimeout: 1000,
+      heartbeatInterval: 100,
+      logStoragePath: "/tmp/raft",
+      snapshotEnabled: false,
+      snapshotDistance: 1000
+    ))
+
+    let encoded = cluster.encodeCluster()
+    let restored = decodeCluster(encoded)
+
+    check restored.getServerCount() == 0
+    check restored.selfId == cluster.selfId
 
 
 suite "RaftNodeState Serialization Tests":
