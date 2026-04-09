@@ -3,10 +3,10 @@
 # Verifies that each statement kind produces the correct PlanOp(s)
 # with correct KV key generation.
 
-import std/[unittest, options, json, os, strutils, random]
+import std/[unittest, options, os, strutils, random]
 import fractio/sql/parser
-import fractio/sql/ast
 import fractio/sql/planner
+import fractio/sql/data_row
 import fractio/core/types except NodeID
 import fractio/distributed/meta/system_tables
 import fractio/distributed/meta/system_schemas
@@ -14,7 +14,6 @@ import fractio/protocol/raft_store
 import fractio/protocol/mvcc_store
 import fractio/protocol/txn_manager
 import fractio/distributed/raft/nuraft_coordinator
-import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/group_types
 import fractio/protocol/server
 import fractio/client/fractio_client
@@ -278,9 +277,9 @@ suite "SQL Planner":
     check plan.ops[0].kind == poInsert
     check plan.ops[0].insTableId == tid
     check plan.ops[0].insRows.len == 1
-    let row = parseJson(plan.ops[0].insRows[0])
-    check row["id"].getInt == 1
-    check row["name"].getStr == "Alice"
+    let row = decodeDataRow(plan.ops[0].insRows[0])
+    check row["id"].intVal == 1
+    check row["name"].strVal == "Alice"
 
   test "plan INSERT multiple rows":
     let tid = testTableId()
