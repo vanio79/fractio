@@ -8,12 +8,12 @@
 # - meta2: /sys/meta2/<key> -> GroupDescriptor (points to data range)
 
 import std/locks
-import std/json
 import std/options
 import std/strutils
 import std/tables
 import fractio/distributed/raft/group_types
 import fractio/distributed/meta/system_tables
+import fractio/utils/binary
 
 # ============================================================================
 # Constants
@@ -311,31 +311,68 @@ proc newNodeDescriptor*(nodeId: NodeID, address: string): NodeDescriptor =
   result.isAlive = true
   result.lastHeartbeatNs = 0
 
-proc toJson*(desc: NodeDescriptor): JsonNode =
-  ## Serialize NodeDescriptor to JSON
-  var localityJson = newJArray()
+# =============================================================================
+# NodeDescriptor Binary Serialization
+# =============================================================================
+
+const
+  NODE_DESC_MAGIC* = [0x4E'u8, 0x44'u8, 0x53'u8] # "NDS" - Node Descriptor
+  NODE_DESC_VERSION* = 0x01'u8
+
+proc encodeNodeDescriptor*(desc: NodeDescriptor): string =
+  ## Encode a NodeDescriptor to binary format.
+  ##
+  ## Binary format (little-endian):
+  ## - Magic: 3 bytes ("NDS")
+  ## - Version: 1 byte
+  ## - NodeId: 4 bytes (uint32)
+  ## - IsAlive: 1 byte (uint8 boolean)
+  ## - LastHeartbeatNs: 8 bytes (int64)
+  ## - Address: length-prefixed string
+  ## - Locality count: 4 bytes (uint32)
+  ## - Locality entries: each is 2 length-prefixed strings (key, value)
+  var w = initBinaryWriter()
+  w.writeBytes(NODE_DESC_MAGIC)
+  w.writeU8(NODE_DESC_VERSION)
+  w.writeU32(desc.nodeId.uint32)
+  w.writeU8(if desc.isAlive: 1'u8 else: 0'u8)
+  w.writeI64(desc.lastHeartbeatNs)
+  w.writeString(desc.address)
+  w.writeU32(uint32(desc.locality.len))
   for loc in desc.locality:
-    localityJson.add(%*{"key": loc.key, "value": loc.value})
+    w.writeString(loc.key)
+    w.writeString(loc.value)
+  w.finish()
 
-  result = %*{
-    "nodeId": desc.nodeId.uint32,
-    "address": desc.address,
-    "locality": localityJson,
-    "isAlive": desc.isAlive,
-    "lastHeartbeatNs": desc.lastHeartbeatNs
-  }
+proc decodeNodeDescriptor*(data: string): NodeDescriptor =
+  ## Decode binary data to a NodeDescriptor.
+  ## Raises ValueError if data is invalid.
+  if data.len < 17: # Minimum: 3 + 1 + 4 + 1 + 8 = 17
+    raise newException(ValueError, "NodeDescriptor: data too small")
+  var r = initBinaryReader(data)
 
-proc parseNodeDescriptor*(json: JsonNode): NodeDescriptor =
-  ## Parse NodeDescriptor from JSON
+  # Verify magic header
+  let magic0 = r.readU8()
+  let magic1 = r.readU8()
+  let magic2 = r.readU8()
+  if magic0 != NODE_DESC_MAGIC[0] or magic1 != NODE_DESC_MAGIC[1] or
+     magic2 != NODE_DESC_MAGIC[2]:
+    raise newException(ValueError, "NodeDescriptor: invalid magic header")
+
+  # Verify version
+  let version = r.readU8()
+  if version != NODE_DESC_VERSION:
+    raise newException(ValueError, "NodeDescriptor: unsupported version " & $version)
+
   new(result)
-  result.nodeId = NodeID(json["nodeId"].getInt())
-  result.address = json["address"].getStr()
-
-  for locJson in json["locality"]:
-    result.locality.add((locJson["key"].getStr(), locJson["value"].getStr()))
-
-  result.isAlive = json["isAlive"].getBool()
-  result.lastHeartbeatNs = json["lastHeartbeatNs"].getInt()
+  result.nodeId = NodeID(r.readU32())
+  result.isAlive = r.readU8() == 1
+  result.lastHeartbeatNs = r.readI64()
+  result.address = r.readString()
+  let locCount = int(r.readU32())
+  result.locality = newSeq[tuple[key, value: string]](locCount)
+  for i in 0..<locCount:
+    result.locality[i] = (r.readString(), r.readString())
 
 proc `$`*(desc: NodeDescriptor): string =
   ## String representation
@@ -368,20 +405,56 @@ proc isValid*(info: LeaseholderInfo, nowNs: int64): bool =
   ## Check if lease is still valid
   nowNs < info.leaseExpirationNs
 
-proc toJson*(info: LeaseholderInfo): JsonNode =
-  ## Serialize to JSON
-  result = %*{
-    "groupId": $(info.groupId),
-    "leaseholder": info.leaseholder.uint32,
-    "leaseExpirationNs": info.leaseExpirationNs,
-    "epoch": info.epoch
-  }
+# =============================================================================
+# LeaseholderInfo Binary Serialization
+# =============================================================================
 
-proc parseLeaseholderInfo*(json: JsonNode): LeaseholderInfo =
-  ## Parse from JSON
-  result = LeaseholderInfo(
-    groupId: parseGroupID(json["groupId"].getStr()),
-    leaseholder: NodeID(json["leaseholder"].getInt()),
-    leaseExpirationNs: json["leaseExpirationNs"].getInt(),
-    epoch: uint64(json["epoch"].getInt())
-  )
+const
+  LEASEHOLDER_INFO_MAGIC* = [0x4C'u8, 0x48'u8, 0x49'u8] # "LHI" - LeaseHolder Info
+  LEASEHOLDER_INFO_VERSION* = 0x01'u8
+
+proc encodeLeaseholderInfo*(info: LeaseholderInfo): string =
+  ## Encode a LeaseholderInfo to binary format.
+  ##
+  ## Binary format (little-endian):
+  ## - Magic: 3 bytes ("LHI")
+  ## - Version: 1 byte
+  ## - GroupId: 16 bytes (ULID)
+  ## - Leaseholder: 4 bytes (uint32)
+  ## - LeaseExpirationNs: 8 bytes (int64)
+  ## - Epoch: 8 bytes (uint64)
+  ## Total: 40 bytes fixed
+  var w = initBinaryWriter()
+  w.writeBytes(LEASEHOLDER_INFO_MAGIC)
+  w.writeU8(LEASEHOLDER_INFO_VERSION)
+  w.writeBytes(groupIDToBytes(info.groupId))
+  w.writeU32(info.leaseholder.uint32)
+  w.writeI64(info.leaseExpirationNs)
+  w.writeU64(info.epoch)
+  w.finish()
+
+proc decodeLeaseholderInfo*(data: string): LeaseholderInfo =
+  ## Decode binary data to a LeaseholderInfo.
+  ## Raises ValueError if data is invalid.
+  if data.len < 40:
+    raise newException(ValueError, "LeaseholderInfo: data too small")
+  var r = initBinaryReader(data)
+
+  # Verify magic header
+  let magic0 = r.readU8()
+  let magic1 = r.readU8()
+  let magic2 = r.readU8()
+  if magic0 != LEASEHOLDER_INFO_MAGIC[0] or magic1 != LEASEHOLDER_INFO_MAGIC[1] or
+     magic2 != LEASEHOLDER_INFO_MAGIC[2]:
+    raise newException(ValueError, "LeaseholderInfo: invalid magic header")
+
+  # Verify version
+  let version = r.readU8()
+  if version != LEASEHOLDER_INFO_VERSION:
+    raise newException(ValueError, "LeaseholderInfo: unsupported version " & $version)
+
+  let groupIdBytes = r.readFixedString(16)
+  result.groupId = groupIDFromBytes(groupIdBytes)
+  result.leaseholder = NodeID(r.readU32())
+  result.leaseExpirationNs = r.readI64()
+  result.epoch = r.readU64()

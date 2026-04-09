@@ -8,7 +8,6 @@
 # - Leaseholder info
 
 import std/unittest
-import std/json
 import std/options
 
 import fractio/distributed/meta/types
@@ -251,33 +250,33 @@ suite "Node Descriptor":
     check desc.isAlive
     check desc.locality.len == 0
 
-  test "serialize to JSON":
+  test "binary serialization roundtrip":
     var desc = newNodeDescriptor(NodeID(1), "localhost:8080")
     desc.locality.add(("region", "us-west"))
     desc.locality.add(("zone", "a"))
 
-    let json = desc.toJson()
-    check json["nodeId"].getInt() == 1
-    check json["address"].getStr() == "localhost:8080"
-    check json["isAlive"].getBool()
-    check json["locality"].len == 2
+    let encoded = encodeNodeDescriptor(desc)
+    let decoded = decodeNodeDescriptor(encoded)
 
-  test "parse from JSON":
-    let json = %*{
-      "nodeId": 1,
-      "address": "localhost:8080",
-      "locality": [{"key": "region", "value": "us-west"}],
-      "isAlive": true,
-      "lastHeartbeatNs": 12345
-    }
+    check decoded.nodeId == NodeID(1)
+    check decoded.address == "localhost:8080"
+    check decoded.isAlive
+    check decoded.locality.len == 2
+    check decoded.locality[0] == ("region", "us-west")
+    check decoded.locality[1] == ("zone", "a")
 
-    let desc = parseNodeDescriptor(json)
-    check desc.nodeId == NodeID(1)
-    check desc.address == "localhost:8080"
-    check desc.locality.len == 1
-    check desc.locality[0] == ("region", "us-west")
-    check desc.isAlive
-    check desc.lastHeartbeatNs == 12345
+  test "binary serialization with heartbeat":
+    var desc = newNodeDescriptor(NodeID(42), "10.0.0.1:9000")
+    desc.lastHeartbeatNs = 12345678
+    desc.isAlive = false
+
+    let encoded = encodeNodeDescriptor(desc)
+    let decoded = decodeNodeDescriptor(encoded)
+
+    check decoded.nodeId == NodeID(42)
+    check decoded.address == "10.0.0.1:9000"
+    check not decoded.isAlive
+    check decoded.lastHeartbeatNs == 12345678
 
   test "string representation":
     let desc = newNodeDescriptor(NodeID(1), "localhost:8080")
@@ -301,27 +300,20 @@ suite "Leaseholder Info":
     check not info.isValid(100000) # Expired
     check not info.isValid(150000) # Expired
 
-  test "serialize to JSON":
+  test "binary serialization roundtrip":
     let info = newLeaseholderInfo(META_GROUP_ID, NodeID(1), 100000'i64, 5)
-    let json = info.toJson()
-    check json["groupId"].getStr() == $META_GROUP_ID
-    check json["leaseholder"].getInt() == 1
-    check json["leaseExpirationNs"].getInt() == 100000
-    check json["epoch"].getInt() == 5
+    let encoded = encodeLeaseholderInfo(info)
+    let decoded = decodeLeaseholderInfo(encoded)
+    check decoded.groupId == META_GROUP_ID
+    check decoded.leaseholder == NodeID(1)
+    check decoded.leaseExpirationNs == 100000
+    check decoded.epoch == 5
 
-  test "parse from JSON":
-    let json = %*{
-      "groupId": $META_GROUP_ID,
-      "leaseholder": 1,
-      "leaseExpirationNs": 100000,
-      "epoch": 5
-    }
-
-    let info = parseLeaseholderInfo(json)
-    check info.groupId == META_GROUP_ID
-    check info.leaseholder == NodeID(1)
-    check info.leaseExpirationNs == 100000
-    check info.epoch == 5
+  test "binary serialization fixed size":
+    let info = newLeaseholderInfo(genGroupID(), NodeID(42), 999999'i64, 100)
+    let encoded = encodeLeaseholderInfo(info)
+    # Fixed size: 3 (magic) + 1 (version) + 16 (groupId) + 4 (leaseholder) + 8 (expiration) + 8 (epoch) = 40
+    check encoded.len == 40
 
 suite "Constants":
   test "meta1 key prefix":
