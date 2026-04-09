@@ -9,6 +9,7 @@
 import std/[times, strutils, json]
 import fractio/utils/binary
 import fractio/core/types
+import fractio/distributed/raft/group_types
 
 # =============================================================================
 # Constants
@@ -196,7 +197,7 @@ type
     ## Record stored in SYS_GROUPS_TABLE
     ## Key: /t/0000000004/<groupId>
     groupId*: ULID
-    spaceId*: ULID
+    spaceId*: SpaceID
     preferredLeader*: uint32
     leader*: uint32 # Current leader (0 = unknown)
     replicas*: seq[GroupReplicaBin]
@@ -204,7 +205,7 @@ type
 proc encode*(rec: GroupRecord): string =
   var w = initBinaryWriter()
   w.writeBytes(ulidToBytes(rec.groupId))
-  w.writeBytes(ulidToBytes(rec.spaceId))
+  w.writeBytes(spaceIDToBytes(rec.spaceId))
   w.writeU32(rec.preferredLeader)
   w.writeU32(rec.leader)
   # Replicas
@@ -216,7 +217,7 @@ proc encode*(rec: GroupRecord): string =
 proc decodeGroupRecord*(data: string): GroupRecord =
   var r = initBinaryReader(data)
   result.groupId = ulidFromBytes(r.readFixedString(ULID_SIZE))
-  result.spaceId = ulidFromBytes(r.readFixedString(ULID_SIZE))
+  result.spaceId = spaceIDFromBytes(r.readFixedString(ULID_SIZE))
   result.preferredLeader = r.readU32()
   result.leader = r.readU32()
   # Replicas
@@ -292,12 +293,12 @@ type
   SpaceRecord* = object
     ## Record stored in SYS_SPACES_TABLE
     ## Key: /t/0000000007/<spaceId>
-    spaceId*: ULID
+    spaceId*: SpaceID
     name*: string
     replicas*: int32 # 0 = ALL nodes
     groupCount*: int32
-    groupIds*: seq[ULID]
-    oldGroupIds*: seq[ULID] # Used during rebalancing
+    groupIds*: seq[GroupID]
+    oldGroupIds*: seq[GroupID] # Used during rebalancing
     rebalancing*: bool
     rebalanceWorker*: int32 # nodeId of the migrating worker
     rebalanceHeartbeat*: int64 # unix epoch seconds of last worker heartbeat
@@ -306,18 +307,18 @@ type
 
 proc encode*(rec: SpaceRecord): string =
   var w = initBinaryWriter()
-  w.writeBytes(ulidToBytes(rec.spaceId))
+  w.writeBytes(spaceIDToBytes(rec.spaceId))
   w.writeString(rec.name)
   w.writeI32(rec.replicas)
   w.writeI32(rec.groupCount)
   # groupIds
   w.writeU32(uint32(rec.groupIds.len))
   for gid in rec.groupIds:
-    w.writeBytes(ulidToBytes(gid))
+    w.writeBytes(groupIDToBytes(gid))
   # oldGroupIds
   w.writeU32(uint32(rec.oldGroupIds.len))
   for gid in rec.oldGroupIds:
-    w.writeBytes(ulidToBytes(gid))
+    w.writeBytes(groupIDToBytes(gid))
   # flags
   var flags: uint8 = 0
   if rec.rebalancing:
@@ -332,20 +333,20 @@ proc encode*(rec: SpaceRecord): string =
 
 proc decodeSpaceRecord*(data: string): SpaceRecord =
   var r = initBinaryReader(data)
-  result.spaceId = ulidFromBytes(r.readFixedString(ULID_SIZE))
+  result.spaceId = spaceIDFromBytes(r.readFixedString(ULID_SIZE))
   result.name = r.readString()
   result.replicas = r.readI32()
   result.groupCount = r.readI32()
   # groupIds
   let gidCount = int(r.readU32())
-  result.groupIds = newSeq[ULID](gidCount)
+  result.groupIds = newSeq[GroupID](gidCount)
   for i in 0..<gidCount:
-    result.groupIds[i] = ulidFromBytes(r.readFixedString(ULID_SIZE))
+    result.groupIds[i] = groupIDFromBytes(r.readFixedString(ULID_SIZE))
   # oldGroupIds
   let oldGidCount = int(r.readU32())
-  result.oldGroupIds = newSeq[ULID](oldGidCount)
+  result.oldGroupIds = newSeq[GroupID](oldGidCount)
   for i in 0..<oldGidCount:
-    result.oldGroupIds[i] = ulidFromBytes(r.readFixedString(ULID_SIZE))
+    result.oldGroupIds[i] = groupIDFromBytes(r.readFixedString(ULID_SIZE))
   # flags
   let flags = r.readU8()
   result.rebalancing = (flags and 0x01) != 0

@@ -51,10 +51,10 @@ proc nextTestDir(baseName: string): string =
 proc createMultiGroupTestStore(testDir: string,
     groupCount: int): tuple[client: FractioClient, server: ProtocolServer,
         store: RaftKVStoreExt, spaceGroupIds: seq[GroupID],
-            testSpaceUlid: ULID] =
+            testSpaceId: SpaceID] =
   ## Create a store with 1 meta range + N space groups.
   ## Seeds sys.spaces and sys.tables so the executor can resolve space routing.
-  ## Returns the space group IDs and test space ULID so tests can verify routing.
+  ## Returns the space group IDs and test space SpaceID so tests can verify routing.
   cleanDir(testDir)
   let clientPort = nextBasePort()
   let nodeId = NodeID(1)
@@ -125,14 +125,14 @@ proc createMultiGroupTestStore(testDir: string,
 
   let metaGroupRec = GroupRecord(
     groupId: metaGroupId,
-    spaceId: ZeroULID(),
+    spaceId: zeroSpaceID(),
     preferredLeader: 1,
     leader: 1,
     replicas: @[GroupReplicaBin(nodeId: 1, replicaType: rtVoter)]
   )
   let dataGroupRec = GroupRecord(
     groupId: dataGroupId,
-    spaceId: ZeroULID(),
+    spaceId: zeroSpaceID(),
     preferredLeader: 1,
     leader: 1,
     replicas: @[GroupReplicaBin(nodeId: 1, replicaType: rtVoter)]
@@ -148,7 +148,7 @@ proc createMultiGroupTestStore(testDir: string,
     let gidUlid = groupIDToULID(gid)
     let spaceGroupRec = GroupRecord(
       groupId: gidUlid,
-      spaceId: ZeroULID(),
+      spaceId: zeroSpaceID(),
       preferredLeader: 1,
       leader: 1,
       replicas: @[GroupReplicaBin(nodeId: 1, replicaType: rtVoter)]
@@ -157,17 +157,14 @@ proc createMultiGroupTestStore(testDir: string,
         value: encode(spaceGroupRec)))
   discard store.sysTablePutBatch(sysTableWrites)
 
-  let testSpaceUlid = ULID() # Generate proper ULID for test space
-  let spaceKey = encodeSpaceKey(SpaceID(testSpaceUlid))
-  var groupIdsSeq: seq[ULID] = @[]
-  for gid in groupIds:
-    groupIdsSeq.add(groupIDToULID(gid))
+  let testSpaceId = genSpaceID() # Generate proper SpaceID for test space
+  let spaceKey = encodeSpaceKey(testSpaceId)
   let spaceRec = SpaceRecord(
-    spaceId: testSpaceUlid,
+    spaceId: testSpaceId, # SpaceRecord.spaceId is now SpaceID
     name: "testspace",
     replicas: 1,
     groupCount: int32(groupCount),
-    groupIds: groupIdsSeq,
+    groupIds: groupIds,   # seq[GroupID] directly
     oldGroupIds: @[],
     rebalancing: false,
     rebalanceWorker: 0,
@@ -195,10 +192,10 @@ proc createMultiGroupTestStore(testDir: string,
   let client = newFractioClient("127.0.0.1", clientPort)
   doAssert client.initialize()
 
-  result = (client, server, store, groupIds, testSpaceUlid)
+  result = (client, server, store, groupIds, testSpaceId)
 
 proc seedSpaceTable(client: FractioClient, store: RaftKVStoreExt,
-    tableId: TableId, tableName: string, spaceId: ULID, database = "default",
+    tableId: TableId, tableName: string, spaceId: SpaceID, database = "default",
         schema = "public") =
   ## Register a table in sys.tables and refresh client metadata.
   let fullName = database & "." & schema & "." & tableName
@@ -208,7 +205,7 @@ proc seedSpaceTable(client: FractioClient, store: RaftKVStoreExt,
     name: tableName,
     database: database,
     schema: schema,
-    spaceId: SpaceID(spaceId),
+    spaceId: spaceId, # TableRecord.spaceId is SpaceID
     primaryKey: @["id"],
     columns: @[
       ColumnDefBin(name: "id", dataType: cdtInt, flags: 0x01), # primaryKey
@@ -221,7 +218,7 @@ proc seedSpaceTable(client: FractioClient, store: RaftKVStoreExt,
   discard client.refreshMetadata()
 
 proc seedSpaceTableThreeCol(client: FractioClient, store: RaftKVStoreExt,
-    tableId: TableId, tableName: string, spaceId: ULID, database = "default",
+    tableId: TableId, tableName: string, spaceId: SpaceID, database = "default",
         schema = "public") =
   ## Register a table with 3 columns (id, name, score) and refresh client metadata.
   let fullName = database & "." & schema & "." & tableName
@@ -231,7 +228,7 @@ proc seedSpaceTableThreeCol(client: FractioClient, store: RaftKVStoreExt,
     name: tableName,
     database: database,
     schema: schema,
-    spaceId: SpaceID(spaceId),
+    spaceId: spaceId, # TableRecord.spaceId is SpaceID
     primaryKey: @["id"],
     columns: @[
       ColumnDefBin(name: "id", dataType: cdtInt, flags: 0x01), # primaryKey
@@ -261,15 +258,15 @@ suite "SQL Executor — space-routed INSERT":
   var server: ProtocolServer
   var store: RaftKVStoreExt
   var spaceGroupIds: seq[GroupID]
-  var testSpaceUlid: ULID
+  var testSpaceId: SpaceID
   var testDir: string
 
   setup:
     testDir = nextTestDir("insert")
     cleanupTestDir(testDir)
     (client, server, store, spaceGroupIds,
-        testSpaceUlid) = createMultiGroupTestStore(testDir, 3)
-    seedSpaceTable(client, store, genTableId(), "items", testSpaceUlid)
+        testSpaceId) = createMultiGroupTestStore(testDir, 3)
+    seedSpaceTable(client, store, genTableId(), "items", testSpaceId)
 
   teardown:
     client.close()
@@ -313,15 +310,15 @@ suite "SQL Executor — space-routed SELECT":
   var server: ProtocolServer
   var store: RaftKVStoreExt
   var spaceGroupIds: seq[GroupID]
-  var testSpaceUlid: ULID
+  var testSpaceId: SpaceID
   var testDir: string
 
   setup:
     testDir = nextTestDir("select")
     cleanupTestDir(testDir)
     (client, server, store, spaceGroupIds,
-        testSpaceUlid) = createMultiGroupTestStore(testDir, 3)
-    seedSpaceTable(client, store, genTableId(), "items", testSpaceUlid)
+        testSpaceId) = createMultiGroupTestStore(testDir, 3)
+    seedSpaceTable(client, store, genTableId(), "items", testSpaceId)
     # Insert 10 rows distributed across groups
     for i in 1 .. 10:
       discard exec(client,
@@ -369,7 +366,7 @@ suite "SQL Executor — space-routed SELECT":
 
   test "SELECT from empty space-routed table":
     # Create a second table in the same space, don't insert data
-    seedSpaceTable(client, store, genTableId(), "empty_items", testSpaceUlid)
+    seedSpaceTable(client, store, genTableId(), "empty_items", testSpaceId)
     let res = exec(client, "SELECT * FROM empty_items")
     check res.kind == erkRows
     check res.rows.len == 0
@@ -388,15 +385,15 @@ suite "SQL Executor — space-routed UPDATE":
   var server: ProtocolServer
   var store: RaftKVStoreExt
   var spaceGroupIds: seq[GroupID]
-  var testSpaceUlid: ULID
+  var testSpaceId: SpaceID
   var testDir: string
 
   setup:
     testDir = nextTestDir("update")
     cleanupTestDir(testDir)
     (client, server, store, spaceGroupIds,
-        testSpaceUlid) = createMultiGroupTestStore(testDir, 3)
-    seedSpaceTable(client, store, genTableId(), "items", testSpaceUlid)
+        testSpaceId) = createMultiGroupTestStore(testDir, 3)
+    seedSpaceTable(client, store, genTableId(), "items", testSpaceId)
     for i in 1 .. 5:
       discard exec(client,
           "INSERT INTO items (id, val) VALUES (" & $i & ", 'orig')")
@@ -448,15 +445,15 @@ suite "SQL Executor — space-routed DELETE":
   var server: ProtocolServer
   var store: RaftKVStoreExt
   var spaceGroupIds: seq[GroupID]
-  var testSpaceUlid: ULID
+  var testSpaceId: SpaceID
   var testDir: string
 
   setup:
     testDir = nextTestDir("delete")
     cleanupTestDir(testDir)
     (client, server, store, spaceGroupIds,
-        testSpaceUlid) = createMultiGroupTestStore(testDir, 3)
-    seedSpaceTable(client, store, genTableId(), "items", testSpaceUlid)
+        testSpaceId) = createMultiGroupTestStore(testDir, 3)
+    seedSpaceTable(client, store, genTableId(), "items", testSpaceId)
     for i in 1 .. 5:
       discard exec(client,
           "INSERT INTO items (id, val) VALUES (" & $i & ", 'v" & $i & "')")
@@ -507,15 +504,15 @@ suite "SQL Executor — space routing full round-trip":
   var server: ProtocolServer
   var store: RaftKVStoreExt
   var spaceGroupIds: seq[GroupID]
-  var testSpaceUlid: ULID
+  var testSpaceId: SpaceID
   var testDir: string
 
   setup:
     testDir = nextTestDir("roundtrip")
     cleanupTestDir(testDir)
     (client, server, store, spaceGroupIds,
-        testSpaceUlid) = createMultiGroupTestStore(testDir, 4)
-    seedSpaceTableThreeCol(client, store, genTableId(), "products", testSpaceUlid)
+        testSpaceId) = createMultiGroupTestStore(testDir, 4)
+    seedSpaceTableThreeCol(client, store, genTableId(), "products", testSpaceId)
 
   teardown:
     client.close()
@@ -595,14 +592,14 @@ suite "SQL Executor — space routing backward compat":
   var server: ProtocolServer
   var store: RaftKVStoreExt
   var spaceGroupIds: seq[GroupID]
-  var testSpaceUlid: ULID
+  var testSpaceId: SpaceID
   var testDir: string
 
   setup:
     testDir = nextTestDir("compat")
     cleanupTestDir(testDir)
     (client, server, store, spaceGroupIds,
-        testSpaceUlid) = createMultiGroupTestStore(testDir, 3)
+        testSpaceId) = createMultiGroupTestStore(testDir, 3)
 
   teardown:
     client.close()
@@ -634,7 +631,7 @@ suite "SQL Executor — space routing backward compat":
         "INSERT INTO plain (id, val) VALUES (1, 'plain1')")
 
     # Space-routed table
-    seedSpaceTable(client, store, genTableId(), "spaced", testSpaceUlid)
+    seedSpaceTable(client, store, genTableId(), "spaced", testSpaceId)
     discard exec(client,
         "INSERT INTO spaced (id, val) VALUES (1, 'spaced1')")
 

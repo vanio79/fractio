@@ -74,7 +74,7 @@ suite "RaftKVStoreExt - preferredLeaders table":
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(gid))
     let val = GroupRecord(
       groupId: groupIDToULID(gid),
-      spaceId: ZeroULID(),
+      spaceId: zeroSpaceID(),
       preferredLeader: 20,
       leader: 0,
       replicas: @[
@@ -100,7 +100,7 @@ suite "RaftKVStoreExt - preferredLeaders table":
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(gid))
     let val = GroupRecord(
       groupId: groupIDToULID(gid),
-      spaceId: ZeroULID(),
+      spaceId: zeroSpaceID(),
       preferredLeader: 0, # 0 = no preferred leader
       leader: 0,
       replicas: @[GroupReplicaBin(nodeId: 10, replicaType: rtVoter)]
@@ -119,7 +119,7 @@ suite "RaftKVStoreExt - preferredLeaders table":
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(gid))
     let val = GroupRecord(
       groupId: groupIDToULID(gid),
-      spaceId: ZeroULID(),
+      spaceId: zeroSpaceID(),
       preferredLeader: 0, # 0 = no preferred leader
       leader: 0,
       replicas: @[GroupReplicaBin(nodeId: 10, replicaType: rtVoter)]
@@ -139,7 +139,7 @@ suite "RaftKVStoreExt - preferredLeaders table":
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(gid))
     let val = GroupRecord(
       groupId: groupIDToULID(gid),
-      spaceId: ZeroULID(),
+      spaceId: zeroSpaceID(),
       preferredLeader: 3,
       leader: 0,
       replicas: @[GroupReplicaBin(nodeId: 10, replicaType: rtVoter)]

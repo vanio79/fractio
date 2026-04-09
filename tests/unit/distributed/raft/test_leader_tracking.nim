@@ -77,7 +77,7 @@ suite "RaftKVStoreExt - groupLeaders table":
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(gid))
     let val = GroupRecord(
       groupId: groupIDToULID(gid),
-      spaceId: ZeroULID(),
+      spaceId: zeroSpaceID(),
       preferredLeader: 0,
       leader: 20,
       replicas: @[
@@ -98,7 +98,7 @@ suite "RaftKVStoreExt - groupLeaders table":
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(gid))
     let val = GroupRecord(
       groupId: groupIDToULID(gid),
-      spaceId: ZeroULID(),
+      spaceId: zeroSpaceID(),
       preferredLeader: 0,
       leader: 0, # 0 = no leader known
       replicas: @[GroupReplicaBin(nodeId: 10, replicaType: rtVoter)]
@@ -113,7 +113,7 @@ suite "RaftKVStoreExt - groupLeaders table":
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(gid))
     let val = GroupRecord(
       groupId: groupIDToULID(gid),
-      spaceId: ZeroULID(),
+      spaceId: zeroSpaceID(),
       preferredLeader: 0,
       leader: 0, # 0 = no leader known
       replicas: @[GroupReplicaBin(nodeId: 10, replicaType: rtVoter)]
@@ -128,7 +128,7 @@ suite "RaftKVStoreExt - groupLeaders table":
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(gid))
     let val = GroupRecord(
       groupId: groupIDToULID(gid),
-      spaceId: ZeroULID(),
+      spaceId: zeroSpaceID(),
       preferredLeader: 0,
       leader: 30,
       replicas: @[GroupReplicaBin(nodeId: 10, replicaType: rtVoter)]
@@ -194,7 +194,7 @@ suite "onLeaderChanged callback":
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(gid))
     let val = GroupRecord(
       groupId: groupIDToULID(gid),
-      spaceId: ZeroULID(),
+      spaceId: zeroSpaceID(),
       preferredLeader: 0,
       leader: 0,
       replicas: @[
@@ -232,7 +232,7 @@ suite "onLeaderChanged callback":
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(gid))
     let val = GroupRecord(
       groupId: groupIDToULID(gid),
-      spaceId: ZeroULID(),
+      spaceId: zeroSpaceID(),
       preferredLeader: 0,
       leader: 10,
       replicas: @[
@@ -267,7 +267,7 @@ suite "onLeaderChanged callback":
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(META_GROUP_ID))
     let val = GroupRecord(
       groupId: groupIDToULID(META_GROUP_ID),
-      spaceId: ZeroULID(),
+      spaceId: zeroSpaceID(),
       preferredLeader: 0,
       leader: 0,
       replicas: @[GroupReplicaBin(nodeId: 10, replicaType: rtVoter)]
@@ -298,7 +298,7 @@ suite "onLeaderChanged callback":
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(DATA_GROUP_START_ID))
     let val = GroupRecord(
       groupId: groupIDToULID(DATA_GROUP_START_ID),
-      spaceId: ZeroULID(),
+      spaceId: zeroSpaceID(),
       preferredLeader: 0,
       leader: 0,
       replicas: @[GroupReplicaBin(nodeId: 10, replicaType: rtVoter)]
@@ -340,7 +340,7 @@ suite "onLeaderChanged callback":
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(gid))
     let val = GroupRecord(
       groupId: groupIDToULID(gid),
-      spaceId: ZeroULID(),
+      spaceId: zeroSpaceID(),
       preferredLeader: 0,
       leader: 0,
       replicas: @[

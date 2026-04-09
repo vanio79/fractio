@@ -101,15 +101,12 @@ proc seedSpaceAndTable(store: RaftKVStoreExt, spaceIdNum: int,
   ## reload the caches.
   let spaceId = coreTypes.genSpaceID()
   let spaceKey = encodeSpaceKey(spaceId)
-  var ulidGroupIds: seq[ULID] = @[]
-  for gid in groupIds:
-    ulidGroupIds.add(groupIDToULID(gid))
   let spaceRec = SpaceRecord(
-    spaceId: ULID(spaceId), # SpaceRecord.spaceId is ULID
+    spaceId: spaceId,
     name: "space_" & $spaceIdNum,
     replicas: 1,
     groupCount: int32(groupIds.len),
-    groupIds: ulidGroupIds,
+    groupIds: groupIds,
   )
   discard store.raftPut(spaceKey, spaceRec.encode())
 

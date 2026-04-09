@@ -10,6 +10,7 @@ import ./parser
 import ./planner
 import ../distributed/meta/system_tables
 import ../distributed/meta/system_schemas
+import ../distributed/raft/group_types
 import ../client/fractio_client
 import ../core/types as coreTypes
 

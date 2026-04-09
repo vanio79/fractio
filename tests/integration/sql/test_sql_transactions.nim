@@ -78,11 +78,12 @@ proc makeTestEnv(suiteName: string): tuple[
     clientPort: clientPort.uint16, status: nsAlive
   )
   let metaGroupRec = GroupRecord(
-    groupId: groupIDToULID(META_GROUP_ID), spaceId: ZeroULID(), leader: 1,
+    groupId: groupIDToULID(META_GROUP_ID), spaceId: zeroSpaceID(), leader: 1,
     replicas: @[GroupReplicaBin(nodeId: 1, replicaType: rtVoter)]
   )
   let dataGroupRec = GroupRecord(
-    groupId: groupIDToULID(DATA_GROUP_START_ID), spaceId: ZeroULID(), leader: 1,
+    groupId: groupIDToULID(DATA_GROUP_START_ID), spaceId: zeroSpaceID(),
+        leader: 1,
     replicas: @[GroupReplicaBin(nodeId: 1, replicaType: rtVoter)]
   )
   discard raftStore.sysTablePutBatch(@[

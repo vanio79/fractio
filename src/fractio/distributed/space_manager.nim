@@ -182,7 +182,7 @@ proc findSpaceByName*(sm: SpaceManager, name: string): Option[SpaceRecord] =
   return none(SpaceRecord)
 
 proc computeGroupPlacement(nodeIds: seq[uint32], replicas: int,
-    spaceId: ULID): seq[GroupRecord] {.gcsafe.} =
+    spaceId: SpaceID): seq[GroupRecord] {.gcsafe.} =
   ## Compute group placement using ring algorithm.
   ## N nodes → N groups, each with R replicas placed in a ring.
   let nodeCount = nodeIds.len
@@ -273,10 +273,10 @@ proc createSpace*(sm: SpaceManager, req: CreateSpaceRequest): CreateSpaceRespons
   ## Must be called on the META leader node.
 
   # Declare variables needed after try block
-  var spaceId: ULID
+  var spaceId: SpaceID
   var groupCount = 0
   var groupRecs: seq[GroupRecord] = @[]
-  var groupIds: seq[ULID] = @[]
+  var groupIds: seq[GroupID] = @[]
   var replicas = 0
 
   let t0 {.used.} = times.getTime()
@@ -330,7 +330,7 @@ proc createSpace*(sm: SpaceManager, req: CreateSpaceRequest): CreateSpaceRespons
 
     # 4. Generate ULID for spaceId
     timedLog("generating spaceId ULID")
-    spaceId = ({.cast(gcsafe).}: genULID())
+    spaceId = ({.cast(gcsafe).}: genSpaceID())
     timedLog(safeFmt("spaceId=$#", $spaceId))
     groupCount = nodeCount
 
@@ -338,7 +338,7 @@ proc createSpace*(sm: SpaceManager, req: CreateSpaceRequest): CreateSpaceRespons
     timedLog("computing group placement")
     groupRecs = computeGroupPlacement(nodeIds, replicas, spaceId)
     for gr in groupRecs:
-      groupIds.add(gr.groupId)
+      groupIds.add(groupIDFromULID(gr.groupId))
 
     timedLog(safeFmt("Creating space '$#' with $# groups, replicas=$#",
         req.name, $groupCount, $replicas))
@@ -608,8 +608,8 @@ proc dropSpace*(sm: SpaceManager, req: DropSpaceRequest): DropSpaceResponse {.gc
     sm.logInfo(safeFmt("Deleted space '$#' and $# groups", req.name,
         $space.groupIds.len))
 
-    # 6. Build response - ULIDs are used directly
-    var deletedGroupIds: seq[ULID] = @[]
+    # 6. Build response - GroupIDs are used directly
+    var deletedGroupIds: seq[GroupID] = @[]
     for gid in space.groupIds:
       deletedGroupIds.add(gid)
 

@@ -398,15 +398,12 @@ suite "Space routing — cache loading":
     # Write a space record into the meta range (binary format)
     let spaceId = coreTypes.genSpaceID()
     let spaceKey = encodeSpaceKey(spaceId)
-    var groupUlids: seq[ULID] = @[]
-    for gid in space.groupIds:
-      groupUlids.add(groupIDToULID(gid))
     let spaceRec = SpaceRecord(
-      spaceId: ULID(spaceId), # SpaceRecord.spaceId is ULID
+      spaceId: spaceId,         # SpaceRecord.spaceId is now SpaceID
       name: "myspace",
       replicas: 1,
       groupCount: 2,
-      groupIds: groupUlids,
+      groupIds: space.groupIds, # seq[GroupID] directly
       oldGroupIds: @[],
       rebalancing: false,
       rebalanceWorker: 0,

@@ -40,7 +40,7 @@ type
   GroupInfo* = object
     ## Cached information about a Raft group
     groupId*: GroupID
-    spaceId*: ULID
+    spaceId*: SpaceID
     leaderNodeId*: uint32
     replicaNodeIds*: seq[uint32]
 
@@ -293,18 +293,11 @@ proc fetchSpacesTable(client: FractioClient, conn: ProtocolClient): bool =
       # Use MVCC decoder
       let (spaceRec, isDeleted) = decodeSpaceRecordFromMVCC(pair.value)
       if not isDeleted:
-        var groupIds: seq[GroupID] = @[]
-        for gid in spaceRec.groupIds:
-          groupIds.add(groupIDFromULID(gid))
-        var oldGroupIds: seq[GroupID] = @[]
-        for gid in spaceRec.oldGroupIds:
-          oldGroupIds.add(groupIDFromULID(gid))
-
-        client.spaces[SpaceID(spaceRec.spaceId)] = SpaceInfo(
-          spaceId: SpaceID(spaceRec.spaceId),
+        client.spaces[spaceRec.spaceId] = SpaceInfo(
+          spaceId: spaceRec.spaceId,
           name: spaceRec.name,
-          groupIds: groupIds,
-          oldGroupIds: oldGroupIds,
+          groupIds: spaceRec.groupIds,
+          oldGroupIds: spaceRec.oldGroupIds,
           rebalancing: spaceRec.rebalancing
         )
 
@@ -832,11 +825,11 @@ type
     isOk*: bool
     err*: string
     ## On success:
-    spaceId*: ULID
+    spaceId*: SpaceID
     groupCount*: int32
     groupIds*: seq[GroupID]
 
-proc spaceOpOk(spaceId: ULID, groupCount: int32, groupIds: seq[
+proc spaceOpOk(spaceId: SpaceID, groupCount: int32, groupIds: seq[
     GroupID]): SpaceOpResult =
   SpaceOpResult(isOk: true, spaceId: spaceId, groupCount: groupCount,
       groupIds: groupIds)
@@ -882,18 +875,12 @@ proc createSpace*(client: FractioClient, name: string,
     withLock client.lock:
       # Parse and cache the space record
       let spaceRec = decodeSpaceRecord(resp.spaceRecord)
-      var groupIds: seq[GroupID] = @[]
-      for gid in spaceRec.groupIds:
-        groupIds.add(groupIDFromULID(gid))
-      var oldGroupIds: seq[GroupID] = @[]
-      for gid in spaceRec.oldGroupIds:
-        oldGroupIds.add(groupIDFromULID(gid))
 
-      client.spaces[SpaceID(spaceRec.spaceId)] = SpaceInfo(
-        spaceId: SpaceID(spaceRec.spaceId),
+      client.spaces[spaceRec.spaceId] = SpaceInfo(
+        spaceId: spaceRec.spaceId,
         name: spaceRec.name,
-        groupIds: groupIds,
-        oldGroupIds: oldGroupIds,
+        groupIds: spaceRec.groupIds,
+        oldGroupIds: spaceRec.oldGroupIds,
         rebalancing: spaceRec.rebalancing
       )
 
@@ -964,15 +951,11 @@ proc dropSpace*(client: FractioClient, name: string): SpaceOpResult =
 
       # Remove all deleted groups
       for gid in resp.deletedGroupIds:
-        let groupId = groupIDFromULID(gid)
-        client.groups.del(groupId)
-        client.leaderConnections.del(groupId)
+        client.groups.del(gid)
+        client.leaderConnections.del(gid)
 
-    var deletedGroupIds: seq[GroupID] = @[]
-    for gid in resp.deletedGroupIds:
-      deletedGroupIds.add(groupIDFromULID(gid))
     return spaceOpOk(resp.spaceId, resp.deletedGroupIds.len.int32,
-      deletedGroupIds)
+      resp.deletedGroupIds)
 
   return spaceOpErr("too many retries")
 

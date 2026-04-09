@@ -2067,7 +2067,7 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
         let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid)
         let groupRec = GroupRecord(
           groupId: groupIDToULID(gid),
-          spaceId: ({.cast(gcsafe).}: genULID()), # TODO: proper space ID for meta/data groups
+          spaceId: ({.cast(gcsafe).}: genSpaceID()), # TODO: proper space ID for meta/data groups
           preferredLeader: server.config.serverId,
           leader: server.config.serverId,
           replicas: @[GroupReplicaBin(nodeId: server.config.serverId,
@@ -2098,14 +2098,14 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
       discard mvccStore.txnPut(sessionId, scKey, encode(scRec))
 
       # Seed default space (replicas=0 means ALL, single group = META_GROUP_ID)
-      let defaultSpaceId = ({.cast(gcsafe).}: genULID())
+      let defaultSpaceId = ({.cast(gcsafe).}: genSpaceID())
       let spaceKey = encodeTableKey(SYS_SPACES_TABLE_ID, $defaultSpaceId)
       let spaceRec = SpaceRecord(
         spaceId: defaultSpaceId,
         name: "default",
         replicas: 0,
         groupCount: 1,
-        groupIds: @[groupIDToULID(META_GROUP_ID)],
+        groupIds: @[META_GROUP_ID],
         oldGroupIds: @[],
         rebalancing: false,
         rebalanceWorker: 0,
@@ -2184,10 +2184,10 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
             let heartbeatAge = nowSecs - sp.rebalanceHeartbeat
             if sp.rebalanceWorker == myNodeId:
               # We are the worker — continue migration
-              rstoreRef.runRebalanceMigration(ULID(sp.spaceId))
+              rstoreRef.runRebalanceMigration(sp.spaceId)
             elif sp.rebalanceWorker == 0 or heartbeatAge > staleHeartbeatSecs:
               # No worker or stale heartbeat — claim and run
-              rstoreRef.runRebalanceMigration(ULID(sp.spaceId))
+              rstoreRef.runRebalanceMigration(sp.spaceId)
         except:
           discard
 

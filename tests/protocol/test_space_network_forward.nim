@@ -199,6 +199,7 @@ proc makeCluster3(): seq[TestNode] =
       replicas.add(GroupReplicaBin(nodeId: uint32(num), replicaType: rtVoter))
     let groupRec = GroupRecord(
       groupId: groupIDToULID(gid),
+      spaceId: coreTypes.zeroSpaceID(),
       replicas: replicas,
     )
     discard nodes[leaderIdx].store.raftPut(key, groupRec.encode())
@@ -217,7 +218,7 @@ proc makeCluster3(): seq[TestNode] =
         break
     let groupRec = GroupRecord(
       groupId: groupIDToULID(gid),
-      spaceId: coreTypes.ZeroULID(),
+      spaceId: coreTypes.zeroSpaceID(),
       replicas: replicas,
       leader: leaderNodeId,
     )
@@ -238,21 +239,21 @@ proc makeCluster3(): seq[TestNode] =
         break
     let groupRec = GroupRecord(
       groupId: groupIDToULID(gid),
-      spaceId: coreTypes.ZeroULID(),
+      spaceId: coreTypes.zeroSpaceID(),
       replicas: replicasSeq,
       leader: uint32(leaderNodeId),
     )
     discard nodes[leaderIdx].store.raftPut(key, groupRec.encode())
 
   # Seed space and table
-  var spaceGroupIds: seq[ULID] = @[]
+  var spaceGroupIds: seq[GroupID] = @[]
   for i in 0 ..< NODE_COUNT:
-    spaceGroupIds.add(groupIDToULID(groupIDFromInt(SPACE_GROUP_START + uint64(i))))
+    spaceGroupIds.add(groupIDFromInt(SPACE_GROUP_START + uint64(i)))
   seededSpaceUid = coreTypes.genSpaceID()
   seededTableId = coreTypes.genTableId()
   let spaceKey = encodeSpaceKey(seededSpaceUid)
   let spaceRec = SpaceRecord(
-    spaceId: ULID(seededSpaceUid), # SpaceRecord.spaceId is ULID
+    spaceId: seededSpaceUid,
     name: "space_2",
     replicas: int32(NODE_COUNT),
     groupCount: int32(NODE_COUNT),

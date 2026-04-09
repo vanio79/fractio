@@ -139,14 +139,13 @@ suite "Space rebalance — loadSpaces parses rebalance fields":
     let spaceId = genSpaceID()
     let spaceKey = encodeSpaceKey(spaceId)
     let spaceRec = SpaceRecord(
-      spaceId: ULID(spaceId),
+      spaceId: spaceId, # SpaceRecord.spaceId is now SpaceID
       name: "rebaltest",
       replicas: 2,
       groupCount: 3,
-      groupIds: @[groupIDToULID(groupIDFromInt(110)), groupIDToULID(
-          groupIDFromInt(111)), groupIDToULID(groupIDFromInt(112))],
-      oldGroupIds: @[groupIDToULID(groupIDFromInt(100)), groupIDToULID(
-          groupIDFromInt(101))],
+      groupIds: @[groupIDFromInt(110), groupIDFromInt(111), groupIDFromInt(
+          112)],
+      oldGroupIds: @[groupIDFromInt(100), groupIDFromInt(101)],
       rebalancing: true,
       rebalanceWorker: 3,
       rebalanceHeartbeat: 1741700000'i64,
@@ -158,7 +157,7 @@ suite "Space rebalance — loadSpaces parses rebalance fields":
     store.loadSpaces()
 
     acquire(store.spacesMu)
-    let sp = store.spaces[SpaceID(spaceId)]
+    let sp = store.spaces[spaceId]
     release(store.spacesMu)
 
     check sp.name == "rebaltest"
@@ -177,11 +176,11 @@ suite "Space rebalance — loadSpaces parses rebalance fields":
     let spaceId = genSpaceID()
     let spaceKey = encodeSpaceKey(spaceId)
     let spaceRec = SpaceRecord(
-      spaceId: ULID(spaceId),
+      spaceId: spaceId, # SpaceRecord.spaceId is now SpaceID
       name: "oldstyle",
       replicas: 1,
       groupCount: 1,
-      groupIds: @[groupIDToULID(groupIDFromInt(100))],
+      groupIds: @[groupIDFromInt(100)],
     )
     discard store.sysTablePut(spaceKey, spaceRec.encode())
     # Wait for Raft commit to apply
@@ -189,7 +188,7 @@ suite "Space rebalance — loadSpaces parses rebalance fields":
     store.loadSpaces()
 
     acquire(store.spacesMu)
-    let sp = store.spaces[SpaceID(spaceId)]
+    let sp = store.spaces[spaceId]
     release(store.spacesMu)
 
     check sp.rebalancing == false
@@ -209,7 +208,7 @@ suite "Space rebalance — updateSpaceRecord":
 
     let spaceId = genSpaceID()
     var space = SpaceInfo(
-      spaceId: SpaceID(spaceId),
+      spaceId: spaceId,
       name: "persist_test",
       replicas: 2,
       groupIds: @[groupIDFromInt(110), groupIDFromInt(111), groupIDFromInt(
@@ -226,7 +225,7 @@ suite "Space rebalance — updateSpaceRecord":
     store.loadSpaces()
 
     acquire(store.spacesMu)
-    let loaded = store.spaces[SpaceID(spaceId)]
+    let loaded = store.spaces[spaceId]
     release(store.spacesMu)
 
     check loaded.name == "persist_test"
@@ -245,7 +244,7 @@ suite "Space rebalance — updateSpaceRecord":
     # First write with rebalancing on
     let spaceId = genSpaceID()
     var space = SpaceInfo(
-      spaceId: SpaceID(spaceId),
+      spaceId: spaceId,
       name: "clear_test",
       replicas: 1,
       groupIds: @[groupIDFromInt(110)],
@@ -271,7 +270,7 @@ suite "Space rebalance — updateSpaceRecord":
     store.loadSpaces()
 
     acquire(store.spacesMu)
-    let loaded = store.spaces[SpaceID(spaceId)]
+    let loaded = store.spaces[spaceId]
     release(store.spacesMu)
 
     check loaded.rebalancing == false

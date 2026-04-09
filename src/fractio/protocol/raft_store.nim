@@ -1681,22 +1681,17 @@ proc parseSpaceInfoFromBinary*(data: string): Option[SpaceInfo] {.gcsafe,
       # Binary decoding (SpaceRecord)
       let spaceRec = decodeSpaceRecord(value)
       var info = SpaceInfo(
-        spaceId: SpaceID(spaceRec.spaceId),
+        spaceId: spaceRec.spaceId,
         name: spaceRec.name,
         replicas: spaceRec.replicas,
-        groupIds: @[],
-        oldGroupIds: @[],
+        groupIds: spaceRec.groupIds,
+        oldGroupIds: spaceRec.oldGroupIds,
         rebalancing: spaceRec.rebalancing,
         rebalanceWorker: spaceRec.rebalanceWorker,
         rebalanceHeartbeat: spaceRec.rebalanceHeartbeat,
         rebalanceCursor: spaceRec.rebalanceCursor,
       )
-      # Convert ULIDs to GroupIDs
-      for gid in spaceRec.groupIds:
-        info.groupIds.add(GroupID(gid))
-      for gid in spaceRec.oldGroupIds:
-        info.oldGroupIds.add(GroupID(gid))
-      # Accept any spaceId, including ZeroULID() for test purposes
+      # Accept any spaceId, including zeroSpaceID() for test purposes
       return some(info)
     except:
       return none(SpaceInfo)
@@ -2620,22 +2615,14 @@ proc updateSpaceRecord*(store: RaftKVStoreExt, space: SpaceInfo): bool {.gcsafe,
   ## Returns true if the write was proposed successfully.
   let spaceKey = encodeSpaceKey(space.spaceId)
 
-  # Convert GroupID seq to ULID seq
-  var groupUids: seq[ULID] = @[]
-  for gid in space.groupIds:
-    groupUids.add(gid.ULID)
-  var oldGroupUids: seq[ULID] = @[]
-  for gid in space.oldGroupIds:
-    oldGroupUids.add(gid.ULID)
-
   # Create binary-encoded SpaceRecord
   let spaceRec = SpaceRecord(
-    spaceId: ULID(space.spaceId),
+    spaceId: space.spaceId,
     name: space.name,
     replicas: int32(space.replicas),
     groupCount: int32(space.groupIds.len),
-    groupIds: groupUids,
-    oldGroupIds: oldGroupUids,
+    groupIds: space.groupIds,
+    oldGroupIds: space.oldGroupIds,
     rebalancing: space.rebalancing,
     rebalanceWorker: int32(space.rebalanceWorker),
     rebalanceHeartbeat: space.rebalanceHeartbeat,
@@ -2815,7 +2802,7 @@ proc rebalanceSpaces*(store: RaftKVStoreExt) {.raises: [].} =
                 replicaType: rtVoter))
           let groupRec = GroupRecord(
             groupId: groupId.ULID,
-            spaceId: ULID(spaceId),
+            spaceId: spaceId,
             preferredLeader: uint32(members[0]),
             leader: 0,
             replicas: replicasList,
@@ -3002,7 +2989,7 @@ proc rebalanceSpaces*(store: RaftKVStoreExt) {.raises: [].} =
     # Reload group members (spaces cache is already updated by updateSpaceRecord)
     store.loadGroupMembers()
 
-proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: ULID) {.raises: [].} =
+proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: SpaceID) {.raises: [].} =
   ## Migrate data from old groups to new groups for a rebalancing space.
   ##
   ## Key insight: All groups on a node share the same WiscKey backend.
@@ -3016,14 +3003,13 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: ULID) {.raises: [].}
   ##   2. At end, remove old group definitions (data is accessible via new groups)
   ##
   ## During migration, raftGetInSpace handles dual-read from both old and new groups.
-  let spaceIdTyped = SpaceID(spaceId)
   {.cast(raises: []).}:
     # Read current space state
     acquire(store.spacesMu)
     var space: SpaceInfo
     var found = false
-    if store.spaces.hasKey(spaceIdTyped):
-      space = store.spaces[spaceIdTyped]
+    if store.spaces.hasKey(spaceId):
+      space = store.spaces[spaceId]
       found = true
     release(store.spacesMu)
     if not found or not space.rebalancing: return
@@ -3070,7 +3056,7 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: ULID) {.raises: [].}
 
           # Binary decoding (TableRecord)
           let tableRec = decodeTableRecord(tblVal)
-          if tableRec.spaceId == spaceIdTyped:
+          if tableRec.spaceId == spaceId:
             tableIds.add(tableRec.tableId)
         except: discard
 
@@ -3172,8 +3158,8 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: ULID) {.raises: [].}
             let curNow = getTime().toUnix()
             # Re-read space to check if we're still the worker
             acquire(store.spacesMu)
-            if store.spaces.hasKey(spaceIdTyped):
-              let curSpace = store.spaces[spaceIdTyped]
+            if store.spaces.hasKey(spaceId):
+              let curSpace = store.spaces[spaceId]
               if curSpace.rebalanceWorker != myNodeId:
                 release(store.spacesMu)
                 return # Another node took over

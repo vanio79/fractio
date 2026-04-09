@@ -96,13 +96,13 @@ proc createTestEnv(suiteName: string): tuple[client: FractioClient,
   )
   let metaGroupRec = GroupRecord(
     groupId: groupIDToULID(META_GROUP_ID),
-    spaceId: ZeroULID(),
+    spaceId: zeroSpaceID(),
     preferredLeader: 1, leader: 1,
     replicas: @[GroupReplicaBin(nodeId: 1, replicaType: rtVoter)]
   )
   let dataGroupRec = GroupRecord(
     groupId: groupIDToULID(DATA_GROUP_START_ID),
-    spaceId: ZeroULID(),
+    spaceId: zeroSpaceID(),
     preferredLeader: 1, leader: 1,
     replicas: @[GroupReplicaBin(nodeId: 1, replicaType: rtVoter)]
   )

@@ -540,7 +540,7 @@ proc planCreateSpace(stmt: Stmt): Plan =
   let plan = newPlan()
   # Use binary encoding for SpaceRecord
   # spaceId will be assigned at execution time - use placeholder
-  var placeholderSpaceId: ULID
+  var placeholderSpaceId: SpaceID
   let rec = SpaceRecord(
     spaceId: placeholderSpaceId, # Will be assigned at execution time
     name: stmt.csSpaceName,
