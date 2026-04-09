@@ -2,7 +2,7 @@
 # Provides atomic commit across multiple nodes/ranges using the 2PC protocol
 # Integrated with Raft for consensus and durability
 
-import std/[options, tables, sets, sequtils, times, strutils, json,
+import std/[options, tables, sets, sequtils, times, strutils,
     asyncdispatch, random]
 import fractio/core/types
 import fractio/core/transaction
@@ -10,6 +10,7 @@ import fractio/core/timestamp_provider
 import fractio/storage/mvcc/engine
 import fractio/storage/mvcc/types
 import fractio/utils/logging
+import fractio/utils/binary
 import fractio/distributed/raft/types
 
 type
@@ -705,51 +706,125 @@ proc handleTimeout*(coordinator: Coordinator): TwoPCResult =
       retryable: false
     )
 
-# Serialization for RPC
+# =============================================================================
+# Binary Serialization for RPC
+# =============================================================================
 
-proc twoPCRequestToJson*(request: TwoPCRequest): JsonNode =
-  ## Serialize a 2PC request to JSON
-  result = %*{
-    "requestId": request.requestId,
-    "requestType": $request.requestType,
-    "transactionId": $request.transactionId,
-    "coordinatorId": request.coordinatorId,
-    "timestamp": int64(request.timestamp),
-    "data": request.data,
-    "participantEndpoints": request.participantEndpoints
-  }
+const
+  TWOPC_REQUEST_MAGIC* = [0x32'u8, 0x50'u8, 0x52'u8]       # "2PR" - 2PC Request
+  TWOPC_RESPONSE_MAGIC* = [0x32'u8, 0x50'u8, 0x53'u8]      # "2PS" - 2PC reSponse
+  TWOPC_VERSION* = 0x01'u8
 
-proc twoPCRequestFromJson*(json: JsonNode): TwoPCRequest =
-  ## Deserialize a 2PC request from JSON
-  result = TwoPCRequest(
-    requestId: json["requestId"].getStr(),
-    requestType: parseEnum[TwoPCRequestType](json["requestType"].getStr()),
-    transactionId: transactionIDFromString(json["transactionId"].getStr()),
-    coordinatorId: json["coordinatorId"].getStr(),
-    timestamp: Timestamp(json["timestamp"].getInt()),
-    data: json["data"].getStr(),
-    participantEndpoints: json["participantEndpoints"].getElems().mapIt(
-        it.getStr())
-  )
+proc encodeTwoPCRequest*(request: TwoPCRequest): string =
+  ## Encode a TwoPCRequest to binary format.
+  ##
+  ## Binary format (little-endian):
+  ## - Magic: 3 bytes ("2PR")
+  ## - Version: 1 byte
+  ## - RequestType: 1 byte (uint8 ordinal)
+  ## - RequestId: length-prefixed string
+  ## - TransactionId: 16 bytes (ULID)
+  ## - CoordinatorId: length-prefixed string
+  ## - Timestamp: 8 bytes (int64)
+  ## - Data: length-prefixed string
+  ## - ParticipantEndpoints: length-prefixed seq of strings
+  var w = initBinaryWriter()
+  w.writeBytes(TWOPC_REQUEST_MAGIC)
+  w.writeU8(TWOPC_VERSION)
+  w.writeU8(uint8(ord(request.requestType)))
+  w.writeString(request.requestId)
+  w.writeBytes(transactionIDToBytes(request.transactionId))
+  w.writeString(request.coordinatorId)
+  w.writeI64(int64(request.timestamp))
+  w.writeString(request.data)
+  # Write participant endpoints
+  w.writeU32(uint32(request.participantEndpoints.len))
+  for ep in request.participantEndpoints:
+    w.writeString(ep)
+  w.finish()
 
-proc twoPCResponseToJson*(response: TwoPCResponse): JsonNode =
-  ## Serialize a 2PC response to JSON
-  result = %*{
-    "requestId": response.requestId,
-    "transactionId": $response.transactionId,
-    "participantId": response.participantId,
-    "vote": $response.vote,
-    "state": $response.state,
-    "error": response.error
-  }
+proc decodeTwoPCRequest*(data: string): TwoPCRequest =
+  ## Decode binary data to a TwoPCRequest.
+  ## Raises ValueError if data is invalid.
+  var r = initBinaryReader(data)
 
-proc twoPCResponseFromJson*(json: JsonNode): TwoPCResponse =
-  ## Deserialize a 2PC response from JSON
-  result = TwoPCResponse(
-    requestId: json["requestId"].getStr(),
-    transactionId: transactionIDFromString(json["transactionId"].getStr()),
-    participantId: json["participantId"].getStr(),
-    vote: parseEnum[ParticipantVote](json["vote"].getStr()),
-    state: parseEnum[TwoPCState](json["state"].getStr()),
-    error: json["error"].getStr()
-  )
+  # Verify magic header
+  if r.remaining < 4:
+    raise newException(ValueError, "TwoPCRequest: data too small for header")
+  let magic0 = r.readU8()
+  let magic1 = r.readU8()
+  let magic2 = r.readU8()
+  if magic0 != TWOPC_REQUEST_MAGIC[0] or magic1 != TWOPC_REQUEST_MAGIC[1] or
+     magic2 != TWOPC_REQUEST_MAGIC[2]:
+    raise newException(ValueError, "TwoPCRequest: invalid magic header")
+
+  # Verify version
+  let version = r.readU8()
+  if version != TWOPC_VERSION:
+    raise newException(ValueError, "TwoPCRequest: unsupported version " & $version)
+
+  # Read fields
+  result.requestType = TwoPCRequestType(int(r.readU8()))
+  result.requestId = r.readString()
+  let txnIdBytes = r.readFixedString(16)
+  result.transactionId = transactionIDFromBytes(txnIdBytes)
+  result.coordinatorId = r.readString()
+  result.timestamp = Timestamp(r.readI64())
+  result.data = r.readString()
+  # Read participant endpoints
+  let epCount = int(r.readU32())
+  result.participantEndpoints = newSeq[string](epCount)
+  for i in 0..<epCount:
+    result.participantEndpoints[i] = r.readString()
+
+proc encodeTwoPCResponse*(response: TwoPCResponse): string =
+  ## Encode a TwoPCResponse to binary format.
+  ##
+  ## Binary format (little-endian):
+  ## - Magic: 3 bytes ("2PS")
+  ## - Version: 1 byte
+  ## - Vote: 1 byte (uint8 ordinal)
+  ## - State: 1 byte (uint8 ordinal)
+  ## - RequestId: length-prefixed string
+  ## - TransactionId: 16 bytes (ULID)
+  ## - ParticipantId: length-prefixed string
+  ## - Error: length-prefixed string
+  var w = initBinaryWriter()
+  w.writeBytes(TWOPC_RESPONSE_MAGIC)
+  w.writeU8(TWOPC_VERSION)
+  w.writeU8(uint8(ord(response.vote)))
+  w.writeU8(uint8(ord(response.state)))
+  w.writeString(response.requestId)
+  w.writeBytes(transactionIDToBytes(response.transactionId))
+  w.writeString(response.participantId)
+  w.writeString(response.error)
+  w.finish()
+
+proc decodeTwoPCResponse*(data: string): TwoPCResponse =
+  ## Decode binary data to a TwoPCResponse.
+  ## Raises ValueError if data is invalid.
+  var r = initBinaryReader(data)
+
+  # Verify magic header
+  if r.remaining < 5:
+    raise newException(ValueError, "TwoPCResponse: data too small for header")
+  let magic0 = r.readU8()
+  let magic1 = r.readU8()
+  let magic2 = r.readU8()
+  if magic0 != TWOPC_RESPONSE_MAGIC[0] or magic1 != TWOPC_RESPONSE_MAGIC[1] or
+     magic2 != TWOPC_RESPONSE_MAGIC[2]:
+    raise newException(ValueError, "TwoPCResponse: invalid magic header")
+
+  # Verify version
+  let version = r.readU8()
+  if version != TWOPC_VERSION:
+    raise newException(ValueError, "TwoPCResponse: unsupported version " & $version)
+
+  # Read fields
+  result.vote = ParticipantVote(int(r.readU8()))
+  result.state = TwoPCState(int(r.readU8()))
+  result.requestId = r.readString()
+  let txnIdBytes = r.readFixedString(16)
+  result.transactionId = transactionIDFromBytes(txnIdBytes)
+  result.participantId = r.readString()
+  result.error = r.readString()
