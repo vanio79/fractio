@@ -1,10 +1,6 @@
 # Raft Node Implementation
 
-import std/json
 import std/strutils
-import std/streams
-import std/sets
-import std/sequtils
 import std/tables
 import std/times
 import std/options
@@ -186,6 +182,7 @@ proc shutdown*(node: RaftNodeImpl) =
 
 proc appendEntry*(store: WiscKeyLogStore, entry: LogEntry): int64 =
   ## Append a log entry to the store (thread-safe)
+  ## Uses binary serialization for high performance.
   if store.backend == nil:
     raise newException(RaftError, "Log store not initialized")
 
@@ -194,11 +191,8 @@ proc appendEntry*(store: WiscKeyLogStore, entry: LogEntry): int64 =
     result = store.nextIndex
     inc store.nextIndex
 
-  # Serialize entry
-  let data = entry.data
-  let serialized = """{"term": """ & $entry.term &
-    ", \"type\": \"" & $entry.entryType &
-    "\", \"data\": \"" & data.replace("\"", "\\\"") & "\"}"
+  # Serialize entry using binary format
+  let serialized = encodeLogEntry(entry)
 
   # Write to WiscKey - use index as key
   let key = $result
@@ -206,7 +200,8 @@ proc appendEntry*(store: WiscKeyLogStore, entry: LogEntry): int64 =
     raise newException(RaftError, "Failed to write log entry")
 
 proc getEntry*(store: WiscKeyLogStore, index: int64): Option[LogEntry] =
-  ## Get a log entry by index
+  ## Get a log entry by index.
+  ## Uses binary serialization format.
   if store.backend == nil:
     raise newException(RaftError, "Log store not initialized")
 
@@ -218,18 +213,14 @@ proc getEntry*(store: WiscKeyLogStore, index: int64): Option[LogEntry] =
   if value.isNone:
     return none(LogEntry)
 
-  # Deserialize entry
+  # Deserialize binary entry
   try:
-    let jsonNode = parseJson(value.get)
-    result = some(LogEntry(
-      term: jsonNode["term"].getInt(),
-      entryType: parseEnum[LogEntryType](jsonNode["type"].getStr()),
-      data: jsonNode["data"].getStr()
-    ))
-  except JsonParsingError:
+    result = some(decodeLogEntry(value.get()))
+  except ValueError:
     var fields = initTable[string, string]()
     fields["index"] = $index
-    warn("Failed to parse log entry", fields)
+    fields["error"] = "binary decode failed"
+    warn("Failed to decode log entry", fields)
     return none(LogEntry)
 
 proc getEntries*(store: WiscKeyLogStore, start: int64, endIndex: int64): seq[LogEntry] =
