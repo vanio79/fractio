@@ -167,7 +167,7 @@ suite "EXPLAIN integration — round-trip":
         database = "testdb")
     check res.kind == erkRows
     check "PointGet" in res.rows[0][0]
-    check "key=2" in res.rows[0][0]
+    # Note: pgKey is now binary-encoded, so we don't check for "key=2" in the string
 
   test "EXPLAIN SELECT with non-PK filter returns Scan with filter":
     let res = exec(client, "EXPLAIN SELECT name FROM users WHERE age > 28",

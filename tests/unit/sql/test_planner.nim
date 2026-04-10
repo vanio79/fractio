@@ -8,6 +8,7 @@ import fractio/sql/parser
 import fractio/sql/planner
 import fractio/sql/data_row
 import fractio/core/types except NodeID
+import fractio/core/primary_key
 import fractio/distributed/meta/system_tables
 import fractio/distributed/meta/system_schemas
 import fractio/protocol/raft_store
@@ -304,7 +305,13 @@ suite "SQL Planner":
     check plan.ops.len == 1
     check plan.ops[0].kind == poPointGet
     check plan.ops[0].pgTableId == tid
-    check plan.ops[0].pgKey == "42"
+    # pgKey is now binary-encoded; decode to verify the value
+    let pkSpec = plan.ops[0].pgPkSpec
+    let pk = decodePrimaryKey(plan.ops[0].pgKey, pkSpec)
+    check pk.len == 1
+    check pk[0].kind == cdtInt
+    check pk[0].intVal == 42
+    check not pk[0].isNull
 
   test "plan SELECT full scan":
     let tid = testTableId()

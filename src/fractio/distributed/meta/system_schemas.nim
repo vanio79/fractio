@@ -94,16 +94,19 @@ type
     ## Binary-encoded column definition
     name*: string
     dataType*: ColumnDataType
-    flags*: uint8 # Bitfield: bit 0 = primaryKey, bit 1 = notNull, bit 2 = unique
+    maxLen*: uint16 ## Max length for VARCHAR/bytes types (used for PK encoding)
+    flags*: uint8   # Bitfield: bit 0 = primaryKey, bit 1 = notNull, bit 2 = unique
 
 proc encodeColumnDef*(col: ColumnDefBin, w: var BinaryWriter) =
   w.writeString(col.name)
   w.writeU8(uint8(col.dataType))
+  w.writeU16(col.maxLen)
   w.writeU8(col.flags)
 
 proc decodeColumnDef*(r: var BinaryReader): ColumnDefBin =
   result.name = r.readString()
   result.dataType = ColumnDataType(r.readU8())
+  result.maxLen = r.readU16()
   result.flags = r.readU8()
 
 # =============================================================================

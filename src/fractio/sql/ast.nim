@@ -104,6 +104,7 @@ type
   ColDef* = object
     name*: string
     dataType*: DataType
+    maxLen*: int ## Max length for VARCHAR/bytes types (0 = unspecified, use default)
     notNull*: bool
     primaryKey*: bool
     unique*: bool

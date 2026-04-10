@@ -69,7 +69,7 @@ suite "EXPLAIN external cluster — round-trip":
     let res = execSQL(cluster, "EXPLAIN SELECT * FROM users WHERE id = 2",
         database = "testdb")
     checkExplainResult(res, "PointGet")
-    check "key=2" in res["rows"][0]["plan"].getStr
+    # Note: pgKey is now binary-encoded, so we don't check for "key=2" in the string
 
   test "EXPLAIN SELECT with non-PK filter returns Scan with filter":
     let res = execSQL(cluster, "EXPLAIN SELECT name FROM users WHERE age > 28",

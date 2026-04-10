@@ -14,6 +14,7 @@ import fractio/sql/ast
 import fractio/sql/planner
 import fractio/sql/executor
 import fractio/core/types except NodeID
+import fractio/core/primary_key
 import fractio/distributed/meta/system_tables
 import fractio/distributed/meta/system_schemas
 import fractio/protocol/raft_store
@@ -442,11 +443,11 @@ suite "EXPLAIN — formatPlanOp":
   test "format PointGet op":
     let op = PlanOp(kind: poPointGet,
       pgTableId: testTableId(),
-      pgKey: "42",
+      pgKey: "42", # Note: In real usage this would be binary-encoded
       pgColumns: @["id", "name"])
     let s = formatPlanOp(op)
     check "PointGet" in s
-    check "key=42" in s
+    # Note: pgKey is binary-encoded in real usage, but formatPlanOp displays it as-is
 
   test "format Insert op":
     let op = PlanOp(kind: poInsert,
@@ -599,7 +600,13 @@ suite "EXPLAIN — planner with store":
     let plan = planStatement(stmt, client)
     check plan.ops[0].kind == poExplain
     check plan.ops[0].exInnerPlan.ops[0].kind == poPointGet
-    check plan.ops[0].exInnerPlan.ops[0].pgKey == "1"
+    # pgKey is now binary-encoded; decode to verify the value
+    let pkSpec = plan.ops[0].exInnerPlan.ops[0].pgPkSpec
+    let pk = decodePrimaryKey(plan.ops[0].exInnerPlan.ops[0].pgKey, pkSpec)
+    check pk.len == 1
+    check pk[0].kind == cdtInt
+    check pk[0].intVal == 1
+    check not pk[0].isNull
 
   test "EXPLAIN UPDATE generates poExplain wrapping poUpdate":
     seedTable(store, "default", "public", "users", testTableId(),

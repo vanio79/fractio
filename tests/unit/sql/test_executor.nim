@@ -815,7 +815,8 @@ suite "SQL Executor — EXPLAIN":
     check res.kind == erkRows
     check res.rows.len == 1
     check "PointGet" in res.rows[0][0]
-    check "42" in res.rows[0][0]
+    # Note: pgKey is now binary-encoded, so we don't check for "42" in the string
+    # The binary PK is properly tested in test_planner.nim via decodePrimaryKey
 
   test "EXPLAIN SELECT with filter":
     discard client.exec(

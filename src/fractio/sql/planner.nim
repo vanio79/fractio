@@ -4,13 +4,14 @@
 # The planner resolves table names to table IDs via catalog lookups
 # and generates the appropriate key encodings for reads/writes.
 
-import std/[options, json, strutils, strformat]
+import std/[options, json, strutils, strformat, sequtils]
 import ./ast
 import ./data_row
 import ../distributed/meta/system_tables
 import ../distributed/meta/system_schemas
 import ../client/fractio_client
 import ../core/types as coreTypes
+import ../core/primary_key
 
 # ---------------------------------------------------------------------------
 # Plan types
@@ -85,11 +86,14 @@ type
       insTableName*: string
       insColumns*: seq[string]     # column names in order
       insPkColumn*: string         # primary key column name
+      insPkSpec*: PrimaryKeySpec   # primary key spec for binary encoding
       insRows*: seq[string]        # binary-encoded DataRow objects
+      insPkValues*: seq[string]    # binary-encoded primary key values
 
     of poPointGet:
       pgTableId*: TableId
-      pgKey*: string               # primary key value
+      pgKey*: string               # binary-encoded primary key value
+      pgPkSpec*: PrimaryKeySpec    # primary key spec for decoding
       pgColumns*: seq[string]      # columns to return (empty = all)
       pgAllColumns*: seq[string]   # all table columns for decoding
 
@@ -191,6 +195,7 @@ type
     database*: string
     columns*: seq[ColDef]
     primaryKey*: seq[string]
+    pkSpec*: PrimaryKeySpec ## Primary key spec for binary encoding
     spaceId*: SpaceID
 
 proc findPkColumn*(desc: TableDescriptor): string =
@@ -244,6 +249,7 @@ proc resolveTable*(client: FractioClient,
     schema: rec.schema,
     database: rec.database,
     spaceId: rec.spaceId,
+    pkSpec: primaryKeySpecFromTable(rec),
   )
   # Copy primary key columns
   for pk in rec.primaryKey:
@@ -252,6 +258,7 @@ proc resolveTable*(client: FractioClient,
   for col in rec.columns:
     var cd = ColDef(name: col.name)
     cd.dataType = columnDataTypeToDataType(col.dataType)
+    cd.maxLen = int(col.maxLen)
     cd.primaryKey = (col.flags and 0x01) != 0
     cd.notNull = (col.flags and 0x02) != 0
     desc.columns.add(cd)
@@ -301,6 +308,41 @@ proc exprToDataRowValue*(e: Expr): DataRowValue =
   of dtString: newRowValue(e.litValue.strValue)
   of dtBool: newRowValue(e.litValue.boolValue)
   else: newRowValue()
+
+proc dataRowValueToPkValue*(v: DataRowValue, colSpec: tuple[name: string,
+    dataType: ColumnDataType, maxLen: int]): PrimaryKeyColumnValue =
+  ## Convert a DataRowValue to a PrimaryKeyColumnValue for encoding.
+  if v.kind == drvkNull:
+    case colSpec.dataType
+    of cdtInt: result = pkValueFromInt(0, isNull = true)
+    of cdtFloat: result = pkValueFromFloat(0.0, isNull = true)
+    of cdtString: result = pkValueFromString("", colSpec.maxLen, isNull = true)
+    of cdtBool: result = pkValueFromBool(false, isNull = true)
+    of cdtBytes: result = PrimaryKeyColumnValue(isNull: true, kind: cdtBytes,
+        bytesMaxLen: colSpec.maxLen)
+    of cdtDate: result = pkValueFromDate(0, isNull = true)
+    of cdtDateTime: result = pkValueFromDateTime(0, isNull = true)
+    of cdtULID: result = PrimaryKeyColumnValue(isNull: true, kind: cdtULID)
+  else:
+    case colSpec.dataType
+    of cdtInt: result = pkValueFromInt(v.intVal)
+    of cdtFloat: result = pkValueFromFloat(v.floatVal)
+    of cdtString: result = pkValueFromString(v.strVal, colSpec.maxLen)
+    of cdtBool: result = pkValueFromBool(v.boolVal)
+    of cdtBytes:
+      var bytes: seq[uint8]
+      for c in v.strVal:
+        bytes.add(uint8(c))
+      result = PrimaryKeyColumnValue(isNull: false, kind: cdtBytes,
+          bytesVal: bytes, bytesMaxLen: colSpec.maxLen)
+    of cdtDate: result = pkValueFromDate(v.intVal)
+    of cdtDateTime: result = pkValueFromDateTime(v.intVal)
+    of cdtULID:
+      var ulid: array[16, uint8]
+      # Assume strVal contains 16-byte binary or parse from string
+      for i in 0..<min(v.strVal.len, 16):
+        ulid[i] = uint8(v.strVal[i])
+      result = pkValueFromULID(ulid)
 
 proc exprToJsonValue*(e: Expr): JsonNode =
   ## Convert a literal expression to a JSON value.
@@ -383,6 +425,7 @@ proc planCreateTable(stmt: Stmt, client: FractioClient,
     columns.add(ColumnDefBin(
       name: col.name,
       dataType: dataTypeToColumnDataType(col.dataType),
+      maxLen: uint16(col.maxLen),
       flags: flags
     ))
 
@@ -432,6 +475,8 @@ proc planInsert(stmt: Stmt, client: FractioClient,
                  else: columnNames(desc)
 
   var rows: seq[string]
+  var pkValues: seq[string]
+
   for row in stmt.intoValues:
     var dataRow = newDataRow()
     for i, expr in row:
@@ -439,12 +484,23 @@ proc planInsert(stmt: Stmt, client: FractioClient,
         dataRow[colNames[i]] = exprToDataRowValue(expr)
     rows.add(encodeDataRow(dataRow))
 
+    # Build binary primary key
+    var pk: PrimaryKey
+    for pkColName in desc.primaryKey:
+      let colSpec = desc.pkSpec.columns[desc.pkSpec.columns.findIt(it.name == pkColName)]
+      let dataVal = if dataRow.hasColumn(pkColName): dataRow[
+          pkColName] else: newRowValue()
+      pk.add(dataRowValueToPkValue(dataVal, colSpec))
+    pkValues.add(encodePrimaryKey(pk, desc.pkSpec))
+
   plan.add(PlanOp(kind: poInsert,
     insTableId: desc.tableId,
     insTableName: desc.name,
     insColumns: colNames,
     insPkColumn: pkCol,
+    insPkSpec: desc.pkSpec,
     insRows: rows,
+    insPkValues: pkValues,
   ))
   plan
 
@@ -477,15 +533,17 @@ proc planSelect(stmt: Stmt, client: FractioClient,
     if w.kind == exBinOp and w.binOp == boEq:
       if w.binLeft.kind == exColumn and w.binLeft.colName == pkCol and
          w.binRight.kind == exLiteral:
-        var pkVal: string
-        if w.binRight.litValue != nil:
-          case w.binRight.litValue.kind
-          of dtInt: pkVal = $w.binRight.litValue.intValue
-          of dtString: pkVal = w.binRight.litValue.strValue
-          else: pkVal = $w.binRight.litValue.intValue
+        # Build binary primary key from literal value
+        var pk: PrimaryKey
+        let colSpec = desc.pkSpec.columns[0]             # First PK column
+        let dataVal = exprToDataRowValue(w.binRight)
+        pk.add(dataRowValueToPkValue(dataVal, colSpec))
+        let pkVal = encodePrimaryKey(pk, desc.pkSpec)
+
         plan.add(PlanOp(kind: poPointGet,
           pgTableId: desc.tableId,
           pgKey: pkVal,
+          pgPkSpec: desc.pkSpec,
           pgColumns: reqCols,
           pgAllColumns: allCols,
         ))

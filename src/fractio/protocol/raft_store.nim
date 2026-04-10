@@ -326,11 +326,16 @@ proc resolveGroupId*(store: RaftKVStoreExt, key: string): Option[
             # decodeTableKey returns "d/<pk>" for data rows; strip the
             # "d/" prefix so we hash the same bare PK that raftPutInSpace
             # and the SQL executor use.
+            # NOTE: We do NOT call stripMvccSuffix on the bare PK because:
+            # 1. The full routingKey was already stripped at line 300
+            # 2. Binary PKs may legitimately contain \x00 bytes (NULL flags/padding)
+            # 3. The MVCC suffix pattern (\x00\x01/\x00\x00 + 8 bytes) could
+            #    accidentally match binary PK content, causing incorrect truncation
             let pk = if primaryKey.startsWith("d/"):
                        primaryKey[2 .. ^1]
                      else:
                        primaryKey
-            let routedGid = routeToGroup(stripMvccSuffix(pk), groupIds)
+            let routedGid = routeToGroup(pk, groupIds)
             return some(routedGid)
       except:
         discard
@@ -383,10 +388,12 @@ proc keyRoutesToGroupIdDuringRebalance*(store: RaftKVStoreExt, key: string,
                        primaryKey[2 .. ^1]
                      else:
                        primaryKey
-            let barePk = stripMvccSuffix(pk)
+            # NOTE: Do NOT call stripMvccSuffix on bare PK - binary PKs may
+            # contain legitimate \x00 bytes that would match the MVCC suffix
+            # pattern incorrectly
 
             # Check if key routes to new group
-            let newRoutedGid = routeToGroup(barePk, newGroupIds)
+            let newRoutedGid = routeToGroup(pk, newGroupIds)
             
             # Debug logging for routing
             when defined(debug):
@@ -396,7 +403,7 @@ proc keyRoutesToGroupIdDuringRebalance*(store: RaftKVStoreExt, key: string,
                     debug("keyRoutesToGroupIdDuringRebalance", {
                       "key": key[0..min(50, key.len-1)],
                       "tableId": $tableId,
-                      "pk": barePk,
+                      "pk": pk,
                       "newGroupIds": $newGroupIds.len,
                       "targetGroupId": $targetGroupId,
                       "newRoutedGid": $newRoutedGid
@@ -409,7 +416,7 @@ proc keyRoutesToGroupIdDuringRebalance*(store: RaftKVStoreExt, key: string,
 
             # During rebalancing, also check old groups (dual-read)
             if rebalancing and oldGroupIds.len > 0:
-              let oldRoutedGid = routeToGroup(barePk, oldGroupIds)
+              let oldRoutedGid = routeToGroup(pk, oldGroupIds)
               if oldRoutedGid == targetGroupId:
                 return true
 
@@ -1259,7 +1266,9 @@ proc validateKeyRouting(store: RaftKVStoreExt, key: string,
                    primaryKey[2 .. ^1]
                  else:
                    primaryKey
-        let expected = routeToGroup(stripMvccSuffix(pk), space.groupIds)
+        # NOTE: Do NOT call stripMvccSuffix on bare PK - binary PKs may
+        # contain legitimate \x00 bytes that would incorrectly match MVCC pattern
+        let expected = routeToGroup(pk, space.groupIds)
         if expected != groupId:
           # During rebalancing, also check if the key routes to an old group
           if space.rebalancing and space.oldGroupIds.len > 0:
@@ -2527,11 +2536,13 @@ proc raftScanSpace*(store: RaftKVStoreExt, startKey, endKey: string,
               let (tableId, primaryKey) = decodeTableKey(k)
               let pk = if primaryKey.startsWith("d/"): primaryKey[
                   2..^1] else: primaryKey
-              let routedGid = routeToGroup(stripMvccSuffix(pk), space.groupIds)
+              # NOTE: Do NOT call stripMvccSuffix on bare PK - binary PKs may
+              # contain legitimate \x00 bytes that would incorrectly match MVCC pattern
+              let routedGid = routeToGroup(pk, space.groupIds)
               # Include if it routes to new groups OR (during rebalancing) old groups
               var matches = (routedGid == gid)
               if not matches and space.rebalancing:
-                let oldRoutedGid = routeToGroup(stripMvccSuffix(pk),
+                let oldRoutedGid = routeToGroup(pk,
                     space.oldGroupIds)
                 matches = (oldRoutedGid == gid)
               if matches:
@@ -3109,8 +3120,10 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: SpaceID) {.raises: [
           if not afterD.startsWith("d/"): continue
           let pk = afterD[2..^1]
 
-          let oldGroup = routeToGroup(stripMvccSuffix(pk), oldGroupIds)
-          let newGroup = routeToGroup(stripMvccSuffix(pk), newGroupIds)
+          # NOTE: Do NOT call stripMvccSuffix on bare PK - binary PKs may
+          # contain legitimate \x00 bytes that would incorrectly match MVCC pattern
+          let oldGroup = routeToGroup(pk, oldGroupIds)
+          let newGroup = routeToGroup(pk, newGroupIds)
 
           # Debug: log routing for each key
           {.cast(raises: []).}:

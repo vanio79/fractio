@@ -915,13 +915,14 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
     of poInsert:
       var count = 0
       var error: string = ""
-      for rowBinary in op.insRows:
-        let row = decodeDataRow(rowBinary)
-        let pkVal = getPkValueFromDataRow(row, op.insPkColumn)
-        if pkVal.len == 0:
+      # Use binary-encoded PK values from planner (insPkValues)
+      for i, rowBinary in op.insRows:
+        let pkBinary = op.insPkValues[i]
+        if pkBinary.len == 0:
           error = "INSERT requires a primary key value"
           break
-        let key = encodeDataRowKey(op.insTableId, pkVal)
+        # Encode data row key with binary PK
+        let key = encodeDataRowKey(op.insTableId, pkBinary)
         # Use active transaction if available, otherwise auto-transaction
         let res = ctx.client.kvPut(key, rowBinary, txnId = ctx.txnId)
         if not res.isOk:

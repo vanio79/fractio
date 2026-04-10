@@ -262,33 +262,52 @@ proc parseExpr(p: var Parser, minPrec: int = 0): Expr =
 # Column type parsing
 # ---------------------------------------------------------------------------
 
-proc parseDataType(p: var Parser): DataType =
+proc parseDataType(p: var Parser): tuple[dt: DataType, maxLen: int] =
+  ## Parse a data type, returning the type and max length for strings/bytes.
+  ## For VARCHAR(n), maxLen is n. For other types, maxLen is 0.
   let t = p.peek
   case t.kind
-  of tkTkInt: discard p.advance; dtInt
-  of tkTkFloat: discard p.advance; dtFloat
+  of tkTkInt:
+    discard p.advance
+    (dtInt, 0)
+  of tkTkFloat:
+    discard p.advance
+    (dtFloat, 0)
   of tkTkText:
     discard p.advance
-    # optional (n) precision — skip it
+    var maxLen = 64 # Default VARCHAR length
     if p.check(tkLParen):
       discard p.advance
-      discard p.expect(tkInt)
+      let lenToken = p.expect(tkInt)
+      maxLen = parseInt(lenToken.value)
       discard p.expect(tkRParen)
-    dtString
-  of tkTkBool: discard p.advance; dtBool
-  of tkTkDate: discard p.advance; dtDate
-  of tkTkDateTime: discard p.advance; dtDateTime
-  of tkTkBytes: discard p.advance; dtBytes
+    (dtString, maxLen)
+  of tkTkBool:
+    discard p.advance
+    (dtBool, 0)
+  of tkTkDate:
+    discard p.advance
+    (dtDate, 0)
+  of tkTkDateTime:
+    discard p.advance
+    (dtDateTime, 0)
+  of tkTkBytes:
+    discard p.advance
+    var maxLen = 1024 # Default BYTES length
+    if p.check(tkLParen):
+      discard p.advance
+      let lenToken = p.expect(tkInt)
+      maxLen = parseInt(lenToken.value)
+      discard p.expect(tkRParen)
+    (dtBytes, maxLen)
   else:
     raise parseError(&"expected a data type but got '{t.value}'", t)
 
-# ---------------------------------------------------------------------------
-# CREATE TABLE
-# ---------------------------------------------------------------------------
-
 proc parseColDef(p: var Parser): ColDef =
   result.name = p.expectIdent
-  result.dataType = p.parseDataType
+  let (dt, maxLen) = p.parseDataType
+  result.dataType = dt
+  result.maxLen = maxLen
   # constraints
   while true:
     case p.peekKind
