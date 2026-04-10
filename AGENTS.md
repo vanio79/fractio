@@ -68,6 +68,15 @@ chroma_chroma_add_document(
 # Run all tests (unit, integration, concurrency)
 nimble test
 
+# Run unit tests only
+nimble test_unit
+
+# Run unit core tests (fast subset)
+nimble test_unit_core
+
+# Run integration tests (real infrastructure)
+nimble test_integration
+
 # Run a single test file
 nim c -r --checks:on -p:src tests/unit/distributed/raft/test_node.nim
 
@@ -81,13 +90,38 @@ nimble build
 nimble docs
 nim doc --project.json src/fractio/core/types.nim
 
-# coverage requires koch
-koch test --metrics  # with coverage metrics
-
 # Clean build artifacts
 nimble clean
 rm -rf tmp/
 ```
+
+### Code Coverage Workflow
+
+Coverage uses unique cache directories per test to avoid gcov checksum mismatches:
+
+```bash
+# Run unit tests with coverage
+nimble coverage_unit
+
+# Run core tests with coverage (fast subset)
+nimble coverage_unit_core
+
+# Clean coverage data
+nimble coverage_clean
+
+# Generate coverage summary
+nimble coverage_summary
+
+# Full coverage workflow
+nimble coverage_clean && nimble coverage_unit_core && nimble coverage_summary
+```
+
+Coverage files are stored in `coverage/` directory:
+- `coverage/cache_<test>/` - Unique nimcache per test
+- `coverage/*.gcda` - Coverage data files
+- `coverage/summary.info` - Merged lcov tracefile
+
+Current coverage: ~26% lines, ~38% functions (unit core tests only)
 
 **Single Test Tip**: Find the exact path first with `find tests -name "test_*.nim"` then compile with `-r` to run immediately.
 

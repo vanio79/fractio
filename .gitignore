@@ -31,6 +31,9 @@ tmp/
 tmp_*/
 testresults/
 test.txt
+
+# Code coverage data and reports
+coverage/
 # Compiled test binaries in root (no extension = Nim binary)
 /test_*
 !/test_*.nim

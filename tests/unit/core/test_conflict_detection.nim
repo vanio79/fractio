@@ -1,4 +1,6 @@
 # Unit tests for Conflict Detection and Resolution
+# Migrated to use DI patterns where applicable
+# Note: Uses inline mocks for StorageBackend/Iterator compatibility
 
 import unittest
 import tables
@@ -12,7 +14,9 @@ import fractio/core/types
 import fractio/storage/mvcc/engine
 import fractio/storage/mvcc/types
 import fractio/storage/backend
-import fractio/distributed/sharedtimer/mock
+import fractio/distributed/sharedtimer/mock as sharedtimerMock
+import fractio/di/container
+import fractio/app/bootstrap
 
 # Constants for testing
 const
@@ -22,37 +26,34 @@ const
   DEFAULT_PRIORITY* = 500
   DEFAULT_MAX_RETRIES* = 15
 
-# Forward declaration
+# Inline mock for MVCCEngine compatibility (must inherit from StorageBackend)
 type
-  MockStorageBackend* = ref object of StorageBackend
-    data*: tables.Table[string, string]
+  InlineMockStorageBackend = ref object of StorageBackend
+    data: tables.Table[string, string]
 
-# Mock Iterator for testing
-type
-  MockStorageIterator* = ref object of StorageIterator
-    backendRef*: MockStorageBackend
-    keys*: seq[string]
-    position*: int
+  InlineMockStorageIterator = ref object of StorageIterator
+    backendRef: InlineMockStorageBackend
+    keys: seq[string]
+    position: int
 
-proc newMockStorageIterator*(backend: MockStorageBackend): MockStorageIterator =
+proc newInlineMockStorageIterator(backend: InlineMockStorageBackend): InlineMockStorageIterator =
   new(result)
   result.backendRef = backend
   result.keys = toSeq(backend.data.keys).sorted()
   result.position = 0
 
-method valid*(iter: MockStorageIterator): bool =
+method valid(iter: InlineMockStorageIterator): bool =
   return iter.position < iter.keys.len
 
-method seekToFirst*(iter: MockStorageIterator): bool =
+method seekToFirst(iter: InlineMockStorageIterator): bool =
   iter.position = 0
   return iter.valid()
 
-method seekToLast*(iter: MockStorageIterator): bool =
+method seekToLast(iter: InlineMockStorageIterator): bool =
   iter.position = iter.keys.len - 1
   return iter.valid()
 
-method seek*(iter: MockStorageIterator, key: string): bool =
-  # Binary search for key
+method seek(iter: InlineMockStorageIterator, key: string): bool =
   var left = 0
   var right = iter.keys.len - 1
   while left <= right:
@@ -67,75 +68,60 @@ method seek*(iter: MockStorageIterator, key: string): bool =
   iter.position = left
   return iter.valid()
 
-method next*(iter: MockStorageIterator): bool =
+method next(iter: InlineMockStorageIterator): bool =
   if iter.position < iter.keys.len - 1:
     inc iter.position
     return true
   return false
 
-method prev*(iter: MockStorageIterator): bool =
+method prev(iter: InlineMockStorageIterator): bool =
   if iter.position > 0:
     dec iter.position
     return true
   return false
 
-method key*(iter: MockStorageIterator): string =
+method key(iter: InlineMockStorageIterator): string =
   if iter.valid():
     return iter.keys[iter.position]
   return ""
 
-method value*(iter: MockStorageIterator): string =
+method value(iter: InlineMockStorageIterator): string =
   if iter.valid():
     let k = iter.keys[iter.position]
     return iter.backendRef.data[k]
   return ""
 
-method destroy*(iter: MockStorageIterator) =
+method destroy(iter: InlineMockStorageIterator) =
   discard
 
-proc newMockStorageBackend*(): MockStorageBackend =
+proc newInlineMockStorageBackend(): InlineMockStorageBackend =
   new(result)
   result.data = initTable[string, string]()
 
-method put*(backend: MockStorageBackend, key: string,
+method put(backend: InlineMockStorageBackend, key: string,
     value: string): bool =
   backend.data[key] = value
   return true
 
-method get*(backend: MockStorageBackend, key: string): Option[string] =
+method get(backend: InlineMockStorageBackend, key: string): Option[string] =
   if key in backend.data:
     return some(backend.data[key])
   return none(string)
 
-method delete*(backend: MockStorageBackend, key: string): bool =
+method delete(backend: InlineMockStorageBackend, key: string): bool =
   if key in backend.data:
     backend.data.del(key)
     return true
   return false
 
-method exists*(backend: MockStorageBackend, key: string): bool =
+method exists(backend: InlineMockStorageBackend, key: string): bool =
   return key in backend.data
 
-method newIterator*(backend: MockStorageBackend): StorageIterator =
-  return newMockStorageIterator(backend)
+method newIterator(backend: InlineMockStorageBackend): StorageIterator =
+  return newInlineMockStorageIterator(backend)
 
-suite "Conflict Detection":
-  setup:
-    let mockBackend = newMockStorageBackend()
-    let mockTimer = MockTimeProvider(currentTime: 1000_000_000)
-    let tsProvider = TimestampProvider(
-      timer: mockTimer,
-      lastTimestamp: 1000,
-      lastCounter: 0,
-      maxOffset: DEFAULT_MAX_OFFSET_NS,
-      nodeId: 0
-    )
-    let mvccEngine = MVCCEngine(
-      backend: mockBackend,
-      timestampProvider: tsProvider,
-      gcEnabled: false
-    )
-
+suite "Conflict Detection - Pure Tests":
+  # Tests that don't need any mocks
   test "conflict info creation":
     let conflict = ConflictInfo(
       conflictType: ctWriteWrite,
@@ -144,85 +130,66 @@ suite "Conflict Detection":
       timestamp: Timestamp(1000),
       retryable: true
     )
-
     check conflict.conflictType == ctWriteWrite
     check conflict.key == "test_key"
     check conflict.retryable == true
 
   test "conflict statistics":
     var stats = newConflictStatistics()
-
     stats.recordConflict(ctWriteWrite)
     stats.recordConflict(ctWriteRead)
     stats.recordConflict(ctWriteWrite)
-
     check stats.totalConflicts == 3
     check stats.writeWriteConflicts == 2
     check stats.writeReadConflicts == 1
-
     stats.recordResolution(crRetry)
     stats.recordResolution(crWait)
-
     check stats.resolvedByRetry == 1
     check stats.resolvedByWait == 1
-
-    let conflictRate = stats.getConflictRate(100)
-    check conflictRate == 0.03 # 3/100
-
-    let retryRate = stats.getRetryRate()
-    check retryRate == 0.5 # 1/2
+    check stats.getConflictRate(100) == 0.03
+    check stats.getRetryRate() == 0.5
 
   test "conflict rate calculation":
     var stats = newConflictStatistics()
-
-    # No transactions
     check stats.getConflictRate(0) == 0.0
-
-    # Some conflicts
     stats.recordConflict(ctWriteWrite)
     stats.recordConflict(ctWriteRead)
-
-    check stats.getConflictRate(10) == 0.2 # 2/10
+    check stats.getConflictRate(10) == 0.2
 
   test "retry rate calculation":
     var stats = newConflictStatistics()
-
-    # No resolutions
     check stats.getRetryRate() == 0.0
-
-    # All retries
     stats.recordResolution(crRetry)
     stats.recordResolution(crRetry)
     stats.recordResolution(crRetry)
-
-    check stats.getRetryRate() == 1.0 # 3/3
-
-    # Mixed resolutions
+    check stats.getRetryRate() == 1.0
     stats.recordResolution(crWait)
     stats.recordResolution(crPush)
-
-    check stats.getRetryRate() == 0.6 # 3/5
-
-  # Note: Complex conflict detection tests removed - require full MVCC engine mock
-  # These tests would need a properly functioning iterator and key encoding system
+    check stats.getRetryRate() == 0.6
 
 suite "Conflict Resolution":
+  var mockBackend: InlineMockStorageBackend
+  var mockTimer: sharedtimerMock.MockTimeProvider
+  var tsProvider: TimestampProvider
+  var mvccEngine: MVCCEngine
+  var resolver: ConflictResolver
+
   setup:
-    let mockBackend = newMockStorageBackend()
-    let mockTimer = MockTimeProvider(currentTime: 1000_000_000)
-    let tsProvider = TimestampProvider(
+    mockBackend = newInlineMockStorageBackend()
+    mockTimer = sharedtimerMock.MockTimeProvider(currentTime: 1000_000_000)
+    tsProvider = TimestampProvider(
       timer: mockTimer,
       lastTimestamp: 1000,
       lastCounter: 0,
       maxOffset: DEFAULT_MAX_OFFSET_NS,
       nodeId: 0
     )
-    let mvccEngine = MVCCEngine(
+    mvccEngine = MVCCEngine(
       backend: mockBackend,
       timestampProvider: tsProvider,
       gcEnabled: false
     )
-    var resolver = newConflictResolver(mvccEngine)
+    resolver = newConflictResolver(mvccEngine)
 
   test "conflict resolver creation":
     check resolver != nil
@@ -234,7 +201,6 @@ suite "Conflict Resolution":
     let resolver2 = newConflictResolver(mvccEngine,
       enablePriority = false,
       maxWaitTimeMs = 5000)
-
     check resolver2.enablePriority == false
     check resolver2.maxWaitTimeMs == 5000
 
@@ -253,7 +219,6 @@ suite "Conflict Resolution":
       lockedKeys: 0,
       epoch: 0
     )
-
     var txn2 = MVCCTransaction(
       id: genTransactionID(),
       status: TXN_COMMITTED,
@@ -268,7 +233,6 @@ suite "Conflict Resolution":
       lockedKeys: 0,
       epoch: 0
     )
-
     let conflict = ConflictInfo(
       conflictType: ctWriteWrite,
       key: "key1",
@@ -276,9 +240,7 @@ suite "Conflict Resolution":
       timestamp: Timestamp(200),
       retryable: true
     )
-
     let result = resolver.resolveConflict(txn1, conflict, txn2)
-
     check result.resolution == crRetry
     check result.newTimestamp == Timestamp(201)
     check result.shouldAbort == false
@@ -298,7 +260,6 @@ suite "Conflict Resolution":
       lockedKeys: 0,
       epoch: 0
     )
-
     var txn2 = MVCCTransaction(
       id: genTransactionID(),
       status: TXN_ABORTED,
@@ -313,7 +274,6 @@ suite "Conflict Resolution":
       lockedKeys: 0,
       epoch: 0
     )
-
     let conflict = ConflictInfo(
       conflictType: ctWriteWrite,
       key: "key1",
@@ -321,11 +281,9 @@ suite "Conflict Resolution":
       timestamp: Timestamp(150),
       retryable: true
     )
-
     let result = resolver.resolveConflict(txn1, conflict, txn2)
-
     check result.resolution == crRetry
-    check result.newTimestamp == Timestamp(100) # Keep our timestamp
+    check result.newTimestamp == Timestamp(100)
     check result.shouldAbort == false
 
   test "resolve conflict with priority - higher priority wins":
@@ -334,7 +292,7 @@ suite "Conflict Resolution":
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
-      priority: 800, # Higher priority
+      priority: 800,
       maxTimestamp: MAX_TIMESTAMP,
       deadline: MAX_TIMESTAMP,
       createdAt: Timestamp(100),
@@ -343,13 +301,12 @@ suite "Conflict Resolution":
       lockedKeys: 0,
       epoch: 0
     )
-
     var txn2 = MVCCTransaction(
       id: genTransactionID(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(50),
       commitTimestamp: INVALID_TIMESTAMP,
-      priority: 500, # Lower priority
+      priority: 500,
       maxTimestamp: MAX_TIMESTAMP,
       deadline: MAX_TIMESTAMP,
       createdAt: Timestamp(50),
@@ -358,7 +315,6 @@ suite "Conflict Resolution":
       lockedKeys: 0,
       epoch: 0
     )
-
     let conflict = ConflictInfo(
       conflictType: ctWriteWrite,
       key: "key1",
@@ -366,13 +322,12 @@ suite "Conflict Resolution":
       timestamp: Timestamp(150),
       retryable: true
     )
-
     let result = resolver.resolveConflict(txn1, conflict, txn2)
-
     check result.resolution == crPush
     check result.shouldAbort == false
 
-suite "Transaction Push Mechanism":
+suite "Transaction Push Mechanism - Pure Tests":
+  # Tests that don't need backend/engine
   test "push transaction timestamp":
     var txn1 = MVCCTransaction(
       id: genTransactionID(),
@@ -388,7 +343,6 @@ suite "Transaction Push Mechanism":
       lockedKeys: 0,
       epoch: 0
     )
-
     var txn2 = MVCCTransaction(
       id: genTransactionID(),
       status: TXN_PENDING,
@@ -403,9 +357,7 @@ suite "Transaction Push Mechanism":
       lockedKeys: 0,
       epoch: 0
     )
-
     let newTs = pushTransaction(txn1, txn2, Timestamp(75))
-
     check newTs == Timestamp(76)
     check txn2.startTimestamp == Timestamp(76)
 
@@ -424,7 +376,6 @@ suite "Transaction Push Mechanism":
       lockedKeys: 0,
       epoch: 0
     )
-
     var txn2 = MVCCTransaction(
       id: genTransactionID(),
       status: TXN_ABORTED,
@@ -439,10 +390,8 @@ suite "Transaction Push Mechanism":
       lockedKeys: 0,
       epoch: 0
     )
-
     let newTs = pushTransaction(txn1, txn2, Timestamp(75))
-
-    check newTs == txn1.startTimestamp # No push needed
+    check newTs == txn1.startTimestamp
 
   test "push committed transaction":
     var txn1 = MVCCTransaction(
@@ -459,7 +408,6 @@ suite "Transaction Push Mechanism":
       lockedKeys: 0,
       epoch: 0
     )
-
     var txn2 = MVCCTransaction(
       id: genTransactionID(),
       status: TXN_COMMITTED,
@@ -474,10 +422,8 @@ suite "Transaction Push Mechanism":
       lockedKeys: 0,
       epoch: 0
     )
-
     let newTs = pushTransaction(txn1, txn2, Timestamp(75))
-
-    check newTs == txn2.commitTimestamp # Return committed timestamp
+    check newTs == txn2.commitTimestamp
 
   test "can push check":
     var txn1 = MVCCTransaction(
@@ -485,7 +431,7 @@ suite "Transaction Push Mechanism":
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
-      priority: 800, # Higher priority
+      priority: 800,
       maxTimestamp: MAX_TIMESTAMP,
       deadline: MAX_TIMESTAMP,
       createdAt: Timestamp(100),
@@ -494,13 +440,12 @@ suite "Transaction Push Mechanism":
       lockedKeys: 0,
       epoch: 0
     )
-
     var txn2 = MVCCTransaction(
       id: genTransactionID(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(50),
       commitTimestamp: INVALID_TIMESTAMP,
-      priority: 500, # Lower priority
+      priority: 500,
       maxTimestamp: MAX_TIMESTAMP,
       deadline: MAX_TIMESTAMP,
       createdAt: Timestamp(50),
@@ -509,18 +454,16 @@ suite "Transaction Push Mechanism":
       lockedKeys: 0,
       epoch: 0
     )
-
     check canPush(txn1, txn2) == true
-
-    txn1.priority = 300 # Lower priority now
+    txn1.priority = 300
     check canPush(txn1, txn2) == false
 
-suite "Wait-Die Deadlock Prevention":
+suite "Wait-Die Deadlock Prevention - Pure Tests":
   test "younger waits for older":
     var txn1 = MVCCTransaction(
       id: genTransactionID(),
       status: TXN_PENDING,
-      startTimestamp: Timestamp(200), # Younger
+      startTimestamp: Timestamp(200),
       commitTimestamp: INVALID_TIMESTAMP,
       priority: DEFAULT_PRIORITY,
       maxTimestamp: MAX_TIMESTAMP,
@@ -531,11 +474,10 @@ suite "Wait-Die Deadlock Prevention":
       lockedKeys: 0,
       epoch: 0
     )
-
     var txn2 = MVCCTransaction(
       id: genTransactionID(),
       status: TXN_PENDING,
-      startTimestamp: Timestamp(100), # Older
+      startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
       priority: DEFAULT_PRIORITY,
       maxTimestamp: MAX_TIMESTAMP,
@@ -546,8 +488,6 @@ suite "Wait-Die Deadlock Prevention":
       lockedKeys: 0,
       epoch: 0
     )
-
-    # Younger waits for older
     check shouldWaitOrDie(txn1, txn2) == true
     check shouldWaitOrDie(txn2, txn1) == false
 
@@ -555,7 +495,7 @@ suite "Wait-Die Deadlock Prevention":
     var txn1 = MVCCTransaction(
       id: genTransactionID(),
       status: TXN_PENDING,
-      startTimestamp: Timestamp(100), # Older
+      startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
       priority: DEFAULT_PRIORITY,
       maxTimestamp: MAX_TIMESTAMP,
@@ -566,11 +506,10 @@ suite "Wait-Die Deadlock Prevention":
       lockedKeys: 0,
       epoch: 0
     )
-
     var txn2 = MVCCTransaction(
       id: genTransactionID(),
       status: TXN_PENDING,
-      startTimestamp: Timestamp(200), # Younger
+      startTimestamp: Timestamp(200),
       commitTimestamp: INVALID_TIMESTAMP,
       priority: DEFAULT_PRIORITY,
       maxTimestamp: MAX_TIMESTAMP,
@@ -581,8 +520,6 @@ suite "Wait-Die Deadlock Prevention":
       lockedKeys: 0,
       epoch: 0
     )
-
-    # Older should abort when conflicting with younger
     check shouldAbortTransaction(txn1, txn2) == true
     check shouldAbortTransaction(txn2, txn1) == false
 
@@ -601,7 +538,6 @@ suite "Wait-Die Deadlock Prevention":
       lockedKeys: 0,
       epoch: 0
     )
-
     var txn2 = MVCCTransaction(
       id: genTransactionID(),
       status: TXN_COMMITTED,
@@ -616,7 +552,5 @@ suite "Wait-Die Deadlock Prevention":
       lockedKeys: 0,
       epoch: 0
     )
-
-    # Committed transaction doesn't cause abort
     check shouldAbortTransaction(txn1, txn2) == false
     check shouldAbortTransaction(txn2, txn1) == false
