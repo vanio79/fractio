@@ -4,8 +4,8 @@
 
 import unittest
 import std/[options, hashes, tables, strutils, locks, atomics, sequtils,
-    algorithm, sets]
-import std/[threadpool, typedthreads]
+    algorithm]
+import std/typedthreads
 import fractio/storage/backend
 import fractio/di/mocks as diMocks
 
@@ -254,14 +254,18 @@ method valid(iter: EnhancedMockIterator): bool =
 method key(iter: EnhancedMockIterator): string =
   let mb = iter.getBackend()
   withLock(mb.lock):
-    if iter.valid():
+    # Check valid without calling valid() to avoid nested lock
+    if iter.validFlag and iter.currentIndex >= 0 and
+       iter.currentIndex < mb.sortedKeys.len:
       return mb.sortedKeys[iter.currentIndex]
     return ""
 
 method value(iter: EnhancedMockIterator): string =
   let mb = iter.getBackend()
   withLock(mb.lock):
-    if iter.valid():
+    # Check valid without calling valid() to avoid nested lock
+    if iter.validFlag and iter.currentIndex >= 0 and
+       iter.currentIndex < mb.sortedKeys.len:
       let k = mb.sortedKeys[iter.currentIndex]
       if k in mb.data:
         return mb.data[k]
@@ -810,12 +814,12 @@ suite "Storage Backend - Approximate Size":
     check backend.approximateSizeCount == 1
 
   test "approximate size with data":
-    discard backend.put("key1", "value10chars")
-    discard backend.put("key2", "value10chars")
-    discard backend.put("key3", "value10chars")
+    discard backend.put("key1", "value10") # 7 chars
+    discard backend.put("key2", "value10")
+    discard backend.put("key3", "value10")
 
     let size = backend.approximateSize("key1", "key3")
-    check size == 30
+    check size == 21 # 3 values * 7 chars = 21 bytes
 
   test "approximate size range filter":
     discard backend.put("a", "value1")
@@ -1272,7 +1276,7 @@ proc concurrentWriter(data: ptr ConcurrentTestData) {.thread.} =
 
 proc concurrentReader(data: ptr ConcurrentTestData) {.thread.} =
   for i in 0..<100:
-    let key = "thread_key_" & $i
+    let key = "key_" & $i # Match the key prefix used in test setup
     if data.backend.get(key).isSome:
       atomicInc data.readCount
 
@@ -1470,11 +1474,11 @@ suite "Storage Backend - Stats Collection":
     check stats.bytesRead == 10
 
   test "stats track bytes written":
-    discard backend.put("key1", "value10chars")
-    discard backend.put("key2", "value10chars")
+    discard backend.put("key1", "value10") # 7 chars = 7 bytes
+    discard backend.put("key2", "value10") # 7 chars = 7 bytes
 
     let stats = backend.getStats()
-    check stats.bytesWritten == 20
+    check stats.bytesWritten == 14 # 7 + 7 = 14 bytes
 
   test "stats track cache misses":
     discard backend.get("nonexistent")
