@@ -132,3 +132,21 @@ type
 method close*(store: RaftLogStore) {.base.} =
   ## Close the log store (base implementation does nothing)
   discard
+
+type
+  RPCType* = enum
+    RPC_APPEND_ENTRIES
+    RPC_REQUEST_VOTE
+    RPC_CLIENT_REQUEST
+
+  RaftRPC* = object
+    ## Raft RPC message
+    rpcType*: RPCType
+    term*: int64
+    leaderId*: int32
+    prevLogIndex*: int64
+    prevLogTerm*: int64
+    entries*: seq[LogEntry]
+    leaderCommit*: int64
+    success*: bool
+    data*: string

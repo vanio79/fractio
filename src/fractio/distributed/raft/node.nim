@@ -21,23 +21,6 @@ type
     nextIndex*: int64
     lock*: Lock   # Lock for thread-safe index assignment
 
-  RaftRPC* = object
-    ## Raft RPC message
-    rpcType*: RPCType
-    term*: int64
-    leaderId*: int32
-    prevLogIndex*: int64
-    prevLogTerm*: int64
-    entries*: seq[LogEntry]
-    leaderCommit*: int64
-    success*: bool
-    data*: string
-
-  RPCType* = enum
-    RPC_APPEND_ENTRIES
-    RPC_REQUEST_VOTE
-    RPC_CLIENT_REQUEST
-
   RaftNodeImpl* = ref object of RaftNode
     ## Internal Raft node implementation
     lastHeartbeat*: int64

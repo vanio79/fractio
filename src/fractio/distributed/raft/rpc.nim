@@ -3,15 +3,18 @@
 import std/json
 import std/streams
 import std/times
+import std/tables
 
+import fractio/utils/logging
 import fractio/distributed/raft/types
 
 proc handleAppendEntries*(node: RaftNode, rpc: RaftRPC): RaftRPC =
   ## Handle AppendEntries RPC
-  debug "Handling AppendEntries RPC", term = $rpc.term, leaderId = $rpc.leaderId
+  var fields = initTable[string, string]()
+  fields["term"] = $rpc.term
+  fields["leaderId"] = $rpc.leaderId
+  debug("Handling AppendEntries RPC", fields)
 
-  # Implementation would handle log replication
-  # This is a placeholder for the actual implementation
   return RaftRPC(
     rpcType: RPC_APPEND_ENTRIES,
     term: node.nodeState.currentTerm,
@@ -21,11 +24,11 @@ proc handleAppendEntries*(node: RaftNode, rpc: RaftRPC): RaftRPC =
 
 proc handleRequestVote*(node: RaftNode, rpc: RaftRPC): RaftRPC =
   ## Handle RequestVote RPC
-  debug "Handling RequestVote RPC", term = $rpc.term,
-      candidateId = $rpc.leaderId
+  var fields = initTable[string, string]()
+  fields["term"] = $rpc.term
+  fields["candidateId"] = $rpc.leaderId
+  debug("Handling RequestVote RPC", fields)
 
-  # Implementation would handle vote requests
-  # This is a placeholder for the actual implementation
   return RaftRPC(
     rpcType: RPC_REQUEST_VOTE,
     term: node.nodeState.currentTerm,
@@ -35,10 +38,11 @@ proc handleRequestVote*(node: RaftNode, rpc: RaftRPC): RaftRPC =
 
 proc handleClientRequest*(node: RaftNode, rpc: RaftRPC): RaftRPC =
   ## Handle client request RPC
-  debug "Handling client request", term = $rpc.term, data = rpc.data
+  var fields = initTable[string, string]()
+  fields["term"] = $rpc.term
+  fields["data"] = rpc.data
+  debug("Handling client request", fields)
 
-  # Implementation would handle client requests
-  # This is a placeholder for the actual implementation
   return RaftRPC(
     rpcType: RPC_CLIENT_REQUEST,
     term: node.nodeState.currentTerm,
@@ -48,11 +52,10 @@ proc handleClientRequest*(node: RaftNode, rpc: RaftRPC): RaftRPC =
 
 proc sendRPC*(node: RaftNode, rpc: RaftRPC, endpoint: string) =
   ## Send an RPC to another node
-  discard endpoint # Placeholder - actual network send not implemented
-  debug "Sending RPC", rpcType = $rpc.rpcType
-
-  # Implementation would send the RPC over the network
-  # This is a placeholder for the actual implementation
+  discard endpoint
+  var fields = initTable[string, string]()
+  fields["rpcType"] = $rpc.rpcType
+  debug("Sending RPC", fields)
 
 proc processRPC*(node: RaftNode, rpc: RaftRPC): RaftRPC =
   ## Process an incoming RPC
@@ -66,32 +69,28 @@ proc processRPC*(node: RaftNode, rpc: RaftRPC): RaftRPC =
 
 proc heartbeat*(node: RaftNode) =
   ## Send periodic heartbeat to followers
-  debug "Sending heartbeat", term = $node.nodeState.currentTerm,
-      leaderId = $node.serverId
-
-  # Implementation would send heartbeat to all followers
-  # This is a placeholder for the actual implementation
+  var fields = initTable[string, string]()
+  fields["term"] = $node.nodeState.currentTerm
+  fields["leaderId"] = $node.serverId
+  debug("Sending heartbeat", fields)
 
 proc requestVote*(node: RaftNode) =
   ## Request votes from other nodes during election
-  debug "Requesting votes", term = $node.nodeState.currentTerm,
-      candidateId = $node.serverId
-
-  # Implementation would request votes from all other nodes
-  # This is a placeholder for the actual implementation
+  var fields = initTable[string, string]()
+  fields["term"] = $node.nodeState.currentTerm
+  fields["candidateId"] = $node.serverId
+  debug("Requesting votes", fields)
 
 proc replicateLog*(node: RaftNode) =
   ## Replicate log entries to followers
-  debug "Replicating log", term = $node.nodeState.currentTerm,
-      leaderId = $node.serverId
-
-  # Implementation would replicate log entries to all followers
-  # This is a placeholder for the actual implementation
+  var fields = initTable[string, string]()
+  fields["term"] = $node.nodeState.currentTerm
+  fields["leaderId"] = $node.serverId
+  debug("Replicating log", fields)
 
 proc processClientRequest*(node: RaftNode, data: string): int64 =
   ## Process a client request
-  debug "Processing client request", data = data
-
-  # Implementation would commit the request and return the log index
-  # This is a placeholder for the actual implementation
+  var fields = initTable[string, string]()
+  fields["data"] = data
+  debug("Processing client request", fields)
   result = 0

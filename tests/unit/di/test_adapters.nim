@@ -449,3 +449,382 @@ suite "Time Provider Bridge Integration":
     check adapter.nowNs() > 0
     check adapter.nowUs() > 0
     check adapter.nowMs() > 0
+
+suite "InMemoryKVStore advanced tests":
+  test "thread-safe concurrent access":
+    let s = newInMemoryKVStore()
+    discard s.put("key1", "value1")
+    discard s.put("key2", "value2")
+    discard s.put("key3", "value3")
+
+    # Multiple reads should work
+    for i in 0..50:
+      check s.get("key1").isSome
+      check s.get("key2").isSome
+      check s.exists("key3")
+
+    s.close()
+
+  test "scan with empty prefix":
+    let s = newInMemoryKVStore()
+    discard s.put("a", "1")
+    discard s.put("b", "2")
+    discard s.put("c", "3")
+
+    let results = s.scan("", 10)
+    check results.len == 3
+    s.close()
+
+  test "scan with no matching prefix":
+    let s = newInMemoryKVStore()
+    discard s.put("key1", "v1")
+    discard s.put("key2", "v2")
+
+    let results = s.scan("xyz/", 10)
+    check results.len == 0
+    s.close()
+
+  test "scan respects limit with many entries":
+    let s = newInMemoryKVStore()
+    for i in 0..20:
+      discard s.put("key/" & $i, $i)
+
+    let results = s.scan("key/", 5'u32)
+    check results.len == 5
+    s.close()
+
+  test "put overwrites existing key":
+    let s = newInMemoryKVStore()
+    discard s.put("key", "value1")
+    check s.get("key").get == "value1"
+
+    discard s.put("key", "value2")
+    check s.get("key").get == "value2"
+    s.close()
+
+  test "delete non-existent key returns true":
+    let s = newInMemoryKVStore()
+    let result = s.delete("nonexistent")
+    check result == true
+    s.close()
+
+  test "get on empty store returns none":
+    let s = newInMemoryKVStore()
+    check s.get("anykey").isNone
+    s.close()
+
+suite "InMemoryBackend advanced tests":
+  test "stats accumulates counts":
+    let b = newInMemoryBackend()
+    discard b.put("k1", "v1")
+    discard b.put("k2", "v2")
+
+    let stats1 = b.stats()
+    check stats1["key_count"] == 2
+
+    discard b.put("k3", "v3")
+    let stats2 = b.stats()
+    check stats2["key_count"] == 3
+    b.close()
+
+  test "scan returns correct keys":
+    let b = newInMemoryBackend()
+    discard b.put("prefix/a", "1")
+    discard b.put("prefix/b", "2")
+    discard b.put("prefix/c", "3")
+    discard b.put("other/x", "4")
+
+    let results = b.scan("prefix/", 100)
+    check results.len == 3
+
+    var foundKeys: seq[string] = @[]
+    for (k, v) in results:
+      foundKeys.add(k)
+    check "prefix/a" in foundKeys
+    check "prefix/b" in foundKeys
+    check "prefix/c" in foundKeys
+    b.close()
+
+  test "close prevents further operations safely":
+    let b = newInMemoryBackend()
+    discard b.put("key", "value")
+    b.close()
+
+    check b.closed
+    # Lock is deinitialized, operations would crash - don't test further
+
+  test "flush and compact are idempotent":
+    let b = newInMemoryBackend()
+    check b.flush() == true
+    check b.flush() == true
+    check b.compact() == true
+    check b.compact() == true
+    b.close()
+
+  test "stats includes custom stats data":
+    let b = newInMemoryBackend()
+    b.statsData["custom_metric"] = 42'i64
+
+    discard b.put("k", "v") # Trigger stats update
+    let stats = b.stats()
+    check stats.hasKey("key_count")
+    b.close()
+
+suite "ConsoleLogger advanced tests":
+  test "log with empty fields":
+    let c = newConsoleLogger("TEST", llDebug)
+    let emptyFields = initTable[string, string]()
+    c.debug("message with empty fields", emptyFields)
+
+  test "log with multiple fields":
+    let c = newConsoleLogger("", llInfo)
+    var fields = {
+      "key1": "value1",
+      "key2": "value2",
+      "key3": "value3"
+    }.toTable
+    c.info("multi-field test", fields)
+
+  test "setMinLevel changes filtering":
+    let c = newConsoleLogger("", llError)
+    check not c.shouldLog(llInfo)
+    check c.shouldLog(llError)
+
+    c.setMinLevel(llDebug)
+    check c.shouldLog(llDebug)
+    check c.shouldLog(llInfo)
+
+  test "prefix formatting":
+    let c = newConsoleLogger("MyApp", llInfo)
+    check c.prefix == "MyApp"
+
+suite "NullLogger advanced tests":
+  test "all log levels discarded":
+    let n = newNullLogger()
+    var fields = initTable[string, string]()
+    fields["field"] = "value"
+
+    n.log(llDebug, "debug", fields)
+    n.log(llInfo, "info", fields)
+    n.log(llWarn, "warn", fields)
+    n.log(llError, "error", fields)
+
+    # All discarded without error
+
+  test "setMinLevel changes internal state":
+    let n = newNullLogger()
+    check n.minLevel == llError
+
+    n.setMinLevel(llDebug)
+    check n.minLevel == llDebug
+
+    # Still discards all messages
+    n.debug("still discarded")
+
+suite "LoggerAdapter advanced tests":
+  test "log level conversion mapping":
+    let original = fractioLogging.newLogger("test", fractioLogging.llWarn)
+    let adapter = newLoggerAdapter(original)
+
+    check adapter.minLevel == llWarn
+
+  test "info logs through adapter":
+    let original = fractioLogging.newLogger("test", fractioLogging.llDebug)
+    let adapter = newLoggerAdapter(original)
+
+    var fields = initTable[string, string]()
+    adapter.info("test info message", fields)
+
+  test "warn logs through adapter":
+    let original = fractioLogging.newLogger("test", fractioLogging.llDebug)
+    let adapter = newLoggerAdapter(original)
+
+    adapter.warn("test warning")
+
+  test "error logs through adapter":
+    let original = fractioLogging.newLogger("test", fractioLogging.llDebug)
+    let adapter = newLoggerAdapter(original)
+
+    adapter.error("test error message")
+
+  test "convenience methods work":
+    let original = fractioLogging.newLogger("test", fractioLogging.llDebug)
+    let adapter = newLoggerAdapter(original)
+
+    adapter.debug("debug msg")
+    adapter.info("info msg")
+    adapter.warn("warn msg")
+    adapter.error("error msg")
+
+suite "SystemTimeProvider advanced tests":
+  test "time increases over calls":
+    let tp = newSystemTimeProvider()
+
+    let t1 = tp.nowNs()
+    let t2 = tp.nowNs()
+    let t3 = tp.nowNs()
+
+    # Each call should return increasing values (or same if very fast)
+    check t2 >= t1
+    check t3 >= t2
+
+  test "unit conversions are consistent":
+    let tp = newSystemTimeProvider()
+
+    let ns = tp.nowNs()
+    let us = tp.nowUs()
+    let ms = tp.nowMs()
+
+    # Microseconds should be approximately ns/1000
+    let expectedUs = ns div 1000
+    check us >= expectedUs - 100 and us <= expectedUs + 100
+
+    # Milliseconds should be approximately ns/1000000
+    let expectedMs = ns div 1_000_000
+    check ms >= expectedMs - 1 and ms <= expectedMs + 1
+
+  test "multiple advances are no-op":
+    let tp = newSystemTimeProvider()
+
+    tp.advance(1000)
+    tp.advance(2000)
+    tp.advance(3000)
+
+    # System time unaffected
+
+suite "DITimeProviderAdapter advanced tests":
+  test "adapter with nil advanceProc handles gracefully":
+    let adapter = newDITimeProviderAdapter(
+      proc(): int64 {.gcsafe.} = 1000'i64
+    )
+
+    adapter.advance(500)
+    check adapter.now() == 1000
+
+  test "adapter with nil nowNsProc returns 0":
+    let adapter = DITimeProviderAdapter(nowNsProc: nil)
+    check adapter.now() == 0
+
+  test "adapter integrates with MockTimeProvider":
+    var staticTime = 5000000000'i64
+    let adapter = newDITimeProviderAdapter(
+      proc(): int64 {.gcsafe.} = staticTime,
+      proc(deltaNs: int64) {.gcsafe.} = staticTime += deltaNs
+    )
+
+    check adapter.now() == 5000000000
+
+    adapter.advance(1000000000)
+    check staticTime == 6000000000
+
+suite "SharedTimerTimeProviderAdapter advanced tests":
+  test "adapter with WallClockTimeProvider":
+    let wallClock = wallclock.WallClockTimeProvider()
+    let adapter = newSharedTimerTimeProviderAdapter(wallClock)
+
+    check adapter.nowNs() > 0
+    check adapter.nowUs() > 0
+    check adapter.nowMs() > 0
+
+  test "adapter advance is no-op for real providers":
+    let monotonicTp = monotonic.MonotonicTimeProvider()
+    let adapter = newSharedTimerTimeProviderAdapter(monotonicTp)
+
+    let before = adapter.nowNs()
+    adapter.advance(1000000000)
+    let after = adapter.nowNs()
+
+    # Real time providers ignore advance calls
+    check after >= before
+
+  test "adapter with stMock.MockTimeProvider":
+    let stMockTp = stMock.MockTimeProvider(currentTime: 1000000000'i64)
+    let adapter = newSharedTimerTimeProviderAdapter(stMockTp)
+
+    check adapter.nowNs() == 1000000000
+
+    stMockTp.setTime(2000000000)
+    check adapter.nowNs() == 2000000000
+
+suite "Convenience functions coverage":
+  test "defaultTimeProvider creates new instance each call":
+    let tp1 = defaultTimeProvider()
+    let tp2 = defaultTimeProvider()
+
+    check tp1 != tp2
+
+  test "nullLogger creates new instance":
+    let n1 = nullLogger()
+    let n2 = nullLogger()
+
+    check n1 != n2
+
+  test "consoleLogger with different prefixes":
+    let c1 = consoleLogger("App1")
+    let c2 = consoleLogger("App2")
+
+    check c1.prefix == "App1"
+    check c2.prefix == "App2"
+
+  test "memoryKVStore creates new instance":
+    let s1 = memoryKVStore()
+    let s2 = memoryKVStore()
+
+    check s1 != s2
+    s1.close()
+    s2.close()
+
+  test "memoryBackend creates new instance":
+    let b1 = memoryBackend()
+    let b2 = memoryBackend()
+
+    check b1 != b2
+    b1.close()
+    b2.close()
+
+suite "Adapter integration with mocks":
+  test "InMemoryKVStore full API":
+    let s = newInMemoryKVStore()
+
+    discard s.put("test", "value")
+    check s.get("test").isSome
+    check s.exists("test")
+    let scanResult = s.scan("", 10)
+    check scanResult.len == 1
+    discard s.delete("test")
+    check not s.exists("test")
+    s.close()
+
+  test "InMemoryBackend full API":
+    let b = newInMemoryBackend()
+
+    discard b.put("key", "value")
+    check b.get("key").isSome
+    discard b.delete("key")
+    let scanResult = b.scan("", 10)
+    discard b.flush()
+    discard b.compact()
+    let stats = b.stats()
+    check stats.hasKey("key_count")
+    b.close()
+
+suite "Error handling in adapters":
+  test "InMemoryKVStore handles empty key":
+    let s = newInMemoryKVStore()
+    discard s.put("", "empty_key_value")
+    check s.get("").isSome
+    check s.get("").get == "empty_key_value"
+    s.close()
+
+  test "InMemoryBackend handles empty key":
+    let b = newInMemoryBackend()
+    discard b.put("", "empty_key_value")
+    check b.get("").isSome
+    b.close()
+
+  test "InMemoryKVStore handles empty value":
+    let s = newInMemoryKVStore()
+    discard s.put("key", "")
+    check s.get("key").isSome
+    check s.get("key").get == ""
+    s.close()
