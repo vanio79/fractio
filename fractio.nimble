@@ -182,130 +182,239 @@ task build_web, "Compile frontend SPA to JS, minify, then build server binary":
 # =============================================================================
 # Code Coverage Tasks
 # =============================================================================
-# Nim uses GCC/Clang instrumentation for coverage via --passc and --passl flags.
-# IMPORTANT: Use --nimcache:/tmp/fractio-coverage/cache_<testname> per test to avoid checksum errors.
-# Different tests compile different code paths, causing gcov checksum mismatches.
-# Reports generated via lcov/genhtml, merging per-test coverage data.
-# Coverage data is stored in /tmp/fractio-coverage to avoid polluting the project directory.
+# Nim coverage workflow using --debugger:native:
+# 1. Compile tests with gcov instrumentation and DWARF debug info
+#    (--debugger:native --passC:--coverage --passL:--coverage)
+# 2. Run tests to generate .gcda files
+# 3. Capture with lcov/geninfo (needs --ignore-errors mismatch,gcov,source)
+# 4. Extract only Fractio source files using lcov --extract
+# 5. Generate HTML report with genhtml
+#
+# This approach uses DWARF debug info to map C coverage back to Nim source lines.
+# The coverage percentages reflect actual Nim source code, not generated C code.
+# All output goes to /tmp/fractio-coverage to avoid cluttering project directory.
 
 const COVERAGE_DIR = "/tmp/fractio-coverage"
+const PROJECT_ROOT = "/home/ingrid/devel/fractio"
 
 task coverage_clean, "Clean coverage data files":
   echo "Cleaning coverage data..."
   exec "rm -rf " & COVERAGE_DIR
   echo "Coverage data cleaned."
 
-task coverage_unit, "Run unit tests with coverage instrumentation and generate report":
-  echo "=== Running unit tests with coverage ==="
-  exec "rm -rf " & COVERAGE_DIR & " && mkdir -p " & COVERAGE_DIR & "/html"
+task coverage_unit, "Run all unit tests with coverage":
+  echo "=== Running all unit tests with coverage ==="
+  exec "rm -rf " & COVERAGE_DIR
+  exec "mkdir -p " & COVERAGE_DIR
   
-  # Coverage compilation flags
-  let covFlags = "--passc:-fprofile-arcs --passc:-ftest-coverage --passl:-lgcov --passl:-fprofile-arcs --passl:-ftest-coverage"
+  let covFlags = "--debugger:native --passC:--coverage --passL:--coverage"
   
-  # Run each test with unique cache directory to avoid checksum conflicts
-  var testNum = 0
+  var testFiles: seq[string] = @[]
   for file in walkDirRec("tests/unit"):
     let name = extractFilename(file)
     if name.startsWith("test_") and name.endsWith(".nim"):
-      testNum = testNum + 1
-      let cacheDir = COVERAGE_DIR & "/cache_" & $testNum
-      echo "  [coverage] ", file
-      exec "nim c -r --checks:on --mm:atomicArc --nimcache:" & cacheDir & " -p:src -p:tests " & covFlags & " " & file
-      # Capture coverage from this test's cache
-      exec "lcov --capture --directory " & cacheDir & " --output-file " & COVERAGE_DIR & "/test_" & $testNum & ".info --ignore-errors gcov 2>/dev/null || true"
+      testFiles.add(file)
+  
+  # Run each test with its own nimcache to avoid stamp mismatches
+  var infoFiles: seq[string] = @[]
+  for i, file in testFiles:
+    let testName = extractFilename(file).replace(".nim", "")
+    let cacheDir = COVERAGE_DIR & "/cache_" & testName
+    echo "  [", i+1, "/", testFiles.len, "] ", file
+    exec "nim c -r --mm:atomicArc --nimcache:" & cacheDir & " -p:src -p:tests " & covFlags & " " & file
+    # Capture coverage for this test
+    let infoFile = COVERAGE_DIR & "/test_" & testName & ".info"
+    exec "geninfo " & cacheDir & " --output-file " & infoFile & " --ignore-errors mismatch,gcov,source --keep-going --base-directory . || true"
+    if fileExists(infoFile):
+      infoFiles.add(infoFile)
   
   # Merge all coverage data
-  echo "Merging coverage data from ", testNum, " tests..."
-  if testNum > 0:
-    # Build list of info files to merge
+  echo "Merging coverage data from ", infoFiles.len, " tests..."
+  if infoFiles.len > 0:
     var mergeCmd = "lcov"
-    for i in 1..testNum:
-      mergeCmd = mergeCmd & " --add-tracefile " & COVERAGE_DIR & "/test_" & $i & ".info"
-    mergeCmd = mergeCmd & " --output-file " & COVERAGE_DIR & "/coverage.info --ignore-errors mismatch,gcov 2>/dev/null || true"
+    for infoFile in infoFiles:
+      mergeCmd = mergeCmd & " --add-tracefile " & infoFile
+    mergeCmd = mergeCmd & " --output-file " & COVERAGE_DIR & "/coverage_merged.info --ignore-errors mismatch,gcov"
     exec mergeCmd
     
-    # Filter out external dependencies
-    exec "lcov --remove " & COVERAGE_DIR & "/coverage.info '/usr/*' '*@nrandom*' '*@nulid*' '*@mtest*' --output-file " & COVERAGE_DIR & "/coverage.filtered.info --ignore-errors unused,source 2>/dev/null || true"
-    exec "genhtml " & COVERAGE_DIR & "/coverage.filtered.info --output-directory " & COVERAGE_DIR & "/html --ignore-errors source 2>/dev/null || true"
+    echo "Extracting Fractio coverage..."
+    exec "lcov --extract " & COVERAGE_DIR & "/coverage_merged.info '" & PROJECT_ROOT & "/src/*' '" & PROJECT_ROOT & "/tests/*' --output-file " & COVERAGE_DIR & "/coverage_fractio.info --ignore-errors empty"
     
-    echo "Coverage report generated in " & COVERAGE_DIR & "/html/"
-    echo "Open " & COVERAGE_DIR & "/html/index.html to view the report."
-    exec "lcov --summary " & COVERAGE_DIR & "/coverage.filtered.info --ignore-errors unused 2>/dev/null || true"
+    echo "Generating HTML report..."
+    exec "genhtml " & COVERAGE_DIR & "/coverage_fractio.info --output-directory " & COVERAGE_DIR & "/html --title 'Fractio Coverage' --legend --ignore-errors unmapped"
+    
+    echo ""
+    echo "=========================================="
+    echo "Coverage report: " & COVERAGE_DIR & "/html/index.html"
+    echo "=========================================="
   else:
-    echo "No unit tests found."
+    echo "No coverage data collected."
 
 task coverage_unit_core, "Run core unit tests with coverage":
   echo "=== Running core unit tests with coverage ==="
-  exec "rm -rf " & COVERAGE_DIR & " && mkdir -p " & COVERAGE_DIR & "/html_core"
+  exec "rm -rf " & COVERAGE_DIR
+  exec "mkdir -p " & COVERAGE_DIR
   
-  let covFlags = "--passc:-fprofile-arcs --passc:-ftest-coverage --passl:-lgcov --passl:-fprofile-arcs --passl:-ftest-coverage"
+  let covFlags = "--debugger:native --passC:--coverage --passL:--coverage"
   
-  var testNum = 0
+  # Collect tests from multiple directories to maximize coverage
+  var testFiles: seq[string] = @[]
+  # Core tests
   for file in walkDirRec("tests/unit/core"):
     let name = extractFilename(file)
     if name.startsWith("test_") and name.endsWith(".nim"):
-      testNum = testNum + 1
-      let cacheDir = COVERAGE_DIR & "/cache_" & $testNum
-      echo "  [coverage] ", file
-      exec "nim c -r --checks:on --mm:atomicArc --nimcache:" & cacheDir & " -p:src -p:tests " & covFlags & " " & file
-      exec "lcov --capture --directory " & cacheDir & " --output-file " & COVERAGE_DIR & "/test_" & $testNum & ".info --ignore-errors gcov 2>/dev/null || true"
-  
-  echo "Merging coverage data from ", testNum, " tests..."
-  if testNum > 0:
-    var mergeCmd = "lcov"
-    for i in 1..testNum:
-      mergeCmd = mergeCmd & " --add-tracefile " & COVERAGE_DIR & "/test_" & $i & ".info"
-    mergeCmd = mergeCmd & " --output-file " & COVERAGE_DIR & "/core.info --ignore-errors mismatch,gcov 2>/dev/null || true"
-    exec mergeCmd
-    
-    exec "lcov --remove " & COVERAGE_DIR & "/core.info '/usr/*' '*@nrandom*' '*@nulid*' '*@mtest*' --output-file " & COVERAGE_DIR & "/core.filtered.info --ignore-errors unused,source 2>/dev/null || true"
-    exec "genhtml " & COVERAGE_DIR & "/core.filtered.info --output-directory " & COVERAGE_DIR & "/html_core --ignore-errors source 2>/dev/null || true"
-    
-    echo "Core coverage report: " & COVERAGE_DIR & "/html_core/"
-    exec "lcov --summary " & COVERAGE_DIR & "/core.filtered.info --ignore-errors unused 2>/dev/null || echo 'No coverage data.'"
-
-task coverage_unit_di, "Run DI unit tests with coverage":
-  echo "=== Running DI unit tests with coverage ==="
-  exec "rm -rf " & COVERAGE_DIR & " && mkdir -p " & COVERAGE_DIR & "/html_di"
-  
-  let covFlags = "--passc:-fprofile-arcs --passc:-ftest-coverage --passl:-lgcov --passl:-fprofile-arcs --passl:-ftest-coverage"
-  
-  var testNum = 0
+      testFiles.add(file)
+  # Network tests (packetcodec)
+  for file in walkDirRec("tests/unit/network"):
+    let name = extractFilename(file)
+    if name.startsWith("test_") and name.endsWith(".nim"):
+      testFiles.add(file)
+  # Distributed tests (all subdirectories)
+  for file in walkDirRec("tests/unit/distributed"):
+    let name = extractFilename(file)
+    if name.startsWith("test_") and name.endsWith(".nim"):
+      testFiles.add(file)
+  # Storage tests
+  for file in walkDirRec("tests/unit/storage"):
+    let name = extractFilename(file)
+    if name.startsWith("test_") and name.endsWith(".nim"):
+      testFiles.add(file)
+  # DI tests
   for file in walkDirRec("tests/unit/di"):
     let name = extractFilename(file)
     if name.startsWith("test_") and name.endsWith(".nim"):
-      testNum = testNum + 1
-      let cacheDir = COVERAGE_DIR & "/cache_" & $testNum
-      echo "  [coverage] ", file
-      exec "nim c -r --checks:on --mm:atomicArc --nimcache:" & cacheDir & " -p:src -p:tests " & covFlags & " " & file
-      exec "lcov --capture --directory " & cacheDir & " --output-file " & COVERAGE_DIR & "/test_" & $testNum & ".info --ignore-errors gcov 2>/dev/null || true"
+      testFiles.add(file)
+  # App tests
+  for file in walkDirRec("tests/unit/app"):
+    let name = extractFilename(file)
+    if name.startsWith("test_") and name.endsWith(".nim"):
+      testFiles.add(file)
+  # Utils tests
+  for file in walkDirRec("tests/unit/utils"):
+    let name = extractFilename(file)
+    if name.startsWith("test_") and name.endsWith(".nim"):
+      testFiles.add(file)
+  # Protocol tests
+  for file in walkDirRec("tests/unit/protocol"):
+    let name = extractFilename(file)
+    if name.startsWith("test_") and name.endsWith(".nim"):
+      testFiles.add(file)
+  # CLI tests
+  for file in walkDirRec("tests/unit/cli"):
+    let name = extractFilename(file)
+    if name.startsWith("test_") and name.endsWith(".nim"):
+      testFiles.add(file)
+  # Client tests
+  for file in walkDirRec("tests/unit/client"):
+    let name = extractFilename(file)
+    if name.startsWith("test_") and name.endsWith(".nim"):
+      testFiles.add(file)
+  # SQL tests
+  for file in walkDirRec("tests/unit/sql"):
+    let name = extractFilename(file)
+    if name.startsWith("test_") and name.endsWith(".nim"):
+      testFiles.add(file)
   
-  echo "Merging coverage data from ", testNum, " tests..."
-  if testNum > 0:
+  # Run each test with its own nimcache to avoid stamp mismatches
+  var infoFiles: seq[string] = @[]
+  for i, file in testFiles:
+    let testName = extractFilename(file).replace(".nim", "")
+    let cacheDir = COVERAGE_DIR & "/cache_" & testName
+    echo "  [", i+1, "/", testFiles.len, "] ", file
+    exec "nim c -r --mm:atomicArc --nimcache:" & cacheDir & " -p:src -p:tests " & covFlags & " " & file
+    # Capture coverage for this test (including branch coverage)
+    let infoFile = COVERAGE_DIR & "/test_" & testName & ".info"
+    exec "geninfo " & cacheDir & " --branch-coverage --output-file " & infoFile & " --ignore-errors mismatch,gcov,source --keep-going --base-directory . || true"
+    if fileExists(infoFile):
+      infoFiles.add(infoFile)
+  
+  # Merge all coverage data incrementally
+  echo "Merging coverage data from ", infoFiles.len, " tests..."
+  if infoFiles.len > 0:
+    # Start with first file as base
+    exec "cp " & infoFiles[0] & " " & COVERAGE_DIR & "/core_merged.info"
+    
+    # Add remaining files one at a time to avoid command line length limits
+    for i, infoFile in infoFiles:
+      if i > 0:
+        echo "Merging " & infoFile & ".." & (infoFiles.len - i) & " remaining"
+        exec "lcov --branch-coverage --add-tracefile " & COVERAGE_DIR & "/core_merged.info --add-tracefile " & infoFile & " --output-file " & COVERAGE_DIR & "/core_merged.info --ignore-errors mismatch,gcov"
+    
+    echo "Extracting Fractio coverage..."
+    exec "lcov --branch-coverage --extract " & COVERAGE_DIR & "/core_merged.info '" & PROJECT_ROOT & "/src/*' '" & PROJECT_ROOT & "/tests/*' --output-file " & COVERAGE_DIR & "/core_fractio.info --ignore-errors empty"
+    
+    echo "Generating HTML report..."
+    exec "genhtml " & COVERAGE_DIR & "/core_fractio.info --branch-coverage --output-directory " & COVERAGE_DIR & "/html_core --title 'Fractio Core Coverage' --legend --ignore-errors unmapped"
+    
+    echo ""
+    echo "=========================================="
+    echo "Core coverage: " & COVERAGE_DIR & "/html_core/index.html"
+    echo "=========================================="
+  else:
+    echo "No coverage data collected."
+
+task coverage_unit_storage, "Run storage unit tests with coverage":
+  echo "=== Running storage unit tests with coverage ==="
+  exec "rm -rf " & COVERAGE_DIR
+  exec "mkdir -p " & COVERAGE_DIR
+  
+  let covFlags = "--debugger:native --passC:--coverage --passL:--coverage"
+  
+  var testFiles: seq[string] = @[]
+  for file in walkDirRec("tests/unit/storage"):
+    let name = extractFilename(file)
+    if name.startsWith("test_") and name.endsWith(".nim"):
+      testFiles.add(file)
+  
+  # Run each test with its own nimcache to avoid stamp mismatches
+  var infoFiles: seq[string] = @[]
+  for i, file in testFiles:
+    let testName = extractFilename(file).replace(".nim", "")
+    let cacheDir = COVERAGE_DIR & "/cache_" & testName
+    echo "  [", i+1, "/", testFiles.len, "] ", file
+    exec "nim c -r --mm:atomicArc --nimcache:" & cacheDir & " -p:src -p:tests " & covFlags & " " & file
+    # Capture coverage for this test
+    let infoFile = COVERAGE_DIR & "/test_" & testName & ".info"
+    exec "geninfo " & cacheDir & " --output-file " & infoFile & " --ignore-errors mismatch,gcov,source --keep-going --base-directory . || true"
+    if fileExists(infoFile):
+      infoFiles.add(infoFile)
+  
+  # Merge all coverage data
+  echo "Merging coverage data from ", infoFiles.len, " tests..."
+  if infoFiles.len > 0:
     var mergeCmd = "lcov"
-    for i in 1..testNum:
-      mergeCmd = mergeCmd & " --add-tracefile " & COVERAGE_DIR & "/test_" & $i & ".info"
-    mergeCmd = mergeCmd & " --output-file " & COVERAGE_DIR & "/di.info --ignore-errors mismatch,gcov 2>/dev/null || true"
+    for infoFile in infoFiles:
+      mergeCmd = mergeCmd & " --add-tracefile " & infoFile
+    mergeCmd = mergeCmd & " --output-file " & COVERAGE_DIR & "/storage_merged.info --ignore-errors mismatch,gcov"
     exec mergeCmd
     
-    exec "lcov --remove " & COVERAGE_DIR & "/di.info '/usr/*' '*@nrandom*' '*@nulid*' '*@mtest*' --output-file " & COVERAGE_DIR & "/di.filtered.info --ignore-errors unused,source 2>/dev/null || true"
-    exec "genhtml " & COVERAGE_DIR & "/di.filtered.info --output-directory " & COVERAGE_DIR & "/html_di --ignore-errors source 2>/dev/null || true"
+    echo "Extracting Fractio coverage..."
+    exec "lcov --extract " & COVERAGE_DIR & "/storage_merged.info '" & PROJECT_ROOT & "/src/*' '" & PROJECT_ROOT & "/tests/*' --output-file " & COVERAGE_DIR & "/storage_fractio.info --ignore-errors empty"
     
-    echo "DI coverage report: " & COVERAGE_DIR & "/html_di/"
-    exec "lcov --summary " & COVERAGE_DIR & "/di.filtered.info --ignore-errors unused 2>/dev/null || echo 'No coverage data.'"
+    echo "Generating HTML report..."
+    exec "genhtml " & COVERAGE_DIR & "/storage_fractio.info --output-directory " & COVERAGE_DIR & "/html_storage --title 'Fractio Storage Coverage' --legend --ignore-errors unmapped"
+    
+    echo ""
+    echo "=========================================="
+    echo "Storage coverage: " & COVERAGE_DIR & "/html_storage/index.html"
+    echo "=========================================="
+  else:
+    echo "No coverage data collected."
 
-task coverage_report, "Generate HTML coverage report from existing coverage data":
-  echo "Generating coverage report..."
-  exec "mkdir -p " & COVERAGE_DIR & "/html"
-  # Find all existing test info files and merge
-  var mergeCmd = "lcov --initial --capture --directory " & COVERAGE_DIR & " --output-file " & COVERAGE_DIR & "/coverage.info --ignore-errors gcov 2>/dev/null || true"
-  exec mergeCmd
-  exec "lcov --remove " & COVERAGE_DIR & "/coverage.info '/usr/*' '*@nrandom*' '*@nulid*' '*@mtest*' --output-file " & COVERAGE_DIR & "/coverage.filtered.info --ignore-errors unused,source 2>/dev/null || true"
-  exec "genhtml " & COVERAGE_DIR & "/coverage.filtered.info --output-directory " & COVERAGE_DIR & "/html --ignore-errors source 2>/dev/null || true"
-  echo "Report generated: " & COVERAGE_DIR & "/html/index.html"
-
-task coverage_summary, "Show coverage summary (text report)":
-  exec "lcov --summary " & COVERAGE_DIR & "/coverage.filtered.info --ignore-errors unused 2>/dev/null || echo 'No coverage data found. Run nimble coverage_unit first.'"
+task coverage_summary, "Show coverage summary":
+  var fractioInfo = COVERAGE_DIR & "/core_filtered.info"
+  if not fileExists(fractioInfo):
+    fractioInfo = COVERAGE_DIR & "/core_fractio.info"
+  if not fileExists(fractioInfo):
+    # Try other merged files
+    for f in ["storage_fractio.info", "coverage_fractio.info"]:
+      if fileExists(COVERAGE_DIR & "/" & f):
+        fractioInfo = COVERAGE_DIR & "/" & f
+        break
+  if not fileExists(fractioInfo):
+    echo "No coverage data found. Run nimble coverage_unit_core first."
+  else:
+    exec "lcov --summary " & fractioInfo
 
 # =============================================================================
 # Deprecated aliases (kept for backward compatibility)
