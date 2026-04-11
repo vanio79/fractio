@@ -99,16 +99,17 @@ proc validateClockOffset*(tp: TimestampProvider): bool =
 proc encodeTimestamp*(ts: Timestamp, nodeId: uint16, txnCounter: int64): int64 =
   ## Encode timestamp with node ID and transaction counter for unique transaction ID
   ## Format: <node_id (10 bits)><timestamp (34 bits)><counter (20 bits)>
+  ## Layout: nodeId at bits 54-63, timestamp at bits 20-53, counter at bits 0-19
   result = (int64(nodeId) shl 54) or
-           ((ts shr 10) and 0x3FFFFFFFF) or
-           ((txnCounter and LOGICAL_MASK) shl 10)
+           ((ts shr 10) shl 20) or # timestamp in bits 20-53
+            (txnCounter and LOGICAL_MASK) # counter in bits 0-19
 
 proc decodeTimestamp*(encoded: int64): tuple[timestamp: Timestamp,
     nodeId: uint16, counter: int64] =
   ## Decode a transaction ID back to components
-  result.timestamp = (encoded and 0x3FFFFFFFF) shl 10
+  result.timestamp = ((encoded shr 20) and 0x3FFFFFFFF) shl 10
   result.nodeId = uint16((encoded shr 54) and 0x3FF)
-  result.counter = (encoded shr 10) and LOGICAL_MASK
+  result.counter = encoded and LOGICAL_MASK
 
 # Error constructors
 

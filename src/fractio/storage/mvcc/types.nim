@@ -134,20 +134,32 @@ proc encodeMVCCKey*(userKey: string, timestamp: Timestamp,
 
 proc decodeMVCCKey*(encodedKey: string): MVCCKey =
   ## Decode an MVCC key back to components
-  if encodedKey.len < 9:
+  ## Handles both version keys and intent keys:
+  ## - Version keys: userKey + VERSION_SEPARATOR(2) + timestamp(8) = userKeyLen + 10
+  ## - Intent keys: userKey + INTENT_SUFFIX(2) + txnId(16) = userKeyLen + 18
+
+  if encodedKey.len < 10:
     raise newException(MVCCError, "Invalid MVCC key: too short")
 
-  let userKeyEnd = encodedKey.len - 9
+  # Check for intent key first (18 bytes suffix: 2 + 16)
+  if encodedKey.len >= 18:
+    let intentUserKeyEnd = encodedKey.len - 18
+    let intentSuffix = encodedKey[intentUserKeyEnd ..< intentUserKeyEnd + 2]
+    if intentSuffix == INTENT_SUFFIX:
+      result.isIntent = true
+      result.userKey = encodedKey[0 ..< intentUserKeyEnd]
+      # Intent keys don't have a timestamp in the same position
+      # They have a txnId instead, which we don't decode here
+      result.timestamp = 0
+      return
 
-  # Check for intent suffix
+  # Must be a version key (10 bytes suffix: 2 + 8)
+  let userKeyEnd = encodedKey.len - 10
   let suffix = encodedKey[userKeyEnd ..< userKeyEnd + 2]
-  if suffix == INTENT_SUFFIX:
-    result.isIntent = true
-  elif suffix == VERSION_SEPARATOR:
-    result.isIntent = false
-  else:
+  if suffix != VERSION_SEPARATOR:
     raise newException(MVCCError, "Invalid MVCC key: unknown suffix")
 
+  result.isIntent = false
   result.userKey = encodedKey[0 ..< userKeyEnd]
 
   # Extract timestamp

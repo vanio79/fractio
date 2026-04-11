@@ -116,10 +116,11 @@ nimble coverage_summary
 nimble coverage_clean && nimble coverage_unit_core && nimble coverage_summary
 ```
 
-Coverage files are stored in `coverage/` directory:
-- `coverage/cache_<test>/` - Unique nimcache per test
-- `coverage/*.gcda` - Coverage data files
-- `coverage/summary.info` - Merged lcov tracefile
+Coverage files are stored in `/tmp/fractio-coverage/` directory:
+- `/tmp/fractio-coverage/cache_<test>/` - Unique nimcache per test
+- `/tmp/fractio-coverage/*.gcda` - Coverage data files
+- `/tmp/fractio-coverage/summary.info` - Merged lcov tracefile
+- `/tmp/fractio-coverage/html/` - HTML coverage report
 
 Current coverage: ~26% lines, ~38% functions (unit core tests only)
 

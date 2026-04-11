@@ -323,5 +323,314 @@ suite "PacketCodec Unit Tests":
     expect ValueError:
       discard codec.bytesToTimestamp(data, 0, BOM_BIG_ENDIAN)
 
+  suite "Negative offset bounds checking":
+    test "readUint16BE raises on negative offset":
+      let data = [uint8(0x12), 0x34]
+      expect ValueError:
+        discard codec.readUint16BE(data, -1)
+
+    test "readUint16LE raises on negative offset":
+      let data = [uint8(0x12), 0x34]
+      expect ValueError:
+        discard codec.readUint16LE(data, -1)
+
+    test "readUint64BE raises on negative offset":
+      let data = [uint8(0x01), 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF]
+      expect ValueError:
+        discard codec.readUint64BE(data, -1)
+
+    test "readUint64LE raises on negative offset":
+      let data = [uint8(0x01), 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF]
+      expect ValueError:
+        discard codec.readUint64LE(data, -1)
+
+    test "writeUint16BE raises on negative offset":
+      var dest = newSeq[uint8](4)
+      expect ValueError:
+        codec.writeUint16BE(0x1234'u16, dest, -1)
+
+    test "writeUint64BE raises on negative offset":
+      var dest = newSeq[uint8](10)
+      expect ValueError:
+        codec.writeUint64BE(0x0123456789ABCDEF'u64, dest, -1)
+
+    test "writeUint64LE raises on negative offset":
+      var dest = newSeq[uint8](10)
+      expect ValueError:
+        codec.writeUint64LE(0x0123456789ABCDEF'u64, dest, -1)
+
+    test "timestampToBytes raises on negative offset":
+      var dest = newSeq[uint8](10)
+      expect ValueError:
+        codec.timestampToBytes(Timestamp(123'i64), BOM_BIG_ENDIAN, dest, -1)
+
+    test "bytesToTimestamp raises on negative offset":
+      let data = [uint8(0x01), 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0x00, 0x00]
+      expect ValueError:
+        discard codec.bytesToTimestamp(data, -1, BOM_BIG_ENDIAN)
+
+  suite "Timestamp edge values":
+    test "timestamp min int64":
+      let minTs = Timestamp(-9223372036854775808'i64)
+      var dest = newSeq[uint8](8)
+      codec.timestampToBytes(minTs, BOM_BIG_ENDIAN, dest, 0)
+      let recovered = codec.bytesToTimestamp(dest, 0, BOM_BIG_ENDIAN)
+      check recovered == minTs
+
+    test "timestamp min int64 little-endian":
+      let minTs = Timestamp(-9223372036854775808'i64)
+      var dest = newSeq[uint8](8)
+      codec.timestampToBytes(minTs, BOM_LITTLE_ENDIAN, dest, 0)
+      let recovered = codec.bytesToTimestamp(dest, 0, BOM_LITTLE_ENDIAN)
+      check recovered == minTs
+
+    test "timestamp near zero positive":
+      let ts = Timestamp(1'i64)
+      var dest = newSeq[uint8](8)
+      codec.timestampToBytes(ts, BOM_BIG_ENDIAN, dest, 0)
+      let recovered = codec.bytesToTimestamp(dest, 0, BOM_BIG_ENDIAN)
+      check recovered == ts
+
+    test "timestamp near zero negative":
+      let ts = Timestamp(-1'i64)
+      var dest = newSeq[uint8](8)
+      codec.timestampToBytes(ts, BOM_BIG_ENDIAN, dest, 0)
+      let recovered = codec.bytesToTimestamp(dest, 0, BOM_BIG_ENDIAN)
+      check recovered == ts
+
+    test "timestamp all bits set":
+      let ts = Timestamp(-1'i64)
+      var dest = newSeq[uint8](8)
+      codec.timestampToBytes(ts, BOM_BIG_ENDIAN, dest, 0)
+      for b in dest:
+        check b == 0xFF'u8
+      let recovered = codec.bytesToTimestamp(dest, 0, BOM_BIG_ENDIAN)
+      check recovered == ts
+
+  suite "Packet size edge cases":
+    test "decodeRequest with exactly minimum size":
+      var packet = newSeq[uint8](REQUEST_PACKET_SIZE)
+      codec.writeUint16BE(BOM_BIG_ENDIAN, packet, 0)
+      packet[2] = MSG_SYNC_REQUEST
+      codec.timestampToBytes(Timestamp(42'i64), BOM_BIG_ENDIAN, packet, 3)
+      let (bom, req) = codec.decodeRequest(packet)
+      check bom == BOM_BIG_ENDIAN
+      check req.t1 == Timestamp(42'i64)
+
+    test "decodeRequest with larger packet ignores extra bytes":
+      var packet = newSeq[uint8](REQUEST_PACKET_SIZE + 10)
+      codec.writeUint16BE(BOM_BIG_ENDIAN, packet, 0)
+      packet[2] = MSG_SYNC_REQUEST
+      codec.timestampToBytes(Timestamp(42'i64), BOM_BIG_ENDIAN, packet, 3)
+      for i in REQUEST_PACKET_SIZE..<packet.len:
+        packet[i] = uint8(i)
+      let (bom, req) = codec.decodeRequest(packet)
+      check bom == BOM_BIG_ENDIAN
+      check req.t1 == Timestamp(42'i64)
+
+    test "decodeResponse with exactly minimum size":
+      var packet = newSeq[uint8](RESPONSE_PACKET_SIZE)
+      codec.writeUint16BE(BOM_BIG_ENDIAN, packet, 0)
+      packet[2] = MSG_SYNC_RESPONSE
+      codec.timestampToBytes(Timestamp(100'i64), BOM_BIG_ENDIAN, packet, 3)
+      codec.timestampToBytes(Timestamp(200'i64), BOM_BIG_ENDIAN, packet, 11)
+      let (bom, res) = codec.decodeResponse(packet)
+      check bom == BOM_BIG_ENDIAN
+      check res.t2 == Timestamp(100'i64)
+      check res.t3 == Timestamp(200'i64)
+
+    test "decodeResponse with larger packet ignores extra bytes":
+      var packet = newSeq[uint8](RESPONSE_PACKET_SIZE + 20)
+      codec.writeUint16BE(BOM_BIG_ENDIAN, packet, 0)
+      packet[2] = MSG_SYNC_RESPONSE
+      codec.timestampToBytes(Timestamp(100'i64), BOM_BIG_ENDIAN, packet, 3)
+      codec.timestampToBytes(Timestamp(200'i64), BOM_BIG_ENDIAN, packet, 11)
+      for i in RESPONSE_PACKET_SIZE..<packet.len:
+        packet[i] = uint8(i mod 256)
+      let (bom, res) = codec.decodeResponse(packet)
+      check bom == BOM_BIG_ENDIAN
+      check res.t2 == Timestamp(100'i64)
+      check res.t3 == Timestamp(200'i64)
+
+    test "decodeRequest raises on size one less than minimum":
+      var packet = newSeq[uint8](REQUEST_PACKET_SIZE - 1)
+      for i in 0..<packet.len:
+        packet[i] = 0'u8
+      expect ValueError:
+        discard codec.decodeRequest(packet)
+
+    test "decodeResponse raises on size one less than minimum":
+      var packet = newSeq[uint8](RESPONSE_PACKET_SIZE - 1)
+      for i in 0..<packet.len:
+        packet[i] = 0'u8
+      expect ValueError:
+        discard codec.decodeResponse(packet)
+
+  suite "Non-standard BOM handling":
+    test "bytesToTimestamp treats non-standard BOM as little-endian":
+      let data = [uint8(0xEF), 0xCD, 0xAB, 0x89, 0x67, 0x45, 0x23, 0x01]
+      let ts = codec.bytesToTimestamp(data, 0, 0x1234'u16)
+      check ts == Timestamp(0x0123456789ABCDEF'i64)
+
+    test "timestampToBytes writes little-endian for non-standard BOM":
+      var dest = newSeq[uint8](8)
+      codec.timestampToBytes(Timestamp(0x0123456789ABCDEF'i64), 0x1234'u16,
+          dest, 0)
+      check dest[0] == 0xEF'u8
+      check dest[7] == 0x01'u8
+
+    test "encodeRequest with non-standard BOM preserves it":
+      let t1 = Timestamp(12345'i64)
+      let packet = codec.encodeRequest(t1, 0xABCD'u16)
+      check codec.readUint16BE(packet, 0) == 0xABCD'u16
+      check packet[2] == MSG_SYNC_REQUEST
+      let decodedT1 = codec.bytesToTimestamp(packet, 3, 0xABCD'u16)
+      check decodedT1 == t1
+
+    test "encodeResponse with non-standard BOM preserves it":
+      let t2 = Timestamp(100'i64)
+      let t3 = Timestamp(200'i64)
+      let packet = codec.encodeResponse(t2, t3, 0xDEAD'u16)
+      check codec.readUint16BE(packet, 0) == 0xDEAD'u16
+      check packet[2] == MSG_SYNC_RESPONSE
+
+  suite "Codec statelessness":
+    test "multiple sequential encode operations":
+      let t1a = Timestamp(100'i64)
+      let t1b = Timestamp(200'i64)
+      let t1c = Timestamp(300'i64)
+
+      let packetA = codec.encodeRequest(t1a, BOM_BIG_ENDIAN)
+      let packetB = codec.encodeRequest(t1b, BOM_LITTLE_ENDIAN)
+      let packetC = codec.encodeRequest(t1c, BOM_BIG_ENDIAN)
+
+      let (_, reqA) = codec.decodeRequest(packetA)
+      let (_, reqB) = codec.decodeRequest(packetB)
+      let (_, reqC) = codec.decodeRequest(packetC)
+
+      check reqA.t1 == t1a
+      check reqB.t1 == t1b
+      check reqC.t1 == t1c
+
+    test "interleaved request and response operations":
+      let t1 = Timestamp(111'i64)
+      let t2 = Timestamp(222'i64)
+      let t3 = Timestamp(333'i64)
+
+      let reqPacket = codec.encodeRequest(t1, BOM_BIG_ENDIAN)
+      let resPacket = codec.encodeResponse(t2, t3, BOM_BIG_ENDIAN)
+
+      let (_, req) = codec.decodeRequest(reqPacket)
+      let (_, res) = codec.decodeResponse(resPacket)
+
+      check req.t1 == t1
+      check res.t2 == t2
+      check res.t3 == t3
+
+    test "same codec instance handles both endianness":
+      let tsBE = Timestamp(0x123456789ABCDEF0'i64)
+      let tsLE = Timestamp(0xFEDCBA9876543210'i64)
+
+      var destBE = newSeq[uint8](8)
+      var destLE = newSeq[uint8](8)
+
+      codec.timestampToBytes(tsBE, BOM_BIG_ENDIAN, destBE, 0)
+      codec.timestampToBytes(tsLE, BOM_LITTLE_ENDIAN, destLE, 0)
+
+      let recoveredBE = codec.bytesToTimestamp(destBE, 0, BOM_BIG_ENDIAN)
+      let recoveredLE = codec.bytesToTimestamp(destLE, 0, BOM_LITTLE_ENDIAN)
+
+      check recoveredBE == tsBE
+      check recoveredLE == tsLE
+
+  suite "Request/Response integration":
+    test "full round-trip with realistic timestamps":
+      let t1 = Timestamp(1700000000000000000'i64)
+      let t2 = Timestamp(1700000000000001000'i64)
+      let t3 = Timestamp(1700000000000001500'i64)
+
+      let reqPacket = codec.encodeRequest(t1, BOM_BIG_ENDIAN)
+      let (reqBom, request) = codec.decodeRequest(reqPacket)
+
+      let resPacket = codec.encodeResponse(t2, t3, reqBom)
+      let (resBom, response) = codec.decodeResponse(resPacket)
+
+      check request.t1 == t1
+      check response.t2 == t2
+      check response.t3 == t3
+      check reqBom == resBom
+
+    test "full round-trip little-endian":
+      let t1 = Timestamp(1700000000000000000'i64)
+      let t2 = Timestamp(1700000000000001000'i64)
+      let t3 = Timestamp(1700000000000001500'i64)
+
+      let reqPacket = codec.encodeRequest(t1, BOM_LITTLE_ENDIAN)
+      let (reqBom, request) = codec.decodeRequest(reqPacket)
+
+      let resPacket = codec.encodeResponse(t2, t3, reqBom)
+      let (resBom, response) = codec.decodeResponse(resPacket)
+
+      check request.t1 == t1
+      check response.t2 == t2
+      check response.t3 == t3
+      check reqBom == BOM_LITTLE_ENDIAN
+      check resBom == BOM_LITTLE_ENDIAN
+
+  suite "Write offset edge cases":
+    test "writeUint16BE at end of buffer":
+      var dest = newSeq[uint8](4)
+      codec.writeUint16BE(0xABCD'u16, dest, 2)
+      check dest[2] == 0xAB'u8
+      check dest[3] == 0xCD'u8
+
+    test "writeUint16BE raises at last position":
+      var dest = newSeq[uint8](3)
+      expect ValueError:
+        codec.writeUint16BE(0x1234'u16, dest, 2)
+
+    test "writeUint64BE at end of buffer":
+      var dest = newSeq[uint8](10)
+      codec.writeUint64BE(0x0123456789ABCDEF'u64, dest, 2)
+      check dest[2] == 0x01'u8
+      check dest[9] == 0xEF'u8
+
+    test "writeUint64BE raises at boundary position":
+      var dest = newSeq[uint8](9)
+      expect ValueError:
+        codec.writeUint64BE(0x0123456789ABCDEF'u64, dest, 2)
+
+    test "writeUint64LE at end of buffer":
+      var dest = newSeq[uint8](10)
+      codec.writeUint64LE(0x0123456789ABCDEF'u64, dest, 2)
+      check dest[2] == 0xEF'u8
+      check dest[9] == 0x01'u8
+
+    test "writeUint64LE raises at boundary position":
+      var dest = newSeq[uint8](9)
+      expect ValueError:
+        codec.writeUint64LE(0x0123456789ABCDEF'u64, dest, 2)
+
+  suite "Read offset edge cases":
+    test "readUint16BE at last valid position":
+      let data = [uint8(0x00), 0x00, 0xAB, 0xCD]
+      let value = codec.readUint16BE(data, 2)
+      check value == 0xABCD'u16
+
+    test "readUint64BE at last valid position":
+      let data = [uint8(0x00), 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF]
+      let value = codec.readUint64BE(data, 1)
+      check value == 0x0123456789ABCDEF'u64
+
+    test "readUint16LE at last valid position":
+      let data = [uint8(0x00), 0x00, 0xCD, 0xAB]
+      let value = codec.readUint16LE(data, 2)
+      check value == 0xABCD'u16
+
+    test "readUint64LE at last valid position":
+      let data = [uint8(0x00), 0xEF, 0xCD, 0xAB, 0x89, 0x67, 0x45, 0x23, 0x01]
+      let value = codec.readUint64LE(data, 1)
+      check value == 0x0123456789ABCDEF'u64
+
   when isMainModule:
     discard # Tests run via nimble

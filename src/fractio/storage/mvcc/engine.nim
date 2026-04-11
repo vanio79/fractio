@@ -65,29 +65,38 @@ proc mvccGet*(engine: MVCCEngine, key: string, timestamp: Timestamp,
       let mvccValue = decodeMVCCValue(intentValue.get())
       return ok(some(mvccValue))
 
-  # Check for any intent from another transaction
-  # Iterate through possible intents (we need a better approach for production)
-  let latestKey = makeVersionKey(key, types.MAX_TIMESTAMP)
+  # Use seekToLast to find newest versions first, then iterate backwards
   let iter = engine.backend.newIterator()
-  discard iter.seek(key) # Seek to the key
+  discard iter.seekToLast()
 
-  if iter.valid():
+  # Iterate backwards to find newest version <= timestamp
+  while iter.valid():
     let iterKey = iter.key()
-    if iterKey.startsWith(key):
-      let decoded = decodeMVCCKey(iterKey)
-      if decoded.isIntent:
-        # There's an intent - check if it's from a committed transaction
-        # For now, return error indicating conflict
-        return err(mvccIntentConflict, "Found intent for key: " & key)
-      else:
-        # Regular version - check if within timestamp
-        if decoded.timestamp <= timestamp:
-          let value = iter.value()
-          let mvccValue = decodeMVCCValue(value)
-          if not mvccValue.isDeleted:
-            return ok(some(mvccValue))
-          else:
-            return ok(none(MVCCValue))
+
+    # Stop if we've moved past our key range
+    if not iterKey.startsWith(key):
+      break
+
+    # Check if this key matches our user key exactly (not a different key)
+    let decoded = decodeMVCCKey(iterKey)
+    if decoded.userKey != key:
+      discard iter.prev()
+      continue
+
+    if decoded.isIntent:
+      # There's an intent from another transaction - return conflict
+      return err(mvccIntentConflict, "Found intent for key: " & key)
+    else:
+      # Regular version - check if within timestamp
+      if decoded.timestamp <= timestamp:
+        let value = iter.value()
+        let mvccValue = decodeMVCCValue(value)
+        if not mvccValue.isDeleted:
+          return ok(some(mvccValue))
+        else:
+          return ok(none(MVCCValue))
+
+    discard iter.prev()
 
   # No version found
   return ok(none(MVCCValue))
@@ -136,84 +145,98 @@ proc mvccDelete*(engine: MVCCEngine, txn: MVCCTransaction,
 proc mvccScan*(engine: MVCCEngine, startKey: string, endKey: string,
     timestamp: Timestamp, txnId: TransactionID = InvalidTransactionID): MVCCScanResult =
   ## Scan MVCC keys within a range at a specific timestamp
+  ## Returns newest version of each key <= timestamp
+  ## Iterates backwards to find newest versions first
 
   var results: seq[MVCCKeyValue] = @[]
-  var lastKey: string = ""
-  var foundEnd = false
+  var seenKeys: HashSet[string] = initHashSet[string]()
 
   let iter = engine.backend.newIterator()
-  discard iter.seek(startKey)
 
+  # Start from the end key (or from last key if no endKey)
+  # We need to find a starting position that's within or before our range
+  if endKey.len > 0:
+    # Try to seek to endKey
+    if not iter.seek(endKey):
+      # No key >= endKey, so start from the last key
+      discard iter.seekToLast()
+    elif iter.key() >= endKey:
+      # We're at or beyond endKey, move back one position
+      discard iter.prev()
+  else:
+    discard iter.seekToLast()
+
+  # Iterate backwards through keys
   while iter.valid():
     let iterKey = iter.key()
 
-    # Check if we've passed the end key
-    if endKey.len > 0 and iterKey >= endKey:
-      foundEnd = true
-      break
-
-    # Skip if not starting with our key prefix
-    if startKey.len > 0 and not iterKey.startsWith(startKey):
-      break
-
     try:
       let decoded = decodeMVCCKey(iterKey)
+      let userKey = decoded.userKey
+
+      # Stop if we've passed below the start key range
+      if userKey < startKey:
+        break
+
+      # Skip if above end key range (for open-ended scans)
+      if endKey.len > 0 and userKey >= endKey:
+        discard iter.prev()
+        continue
 
       # Skip intents - they need special handling
       if decoded.isIntent:
-        # For intents, we'd need to resolve them first
-        # For now, skip
-        discard iter.next()
+        discard iter.prev()
         continue
 
       # Only include versions <= timestamp
       if decoded.timestamp <= timestamp:
         # Skip if we've already seen this key (only keep newest)
-        if decoded.userKey == lastKey:
-          discard iter.next()
+        if userKey in seenKeys:
+          discard iter.prev()
           continue
+
+        seenKeys.incl(userKey)
 
         let value = iter.value()
         let mvccValue = decodeMVCCValue(value)
 
-        lastKey = decoded.userKey
-
         # Only include non-deleted values
         if not mvccValue.isDeleted:
-          results.add((MVCCKey(userKey: decoded.userKey,
+          results.add((MVCCKey(userKey: userKey,
               timestamp: decoded.timestamp, isIntent: false), mvccValue))
     except MVCCError:
       # Skip invalid keys
       discard
 
-    discard iter.next()
+    discard iter.prev()
 
+  # Reverse results to get them in forward key order
+  results.reverse()
   return okScan(results)
 
 proc getLatestVersion*(engine: MVCCEngine, key: string): Option[MVCCValue] =
   ## Get the latest non-intent version of a key
   ## Used for conflict detection during commit
+  ## Iterates backwards to find newest version first
 
   let iter = engine.backend.newIterator()
-  discard iter.seek(key)
+  discard iter.seekToLast()
 
   while iter.valid():
     let iterKey = iter.key()
 
-    if not iterKey.startsWith(key):
-      break
-
     try:
       let decoded = decodeMVCCKey(iterKey)
 
-      if not decoded.isIntent:
+      # Check if this key matches our user key exactly
+      if decoded.userKey == key and not decoded.isIntent:
         # Found a committed version
         let value = iter.value()
         return some(decodeMVCCValue(value))
     except MVCCError:
       discard
 
-    discard iter.next()
+    discard iter.prev()
 
   return none(MVCCValue)
 
@@ -270,21 +293,19 @@ proc getIntent*(engine: MVCCEngine, key: string,
 proc hasIntent*(engine: MVCCEngine, key: string): bool =
   ## Check if any intent exists for a key
   let iter = engine.backend.newIterator()
-  discard iter.seek(key)
+  discard iter.seekToLast()
 
   while iter.valid():
     let iterKey = iter.key()
-    if not iterKey.startsWith(key):
-      break
 
     try:
       let decoded = decodeMVCCKey(iterKey)
-      if decoded.isIntent:
+      if decoded.userKey == key and decoded.isIntent:
         return true
     except MVCCError:
       discard
 
-    discard iter.next()
+    discard iter.prev()
 
   return false
 
@@ -293,16 +314,14 @@ proc getIntentsForKey*(engine: MVCCEngine, key: string): seq[Intent] =
   result = @[]
 
   let iter = engine.backend.newIterator()
-  discard iter.seek(key)
+  discard iter.seekToLast()
 
   while iter.valid():
     let iterKey = iter.key()
-    if not iterKey.startsWith(key):
-      break
 
     try:
       let decoded = decodeMVCCKey(iterKey)
-      if decoded.isIntent:
+      if decoded.userKey == key and decoded.isIntent:
         let decodedKey = decodeIntentKey(iterKey)
         let value = iter.value()
         let mvccValue = decodeMVCCValue(value)
@@ -317,23 +336,22 @@ proc getIntentsForKey*(engine: MVCCEngine, key: string): seq[Intent] =
     except MVCCError:
       discard
 
-    discard iter.next()
+    discard iter.prev()
 
 proc getAllVersions*(engine: MVCCEngine, userKey: string): seq[KeyVersion] =
   ## Get all versions of a key, sorted by timestamp (newest first)
+  ## Iterates backwards to get newest versions first
   result = @[]
 
   let iter = engine.backend.newIterator()
-  discard iter.seek(userKey)
+  discard iter.seekToLast()
 
   while iter.valid():
     let iterKey = iter.key()
-    if not iterKey.startsWith(userKey):
-      break
 
     try:
       let decoded = decodeMVCCKey(iterKey)
-      if not decoded.isIntent:
+      if decoded.userKey == userKey and not decoded.isIntent:
         # This is a committed version
         let value = iter.value()
         let mvccValue = decodeMVCCValue(value)
@@ -346,7 +364,7 @@ proc getAllVersions*(engine: MVCCEngine, userKey: string): seq[KeyVersion] =
     except MVCCError:
       discard
 
-    discard iter.next()
+    discard iter.prev()
 
 # Unit tests
 when isMainModule:

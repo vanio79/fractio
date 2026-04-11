@@ -32,8 +32,7 @@ tmp_*/
 testresults/
 test.txt
 
-# Code coverage data and reports
-coverage/
+# Code coverage data and reports (now in /tmp/fractio-coverage)
 # Compiled test binaries in root (no extension = Nim binary)
 /test_*
 !/test_*.nim
