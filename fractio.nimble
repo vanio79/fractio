@@ -234,7 +234,7 @@ task coverage_unit, "Run all unit tests with coverage":
     var mergeCmd = "lcov"
     for infoFile in infoFiles:
       mergeCmd = mergeCmd & " --add-tracefile " & infoFile
-    mergeCmd = mergeCmd & " --output-file " & COVERAGE_DIR & "/coverage_merged.info --ignore-errors mismatch,gcov,format,corrupt"
+    mergeCmd = mergeCmd & " --output-file " & COVERAGE_DIR & "/coverage_merged.info --branch-coverage --ignore-errors mismatch,gcov,format,corrupt"
     exec mergeCmd
     
     echo "Generating HTML report (with branch coverage)..."
@@ -338,7 +338,7 @@ task coverage_unit_core, "Run core unit tests with coverage":
       if i > 0:
         let remaining = infoFiles.len - i
         echo "Merging " & infoFile & ".." & $remaining & " remaining"
-        exec "lcov --branch-coverage --add-tracefile " & COVERAGE_DIR & "/core_merged.info --add-tracefile " & infoFile & " --output-file " & COVERAGE_DIR & "/core_merged.info --ignore-errors mismatch,gcov"
+        exec "lcov --branch-coverage --add-tracefile " & COVERAGE_DIR & "/core_merged.info --add-tracefile " & infoFile & " --output-file " & COVERAGE_DIR & "/core_merged.info --branch-coverage --ignore-errors mismatch,gcov"
     
     echo "Generating HTML report (with branch coverage)..."
     # Use --include to filter files in genhtml (preserves branch coverage)
@@ -383,7 +383,7 @@ task coverage_unit_storage, "Run storage unit tests with coverage":
     var mergeCmd = "lcov"
     for infoFile in infoFiles:
       mergeCmd = mergeCmd & " --add-tracefile " & infoFile
-    mergeCmd = mergeCmd & " --output-file " & COVERAGE_DIR & "/storage_merged.info --ignore-errors mismatch,gcov"
+    mergeCmd = mergeCmd & " --output-file " & COVERAGE_DIR & "/storage_merged.info --branch-coverage --ignore-errors mismatch,gcov"
     exec mergeCmd
     
     echo "Generating HTML report (with branch coverage)..."
