@@ -92,3 +92,5 @@ src/fractio/protocol/mvcc_store
 src/fractio/protocol/raft_store
 src/fractio/sql/executor
 src/fractio/storage/mvcc/types
+*.gcov
+generated_not_to_break_here
