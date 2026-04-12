@@ -337,7 +337,8 @@ task coverage_unit_core, "Run core unit tests with coverage":
     # Add remaining files one at a time to avoid command line length limits
     for i, infoFile in infoFiles:
       if i > 0:
-        echo "Merging " & infoFile & ".." & (infoFiles.len - i) & " remaining"
+        let remaining = infoFiles.len - i
+        echo "Merging " & infoFile & ".." & $remaining & " remaining"
         exec "lcov --branch-coverage --add-tracefile " & COVERAGE_DIR & "/core_merged.info --add-tracefile " & infoFile & " --output-file " & COVERAGE_DIR & "/core_merged.info --ignore-errors mismatch,gcov"
     
     echo "Extracting Fractio coverage..."
