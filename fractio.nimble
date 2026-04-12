@@ -234,7 +234,7 @@ task coverage_unit, "Run all unit tests with coverage":
     var mergeCmd = "lcov"
     for infoFile in infoFiles:
       mergeCmd = mergeCmd & " --add-tracefile " & infoFile
-    mergeCmd = mergeCmd & " --output-file " & COVERAGE_DIR & "/coverage_merged.info --ignore-errors mismatch,gcov"
+    mergeCmd = mergeCmd & " --output-file " & COVERAGE_DIR & "/coverage_merged.info --ignore-errors mismatch,gcov,format,corrupt"
     exec mergeCmd
     
     echo "Extracting Fractio coverage..."
