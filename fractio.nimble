@@ -224,7 +224,7 @@ task coverage_unit, "Run all unit tests with coverage":
     exec "nim c -r --mm:atomicArc --nimcache:" & cacheDir & " -p:src -p:tests " & covFlags & " " & file
     # Capture coverage for this test
     let infoFile = COVERAGE_DIR & "/test_" & testName & ".info"
-    exec "geninfo " & cacheDir & " --output-file " & infoFile & " --ignore-errors mismatch,gcov,source --keep-going --base-directory . || true"
+    exec "geninfo " & cacheDir & " --output-file " & infoFile & " --branch-coverage --ignore-errors mismatch,gcov,source --keep-going --base-directory . || true"
     if fileExists(infoFile):
       infoFiles.add(infoFile)
   
@@ -241,7 +241,7 @@ task coverage_unit, "Run all unit tests with coverage":
     exec "lcov --extract " & COVERAGE_DIR & "/coverage_merged.info '" & PROJECT_ROOT & "/src/*' '" & PROJECT_ROOT & "/tests/*' --output-file " & COVERAGE_DIR & "/coverage_fractio.info --ignore-errors empty"
     
     echo "Generating HTML report..."
-    exec "genhtml " & COVERAGE_DIR & "/coverage_fractio.info --output-directory " & COVERAGE_DIR & "/html --title 'Fractio Coverage' --legend --ignore-errors unmapped"
+    exec "genhtml " & COVERAGE_DIR & "/coverage_fractio.info --output-directory " & COVERAGE_DIR & "/html --title 'Fractio Coverage' --legend --branch-coverage --ignore-errors unmapped"
     
     echo ""
     echo "=========================================="
@@ -376,7 +376,7 @@ task coverage_unit_storage, "Run storage unit tests with coverage":
     exec "nim c -r --mm:atomicArc --nimcache:" & cacheDir & " -p:src -p:tests " & covFlags & " " & file
     # Capture coverage for this test
     let infoFile = COVERAGE_DIR & "/test_" & testName & ".info"
-    exec "geninfo " & cacheDir & " --output-file " & infoFile & " --ignore-errors mismatch,gcov,source --keep-going --base-directory . || true"
+    exec "geninfo " & cacheDir & " --output-file " & infoFile & " --branch-coverage --ignore-errors mismatch,gcov,source --keep-going --base-directory . || true"
     if fileExists(infoFile):
       infoFiles.add(infoFile)
   
@@ -393,7 +393,7 @@ task coverage_unit_storage, "Run storage unit tests with coverage":
     exec "lcov --extract " & COVERAGE_DIR & "/storage_merged.info '" & PROJECT_ROOT & "/src/*' '" & PROJECT_ROOT & "/tests/*' --output-file " & COVERAGE_DIR & "/storage_fractio.info --ignore-errors empty"
     
     echo "Generating HTML report..."
-    exec "genhtml " & COVERAGE_DIR & "/storage_fractio.info --output-directory " & COVERAGE_DIR & "/html_storage --title 'Fractio Storage Coverage' --legend --ignore-errors unmapped"
+    exec "genhtml " & COVERAGE_DIR & "/storage_fractio.info --output-directory " & COVERAGE_DIR & "/html_storage --title 'Fractio Storage Coverage' --legend --branch-coverage --ignore-errors unmapped"
     
     echo ""
     echo "=========================================="
