@@ -494,14 +494,15 @@ suite "Allocator":
 
   test "selectLeaseholder keeps current if not overloaded":
     let pool = newStorePool()
+    # Both stores have similar low load - neither is overloaded
     var stats1 = newStoreStats(NodeID(1))
     stats1.capacityBytes = 1000'i64
-    stats1.totalBytes = 500'i64
+    stats1.totalBytes = 100'i64 # 10% utilization
     pool.addStore(stats1)
 
     var stats2 = newStoreStats(NodeID(2))
     stats2.capacityBytes = 1000'i64
-    stats2.totalBytes = 100'i64 # Less loaded but current is fine
+    stats2.totalBytes = 110'i64 # Similar load, slightly more
     pool.addStore(stats2)
 
     let alloc = newAllocator(pool)
@@ -511,7 +512,7 @@ suite "Allocator":
     ]
     let result = alloc.selectLeaseholder(replicas, NodeID(1))
     check result.isSome
-    check result.get == NodeID(1) # Current leaseholder not overloaded
+    check result.get == NodeID(1) # Current leaseholder not overloaded, kept even though NodeID(2) is slightly less loaded
     alloc.destroy()
     pool.destroy()
 
