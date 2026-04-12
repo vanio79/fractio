@@ -237,11 +237,10 @@ task coverage_unit, "Run all unit tests with coverage":
     mergeCmd = mergeCmd & " --output-file " & COVERAGE_DIR & "/coverage_merged.info --ignore-errors mismatch,gcov,format,corrupt"
     exec mergeCmd
     
-    echo "Extracting Fractio coverage..."
-    exec "lcov --extract " & COVERAGE_DIR & "/coverage_merged.info '" & PROJECT_ROOT & "/src/*' '" & PROJECT_ROOT & "/tests/*' --output-file " & COVERAGE_DIR & "/coverage_fractio.info --ignore-errors empty"
-    
-    echo "Generating HTML report..."
-    exec "genhtml " & COVERAGE_DIR & "/coverage_fractio.info --output-directory " & COVERAGE_DIR & "/html --title 'Fractio Coverage' --legend --branch-coverage --ignore-errors unmapped"
+    echo "Generating HTML report (with branch coverage)..."
+    # Use --include to filter files in genhtml (preserves branch coverage)
+    # Note: lcov --extract removes branch data, so we use genhtml filtering instead
+    exec "genhtml " & COVERAGE_DIR & "/coverage_merged.info --output-directory " & COVERAGE_DIR & "/html --title 'Fractio Coverage' --legend --branch-coverage --include '" & PROJECT_ROOT & "/src/*' --include '" & PROJECT_ROOT & "/tests/*' --ignore-errors unmapped,empty"
     
     echo ""
     echo "=========================================="
@@ -341,11 +340,9 @@ task coverage_unit_core, "Run core unit tests with coverage":
         echo "Merging " & infoFile & ".." & $remaining & " remaining"
         exec "lcov --branch-coverage --add-tracefile " & COVERAGE_DIR & "/core_merged.info --add-tracefile " & infoFile & " --output-file " & COVERAGE_DIR & "/core_merged.info --ignore-errors mismatch,gcov"
     
-    echo "Extracting Fractio coverage..."
-    exec "lcov --branch-coverage --extract " & COVERAGE_DIR & "/core_merged.info '" & PROJECT_ROOT & "/src/*' '" & PROJECT_ROOT & "/tests/*' --output-file " & COVERAGE_DIR & "/core_fractio.info --ignore-errors empty"
-    
-    echo "Generating HTML report..."
-    exec "genhtml " & COVERAGE_DIR & "/core_fractio.info --branch-coverage --output-directory " & COVERAGE_DIR & "/html_core --title 'Fractio Core Coverage' --legend --ignore-errors unmapped"
+    echo "Generating HTML report (with branch coverage)..."
+    # Use --include to filter files in genhtml (preserves branch coverage)
+    exec "genhtml " & COVERAGE_DIR & "/core_merged.info --branch-coverage --output-directory " & COVERAGE_DIR & "/html_core --title 'Fractio Core Coverage' --legend --include '" & PROJECT_ROOT & "/src/*' --include '" & PROJECT_ROOT & "/tests/*' --ignore-errors unmapped,empty"
     
     echo ""
     echo "=========================================="
@@ -389,11 +386,9 @@ task coverage_unit_storage, "Run storage unit tests with coverage":
     mergeCmd = mergeCmd & " --output-file " & COVERAGE_DIR & "/storage_merged.info --ignore-errors mismatch,gcov"
     exec mergeCmd
     
-    echo "Extracting Fractio coverage..."
-    exec "lcov --extract " & COVERAGE_DIR & "/storage_merged.info '" & PROJECT_ROOT & "/src/*' '" & PROJECT_ROOT & "/tests/*' --output-file " & COVERAGE_DIR & "/storage_fractio.info --ignore-errors empty"
-    
-    echo "Generating HTML report..."
-    exec "genhtml " & COVERAGE_DIR & "/storage_fractio.info --output-directory " & COVERAGE_DIR & "/html_storage --title 'Fractio Storage Coverage' --legend --branch-coverage --ignore-errors unmapped"
+    echo "Generating HTML report (with branch coverage)..."
+    # Use --include to filter files in genhtml (preserves branch coverage)
+    exec "genhtml " & COVERAGE_DIR & "/storage_merged.info --output-directory " & COVERAGE_DIR & "/html_storage --title 'Fractio Storage Coverage' --legend --branch-coverage --include '" & PROJECT_ROOT & "/src/*' --include '" & PROJECT_ROOT & "/tests/*' --ignore-errors unmapped,empty"
     
     echo ""
     echo "=========================================="
