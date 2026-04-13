@@ -435,3 +435,165 @@ suite "SQL Parser — error cases":
       fail()
     except ParseError:
       discard
+
+suite "SQL Parser — SHOW Commands":
+
+  test "SHOW DATABASES":
+    let s = parseStatement("SHOW DATABASES")
+    check s.kind == stmtShowDatabases
+
+  test "SHOW SCHEMAS":
+    let s = parseStatement("SHOW SCHEMAS")
+    check s.kind == stmtShowSchemas
+    check s.showSchemasDb == ""
+
+  test "SHOW SCHEMAS IN database":
+    let s = parseStatement("SHOW SCHEMAS IN mydb")
+    check s.kind == stmtShowSchemas
+    check s.showSchemasDb == "mydb"
+
+  test "SHOW TABLES":
+    let s = parseStatement("SHOW TABLES")
+    check s.kind == stmtShowTables
+    check s.showTablesDb == ""
+    check s.showTablesSchema == ""
+
+  test "SHOW TABLES IN schema":
+    let s = parseStatement("SHOW TABLES IN public")
+    check s.kind == stmtShowTables
+    check s.showTablesDb == ""
+    check s.showTablesSchema == "public"
+
+  test "SHOW TABLES IN database.schema":
+    let s = parseStatement("SHOW TABLES IN mydb.public")
+    check s.kind == stmtShowTables
+    check s.showTablesDb == "mydb"
+    check s.showTablesSchema == "public"
+
+  test "SHOW SPACES":
+    let s = parseStatement("SHOW SPACES")
+    check s.kind == stmtShowSpaces
+
+suite "SQL Parser — USE Commands":
+
+  test "USE DATABASE name":
+    let s = parseStatement("USE DATABASE mydb")
+    check s.kind == stmtUseDatabase
+    check s.useDbName == "mydb"
+
+  test "USE SCHEMA name":
+    let s = parseStatement("USE SCHEMA public")
+    check s.kind == stmtUseSchema
+    check s.useSchemaName == "public"
+
+  test "USE bare name defaults to database":
+    let s = parseStatement("USE mydb")
+    check s.kind == stmtUseDatabase
+    check s.useDbName == "mydb"
+
+suite "SQL Parser — EXPLAIN":
+
+  test "EXPLAIN SELECT":
+    let s = parseStatement("EXPLAIN SELECT * FROM users")
+    check s.kind == stmtExplain
+    check s.explainStmt.kind == stmtSelect
+
+  test "EXPLAIN INSERT":
+    let s = parseStatement("EXPLAIN INSERT INTO t VALUES (1)")
+    check s.kind == stmtExplain
+    check s.explainStmt.kind == stmtInsert
+
+  test "EXPLAIN nested":
+    let inner = parseStatement("EXPLAIN SELECT id FROM users WHERE id > 5")
+    check inner.kind == stmtExplain
+    check inner.explainStmt.selCols.len == 1
+
+suite "SQL Parser — SPACE Commands":
+
+  test "CREATE SPACE with replicas":
+    let s = parseStatement("CREATE SPACE myspace WITH REPLICAS = 3")
+    check s.kind == stmtCreateSpace
+    check s.csSpaceName == "myspace"
+    check s.csSpaceReplicas == 3
+
+  test "CREATE SPACE with ALL replicas":
+    let s = parseStatement("CREATE SPACE global WITH REPLICAS = ALL")
+    check s.kind == stmtCreateSpace
+    check s.csSpaceName == "global"
+    check s.csSpaceReplicas == 0 # 0 means ALL
+
+  test "DROP SPACE":
+    let s = parseStatement("DROP SPACE myspace")
+    check s.kind == stmtDropSpace
+    check s.dsSpaceName == "myspace"
+
+  test "CREATE SPACE replicas minimum":
+    try:
+      discard parseStatement("CREATE SPACE bad WITH REPLICAS = 0")
+      fail()
+    except ParseError:
+      discard
+
+suite "SQL Parser — parseAll Multi-Statement":
+
+  test "parseAll multiple statements":
+    let stmts = parseAll("SELECT * FROM t; INSERT INTO t VALUES (2); COMMIT;")
+    check stmts.len == 3
+    check stmts[0].kind == stmtSelect
+    check stmts[1].kind == stmtInsert
+    check stmts[2].kind == stmtCommit
+
+  test "parseAll handles trailing semicolons":
+    let stmts = parseAll("SELECT * FROM t;; ;")
+    check stmts.len == 1
+
+  test "parseAll empty input":
+    let stmts = parseAll("")
+    check stmts.len == 0
+
+  test "parseAll only semicolons":
+    let stmts = parseAll(";; ; ;")
+    check stmts.len == 0
+
+suite "SQL Parser — READ ONLY Transaction":
+
+  test "BEGIN READ ONLY":
+    let s = parseStatement("BEGIN READ ONLY")
+    check s.kind == stmtBegin
+    check s.beginReadOnly == true
+
+  test "BEGIN TRANSACTION READ ONLY":
+    let s = parseStatement("BEGIN TRANSACTION READ ONLY")
+    check s.kind == stmtBegin
+    check s.beginReadOnly == true
+
+suite "SQL Parser — IN SPACE Clause":
+
+  test "CREATE TABLE IN SPACE":
+    let s = parseStatement("CREATE TABLE users (id INT) IN SPACE myspace")
+    check s.kind == stmtCreateTable
+    check s.ctTable == "users"
+    check s.ctSpaceName == some("myspace")
+
+suite "SQL Parser — Error Recovery":
+
+  test "SHOW without target raises error":
+    try:
+      discard parseStatement("SHOW")
+      fail()
+    except ParseError:
+      discard
+
+  test "USE without name raises error":
+    try:
+      discard parseStatement("USE")
+      fail()
+    except ParseError:
+      discard
+
+  test "CREATE SPACE without REPLICAS raises error":
+    try:
+      discard parseStatement("CREATE SPACE myspace WITH SOMETHING = 3")
+      fail()
+    except ParseError:
+      discard

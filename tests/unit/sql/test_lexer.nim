@@ -473,3 +473,328 @@ suite "Lexer Edge Cases":
     let toks = tokenize("IF")
     check toks[0].kind == tkIdent
     check toks[0].value == "IF"
+
+suite "Lexer Additional Coverage":
+
+  test "lexString with escaped quote at end":
+    let toks = tokenize("'end''")
+    check toks[0].kind == tkError
+    check "unterminated" in toks[0].value
+
+  test "lexQuotedIdent empty":
+    let toks = tokenize("\"\"")
+    check toks[0].kind == tkIdent
+    check toks[0].value == ""
+
+  test "lexQuotedIdent with nested quotes":
+    let toks = tokenize("\"\"\"\"")
+    check toks[0].kind == tkIdent
+    check toks[0].value == "\""
+
+  test "lexNumber without fraction":
+    let toks = tokenize("1.")
+    check toks[0].kind == tkInt
+    check toks[0].value == "1"
+    check toks[1].kind == tkDot
+
+  test "lexNumber scientific without digits after e":
+    let toks = tokenize("1e")
+    check toks[0].kind == tkFloat
+    check toks[0].value == "1e"
+
+  test "lexNumber scientific negative":
+    let toks = tokenize("1e-5")
+    check toks[0].kind == tkFloat
+    check toks[0].value == "1e-5"
+
+  test "lexIdent with digits":
+    let toks = tokenize("col123")
+    check toks[0].kind == tkIdent
+    check toks[0].value == "col123"
+
+  test "lexIdent with keyword fallback":
+    # IF is a special keyword that gets treated as identifier for parser handling
+    let toks = tokenize("IF")
+    check toks[0].kind == tkIdent
+
+  test "nextToken at end returns EOF":
+    var l = newLexer("")
+    let tok = l.nextToken
+    check tok.kind == tkEOF
+
+  test "lexString with newline inside":
+    let toks = tokenize("'hello\nworld'")
+    check toks[0].kind == tkString
+    check toks[0].value == "hello\nworld"
+
+  test "skipWhitespaceAndComments mixed":
+    let toks = tokenize("  -- comment\n  SELECT")
+    check toks[0].kind == tkSelect
+
+  test "block comment spanning multiple lines":
+    let toks = tokenize("/* line1\nline2\nline3 */ SELECT")
+    check toks[0].kind == tkSelect
+
+  test "lexer state fields":
+    let l = newLexer("test input")
+    check l.src == "test input"
+    check l.pos == 0
+    check l.line == 1
+    check l.col == 1
+
+  test "tkTrue and tkFalse as literal keywords":
+    let toksTrue = tokenize("TRUE")
+    check toksTrue[0].kind == tkTrue
+    let toksFalse = tokenize("FALSE")
+    check toksFalse[0].kind == tkFalse
+
+  test "MySQL backtick identifier empty":
+    let toks = tokenize("`")
+    check toks[0].kind == tkIdent
+    check toks[0].value == ""
+
+  test "MySQL backtick identifier with content":
+    let toks = tokenize("`table_name`")
+    check toks[0].kind == tkIdent
+    check toks[0].value == "table_name"
+
+  test "error token for unexpected char":
+    let toks = tokenize("@")
+    check toks[0].kind == tkError
+    check toks[0].value == "@"
+
+  test "unterminated block comment returns EOF":
+    # Unterminated block comment consumes until EOF
+    let toks = tokenize("/* comment")
+    check toks[0].kind == tkEOF
+
+suite "Lexer Edge Cases - Numbers":
+
+  test "negative number":
+    let toks = tokenize("-5")
+    check toks.len >= 2
+    check toks[0].kind == tkMinus
+    check toks[1].kind == tkInt
+    check toks[1].value == "5"
+
+  test "float with many decimals":
+    let toks = tokenize("3.14159265358979")
+    check toks[0].kind == tkFloat
+    check toks[0].value == "3.14159265358979"
+
+  test "number with leading zeros":
+    let toks = tokenize("007")
+    check toks[0].kind == tkInt
+    check toks[0].value == "007"
+
+  test "zero":
+    let toks = tokenize("0")
+    check toks[0].kind == tkInt
+    check toks[0].value == "0"
+
+  test "large integer":
+    let toks = tokenize("999999999999999999")
+    check toks[0].kind == tkInt
+
+suite "Lexer Edge Cases - Strings":
+
+  test "empty string":
+    let toks = tokenize("''")
+    check toks[0].kind == tkString
+    check toks[0].value == ""
+
+  test "string with spaces":
+    let toks = tokenize("'hello world'")
+    check toks[0].kind == tkString
+    check toks[0].value == "hello world"
+
+  test "string with special chars":
+    let toks = tokenize("'hello!@#$%^&*()'")
+    check toks[0].kind == tkString
+    check toks[0].value == "hello!@#$%^&*()"
+
+  test "string with unicode":
+    let toks = tokenize("'日本語'")
+    check toks[0].kind == tkString
+    check toks[0].value == "日本語"
+
+  test "multiple strings":
+    let toks = tokenize("'a' 'b' 'c'")
+    check toks.len == 4 # 3 strings + EOF
+    check toks[0].value == "a"
+    check toks[1].value == "b"
+    check toks[2].value == "c"
+
+suite "Lexer Edge Cases - Keywords":
+
+  test "mixed case keywords":
+    let toks = tokenize("CREATE TABLE")
+    check toks[0].kind == tkCreate
+    check toks[1].kind == tkTable
+
+  test "keyword like identifier":
+    let toks = tokenize("select") # lowercase is keyword
+    check toks[0].kind == tkSelect
+
+  test "all DDL keywords":
+    let toks = tokenize("CREATE DROP DATABASE TABLE SCHEMA IF EXISTS PRIMARY KEY UNIQUE NOT DEFAULT")
+    check toks[0].kind == tkCreate
+    check toks[1].kind == tkDrop
+    check toks[2].kind == tkDatabase
+    check toks[3].kind == tkTable
+    check toks[4].kind == tkSchema
+
+  test "all DML keywords":
+    let toks = tokenize("SELECT INSERT UPDATE DELETE FROM WHERE AND OR IN IS BETWEEN LIKE LIMIT OFFSET ORDER BY ASC DESC")
+    check toks[0].kind == tkSelect
+    check toks[1].kind == tkInsert
+    check toks[2].kind == tkUpdate
+    check toks[3].kind == tkDelete
+
+suite "Lexer Edge Cases - Operators":
+
+  test "comparison operators":
+    let toks = tokenize("= != < > <= >= <>")
+    check toks[0].kind == tkEq
+    check toks[1].kind == tkNeq
+    check toks[2].kind == tkLt
+    check toks[3].kind == tkGt
+    check toks[4].kind == tkLte
+    check toks[5].kind == tkGte
+
+  test "arithmetic operators":
+    let toks = tokenize("+ - * / %")
+    check toks[0].kind == tkPlus
+    check toks[1].kind == tkMinus
+    check toks[2].kind == tkStar
+    check toks[3].kind == tkSlash
+    check toks[4].kind == tkPercent
+
+  test "logical operators":
+    let toks = tokenize("AND OR NOT")
+    check toks[0].kind == tkAnd
+    check toks[1].kind == tkOr
+    check toks[2].kind == tkNot
+
+suite "Lexer Edge Cases - Punctuation":
+
+  test "parentheses":
+    let toks = tokenize("( )")
+    check toks[0].kind == tkLParen
+    check toks[1].kind == tkRParen
+
+  test "comma and semicolon":
+    let toks = tokenize(", ;")
+    check toks[0].kind == tkComma
+    check toks[1].kind == tkSemicolon
+
+  test "dot for qualified names":
+    let toks = tokenize("a.b")
+    check toks[0].kind == tkIdent
+    check toks[1].kind == tkDot
+    check toks[2].kind == tkIdent
+
+suite "Lexer Edge Cases - Comments":
+
+  test "line comment at start":
+    let toks = tokenize("-- comment\nSELECT")
+    check toks[0].kind == tkSelect
+
+  test "line comment at end":
+    let toks = tokenize("SELECT -- comment")
+    check toks[0].kind == tkSelect
+    check toks[1].kind == tkEOF
+
+  test "block comment spanning lines":
+    let toks = tokenize("/* line1\nline2\nline3 */ SELECT")
+    check toks[0].kind == tkSelect
+
+  test "nested block comment chars":
+    # Not nested, just contains /* inside
+    let toks = tokenize("/* text */ SELECT")
+    check toks[0].kind == tkSelect
+
+  test "comment between tokens":
+    let toks = tokenize("SELECT /*x*/ FROM")
+    check toks[0].kind == tkSelect
+    check toks[1].kind == tkFrom
+
+suite "Lexer Edge Cases - Whitespace":
+
+  test "tabs":
+    let toks = tokenize("SELECT\tFROM")
+    check toks[0].kind == tkSelect
+    check toks[1].kind == tkFrom
+
+  test "mixed whitespace":
+    let toks = tokenize("SELECT  \t  FROM")
+    check toks[0].kind == tkSelect
+    check toks[1].kind == tkFrom
+
+  test "leading whitespace":
+    let toks = tokenize("   SELECT")
+    check toks[0].kind == tkSelect
+
+  test "trailing whitespace":
+    let toks = tokenize("SELECT   ")
+    check toks[0].kind == tkSelect
+    check toks[1].kind == tkEOF
+
+suite "Lexer Complex Inputs":
+
+  test "simple SELECT":
+    let toks = tokenize("SELECT * FROM users")
+    check toks[0].kind == tkSelect
+    check toks[1].kind == tkStar
+    check toks[2].kind == tkFrom
+    check toks[3].kind == tkIdent
+
+  test "SELECT with WHERE":
+    let toks = tokenize("SELECT id FROM users WHERE id = 1")
+    check toks[0].kind == tkSelect
+    check toks[1].kind == tkIdent # id
+    check toks[2].kind == tkFrom
+    check toks[3].kind == tkIdent # users
+    check toks[4].kind == tkWhere
+    check toks[5].kind == tkIdent # id
+    check toks[6].kind == tkEq
+    check toks[7].kind == tkInt # 1
+
+  test "INSERT statement":
+    let toks = tokenize("INSERT INTO users VALUES (1, 'Alice')")
+    check toks[0].kind == tkInsert
+    check toks[1].kind == tkInto
+    check toks[2].kind == tkIdent # users
+    check toks[3].kind == tkValues
+    check toks[4].kind == tkLParen # (
+    check toks[5].kind == tkInt # 1
+    check toks[6].kind == tkComma
+
+  test "CREATE TABLE":
+    let toks = tokenize("CREATE TABLE users (id INT PRIMARY KEY)")
+    check toks[0].kind == tkCreate
+    check toks[1].kind == tkTable
+    check toks[2].kind == tkIdent # users
+    check toks[3].kind == tkLParen # (
+    check toks[4].kind == tkIdent # id
+    check toks[5].kind == tkTkInt # INT
+
+  test "multiple statements":
+    let toks = tokenize("SELECT 1; SELECT 2;")
+    check toks[0].kind == tkSelect
+    check toks[2].kind == tkSemicolon
+    check toks[3].kind == tkSelect
+
+suite "Lexer Position Tracking":
+
+  test "token position after whitespace":
+    var l = newLexer("   SELECT")
+    let t = l.nextToken()
+    check t.line == 1
+    check t.col == 4 # After 3 spaces
+
+  test "token position after newline":
+    var l = newLexer("\n\nSELECT")
+    let t = l.nextToken()
+    check t.line == 3
+    check t.col == 1

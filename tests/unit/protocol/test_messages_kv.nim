@@ -1,0 +1,1369 @@
+# Unit tests for fractio/protocol/messages/kv.nim
+# Tests Get, Put, Delete, Batch, Scan encoding/decoding
+
+import std/unittest
+import fractio/protocol/messages/kv
+import fractio/protocol/types
+import fractio/protocol/codec
+import fractio/core/types
+import fractio/distributed/raft/group_types
+
+suite "Get Request Messages":
+
+  test "encodeGetRequest basic":
+    let txnId = genULID()
+    let req = GetRequest(
+      flags: 0x00'u8,
+      txnId: TransactionID(txnId),
+      readTimestamp: 0'u64,
+      key: "test_key",
+      groupId: ZeroGroupID()
+    )
+    let encoded = encodeGetRequest(req)
+    check encoded.len > 2 # Has message type + fields
+    var pos = 0
+    let mt = readUint16BE(encoded, pos)
+    check mt.value == uint16(mtGet)
+
+  test "encodeGetRequest with IncludeTimestamp flag":
+    let txnId = genULID()
+    let req = GetRequest(
+      flags: GetFlagIncludeTimestamp,
+      txnId: TransactionID(txnId),
+      readTimestamp: 1000'u64,
+      key: "key1",
+      groupId: ZeroGroupID()
+    )
+    let encoded = encodeGetRequest(req)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    let flags = readUint8(encoded, pos)
+    check flags.value == GetFlagIncludeTimestamp
+
+  test "encodeGetRequest with IncludeVersion flag":
+    let txnId = genULID()
+    let req = GetRequest(
+      flags: GetFlagIncludeVersion,
+      txnId: TransactionID(txnId),
+      readTimestamp: 0'u64,
+      key: "key2",
+      groupId: ZeroGroupID()
+    )
+    let encoded = encodeGetRequest(req)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    let flags = readUint8(encoded, pos)
+    check flags.value == GetFlagIncludeVersion
+
+  test "encodeGetRequest with GroupRouted flag":
+    let txnId = genULID()
+    let groupId = groupIDFromInt(1)
+    let req = GetRequest(
+      flags: 0x00'u8,
+      txnId: TransactionID(txnId),
+      readTimestamp: 0'u64,
+      key: "routed_key",
+      groupId: groupId
+    )
+    let encoded = encodeGetRequest(req)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    let flags = readUint8(encoded, pos)
+    check (flags.value and GetFlagGroupRouted) != 0'u8
+
+  test "encodeGetRequest combined flags":
+    let txnId = genULID()
+    let req = GetRequest(
+      flags: GetFlagIncludeTimestamp or GetFlagIncludeVersion,
+      txnId: TransactionID(txnId),
+      readTimestamp: 5000'u64,
+      key: "key3",
+      groupId: ZeroGroupID()
+    )
+    let encoded = encodeGetRequest(req)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    let flags = readUint8(encoded, pos)
+    check flags.value == (GetFlagIncludeTimestamp or GetFlagIncludeVersion)
+
+  test "encodeGetRequest empty key":
+    let txnId = genULID()
+    let req = GetRequest(
+      flags: 0x00'u8,
+      txnId: TransactionID(txnId),
+      readTimestamp: 0'u64,
+      key: "",
+      groupId: ZeroGroupID()
+    )
+    let encoded = encodeGetRequest(req)
+    let decoded = decodeGetRequest(encoded)
+    check decoded.isOk
+    check decoded.value.key == ""
+
+  test "encodeGetRequest binary key":
+    let txnId = genULID()
+    let req = GetRequest(
+      flags: 0x00'u8,
+      txnId: TransactionID(txnId),
+      readTimestamp: 0'u64,
+      key: "\x00\x01\x02\xff",
+      groupId: ZeroGroupID()
+    )
+    let encoded = encodeGetRequest(req)
+    let decoded = decodeGetRequest(encoded)
+    check decoded.isOk
+    check decoded.value.key == "\x00\x01\x02\xff"
+
+  test "decodeGetRequest valid":
+    let txnId = genULID()
+    let req = GetRequest(
+      flags: 0x00'u8,
+      txnId: TransactionID(txnId),
+      readTimestamp: 12345'u64,
+      key: "test_key",
+      groupId: ZeroGroupID()
+    )
+    let encoded = encodeGetRequest(req)
+    let decoded = decodeGetRequest(encoded)
+    check decoded.isOk
+    check decoded.value.key == "test_key"
+    check decoded.value.readTimestamp == 12345'u64
+
+  test "decodeGetRequest with groupId":
+    let txnId = genULID()
+    let groupId = groupIDFromInt(42)
+    let req = GetRequest(
+      flags: 0x00'u8,
+      txnId: TransactionID(txnId),
+      readTimestamp: 0'u64,
+      key: "grouped_key",
+      groupId: groupId
+    )
+    let encoded = encodeGetRequest(req)
+    let decoded = decodeGetRequest(encoded)
+    check decoded.isOk
+    check decoded.value.groupId == groupId
+
+  test "decodeGetRequest truncated flags":
+    let invalid = "\x01\x00" # Just message type
+    let decoded = decodeGetRequest(invalid)
+    check decoded.isErr
+
+  test "decodeGetRequest truncated txnId":
+    let invalid = "\x01\x00\x00" # Message type + flags, no txnId
+    let decoded = decodeGetRequest(invalid)
+    check decoded.isErr
+
+  test "decodeGetRequest truncated key":
+    let txnId = genULID()
+    let txnBytes = ulidToBytes(txnId)
+    let invalid = "\x01\x00\x00" & txnBytes &
+        "\x00\x00\x00\x00\x00\x00\x00\x00" # no key length
+    let decoded = decodeGetRequest(invalid)
+    check decoded.isErr
+
+suite "Get Response Messages":
+
+  test "encodeGetResponse not found":
+    let resp = GetResponse(found: false)
+    let encoded = encodeGetResponse(resp)
+    check encoded.len == 3 # 2 byte type + 1 byte flags
+    var pos = 0
+    let mt = readUint16BE(encoded, pos)
+    check mt.value == uint16(mtGet)
+    let flags = readUint8(encoded, pos)
+    check flags.value == 0x00'u8
+
+  test "encodeGetResponse found":
+    let resp = GetResponse(
+      found: true,
+      value: "test_value",
+      hasTimestamp: false,
+      hasVersion: false
+    )
+    let encoded = encodeGetResponse(resp)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    let flags = readUint8(encoded, pos)
+    check (flags.value and GetRespFlagFound) != 0'u8
+
+  test "encodeGetResponse with timestamp":
+    let resp = GetResponse(
+      found: true,
+      value: "value1",
+      timestamp: 1000'u64,
+      hasTimestamp: true,
+      hasVersion: false
+    )
+    let encoded = encodeGetResponse(resp)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    let flags = readUint8(encoded, pos)
+    check (flags.value and GetRespFlagHasTimestamp) != 0'u8
+    let ts = readUint64BE(encoded, pos)
+    check ts.value == 1000'u64
+
+  test "encodeGetResponse with version":
+    let resp = GetResponse(
+      found: true,
+      value: "value2",
+      version: 5'u64,
+      hasTimestamp: false,
+      hasVersion: true
+    )
+    let encoded = encodeGetResponse(resp)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    let flags = readUint8(encoded, pos)
+    check (flags.value and GetRespFlagHasVersion) != 0'u8
+    let ver = readUint64BE(encoded, pos)
+    check ver.value == 5'u64
+
+  test "encodeGetResponse with both timestamp and version":
+    let resp = GetResponse(
+      found: true,
+      value: "value3",
+      timestamp: 2000'u64,
+      version: 10'u64,
+      hasTimestamp: true,
+      hasVersion: true
+    )
+    let encoded = encodeGetResponse(resp)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    let flags = readUint8(encoded, pos)
+    check (flags.value and GetRespFlagHasTimestamp) != 0'u8
+    check (flags.value and GetRespFlagHasVersion) != 0'u8
+
+  test "encodeGetResponse empty value":
+    let resp = GetResponse(
+      found: true,
+      value: "",
+      hasTimestamp: false,
+      hasVersion: false
+    )
+    let encoded = encodeGetResponse(resp)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    discard readUint8(encoded, pos)
+    let val = readBytes(encoded, pos)
+    check val.value == ""
+
+  test "encodeGetResponse binary value":
+    let resp = GetResponse(
+      found: true,
+      value: "\x00\xff\xfe",
+      hasTimestamp: false,
+      hasVersion: false
+    )
+    let encoded = encodeGetResponse(resp)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    discard readUint8(encoded, pos)
+    let val = readBytes(encoded, pos)
+    check val.value == "\x00\xff\xfe"
+
+  test "decodeGetResponse not found":
+    let resp = GetResponse(found: false)
+    let encoded = encodeGetResponse(resp)
+    let decoded = decodeGetResponse(encoded)
+    check decoded.isOk
+    check decoded.value.found == false
+    check decoded.value.value == ""
+
+  test "decodeGetResponse found":
+    let resp = GetResponse(
+      found: true,
+      value: "decoded_value",
+      hasTimestamp: false,
+      hasVersion: false
+    )
+    let encoded = encodeGetResponse(resp)
+    let decoded = decodeGetResponse(encoded)
+    check decoded.isOk
+    check decoded.value.found == true
+    check decoded.value.value == "decoded_value"
+
+  test "decodeGetResponse with timestamp":
+    let resp = GetResponse(
+      found: true,
+      value: "val",
+      timestamp: 3000'u64,
+      hasTimestamp: true,
+      hasVersion: false
+    )
+    let encoded = encodeGetResponse(resp)
+    let decoded = decodeGetResponse(encoded)
+    check decoded.isOk
+    check decoded.value.timestamp == 3000'u64
+
+  test "decodeGetResponse with version":
+    let resp = GetResponse(
+      found: true,
+      value: "val",
+      version: 15'u64,
+      hasTimestamp: false,
+      hasVersion: true
+    )
+    let encoded = encodeGetResponse(resp)
+    let decoded = decodeGetResponse(encoded)
+    check decoded.isOk
+    check decoded.value.version == 15'u64
+
+  test "decodeGetResponse truncated flags":
+    let invalid = "\x01\x00" # Just message type
+    let decoded = decodeGetResponse(invalid)
+    check decoded.isErr
+
+suite "Put Request Messages":
+
+  test "encodePutRequest basic":
+    let txnId = genULID()
+    let req = PutRequest(
+      flags: 0x00'u8,
+      txnId: TransactionID(txnId),
+      expectedVersion: 0'u64,
+      key: "put_key",
+      value: "put_value",
+      groupId: ZeroGroupID()
+    )
+    let encoded = encodePutRequest(req)
+    var pos = 0
+    let mt = readUint16BE(encoded, pos)
+    check mt.value == uint16(mtPut)
+
+  test "encodePutRequest with ReturnPrev flag":
+    let txnId = genULID()
+    let req = PutRequest(
+      flags: PutFlagReturnPrev,
+      txnId: TransactionID(txnId),
+      expectedVersion: 0'u64,
+      key: "key1",
+      value: "val1",
+      groupId: ZeroGroupID()
+    )
+    let encoded = encodePutRequest(req)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    let flags = readUint8(encoded, pos)
+    check (flags.value and PutFlagReturnPrev) != 0'u8
+
+  test "encodePutRequest with SyncWrite flag":
+    let txnId = genULID()
+    let req = PutRequest(
+      flags: PutFlagSyncWrite,
+      txnId: TransactionID(txnId),
+      expectedVersion: 0'u64,
+      key: "key2",
+      value: "val2",
+      groupId: ZeroGroupID()
+    )
+    let encoded = encodePutRequest(req)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    let flags = readUint8(encoded, pos)
+    check (flags.value and PutFlagSyncWrite) != 0'u8
+
+  test "encodePutRequest with CAS flag":
+    let txnId = genULID()
+    let req = PutRequest(
+      flags: PutFlagCAS,
+      txnId: TransactionID(txnId),
+      expectedVersion: 5'u64,
+      key: "cas_key",
+      value: "new_val",
+      groupId: ZeroGroupID()
+    )
+    let encoded = encodePutRequest(req)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    discard readUint8(encoded, pos)
+    discard readUint64BE(encoded, pos) # txn bytes
+    discard readUint64BE(encoded, pos) # skip txn bytes from pos
+    let ev = readUint64BE(encoded, pos)
+    check ev.value == 5'u64
+
+  test "encodePutRequest with groupId":
+    let txnId = genULID()
+    let groupId = groupIDFromInt(7)
+    let req = PutRequest(
+      flags: 0x00'u8,
+      txnId: TransactionID(txnId),
+      expectedVersion: 0'u64,
+      key: "g_key",
+      value: "g_val",
+      groupId: groupId
+    )
+    let encoded = encodePutRequest(req)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    let flags = readUint8(encoded, pos)
+    check (flags.value and PutFlagGroupRouted) != 0'u8
+
+  test "encodePutRequest combined flags":
+    let txnId = genULID()
+    let req = PutRequest(
+      flags: PutFlagReturnPrev or PutFlagSyncWrite or PutFlagCAS,
+      txnId: TransactionID(txnId),
+      expectedVersion: 3'u64,
+      key: "combined",
+      value: "data",
+      groupId: ZeroGroupID()
+    )
+    let encoded = encodePutRequest(req)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    let flags = readUint8(encoded, pos)
+    check flags.value == (PutFlagReturnPrev or PutFlagSyncWrite or PutFlagCAS)
+
+  test "encodePutRequest empty key and value":
+    let txnId = genULID()
+    let req = PutRequest(
+      flags: 0x00'u8,
+      txnId: TransactionID(txnId),
+      expectedVersion: 0'u64,
+      key: "",
+      value: "",
+      groupId: ZeroGroupID()
+    )
+    let encoded = encodePutRequest(req)
+    let decoded = decodePutRequest(encoded)
+    check decoded.isOk
+    check decoded.value.key == ""
+    check decoded.value.value == ""
+
+  test "decodePutRequest valid":
+    let txnId = genULID()
+    let req = PutRequest(
+      flags: 0x00'u8,
+      txnId: TransactionID(txnId),
+      expectedVersion: 0'u64,
+      key: "decode_key",
+      value: "decode_value",
+      groupId: ZeroGroupID()
+    )
+    let encoded = encodePutRequest(req)
+    let decoded = decodePutRequest(encoded)
+    check decoded.isOk
+    check decoded.value.key == "decode_key"
+    check decoded.value.value == "decode_value"
+
+  test "decodePutRequest with groupId":
+    let txnId = genULID()
+    let groupId = groupIDFromInt(99)
+    let req = PutRequest(
+      flags: 0x00'u8,
+      txnId: TransactionID(txnId),
+      expectedVersion: 0'u64,
+      key: "key",
+      value: "val",
+      groupId: groupId
+    )
+    let encoded = encodePutRequest(req)
+    let decoded = decodePutRequest(encoded)
+    check decoded.isOk
+    check decoded.value.groupId == groupId
+
+  test "decodePutRequest truncated":
+    let invalid = "\x01\x01" # Just message type
+    let decoded = decodePutRequest(invalid)
+    check decoded.isErr
+
+  test "encodeRawPutRequest":
+    let txnId = genULID()
+    let req = PutRequest(
+      flags: 0x00'u8,
+      txnId: TransactionID(txnId),
+      expectedVersion: 0'u64,
+      key: "raw_key",
+      value: "raw_value",
+      groupId: ZeroGroupID()
+    )
+    let encoded = encodeRawPutRequest(req)
+    var pos = 0
+    let mt = readUint16BE(encoded, pos)
+    check mt.value == uint16(mtRawPut)
+
+suite "Put Response Messages":
+
+  test "encodePutResponse OK":
+    let resp = PutResponse(
+      status: PutStatusOK,
+      timestamp: 1000'u64,
+      version: 1'u64,
+      hasPreviousValue: false,
+      previousValue: ""
+    )
+    let encoded = encodePutResponse(resp)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    let status = readUint8(encoded, pos)
+    check status.value == PutStatusOK
+
+  test "encodePutResponse CASFailed":
+    let resp = PutResponse(
+      status: PutStatusCASFailed,
+      timestamp: 0'u64,
+      version: 0'u64,
+      hasPreviousValue: false,
+      previousValue: ""
+    )
+    let encoded = encodePutResponse(resp)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    let status = readUint8(encoded, pos)
+    check status.value == PutStatusCASFailed
+
+  test "encodePutResponse TxnAborted":
+    let resp = PutResponse(
+      status: PutStatusTxnAborted,
+      timestamp: 0'u64,
+      version: 0'u64,
+      hasPreviousValue: false,
+      previousValue: ""
+    )
+    let encoded = encodePutResponse(resp)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    let status = readUint8(encoded, pos)
+    check status.value == PutStatusTxnAborted
+
+  test "encodePutResponse with previous value":
+    let resp = PutResponse(
+      status: PutStatusOK,
+      timestamp: 2000'u64,
+      version: 2'u64,
+      hasPreviousValue: true,
+      previousValue: "old_value"
+    )
+    let encoded = encodePutResponse(resp)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    discard readUint8(encoded, pos)
+    discard readUint64BE(encoded, pos)
+    discard readUint64BE(encoded, pos)
+    let prev = readBytes(encoded, pos)
+    check prev.value == "old_value"
+
+  test "encodePutResponse empty previous value":
+    let resp = PutResponse(
+      status: PutStatusOK,
+      timestamp: 3000'u64,
+      version: 3'u64,
+      hasPreviousValue: false,
+      previousValue: ""
+    )
+    let encoded = encodePutResponse(resp)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    discard readUint8(encoded, pos)
+    discard readUint64BE(encoded, pos)
+    discard readUint64BE(encoded, pos)
+    let prev = readBytes(encoded, pos)
+    check prev.value == ""
+
+  test "decodePutResponse OK":
+    let resp = PutResponse(
+      status: PutStatusOK,
+      timestamp: 4000'u64,
+      version: 4'u64,
+      hasPreviousValue: false,
+      previousValue: ""
+    )
+    let encoded = encodePutResponse(resp)
+    let decoded = decodePutResponse(encoded)
+    check decoded.isOk
+    check decoded.value.status == PutStatusOK
+    check decoded.value.timestamp == 4000'u64
+    check decoded.value.version == 4'u64
+
+  test "decodePutResponse with previous":
+    let resp = PutResponse(
+      status: PutStatusOK,
+      timestamp: 5000'u64,
+      version: 5'u64,
+      hasPreviousValue: true,
+      previousValue: "prev_val"
+    )
+    let encoded = encodePutResponse(resp)
+    let decoded = decodePutResponse(encoded)
+    check decoded.isOk
+    check decoded.value.hasPreviousValue == true
+    check decoded.value.previousValue == "prev_val"
+
+  test "decodePutResponse truncated":
+    let invalid = "\x01\x01" # Just message type
+    let decoded = decodePutResponse(invalid)
+    check decoded.isErr
+
+suite "Delete Request Messages":
+
+  test "encodeDeleteRequest basic":
+    let txnId = genULID()
+    let req = DeleteRequest(
+      flags: 0x00'u8,
+      txnId: TransactionID(txnId),
+      key: "del_key",
+      groupId: ZeroGroupID()
+    )
+    let encoded = encodeDeleteRequest(req)
+    var pos = 0
+    let mt = readUint16BE(encoded, pos)
+    check mt.value == uint16(mtDelete)
+
+  test "encodeDeleteRequest with ReturnPrev flag":
+    let txnId = genULID()
+    let req = DeleteRequest(
+      flags: DelFlagReturnPrev,
+      txnId: TransactionID(txnId),
+      key: "key1",
+      groupId: ZeroGroupID()
+    )
+    let encoded = encodeDeleteRequest(req)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    let flags = readUint8(encoded, pos)
+    check (flags.value and DelFlagReturnPrev) != 0'u8
+
+  test "encodeDeleteRequest with SyncWrite flag":
+    let txnId = genULID()
+    let req = DeleteRequest(
+      flags: DelFlagSyncWrite,
+      txnId: TransactionID(txnId),
+      key: "key2",
+      groupId: ZeroGroupID()
+    )
+    let encoded = encodeDeleteRequest(req)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    let flags = readUint8(encoded, pos)
+    check (flags.value and DelFlagSyncWrite) != 0'u8
+
+  test "encodeDeleteRequest with OnlyIfExists flag":
+    let txnId = genULID()
+    let req = DeleteRequest(
+      flags: DelFlagOnlyIfExists,
+      txnId: TransactionID(txnId),
+      key: "key3",
+      groupId: ZeroGroupID()
+    )
+    let encoded = encodeDeleteRequest(req)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    let flags = readUint8(encoded, pos)
+    check (flags.value and DelFlagOnlyIfExists) != 0'u8
+
+  test "encodeDeleteRequest with groupId":
+    let txnId = genULID()
+    let groupId = groupIDFromInt(11)
+    let req = DeleteRequest(
+      flags: 0x00'u8,
+      txnId: TransactionID(txnId),
+      key: "group_del",
+      groupId: groupId
+    )
+    let encoded = encodeDeleteRequest(req)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    let flags = readUint8(encoded, pos)
+    check (flags.value and DelFlagGroupRouted) != 0'u8
+
+  test "decodeDeleteRequest valid":
+    let txnId = genULID()
+    let req = DeleteRequest(
+      flags: 0x00'u8,
+      txnId: TransactionID(txnId),
+      key: "valid_del",
+      groupId: ZeroGroupID()
+    )
+    let encoded = encodeDeleteRequest(req)
+    let decoded = decodeDeleteRequest(encoded)
+    check decoded.isOk
+    check decoded.value.key == "valid_del"
+
+  test "decodeDeleteRequest with groupId":
+    let txnId = genULID()
+    let groupId = groupIDFromInt(22)
+    let req = DeleteRequest(
+      flags: 0x00'u8,
+      txnId: TransactionID(txnId),
+      key: "key",
+      groupId: groupId
+    )
+    let encoded = encodeDeleteRequest(req)
+    let decoded = decodeDeleteRequest(encoded)
+    check decoded.isOk
+    check decoded.value.groupId == groupId
+
+  test "decodeDeleteRequest truncated":
+    let invalid = "\x01\x02" # Just message type
+    let decoded = decodeDeleteRequest(invalid)
+    check decoded.isErr
+
+suite "Delete Response Messages":
+
+  test "encodeDeleteResponse Deleted":
+    let resp = DeleteResponse(
+      status: DelStatusDeleted,
+      hasPreviousValue: false,
+      previousValue: ""
+    )
+    let encoded = encodeDeleteResponse(resp)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    let status = readUint8(encoded, pos)
+    check status.value == DelStatusDeleted
+
+  test "encodeDeleteResponse NotFound":
+    let resp = DeleteResponse(
+      status: DelStatusNotFound,
+      hasPreviousValue: false,
+      previousValue: ""
+    )
+    let encoded = encodeDeleteResponse(resp)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    let status = readUint8(encoded, pos)
+    check status.value == DelStatusNotFound
+
+  test "encodeDeleteResponse TxnAborted":
+    let resp = DeleteResponse(
+      status: DelStatusTxnAborted,
+      hasPreviousValue: false,
+      previousValue: ""
+    )
+    let encoded = encodeDeleteResponse(resp)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    let status = readUint8(encoded, pos)
+    check status.value == DelStatusTxnAborted
+
+  test "encodeDeleteResponse with previous":
+    let resp = DeleteResponse(
+      status: DelStatusDeleted,
+      hasPreviousValue: true,
+      previousValue: "deleted_val"
+    )
+    let encoded = encodeDeleteResponse(resp)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    discard readUint8(encoded, pos)
+    let prev = readBytes(encoded, pos)
+    check prev.value == "deleted_val"
+
+  test "decodeDeleteResponse Deleted":
+    let resp = DeleteResponse(
+      status: DelStatusDeleted,
+      hasPreviousValue: false,
+      previousValue: ""
+    )
+    let encoded = encodeDeleteResponse(resp)
+    let decoded = decodeDeleteResponse(encoded)
+    check decoded.isOk
+    check decoded.value.status == DelStatusDeleted
+
+  test "decodeDeleteResponse with previous":
+    let resp = DeleteResponse(
+      status: DelStatusDeleted,
+      hasPreviousValue: true,
+      previousValue: "old"
+    )
+    let encoded = encodeDeleteResponse(resp)
+    let decoded = decodeDeleteResponse(encoded)
+    check decoded.isOk
+    check decoded.value.hasPreviousValue == true
+    check decoded.value.previousValue == "old"
+
+  test "decodeDeleteResponse truncated":
+    let invalid = "\x01\x02" # Just message type
+    let decoded = decodeDeleteResponse(invalid)
+    check decoded.isErr
+
+suite "Batch Messages":
+
+  test "encodeBatchRequest empty":
+    let txnId = genULID()
+    let req = BatchRequest(
+      flags: 0x00'u8,
+      txnId: TransactionID(txnId),
+      operations: @[]
+    )
+    let encoded = encodeBatchRequest(req)
+    let decoded = decodeBatchRequest(encoded)
+    check decoded.isOk
+    check decoded.value.operations.len == 0
+
+  test "encodeBatchRequest single Get":
+    let txnId = genULID()
+    let req = BatchRequest(
+      flags: BatchFlagAllOrNothing,
+      txnId: TransactionID(txnId),
+      operations: @[BatchOp(kind: BatchOpGet, flags: 0x00'u8, data: "key_data")]
+    )
+    let encoded = encodeBatchRequest(req)
+    let decoded = decodeBatchRequest(encoded)
+    check decoded.isOk
+    check decoded.value.operations.len == 1
+    check decoded.value.operations[0].kind == BatchOpGet
+    check decoded.value.operations[0].data == "key_data"
+
+  test "encodeBatchRequest single Put":
+    let txnId = genULID()
+    let req = BatchRequest(
+      flags: 0x00'u8,
+      txnId: TransactionID(txnId),
+      operations: @[BatchOp(kind: BatchOpPut, flags: 0x00'u8, data: "put_data")]
+    )
+    let encoded = encodeBatchRequest(req)
+    let decoded = decodeBatchRequest(encoded)
+    check decoded.isOk
+    check decoded.value.operations.len == 1
+    check decoded.value.operations[0].kind == BatchOpPut
+    check decoded.value.operations[0].data == "put_data"
+
+  test "encodeBatchRequest single Delete":
+    let txnId = genULID()
+    let req = BatchRequest(
+      flags: 0x00'u8,
+      txnId: TransactionID(txnId),
+      operations: @[BatchOp(kind: BatchOpDelete, flags: 0x00'u8,
+          data: "del_data")]
+    )
+    let encoded = encodeBatchRequest(req)
+    let decoded = decodeBatchRequest(encoded)
+    check decoded.isOk
+    check decoded.value.operations.len == 1
+    check decoded.value.operations[0].kind == BatchOpDelete
+    check decoded.value.operations[0].data == "del_data"
+
+  test "encodeBatchRequest multiple operations":
+    let txnId = genULID()
+    let req = BatchRequest(
+      flags: BatchFlagContinueOnErr,
+      txnId: TransactionID(txnId),
+      operations: @[
+        BatchOp(kind: BatchOpGet, flags: 0x01'u8, data: "get1"),
+        BatchOp(kind: BatchOpPut, flags: 0x02'u8, data: "put1"),
+        BatchOp(kind: BatchOpDelete, flags: 0x00'u8, data: "del1")
+      ]
+    )
+    let encoded = encodeBatchRequest(req)
+    let decoded = decodeBatchRequest(encoded)
+    check decoded.isOk
+    check decoded.value.operations.len == 3
+    check decoded.value.flags == BatchFlagContinueOnErr
+
+  test "decodeBatchRequest valid":
+    let txnId = genULID()
+    let req = BatchRequest(
+      flags: BatchFlagAllOrNothing,
+      txnId: TransactionID(txnId),
+      operations: @[
+        BatchOp(kind: BatchOpGet, flags: 0x00'u8, data: "op1"),
+        BatchOp(kind: BatchOpPut, flags: 0x00'u8, data: "op2")
+      ]
+    )
+    let encoded = encodeBatchRequest(req)
+    let decoded = decodeBatchRequest(encoded)
+    check decoded.isOk
+    check decoded.value.flags == BatchFlagAllOrNothing
+    check decoded.value.operations.len == 2
+
+  test "decodeBatchRequest empty":
+    let txnId = genULID()
+    let req = BatchRequest(
+      flags: 0x00'u8,
+      txnId: TransactionID(txnId),
+      operations: @[]
+    )
+    let encoded = encodeBatchRequest(req)
+    let decoded = decodeBatchRequest(encoded)
+    check decoded.isOk
+    check decoded.value.operations.len == 0
+
+  test "decodeBatchRequest truncated":
+    let invalid = "\x01\x03" # Just message type
+    let decoded = decodeBatchRequest(invalid)
+    check decoded.isErr
+
+  test "encodeBatchResponse AllOK":
+    let resp = BatchResponse(
+      status: BatchStatusAllOK,
+      results: @[]
+    )
+    let encoded = encodeBatchResponse(resp)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    let status = readUint8(encoded, pos)
+    check status.value == BatchStatusAllOK
+
+  test "encodeBatchResponse PartialFailure":
+    let resp = BatchResponse(
+      status: BatchStatusPartialFailure,
+      results: @[BatchOpResult(status: 0x01'u8, data: "err1")]
+    )
+    let encoded = encodeBatchResponse(resp)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    let status = readUint8(encoded, pos)
+    check status.value == BatchStatusPartialFailure
+
+  test "encodeBatchResponse AllFailed":
+    let resp = BatchResponse(
+      status: BatchStatusAllFailed,
+      results: @[]
+    )
+    let encoded = encodeBatchResponse(resp)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    let status = readUint8(encoded, pos)
+    check status.value == BatchStatusAllFailed
+
+  test "encodeBatchResponse with results":
+    let resp = BatchResponse(
+      status: BatchStatusAllOK,
+      results: @[
+        BatchOpResult(status: 0x00'u8, data: "res1"),
+        BatchOpResult(status: 0x00'u8, data: "res2")
+      ]
+    )
+    let encoded = encodeBatchResponse(resp)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    discard readUint8(encoded, pos)
+    let count = readUint32BE(encoded, pos)
+    check count.value == 2'u32
+
+  test "decodeBatchResponse AllOK":
+    let resp = BatchResponse(
+      status: BatchStatusAllOK,
+      results: @[]
+    )
+    let encoded = encodeBatchResponse(resp)
+    let decoded = decodeBatchResponse(encoded)
+    check decoded.isOk
+    check decoded.value.status == BatchStatusAllOK
+
+  test "decodeBatchResponse with results":
+    let resp = BatchResponse(
+      status: BatchStatusPartialFailure,
+      results: @[
+        BatchOpResult(status: 0x00'u8, data: "ok"),
+        BatchOpResult(status: 0x01'u8, data: "fail")
+      ]
+    )
+    let encoded = encodeBatchResponse(resp)
+    let decoded = decodeBatchResponse(encoded)
+    check decoded.isOk
+    check decoded.value.results.len == 2
+
+  test "decodeBatchResponse truncated":
+    let invalid = "\x01\x03" # Just message type
+    let decoded = decodeBatchResponse(invalid)
+    check decoded.isErr
+
+suite "Scan Request Messages":
+
+  test "encodeScanRequest basic":
+    let txnId = genULID()
+    let req = ScanRequest(
+      flags: 0x00'u8,
+      txnId: TransactionID(txnId),
+      readTimestamp: 0'u64,
+      startKey: "",
+      endKey: "",
+      limit: 0'u32,
+      groupId: ZeroGroupID()
+    )
+    let encoded = encodeScanRequest(req)
+    var pos = 0
+    let mt = readUint16BE(encoded, pos)
+    check mt.value == uint16(mtScan)
+
+  test "encodeScanRequest with flags":
+    let txnId = genULID()
+    let req = ScanRequest(
+      flags: ScanFlagIncludeTimestamp or ScanFlagIncludeVersion,
+      txnId: TransactionID(txnId),
+      readTimestamp: 1000'u64,
+      startKey: "start",
+      endKey: "end",
+      limit: 100'u32,
+      groupId: ZeroGroupID()
+    )
+    let encoded = encodeScanRequest(req)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    let flags = readUint8(encoded, pos)
+    check flags.value == (ScanFlagIncludeTimestamp or ScanFlagIncludeVersion)
+
+  test "encodeScanRequest KeysOnly":
+    let txnId = genULID()
+    let req = ScanRequest(
+      flags: ScanFlagKeysOnly,
+      txnId: TransactionID(txnId),
+      readTimestamp: 0'u64,
+      startKey: "",
+      endKey: "",
+      limit: 50'u32,
+      groupId: ZeroGroupID()
+    )
+    let encoded = encodeScanRequest(req)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    let flags = readUint8(encoded, pos)
+    check (flags.value and ScanFlagKeysOnly) != 0'u8
+
+  test "encodeScanRequest Reverse":
+    let txnId = genULID()
+    let req = ScanRequest(
+      flags: ScanFlagReverse,
+      txnId: TransactionID(txnId),
+      readTimestamp: 0'u64,
+      startKey: "",
+      endKey: "",
+      limit: 0'u32,
+      groupId: ZeroGroupID()
+    )
+    let encoded = encodeScanRequest(req)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    let flags = readUint8(encoded, pos)
+    check (flags.value and ScanFlagReverse) != 0'u8
+
+  test "encodeScanRequest with groupId":
+    let txnId = genULID()
+    let groupId = groupIDFromInt(33)
+    let req = ScanRequest(
+      flags: ScanFlagGroupRouted,
+      txnId: TransactionID(txnId),
+      readTimestamp: 0'u64,
+      startKey: "",
+      endKey: "",
+      limit: 0'u32,
+      groupId: groupId
+    )
+    let encoded = encodeScanRequest(req)
+    let decoded = decodeScanRequest(encoded)
+    check decoded.isOk
+    check decoded.value.groupId == groupId
+
+  test "encodeScanRequest with range":
+    let txnId = genULID()
+    let req = ScanRequest(
+      flags: 0x00'u8,
+      txnId: TransactionID(txnId),
+      readTimestamp: 2000'u64,
+      startKey: "a",
+      endKey: "z",
+      limit: 1000'u32,
+      groupId: ZeroGroupID()
+    )
+    let encoded = encodeScanRequest(req)
+    let decoded = decodeScanRequest(encoded)
+    check decoded.isOk
+    check decoded.value.startKey == "a"
+    check decoded.value.endKey == "z"
+    check decoded.value.limit == 1000'u32
+
+  test "decodeScanRequest valid":
+    let txnId = genULID()
+    let req = ScanRequest(
+      flags: ScanFlagKeysOnly,
+      txnId: TransactionID(txnId),
+      readTimestamp: 3000'u64,
+      startKey: "from",
+      endKey: "to",
+      limit: 200'u32,
+      groupId: ZeroGroupID()
+    )
+    let encoded = encodeScanRequest(req)
+    let decoded = decodeScanRequest(encoded)
+    check decoded.isOk
+    check decoded.value.startKey == "from"
+    check decoded.value.endKey == "to"
+    check decoded.value.limit == 200'u32
+
+  test "decodeScanRequest with groupId":
+    let txnId = genULID()
+    let groupId = groupIDFromInt(44)
+    let req = ScanRequest(
+      flags: ScanFlagGroupRouted,
+      txnId: TransactionID(txnId),
+      readTimestamp: 0'u64,
+      startKey: "",
+      endKey: "",
+      limit: 0'u32,
+      groupId: groupId
+    )
+    let encoded = encodeScanRequest(req)
+    let decoded = decodeScanRequest(encoded)
+    check decoded.isOk
+    check decoded.value.groupId == groupId
+
+  test "decodeScanRequest truncated":
+    let invalid = "\x01\x04" # Just message type
+    let decoded = decodeScanRequest(invalid)
+    check decoded.isErr
+
+suite "Scan Response Frame Messages":
+
+  test "encodeScanResponseFrame empty":
+    let rf = ScanResponseFrame(
+      respFlags: ScanRespFlagEndOfScan,
+      pairs: @[],
+      reqFlags: 0x00'u8
+    )
+    let encoded = encodeScanResponseFrame(rf)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    let flags = readUint8(encoded, pos)
+    check (flags.value and ScanRespFlagEndOfScan) != 0'u8
+    let count = readUint32BE(encoded, pos)
+    check count.value == 0'u32
+
+  test "encodeScanResponseFrame single pair":
+    let rf = ScanResponseFrame(
+      respFlags: ScanRespFlagHasMore,
+      pairs: @[ScanPair(key: "k1", value: "v1", timestamp: 0'u64,
+          version: 0'u64)],
+      reqFlags: 0x00'u8
+    )
+    let encoded = encodeScanResponseFrame(rf)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    let flags = readUint8(encoded, pos)
+    check (flags.value and ScanRespFlagHasMore) != 0'u8
+    let count = readUint32BE(encoded, pos)
+    check count.value == 1'u32
+
+  test "encodeScanResponseFrame multiple pairs":
+    let rf = ScanResponseFrame(
+      respFlags: 0x00'u8,
+      pairs: @[
+        ScanPair(key: "k1", value: "v1", timestamp: 0'u64, version: 0'u64),
+        ScanPair(key: "k2", value: "v2", timestamp: 0'u64, version: 0'u64),
+        ScanPair(key: "k3", value: "v3", timestamp: 0'u64, version: 0'u64)
+      ],
+      reqFlags: 0x00'u8
+    )
+    let encoded = encodeScanResponseFrame(rf)
+    let decoded = decodeScanResponseFrame(encoded, 0x00'u8)
+    check decoded.isOk
+    check decoded.value.pairs.len == 3
+    check decoded.value.pairs[0].key == "k1"
+    check decoded.value.pairs[1].key == "k2"
+    check decoded.value.pairs[2].key == "k3"
+
+  test "encodeScanResponseFrame with timestamp":
+    let rf = ScanResponseFrame(
+      respFlags: 0x00'u8,
+      pairs: @[ScanPair(key: "k", value: "v", timestamp: 1000'u64,
+          version: 0'u64)],
+      reqFlags: ScanFlagIncludeTimestamp
+    )
+    let encoded = encodeScanResponseFrame(rf)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    discard readUint8(encoded, pos)
+    discard readUint32BE(encoded, pos)
+    discard readBytes(encoded, pos) # key
+    discard readBytes(encoded, pos) # value
+    let ts = readUint64BE(encoded, pos)
+    check ts.value == 1000'u64
+
+  test "encodeScanResponseFrame with version":
+    let rf = ScanResponseFrame(
+      respFlags: 0x00'u8,
+      pairs: @[ScanPair(key: "k", value: "v", timestamp: 0'u64,
+          version: 5'u64)],
+      reqFlags: ScanFlagIncludeVersion
+    )
+    let encoded = encodeScanResponseFrame(rf)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    discard readUint8(encoded, pos)
+    discard readUint32BE(encoded, pos)
+    discard readBytes(encoded, pos) # key
+    discard readBytes(encoded, pos) # value
+    let ver = readUint64BE(encoded, pos)
+    check ver.value == 5'u64
+
+  test "encodeScanResponseFrame KeysOnly":
+    let rf = ScanResponseFrame(
+      respFlags: 0x00'u8,
+      pairs: @[ScanPair(key: "k", value: "", timestamp: 0'u64, version: 0'u64)],
+      reqFlags: ScanFlagKeysOnly
+    )
+    let encoded = encodeScanResponseFrame(rf)
+    var pos = 0
+    discard readUint16BE(encoded, pos)
+    discard readUint8(encoded, pos)
+    discard readUint32BE(encoded, pos)
+    discard readBytes(encoded, pos) # key
+    let val = readBytes(encoded, pos)
+    check val.value == ""
+
+  test "decodeScanResponseFrame empty":
+    let rf = ScanResponseFrame(
+      respFlags: ScanRespFlagEndOfScan,
+      pairs: @[],
+      reqFlags: 0x00'u8
+    )
+    let encoded = encodeScanResponseFrame(rf)
+    let decoded = decodeScanResponseFrame(encoded, 0x00'u8)
+    check decoded.isOk
+    check decoded.value.pairs.len == 0
+    check (decoded.value.respFlags and ScanRespFlagEndOfScan) != 0'u8
+
+  test "decodeScanResponseFrame with pairs":
+    let rf = ScanResponseFrame(
+      respFlags: ScanRespFlagHasMore,
+      pairs: @[
+        ScanPair(key: "k1", value: "v1", timestamp: 0'u64, version: 0'u64),
+        ScanPair(key: "k2", value: "v2", timestamp: 0'u64, version: 0'u64)
+      ],
+      reqFlags: 0x00'u8
+    )
+    let encoded = encodeScanResponseFrame(rf)
+    let decoded = decodeScanResponseFrame(encoded, 0x00'u8)
+    check decoded.isOk
+    check decoded.value.pairs.len == 2
+    check decoded.value.pairs[0].key == "k1"
+    check decoded.value.pairs[0].value == "v1"
+
+  test "decodeScanResponseFrame with timestamp":
+    let rf = ScanResponseFrame(
+      respFlags: 0x00'u8,
+      pairs: @[ScanPair(key: "k", value: "v", timestamp: 2000'u64,
+          version: 0'u64)],
+      reqFlags: ScanFlagIncludeTimestamp
+    )
+    let encoded = encodeScanResponseFrame(rf)
+    let decoded = decodeScanResponseFrame(encoded, ScanFlagIncludeTimestamp)
+    check decoded.isOk
+    check decoded.value.pairs[0].timestamp == 2000'u64
+
+  test "decodeScanResponseFrame with version":
+    let rf = ScanResponseFrame(
+      respFlags: 0x00'u8,
+      pairs: @[ScanPair(key: "k", value: "v", timestamp: 0'u64,
+          version: 10'u64)],
+      reqFlags: ScanFlagIncludeVersion
+    )
+    let encoded = encodeScanResponseFrame(rf)
+    let decoded = decodeScanResponseFrame(encoded, ScanFlagIncludeVersion)
+    check decoded.isOk
+    check decoded.value.pairs[0].version == 10'u64
+
+  test "decodeScanResponseFrame truncated":
+    let invalid = "\x01\x04" # Just message type
+    let decoded = decodeScanResponseFrame(invalid, 0x00'u8)
+    check decoded.isErr
+
+suite "KV Constants":
+
+  test "GetFlagIncludeTimestamp value":
+    check GetFlagIncludeTimestamp == 0x01'u8
+
+  test "GetFlagIncludeVersion value":
+    check GetFlagIncludeVersion == 0x02'u8
+
+  test "GetFlagGroupRouted value":
+    check GetFlagGroupRouted == 0x10'u8
+
+  test "GetRespFlagFound value":
+    check GetRespFlagFound == 0x01'u8
+
+  test "GetRespFlagHasTimestamp value":
+    check GetRespFlagHasTimestamp == 0x02'u8
+
+  test "GetRespFlagHasVersion value":
+    check GetRespFlagHasVersion == 0x04'u8
+
+  test "PutFlagReturnPrev value":
+    check PutFlagReturnPrev == 0x01'u8
+
+  test "PutFlagSyncWrite value":
+    check PutFlagSyncWrite == 0x02'u8
+
+  test "PutFlagCAS value":
+    check PutFlagCAS == 0x04'u8
+
+  test "PutFlagGroupRouted value":
+    check PutFlagGroupRouted == 0x10'u8
+
+  test "PutStatusOK value":
+    check PutStatusOK == 0x00'u8
+
+  test "PutStatusCASFailed value":
+    check PutStatusCASFailed == 0x01'u8
+
+  test "PutStatusTxnAborted value":
+    check PutStatusTxnAborted == 0x02'u8
+
+  test "DelFlagReturnPrev value":
+    check DelFlagReturnPrev == 0x01'u8
+
+  test "DelFlagSyncWrite value":
+    check DelFlagSyncWrite == 0x02'u8
+
+  test "DelFlagOnlyIfExists value":
+    check DelFlagOnlyIfExists == 0x04'u8
+
+  test "DelFlagGroupRouted value":
+    check DelFlagGroupRouted == 0x10'u8
+
+  test "DelStatusDeleted value":
+    check DelStatusDeleted == 0x00'u8
+
+  test "DelStatusNotFound value":
+    check DelStatusNotFound == 0x01'u8
+
+  test "DelStatusTxnAborted value":
+    check DelStatusTxnAborted == 0x02'u8
+
+  test "BatchFlagAllOrNothing value":
+    check BatchFlagAllOrNothing == 0x01'u8
+
+  test "BatchFlagContinueOnErr value":
+    check BatchFlagContinueOnErr == 0x02'u8
+
+  test "BatchOpGet value":
+    check BatchOpGet == 0x00'u8
+
+  test "BatchOpPut value":
+    check BatchOpPut == 0x01'u8
+
+  test "BatchOpDelete value":
+    check BatchOpDelete == 0x02'u8
+
+  test "BatchStatusAllOK value":
+    check BatchStatusAllOK == 0x00'u8
+
+  test "BatchStatusPartialFailure value":
+    check BatchStatusPartialFailure == 0x01'u8
+
+  test "BatchStatusAllFailed value":
+    check BatchStatusAllFailed == 0x02'u8
+
+  test "ScanFlagIncludeTimestamp value":
+    check ScanFlagIncludeTimestamp == 0x01'u8
+
+  test "ScanFlagIncludeVersion value":
+    check ScanFlagIncludeVersion == 0x02'u8
+
+  test "ScanFlagKeysOnly value":
+    check ScanFlagKeysOnly == 0x04'u8
+
+  test "ScanFlagReverse value":
+    check ScanFlagReverse == 0x08'u8
+
+  test "ScanFlagGroupRouted value":
+    check ScanFlagGroupRouted == 0x10'u8
+
+  test "ScanRespFlagHasMore value":
+    check ScanRespFlagHasMore == 0x01'u8
+
+  test "ScanRespFlagEndOfScan value":
+    check ScanRespFlagEndOfScan == 0x02'u8

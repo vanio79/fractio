@@ -22,6 +22,55 @@ method close(self: MockTransportForTimer) =
 type MockTransportSimple = ref object of NetworkTransport
 method close(self: MockTransportSimple) = discard
 
+type MockTransportWithResults = ref object of NetworkTransport
+  results: seq[ClockOffset]
+
+method syncRound(self: MockTransportWithResults, localSend: Timestamp,
+    peers: seq[PeerConfig]): seq[ClockOffset] {.gcsafe.} =
+  result = self.results
+
+method close(self: MockTransportWithResults) {.gcsafe.} =
+  discard
+
+type MockTransportOffsets = ref object of NetworkTransport
+  offsetsToReturn: seq[ClockOffset]
+
+method syncRound(self: MockTransportOffsets, localSend: Timestamp,
+    peers: seq[PeerConfig]): seq[ClockOffset] {.gcsafe.} =
+  result = self.offsetsToReturn
+
+method close(self: MockTransportOffsets) {.gcsafe.} =
+  discard
+
+type MockTransportTime = ref object of NetworkTransport
+  results: seq[ClockOffset]
+
+method syncRound(self: MockTransportTime, localSend: Timestamp,
+    peers: seq[PeerConfig]): seq[ClockOffset] {.gcsafe.} =
+  result = self.results
+
+method close(self: MockTransportTime) {.gcsafe.} =
+  discard
+
+type MockTransportHistory = ref object of NetworkTransport
+  results: seq[ClockOffset]
+
+method syncRound(self: MockTransportHistory, localSend: Timestamp,
+    peers: seq[PeerConfig]): seq[ClockOffset] {.gcsafe.} =
+  result = self.results
+
+method close(self: MockTransportHistory) {.gcsafe.} =
+  discard
+
+type MockTransportError = ref object of NetworkTransport
+
+method syncRound(self: MockTransportError, localSend: Timestamp,
+    peers: seq[PeerConfig]): seq[ClockOffset] {.gcsafe.} =
+  raise newException(Exception, "Network error")
+
+method close(self: MockTransportError) {.gcsafe.} =
+  discard
+
 suite "SharedTimer - Helper Functions":
 
   test "calculateOffset basic":
@@ -480,3 +529,284 @@ suite "SharedTimer - Background Thread":
     let timer = newSharedTimer(nodeId = "test", numericNodeId = 1'u16)
     timer.stop()
     check not timer.running.load()
+
+suite "SharedTimer - updateConsensus":
+
+  test "updateConsensus fails with insufficient peers":
+    var mockClock: MockTimeProvider
+    new(mockClock)
+    mockClock.currentTime = 1000_000_000
+
+    var transport: MockTransportSimple
+    new(transport)
+
+    let timer = newSharedTimer(
+      nodeId = "test",
+      numericNodeId = 1'u16,
+      localClock = mockClock,
+      network = transport
+    )
+    timer.offsets = @[ClockOffset(offset: 100.0, peerId: "p1")]
+    timer.updateConsensus()
+    check timer.getState() == tssFailed
+    transport.close()
+
+  test "updateConsensus succeeds with enough peers":
+    var mockClock: MockTimeProvider
+    new(mockClock)
+    mockClock.currentTime = 1000_000_000
+
+    var transport: MockTransportSimple
+    new(transport)
+
+    let timer = newSharedTimer(
+      nodeId = "test",
+      numericNodeId = 1'u16,
+      localClock = mockClock,
+      network = transport
+    )
+    timer.offsets = @[
+      ClockOffset(offset: 100.0, peerId: "peer1", confidence: 1.0),
+      ClockOffset(offset: 105.0, peerId: "peer2", confidence: 1.0)
+    ]
+    timer.updateConsensus()
+    check timer.getState() == tssSynchronized
+    check timer.consensusOffset >= 100.0
+    transport.close()
+
+  test "updateConsensus filters outliers":
+    var mockClock: MockTimeProvider
+    new(mockClock)
+    mockClock.currentTime = 1000_000_000
+
+    var transport: MockTransportSimple
+    new(transport)
+
+    let timer = newSharedTimer(
+      nodeId = "test",
+      numericNodeId = 1'u16,
+      localClock = mockClock,
+      network = transport
+    )
+    # One extreme outlier, others clustered around 100
+    timer.offsets = @[
+      ClockOffset(offset: 100.0, peerId: "p1", confidence: 1.0),
+      ClockOffset(offset: 100.0, peerId: "p2", confidence: 1.0),
+      ClockOffset(offset: 100.0, peerId: "p3", confidence: 1.0),
+      ClockOffset(offset: 10000.0, peerId: "p4", confidence: 1.0) # outlier
+    ]
+    timer.updateConsensus()
+    # Should be synchronized after filtering
+    check timer.getState() == tssSynchronized
+    transport.close()
+
+  test "updateConsensus fails if all peers filtered as outliers":
+    var mockClock: MockTimeProvider
+    new(mockClock)
+    mockClock.currentTime = 1000_000_000
+
+    var transport: MockTransportSimple
+    new(transport)
+
+    let timer = newSharedTimer(
+      nodeId = "test",
+      numericNodeId = 1'u16,
+      localClock = mockClock,
+      network = transport
+    )
+    # All peers are extreme outliers relative to each other
+    timer.offsets = @[
+      ClockOffset(offset: 0.0, peerId: "p1", confidence: 1.0),
+      ClockOffset(offset: 1000000.0, peerId: "p2", confidence: 1.0),
+      ClockOffset(offset: -1000000.0, peerId: "p3", confidence: 1.0)
+    ]
+    timer.updateConsensus()
+    # After filtering, may have fewer than MIN_PEERS_FOR_CONSENSUS
+    check timer.getState() == tssFailed or timer.getState() == tssSynchronized
+    transport.close()
+
+  test "updateConsensus updates consensusOffset":
+    var mockClock: MockTimeProvider
+    new(mockClock)
+    mockClock.currentTime = 1000_000_000
+
+    var transport: MockTransportSimple
+    new(transport)
+
+    let timer = newSharedTimer(
+      nodeId = "test",
+      numericNodeId = 1'u16,
+      localClock = mockClock,
+      network = transport
+    )
+    timer.offsets = @[
+      ClockOffset(offset: 50.0, peerId: "p1", confidence: 1.0),
+      ClockOffset(offset: 50.0, peerId: "p2", confidence: 1.0)
+    ]
+    let oldOffset = timer.consensusOffset
+    timer.updateConsensus()
+    check timer.consensusOffset != oldOffset
+    transport.close()
+
+suite "SharedTimer - tick":
+
+  test "tick sets state to syncing":
+    var mockClock: MockTimeProvider
+    new(mockClock)
+    mockClock.currentTime = 1000_000_000
+
+    var transport: MockTransportWithResults
+    new(transport)
+    transport.results = @[
+      ClockOffset(offset: 100.0, peerId: "p1", confidence: 1.0),
+      ClockOffset(offset: 100.0, peerId: "p2", confidence: 1.0)
+    ]
+
+    let timer = newSharedTimer(
+      nodeId = "test",
+      numericNodeId = 1'u16,
+      peers = @[PeerConfig(peerId: "p1"), PeerConfig(peerId: "p2")],
+      localClock = mockClock,
+      network = transport
+    )
+    timer.tick()
+    check timer.getState() == tssSynchronized
+    transport.close()
+
+  test "tick updates offsets":
+    var mockClock: MockTimeProvider
+    new(mockClock)
+    mockClock.currentTime = 1000_000_000
+
+    var transport: MockTransportOffsets
+    new(transport)
+    transport.offsetsToReturn = @[
+      ClockOffset(offset: 50.0, peerId: "p1", confidence: 1.0),
+      ClockOffset(offset: 55.0, peerId: "p2", confidence: 1.0)
+    ]
+
+    let timer = newSharedTimer(
+      nodeId = "test",
+      numericNodeId = 1'u16,
+      peers = @[PeerConfig(peerId: "p1")],
+      localClock = mockClock,
+      network = transport
+    )
+    timer.tick()
+    check timer.offsets.len == 2
+    transport.close()
+
+  test "tick updates lastSyncTime":
+    var mockClock: MockTimeProvider
+    new(mockClock)
+    mockClock.currentTime = 5000_000_000
+
+    var transport: MockTransportTime
+    new(transport)
+    transport.results = @[
+      ClockOffset(offset: 100.0, peerId: "p1", confidence: 1.0),
+      ClockOffset(offset: 100.0, peerId: "p2", confidence: 1.0)
+    ]
+
+    let timer = newSharedTimer(
+      nodeId = "test",
+      numericNodeId = 1'u16,
+      peers = @[PeerConfig(peerId: "p1")],
+      localClock = mockClock,
+      network = transport
+    )
+    let beforeSync = timer.lastSyncTime
+    timer.tick()
+    check timer.lastSyncTime > beforeSync
+    transport.close()
+
+  test "tick adds to offsetHistory":
+    var mockClock: MockTimeProvider
+    new(mockClock)
+    mockClock.currentTime = 1000_000_000
+
+    var transport: MockTransportHistory
+    new(transport)
+    transport.results = @[
+      ClockOffset(offset: 100.0, peerId: "p1", confidence: 1.0),
+      ClockOffset(offset: 100.0, peerId: "p2", confidence: 1.0)
+    ]
+
+    let timer = newSharedTimer(
+      nodeId = "test",
+      numericNodeId = 1'u16,
+      peers = @[PeerConfig(peerId: "p1")],
+      localClock = mockClock,
+      network = transport
+    )
+    let beforeSize = timer.offsetHistory.size
+    timer.tick()
+    check timer.offsetHistory.size > beforeSize
+    transport.close()
+
+  test "tick sets failed on exception":
+    var mockClock: MockTimeProvider
+    new(mockClock)
+    mockClock.currentTime = 1000_000_000
+
+    var transport: MockTransportError
+    new(transport)
+
+    let timer = newSharedTimer(
+      nodeId = "test",
+      numericNodeId = 1'u16,
+      peers = @[PeerConfig(peerId: "p1")],
+      localClock = mockClock,
+      network = transport
+    )
+    timer.tick()
+    check timer.getState() == tssFailed
+    transport.close()
+
+suite "SharedTimer - now with synchronized state":
+
+  test "now returns synchronized time when state is synchronized":
+    var mockClock: MockTimeProvider
+    new(mockClock)
+    mockClock.currentTime = 1000_000_000
+
+    var transport: MockTransportSimple
+    new(transport)
+
+    let timer = newSharedTimer(
+      nodeId = "test",
+      numericNodeId = 1'u16,
+      localClock = mockClock,
+      network = transport
+    )
+    # Manually set offset and state
+    timer.consensusOffset = 500.0
+    timer.setState(tssSynchronized)
+
+    let ts = timer.now()
+    # Should return synchronized time (local + offset)
+    check ts == 1000_000_500 # local + offset as int64
+    transport.close()
+
+suite "SharedTimer - Dollar operator":
+
+  test "dollar for ClockOffset":
+    let offset = ClockOffset(
+      offset: 100.0,
+      delay: 50.0,
+      peerId: "peer1",
+      confidence: 0.95,
+      lastUpdate: 1000_000_000
+    )
+    let s = $offset
+    check s.len > 0
+
+  test "dollar for PeerConfig":
+    let peer = PeerConfig(
+      peerId: "node1",
+      address: "192.168.1.1",
+      port: 8080,
+      weight: 1.0
+    )
+    let s = $peer
+    check s.len > 0

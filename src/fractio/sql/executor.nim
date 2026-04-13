@@ -340,12 +340,12 @@ proc matchesFilter*(filter: Option[Expr], row: JsonNode): bool =
 # Row helpers
 # ---------------------------------------------------------------------------
 
-proc extractColumnsFromDataRow(row: DataRow, columns: seq[string]): seq[string] =
+proc extractColumnsFromDataRow*(row: DataRow, columns: seq[string]): seq[string] =
   ## Extract column values from a DataRow as strings
   for col in columns:
     result.add(row[col].toStringValue())
 
-proc getPkValueFromDataRow(row: DataRow, pkColumn: string): string =
+proc getPkValueFromDataRow*(row: DataRow, pkColumn: string): string =
   ## Get primary key value from a DataRow
   if row.hasColumn(pkColumn):
     let v = row[pkColumn]
@@ -356,7 +356,7 @@ proc getPkValueFromDataRow(row: DataRow, pkColumn: string): string =
   ""
 
 # Legacy JSON helpers (kept for backward compatibility)
-proc jsonToStringValue(j: JsonNode): string =
+proc jsonToStringValue*(j: JsonNode): string =
   case j.kind
   of JString: j.getStr
   of JInt: $j.getInt
@@ -365,14 +365,14 @@ proc jsonToStringValue(j: JsonNode): string =
   of JNull: "NULL"
   else: $j
 
-proc extractColumns(row: JsonNode, columns: seq[string]): seq[string] =
+proc extractColumns*(row: JsonNode, columns: seq[string]): seq[string] =
   for col in columns:
     if row.hasKey(col):
       result.add(jsonToStringValue(row[col]))
     else:
       result.add("NULL")
 
-proc getPkValue(row: JsonNode, pkColumn: string): string =
+proc getPkValue*(row: JsonNode, pkColumn: string): string =
   if row.hasKey(pkColumn):
     let v = row[pkColumn]
     case v.kind
