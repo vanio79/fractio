@@ -7,6 +7,7 @@ import unittest
 import std/[strformat, algorithm, sequtils]
 
 import fractio/utils/binary
+import fractio/core/types # for genULID
 import fractio/core/primary_key
 import fractio/distributed/meta/system_schemas
 
@@ -442,6 +443,313 @@ suite "Type Width Calculations":
     check columnTotalWidth(cdtULID) == 17
 
 # =============================================================================
+# Value Extraction Helper Tests
+# =============================================================================
+
+suite "Value Extraction Helpers":
+
+  test "pkValueFromInt basic":
+    let col = pkValueFromInt(42)
+    check col.isNull == false
+    check col.kind == cdtInt
+    check col.intVal == 42
+
+  test "pkValueFromInt NULL":
+    let col = pkValueFromInt(0, isNull = true)
+    check col.isNull == true
+    check col.kind == cdtInt
+
+  test "pkValueFromFloat basic":
+    let col = pkValueFromFloat(3.14159)
+    check col.isNull == false
+    check col.kind == cdtFloat
+    check col.floatVal == 3.14159
+
+  test "pkValueFromFloat NULL":
+    let col = pkValueFromFloat(0.0, isNull = true)
+    check col.isNull == true
+    check col.kind == cdtFloat
+
+  test "pkValueFromString basic":
+    let col = pkValueFromString("hello", maxLen = 32)
+    check col.isNull == false
+    check col.kind == cdtString
+    check col.strVal == "hello"
+    check col.strMaxLen == 32
+
+  test "pkValueFromString NULL":
+    let col = pkValueFromString("", maxLen = 16, isNull = true)
+    check col.isNull == true
+    check col.kind == cdtString
+
+  test "pkValueFromBool true":
+    let col = pkValueFromBool(true)
+    check col.isNull == false
+    check col.kind == cdtBool
+    check col.boolVal == true
+
+  test "pkValueFromBool false":
+    let col = pkValueFromBool(false)
+    check col.isNull == false
+    check col.kind == cdtBool
+    check col.boolVal == false
+
+  test "pkValueFromBool NULL":
+    let col = pkValueFromBool(false, isNull = true)
+    check col.isNull == true
+    check col.kind == cdtBool
+
+  test "pkValueFromDate basic":
+    let col = pkValueFromDate(1710000000000000000'i64)
+    check col.isNull == false
+    check col.kind == cdtDate
+    check col.dateVal == 1710000000000000000'i64
+
+  test "pkValueFromDate NULL":
+    let col = pkValueFromDate(0'i64, isNull = true)
+    check col.isNull == true
+    check col.kind == cdtDate
+
+  test "pkValueFromDateTime basic":
+    let col = pkValueFromDateTime(1710000000000000000'i64)
+    check col.isNull == false
+    check col.kind == cdtDateTime
+    check col.datetimeVal == 1710000000000000000'i64
+
+  test "pkValueFromDateTime NULL":
+    let col = pkValueFromDateTime(0'i64, isNull = true)
+    check col.isNull == true
+    check col.kind == cdtDateTime
+
+  test "pkValueFromULID basic":
+    var ulid: array[16, uint8]
+    for i in 0..<16:
+      ulid[i] = uint8(i + 1)
+    let col = pkValueFromULID(ulid)
+    check col.isNull == false
+    check col.kind == cdtULID
+    check col.ulidVal == ulid
+
+  test "pkValueFromULID NULL":
+    var ulid: array[16, uint8]
+    let col = pkValueFromULID(ulid, isNull = true)
+    check col.isNull == true
+    check col.kind == cdtULID
+
+# =============================================================================
+# Additional Type Encoding Tests
+# =============================================================================
+
+suite "Date/DateTime Column Encoding":
+
+  test "Encode/decode DATE column":
+    var w = initBinaryWriter()
+    let col = pkValueFromDate(1710000000000000000'i64)
+    encodePkColumn(col, w)
+    let data = w.finish()
+
+    var r = initBinaryReader(data)
+    let decoded = decodePkColumn(r, cdtDate)
+    check decoded.isNull == false
+    check decoded.dateVal == 1710000000000000000'i64
+
+  test "Encode/decode NULL DATE column":
+    var w = initBinaryWriter()
+    let col = pkValueFromDate(0'i64, isNull = true)
+    encodePkColumn(col, w)
+    let data = w.finish()
+
+    var r = initBinaryReader(data)
+    let decoded = decodePkColumn(r, cdtDate)
+    check decoded.isNull == true
+
+  test "Encode/decode DATETIME column":
+    var w = initBinaryWriter()
+    let col = pkValueFromDateTime(1710000000123456789'i64)
+    encodePkColumn(col, w)
+    let data = w.finish()
+
+    var r = initBinaryReader(data)
+    let decoded = decodePkColumn(r, cdtDateTime)
+    check decoded.isNull == false
+    check decoded.datetimeVal == 1710000000123456789'i64
+
+  test "Encode/decode NULL DATETIME column":
+    var w = initBinaryWriter()
+    let col = pkValueFromDateTime(0'i64, isNull = true)
+    encodePkColumn(col, w)
+    let data = w.finish()
+
+    var r = initBinaryReader(data)
+    let decoded = decodePkColumn(r, cdtDateTime)
+    check decoded.isNull == true
+
+suite "ULID Column Encoding":
+
+  test "Encode/decode ULID column":
+    var w = initBinaryWriter()
+    var ulid: array[16, uint8]
+    for i in 0..<16:
+      ulid[i] = uint8(i * 16)
+    let col = pkValueFromULID(ulid)
+    encodePkColumn(col, w)
+    let data = w.finish()
+
+    # Total bytes: 1 (flag) + 16 (value) = 17
+    check data.len == 17
+
+    var r = initBinaryReader(data)
+    let decoded = decodePkColumn(r, cdtULID)
+    check decoded.isNull == false
+    check decoded.ulidVal == ulid
+
+  test "Encode/decode NULL ULID column":
+    var w = initBinaryWriter()
+    var ulid: array[16, uint8]
+    let col = pkValueFromULID(ulid, isNull = true)
+    encodePkColumn(col, w)
+    let data = w.finish()
+
+    var r = initBinaryReader(data)
+    let decoded = decodePkColumn(r, cdtULID)
+    check decoded.isNull == true
+
+suite "Bytes Column Encoding":
+
+  test "Encode/decode BYTES column":
+    var w = initBinaryWriter()
+    let col = PrimaryKeyColumnValue(
+      isNull: false,
+      kind: cdtBytes,
+      bytesVal: @[0x01'u8, 0x02, 0x03, 0x04],
+      bytesMaxLen: 16
+    )
+    encodePkColumn(col, w)
+    let data = w.finish()
+
+    # Total bytes: 1 (flag) + 16 (value) = 17
+    check data.len == 17
+
+    var r = initBinaryReader(data)
+    let decoded = decodePkColumn(r, cdtBytes, maxLen = 16)
+    check decoded.isNull == false
+    check decoded.bytesVal == @[0x01'u8, 0x02, 0x03, 0x04]
+
+  test "Encode/decode NULL BYTES column":
+    var w = initBinaryWriter()
+    let col = PrimaryKeyColumnValue(
+      isNull: true,
+      kind: cdtBytes,
+      bytesVal: @[],
+      bytesMaxLen: 16
+    )
+    encodePkColumn(col, w)
+    let data = w.finish()
+
+    var r = initBinaryReader(data)
+    let decoded = decodePkColumn(r, cdtBytes, maxLen = 16)
+    check decoded.isNull == true
+
+  test "BYTES exceeding max length raises error":
+    var w = initBinaryWriter()
+    let col = PrimaryKeyColumnValue(
+      isNull: false,
+      kind: cdtBytes,
+      bytesVal: @[0x01'u8, 0x02, 0x03, 0x04, 0x05], # 5 bytes
+      bytesMaxLen: 4 # max is 4
+    )
+    var raised = false
+    try:
+      encodePkColumn(col, w)
+    except ValueError:
+      raised = true
+    check raised
+
+# =============================================================================
+# Debug/Display Helper Tests
+# =============================================================================
+
+suite "Debug Helpers":
+
+  test "pkColumnToString INT":
+    let col = pkValueFromInt(42)
+    check pkColumnToString(col) == "42"
+
+  test "pkColumnToString INT negative":
+    let col = pkValueFromInt(-100)
+    check pkColumnToString(col) == "-100"
+
+  test "pkColumnToString FLOAT":
+    let col = pkValueFromFloat(3.14)
+    check pkColumnToString(col) == "3.14"
+
+  test "pkColumnToString STRING":
+    let col = pkValueFromString("hello", maxLen = 32)
+    check pkColumnToString(col) == "hello"
+
+  test "pkColumnToString BOOL true":
+    let col = pkValueFromBool(true)
+    check pkColumnToString(col) == "true"
+
+  test "pkColumnToString BOOL false":
+    let col = pkValueFromBool(false)
+    check pkColumnToString(col) == "false"
+
+  test "pkColumnToString DATE":
+    let col = pkValueFromDate(1710000000000000000'i64)
+    check pkColumnToString(col) == "1710000000000000000"
+
+  test "pkColumnToString DATETIME":
+    let col = pkValueFromDateTime(1710000000123456789'i64)
+    check pkColumnToString(col) == "1710000000123456789"
+
+  test "pkColumnToString NULL":
+    let col = pkValueFromInt(0, isNull = true)
+    check pkColumnToString(col) == "NULL"
+
+  test "pkColumnToString BYTES":
+    let col = PrimaryKeyColumnValue(
+      isNull: false,
+      kind: cdtBytes,
+      bytesVal: @[0x01'u8, 0x02, 0x03],
+      bytesMaxLen: 16
+    )
+    let s = pkColumnToString(col)
+    check s.len > 0
+    # The output format is "bytes:N" where N is the length
+    check s[0..5] == "bytes:"
+
+  test "pkColumnToString ULID":
+    var ulid: array[16, uint8]
+    for i in 0..<16:
+      ulid[i] = 0x41'u8 # 'A'
+    let col = pkValueFromULID(ulid)
+    let s = pkColumnToString(col)
+    check s.len == 16
+
+  test "pkToString single column":
+    let pk: PrimaryKey = @[pkValueFromInt(42)]
+    check pkToString(pk) == "(42)"
+
+  test "pkToString multiple columns":
+    let pk: PrimaryKey = @[
+      pkValueFromInt(42),
+      pkValueFromString("test", maxLen = 16)
+    ]
+    check pkToString(pk) == "(42, test)"
+
+  test "pkToString with NULL":
+    let pk: PrimaryKey = @[
+      pkValueFromInt(42),
+      pkValueFromInt(0, isNull = true)
+    ]
+    check pkToString(pk) == "(42, NULL)"
+
+  test "pkToString empty":
+    let pk: PrimaryKey = @[]
+    check pkToString(pk) == "()"
+
+# =============================================================================
 # Edge Case Tests
 # =============================================================================
 
@@ -491,3 +799,89 @@ suite "Edge Cases":
     check decoded[1].floatVal == -3.14159
     check decoded[2].strVal == "test"
     check decoded[3].boolVal == false
+
+# =============================================================================
+# PrimaryKeySpec from TableRecord Tests
+# =============================================================================
+# ColumnFlags bit positions: cfPrimaryKey=0, cfNotNull=1, cfUnique=2
+
+suite "PrimaryKeySpec from TableRecord":
+
+  test "primaryKeySpecFromTable single PK column":
+    let rec = TableRecord(
+      tableId: genTableId(),
+      name: "users",
+      schema: "public",
+      database: "testdb",
+      spaceId: genSpaceID(),
+      columns: @[
+        ColumnDefBin(name: "id", dataType: cdtInt, maxLen: 0,
+            flags: uint8(1 shl int(cfPrimaryKey) or 1 shl int(cfNotNull))),
+        ColumnDefBin(name: "name", dataType: cdtString, maxLen: 64, flags: 0)
+      ],
+      primaryKey: @["id"]
+    )
+    let spec = primaryKeySpecFromTable(rec)
+    check spec.columns.len == 1
+    check spec.columns[0].name == "id"
+    check spec.columns[0].dataType == cdtInt
+    check spec.columns[0].maxLen == 0
+
+  test "primaryKeySpecFromTable composite PK":
+    let rec = TableRecord(
+      tableId: genTableId(),
+      name: "orders",
+      schema: "public",
+      database: "testdb",
+      spaceId: genSpaceID(),
+      columns: @[
+        ColumnDefBin(name: "user_id", dataType: cdtInt, maxLen: 0,
+            flags: uint8(1 shl int(cfPrimaryKey) or 1 shl int(cfNotNull))),
+        ColumnDefBin(name: "order_id", dataType: cdtInt, maxLen: 0,
+            flags: uint8(1 shl int(cfPrimaryKey) or 1 shl int(cfNotNull))),
+        ColumnDefBin(name: "status", dataType: cdtString, maxLen: 32, flags: 0)
+      ],
+      primaryKey: @["user_id", "order_id"]
+    )
+    let spec = primaryKeySpecFromTable(rec)
+    check spec.columns.len == 2
+    check spec.columns[0].name == "user_id"
+    check spec.columns[1].name == "order_id"
+
+  test "primaryKeySpecFromTable with string PK":
+    let rec = TableRecord(
+      tableId: genTableId(),
+      name: "countries",
+      schema: "public",
+      database: "testdb",
+      spaceId: genSpaceID(),
+      columns: @[
+        ColumnDefBin(name: "code", dataType: cdtString, maxLen: 4,
+            flags: uint8(1 shl int(cfPrimaryKey) or 1 shl int(cfNotNull))),
+        ColumnDefBin(name: "name", dataType: cdtString, maxLen: 64, flags: 0)
+      ],
+      primaryKey: @["code"]
+    )
+    let spec = primaryKeySpecFromTable(rec)
+    check spec.columns.len == 1
+    check spec.columns[0].dataType == cdtString
+    check spec.columns[0].maxLen == 4
+
+  test "primaryKeySpecFromTable missing PK column raises error":
+    let rec = TableRecord(
+      tableId: genTableId(),
+      name: "bad_table",
+      schema: "public",
+      database: "testdb",
+      spaceId: genSpaceID(),
+      columns: @[
+        ColumnDefBin(name: "id", dataType: cdtInt, maxLen: 0, flags: 0)
+      ],
+      primaryKey: @["missing_column"]
+    )
+    var raised = false
+    try:
+      discard primaryKeySpecFromTable(rec)
+    except ValueError:
+      raised = true
+    check raised
