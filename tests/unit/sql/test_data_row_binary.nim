@@ -1,7 +1,7 @@
 # Unit Tests for DataRow Binary Serialization
 
 import unittest
-import std/strutils
+import std/[strutils, sequtils, options]
 import fractio/sql/data_row
 import fractio/utils/binary
 
@@ -325,3 +325,304 @@ suite "DataRow String Conversion Tests":
     ])
     let strRow = toStringRow(row, @["id", "name"])
     check strRow == @["1", "test"]
+
+suite "DataRow Error Cases":
+
+  test "Decode data too small":
+    var raised = false
+    try:
+      discard decodeDataRow("DR") # Only 2 bytes, need at least 7
+    except ValueError:
+      raised = true
+    check raised
+
+  test "Decode unsupported version":
+    # Valid magic but wrong version
+    let data = @[0x44'u8, 0x52'u8, 0x02'u8, 0x00'u8, 0x00'u8, 0x00'u8, 0x00'u8]
+    var raised = false
+    try:
+      discard decodeDataRow(data.mapIt(chr(it)).join)
+    except ValueError:
+      raised = true
+    check raised
+
+  test "Decode completely wrong magic":
+    let data = @[0xFF'u8, 0xFF'u8, 0x01'u8, 0x00'u8, 0x00'u8, 0x00'u8, 0x00'u8]
+    var raised = false
+    try:
+      discard decodeDataRow(data.mapIt(chr(it)).join)
+    except ValueError:
+      raised = true
+    check raised
+
+suite "DataRow Column Index Tests":
+
+  test "getColumnIdx finds column":
+    let row = newDataRow(@[
+      newColumn("id", newRowValue(1'i64)),
+      newColumn("name", newRowValue("test"))
+    ])
+    check row.getColumnIdx("id") == 0
+    check row.getColumnIdx("name") == 1
+
+  test "getColumnIdx returns -1 for missing":
+    let row = newDataRow(@[
+      newColumn("id", newRowValue(1'i64))
+    ])
+    check row.getColumnIdx("missing") == -1
+
+  test "getColumn returns some":
+    let row = newDataRow(@[
+      newColumn("count", newRowValue(42'i64))
+    ])
+    let opt = row.getColumn("count")
+    check opt.isSome
+    check opt.get.getInt() == 42
+
+  test "getColumn returns none for missing":
+    let row = newDataRow()
+    let opt = row.getColumn("missing")
+    check opt.isNone
+
+suite "DataRowValue Default Value Tests":
+
+  test "getInt with default":
+    let nullVal = newRowValue()
+    check nullVal.getInt(99) == 99
+    let strVal = newRowValue("text")
+    check strVal.getInt(99) == 99
+
+  test "getFloat with default":
+    let nullVal = newRowValue()
+    check nullVal.getFloat(3.14) == 3.14
+    let intVal = newRowValue(10'i64)
+    check intVal.getFloat(3.14) == 3.14
+
+  test "getString with default":
+    let nullVal = newRowValue()
+    check nullVal.getString("default") == "default"
+    let intVal = newRowValue(10'i64)
+    check intVal.getString("default") == "default"
+
+  test "getBool with default":
+    let nullVal = newRowValue()
+    check nullVal.getBool(true) == true
+    let intVal = newRowValue(10'i64)
+    check intVal.getBool(true) == true
+
+suite "DataRowValue Mixed Type Comparison Tests":
+
+  test "Different types equality returns false":
+    let a = newRowValue(10'i64)
+    let b = newRowValue(10.0)
+    check (a == b) == false # Different kinds, so false
+    check (a == newRowValue("10")) == false
+
+  test "Different types ordering returns false":
+    let a = newRowValue(5'i64)
+    let b = newRowValue("10")
+    check (a < b) == false # Different kinds, false
+    check (a <= b) == false # Different kinds, false
+    check (a > b) == false # Different kinds, false
+
+  test "Null equality":
+    let a = newRowValue()
+    let b = newRowValue()
+    check a == b
+
+  test "Null ordering":
+    let a = newRowValue()
+    let b = newRowValue()
+    check (a < b) == false # Null < Null is false
+    check a <= b # Null <= Null is true
+
+  test "Bool ordering":
+    let a = newRowValue(false)
+    let b = newRowValue(true)
+    check a < b
+    check a <= b
+    check b > a
+
+suite "DataRowValue Float Ordering Tests":
+  test "Float ordering less than":
+    let a = newRowValue(1.5)
+    let b = newRowValue(3.5)
+    check a < b
+    check a <= b
+    check not (a > b)
+    check not (a >= b)
+
+  test "Float ordering greater than":
+    let a = newRowValue(5.5)
+    let b = newRowValue(2.5)
+    check a > b
+    check a >= b
+    check not (a < b)
+    check not (a <= b)
+
+  test "Float ordering equal":
+    let a = newRowValue(3.14)
+    let b = newRowValue(3.14)
+    check not (a < b)
+    check a <= b
+    check not (a > b)
+    check a >= b
+
+  test "Float ordering negative values":
+    let a = newRowValue(-5.0)
+    let b = newRowValue(-2.0)
+    check a < b
+    check a <= b
+
+  test "Float ordering negative and positive":
+    let a = newRowValue(-1.0)
+    let b = newRowValue(1.0)
+    check a < b
+    check b > a
+
+suite "DataRowValue Mixed Type Arithmetic Tests":
+
+  test "Add non-int returns null":
+    let a = newRowValue(5'i64)
+    let b = newRowValue(3.0)
+    check (a + b).kind == drvkNull
+    check (newRowValue("a") + newRowValue("b")).kind == drvkNull
+
+  test "Subtract non-int returns null":
+    let a = newRowValue(10'i64)
+    let b = newRowValue("3")
+    check (a - b).kind == drvkNull
+
+  test "Multiply non-int returns null":
+    let a = newRowValue(6'i64)
+    let b = newRowValue(true)
+    check (a * b).kind == drvkNull
+
+  test "Divide non-int returns null":
+    let a = newRowValue(20'i64)
+    let b = newRowValue(4.0)
+    check (a div b).kind == drvkNull
+
+  test "Modulo non-int returns null":
+    let a = newRowValue(17'i64)
+    let b = newRowValue(5.0)
+    check (a mod b).kind == drvkNull
+
+  test "Modulo by zero returns null":
+    let a = newRowValue(10'i64)
+    let b = newRowValue(0'i64)
+    check (a mod b).kind == drvkNull
+
+  test "Negate non-int returns null":
+    let a = newRowValue(3.14)
+    check (-a).kind == drvkNull
+    check (-newRowValue("text")).kind == drvkNull
+
+suite "DataRowValue Mixed Type Logic Tests":
+
+  test "AND non-bool returns null":
+    let a = newRowValue(true)
+    let b = newRowValue(1'i64)
+    check (a and b).kind == drvkNull
+    check (newRowValue(1'i64) and newRowValue(2'i64)).kind == drvkNull
+
+  test "OR non-bool returns null":
+    let a = newRowValue(true)
+    let b = newRowValue("false")
+    check (a or b).kind == drvkNull
+
+  test "NOT non-bool returns null":
+    let a = newRowValue(1'i64)
+    check (not a).kind == drvkNull
+    check (not newRowValue()).kind == drvkNull
+
+suite "DataRowValue Float Tests":
+
+  test "Float round-trip":
+    let original = newRowValue(3.14159265358979)
+    let row = newDataRow(@[newColumn("pi", original)])
+    let encoded = encodeDataRow(row)
+    let restored = decodeDataRow(encoded)
+    check restored["pi"].getFloat() == 3.14159265358979
+
+  test "Float zero":
+    let v = newRowValue(0.0)
+    check v.kind == drvkFloat
+    check v.getFloat() == 0.0
+
+  test "Negative float":
+    let v = newRowValue(-123.45)
+    check v.getFloat() == -123.45
+
+  test "Very large float":
+    let v = newRowValue(1e308)
+    check v.getFloat() == 1e308
+
+  test "Very small float":
+    let v = newRowValue(1e-308)
+    check v.getFloat() == 1e-308
+
+suite "DataRowValue Special Cases":
+
+  test "Empty string value":
+    let v = newRowValue("")
+    check v.kind == drvkString
+    check v.getString() == ""
+
+  test "Int min value":
+    let v = newRowValue(int64.low)
+    check v.getInt() == int64.low
+
+  test "Int max value":
+    let v = newRowValue(int64.high)
+    check v.getInt() == int64.high
+
+  test "Negative int":
+    let v = newRowValue(-1'i64)
+    check v.getInt() == -1
+
+suite "DataRow Column Manipulation":
+
+  test "SetColumn adds new column":
+    var row = newDataRow()
+    row.setColumn("count", newRowValue(5'i64))
+    check row.columns.len == 1
+    check row["count"].getInt() == 5
+
+  test "SetColumn updates existing":
+    var row = newDataRow(@[
+      newColumn("count", newRowValue(0'i64))
+    ])
+    row.setColumn("count", newRowValue(100'i64))
+    check row.columns.len == 1 # Not added, just updated
+    check row["count"].getInt() == 100
+
+  test "Bracket assignment":
+    var row = newDataRow()
+    row["status"] = newRowValue("active")
+    check row.hasColumn("status")
+    check row["status"].getString() == "active"
+
+suite "DataRow ToStringRow Edge Cases":
+
+  test "ToStringRow with missing column":
+    let row = newDataRow(@[
+      newColumn("id", newRowValue(1'i64))
+    ])
+    let strRow = toStringRow(row, @["id", "missing"])
+    check strRow == @["1", "NULL"] # Missing returns null
+
+  test "ToStringRow with null value":
+    let row = newDataRow(@[
+      newColumn("id", newRowValue(1'i64)),
+      newColumn("nullable", newRowValue())
+    ])
+    let strRow = toStringRow(row, @["id", "nullable"])
+    check strRow == @["1", "NULL"]
+
+  test "ToStringRow with float":
+    let row = newDataRow(@[
+      newColumn("price", newRowValue(19.99))
+    ])
+    let strRow = toStringRow(row, @["price"])
+    check strRow[0].contains("19.99")

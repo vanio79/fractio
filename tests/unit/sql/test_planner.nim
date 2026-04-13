@@ -4,6 +4,8 @@ import fractio/sql/planner
 import fractio/sql/parser
 import fractio/sql/data_row
 import fractio/core/types
+import fractio/core/primary_key
+import fractio/distributed/meta/system_schemas
 
 suite "Planner Result Constructors":
 
@@ -194,6 +196,18 @@ suite "Planner formatExpr":
       binRight: Expr(kind: exLiteral, litValue: newValueRef(100'i64)))
     check formatExpr(e) == "score > 100"
 
+  test "format binary operator less or equal":
+    let e = Expr(kind: exBinOp, binOp: boLte,
+      binLeft: Expr(kind: exColumn, colName: "age"),
+      binRight: Expr(kind: exLiteral, litValue: newValueRef(65'i64)))
+    check formatExpr(e) == "age <= 65"
+
+  test "format binary operator greater or equal":
+    let e = Expr(kind: exBinOp, binOp: boGte,
+      binLeft: Expr(kind: exColumn, colName: "level"),
+      binRight: Expr(kind: exLiteral, litValue: newValueRef(5'i64)))
+    check formatExpr(e) == "level >= 5"
+
   test "format binary operator AND":
     let e = Expr(kind: exBinOp, binOp: boAnd,
       binLeft: Expr(kind: exLiteral, litValue: newValueRef(true)),
@@ -252,6 +266,76 @@ suite "Planner formatExpr":
   test "format unknown expression":
     let e = Expr(kind: exParam, paramIdx: 1)
     check formatExpr(e) == "?"
+
+  test "format exIn expression":
+    let expr = Expr(kind: exColumn, colName: "status")
+    let items = @[
+      Expr(kind: exLiteral, litValue: newValueRef("active")),
+      Expr(kind: exLiteral, litValue: newValueRef("pending"))
+    ]
+    let e = Expr(kind: exIn, inExpr: expr, inNot: false, inList: items)
+    check formatExpr(e) == "?" # exIn falls through to else branch
+
+  test "format exIn NOT IN expression":
+    let e = Expr(kind: exIn, inExpr: Expr(kind: exColumn, colName: "x"),
+                 inNot: true, inList: @[])
+    check formatExpr(e) == "?" # exIn falls through to else branch
+
+  test "format exBetween expression":
+    let e = Expr(kind: exBetween, betweenExpr: Expr(kind: exColumn, colName: "age"),
+                 betweenNot: false, betweenLo: Expr(kind: exLiteral,
+                     litValue: newValueRef(18'i64)),
+                 betweenHi: Expr(kind: exLiteral, litValue: newValueRef(65'i64)))
+    check formatExpr(e) == "?" # exBetween falls through to else branch
+
+  test "format exBetween NOT BETWEEN expression":
+    let e = Expr(kind: exBetween, betweenExpr: Expr(kind: exColumn, colName: "x"),
+                 betweenNot: true, betweenLo: Expr(kind: exLiteral,
+                     litValue: nil), betweenHi: Expr(kind: exLiteral,
+                     litValue: nil))
+    check formatExpr(e) == "?"
+
+  test "format exLike expression":
+    let e = Expr(kind: exLike, likeExpr: Expr(kind: exColumn, colName: "name"),
+                 likeNot: false, likePattern: Expr(kind: exLiteral,
+                     litValue: newValueRef("A%")))
+    check formatExpr(e) == "?" # exLike falls through to else branch
+
+  test "format exLike NOT LIKE expression":
+    let e = Expr(kind: exLike, likeExpr: Expr(kind: exColumn, colName: "name"),
+                 likeNot: true, likePattern: Expr(kind: exLiteral,
+                     litValue: nil))
+    check formatExpr(e) == "?"
+
+  test "format exList expression":
+    let items = @[
+      Expr(kind: exLiteral, litValue: newValueRef(1'i64)),
+      Expr(kind: exLiteral, litValue: newValueRef(2'i64))
+    ]
+    let e = Expr(kind: exList, listItems: items)
+    check formatExpr(e) == "?" # exList falls through to else branch
+
+  test "format literal with dtDate falls through":
+    # dtDate has dateValue field
+    let v = ValueRef(kind: dtDate, dateValue: 12345)
+    let e = Expr(kind: exLiteral, litValue: v)
+    check formatExpr(e) == "?" # dtDate falls through to else
+
+  test "format literal with dtDateTime falls through":
+    # dtDateTime has datetimeValue field
+    let v = ValueRef(kind: dtDateTime, datetimeValue: 12345)
+    let e = Expr(kind: exLiteral, litValue: v)
+    check formatExpr(e) == "?" # dtDateTime falls through to else
+
+  test "format literal with dtBytes falls through":
+    let v = ValueRef(kind: dtBytes, bytesValue: @[1.uint8, 2, 3])
+    let e = Expr(kind: exLiteral, litValue: v)
+    check formatExpr(e) == "?" # dtBytes falls through to else
+
+  test "format literal with dtULID falls through":
+    let v = newValueRef(genULID())
+    let e = Expr(kind: exLiteral, litValue: v)
+    check formatExpr(e) == "?" # dtULID falls through to else
 
 suite "Planner formatPlanOp":
 
@@ -393,9 +477,543 @@ suite "Planner PlanOp Variants":
     check op.kind == poDelete
     check op.delTableName == "logs"
 
+suite "Planner genNewTableId":
+  test "generates unique TableId":
+    let id1 = genNewTableId()
+    let id2 = genNewTableId()
+    # ULID-based IDs should be unique
+    check id1 != id2
+
+  test "generates non-zero TableId":
+    let id = genNewTableId()
+    # TableId is ULID-based, string representation is never all zeros
+    check $id != "00000000000000000000000000"
+
+suite "Planner dataRowValueToPkValue":
+  test "int value":
+    let v = newRowValue(42'i64)
+    let colSpec = (name: "id", dataType: cdtInt, maxLen: 0)
+    let pk = dataRowValueToPkValue(v, colSpec)
+    check pk.isNull == false
+    check pk.kind == cdtInt
+    check pk.intVal == 42
+
+  test "float value":
+    let v = newRowValue(3.14)
+    let colSpec = (name: "val", dataType: cdtFloat, maxLen: 0)
+    let pk = dataRowValueToPkValue(v, colSpec)
+    check pk.isNull == false
+    check pk.kind == cdtFloat
+    check pk.floatVal == 3.14
+
+  test "string value":
+    let v = newRowValue("hello")
+    let colSpec = (name: "name", dataType: cdtString, maxLen: 32)
+    let pk = dataRowValueToPkValue(v, colSpec)
+    check pk.isNull == false
+    check pk.kind == cdtString
+    check pk.strVal == "hello"
+    check pk.strMaxLen == 32
+
+  test "bool value":
+    let v = newRowValue(true)
+    let colSpec = (name: "active", dataType: cdtBool, maxLen: 0)
+    let pk = dataRowValueToPkValue(v, colSpec)
+    check pk.isNull == false
+    check pk.kind == cdtBool
+    check pk.boolVal == true
+
+  test "null value int":
+    let v = newRowValue()
+    let colSpec = (name: "id", dataType: cdtInt, maxLen: 0)
+    let pk = dataRowValueToPkValue(v, colSpec)
+    check pk.isNull == true
+    check pk.kind == cdtInt
+
+  test "null value float":
+    let v = newRowValue()
+    let colSpec = (name: "val", dataType: cdtFloat, maxLen: 0)
+    let pk = dataRowValueToPkValue(v, colSpec)
+    check pk.isNull == true
+    check pk.kind == cdtFloat
+
+  test "null value string":
+    let v = newRowValue()
+    let colSpec = (name: "name", dataType: cdtString, maxLen: 32)
+    let pk = dataRowValueToPkValue(v, colSpec)
+    check pk.isNull == true
+    check pk.kind == cdtString
+
+  test "null value bool":
+    let v = newRowValue()
+    let colSpec = (name: "active", dataType: cdtBool, maxLen: 0)
+    let pk = dataRowValueToPkValue(v, colSpec)
+    check pk.isNull == true
+    check pk.kind == cdtBool
+
+  test "null value bytes":
+    let v = newRowValue()
+    let colSpec = (name: "data", dataType: cdtBytes, maxLen: 64)
+    let pk = dataRowValueToPkValue(v, colSpec)
+    check pk.isNull == true
+    check pk.kind == cdtBytes
+    check pk.bytesMaxLen == 64
+
+  test "null value date":
+    let v = newRowValue()
+    let colSpec = (name: "dt", dataType: cdtDate, maxLen: 0)
+    let pk = dataRowValueToPkValue(v, colSpec)
+    check pk.isNull == true
+    check pk.kind == cdtDate
+
+  test "null value datetime":
+    let v = newRowValue()
+    let colSpec = (name: "ts", dataType: cdtDateTime, maxLen: 0)
+    let pk = dataRowValueToPkValue(v, colSpec)
+    check pk.isNull == true
+    check pk.kind == cdtDateTime
+
+  test "null value ULID":
+    let v = newRowValue()
+    let colSpec = (name: "ulid", dataType: cdtULID, maxLen: 0)
+    let pk = dataRowValueToPkValue(v, colSpec)
+    check pk.isNull == true
+    check pk.kind == cdtULID
+
+  test "bytes value":
+    let v = newRowValue("ABC")
+    let colSpec = (name: "data", dataType: cdtBytes, maxLen: 64)
+    let pk = dataRowValueToPkValue(v, colSpec)
+    check pk.isNull == false
+    check pk.kind == cdtBytes
+    check pk.bytesVal.len == 3
+    check pk.bytesVal[0] == uint8('A')
+
+  test "date value":
+    let v = newRowValue(12345'i64)
+    let colSpec = (name: "dt", dataType: cdtDate, maxLen: 0)
+    let pk = dataRowValueToPkValue(v, colSpec)
+    check pk.isNull == false
+    check pk.kind == cdtDate
+    check pk.dateVal == 12345
+
+  test "datetime value":
+    let v = newRowValue(12345'i64)
+    let colSpec = (name: "ts", dataType: cdtDateTime, maxLen: 0)
+    let pk = dataRowValueToPkValue(v, colSpec)
+    check pk.isNull == false
+    check pk.kind == cdtDateTime
+    check pk.datetimeVal == 12345
+
+suite "Planner formatPlanOp DML":
+  test "format Insert":
+    let tid = genTableId()
+    let op = PlanOp(kind: poInsert, insTableName: "users", insTableId: tid,
+        insRows: @["r1", "r2"])
+    let s = formatPlanOp(op)
+    check "Insert" in s
+    check "users" in s
+    check "rows=2" in s
+
+  test "format PointGet":
+    let tid = genTableId()
+    let op = PlanOp(kind: poPointGet, pgTableId: tid, pgKey: "abc",
+        pgColumns: @["id", "name"])
+    let s = formatPlanOp(op)
+    check "PointGet" in s
+    check "abc" in s
+    check "id" in s
+
+  test "format Scan without filter":
+    let tid = genTableId()
+    let op = PlanOp(kind: poScan, scTableId: tid, scColumns: @["id"], scLimit: 0)
+    let s = formatPlanOp(op)
+    check "Scan" in s
+    check "id" in s
+
+  test "format Scan with filter":
+    let tid = genTableId()
+    let filter = Expr(kind: exBinOp, binOp: boEq,
+      binLeft: Expr(kind: exColumn, colName: "status"),
+      binRight: Expr(kind: exLiteral, litValue: newValueRef("active")))
+    let op = PlanOp(kind: poScan, scTableId: tid, scColumns: @["id"],
+                    scFilter: some(filter), scLimit: 10)
+    let s = formatPlanOp(op)
+    check "Scan" in s
+    check "filter=" in s
+    check "status" in s
+    check "limit=10" in s
+
+  test "format Update without filter":
+    let tid = genTableId()
+    let op = PlanOp(kind: poUpdate, upTableName: "users", upTableId: tid,
+                    upSets: @[("name", Expr(kind: exLiteral,
+                        litValue: newValueRef("test")))])
+    let s = formatPlanOp(op)
+    check "Update" in s
+    check "users" in s
+    check "1 cols" in s
+
+  test "format Update with filter":
+    let tid = genTableId()
+    let filter = Expr(kind: exBinOp, binOp: boGt,
+      binLeft: Expr(kind: exColumn, colName: "age"),
+      binRight: Expr(kind: exLiteral, litValue: newValueRef(18'i64)))
+    let op = PlanOp(kind: poUpdate, upTableName: "users", upTableId: tid,
+                    upFilter: some(filter), upSets: @[("age", Expr(
+                        kind: exLiteral))])
+    let s = formatPlanOp(op)
+    check "Update" in s
+    check "filter=" in s
+    check "age" in s
+
+  test "format Delete without filter":
+    let tid = genTableId()
+    let op = PlanOp(kind: poDelete, delTableName: "logs", delTableId: tid)
+    let s = formatPlanOp(op)
+    check "Delete" in s
+    check "logs" in s
+
+  test "format Delete with filter":
+    let tid = genTableId()
+    let filter = Expr(kind: exBinOp, binOp: boLt,
+      binLeft: Expr(kind: exColumn, colName: "created"),
+      binRight: Expr(kind: exLiteral, litValue: newValueRef(100'i64)))
+    let op = PlanOp(kind: poDelete, delTableName: "logs", delTableId: tid,
+                    delFilter: some(filter))
+    let s = formatPlanOp(op)
+    check "Delete" in s
+    check "filter=" in s
+    check "created" in s
+
 suite "Planner PlanError":
   test "PlanError type exists":
     var e: ref PlanError
     new e
     e.msg = "table not found"
     check e.msg == "table not found"
+
+suite "Planner planStatement DDL (no client required)":
+
+  test "planCreateDatabase creates correct plan":
+    let stmt = Stmt(
+      kind: stmtCreateDatabase,
+      cdbName: "testdb",
+      cdbIfNotExists: false,
+      cdbReplicas: some(3)
+    )
+    let plan = planStatement(stmt, nil)
+    check plan.ops.len == 1
+    check plan.ops[0].kind == poCreateDatabase
+    check plan.ops[0].cdbName == "testdb"
+    check plan.ops[0].cdbIfNotExists == false
+    check plan.ops[0].cdbReplicas.isSome
+    check plan.ops[0].cdbReplicas.get == 3
+
+  test "planCreateDatabase with IF NOT EXISTS":
+    let stmt = Stmt(
+      kind: stmtCreateDatabase,
+      cdbName: "mydb",
+      cdbIfNotExists: true,
+      cdbReplicas: none(int)
+    )
+    let plan = planStatement(stmt, nil)
+    check plan.ops.len == 1
+    check plan.ops[0].cdbIfNotExists == true
+    check plan.ops[0].cdbReplicas.isNone
+
+  test "planDropDatabase creates correct plan":
+    let stmt = Stmt(
+      kind: stmtDropDatabase,
+      ddbName: "testdb",
+      ddbIfExists: false
+    )
+    let plan = planStatement(stmt, nil)
+    check plan.ops.len == 1
+    check plan.ops[0].kind == poDropDatabase
+    check plan.ops[0].ddbName == "testdb"
+    check plan.ops[0].ddbIfExists == false
+
+  test "planDropDatabase with IF EXISTS":
+    let stmt = Stmt(
+      kind: stmtDropDatabase,
+      ddbName: "old_db",
+      ddbIfExists: true
+    )
+    let plan = planStatement(stmt, nil)
+    check plan.ops[0].ddbIfExists == true
+
+  test "planCreateSchema creates correct plan":
+    let stmt = Stmt(
+      kind: stmtCreateSchema,
+      csName: "reporting",
+      csIfNotExists: false,
+      csReplicas: none(int)
+    )
+    let plan = planStatement(stmt, nil, database = "mydb")
+    check plan.ops.len == 1
+    check plan.ops[0].kind == poCreateSchema
+    check plan.ops[0].csName == "reporting"
+    check plan.ops[0].csDatabase == "mydb"
+
+  test "planCreateSchema with replicas":
+    let stmt = Stmt(
+      kind: stmtCreateSchema,
+      csName: "analytics",
+      csIfNotExists: true,
+      csReplicas: some(5)
+    )
+    let plan = planStatement(stmt, nil, database = "production")
+    check plan.ops[0].csIfNotExists == true
+    check plan.ops[0].csReplicas.isSome
+    check plan.ops[0].csReplicas.get == 5
+
+  test "planDropSchema creates correct plan":
+    let stmt = Stmt(
+      kind: stmtDropSchema,
+      dsName: "old_schema",
+      dsIfExists: false
+    )
+    let plan = planStatement(stmt, nil, database = "mydb")
+    check plan.ops.len == 1
+    check plan.ops[0].kind == poDropSchema
+    check plan.ops[0].dsName == "old_schema"
+    check plan.ops[0].dsDatabase == "mydb"
+
+  test "planDropSchema with IF EXISTS":
+    let stmt = Stmt(
+      kind: stmtDropSchema,
+      dsName: "deprecated",
+      dsIfExists: true
+    )
+    let plan = planStatement(stmt, nil, database = "testdb")
+    check plan.ops[0].dsIfExists == true
+
+  test "planCreateSpace creates correct plan":
+    let stmt = Stmt(
+      kind: stmtCreateSpace,
+      csSpaceName: "production",
+      csSpaceReplicas: 3
+    )
+    let plan = planStatement(stmt, nil)
+    check plan.ops.len == 1
+    check plan.ops[0].kind == poCreateSpace
+    check plan.ops[0].cspName == "production"
+    check plan.ops[0].cspReplicas == 3
+
+  test "planCreateSpace with 0 replicas (ALL)":
+    let stmt = Stmt(
+      kind: stmtCreateSpace,
+      csSpaceName: "all_nodes_space",
+      csSpaceReplicas: 0
+    )
+    let plan = planStatement(stmt, nil)
+    check plan.ops[0].cspReplicas == 0
+
+  test "planDropSpace creates correct plan":
+    let stmt = Stmt(
+      kind: stmtDropSpace,
+      dsSpaceName: "old_space"
+    )
+    let plan = planStatement(stmt, nil)
+    check plan.ops.len == 1
+    check plan.ops[0].kind == poDropSpace
+    check plan.ops[0].dspName == "old_space"
+
+  test "planStatement stmtShowDatabases":
+    let stmt = Stmt(kind: stmtShowDatabases)
+    let plan = planStatement(stmt, nil)
+    check plan.ops.len == 1
+    check plan.ops[0].kind == poShowDatabases
+
+  test "planStatement stmtShowSchemas":
+    let stmt = Stmt(kind: stmtShowSchemas, showSchemasDb: "mydb")
+    let plan = planStatement(stmt, nil)
+    check plan.ops.len == 1
+    check plan.ops[0].kind == poShowSchemas
+    check plan.ops[0].ssDatabase == "mydb"
+
+  test "planStatement stmtShowSchemas with empty db uses current":
+    let stmt = Stmt(kind: stmtShowSchemas, showSchemasDb: "")
+    let plan = planStatement(stmt, nil, database = "default")
+    check plan.ops[0].ssDatabase == "default"
+
+  test "planStatement stmtShowTables":
+    let stmt = Stmt(
+      kind: stmtShowTables,
+      showTablesDb: "mydb",
+      showTablesSchema: "public"
+    )
+    let plan = planStatement(stmt, nil)
+    check plan.ops.len == 1
+    check plan.ops[0].kind == poShowTables
+    check plan.ops[0].stDatabase == "mydb"
+    check plan.ops[0].stSchema == "public"
+
+  test "planStatement stmtShowTables with empty fields uses defaults":
+    let stmt = Stmt(
+      kind: stmtShowTables,
+      showTablesDb: "",
+      showTablesSchema: ""
+    )
+    let plan = planStatement(stmt, nil, database = "mydb", schema = "reporting")
+    check plan.ops[0].stDatabase == "mydb"
+    check plan.ops[0].stSchema == "reporting"
+
+  test "planStatement stmtShowSpaces":
+    let stmt = Stmt(kind: stmtShowSpaces)
+    let plan = planStatement(stmt, nil)
+    check plan.ops.len == 1
+    check plan.ops[0].kind == poShowSpaces
+
+  test "planStatement stmtUseDatabase":
+    let stmt = Stmt(kind: stmtUseDatabase, useDbName: "newdb")
+    let plan = planStatement(stmt, nil)
+    check plan.ops.len == 1
+    check plan.ops[0].kind == poUseDatabase
+    check plan.ops[0].udName == "newdb"
+
+  test "planStatement stmtUseSchema":
+    let stmt = Stmt(kind: stmtUseSchema, useSchemaName: "analytics")
+    let plan = planStatement(stmt, nil)
+    check plan.ops.len == 1
+    check plan.ops[0].kind == poUseSchema
+    check plan.ops[0].usName == "analytics"
+
+  test "planStatement stmtBegin":
+    let stmt = Stmt(kind: stmtBegin, beginReadOnly: false)
+    let plan = planStatement(stmt, nil)
+    check plan.ops.len == 1
+    check plan.ops[0].kind == poBeginTxn
+    check plan.ops[0].btReadOnly == false
+
+  test "planStatement stmtBegin read-only":
+    let stmt = Stmt(kind: stmtBegin, beginReadOnly: true)
+    let plan = planStatement(stmt, nil)
+    check plan.ops[0].btReadOnly == true
+
+  test "planStatement stmtCommit":
+    let stmt = Stmt(kind: stmtCommit)
+    let plan = planStatement(stmt, nil)
+    check plan.ops.len == 1
+    check plan.ops[0].kind == poCommitTxn
+
+  test "planStatement stmtRollback":
+    let stmt = Stmt(kind: stmtRollback)
+    let plan = planStatement(stmt, nil)
+    check plan.ops.len == 1
+    check plan.ops[0].kind == poRollbackTxn
+
+suite "Planner planCreateTable":
+  test "planCreateTable creates correct plan structure":
+    let stmt = Stmt(
+      kind: stmtCreateTable,
+      ctTable: "users",
+      ctIfNotExists: false,
+      ctColumns: @[
+        ColDef(name: "id", dataType: dtInt, primaryKey: true, notNull: true),
+        ColDef(name: "name", dataType: dtString, maxLen: 100)
+      ],
+      ctPrimaryKey: @[],
+      ctReplicas: none(int),
+      ctSpaceName: none(string)
+    )
+    let plan = planStatement(stmt, nil, database = "mydb", schema = "public")
+    check plan.ops.len == 1
+    check plan.ops[0].kind == poCreateTable
+    check plan.ops[0].ctName == "users"
+    check plan.ops[0].ctDatabase == "mydb"
+    check plan.ops[0].ctSchema == "public"
+    check plan.ops[0].ctIfNotExists == false
+    check plan.ops[0].ctSpaceName.isNone
+
+  test "planCreateTable with IF NOT EXISTS":
+    let stmt = Stmt(
+      kind: stmtCreateTable,
+      ctTable: "products",
+      ctIfNotExists: true,
+      ctColumns: @[ColDef(name: "id", dataType: dtInt)],
+      ctPrimaryKey: @[],
+      ctReplicas: none(int),
+      ctSpaceName: none(string)
+    )
+    let plan = planStatement(stmt, nil)
+    check plan.ops[0].ctIfNotExists == true
+
+  test "planCreateTable with IN SPACE":
+    let stmt = Stmt(
+      kind: stmtCreateTable,
+      ctTable: "orders",
+      ctIfNotExists: false,
+      ctColumns: @[ColDef(name: "id", dataType: dtInt)],
+      ctPrimaryKey: @["id"],
+      ctReplicas: none(int),
+      ctSpaceName: some("production_space")
+    )
+    let plan = planStatement(stmt, nil)
+    check plan.ops[0].ctSpaceName.isSome
+    check plan.ops[0].ctSpaceName.get == "production_space"
+
+  test "planCreateTable with table-level primary key":
+    let stmt = Stmt(
+      kind: stmtCreateTable,
+      ctTable: "composite_pk_table",
+      ctIfNotExists: false,
+      ctColumns: @[
+        ColDef(name: "user_id", dataType: dtInt),
+        ColDef(name: "order_id", dataType: dtInt)
+      ],
+      ctPrimaryKey: @["user_id", "order_id"],
+      ctReplicas: none(int),
+      ctSpaceName: none(string)
+    )
+    let plan = planStatement(stmt, nil)
+    check plan.ops[0].kind == poCreateTable
+
+suite "Planner planDropTable":
+  test "planDropTable creates correct plan":
+    let stmt = Stmt(
+      kind: stmtDropTable,
+      dtTable: "old_table",
+      dtIfExists: false
+    )
+    let plan = planStatement(stmt, nil, database = "mydb", schema = "public")
+    check plan.ops.len == 1
+    check plan.ops[0].kind == poDropTable
+    check plan.ops[0].dtName == "old_table"
+    check plan.ops[0].dtDatabase == "mydb"
+    check plan.ops[0].dtSchema == "public"
+    check plan.ops[0].dtIfExists == false
+
+  test "planDropTable with IF EXISTS":
+    let stmt = Stmt(
+      kind: stmtDropTable,
+      dtTable: "deprecated_table",
+      dtIfExists: true
+    )
+    let plan = planStatement(stmt, nil)
+    check plan.ops[0].dtIfExists == true
+
+suite "Planner stmtExplain":
+  test "planStatement stmtExplain wraps inner plan":
+    let innerStmt = Stmt(kind: stmtShowDatabases)
+    let stmt = Stmt(kind: stmtExplain, explainStmt: innerStmt)
+    let plan = planStatement(stmt, nil)
+    check plan.ops.len == 1
+    check plan.ops[0].kind == poExplain
+    check plan.ops[0].exInnerPlan != nil
+    check plan.ops[0].exInnerPlan.ops.len == 1
+    check plan.ops[0].exInnerPlan.ops[0].kind == poShowDatabases
+
+  test "planStatement stmtExplain with CREATE DATABASE":
+    let innerStmt = Stmt(
+      kind: stmtCreateDatabase,
+      cdbName: "explained_db",
+      cdbIfNotExists: false,
+      cdbReplicas: none(int)
+    )
+    let stmt = Stmt(kind: stmtExplain, explainStmt: innerStmt)
+    let plan = planStatement(stmt, nil)
+    check plan.ops[0].kind == poExplain
+    check plan.ops[0].exInnerPlan.ops[0].kind == poCreateDatabase
+    check plan.ops[0].exInnerPlan.ops[0].cdbName == "explained_db"
