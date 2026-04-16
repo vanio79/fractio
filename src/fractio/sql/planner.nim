@@ -12,6 +12,7 @@ import ../distributed/meta/system_schemas
 import ../client/fractio_client
 import ../core/types as coreTypes
 import ../core/primary_key
+import ../core/kv_interface # for KVOpResult isErr/isOk procs
 
 # ---------------------------------------------------------------------------
 # Plan types

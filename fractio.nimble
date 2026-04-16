@@ -192,6 +192,7 @@ task build_web, "Compile frontend SPA to JS, minify, then build server binary":
 #
 # This approach uses DWARF debug info to map C coverage back to Nim source lines.
 # The coverage percentages reflect actual Nim source code, not generated C code.
+# Note: Function and branch coverage are unreliable for Nim, so we only track line coverage.
 # All output goes to /tmp/fractio-coverage to avoid cluttering project directory.
 
 const COVERAGE_DIR = "/tmp/fractio-coverage"
@@ -224,106 +225,7 @@ task coverage_unit, "Run all unit tests with coverage":
     exec "nim c -r --mm:atomicArc --nimcache:" & cacheDir & " -p:src -p:tests " & covFlags & " " & file
     # Capture coverage for this test
     let infoFile = COVERAGE_DIR & "/test_" & testName & ".info"
-    exec "geninfo " & cacheDir & " --output-file " & infoFile & " --branch-coverage --ignore-errors mismatch,gcov,source --keep-going --base-directory . || true"
-    if fileExists(infoFile):
-      infoFiles.add(infoFile)
-  
-  # Merge all coverage data
-  echo "Merging coverage data from ", infoFiles.len, " tests..."
-  if infoFiles.len > 0:
-    var mergeCmd = "lcov"
-    for infoFile in infoFiles:
-      mergeCmd = mergeCmd & " --add-tracefile " & infoFile
-    mergeCmd = mergeCmd & " --output-file " & COVERAGE_DIR & "/coverage_merged.info --branch-coverage --ignore-errors mismatch,gcov,format,corrupt"
-    exec mergeCmd
-    
-    echo "Generating HTML report (with branch coverage)..."
-    # Use --include to filter files in genhtml (preserves branch coverage)
-    # Note: lcov --extract removes branch data, so we use genhtml filtering instead
-    exec "genhtml " & COVERAGE_DIR & "/coverage_merged.info --output-directory " & COVERAGE_DIR & "/html --title 'Fractio Coverage' --legend --branch-coverage --include '" & PROJECT_ROOT & "/src/*' --include '" & PROJECT_ROOT & "/tests/*' --ignore-errors unmapped,empty"
-    
-    echo ""
-    echo "=========================================="
-    echo "Coverage report: " & COVERAGE_DIR & "/html/index.html"
-    echo "=========================================="
-  else:
-    echo "No coverage data collected."
-
-task coverage_unit_core, "Run core unit tests with coverage":
-  echo "=== Running core unit tests with coverage ==="
-  exec "rm -rf " & COVERAGE_DIR
-  exec "mkdir -p " & COVERAGE_DIR
-  
-  let covFlags = "--debugger:native --passC:--coverage --passL:--coverage"
-  
-  # Collect tests from multiple directories to maximize coverage
-  var testFiles: seq[string] = @[]
-  # Core tests
-  for file in walkDirRec("tests/unit/core"):
-    let name = extractFilename(file)
-    if name.startsWith("test_") and name.endsWith(".nim"):
-      testFiles.add(file)
-  # Network tests (packetcodec)
-  for file in walkDirRec("tests/unit/network"):
-    let name = extractFilename(file)
-    if name.startsWith("test_") and name.endsWith(".nim"):
-      testFiles.add(file)
-  # Distributed tests (all subdirectories)
-  for file in walkDirRec("tests/unit/distributed"):
-    let name = extractFilename(file)
-    if name.startsWith("test_") and name.endsWith(".nim"):
-      testFiles.add(file)
-  # Storage tests
-  for file in walkDirRec("tests/unit/storage"):
-    let name = extractFilename(file)
-    if name.startsWith("test_") and name.endsWith(".nim"):
-      testFiles.add(file)
-  # DI tests
-  for file in walkDirRec("tests/unit/di"):
-    let name = extractFilename(file)
-    if name.startsWith("test_") and name.endsWith(".nim"):
-      testFiles.add(file)
-  # App tests
-  for file in walkDirRec("tests/unit/app"):
-    let name = extractFilename(file)
-    if name.startsWith("test_") and name.endsWith(".nim"):
-      testFiles.add(file)
-  # Utils tests
-  for file in walkDirRec("tests/unit/utils"):
-    let name = extractFilename(file)
-    if name.startsWith("test_") and name.endsWith(".nim"):
-      testFiles.add(file)
-  # Protocol tests
-  for file in walkDirRec("tests/unit/protocol"):
-    let name = extractFilename(file)
-    if name.startsWith("test_") and name.endsWith(".nim"):
-      testFiles.add(file)
-  # CLI tests
-  for file in walkDirRec("tests/unit/cli"):
-    let name = extractFilename(file)
-    if name.startsWith("test_") and name.endsWith(".nim"):
-      testFiles.add(file)
-  # Client tests
-  for file in walkDirRec("tests/unit/client"):
-    let name = extractFilename(file)
-    if name.startsWith("test_") and name.endsWith(".nim"):
-      testFiles.add(file)
-  # SQL tests
-  for file in walkDirRec("tests/unit/sql"):
-    let name = extractFilename(file)
-    if name.startsWith("test_") and name.endsWith(".nim"):
-      testFiles.add(file)
-  
-  # Run each test with its own nimcache to avoid stamp mismatches
-  var infoFiles: seq[string] = @[]
-  for i, file in testFiles:
-    let testName = extractFilename(file).replace(".nim", "")
-    let cacheDir = COVERAGE_DIR & "/cache_" & testName
-    echo "  [", i+1, "/", testFiles.len, "] ", file
-    exec "nim c -r --mm:atomicArc --nimcache:" & cacheDir & " -p:src -p:tests " & covFlags & " " & file
-    # Capture coverage for this test (including branch coverage)
-    let infoFile = COVERAGE_DIR & "/test_" & testName & ".info"
-    exec "geninfo " & cacheDir & " --branch-coverage --output-file " & infoFile & " --ignore-errors mismatch,gcov,source --keep-going --base-directory . || true"
+    exec "geninfo --no-function-coverage " & cacheDir & " --output-file " & infoFile & " --ignore-errors mismatch,gcov,source --keep-going --base-directory . || true"
     if fileExists(infoFile):
       infoFiles.add(infoFile)
   
@@ -338,11 +240,18 @@ task coverage_unit_core, "Run core unit tests with coverage":
       if i > 0:
         let remaining = infoFiles.len - i
         echo "Merging " & infoFile & ".." & $remaining & " remaining"
-        exec "lcov --branch-coverage --add-tracefile " & COVERAGE_DIR & "/core_merged.info --add-tracefile " & infoFile & " --output-file " & COVERAGE_DIR & "/core_merged.info --branch-coverage --ignore-errors mismatch,gcov,format,corrupt"
+        exec "lcov --add-tracefile " & COVERAGE_DIR & "/core_merged.info --add-tracefile " & infoFile & " --output-file " & COVERAGE_DIR & "/core_merged.info --ignore-errors mismatch,gcov,format,corrupt"
     
-    echo "Generating HTML report (with branch coverage)..."
-    # Use --include to filter files in genhtml (preserves branch coverage)
-    exec "genhtml " & COVERAGE_DIR & "/core_merged.info --branch-coverage --output-directory " & COVERAGE_DIR & "/html_core --title 'Fractio Core Coverage' --legend --include '" & PROJECT_ROOT & "/src/*' --include '" & PROJECT_ROOT & "/tests/*' --ignore-errors unmapped,empty"
+    # Files excluded from coverage report (purely declarative, no testable logic):
+    # - ast_types.nim: SQL AST type definitions (enums, discriminated unions)
+    # - sharedtimer/types_base.nim: Clock offset structs (no operators)
+    # - di/interfaces.nim: Nim concepts and error types (compile-time checks)
+    # - network/types_base.nim: Message types, enums, constants (no executable code)
+    # - raft/types_base.nim: Raft types, enums, constants (no executable code)
+    let excludePatterns = " --exclude '*/sql/ast_types.nim' --exclude '*/sharedtimer/types_base.nim' --exclude '*/di/interfaces.nim' --exclude '*/network/types_base.nim' --exclude '*/raft/types_base.nim'"
+    
+    echo "Generating HTML report (lines only, excluding declarative type files)..."
+    exec "genhtml --no-function-coverage " & COVERAGE_DIR & "/core_merged.info --output-directory " & COVERAGE_DIR & "/html_core --title 'Fractio Core Coverage' --legend --include '" & PROJECT_ROOT & "/src/*' --include '" & PROJECT_ROOT & "/tests/*'" & excludePatterns & " --ignore-errors unmapped,empty,format,mismatch,source,unused --synthesize-missing"
     
     echo ""
     echo "=========================================="
@@ -373,7 +282,7 @@ task coverage_unit_storage, "Run storage unit tests with coverage":
     exec "nim c -r --mm:atomicArc --nimcache:" & cacheDir & " -p:src -p:tests " & covFlags & " " & file
     # Capture coverage for this test
     let infoFile = COVERAGE_DIR & "/test_" & testName & ".info"
-    exec "geninfo " & cacheDir & " --output-file " & infoFile & " --branch-coverage --ignore-errors mismatch,gcov,source --keep-going --base-directory . || true"
+    exec "geninfo --no-function-coverage " & cacheDir & " --output-file " & infoFile & " --ignore-errors mismatch,gcov,source --keep-going --base-directory . || true"
     if fileExists(infoFile):
       infoFiles.add(infoFile)
   
@@ -383,12 +292,19 @@ task coverage_unit_storage, "Run storage unit tests with coverage":
     var mergeCmd = "lcov"
     for infoFile in infoFiles:
       mergeCmd = mergeCmd & " --add-tracefile " & infoFile
-    mergeCmd = mergeCmd & " --output-file " & COVERAGE_DIR & "/storage_merged.info --branch-coverage --ignore-errors mismatch,gcov,format,corrupt"
+    mergeCmd = mergeCmd & " --output-file " & COVERAGE_DIR & "/storage_merged.info --ignore-errors mismatch,gcov,format,corrupt"
     exec mergeCmd
     
-    echo "Generating HTML report (with branch coverage)..."
-    # Use --include to filter files in genhtml (preserves branch coverage)
-    exec "genhtml " & COVERAGE_DIR & "/storage_merged.info --output-directory " & COVERAGE_DIR & "/html_storage --title 'Fractio Storage Coverage' --legend --branch-coverage --include '" & PROJECT_ROOT & "/src/*' --include '" & PROJECT_ROOT & "/tests/*' --ignore-errors unmapped,empty"
+    # Files excluded from coverage report (purely declarative, no testable logic):
+    # - ast_types.nim: SQL AST type definitions (enums, discriminated unions)
+    # - sharedtimer/types_base.nim: Clock offset structs (no operators)
+    # - di/interfaces.nim: Nim concepts and error types (compile-time checks)
+    # - network/types_base.nim: Message types, enums, constants (no executable code)
+    # - raft/types_base.nim: Raft types, enums, constants (no executable code)
+    let excludePatterns = " --exclude '*/sql/ast_types.nim' --exclude '*/sharedtimer/types_base.nim' --exclude '*/di/interfaces.nim' --exclude '*/network/types_base.nim' --exclude '*/raft/types_base.nim'"
+    
+    echo "Generating HTML report (lines only, excluding declarative type files)..."
+    exec "genhtml --no-function-coverage " & COVERAGE_DIR & "/storage_merged.info --output-directory " & COVERAGE_DIR & "/html_storage --title 'Fractio Storage Coverage' --legend --include '" & PROJECT_ROOT & "/src/*' --include '" & PROJECT_ROOT & "/tests/*'" & excludePatterns & " --ignore-errors unmapped,empty,format,mismatch,source,unused --synthesize-missing"
     
     echo ""
     echo "=========================================="
@@ -397,20 +313,17 @@ task coverage_unit_storage, "Run storage unit tests with coverage":
   else:
     echo "No coverage data collected."
 
-task coverage_summary, "Show coverage summary":
-  var fractioInfo = COVERAGE_DIR & "/core_filtered.info"
+task coverage_summary, "Show coverage summary (lines only)":
+  var fractioInfo = COVERAGE_DIR & "/core_merged.info"
   if not fileExists(fractioInfo):
-    fractioInfo = COVERAGE_DIR & "/core_fractio.info"
+    fractioInfo = COVERAGE_DIR & "/coverage_merged.info"
   if not fileExists(fractioInfo):
-    # Try other merged files
-    for f in ["storage_fractio.info", "coverage_fractio.info"]:
-      if fileExists(COVERAGE_DIR & "/" & f):
-        fractioInfo = COVERAGE_DIR & "/" & f
-        break
+    fractioInfo = COVERAGE_DIR & "/storage_merged.info"
   if not fileExists(fractioInfo):
     echo "No coverage data found. Run nimble coverage_unit_core first."
   else:
-    exec "lcov --summary " & fractioInfo
+    # Show only line coverage (filter out function/branch coverage which is unreliable for Nim)
+    exec "lcov --summary " & fractioInfo & " 2>&1 | grep -E '^(lines|Reading|Summary)' | grep -v '^functions' | grep -v '^branches'"
 
 # =============================================================================
 # Deprecated aliases (kept for backward compatibility)

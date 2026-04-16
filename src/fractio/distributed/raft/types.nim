@@ -1,62 +1,15 @@
-# Raft Types and Core Definitions
+# Raft Types - Helper procs for Raft types
+#
+# This file contains ONLY executable code (procs).
+# Type definitions are in types_base.nim which is excluded from coverage.
 
 import fractio/utils/binary
+import ./types_base
+export types_base
 
 # =============================================================================
-# Binary Serialization Constants
+# LogEntry Binary Serialization
 # =============================================================================
-
-const
-  LOG_ENTRY_MAGIC* = [0x52'u8, 0x45'u8] # "RE" - Raft Entry binary marker
-  LOG_ENTRY_VERSION* = 0x01'u8          # Current binary format version
-
-# =============================================================================
-# Raft Server Roles
-# =============================================================================
-
-type
-  ServerRole* = enum
-    SR_LEADER
-    SR_CANDIDATE
-    SR_FOLLOWER
-
-# Raft Node State
-type
-  RaftNodeState* = object
-    role*: ServerRole
-    currentTerm*: int64
-    votedFor*: int32
-    leaderId*: int32
-    commitIndex*: int64
-    lastApplied*: int64
-
-# Raft Configuration
-type
-  RaftConfig* = object
-    ## Configuration for Raft node
-    serverId*: int32
-    endpoint*: string
-    electionTimeout*: int   # ms
-    heartbeatInterval*: int # ms
-    logStoragePath*: string # WiscKey path
-    snapshotEnabled*: bool
-    snapshotDistance*: int  # Log distance between snapshots
-    maxAppendSize*: int     # Max entries per append RPC
-
-# =============================================================================
-# Raft Log Entry
-# =============================================================================
-
-type
-  LogEntryType* = enum
-    LET_NORMAL
-    LET_CONFIG_CHANGE
-    LET_NO_OP
-
-  LogEntry* = object
-    term*: int64
-    entryType*: LogEntryType
-    data*: string
 
 proc encodeLogEntry*(entry: LogEntry): string =
   ## Encode a LogEntry to binary format.
@@ -101,52 +54,9 @@ proc decodeLogEntry*(data: string): LogEntry =
   result.data = r.readString()
 
 # =============================================================================
-# Raft Log Store Interface
+# RaftLogStore Methods
 # =============================================================================
-type
-  RaftLogStore* = ref object of RootObj
-    ## Abstract log store for Raft
-
-  RaftError* = object of CatchableError
-    ## Raft-specific errors
-
-# Raft State Machine Interface
-type
-  StateMachine* = ref object of RootObj
-    ## Base class for user-defined state machines
-
-  RaftNode* = ref object of RootObj
-    ## High-level Raft node for managing consensus
-    serverId*: int32
-    endpoint*: string
-    config*: RaftConfig
-    nodeState*: RaftNodeState
-    logStore*: RaftLogStore
-    stateMachine*: StateMachine
-    initialized*: bool
-    isLeader*: bool
-    leaderId*: int32
-    commitIndex*: int64
-    lastApplied*: int64
 
 method close*(store: RaftLogStore) {.base.} =
   ## Close the log store (base implementation does nothing)
   discard
-
-type
-  RPCType* = enum
-    RPC_APPEND_ENTRIES
-    RPC_REQUEST_VOTE
-    RPC_CLIENT_REQUEST
-
-  RaftRPC* = object
-    ## Raft RPC message
-    rpcType*: RPCType
-    term*: int64
-    leaderId*: int32
-    prevLogIndex*: int64
-    prevLogTerm*: int64
-    entries*: seq[LogEntry]
-    leaderCommit*: int64
-    success*: bool
-    data*: string

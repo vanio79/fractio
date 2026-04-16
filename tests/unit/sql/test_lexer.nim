@@ -797,4 +797,256 @@ suite "Lexer Position Tracking":
     var l = newLexer("\n\nSELECT")
     let t = l.nextToken()
     check t.line == 3
+
+suite "Lexer Edge Cases":
+
+  test "lexer handles comment":
+    let toks = tokenize("SELECT /* comment */ 1")
+    check toks[0].kind == tkSelect
+    check toks[1].kind == tkInt # 1 - comment skipped
+
+  test "lexer handles single line comment":
+    let toks = tokenize("SELECT 1 -- comment\n2")
+    check toks[0].kind == tkSelect
+    check toks[1].kind == tkInt # 1
+    check toks[2].kind == tkInt # 2 - comment skipped
+
+  test "lexer handles block comment (not nested)":
+    # Lexer does not support nested comments - first */ ends the comment
+    let toks = tokenize("SELECT /* comment */ 1")
+    check toks[0].kind == tkSelect
+    check toks[1].kind == tkInt
+
+  test "lexer handles unterminated comment":
+    let toks = tokenize("SELECT /* unterminated")
+    check toks[0].kind == tkSelect
+    # Unterminated comment consumes all remaining input and returns EOF
+
+  test "lexer handles special characters":
+    let toks = tokenize("SELECT * FROM t WHERE a = b")
+    # SELECT(0) *(1) FROM(2) t(3) WHERE(4) a(5) =(6) b(7) EOF(8)
+    check toks[1].kind == tkStar
+    check toks[3].kind == tkIdent
+    check toks[5].kind == tkIdent
+    check toks[6].kind == tkEq # = is at index 6, not 7
+    check toks[7].kind == tkIdent # b is at index 7
+
+  test "lexer handles parentheses":
+    let toks = tokenize("(SELECT)")
+    check toks[0].kind == tkLParen
+    check toks[1].kind == tkSelect
+    check toks[2].kind == tkRParen
+
+  test "lexer handles operators":
+    let toks = tokenize("a <> b <= c >= d")
+    check toks[1].kind == tkNeq
+    check toks[3].kind == tkLte
+    check toks[5].kind == tkGte
+
+  test "lexer handles arithmetic":
+    let toks = tokenize("1 + 2 - 3")
+    check toks[1].kind == tkPlus
+    check toks[3].kind == tkMinus
+
+  test "lexer handles logical operators":
+    let toks = tokenize("a AND b OR c")
+    check toks[1].kind == tkAnd
+    check toks[3].kind == tkOr
+
+  test "lexer handles IS NULL":
+    let toks = tokenize("a IS NULL")
+    check toks[1].kind == tkIs
+    check toks[2].kind == tkNull
+
+  test "lexer handles IS NOT NULL":
+    let toks = tokenize("a IS NOT NULL")
+    check toks[1].kind == tkIs
+    check toks[2].kind == tkNot
+    check toks[3].kind == tkNull
+
+  test "lexer handles BETWEEN":
+    let toks = tokenize("a BETWEEN 1 AND 10")
+    check toks[1].kind == tkBetween
+    check toks[2].kind == tkInt
+    check toks[3].kind == tkAnd
+    check toks[4].kind == tkInt
+
+  test "lexer handles LIKE":
+    let toks = tokenize("name LIKE 'pattern'")
+    check toks[1].kind == tkLike
+    check toks[2].kind == tkString
+
+  test "lexer handles IN":
+    let toks = tokenize("a IN (1, 2, 3)")
+    check toks[1].kind == tkIn
+    check toks[2].kind == tkLParen
+
+  test "lexer handles DISTINCT":
+    let toks = tokenize("SELECT DISTINCT a")
+    check toks[1].kind == tkDistinct
+
+  test "lexer handles ORDER BY":
+    let toks = tokenize("ORDER BY a DESC")
+    check toks[0].kind == tkOrder
+    check toks[1].kind == tkBy
+    check toks[3].kind == tkDesc
+
+  test "lexer handles LIMIT OFFSET":
+    let toks = tokenize("LIMIT 10 OFFSET 5")
+    check toks[0].kind == tkLimit
+    check toks[1].kind == tkInt
+    check toks[2].kind == tkOffset
+    check toks[3].kind == tkInt
+
+  test "lexer handles NULL keyword":
+    let toks = tokenize("INSERT NULL")
+    check toks[0].kind == tkInsert
+    check toks[1].kind == tkNull
+
+  test "lexer handles boolean literals":
+    let toks = tokenize("TRUE FALSE")
+    check toks[0].kind == tkTrue
+    check toks[1].kind == tkFalse
+
+  test "lexer handles INTO":
+    let toks = tokenize("INSERT INTO t")
+    check toks[1].kind == tkInto
+
+  test "lexer handles VALUES":
+    let toks = tokenize("VALUES (1, 2)")
+    check toks[0].kind == tkValues
+
+  test "lexer handles SET":
+    let toks = tokenize("SET a = 1")
+    check toks[0].kind == tkSet
+
+  test "lexer handles FROM":
+    let toks = tokenize("FROM table")
+    check toks[0].kind == tkFrom
+
+  test "lexer handles WHERE":
+    let toks = tokenize("WHERE a = 1")
+    check toks[0].kind == tkWhere
+
+  test "lexer handles USE":
+    let toks = tokenize("USE DATABASE db")
+    check toks[0].kind == tkUse
+
+  test "lexer handles SHOW":
+    let toks = tokenize("SHOW TABLES")
+    check toks[0].kind == tkShow
+
+  test "lexer handles DATABASES":
+    let toks = tokenize("SHOW DATABASES")
+    check toks[1].kind == tkDatabases
+
+  test "lexer handles SCHEMAS":
+    let toks = tokenize("SHOW SCHEMAS")
+    check toks[1].kind == tkSchemas
+
+  test "lexer handles TABLES":
+    let toks = tokenize("SHOW TABLES")
+    check toks[1].kind == tkTables
+
+  test "lexer handles SPACES":
+    let toks = tokenize("SHOW SPACES")
+    check toks[1].kind == tkSpaces
+
+  test "lexer handles SPACE":
+    let toks = tokenize("CREATE SPACE s")
+    check toks[1].kind == tkSpace
+
+  test "lexer handles DOT for qualified names":
+    let toks = tokenize("schema.table.column")
+    check toks[1].kind == tkDot
+    check toks[3].kind == tkDot
+
+  test "lexer handles BETWEEN AND correctly":
+    let toks = tokenize("a BETWEEN 1 AND 2 AND b = 3")
+    check toks[1].kind == tkBetween
+    check toks[3].kind == tkAnd # BETWEEN's AND
+    check toks[5].kind == tkAnd # Logical AND
+
+  test "lexer handles multiple newlines":
+    let toks = tokenize("SELECT\n\n\n1")
+    check toks[0].kind == tkSelect
+    check toks[1].kind == tkInt
+
+  test "lexer handles tabs":
+    let toks = tokenize("\tSELECT\t1")
+    check toks[0].kind == tkSelect
+    check toks[1].kind == tkInt
+
+  test "lexer handles mixed whitespace":
+    let toks = tokenize(" \t\n SELECT \t\n 1")
+    check toks[0].kind == tkSelect
+    check toks[1].kind == tkInt
+
+  test "newLexer initializes correctly":
+    var l = newLexer("SELECT")
+    let t = l.nextToken()
+    check t.kind == tkSelect
+
+  test "tokenize returns EOF for empty string":
+    let toks = tokenize("")
+    # Empty input returns one EOF token
+    check toks.len == 1
+    check toks[0].kind == tkEOF
+
+  test "tokenize returns EOF for whitespace":
+    let toks = tokenize("   \t\n  ")
+    # Whitespace-only input returns one EOF token
+    check toks.len == 1
+    check toks[0].kind == tkEOF
+
+  test "lexer handles negative numbers":
+    let toks = tokenize("-123")
+    check toks[0].kind == tkMinus
+    check toks[1].kind == tkInt
+
+  test "lexer handles decimal start as dot then integer":
+    let toks = tokenize(".5")
+    # Lexer parses .5 as tkDot followed by tkInt(5)
+    # A number starting with dot requires digits before the dot
+    check toks[0].kind == tkDot
+    check toks[1].kind == tkInt
+
+  test "lexer handles exponent":
+    let toks = tokenize("1e10")
+    check toks[0].kind == tkFloat
+
+  test "lexer handles unterminated string":
+    let toks = tokenize("'unterminated")
+    check toks[0].kind == tkError
+
+  test "lexer handles escape sequences in string":
+    let toks = tokenize("'escaped''quote'")
+    check toks[0].kind == tkString
+
+  test "lexer handles slash operator":
+    let toks = tokenize("10 / 2")
+    check toks[1].kind == tkSlash
+
+  test "lexer handles percent operator":
+    let toks = tokenize("10 % 3")
+    check toks[1].kind == tkPercent
+
+  test "lexer handles lt gt operators":
+    let toks = tokenize("a < b > c")
+    check toks[1].kind == tkLt
+    check toks[3].kind == tkGt
+
+  test "lexer handles comma":
+    let toks = tokenize("a, b, c")
+    check toks[1].kind == tkComma
+    check toks[3].kind == tkComma
+
+  test "lexer handles semicolon":
+    let toks = tokenize("SELECT 1;")
+    check toks[2].kind == tkSemicolon
+
+  test "lexer handles EOF":
+    var l = newLexer("")
+    let t = l.nextToken()
+    check t.kind == tkEOF
     check t.col == 1

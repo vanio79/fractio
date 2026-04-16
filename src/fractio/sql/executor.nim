@@ -3,17 +3,22 @@
 # Executes a Plan against a FractioClient, returning results.
 # Each PlanOp maps directly to KV operations via the client.
 # Supports MVCC transactions through the client's transaction API.
+#
+# Pure expression evaluation functions are in expr_eval.nim and are
+# fully testable without I/O dependencies.
 
 import std/[options, json, strutils, strformat, tables, algorithm]
 import ./ast
 import ./parser
 import ./planner
 import ./data_row
+import ./expr_eval # Pure expression evaluation functions
 import ../distributed/meta/system_tables
 import ../distributed/meta/system_schemas
 import ../distributed/raft/group_types
 import ../client/fractio_client
 import ../core/types as coreTypes
+import ../core/kv_interface # KVStore interface for mockable testing
 
 # ---------------------------------------------------------------------------
 # Result types
@@ -46,7 +51,11 @@ type
       newSchema*: string
 
   ExecutorContext* = ref object
-    ## Execution context for a session, holding transaction state
+    ## Execution context for a session, holding transaction state.
+    ## Uses KVStore interface for mockable KV operations.
+    ## The client field is kept for FractioClient-specific operations
+    ## (space management, routing) that aren't part of the basic KV interface.
+    kv*: KVStore
     client*: FractioClient
     txnId*: TransactionID
     readTimestamp*: uint64
@@ -77,8 +86,10 @@ proc rowsResult*(columns: seq[string], rows: seq[seq[string]]): ExecResult =
 
 proc newExecutorContext*(client: FractioClient, database: string = "default",
     schema: string = "public"): ExecutorContext =
-  ## Create a new executor context with default settings
+  ## Create a new executor context with default settings.
+  ## Uses the FractioClient as the KVStore implementation.
   ExecutorContext(
+    kv: client, # FractioClient implements KVStoreWithRouting
     client: client,
     txnId: client.activeTxnId,
     readTimestamp: client.activeReadTs,
@@ -87,299 +98,37 @@ proc newExecutorContext*(client: FractioClient, database: string = "default",
     schema: schema
   )
 
-# ---------------------------------------------------------------------------
-# Expression evaluator (in-memory, for WHERE filters)
-# ---------------------------------------------------------------------------
-
-proc evalExprDataRow*(expr: Expr, row: DataRow): DataRowValue =
-  ## Evaluate an expression against a DataRow.
-  case expr.kind
-  of exLiteral:
-    if expr.litValue == nil:
-      return newRowValue()
-    case expr.litValue.kind
-    of dtInt: return newRowValue(expr.litValue.intValue)
-    of dtFloat: return newRowValue(expr.litValue.floatValue)
-    of dtString: return newRowValue(expr.litValue.strValue)
-    of dtBool: return newRowValue(expr.litValue.boolValue)
-    else: return newRowValue()
-
-  of exColumn:
-    let name = expr.colName
-    if row.hasColumn(name):
-      return row[name]
-    return newRowValue()
-
-  of exBinOp:
-    let left = evalExprDataRow(expr.binLeft, row)
-    let right = evalExprDataRow(expr.binRight, row)
-
-    case expr.binOp
-    of boEq:
-      return newRowValue(left == right)
-    of boNeq:
-      return newRowValue(left != right)
-    of boLt:
-      return newRowValue(left < right)
-    of boLte:
-      return newRowValue(left <= right)
-    of boGt:
-      return newRowValue(left > right)
-    of boGte:
-      return newRowValue(left >= right)
-    of boAnd:
-      return left and right
-    of boOr:
-      return left or right
-    of boAdd:
-      return left + right
-    of boSub:
-      return left - right
-    of boMul:
-      return left * right
-    of boDiv:
-      return left div right
-    of boMod:
-      return left mod right
-
-  of exUnaryOp:
-    let inner = evalExprDataRow(expr.unaryExpr, row)
-    case expr.unaryOp
-    of uoNot:
-      return not inner
-    of uoNeg:
-      return -inner
-
-  of exIsNull:
-    let inner = evalExprDataRow(expr.isNullExpr, row)
-    let isNull = inner.kind == drvkNull
-    return newRowValue(if expr.isNullNot: not isNull else: isNull)
-
-  of exIn:
-    let val = evalExprDataRow(expr.inExpr, row)
-    var found = false
-    for item in expr.inList:
-      if evalExprDataRow(item, row) == val:
-        found = true
-        break
-    return newRowValue(if expr.inNot: not found else: found)
-
-  of exBetween:
-    let val = evalExprDataRow(expr.betweenExpr, row)
-    let lo = evalExprDataRow(expr.betweenLo, row)
-    let hi = evalExprDataRow(expr.betweenHi, row)
-    var inRange = val >= lo and val <= hi
-    return newRowValue(if expr.betweenNot: not inRange else: inRange)
-
-  of exLike:
-    # Simple LIKE: only handle % wildcard at start/end
-    let val = evalExprDataRow(expr.likeExpr, row)
-    let pat = evalExprDataRow(expr.likePattern, row)
-    if val.kind == drvkString and pat.kind == drvkString:
-      let s = val.strVal
-      let p = pat.strVal
-      var matches = false
-      if p.startsWith("%") and p.endsWith("%"):
-        matches = p[1..^2] in s
-      elif p.startsWith("%"):
-        matches = s.endsWith(p[1..^1])
-      elif p.endsWith("%"):
-        matches = s.startsWith(p[0..^2])
-      else:
-        matches = s == p
-      return newRowValue(if expr.likeNot: not matches else: matches)
-    return newRowValue()
-
-  of exStar, exParam, exList:
-    return newRowValue()
-
-proc matchesFilterDataRow*(filter: Option[Expr], row: DataRow): bool =
-  ## Check if a DataRow passes the WHERE filter.
-  if filter.isNone:
-    return true
-  let result = evalExprDataRow(filter.get(), row)
-  result.kind == drvkBool and result.boolVal
-
-# Legacy JSON-based evaluators (kept for backward compatibility with external code)
-proc evalExpr*(expr: Expr, row: JsonNode): JsonNode =
-  ## Evaluate an expression against a JSON row object.
-  ## DEPRECATED: Use evalExprDataRow with DataRow instead.
-  case expr.kind
-  of exLiteral:
-    if expr.litValue == nil:
-      return newJNull()
-    case expr.litValue.kind
-    of dtInt: return newJInt(expr.litValue.intValue)
-    of dtFloat: return newJFloat(expr.litValue.floatValue)
-    of dtString: return newJString(expr.litValue.strValue)
-    of dtBool: return newJBool(expr.litValue.boolValue)
-    else: return newJNull()
-
-  of exColumn:
-    let name = expr.colName
-    if row.hasKey(name):
-      return row[name]
-    return newJNull()
-
-  of exBinOp:
-    let left = evalExpr(expr.binLeft, row)
-    let right = evalExpr(expr.binRight, row)
-
-    case expr.binOp
-    of boEq:
-      return newJBool(left == right)
-    of boNeq:
-      return newJBool(left != right)
-    of boLt:
-      if left.kind == JInt and right.kind == JInt:
-        return newJBool(left.getInt < right.getInt)
-      if left.kind == JString and right.kind == JString:
-        return newJBool(left.getStr < right.getStr)
-      return newJBool(false)
-    of boLte:
-      if left.kind == JInt and right.kind == JInt:
-        return newJBool(left.getInt <= right.getInt)
-      return newJBool(false)
-    of boGt:
-      if left.kind == JInt and right.kind == JInt:
-        return newJBool(left.getInt > right.getInt)
-      return newJBool(false)
-    of boGte:
-      if left.kind == JInt and right.kind == JInt:
-        return newJBool(left.getInt >= right.getInt)
-      return newJBool(false)
-    of boAnd:
-      return newJBool(left.getBool(false) and right.getBool(false))
-    of boOr:
-      return newJBool(left.getBool(false) or right.getBool(false))
-    of boAdd:
-      if left.kind == JInt and right.kind == JInt:
-        return newJInt(left.getInt + right.getInt)
-      return newJNull()
-    of boSub:
-      if left.kind == JInt and right.kind == JInt:
-        return newJInt(left.getInt - right.getInt)
-      return newJNull()
-    of boMul:
-      if left.kind == JInt and right.kind == JInt:
-        return newJInt(left.getInt * right.getInt)
-      return newJNull()
-    of boDiv:
-      if left.kind == JInt and right.kind == JInt and right.getInt != 0:
-        return newJInt(left.getInt div right.getInt)
-      return newJNull()
-    of boMod:
-      if left.kind == JInt and right.kind == JInt and right.getInt != 0:
-        return newJInt(left.getInt mod right.getInt)
-      return newJNull()
-
-  of exUnaryOp:
-    let inner = evalExpr(expr.unaryExpr, row)
-    case expr.unaryOp
-    of uoNot:
-      return newJBool(not inner.getBool(false))
-    of uoNeg:
-      if inner.kind == JInt:
-        return newJInt(-inner.getInt)
-      return newJNull()
-
-  of exIsNull:
-    let inner = evalExpr(expr.isNullExpr, row)
-    let isNull = inner.kind == JNull
-    return newJBool(if expr.isNullNot: not isNull else: isNull)
-
-  of exIn:
-    let val = evalExpr(expr.inExpr, row)
-    var found = false
-    for item in expr.inList:
-      if evalExpr(item, row) == val:
-        found = true
-        break
-    return newJBool(if expr.inNot: not found else: found)
-
-  of exBetween:
-    let val = evalExpr(expr.betweenExpr, row)
-    let lo = evalExpr(expr.betweenLo, row)
-    let hi = evalExpr(expr.betweenHi, row)
-    var inRange = false
-    if val.kind == JInt and lo.kind == JInt and hi.kind == JInt:
-      inRange = val.getInt >= lo.getInt and val.getInt <= hi.getInt
-    return newJBool(if expr.betweenNot: not inRange else: inRange)
-
-  of exLike:
-    # Simple LIKE: only handle % wildcard at start/end
-    let val = evalExpr(expr.likeExpr, row)
-    let pat = evalExpr(expr.likePattern, row)
-    if val.kind == JString and pat.kind == JString:
-      let s = val.getStr
-      let p = pat.getStr
-      var matches = false
-      if p.startsWith("%") and p.endsWith("%"):
-        matches = p[1..^2] in s
-      elif p.startsWith("%"):
-        matches = s.endsWith(p[1..^1])
-      elif p.endsWith("%"):
-        matches = s.startsWith(p[0..^2])
-      else:
-        matches = s == p
-      return newJBool(if expr.likeNot: not matches else: matches)
-    return newJBool(false)
-
-  of exStar, exParam, exList:
-    return newJNull()
-
-proc matchesFilter*(filter: Option[Expr], row: JsonNode): bool =
-  ## Check if a row passes the WHERE filter.
-  ## DEPRECATED: Use matchesFilterDataRow with DataRow instead.
-  if filter.isNone:
-    return true
-  let result = evalExpr(filter.get(), row)
-  result.kind == JBool and result.getBool(false)
+proc newExecutorContextWithKV*(kv: KVStore, client: FractioClient = nil,
+    database: string = "default", schema: string = "public",
+    txnId: TransactionID = zeroTransactionID(),
+    readTimestamp: uint64 = 0): ExecutorContext =
+  ## Create a new executor context with a custom KVStore implementation.
+  ## This is useful for testing with MockKVStore.
+  ## If client is nil, space operations (CREATE/DROP SPACE) will fail.
+  ExecutorContext(
+    kv: kv,
+    client: client,
+    txnId: txnId,
+    readTimestamp: readTimestamp,
+    hasActiveTransaction: not isZero(txnId),
+    database: database,
+    schema: schema
+  )
 
 # ---------------------------------------------------------------------------
-# Row helpers
+# Transaction-aware KV operation helpers
 # ---------------------------------------------------------------------------
 
-proc extractColumnsFromDataRow*(row: DataRow, columns: seq[string]): seq[string] =
-  ## Extract column values from a DataRow as strings
-  for col in columns:
-    result.add(row[col].toStringValue())
+proc txnGet(ctx: ExecutorContext, key: string): KVOpResult[Option[string]] =
+  ## Get a value, using transactional read if in a transaction,
+  ## or latest MVCC read otherwise.
+  ctx.kv.get(key, txnId = ctx.txnId, readTimestamp = ctx.readTimestamp)
 
-proc getPkValueFromDataRow*(row: DataRow, pkColumn: string): string =
-  ## Get primary key value from a DataRow
-  if row.hasColumn(pkColumn):
-    let v = row[pkColumn]
-    case v.kind
-    of drvkString: return v.strVal
-    of drvkInt: return $v.intVal
-    else: return v.toStringValue()
-  ""
-
-# Legacy JSON helpers (kept for backward compatibility)
-proc jsonToStringValue*(j: JsonNode): string =
-  case j.kind
-  of JString: j.getStr
-  of JInt: $j.getInt
-  of JFloat: $j.getFloat
-  of JBool: $j.getBool
-  of JNull: "NULL"
-  else: $j
-
-proc extractColumns*(row: JsonNode, columns: seq[string]): seq[string] =
-  for col in columns:
-    if row.hasKey(col):
-      result.add(jsonToStringValue(row[col]))
-    else:
-      result.add("NULL")
-
-proc getPkValue*(row: JsonNode, pkColumn: string): string =
-  if row.hasKey(pkColumn):
-    let v = row[pkColumn]
-    case v.kind
-    of JString: return v.getStr
-    of JInt: return $v.getInt
-    else: return $v
-  ""
+proc execTxnScan(ctx: ExecutorContext, startKey, endKey: string,
+    limit: uint32 = 0): KVOpResult[seq[tuple[key, value: string]]] =
+  ## Scan keys with MVCC awareness.
+  ctx.kv.scan(startKey, endKey, limit, txnId = ctx.txnId,
+              readTimestamp = ctx.readTimestamp)
 
 # ---------------------------------------------------------------------------
 # Per-op executors
@@ -390,25 +139,25 @@ proc execCreateDatabase(op: PlanOp, ctx: ExecutorContext): ExecResult =
   let key = encodeTableKey(SYS_DATABASES_TABLE_ID, op.cdbName)
 
   # Create internal transaction
-  let txnRes = ctx.client.beginTxn()
-  if not txnRes.isOk:
+  let txnRes = ctx.kv.beginTxn()
+  if txnRes.isErr:
     return errorResult(&"failed to start internal transaction: {txnRes.err}")
   let internalTxnId = txnRes.val.txnId
   let internalReadTimestamp = txnRes.val.readTimestamp
 
   # Check for duplicate (within transaction snapshot)
-  let existing = ctx.client.kvGet(key, txnId = internalTxnId,
+  let existing = ctx.kv.get(key, txnId = internalTxnId,
       readTimestamp = internalReadTimestamp)
   if existing.isOk and existing.val.isSome:
-    discard ctx.client.rollbackTxn(internalTxnId)
+    discard ctx.kv.rollbackTxn(internalTxnId)
     if op.cdbIfNotExists:
       return okResult("database already exists (IF NOT EXISTS)")
     return errorResult(&"database '{op.cdbName}' already exists")
 
   # Write database record (binary encoded - value already encoded by planner)
-  let putRes = ctx.client.kvPut(key, op.cdbValue, txnId = internalTxnId)
-  if not putRes.isOk:
-    discard ctx.client.rollbackTxn(internalTxnId)
+  let putRes = ctx.kv.put(key, op.cdbValue, txnId = internalTxnId)
+  if putRes.isErr:
+    discard ctx.kv.rollbackTxn(internalTxnId)
     return errorResult(&"failed to create database: {putRes.err}")
 
   # Seed a default "public" schema for every new database
@@ -418,15 +167,15 @@ proc execCreateDatabase(op: PlanOp, ctx: ExecutorContext): ExecResult =
     database: op.cdbName,
     createdAtNs: nowNs()
   )
-  let pubPutRes = ctx.client.kvPut(pubKey, encode(pubRec),
+  let pubPutRes = ctx.kv.put(pubKey, encode(pubRec),
       txnId = internalTxnId)
-  if not pubPutRes.isOk:
-    discard ctx.client.rollbackTxn(internalTxnId)
+  if pubPutRes.isErr:
+    discard ctx.kv.rollbackTxn(internalTxnId)
     return errorResult(&"failed to create public schema: {pubPutRes.err}")
 
   # Commit the transaction
-  let commitRes = ctx.client.commitTxn(internalTxnId)
-  if not commitRes.isOk:
+  let commitRes = ctx.kv.commitTxn(internalTxnId)
+  if commitRes.isErr:
     return errorResult(&"failed to commit: {commitRes.err}")
 
   okResult(&"CREATE DATABASE")
@@ -436,17 +185,17 @@ proc execDropDatabase(op: PlanOp, ctx: ExecutorContext): ExecResult =
   let key = encodeTableKey(SYS_DATABASES_TABLE_ID, op.ddbName)
 
   # Create internal transaction
-  let txnRes = ctx.client.beginTxn()
-  if not txnRes.isOk:
+  let txnRes = ctx.kv.beginTxn()
+  if txnRes.isErr:
     return errorResult(&"failed to start internal transaction: {txnRes.err}")
   let internalTxnId = txnRes.val.txnId
   let internalReadTimestamp = txnRes.val.readTimestamp
 
   # Check if database exists
-  let existing = ctx.client.kvGet(key, txnId = internalTxnId,
+  let existing = ctx.kv.get(key, txnId = internalTxnId,
       readTimestamp = internalReadTimestamp)
-  if not existing.isOk or existing.val.isNone:
-    discard ctx.client.rollbackTxn(internalTxnId)
+  if existing.isErr or existing.val.isNone:
+    discard ctx.kv.rollbackTxn(internalTxnId)
     if op.ddbIfExists:
       return okResult("database does not exist (IF EXISTS)")
     return errorResult(&"database '{op.ddbName}' does not exist")
@@ -456,19 +205,19 @@ proc execDropDatabase(op: PlanOp, ctx: ExecutorContext): ExecResult =
   let schemaPrefix = op.ddbName & "."
   let schemaStart = encodeTableKey(SYS_SCHEMAS_TABLE_ID, schemaPrefix)
   let schemaEnd = encodeTableKey(SYS_SCHEMAS_TABLE_ID, schemaPrefix & "\xFF")
-  let schemaScan = ctx.client.kvScan(schemaStart, schemaEnd, 0,
+  let schemaScan = ctx.kv.scan(schemaStart, schemaEnd, 0,
       txnId = internalTxnId, readTimestamp = internalReadTimestamp)
   if schemaScan.isOk:
     for entry in schemaScan.val:
-      let delRes = ctx.client.kvDelete(entry.key, txnId = internalTxnId)
-      if not delRes.isOk:
-        discard ctx.client.rollbackTxn(internalTxnId)
+      let delRes = ctx.kv.delete(entry.key, txnId = internalTxnId)
+      if delRes.isErr:
+        discard ctx.kv.rollbackTxn(internalTxnId)
         return errorResult(&"failed to delete schema: {delRes.err}")
 
   # Find and delete all tables and their data rows
   let tableStart = encodeTableKey(SYS_TABLES_TABLE_ID, "")
   let tableEnd = makeScanEndKey(SYS_TABLES_TABLE_ID)
-  let tableScan = ctx.client.kvScan(tableStart, tableEnd, 0,
+  let tableScan = ctx.kv.scan(tableStart, tableEnd, 0,
       txnId = internalTxnId, readTimestamp = internalReadTimestamp)
   if tableScan.isOk:
     for entry in tableScan.val:
@@ -478,30 +227,30 @@ proc execDropDatabase(op: PlanOp, ctx: ExecutorContext): ExecResult =
         # Delete all data rows for this table
         let dataStart = encodeDataRowKey(tableId, "")
         let dataEnd = makeDataRowScanEndKey(tableId)
-        let dataScan = ctx.client.kvScan(dataStart, dataEnd, 0,
+        let dataScan = ctx.kv.scan(dataStart, dataEnd, 0,
             txnId = internalTxnId, readTimestamp = internalReadTimestamp)
         if dataScan.isOk:
           for dataEntry in dataScan.val:
-            let delRes = ctx.client.kvDelete(dataEntry.key,
+            let delRes = ctx.kv.delete(dataEntry.key,
                 txnId = internalTxnId)
-            if not delRes.isOk:
-              discard ctx.client.rollbackTxn(internalTxnId)
+            if delRes.isErr:
+              discard ctx.kv.rollbackTxn(internalTxnId)
               return errorResult(&"failed to delete data row: {delRes.err}")
         # Delete the table record
-        let delRes = ctx.client.kvDelete(entry.key, txnId = internalTxnId)
-        if not delRes.isOk:
-          discard ctx.client.rollbackTxn(internalTxnId)
+        let delRes = ctx.kv.delete(entry.key, txnId = internalTxnId)
+        if delRes.isErr:
+          discard ctx.kv.rollbackTxn(internalTxnId)
           return errorResult(&"failed to delete table: {delRes.err}")
 
   # Delete the database record
-  let delRes = ctx.client.kvDelete(key, txnId = internalTxnId)
-  if not delRes.isOk:
-    discard ctx.client.rollbackTxn(internalTxnId)
+  let delRes = ctx.kv.delete(key, txnId = internalTxnId)
+  if delRes.isErr:
+    discard ctx.kv.rollbackTxn(internalTxnId)
     return errorResult(&"failed to drop database: {delRes.err}")
 
   # Commit the transaction
-  let commitRes = ctx.client.commitTxn(internalTxnId)
-  if not commitRes.isOk:
+  let commitRes = ctx.kv.commitTxn(internalTxnId)
+  if commitRes.isErr:
     return errorResult(&"failed to commit: {commitRes.err}")
 
   okResult("DROP DATABASE")
@@ -512,27 +261,27 @@ proc execCreateSchema(op: PlanOp, ctx: ExecutorContext): ExecResult =
       op.csDatabase & "." & op.csName)
 
   # Create internal transaction
-  let txnRes = ctx.client.beginTxn()
-  if not txnRes.isOk:
+  let txnRes = ctx.kv.beginTxn()
+  if txnRes.isErr:
     return errorResult(&"failed to start internal transaction: {txnRes.err}")
   let internalTxnId = txnRes.val.txnId
   let internalReadTimestamp = txnRes.val.readTimestamp
 
-  let existing = ctx.client.kvGet(key, txnId = internalTxnId,
+  let existing = ctx.kv.get(key, txnId = internalTxnId,
       readTimestamp = internalReadTimestamp)
   if existing.isOk and existing.val.isSome:
-    discard ctx.client.rollbackTxn(internalTxnId)
+    discard ctx.kv.rollbackTxn(internalTxnId)
     if op.csIfNotExists:
       return okResult("schema already exists (IF NOT EXISTS)")
     return errorResult(&"schema '{op.csName}' already exists")
 
-  let putRes = ctx.client.kvPut(key, op.csValue, txnId = internalTxnId)
-  if not putRes.isOk:
-    discard ctx.client.rollbackTxn(internalTxnId)
+  let putRes = ctx.kv.put(key, op.csValue, txnId = internalTxnId)
+  if putRes.isErr:
+    discard ctx.kv.rollbackTxn(internalTxnId)
     return errorResult(&"failed to create schema: {putRes.err}")
 
-  let commitRes = ctx.client.commitTxn(internalTxnId)
-  if not commitRes.isOk:
+  let commitRes = ctx.kv.commitTxn(internalTxnId)
+  if commitRes.isErr:
     return errorResult(&"failed to commit: {commitRes.err}")
 
   okResult("CREATE SCHEMA")
@@ -543,27 +292,27 @@ proc execDropSchema(op: PlanOp, ctx: ExecutorContext): ExecResult =
       op.dsDatabase & "." & op.dsName)
 
   # Create internal transaction
-  let txnRes = ctx.client.beginTxn()
-  if not txnRes.isOk:
+  let txnRes = ctx.kv.beginTxn()
+  if txnRes.isErr:
     return errorResult(&"failed to start internal transaction: {txnRes.err}")
   let internalTxnId = txnRes.val.txnId
   let internalReadTimestamp = txnRes.val.readTimestamp
 
-  let existing = ctx.client.kvGet(key, txnId = internalTxnId,
+  let existing = ctx.kv.get(key, txnId = internalTxnId,
       readTimestamp = internalReadTimestamp)
-  if not existing.isOk or existing.val.isNone:
-    discard ctx.client.rollbackTxn(internalTxnId)
+  if existing.isErr or existing.val.isNone:
+    discard ctx.kv.rollbackTxn(internalTxnId)
     if op.dsIfExists:
       return okResult("schema does not exist (IF EXISTS)")
     return errorResult(&"schema '{op.dsName}' does not exist")
 
-  let delRes = ctx.client.kvDelete(key, txnId = internalTxnId)
-  if not delRes.isOk:
-    discard ctx.client.rollbackTxn(internalTxnId)
+  let delRes = ctx.kv.delete(key, txnId = internalTxnId)
+  if delRes.isErr:
+    discard ctx.kv.rollbackTxn(internalTxnId)
     return errorResult(&"failed to drop schema: {delRes.err}")
 
-  let commitRes = ctx.client.commitTxn(internalTxnId)
-  if not commitRes.isOk:
+  let commitRes = ctx.kv.commitTxn(internalTxnId)
+  if commitRes.isErr:
     return errorResult(&"failed to commit: {commitRes.err}")
 
   okResult("DROP SCHEMA")
@@ -574,21 +323,21 @@ proc execCreateTable(op: PlanOp, ctx: ExecutorContext): ExecResult =
       op.ctDatabase & "." & op.ctSchema & "." & op.ctName)
 
   # Create internal transaction
-  let txnRes = ctx.client.beginTxn()
-  if not txnRes.isOk:
+  let txnRes = ctx.kv.beginTxn()
+  if txnRes.isErr:
     return errorResult(&"failed to start internal transaction: {txnRes.err}")
   let internalTxnId = txnRes.val.txnId
   let internalReadTimestamp = txnRes.val.readTimestamp
 
-  let existing = ctx.client.kvGet(key, txnId = internalTxnId,
+  let existing = ctx.kv.get(key, txnId = internalTxnId,
       readTimestamp = internalReadTimestamp)
   if existing.isOk and existing.val.isSome:
-    discard ctx.client.rollbackTxn(internalTxnId)
+    discard ctx.kv.rollbackTxn(internalTxnId)
     if op.ctIfNotExists:
       return okResult("table already exists (IF NOT EXISTS)")
     return errorResult(&"table '{op.ctName}' already exists")
 
-# Resolve space name to spaceId
+  # Resolve space name to spaceId
   # Note: We do NOT use the transaction's read timestamp for this lookup.
   # CREATE SPACE writes the space record, and we need to see that write immediately.
   # Using the transaction's read timestamp would cause us to not see the newly created space.
@@ -598,7 +347,7 @@ proc execCreateTable(op: PlanOp, ctx: ExecutorContext): ExecResult =
     let sStart = encodeTableKey(SYS_SPACES_TABLE_ID, "")
     let sEnd = makeScanEndKey(SYS_SPACES_TABLE_ID)
     # Use a fresh scan WITHOUT the transaction's read timestamp to see recent writes
-    let sScan = ctx.client.kvScan(sStart, sEnd, 0, txnId = zeroTransactionID(),
+    let sScan = ctx.kv.scan(sStart, sEnd, 0, txnId = zeroTransactionID(),
         readTimestamp = 0)
     var spaceId: SpaceID
     var spaceFound = false
@@ -610,20 +359,20 @@ proc execCreateTable(op: PlanOp, ctx: ExecutorContext): ExecResult =
           spaceFound = true
           break
     if not spaceFound:
-      discard ctx.client.rollbackTxn(internalTxnId)
+      discard ctx.kv.rollbackTxn(internalTxnId)
       return errorResult(&"space '{spaceName}' does not exist")
     # Update spaceId in the binary table record
     var rec = decodeTableRecord(tableValue)
     rec.spaceId = spaceId
     tableValue = encode(rec)
 
-  let putRes = ctx.client.kvPut(key, tableValue, txnId = internalTxnId)
-  if not putRes.isOk:
-    discard ctx.client.rollbackTxn(internalTxnId)
+  let putRes = ctx.kv.put(key, tableValue, txnId = internalTxnId)
+  if putRes.isErr:
+    discard ctx.kv.rollbackTxn(internalTxnId)
     return errorResult(&"failed to create table: {putRes.err}")
 
-  let commitRes = ctx.client.commitTxn(internalTxnId)
-  if not commitRes.isOk:
+  let commitRes = ctx.kv.commitTxn(internalTxnId)
+  if commitRes.isErr:
     return errorResult(&"failed to commit: {commitRes.err}")
 
   okResult("CREATE TABLE")
@@ -634,28 +383,28 @@ proc execDropTable(op: PlanOp, ctx: ExecutorContext): ExecResult =
       op.dtDatabase & "." & op.dtSchema & "." & op.dtName)
 
   # Create internal transaction
-  let txnRes = ctx.client.beginTxn()
-  if not txnRes.isOk:
+  let txnRes = ctx.kv.beginTxn()
+  if txnRes.isErr:
     return errorResult(&"failed to start internal transaction: {txnRes.err}")
   let internalTxnId = txnRes.val.txnId
   let internalReadTimestamp = txnRes.val.readTimestamp
 
-  let existing = ctx.client.kvGet(key, txnId = internalTxnId,
+  let existing = ctx.kv.get(key, txnId = internalTxnId,
       readTimestamp = internalReadTimestamp)
-  if not existing.isOk or existing.val.isNone:
-    discard ctx.client.rollbackTxn(internalTxnId)
+  if existing.isErr or existing.val.isNone:
+    discard ctx.kv.rollbackTxn(internalTxnId)
     if op.dtIfExists:
       return okResult("table does not exist (IF EXISTS)")
     return errorResult(&"table '{op.dtName}' does not exist")
 
   # TODO: also delete all data rows for the table
-  let delRes = ctx.client.kvDelete(key, txnId = internalTxnId)
-  if not delRes.isOk:
-    discard ctx.client.rollbackTxn(internalTxnId)
+  let delRes = ctx.kv.delete(key, txnId = internalTxnId)
+  if delRes.isErr:
+    discard ctx.kv.rollbackTxn(internalTxnId)
     return errorResult(&"failed to drop table: {delRes.err}")
 
-  let commitRes = ctx.client.commitTxn(internalTxnId)
-  if not commitRes.isOk:
+  let commitRes = ctx.kv.commitTxn(internalTxnId)
+  if commitRes.isErr:
     return errorResult(&"failed to commit: {commitRes.err}")
 
   okResult("DROP TABLE")
@@ -672,6 +421,11 @@ proc execCreateSpace(op: PlanOp, ctx: ExecutorContext): ExecResult =
   ##   - Waiting for leaders to be elected
   ##   - Writing space/group records to sys tables via Raft
   ## The client receives updated sys table data to update its cache.
+  ##
+  ## NOTE: This operation requires a real FractioClient (not just KVStore).
+
+  if ctx.client == nil:
+    return errorResult("CREATE SPACE requires a real FractioClient connection")
 
   # Call server-side createSpace RPC
   let res = ctx.client.createSpace(op.cspName, int32(op.cspReplicas))
@@ -688,6 +442,11 @@ proc execDropSpace(op: PlanOp, ctx: ExecutorContext): ExecResult =
   ##   - Marking space/group records as deleted
   ##   - Stopping Raft groups on all nodes
   ## The client receives deleted groupIds to update its cache.
+  ##
+  ## NOTE: This operation requires a real FractioClient (not just KVStore).
+
+  if ctx.client == nil:
+    return errorResult("DROP SPACE requires a real FractioClient connection")
 
   # Call server-side dropSpace RPC
   let res = ctx.client.dropSpace(op.dspName)
@@ -698,21 +457,6 @@ proc execDropSpace(op: PlanOp, ctx: ExecutorContext): ExecResult =
   okResult("DROP SPACE")
 
 # ---------------------------------------------------------------------------
-# Transaction-aware KV operation helpers
-# ---------------------------------------------------------------------------
-
-proc txnGet(ctx: ExecutorContext, key: string): KVOpResult[Option[string]] =
-  ## Get a value, using transactional read if in a transaction,
-  ## or latest MVCC read otherwise.
-  ctx.client.kvGet(key, txnId = ctx.txnId, readTimestamp = ctx.readTimestamp)
-
-proc execTxnScan(ctx: ExecutorContext, startKey, endKey: string,
-    limit: uint32 = 0): KVOpResult[seq[tuple[key, value: string]]] =
-  ## Scan keys with MVCC awareness.
-  ctx.client.kvScan(startKey, endKey, limit, txnId = ctx.txnId,
-                    readTimestamp = ctx.readTimestamp)
-
-# ---------------------------------------------------------------------------
 # MVCC-aware show operations
 # ---------------------------------------------------------------------------
 
@@ -720,7 +464,7 @@ proc execShowDatabasesTxn(ctx: ExecutorContext): ExecResult =
   let startKey = encodeTableKey(SYS_DATABASES_TABLE_ID, "")
   let endKey = makeScanEndKey(SYS_DATABASES_TABLE_ID)
   let res = execTxnScan(ctx, startKey, endKey, 0)
-  if not res.isOk:
+  if res.isErr:
     return errorResult(&"failed to scan databases: {res.err}")
 
   var resultRows: seq[seq[string]]
@@ -735,7 +479,7 @@ proc execShowSchemasTxn(op: PlanOp, ctx: ExecutorContext): ExecResult =
   let startKey = encodeTableKey(SYS_SCHEMAS_TABLE_ID, "")
   let endKey = makeScanEndKey(SYS_SCHEMAS_TABLE_ID)
   let res = execTxnScan(ctx, startKey, endKey, 0)
-  if not res.isOk:
+  if res.isErr:
     return errorResult(&"failed to scan schemas: {res.err}")
 
   var resultRows: seq[seq[string]]
@@ -750,7 +494,7 @@ proc execShowTablesTxn(op: PlanOp, ctx: ExecutorContext): ExecResult =
   let startKey = encodeTableKey(SYS_TABLES_TABLE_ID, "")
   let endKey = makeScanEndKey(SYS_TABLES_TABLE_ID)
   let res = execTxnScan(ctx, startKey, endKey, 0)
-  if not res.isOk:
+  if res.isErr:
     return errorResult(&"failed to scan tables: {res.err}")
 
   var resultRows: seq[seq[string]]
@@ -768,7 +512,7 @@ proc execShowSpacesTxn(ctx: ExecutorContext): ExecResult =
   let startKey = encodeTableKey(SYS_SPACES_TABLE_ID, "")
   let endKey = makeScanEndKey(SYS_SPACES_TABLE_ID)
   let res = execTxnScan(ctx, startKey, endKey, 0)
-  if not res.isOk:
+  if res.isErr:
     return errorResult(&"failed to scan spaces: {res.err}")
 
   var resultRows: seq[seq[string]]
@@ -830,7 +574,7 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
 
   proc beginImplicitTxn(): bool =
     ## Begin an implicit transaction. Returns true on success.
-    let res = ctx.client.beginTxn()
+    let res = ctx.kv.beginTxn()
     if res.isOk:
       ctx.txnId = res.val.txnId
       ctx.readTimestamp = res.val.readTimestamp
@@ -841,7 +585,7 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
 
   proc commitImplicitTxn(): bool =
     ## Commit an implicit transaction. Returns true on success.
-    let res = ctx.client.commitTxn(ctx.txnId)
+    let res = ctx.kv.commitTxn(ctx.txnId)
     if res.isOk:
       ctx.hasActiveTransaction = false
       ctx.txnId = zeroTransactionID()
@@ -852,7 +596,7 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
 
   proc rollbackImplicitTxn() =
     ## Rollback an implicit transaction.
-    discard ctx.client.rollbackTxn(ctx.txnId)
+    discard ctx.kv.rollbackTxn(ctx.txnId)
     ctx.hasActiveTransaction = false
     ctx.txnId = zeroTransactionID()
     ctx.readTimestamp = 0
@@ -924,8 +668,8 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
         # Encode data row key with binary PK
         let key = encodeDataRowKey(op.insTableId, pkBinary)
         # Use active transaction if available, otherwise auto-transaction
-        let res = ctx.client.kvPut(key, rowBinary, txnId = ctx.txnId)
-        if not res.isOk:
+        let res = ctx.kv.put(key, rowBinary, txnId = ctx.txnId)
+        if res.isErr:
           error = &"failed to insert row: {res.err}"
           break
         inc count
@@ -938,7 +682,7 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
     of poPointGet:
       let key = encodeDataRowKey(op.pgTableId, op.pgKey)
       let res = txnGet(ctx, key)
-      if not res.isOk:
+      if res.isErr:
         return errorResult(&"failed to read: {res.err}")
       if res.val.isNone:
         return rowsResult(op.pgColumns, @[])
@@ -948,7 +692,7 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
 
     of poScan:
       let res = execTxnScan(ctx, op.scStartKey, op.scEndKey, 0)
-      if not res.isOk:
+      if res.isErr:
         return errorResult(&"failed to scan: {res.err}")
 
       var resultRows: seq[seq[string]] = @[]
@@ -971,10 +715,10 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
       let startKey = encodeDataRowKey(op.upTableId, "")
       let endKey = makeDataRowScanEndKey(op.upTableId)
       # Use transaction context for consistent scan
-      let res = ctx.client.kvScan(startKey, endKey, 0, txnId = ctx.txnId,
+      let res = ctx.kv.scan(startKey, endKey, 0, txnId = ctx.txnId,
           readTimestamp = ctx.readTimestamp)
 
-      if not res.isOk:
+      if res.isErr:
         return errorResult(&"failed to scan for update: {res.err}")
 
       var count = 0
@@ -986,9 +730,9 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
             for (col, valExpr) in op.upSets:
               row[col] = evalExprDataRow(valExpr, row)
             # Use active transaction if available
-            let putRes = ctx.client.kvPut(entry.key, encodeDataRow(row),
+            let putRes = ctx.kv.put(entry.key, encodeDataRow(row),
                 txnId = ctx.txnId)
-            if not putRes.isOk:
+            if putRes.isErr:
               error = &"failed to update row: {putRes.err}"
               break
             inc count
@@ -1005,10 +749,10 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
       let startKey = encodeDataRowKey(op.delTableId, "")
       let endKey = makeDataRowScanEndKey(op.delTableId)
       # Use transaction context for consistent scan
-      let res = ctx.client.kvScan(startKey, endKey, 0, txnId = ctx.txnId,
+      let res = ctx.kv.scan(startKey, endKey, 0, txnId = ctx.txnId,
           readTimestamp = ctx.readTimestamp)
 
-      if not res.isOk:
+      if res.isErr:
         return errorResult(&"failed to scan for delete: {res.err}")
 
       var count = 0
@@ -1018,8 +762,8 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
           let row = decodeDataRow(entry.value)
           if matchesFilterDataRow(op.delFilter, row):
             # Use active transaction if available
-            let delRes = ctx.client.kvDelete(entry.key, txnId = ctx.txnId)
-            if not delRes.isOk:
+            let delRes = ctx.kv.delete(entry.key, txnId = ctx.txnId)
+            if delRes.isErr:
               error = &"failed to delete row: {delRes.err}"
               break
             inc count
@@ -1039,7 +783,7 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
     of poUseDatabase:
       let key = encodeTableKey(SYS_DATABASES_TABLE_ID, op.udName)
       let existing = txnGet(ctx, key)
-      if not existing.isOk or existing.val.isNone:
+      if existing.isErr or existing.val.isNone:
         errorResult(&"database '{op.udName}' does not exist")
       else:
         ExecResult(kind: erkUseDatabase, newDatabase: op.udName)
@@ -1047,7 +791,7 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
     of poUseSchema:
       let key = encodeTableKey(SYS_SCHEMAS_TABLE_ID, ctx.database & "." & op.usName)
       let existing = txnGet(ctx, key)
-      if not existing.isOk or existing.val.isNone:
+      if existing.isErr or existing.val.isNone:
         errorResult(&"schema '{op.usName}' does not exist in database '{ctx.database}'")
       else:
         ExecResult(kind: erkUseSchema, newSchema: op.usName)
@@ -1056,13 +800,15 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
       if ctx.hasActiveTransaction:
         okResult("BEGIN (transaction already active)")
       else:
-        let res = ctx.client.beginTxn()
+        let res = ctx.kv.beginTxn()
         if res.isOk:
           ctx.txnId = res.val.txnId
           ctx.readTimestamp = res.val.readTimestamp
           ctx.hasActiveTransaction = true
-          ctx.client.activeTxnId = res.val.txnId
-          ctx.client.activeReadTs = res.val.readTimestamp
+          # Also update client's active txn state if client exists
+          if ctx.client != nil:
+            ctx.client.activeTxnId = res.val.txnId
+            ctx.client.activeReadTs = res.val.readTimestamp
           okResult("BEGIN")
         else:
           errorResult(&"failed to begin transaction: {res.err}")
@@ -1071,13 +817,15 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
       if not ctx.hasActiveTransaction:
         okResult("COMMIT (no active transaction)")
       else:
-        let res = ctx.client.commitTxn(ctx.txnId)
+        let res = ctx.kv.commitTxn(ctx.txnId)
         if res.isOk:
           ctx.hasActiveTransaction = false
           ctx.txnId = zeroTransactionID()
           ctx.readTimestamp = 0
-          ctx.client.activeTxnId = zeroTransactionID()
-          ctx.client.activeReadTs = 0
+          # Also update client's active txn state if client exists
+          if ctx.client != nil:
+            ctx.client.activeTxnId = zeroTransactionID()
+            ctx.client.activeReadTs = 0
           okResult("COMMIT")
         else:
           errorResult(&"failed to commit transaction: {res.err}")
@@ -1086,13 +834,15 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
       if not ctx.hasActiveTransaction:
         okResult("ROLLBACK (no active transaction)")
       else:
-        let res = ctx.client.rollbackTxn(ctx.txnId)
+        let res = ctx.kv.rollbackTxn(ctx.txnId)
         if res.isOk:
           ctx.hasActiveTransaction = false
           ctx.txnId = zeroTransactionID()
           ctx.readTimestamp = 0
-          ctx.client.activeTxnId = zeroTransactionID()
-          ctx.client.activeReadTs = 0
+          # Also update client's active txn state if client exists
+          if ctx.client != nil:
+            ctx.client.activeTxnId = zeroTransactionID()
+            ctx.client.activeReadTs = 0
           okResult("ROLLBACK")
         else:
           errorResult(&"failed to rollback transaction: {res.err}")
@@ -1108,4 +858,3 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
       return lastResult
 
   lastResult
-

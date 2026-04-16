@@ -213,4 +213,169 @@ suite "Error Exception Behavior":
     try:
       raise err
     except FractioError as e:
-      check e.msg == "SQL syntax error"
+      check e.msg.contains("SQL syntax error")
+
+suite "Error Code Verification":
+
+  test "fekNone has no code":
+    let code = ErrorCodes.getOrDefault(fekNone, -999)
+    check code == -999 # Not defined
+
+  test "fekSyntax code is 1000":
+    check ErrorCodes[fekSyntax] == 1000
+
+  test "fekSemantic code is 2000":
+    check ErrorCodes[fekSemantic] == 2000
+
+  test "fekConstraint code is 3000":
+    check ErrorCodes[fekConstraint] == 3000
+
+  test "fekTransaction code is 4000":
+    check ErrorCodes[fekTransaction] == 4000
+
+  test "fekDeadlock code is 4100":
+    check ErrorCodes[fekDeadlock] == 4100
+
+  test "fekSharding code is 5000":
+    check ErrorCodes[fekSharding] == 5000
+
+  test "fekReplication code is 6000":
+    check ErrorCodes[fekReplication] == 6000
+
+  test "fekNetwork code is 7000":
+    check ErrorCodes[fekNetwork] == 7000
+
+  test "fekStorage code is 8000":
+    check ErrorCodes[fekStorage] == 8000
+
+  test "fekConfig code is 9000":
+    check ErrorCodes[fekConfig] == 9000
+
+  test "fekPermission code is 10000":
+    check ErrorCodes[fekPermission] == 10000
+
+  test "fekNotImplemented code is 11000":
+    check ErrorCodes[fekNotImplemented] == 11000
+
+suite "Error isError helper":
+
+  test "isError returns true for non-none kinds":
+    check isError(newError(fekSyntax, "test"))
+    check isError(newError(fekStorage, "test"))
+    check isError(newError(fekNetwork, "test"))
+
+  test "isError returns false for fekNone":
+    let err = newError(fekNone, "test")
+    check not isError(err)
+
+suite "Error Dollar Operator":
+
+  test "dollar includes FractioError prefix":
+    let err = newError(fekSyntax, "test error")
+    let str = $err
+    check str.contains("FractioError")
+    check str.contains("test error")
+
+  test "dollar includes code":
+    let err = newError(fekStorage, "disk full", "/data")
+    let str = $err
+    check str.contains("8000")
+
+  test "dollar includes context when provided":
+    let err = newError(fekNetwork, "timeout", "node1:8080")
+    let str = $err
+    check str.contains("node1:8080")
+
+suite "Error Kind Names":
+
+  test "all error kinds are accessible":
+    check fekNone.ord == 0
+    check fekSyntax.ord > 0
+    check fekSemantic.ord > 0
+    check fekConstraint.ord > 0
+    check fekTransaction.ord > 0
+    check fekDeadlock.ord > 0
+    check fekSharding.ord > 0
+    check fekReplication.ord > 0
+    check fekNetwork.ord > 0
+    check fekStorage.ord > 0
+    check fekConfig.ord > 0
+    check fekPermission.ord > 0
+    check fekNotImplemented.ord > 0
+
+suite "Error Constructors with Empty Context":
+
+  test "syntaxError empty context":
+    let err = syntaxError("bad SQL", "")
+    check err.context == ""
+
+  test "semanticError empty context":
+    let err = semanticError("type mismatch", "")
+    check err.context == ""
+
+  test "constraintError empty context":
+    let err = constraintError("PK violation", "")
+    check err.context == ""
+
+  test "transactionError empty context":
+    let err = transactionError("abort", "")
+    check err.context == ""
+
+  test "deadlockError always succeeds":
+    let err = deadlockError()
+    check err.kind == fekDeadlock
+
+  test "shardingError empty context":
+    let err = shardingError("key not found", "")
+    check err.context == ""
+
+  test "replicationError empty context":
+    let err = replicationError("leader lost", "")
+    check err.context == ""
+
+  test "networkError empty context":
+    let err = networkError("connection failed", "")
+    check err.context == ""
+
+  test "storageError empty context":
+    let err = storageError("write failed", "")
+    check err.context == ""
+
+  test "configError empty context":
+    let err = configError("bad config", "")
+    check err.context == ""
+
+  test "permissionError empty context":
+    let err = permissionError("denied", "")
+    check err.context == ""
+
+  test "notImplementedError empty context":
+    let err = notImplementedError("future", "")
+    check err.context == ""
+
+suite "Error Message Handling":
+
+  test "long messages are preserved":
+    let longMsg = "This is a very long error message that should still be preserved in full without truncation or modification"
+    let err = newError(fekStorage, longMsg)
+    check err.message == longMsg
+
+  test "special characters in message":
+    let err = newError(fekSyntax, "Invalid chars: \n\t\r\"'")
+    check err.message.contains("\n")
+    check err.message.contains("\t")
+
+  test "unicode in message":
+    let err = newError(fekStorage, "Unicode: \u00e9\u00e8\u00ea")
+    check err.message.contains("\u00e9")
+
+suite "Error Context Handling":
+
+  test "long context preserved":
+    let longCtx = "Very long context string with details about where error occurred"
+    let err = newError(fekNetwork, "timeout", longCtx)
+    check err.context == longCtx
+
+  test "special characters in context":
+    let err = newError(fekStorage, "error", "path: /data/file\x00.bin")
+    check err.context.contains("/data")

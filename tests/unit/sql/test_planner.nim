@@ -1017,3 +1017,74 @@ suite "Planner stmtExplain":
     check plan.ops[0].kind == poExplain
     check plan.ops[0].exInnerPlan.ops[0].kind == poCreateDatabase
     check plan.ops[0].exInnerPlan.ops[0].cdbName == "explained_db"
+
+suite "Planner exprToDataRowValue":
+
+  test "int literal to DataRowValue":
+    let e = Expr(kind: exLiteral, litValue: ValueRef(kind: dtInt, intValue: 42))
+    let v = exprToDataRowValue(e)
+    check v.kind == drvkInt
+    check v.intVal == 42
+
+  test "float literal to DataRowValue":
+    let e = Expr(kind: exLiteral, litValue: ValueRef(kind: dtFloat,
+        floatValue: 3.14))
+    let v = exprToDataRowValue(e)
+    check v.kind == drvkFloat
+    check v.floatVal == 3.14
+
+  test "string literal to DataRowValue":
+    let e = Expr(kind: exLiteral, litValue: ValueRef(kind: dtString,
+        strValue: "hello"))
+    let v = exprToDataRowValue(e)
+    check v.kind == drvkString
+    check v.strVal == "hello"
+
+  test "bool literal to DataRowValue":
+    let e = Expr(kind: exLiteral, litValue: ValueRef(kind: dtBool,
+        boolValue: true))
+    let v = exprToDataRowValue(e)
+    check v.kind == drvkBool
+    check v.boolVal == true
+
+  test "null literal to DataRowValue":
+    let e = Expr(kind: exLiteral, litValue: nil)
+    let v = exprToDataRowValue(e)
+    check v.kind == drvkNull
+
+  test "column expr returns null":
+    let e = Expr(kind: exColumn, colName: "id", colTable: "")
+    let v = exprToDataRowValue(e)
+    check v.kind == drvkNull
+
+suite "Planner dataRowValueToPkValue":
+
+  test "int value to PK":
+    let v = DataRowValue(kind: drvkInt, intVal: 123)
+    let spec = ("id", cdtInt, 0)
+    let pkVal = dataRowValueToPkValue(v, spec)
+    check pkVal.isNull == false
+    check pkVal.kind == cdtInt
+    check pkVal.intVal == 123
+
+  test "string value to PK":
+    let v = DataRowValue(kind: drvkString, strVal: "abc")
+    let spec = ("name", cdtString, 10)
+    let pkVal = dataRowValueToPkValue(v, spec)
+    check pkVal.isNull == false
+    check pkVal.kind == cdtString
+
+  test "null value to PK":
+    let v = DataRowValue(kind: drvkNull)
+    let spec = ("id", cdtInt, 0)
+    let pkVal = dataRowValueToPkValue(v, spec)
+    check pkVal.isNull == true
+
+suite "Planner genNewTableId":
+
+  test "generates unique IDs":
+    let id1 = genNewTableId()
+    let id2 = genNewTableId()
+    check id1 != id2
+    # ULIDs are 26 characters
+    check tableIdToBytes(id1).len == 16

@@ -2,14 +2,27 @@ import std/[unittest, options, json, locks, atomics, strutils, algorithm]
 import std/tables as stdtables
 import fractio/sql/ast
 import fractio/sql/executor
+import fractio/sql/expr_eval # for evalExprDataRow, matchesFilterDataRow
 import fractio/sql/planner
 import fractio/sql/data_row
 import fractio/core/types
+import fractio/core/primary_key # for PrimaryKeySpec, encodeInt64BE
+import fractio/core/kv_interface # for KVOpResult, KVOpVoidResult types
 import fractio/distributed/meta/system_schemas
 import fractio/distributed/meta/system_tables
 import fractio/distributed/raft/group_types
 import fractio/client/fractio_client
 import fractio/utils/binary
+
+# =============================================================================
+# Helper for PK encoding in tests
+# =============================================================================
+
+proc bytesToString*(arr: array[8, uint8]): string =
+  ## Convert array of bytes to string
+  result = newString(8)
+  for i in 0..<8:
+    result[i] = char(arr[i])
 
 # =============================================================================
 # Mock FractioClient for executor unit tests
@@ -1807,3 +1820,1025 @@ suite "formatPlan Full Plan":
     check text.contains("BeginTxn")
     check text.contains("ShowDatabases")
     check text.contains("CommitTxn")
+
+# =============================================================================
+# Executor tests with MockKVStore
+# =============================================================================
+
+import fractio/core/mock_kv
+
+suite "ExecutorContext with MockKVStore":
+
+  test "newExecutorContextWithKV creates context":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+    check ctx.kv != nil
+    check ctx.database == "default"
+    check ctx.schema == "public"
+    check ctx.hasActiveTransaction == false
+
+  test "newExecutorContextWithKV with custom settings":
+    let mockKV = newMockKVStore()
+    let txnId = genTransactionID()
+    let ctx = newExecutorContextWithKV(mockKV, nil, "mydb", "myschema",
+                                        txnId, readTimestamp = 100)
+    check ctx.database == "mydb"
+    check ctx.schema == "myschema"
+    check ctx.txnId == txnId
+    check ctx.readTimestamp == 100
+    check ctx.hasActiveTransaction == true
+
+  test "newExecutorContextWithKV with zero txnId":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV, nil, "default", "public",
+                                        zeroTransactionID(), 0)
+    check ctx.hasActiveTransaction == false
+
+suite "Executor Transaction Operations with MockKVStore":
+
+  test "executeWithTxn BEGIN creates transaction":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    let plan = newPlan()
+    plan.add(PlanOp(kind: poBeginTxn, btReadOnly: false))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkOk
+    check result.okMessage == "BEGIN"
+    check ctx.hasActiveTransaction == true
+    check ctx.txnId != zeroTransactionID()
+
+  test "executeWithTxn COMMIT commits transaction":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    # Begin transaction
+    let beginPlan = newPlan()
+    beginPlan.add(PlanOp(kind: poBeginTxn, btReadOnly: false))
+    discard executeWithTxn(beginPlan, ctx)
+
+    # Commit
+    let plan = newPlan()
+    plan.add(PlanOp(kind: poCommitTxn))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkOk
+    check result.okMessage == "COMMIT"
+    check ctx.hasActiveTransaction == false
+    check ctx.txnId == zeroTransactionID()
+
+  test "executeWithTxn ROLLBACK discards transaction":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    # Begin transaction
+    let beginPlan = newPlan()
+    beginPlan.add(PlanOp(kind: poBeginTxn, btReadOnly: false))
+    discard executeWithTxn(beginPlan, ctx)
+
+    # Write some data (will be discarded)
+    let tableId = genTableId()
+    let writePlan = newPlan()
+    writePlan.add(PlanOp(kind: poInsert, insTableId: tableId,
+                         insRows: @["test_row"], insPkValues: @["pk1"]))
+    discard executeWithTxn(writePlan, ctx)
+
+    # Rollback
+    let rollbackPlan = newPlan()
+    rollbackPlan.add(PlanOp(kind: poRollbackTxn))
+
+    let result = executeWithTxn(rollbackPlan, ctx)
+    check result.kind == erkOk
+    check result.okMessage == "ROLLBACK"
+    check ctx.hasActiveTransaction == false
+
+suite "Executor DDL Operations with MockKVStore":
+
+  test "executeWithTxn CREATE DATABASE":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    let dbRec = DatabaseRecord(name: "testdb", createdAtNs: nowNs())
+    let plan = newPlan()
+    plan.add(PlanOp(kind: poCreateDatabase, cdbName: "testdb",
+                    cdbValue: encode(dbRec), cdbIfNotExists: false))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkOk
+    check "CREATE DATABASE" in result.okMessage
+
+    # Verify database was created
+    let key = encodeTableKey(SYS_DATABASES_TABLE_ID, "testdb")
+    check mockKV.hasKey(key)
+
+  test "executeWithTxn CREATE DATABASE IF NOT EXISTS":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    # Create database first
+    let dbRec = DatabaseRecord(name: "testdb", createdAtNs: nowNs())
+    let plan1 = newPlan()
+    plan1.add(PlanOp(kind: poCreateDatabase, cdbName: "testdb",
+                     cdbValue: encode(dbRec), cdbIfNotExists: false))
+    discard executeWithTxn(plan1, ctx)
+
+    # Try creating again with IF NOT EXISTS
+    let plan2 = newPlan()
+    plan2.add(PlanOp(kind: poCreateDatabase, cdbName: "testdb",
+                     cdbValue: encode(dbRec), cdbIfNotExists: true))
+
+    let result = executeWithTxn(plan2, ctx)
+    check result.kind == erkOk
+    check "IF NOT EXISTS" in result.okMessage
+
+  test "executeWithTxn CREATE DATABASE duplicate fails":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    # Create database first
+    let dbRec = DatabaseRecord(name: "testdb", createdAtNs: nowNs())
+    let plan1 = newPlan()
+    plan1.add(PlanOp(kind: poCreateDatabase, cdbName: "testdb",
+                     cdbValue: encode(dbRec), cdbIfNotExists: false))
+    discard executeWithTxn(plan1, ctx)
+
+    # Try creating again without IF NOT EXISTS
+    let plan2 = newPlan()
+    plan2.add(PlanOp(kind: poCreateDatabase, cdbName: "testdb",
+                     cdbValue: encode(dbRec), cdbIfNotExists: false))
+
+    let result = executeWithTxn(plan2, ctx)
+    check result.kind == erkError
+    check "already exists" in result.error
+
+  test "executeWithTxn DROP DATABASE":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    # Create database first
+    let dbRec = DatabaseRecord(name: "testdb", createdAtNs: nowNs())
+    var createPlan = newPlan()
+    createPlan.add(PlanOp(kind: poCreateDatabase, cdbName: "testdb",
+                          cdbValue: encode(dbRec)))
+    discard executeWithTxn(createPlan, ctx)
+
+    # Drop it
+    let plan = newPlan()
+    plan.add(PlanOp(kind: poDropDatabase, ddbName: "testdb",
+        ddbIfExists: false))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkOk
+    check "DROP DATABASE" in result.okMessage
+
+    # Verify database was dropped
+    let key = encodeTableKey(SYS_DATABASES_TABLE_ID, "testdb")
+    check not mockKV.hasKey(key)
+
+  test "executeWithTxn CREATE SCHEMA":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    let schemaRec = SchemaRecord(name: "myschema", database: "default",
+                                 createdAtNs: nowNs())
+    let plan = newPlan()
+    plan.add(PlanOp(kind: poCreateSchema, csDatabase: "default",
+                    csName: "myschema", csValue: encode(schemaRec),
+                    csIfNotExists: false))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkOk
+    check "CREATE SCHEMA" in result.okMessage
+
+    # Verify schema was created
+    let key = encodeTableKey(SYS_SCHEMAS_TABLE_ID, "default.myschema")
+    check mockKV.hasKey(key)
+
+  test "executeWithTxn CREATE TABLE":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    let tableRec = TableRecord(
+      tableId: genTableId(),
+      name: "users",
+      database: "default",
+      schema: "public",
+      spaceId: genSpaceID(),
+      columns: @[ColumnDefBin(name: "id", dataType: cdtInt,
+                               flags: uint8(cfPrimaryKey.ord))],
+      primaryKey: @["id"]
+    )
+    let plan = newPlan()
+    plan.add(PlanOp(kind: poCreateTable, ctDatabase: "default",
+                    ctSchema: "public", ctName: "users",
+                    ctValue: encode(tableRec), ctIfNotExists: false))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkOk
+    check "CREATE TABLE" in result.okMessage
+
+    # Verify table was created
+    let key = encodeTableKey(SYS_TABLES_TABLE_ID, "default.public.users")
+    check mockKV.hasKey(key)
+
+suite "Executor SHOW Operations with MockKVStore":
+
+  test "executeWithTxn SHOW DATABASES":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    # Create some databases
+    let db1 = DatabaseRecord(name: "db1", createdAtNs: nowNs())
+    let db2 = DatabaseRecord(name: "db2", createdAtNs: nowNs())
+    var createPlan1 = newPlan()
+    createPlan1.add(PlanOp(kind: poCreateDatabase, cdbName: "db1",
+        cdbValue: encode(db1)))
+    discard executeWithTxn(createPlan1, ctx)
+    var createPlan2 = newPlan()
+    createPlan2.add(PlanOp(kind: poCreateDatabase, cdbName: "db2",
+        cdbValue: encode(db2)))
+    discard executeWithTxn(createPlan2, ctx)
+
+    # Show databases
+    let plan = newPlan()
+    plan.add(PlanOp(kind: poShowDatabases))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkRows
+    check result.columns == @["database_name"]
+    check result.rows.len >= 2 # At least db1 and db2
+
+  test "executeWithTxn SHOW SCHEMAS":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    # Create a schema
+    let schemaRec = SchemaRecord(name: "myschema", database: "default",
+                                 createdAtNs: nowNs())
+    var createSchemaPlan = newPlan()
+    createSchemaPlan.add(PlanOp(kind: poCreateSchema, csDatabase: "default",
+                                csName: "myschema", csValue: encode(schemaRec)))
+    discard executeWithTxn(createSchemaPlan, ctx)
+
+    # Show schemas
+    let plan = newPlan()
+    plan.add(PlanOp(kind: poShowSchemas, ssDatabase: "default"))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkRows
+    check result.columns == @["schema_name"]
+    check result.rows.len >= 1
+
+  test "executeWithTxn SHOW TABLES":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    # Create a table
+    let tableRec = TableRecord(
+      tableId: genTableId(),
+      name: "users",
+      database: "default",
+      schema: "public",
+      spaceId: genSpaceID(),
+      columns: @[ColumnDefBin(name: "id", dataType: cdtInt,
+                               flags: uint8(cfPrimaryKey.ord))],
+      primaryKey: @["id"]
+    )
+    var createTablePlan = newPlan()
+    createTablePlan.add(PlanOp(kind: poCreateTable, ctDatabase: "default",
+                               ctSchema: "public", ctName: "users",
+                               ctValue: encode(tableRec)))
+    discard executeWithTxn(createTablePlan, ctx)
+
+    # Show tables
+    let plan = newPlan()
+    plan.add(PlanOp(kind: poShowTables, stDatabase: "default",
+        stSchema: "public"))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkRows
+    check result.columns == @["table_name"]
+    check result.rows.len >= 1
+
+suite "Executor USE Operations with MockKVStore":
+
+  test "executeWithTxn USE DATABASE valid":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    # Create database first
+    let dbRec = DatabaseRecord(name: "mydb", createdAtNs: nowNs())
+    var createDbPlan = newPlan()
+    createDbPlan.add(PlanOp(kind: poCreateDatabase, cdbName: "mydb",
+                            cdbValue: encode(dbRec)))
+    discard executeWithTxn(createDbPlan, ctx)
+
+    # Use database
+    let plan = newPlan()
+    plan.add(PlanOp(kind: poUseDatabase, udName: "mydb"))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkUseDatabase
+    check result.newDatabase == "mydb"
+
+  test "executeWithTxn USE DATABASE invalid":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    let plan = newPlan()
+    plan.add(PlanOp(kind: poUseDatabase, udName: "nonexistent"))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkError
+    check "does not exist" in result.error
+
+  test "executeWithTxn USE SCHEMA valid":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV, nil, "default")
+
+    # Create schema first
+    let schemaRec = SchemaRecord(name: "myschema", database: "default",
+                                 createdAtNs: nowNs())
+    var createSchemaPlan2 = newPlan()
+    createSchemaPlan2.add(PlanOp(kind: poCreateSchema, csDatabase: "default",
+                                 csName: "myschema", csValue: encode(schemaRec)))
+    discard executeWithTxn(createSchemaPlan2, ctx)
+
+    # Use schema
+    let plan = newPlan()
+    plan.add(PlanOp(kind: poUseSchema, usName: "myschema"))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkUseSchema
+    check result.newSchema == "myschema"
+
+suite "Executor DDL Forbidden in Transaction":
+
+  test "CREATE DATABASE forbidden in transaction":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    # Begin transaction
+    var beginPlan = newPlan()
+    beginPlan.add(PlanOp(kind: poBeginTxn, btReadOnly: false))
+    discard executeWithTxn(beginPlan, ctx)
+
+    # Try CREATE DATABASE
+    let dbRec = DatabaseRecord(name: "testdb", createdAtNs: nowNs())
+    let plan = newPlan()
+    plan.add(PlanOp(kind: poCreateDatabase, cdbName: "testdb",
+                    cdbValue: encode(dbRec)))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkError
+    check "not allowed inside a transaction" in result.error
+
+  test "CREATE TABLE forbidden in transaction":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    # Begin transaction
+    var beginPlan2 = newPlan()
+    beginPlan2.add(PlanOp(kind: poBeginTxn, btReadOnly: false))
+    discard executeWithTxn(beginPlan2, ctx)
+
+    # Try CREATE TABLE
+    let tableRec = TableRecord(
+      tableId: genTableId(),
+      name: "users",
+      database: "default",
+      schema: "public",
+      spaceId: genSpaceID(),
+      columns: @[ColumnDefBin(name: "id", dataType: cdtInt,
+                               flags: uint8(cfPrimaryKey.ord))],
+      primaryKey: @["id"]
+    )
+    let plan = newPlan()
+    plan.add(PlanOp(kind: poCreateTable, ctDatabase: "default",
+                    ctSchema: "public", ctName: "users",
+                    ctValue: encode(tableRec)))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkError
+    check "not allowed inside a transaction" in result.error
+
+suite "Executor EXPLAIN with MockKVStore":
+
+  test "executeWithTxn EXPLAIN":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    let innerPlan = newPlan()
+    innerPlan.add(PlanOp(kind: poShowDatabases))
+
+    let plan = newPlan()
+    plan.add(PlanOp(kind: poExplain, exInnerPlan: innerPlan))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkRows
+    check result.columns == @["plan"]
+    check result.rows.len >= 1
+    check "ShowDatabases" in result.rows[0][0]
+
+suite "Executor DROP Operations with MockKVStore":
+
+  test "executeWithTxn DROP SCHEMA":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    # Create schema first
+    let schemaRec = SchemaRecord(name: "myschema", database: "default",
+                                 createdAtNs: nowNs())
+    var createSchemaPlan = newPlan()
+    createSchemaPlan.add(PlanOp(kind: poCreateSchema, csDatabase: "default",
+                                csName: "myschema", csValue: encode(schemaRec)))
+    discard executeWithTxn(createSchemaPlan, ctx)
+
+    # Drop the schema
+    let plan = newPlan()
+    plan.add(PlanOp(kind: poDropSchema, dsDatabase: "default",
+                    dsName: "myschema", dsIfExists: false))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkOk
+    check "DROP SCHEMA" in result.okMessage
+
+    # Verify schema was deleted
+    let key = encodeTableKey(SYS_SCHEMAS_TABLE_ID, "default.myschema")
+    check not mockKV.hasKey(key)
+
+  test "executeWithTxn DROP SCHEMA IF EXISTS non-existent":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    let plan = newPlan()
+    plan.add(PlanOp(kind: poDropSchema, dsDatabase: "default",
+                    dsName: "nonexistent", dsIfExists: true))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkOk
+    check "IF EXISTS" in result.okMessage
+
+  test "executeWithTxn DROP SCHEMA non-existent fails":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    let plan = newPlan()
+    plan.add(PlanOp(kind: poDropSchema, dsDatabase: "default",
+                    dsName: "nonexistent", dsIfExists: false))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkError
+    check "does not exist" in result.error
+
+  test "executeWithTxn DROP TABLE":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    # Create table first
+    let tableRec = TableRecord(
+      tableId: genTableId(),
+      name: "users",
+      database: "default",
+      schema: "public",
+      spaceId: genSpaceID(),
+      columns: @[ColumnDefBin(name: "id", dataType: cdtInt,
+                               flags: uint8(cfPrimaryKey.ord))],
+      primaryKey: @["id"]
+    )
+    var createTablePlan = newPlan()
+    createTablePlan.add(PlanOp(kind: poCreateTable, ctDatabase: "default",
+                               ctSchema: "public", ctName: "users",
+                               ctValue: encode(tableRec)))
+    discard executeWithTxn(createTablePlan, ctx)
+
+    # Drop the table
+    let plan = newPlan()
+    plan.add(PlanOp(kind: poDropTable, dtDatabase: "default",
+                    dtSchema: "public", dtName: "users", dtIfExists: false))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkOk
+    check "DROP TABLE" in result.okMessage
+
+    # Verify table was deleted
+    let key = encodeTableKey(SYS_TABLES_TABLE_ID, "default.public.users")
+    check not mockKV.hasKey(key)
+
+  test "executeWithTxn DROP TABLE IF EXISTS non-existent":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    let plan = newPlan()
+    plan.add(PlanOp(kind: poDropTable, dtDatabase: "default",
+                    dtSchema: "public", dtName: "nonexistent",
+                    dtIfExists: true))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkOk
+    check "IF EXISTS" in result.okMessage
+
+  test "executeWithTxn DROP TABLE non-existent fails":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    let plan = newPlan()
+    plan.add(PlanOp(kind: poDropTable, dtDatabase: "default",
+                    dtSchema: "public", dtName: "nonexistent",
+                    dtIfExists: false))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkError
+    check "does not exist" in result.error
+
+suite "Executor DML Operations with MockKVStore":
+
+  test "executeWithTxn INSERT row":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    # Begin a transaction for DML
+    var beginPlan = newPlan()
+    beginPlan.add(PlanOp(kind: poBeginTxn, btReadOnly: false))
+    discard executeWithTxn(beginPlan, ctx)
+
+    # Create a data row
+    var row = newDataRow()
+    row["id"] = DataRowValue(kind: drvkInt, intVal: 123)
+    row["name"] = DataRowValue(kind: drvkString, strVal: "Alice")
+
+    let tableId = genTableId()
+    let pkSpec = PrimaryKeySpec(columns: @[("id", cdtInt, 0)])
+    let pkValue = bytesToString(encodeInt64BE(123'i64))
+
+    let plan = newPlan()
+    plan.add(PlanOp(
+      kind: poInsert,
+      insTableId: tableId,
+      insTableName: "users",
+      insColumns: @["id", "name"],
+      insPkColumn: "id",
+      insPkSpec: pkSpec,
+      insRows: @[encodeDataRow(row)],
+      insPkValues: @[pkValue]
+    ))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkModified
+    check result.count == 1
+
+    # Commit the transaction to persist the data
+    var commitPlan = newPlan()
+    commitPlan.add(PlanOp(kind: poCommitTxn))
+    discard executeWithTxn(commitPlan, ctx)
+
+    # Verify row was inserted
+    let key = encodeDataRowKey(tableId, pkValue)
+    check mockKV.hasKey(key)
+
+  test "executeWithTxn INSERT multiple rows":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    # Begin a transaction
+    var beginPlan = newPlan()
+    beginPlan.add(PlanOp(kind: poBeginTxn, btReadOnly: false))
+    discard executeWithTxn(beginPlan, ctx)
+
+    let tableId = genTableId()
+    let pkSpec = PrimaryKeySpec(columns: @[("id", cdtInt, 0)])
+
+    var rows: seq[string] = @[]
+    var pkValues: seq[string] = @[]
+    for i in 1..3:
+      var row = newDataRow()
+      row["id"] = DataRowValue(kind: drvkInt, intVal: int64(i))
+      row["name"] = DataRowValue(kind: drvkString, strVal: "User" & $i)
+      rows.add(encodeDataRow(row))
+      pkValues.add(bytesToString(encodeInt64BE(int64(i))))
+
+    let plan = newPlan()
+    plan.add(PlanOp(
+      kind: poInsert,
+      insTableId: tableId,
+      insTableName: "users",
+      insColumns: @["id", "name"],
+      insPkColumn: "id",
+      insPkSpec: pkSpec,
+      insRows: rows,
+      insPkValues: pkValues
+    ))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkModified
+    check result.count == 3
+
+  test "executeWithTxn INSERT without PK fails":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    # Begin a transaction
+    var beginPlan = newPlan()
+    beginPlan.add(PlanOp(kind: poBeginTxn, btReadOnly: false))
+    discard executeWithTxn(beginPlan, ctx)
+
+    var row = newDataRow()
+    row["name"] = DataRowValue(kind: drvkString, strVal: "Alice")
+
+    let plan = newPlan()
+    plan.add(PlanOp(
+      kind: poInsert,
+      insTableId: genTableId(),
+      insTableName: "users",
+      insColumns: @["name"],
+      insPkColumn: "id",
+      insPkSpec: PrimaryKeySpec(columns: @[("id", cdtInt, 0)]),
+      insRows: @[encodeDataRow(row)],
+      insPkValues: @[""] # Empty PK value
+    ))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkError
+    check "primary key" in result.error
+
+  test "executeWithTxn PointGet existing row":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    # Begin a transaction
+    var beginPlan = newPlan()
+    beginPlan.add(PlanOp(kind: poBeginTxn, btReadOnly: false))
+    discard executeWithTxn(beginPlan, ctx)
+
+    # Insert a row first
+    let tableId = genTableId()
+    var row = newDataRow()
+    row["id"] = DataRowValue(kind: drvkInt, intVal: 42)
+    row["name"] = DataRowValue(kind: drvkString, strVal: "Bob")
+    let pkValue = bytesToString(encodeInt64BE(42'i64))
+
+    var insertPlan = newPlan()
+    insertPlan.add(PlanOp(
+      kind: poInsert,
+      insTableId: tableId,
+      insTableName: "users",
+      insColumns: @["id", "name"],
+      insPkColumn: "id",
+      insPkSpec: PrimaryKeySpec(columns: @[("id", cdtInt, 0)]),
+      insRows: @[encodeDataRow(row)],
+      insPkValues: @[pkValue]
+    ))
+    discard executeWithTxn(insertPlan, ctx)
+
+    # PointGet the row
+    let plan = newPlan()
+    plan.add(PlanOp(
+      kind: poPointGet,
+      pgTableId: tableId,
+      pgKey: pkValue,
+      pgPkSpec: PrimaryKeySpec(columns: @[("id", cdtInt, 0)]),
+      pgColumns: @["id", "name"],
+      pgAllColumns: @["id", "name"]
+    ))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkRows
+    check result.rows.len == 1
+    check result.rows[0].len == 2
+
+  test "executeWithTxn PointGet non-existent row":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    # Begin a transaction
+    var beginPlan = newPlan()
+    beginPlan.add(PlanOp(kind: poBeginTxn, btReadOnly: false))
+    discard executeWithTxn(beginPlan, ctx)
+
+    let tableId = genTableId()
+    let pkValue = bytesToString(encodeInt64BE(999'i64))
+
+    let plan = newPlan()
+    plan.add(PlanOp(
+      kind: poPointGet,
+      pgTableId: tableId,
+      pgKey: pkValue,
+      pgPkSpec: PrimaryKeySpec(columns: @[("id", cdtInt, 0)]),
+      pgColumns: @["id", "name"],
+      pgAllColumns: @["id", "name"]
+    ))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkRows
+    check result.rows.len == 0
+
+  test "executeWithTxn Scan all rows":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    # Begin a transaction
+    var beginPlan = newPlan()
+    beginPlan.add(PlanOp(kind: poBeginTxn, btReadOnly: false))
+    discard executeWithTxn(beginPlan, ctx)
+
+    # Insert multiple rows
+    let tableId = genTableId()
+    let pkSpec = PrimaryKeySpec(columns: @[("id", cdtInt, 0)])
+
+    for i in 1..5:
+      var row = newDataRow()
+      row["id"] = DataRowValue(kind: drvkInt, intVal: int64(i * 10))
+      row["value"] = DataRowValue(kind: drvkString, strVal: "val" & $i)
+      var insertPlan = newPlan()
+      insertPlan.add(PlanOp(
+        kind: poInsert,
+        insTableId: tableId,
+        insTableName: "test",
+        insColumns: @["id", "value"],
+        insPkColumn: "id",
+        insPkSpec: pkSpec,
+        insRows: @[encodeDataRow(row)],
+        insPkValues: @[bytesToString(encodeInt64BE(int64(i * 10)))]
+      ))
+      discard executeWithTxn(insertPlan, ctx)
+
+    # Scan all rows
+    let startKey = encodeDataRowKey(tableId, "")
+    let endKey = makeDataRowScanEndKey(tableId)
+
+    let plan = newPlan()
+    plan.add(PlanOp(
+      kind: poScan,
+      scTableId: tableId,
+      scStartKey: startKey,
+      scEndKey: endKey,
+      scLimit: 0,
+      scFilter: none(Expr),
+      scColumns: @["id", "value"],
+      scAllColumns: @["id", "value"]
+    ))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkRows
+    check result.rows.len == 5
+
+  test "executeWithTxn Scan with limit":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    # Begin a transaction
+    var beginPlan = newPlan()
+    beginPlan.add(PlanOp(kind: poBeginTxn, btReadOnly: false))
+    discard executeWithTxn(beginPlan, ctx)
+
+    # Insert multiple rows
+    let tableId = genTableId()
+    let pkSpec = PrimaryKeySpec(columns: @[("id", cdtInt, 0)])
+
+    for i in 1..10:
+      var row = newDataRow()
+      row["id"] = DataRowValue(kind: drvkInt, intVal: int64(i))
+      var insertPlan = newPlan()
+      insertPlan.add(PlanOp(
+        kind: poInsert,
+        insTableId: tableId,
+        insTableName: "test",
+        insColumns: @["id"],
+        insPkColumn: "id",
+        insPkSpec: pkSpec,
+        insRows: @[encodeDataRow(row)],
+        insPkValues: @[bytesToString(encodeInt64BE(int64(i)))]
+      ))
+      discard executeWithTxn(insertPlan, ctx)
+
+    # Scan with limit
+    let startKey = encodeDataRowKey(tableId, "")
+    let endKey = makeDataRowScanEndKey(tableId)
+
+    let plan = newPlan()
+    plan.add(PlanOp(
+      kind: poScan,
+      scTableId: tableId,
+      scStartKey: startKey,
+      scEndKey: endKey,
+      scLimit: 3,
+      scFilter: none(Expr),
+      scColumns: @["id"],
+      scAllColumns: @["id"]
+    ))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkRows
+    check result.rows.len == 3
+
+  test "executeWithTxn UPDATE rows":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    # Begin a transaction
+    var beginPlan = newPlan()
+    beginPlan.add(PlanOp(kind: poBeginTxn, btReadOnly: false))
+    discard executeWithTxn(beginPlan, ctx)
+
+    # Insert rows
+    let tableId = genTableId()
+    let pkSpec = PrimaryKeySpec(columns: @[("id", cdtInt, 0)])
+
+    for i in 1..3:
+      var row = newDataRow()
+      row["id"] = DataRowValue(kind: drvkInt, intVal: int64(i))
+      row["status"] = DataRowValue(kind: drvkString, strVal: "active")
+      var insertPlan = newPlan()
+      insertPlan.add(PlanOp(
+        kind: poInsert,
+        insTableId: tableId,
+        insTableName: "test",
+        insColumns: @["id", "status"],
+        insPkColumn: "id",
+        insPkSpec: pkSpec,
+        insRows: @[encodeDataRow(row)],
+        insPkValues: @[bytesToString(encodeInt64BE(int64(i)))]
+      ))
+      discard executeWithTxn(insertPlan, ctx)
+
+    # Update all rows (no filter)
+    let plan = newPlan()
+    plan.add(PlanOp(
+      kind: poUpdate,
+      upTableId: tableId,
+      upTableName: "test",
+      upFilter: none(Expr),
+      upSets: @[(col: "status", val: Expr(kind: exLiteral,
+          litValue: ValueRef(kind: dtString, strValue: "inactive")))],
+      upAllColumns: @["id", "status"],
+      upPkColumn: "id"
+    ))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkModified
+    check result.count == 3
+
+  test "executeWithTxn DELETE rows":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    # Begin a transaction
+    var beginPlan = newPlan()
+    beginPlan.add(PlanOp(kind: poBeginTxn, btReadOnly: false))
+    discard executeWithTxn(beginPlan, ctx)
+
+    # Insert rows
+    let tableId = genTableId()
+    let pkSpec = PrimaryKeySpec(columns: @[("id", cdtInt, 0)])
+
+    for i in 1..5:
+      var row = newDataRow()
+      row["id"] = DataRowValue(kind: drvkInt, intVal: int64(i))
+      var insertPlan = newPlan()
+      insertPlan.add(PlanOp(
+        kind: poInsert,
+        insTableId: tableId,
+        insTableName: "test",
+        insColumns: @["id"],
+        insPkColumn: "id",
+        insPkSpec: pkSpec,
+        insRows: @[encodeDataRow(row)],
+        insPkValues: @[bytesToString(encodeInt64BE(int64(i)))]
+      ))
+      discard executeWithTxn(insertPlan, ctx)
+
+    # Delete all rows (no filter)
+    let plan = newPlan()
+    plan.add(PlanOp(
+      kind: poDelete,
+      delTableId: tableId,
+      delTableName: "test",
+      delFilter: none(Expr),
+      delAllColumns: @["id"],
+      delPkColumn: "id"
+    ))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkModified
+    check result.count == 5
+
+suite "Executor SHOW SPACES with MockKVStore":
+
+  test "executeWithTxn SHOW SPACES":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    # Create a space record
+    let spaceRec = SpaceRecord(
+      spaceId: genSpaceID(),
+      name: "myspace",
+      replicas: 3,
+      groupCount: 5,
+      groupIds: @[genGroupID(), genGroupID(), genGroupID(), genGroupID(),
+          genGroupID()]
+    )
+    let key = encodeTableKey(SYS_SPACES_TABLE_ID, "myspace")
+    discard mockKV.put(key, encode(spaceRec), txnId = zeroTransactionID())
+
+    let plan = newPlan()
+    plan.add(PlanOp(kind: poShowSpaces))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkRows
+    check result.columns == @["space_id", "name", "replicas", "group_count", "group_ids"]
+    check result.rows.len >= 1
+
+suite "Executor DDL Forbidden in Transaction Extended":
+
+  test "DROP SCHEMA forbidden in transaction":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    # Begin transaction
+    var beginPlan = newPlan()
+    beginPlan.add(PlanOp(kind: poBeginTxn, btReadOnly: false))
+    discard executeWithTxn(beginPlan, ctx)
+
+    # Try DROP SCHEMA
+    let plan = newPlan()
+    plan.add(PlanOp(kind: poDropSchema, dsDatabase: "default",
+                    dsName: "test", dsIfExists: false))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkError
+    check "not allowed inside a transaction" in result.error
+
+  test "DROP TABLE forbidden in transaction":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    # Begin transaction
+    var beginPlan = newPlan()
+    beginPlan.add(PlanOp(kind: poBeginTxn, btReadOnly: false))
+    discard executeWithTxn(beginPlan, ctx)
+
+    # Try DROP TABLE
+    let plan = newPlan()
+    plan.add(PlanOp(kind: poDropTable, dtDatabase: "default",
+                    dtSchema: "public", dtName: "test", dtIfExists: false))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkError
+    check "not allowed inside a transaction" in result.error
+
+  test "CREATE SPACE forbidden in transaction":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    # Begin transaction
+    var beginPlan = newPlan()
+    beginPlan.add(PlanOp(kind: poBeginTxn, btReadOnly: false))
+    discard executeWithTxn(beginPlan, ctx)
+
+    # Try CREATE SPACE
+    let plan = newPlan()
+    plan.add(PlanOp(kind: poCreateSpace, cspName: "testspace", cspReplicas: 3))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkError
+    check "not allowed inside a transaction" in result.error
+
+  test "DROP SPACE forbidden in transaction":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    # Begin transaction
+    var beginPlan = newPlan()
+    beginPlan.add(PlanOp(kind: poBeginTxn, btReadOnly: false))
+    discard executeWithTxn(beginPlan, ctx)
+
+    # Try DROP SPACE
+    let plan = newPlan()
+    plan.add(PlanOp(kind: poDropSpace, dspName: "testspace"))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkError
+    check "not allowed inside a transaction" in result.error
+
+  test "CREATE SPACE without client fails":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV) # No real client
+
+    let plan = newPlan()
+    plan.add(PlanOp(kind: poCreateSpace, cspName: "testspace", cspReplicas: 3))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkError
+    check "requires a real FractioClient" in result.error
+
+  test "DROP SPACE without client fails":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV) # No real client
+
+    let plan = newPlan()
+    plan.add(PlanOp(kind: poDropSpace, dspName: "testspace"))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkError
+    check "requires a real FractioClient" in result.error
