@@ -514,7 +514,9 @@ proc execWithRetry(nodes: seq[TestNode], sql: string,
   ExecResult(kind: erkError, error: "max retries exceeded for: " & sql)
 
 proc exec(node: TestNode, sql: string): ExecResult =
-  node.client.query(sql)
+  ## Execute SQL and buffer streaming rows into regular rows for test assertions.
+  let res = node.client.query(sql)
+  bufferRows(res)
 
 proc loadMetadataOnAllNodes(nodes: seq[TestNode]) =
   ## Load space, table, and group membership metadata on all nodes.

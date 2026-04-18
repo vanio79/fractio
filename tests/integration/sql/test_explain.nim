@@ -130,7 +130,9 @@ proc cleanupTestDir(testDir: string) =
 
 proc exec(client: FractioClient, sql: string, database = "default",
     schema = "public"): ExecResult =
-  client.query(sql, database, schema)
+  ## Execute SQL and buffer streaming rows into regular rows for test assertions.
+  let res = client.query(sql, database, schema)
+  bufferRows(res)
 
 proc seedTable(store: RaftKVStoreExt, database, schema, name: string,
     tableId: TableId, columns: seq[tuple[name: string, typ: string]],

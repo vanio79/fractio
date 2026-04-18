@@ -1,7 +1,7 @@
 # WiscKey Storage Backend Implementation
 # Implements the StorageBackend interface using WiscKey (LSM-Tree with value log separation)
 
-import std/[options, locks]
+import std/[options, locks, atomics, typedthreads, deques, os]
 import backend
 
 # WiscKey C bindings - static linking
@@ -28,6 +28,17 @@ type
     ## WiscKey iterator
     iter*: pointer # leveldb_iterator_t*
     backendRef*: WiscKeyBackend
+
+  WiscKeyStreamResultSet* = ref object of StreamResultSet
+    ## Streaming result set implementation for WiscKey backend.
+    ## Uses a background thread to prefetch data from LevelDB.
+    backend*: WiscKeyBackend
+    sharedData*: ptr StreamSharedData
+    prefetchThread*: Thread[PrefetchWorkerArgs]
+    config*: StreamConfig
+    startKey*: string
+    endKey*: string
+    limit*: int
 
 # Forward declarations for C functions
 proc c_leveldb_open(options: pointer, name: cstring,
@@ -562,3 +573,270 @@ method destroy*(backend: WiscKeyBackend): bool =
     return false
 
   return true
+
+# ============================================================================
+# Streaming Scan Implementation
+# ============================================================================
+
+# Prefetch worker thread proc - runs in background reading from LevelDB
+proc prefetchWorker(args: PrefetchWorkerArgs) {.thread.} =
+  ## Background thread that reads key-value pairs from LevelDB and fills buffer.
+  ## Thread-safe: uses locks to protect buffer and atomics for state.
+  let rs = args.resultSet
+  let wkRs = cast[WiscKeyStreamResultSet](rs)
+  let backend = wkRs.backend
+  let shared = wkRs.sharedData
+  let config = wkRs.config
+
+  # Early exit if stream already closed
+  if shared.state.load(moRelaxed) == ssClosed:
+    return
+
+  # Acquire backend lock for iterator creation
+  acquire(backend.mu)
+  if not backend.isOpen:
+    release(backend.mu)
+    shared.state.store(ssError, moRelaxed)
+    shared.error.store("backend not open", moRelaxed)
+    return
+
+  let iter = c_leveldb_create_iterator(backend.db, backend.readOptions)
+  release(backend.mu)
+
+  if iter == nil:
+    shared.state.store(ssError, moRelaxed)
+    shared.error.store("failed to create iterator", moRelaxed)
+    return
+
+  # Position iterator
+  if args.startKey.len > 0:
+    c_leveldb_iter_seek(iter, args.startKey.cstring, args.startKey.len.csize_t)
+  else:
+    c_leveldb_iter_seek_to_first(iter)
+
+  # Read loop - fill buffer until exhausted or closed
+  var itemsRead = 0
+  while true:
+    # Check if we should stop
+    let currentState = shared.state.load(moRelaxed)
+    if currentState == ssClosed:
+      break
+
+    if args.limit > 0 and itemsRead >= args.limit:
+      break
+
+    # Check iterator validity
+    if c_leveldb_iter_valid(iter) == 0:
+      break
+
+    # Read current key
+    var keylen: csize_t
+    let keyC = c_leveldb_iter_key(iter, addr keylen)
+    if keyC == nil:
+      break
+
+    var k = newString(keylen)
+    if keylen > 0:
+      copyMem(k[0].addr, keyC, keylen)
+
+    # Check upper bound
+    if args.endKey.len > 0 and k >= args.endKey:
+      break
+
+    # Read current value
+    var vallen: csize_t
+    let valC = c_leveldb_iter_value(iter, addr vallen)
+    var v = newString(vallen)
+    if vallen > 0 and valC != nil:
+      copyMem(v[0].addr, valC, vallen)
+
+    # Add to buffer (thread-safe)
+    acquire(shared.bufferLock)
+    shared.buffer.addLast((key: k, value: v))
+    let bufferLen = shared.buffer.len
+    release(shared.bufferLock)
+
+    inc itemsRead
+    shared.totalRead.store(itemsRead, moRelaxed)
+
+    # Pause if buffer is full - wait for consumer to drain
+    while bufferLen >= config.bufferSize and
+          shared.state.load(moRelaxed) != ssClosed:
+      # Small sleep to avoid busy waiting
+      os.sleep(1)
+      acquire(shared.bufferLock)
+      let currentLen = shared.buffer.len
+      release(shared.bufferLock)
+      if currentLen < config.bufferSize:
+        break
+
+    # Advance iterator
+    c_leveldb_iter_next(iter)
+
+  # Cleanup iterator
+  c_leveldb_iter_destroy(iter)
+
+  # Mark stream as exhausted (or error if closed during reading)
+  let finalState = shared.state.load(moRelaxed)
+  if finalState != ssClosed and finalState != ssError:
+    shared.state.store(ssExhausted, moRelaxed)
+
+# StreamResultSet implementation for WiscKey
+
+method init*(rs: WiscKeyStreamResultSet, backend: StorageBackend,
+            startKey: string, endKey: string, limit: int = 0,
+            config: StreamConfig = StreamConfig()): bool =
+  ## Initialize the stream for reading from WiscKey backend.
+  if backend of WiscKeyBackend:
+    rs.backend = WiscKeyBackend(backend)
+  else:
+    return false
+
+  rs.startKey = startKey
+  rs.endKey = endKey
+  rs.limit = limit
+  rs.config = config
+
+  # Allocate shared data
+  rs.sharedData = create(StreamSharedData)
+  rs.sharedData.buffer = initDeque[KeyValuePair]()
+  initLock(rs.sharedData.bufferLock)
+  rs.sharedData.state.store(ssIdle, moRelaxed)
+  rs.sharedData.error.store("", moRelaxed)
+  rs.sharedData.totalRead.store(0, moRelaxed)
+  rs.sharedData.consumerPos.store(0, moRelaxed)
+
+  # Start prefetch thread
+  rs.sharedData.state.store(ssReading, moRelaxed)
+  let args: PrefetchWorkerArgs = (
+    resultSet: rs,
+    backend: rs.backend,
+    startKey: startKey,
+    endKey: endKey,
+    limit: limit
+  )
+  createThread(rs.prefetchThread, prefetchWorker, args)
+
+  return true
+
+method next*(rs: WiscKeyStreamResultSet): Option[KeyValuePair] =
+  ## Get the next key-value pair from the stream.
+  ## Returns none() if exhausted or closed.
+  let shared = rs.sharedData
+
+  # Check state
+  let currentState = shared.state.load(moRelaxed)
+  if currentState == ssClosed:
+    return none(KeyValuePair)
+
+  if currentState == ssError:
+    return none(KeyValuePair)
+
+  # Try to get from buffer
+  acquire(shared.bufferLock)
+  if shared.buffer.len > 0:
+    let kv = shared.buffer.popFirst()
+    let consumerPos = shared.consumerPos.load(moRelaxed) + 1
+    shared.consumerPos.store(consumerPos, moRelaxed)
+    release(shared.bufferLock)
+    return some(kv)
+  release(shared.bufferLock)
+
+  # Buffer empty - check if stream exhausted
+  if currentState == ssExhausted:
+    return none(KeyValuePair)
+
+  # Wait briefly for prefetch to fill buffer
+  for i in 0 ..< 10:
+    os.sleep(1)
+    acquire(shared.bufferLock)
+    if shared.buffer.len > 0:
+      let kv = shared.buffer.popFirst()
+      let consumerPos = shared.consumerPos.load(moRelaxed) + 1
+      shared.consumerPos.store(consumerPos, moRelaxed)
+      release(shared.bufferLock)
+      return some(kv)
+    let state = shared.state.load(moRelaxed)
+    release(shared.bufferLock)
+    if state == ssExhausted or state == ssClosed:
+      break
+
+  # Still empty after wait
+  return none(KeyValuePair)
+
+method hasNext*(rs: WiscKeyStreamResultSet): bool =
+  ## Check if more data is available.
+  let shared = rs.sharedData
+
+  let currentState = shared.state.load(moRelaxed)
+  if currentState == ssClosed or currentState == ssError:
+    return false
+
+  # Check buffer
+  acquire(shared.bufferLock)
+  let bufferLen = shared.buffer.len
+  release(shared.bufferLock)
+
+  if bufferLen > 0:
+    return true
+
+  # Buffer empty but still reading
+  if currentState == ssReading:
+    return true
+
+  # Exhausted and empty
+  return false
+
+method close*(rs: WiscKeyStreamResultSet) =
+  ## Close the stream and stop the prefetch thread.
+  let shared = rs.sharedData
+
+  if shared == nil:
+    return
+
+  # Signal thread to stop
+  shared.state.store(ssClosed, moRelaxed)
+
+  # Wait for thread to finish
+  joinThread(rs.prefetchThread)
+
+  # Cleanup shared data
+  deinitLock(shared.bufferLock)
+  dealloc(shared)
+  rs.sharedData = nil
+
+method getState*(rs: WiscKeyStreamResultSet): StreamState =
+  if rs.sharedData == nil:
+    return ssIdle
+  rs.sharedData.state.load(moRelaxed)
+
+method getTotalRead*(rs: WiscKeyStreamResultSet): int =
+  if rs.sharedData == nil:
+    return 0
+  rs.sharedData.totalRead.load(moRelaxed)
+
+method getError*(rs: WiscKeyStreamResultSet): Option[string] =
+  if rs.sharedData == nil:
+    return none(string)
+  let err = rs.sharedData.error.load(moRelaxed)
+  if err.len > 0:
+    return some(err)
+  return none(string)
+
+# Factory proc for creating streaming result set
+proc newWiscKeyStreamResultSet*(backend: WiscKeyBackend, startKey: string,
+                               endKey: string, limit: int = 0,
+                               config: StreamConfig = defaultStreamConfig()): WiscKeyStreamResultSet =
+  ## Create a new streaming result set for WiscKey backend.
+  ## Automatically starts the prefetch thread.
+  new(result)
+  discard result.init(backend, startKey, endKey, limit, config)
+
+# Streaming scan method
+proc streamScan*(backend: WiscKeyBackend, startKey: string, endKey: string,
+               limit: int = 0,
+               config: StreamConfig = defaultStreamConfig()): StreamResultSet =
+  ## Streaming range scan: returns a StreamResultSet for lazy iteration.
+  ## Uses a background thread to prefetch data into a buffer.
+  ## Consumer can read from buffer while prefetch thread continues reading.
+  result = newWiscKeyStreamResultSet(backend, startKey, endKey, limit, config)

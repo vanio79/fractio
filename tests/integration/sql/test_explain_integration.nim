@@ -118,7 +118,9 @@ proc cleanupTestDir(testDir: string) =
 
 proc exec(client: FractioClient,
     sql: string, database = "default", schema = "public"): ExecResult =
-  client.query(sql, database = database, schema = schema)
+  ## Execute SQL and buffer streaming rows into regular rows for test assertions.
+  let res = client.query(sql, database = database, schema = schema)
+  bufferRows(res)
 
 # ---------------------------------------------------------------------------
 # Suite 1: EXPLAIN round-trip with real data

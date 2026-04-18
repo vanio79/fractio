@@ -454,7 +454,9 @@ proc updateGroupLeaders(nodes: seq[TestNode]) =
 
 proc exec(node: TestNode, sql: string, database = "default",
     schema = "public"): ExecResult =
-  node.client.query(sql, database, schema)
+  ## Execute SQL and buffer streaming rows into regular rows for test assertions.
+  let res = node.client.query(sql, database, schema)
+  bufferRows(res)
 
 # ---------------------------------------------------------------------------
 # Cluster fixtures

@@ -6,6 +6,7 @@
 import std/options
 import ./types
 import ../distributed/raft/group_types # for GroupID
+import ../storage/backend # for StreamResultSet, StreamConfig, KeyValuePair
 
 # ---------------------------------------------------------------------------
 # Result types
@@ -21,6 +22,12 @@ type
   KVOpVoidResult* = object
     ## Result type for KV operations that don't return a value (put, delete)
     isOk*: bool
+    err*: string
+
+  KVStreamResult* = object
+    ## Result type for streaming scan operations
+    isOk*: bool
+    stream*: StreamResultSet
     err*: string
 
 proc kvOpOk*[T](v: T): KVOpResult[T] =
@@ -55,6 +62,27 @@ proc isErr*(r: KVOpVoidResult): bool =
 
 proc isOk*(r: KVOpVoidResult): bool =
   r.isOk
+
+# Stream result constructors
+proc kvStreamOk*(stream: StreamResultSet): KVStreamResult =
+  KVStreamResult(isOk: true, stream: stream)
+
+proc kvStreamErr*(msg: string): KVStreamResult =
+  KVStreamResult(isOk: false, err: msg)
+
+proc isErr*(r: KVStreamResult): bool =
+  not r.isOk
+
+proc isOk*(r: KVStreamResult): bool =
+  r.isOk
+
+proc stream*(r: KVStreamResult): StreamResultSet =
+  doAssert r.isOk, "called .stream on Err result: " & r.err
+  r.stream
+
+proc error*(r: KVStreamResult): string =
+  doAssert not r.isOk, "called .error on Ok result"
+  r.err
 
 # ---------------------------------------------------------------------------
 # Transaction result type
@@ -99,7 +127,7 @@ method delete*(store: KVStore, key: string,
   ## If txnId is provided, deletion is staged until commit.
   kvVoidErr("not implemented")
 
-# Scan operation
+# Scan operation (returns all results as array - deprecated for large scans)
 method scan*(store: KVStore, startKey: string, endKey: string,
              limit: uint32 = 0,
              txnId: TransactionID = zeroTransactionID(),
@@ -109,7 +137,20 @@ method scan*(store: KVStore, startKey: string, endKey: string,
   ## Returns all key-value pairs in the range [startKey, endKey).
   ## If limit > 0, returns at most limit entries.
   ## Transaction-aware: reads from snapshot at readTimestamp if provided.
+  ## DEPRECATED for large scans - use streamScan instead.
   kvOpErr[seq[tuple[key, value: string]]]("not implemented")
+
+# Streaming scan operation (preferred for large result sets)
+method streamScan*(store: KVStore, startKey: string, endKey: string,
+                  limit: uint32 = 0,
+                  txnId: TransactionID = zeroTransactionID(),
+                  readTimestamp: uint64 = 0,
+                  config: StreamConfig = defaultStreamConfig()): KVStreamResult {.base, gcsafe.} =
+  ## Streaming scan for large key ranges.
+  ## Returns a StreamResultSet that lazily fetches data using a background thread.
+  ## Use this for queries that may return large result sets to avoid memory pressure.
+  ## Consumer can iterate while prefetch thread continues reading ahead.
+  kvStreamErr("not implemented")
 
 # Transaction operations
 method beginTxn*(store: KVStore): KVOpResult[TxnBeginResult] {.base.} =
@@ -179,3 +220,23 @@ proc txnScan*(store: KVStore, startKey: string, endKey: string,
   ## Scan within a transaction context.
   store.scan(startKey, endKey, limit, txnId = txnId,
       readTimestamp = readTimestamp)
+
+proc txnStreamScan*(store: KVStore, startKey: string, endKey: string,
+                   txnId: TransactionID, readTimestamp: uint64,
+                   limit: uint32 = 0,
+                   config: StreamConfig = defaultStreamConfig()): KVStreamResult =
+  ## Streaming scan within a transaction context.
+  ## Preferred for large result sets.
+  store.streamScan(startKey, endKey, limit, txnId = txnId,
+      readTimestamp = readTimestamp, config = config)
+
+# Helper to consume entire stream into a sequence (for backward compatibility)
+proc consumeStream*(rs: StreamResultSet): seq[KeyValuePair] =
+  ## Consume entire stream and return all results as a sequence.
+  ## WARNING: This defeats the streaming purpose - use only for small results.
+  ## Caller must close the stream after calling this.
+  result = @[]
+  while rs.hasNext():
+    let kv = rs.next()
+    if kv.isSome:
+      result.add(kv.get)

@@ -6,6 +6,7 @@ import fractio/sql/data_row
 import fractio/core/types
 import fractio/core/primary_key
 import fractio/distributed/meta/system_schemas
+import fractio/protocol/messages/kv # for WireFilterExpr types
 
 suite "Planner Result Constructors":
 
@@ -1088,3 +1089,154 @@ suite "Planner genNewTableId":
     check id1 != id2
     # ULIDs are 26 characters
     check tableIdToBytes(id1).len == 16
+
+suite "Planner exprToWireFilterExpr":
+
+  test "converts literal int":
+    let e = Expr(kind: exLiteral, litValue: newValueRef(42'i64))
+    let wire = exprToWireFilterExpr(e)
+    check wire.kind == wekLiteral
+    check wire.litDataType == wdtInt
+    check wire.litIntVal == 42'i64
+
+  test "converts literal string":
+    let e = Expr(kind: exLiteral, litValue: newValueRef("active"))
+    let wire = exprToWireFilterExpr(e)
+    check wire.kind == wekLiteral
+    check wire.litDataType == wdtString
+    check wire.litStringVal == "active"
+
+  test "converts literal bool":
+    let e = Expr(kind: exLiteral, litValue: newValueRef(true))
+    let wire = exprToWireFilterExpr(e)
+    check wire.kind == wekLiteral
+    check wire.litDataType == wdtBool
+    check wire.litBoolVal == true
+
+  test "converts literal float":
+    let e = Expr(kind: exLiteral, litValue: newValueRef(3.14))
+    let wire = exprToWireFilterExpr(e)
+    check wire.kind == wekLiteral
+    check wire.litDataType == wdtFloat
+    check wire.litFloatVal == 3.14
+
+  test "converts literal null":
+    let e = Expr(kind: exLiteral, litValue: nil)
+    let wire = exprToWireFilterExpr(e)
+    check wire.kind == wekLiteral
+    check wire.litDataType == wdtNull
+
+  test "converts column reference":
+    let e = Expr(kind: exColumn, colName: "status")
+    let wire = exprToWireFilterExpr(e)
+    check wire.kind == wekColumn
+    check wire.colName == "status"
+
+  test "converts binary op equality":
+    let left = Expr(kind: exColumn, colName: "id")
+    let right = Expr(kind: exLiteral, litValue: newValueRef(1'i64))
+    let e = Expr(kind: exBinOp, binOp: boEq, binLeft: left, binRight: right)
+    let wire = exprToWireFilterExpr(e)
+    check wire.kind == wekBinOp
+    check wire.binOpKind == wboEq
+    check wire.binLeft.kind == wekColumn
+    check wire.binLeft.colName == "id"
+    check wire.binRight.kind == wekLiteral
+    check wire.binRight.litIntVal == 1'i64
+
+  test "converts binary op less than":
+    let left = Expr(kind: exColumn, colName: "age")
+    let right = Expr(kind: exLiteral, litValue: newValueRef(18'i64))
+    let e = Expr(kind: exBinOp, binOp: boLt, binLeft: left, binRight: right)
+    let wire = exprToWireFilterExpr(e)
+    check wire.kind == wekBinOp
+    check wire.binOpKind == wboLt
+
+  test "converts binary op greater than":
+    let left = Expr(kind: exColumn, colName: "age")
+    let right = Expr(kind: exLiteral, litValue: newValueRef(18'i64))
+    let e = Expr(kind: exBinOp, binOp: boGt, binLeft: left, binRight: right)
+    let wire = exprToWireFilterExpr(e)
+    check wire.kind == wekBinOp
+    check wire.binOpKind == wboGt
+
+  test "converts AND expression":
+    let leftInner = Expr(kind: exColumn, colName: "id")
+    let leftLit = Expr(kind: exLiteral, litValue: newValueRef(1'i64))
+    let left = Expr(kind: exBinOp, binOp: boEq, binLeft: leftInner,
+        binRight: leftLit)
+    let rightInner = Expr(kind: exColumn, colName: "status")
+    let rightLit = Expr(kind: exLiteral, litValue: newValueRef("active"))
+    let right = Expr(kind: exBinOp, binOp: boEq, binLeft: rightInner,
+        binRight: rightLit)
+    let e = Expr(kind: exBinOp, binOp: boAnd, binLeft: left, binRight: right)
+    let wire = exprToWireFilterExpr(e)
+    check wire.kind == wekBinOp
+    check wire.binOpKind == wboAnd
+    check wire.binLeft.kind == wekBinOp
+    check wire.binLeft.binOpKind == wboEq
+    check wire.binRight.kind == wekBinOp
+    check wire.binRight.binOpKind == wboEq
+
+  test "converts OR expression":
+    let leftInner = Expr(kind: exColumn, colName: "status")
+    let leftLit = Expr(kind: exLiteral, litValue: newValueRef("active"))
+    let left = Expr(kind: exBinOp, binOp: boEq, binLeft: leftInner,
+        binRight: leftLit)
+    let rightLit = Expr(kind: exLiteral, litValue: newValueRef("pending"))
+    let right = Expr(kind: exBinOp, binOp: boEq, binLeft: leftInner,
+        binRight: rightLit)
+    let e = Expr(kind: exBinOp, binOp: boOr, binLeft: left, binRight: right)
+    let wire = exprToWireFilterExpr(e)
+    check wire.kind == wekBinOp
+    check wire.binOpKind == wboOr
+
+  test "converts NOT expression":
+    let innerCol = Expr(kind: exColumn, colName: "status")
+    let innerLit = Expr(kind: exLiteral, litValue: newValueRef("active"))
+    let inner = Expr(kind: exBinOp, binOp: boEq, binLeft: innerCol,
+        binRight: innerLit)
+    let e = Expr(kind: exUnaryOp, unaryOp: uoNot, unaryExpr: inner)
+    let wire = exprToWireFilterExpr(e)
+    check wire.kind == wekUnaryOp
+    check wire.unaryOpKind == wuoNot
+    check wire.unaryExpr.kind == wekBinOp
+
+  test "converts IS NULL expression":
+    let inner = Expr(kind: exColumn, colName: "deleted_at")
+    let e = Expr(kind: exIsNull, isNullExpr: inner, isNullNot: false)
+    let wire = exprToWireFilterExpr(e)
+    check wire.kind == wekIsNull
+    check wire.isNullNot == false
+    check wire.isNullExpr.kind == wekColumn
+
+  test "converts IS NOT NULL expression":
+    let inner = Expr(kind: exColumn, colName: "deleted_at")
+    let e = Expr(kind: exIsNull, isNullExpr: inner, isNullNot: true)
+    let wire = exprToWireFilterExpr(e)
+    check wire.kind == wekIsNull
+    check wire.isNullNot == true
+
+  test "converts BETWEEN expression":
+    let exprCol = Expr(kind: exColumn, colName: "age")
+    let lo = Expr(kind: exLiteral, litValue: newValueRef(18'i64))
+    let hi = Expr(kind: exLiteral, litValue: newValueRef(65'i64))
+    let e = Expr(kind: exBetween, betweenExpr: exprCol, betweenLo: lo,
+        betweenHi: hi, betweenNot: false)
+    let wire = exprToWireFilterExpr(e)
+    check wire.kind == wekBetween
+    check wire.betweenNot == false
+    check wire.betweenExpr.colName == "age"
+    check wire.betweenLo.litIntVal == 18'i64
+    check wire.betweenHi.litIntVal == 65'i64
+
+  test "converts LIKE expression":
+    let exprCol = Expr(kind: exColumn, colName: "name")
+    let pattern = Expr(kind: exLiteral, litValue: newValueRef("%test%"))
+    let e = Expr(kind: exLike, likeExpr: exprCol, likePattern: pattern,
+        likeNot: false)
+    let wire = exprToWireFilterExpr(e)
+    check wire.kind == wekLike
+    check wire.likeNot == false
+    check wire.likeExpr.colName == "name"
+    check wire.likePattern.litStringVal == "%test%"

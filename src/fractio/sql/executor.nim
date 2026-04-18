@@ -3,13 +3,13 @@
 # Executes a Plan against a FractioClient, returning results.
 # Each PlanOp maps directly to KV operations via the client.
 # Supports MVCC transactions through the client's transaction API.
+# Streaming SELECT results for large table scans.
 #
 # Pure expression evaluation functions are in expr_eval.nim and are
 # fully testable without I/O dependencies.
 
-import std/[options, json, strutils, strformat, tables, algorithm]
+import std/[options, strutils, strformat]
 import ./ast
-import ./parser
 import ./planner
 import ./data_row
 import ./expr_eval # Pure expression evaluation functions
@@ -19,6 +19,9 @@ import ../distributed/raft/group_types
 import ../client/fractio_client
 import ../core/types as coreTypes
 import ../core/kv_interface # KVStore interface for mockable testing
+import ../protocol/client # For StreamingScanClient
+import ../protocol/types # For ProtocolError, peErr
+import ../protocol/messages/kv as kvMsgs # For ScanPair
 
 # ---------------------------------------------------------------------------
 # Result types
@@ -26,18 +29,22 @@ import ../core/kv_interface # KVStore interface for mockable testing
 
 type
   ExecResultKind* = enum
-    erkRows        ## SELECT results
-    erkModified    ## INSERT/UPDATE/DELETE affected rows
-    erkOk          ## DDL success
-    erkError       ## Error
-    erkUseDatabase ## USE DATABASE — caller should update session context
-    erkUseSchema   ## USE SCHEMA — caller should update session context
+    erkRows          ## SELECT results (buffered in memory)
+    erkStreamingRows ## SELECT results (streaming iterator)
+    erkModified      ## INSERT/UPDATE/DELETE affected rows
+    erkOk            ## DDL success
+    erkError         ## Error
+    erkUseDatabase   ## USE DATABASE — caller should update session context
+    erkUseSchema     ## USE SCHEMA — caller should update session context
 
   ExecResult* = ref object
     case kind*: ExecResultKind
     of erkRows:
       columns*: seq[string]
-      rows*: seq[seq[string]] # each row is column values as strings
+      rows*: seq[seq[string]]     # each row is column values as strings
+    of erkStreamingRows:
+      streamIterator*: StreamingRowIterator ## Streaming iterator for lazy row access
+      streamColumns*: seq[string] ## Column names for streaming result
     of erkModified:
       count*: int
       message*: string
@@ -49,6 +56,19 @@ type
       newDatabase*: string
     of erkUseSchema:
       newSchema*: string
+
+  StreamingRowIterator* = ref object
+    ## Streaming iterator that wraps StreamingScanClient and yields decoded rows.
+    ## Handles filtering, column extraction, and LIMIT enforcement lazily.
+    stream*: StreamingScanClient ## Underlying KV stream
+    filter*: Option[Expr] ## WHERE clause filter (optional)
+    columns*: seq[string] ## Columns to extract
+    allColumns*: seq[string] ## All table columns for decoding
+    limit*: uint32 ## LIMIT value (0 = no limit)
+    rowsReturned*: int ## Count of rows returned (for LIMIT)
+    exhausted*: bool ## True when no more rows available
+    pendingRow*: Option[seq[string]] ## Next row ready for consumption
+    error*: Option[string] ## Error message if stream failed
 
   ExecutorContext* = ref object
     ## Execution context for a session, holding transaction state.
@@ -79,6 +99,163 @@ proc modifiedResult*(count: int, msg: string = ""): ExecResult =
 
 proc rowsResult*(columns: seq[string], rows: seq[seq[string]]): ExecResult =
   ExecResult(kind: erkRows, columns: columns, rows: rows)
+
+proc streamingRowsResult*(columns: seq[string],
+    rowIter: StreamingRowIterator): ExecResult =
+  ## Create a streaming result that yields rows lazily.
+  ExecResult(kind: erkStreamingRows, streamColumns: columns,
+             streamIterator: rowIter)
+
+# ---------------------------------------------------------------------------
+# StreamingRowIterator implementation
+# ---------------------------------------------------------------------------
+
+proc newStreamingRowIterator*(stream: StreamingScanClient,
+    filter: Option[Expr], columns: seq[string], allColumns: seq[string],
+    limit: uint32): StreamingRowIterator =
+  ## Create a new streaming row iterator.
+  new(result)
+  result.stream = stream
+  result.filter = filter
+  result.columns = columns
+  result.allColumns = allColumns
+  result.limit = limit
+  result.rowsReturned = 0
+  result.exhausted = false
+  result.pendingRow = none(seq[string])
+  result.error = none(string)
+
+proc fetchNextMatchingRow*(iter: StreamingRowIterator): Option[seq[string]] =
+  ## Fetch the next row that matches the filter (if any).
+  ## Returns some(row) if found, none if exhausted.
+  ## This is internal - callers should use hasNext/nextRow.
+  if iter.exhausted:
+    return none(seq[string])
+
+  # Check limit
+  if iter.limit > 0 and iter.rowsReturned >= int(iter.limit):
+    iter.exhausted = true
+    return none(seq[string])
+
+  # Debug: check if stream exists
+  if iter.stream == nil:
+    iter.exhausted = true
+    return none(seq[string])
+
+  # Search for next matching row
+  var callCount = 0
+  while iter.stream.hasNext() and callCount < 1000:
+    inc callCount
+    let pairOpt = iter.stream.nextPair()
+    if pairOpt.isNone:
+      iter.exhausted = true
+      return none(seq[string])
+
+    let pair = pairOpt.get()
+    try:
+      let dataRow = decodeDataRow(pair.value)
+
+      # Apply filter if present
+      if not matchesFilterDataRow(iter.filter, dataRow):
+        continue # Skip non-matching row
+      
+      # Extract requested columns
+      let extracted = extractColumnsFromDataRow(dataRow, iter.columns)
+      inc iter.rowsReturned
+      return some(extracted)
+    except ValueError:
+      # Skip malformed rows
+      continue
+
+  iter.exhausted = true
+  return none(seq[string])
+
+proc hasNextRow*(iter: StreamingRowIterator): bool =
+  ## Check if more rows are available.
+  ## May fetch ahead to find a matching row.
+  if iter.exhausted:
+    return false
+
+  # Check limit
+  if iter.limit > 0 and iter.rowsReturned >= int(iter.limit):
+    iter.exhausted = true
+    return false
+
+  # If we have a pending row, return true
+  if iter.pendingRow.isSome:
+    return true
+
+  # Debug: check stream
+  if iter.stream == nil:
+    iter.exhausted = true
+    return false
+
+  # Try to fetch next matching row
+  let nextRow = iter.fetchNextMatchingRow()
+  if nextRow.isSome:
+    iter.pendingRow = nextRow
+    return true
+
+  iter.exhausted = true
+  return false
+
+proc nextRow*(iter: StreamingRowIterator): Option[seq[string]] =
+  ## Get the next row from the iterator.
+  ## Returns some(row) if available, none if exhausted.
+  if iter.exhausted:
+    return none(seq[string])
+
+  # Return pending row if we have one
+  if iter.pendingRow.isSome:
+    let row = iter.pendingRow.get()
+    iter.pendingRow = none(seq[string])
+    return some(row)
+
+  # Fetch next matching row
+  iter.fetchNextMatchingRow()
+
+proc closeIterator*(iter: StreamingRowIterator) =
+  ## Close the iterator and release resources.
+  iter.exhausted = true
+  if iter.stream != nil:
+    iter.stream.closeStream()
+
+proc getIteratorError*(iter: StreamingRowIterator): Option[string] =
+  ## Get any error that occurred during iteration.
+  iter.error
+
+proc consumeAllRows*(iter: StreamingRowIterator): seq[seq[string]] =
+  ## Consume all remaining rows from the iterator.
+  ## Warning: For large result sets, this defeats the purpose of streaming.
+  var rows: seq[seq[string]] = @[]
+  # Debug: check state
+  if iter.stream == nil:
+    return rows
+  if iter.exhausted:
+    return rows
+  while iter.hasNextRow():
+    let rowOpt = iter.nextRow()
+    if rowOpt.isSome:
+      rows.add(rowOpt.get())
+  iter.closeIterator()
+  rows
+
+proc bufferRows*(res: ExecResult): ExecResult =
+  ## Convert streaming rows to buffered rows.
+  ## If res is erkStreamingRows, consumes all rows and returns erkRows.
+  ## Otherwise returns the original res unchanged.
+  ## Warning: For large result sets, this defeats the purpose of streaming.
+  if res.kind == erkStreamingRows:
+    # Debug: check if streamIterator exists
+    if res.streamIterator == nil:
+      return ExecResult(kind: erkRows, columns: res.streamColumns, rows: @[])
+    # Debug: check if stream has data
+    if res.streamIterator.stream == nil:
+      return ExecResult(kind: erkRows, columns: res.streamColumns, rows: @[])
+    let rows = res.streamIterator.consumeAllRows()
+    ExecResult(kind: erkRows, columns: res.streamColumns, rows: rows)
+  else:
+    res
 
 # ---------------------------------------------------------------------------
 # ExecutorContext helpers
@@ -126,9 +303,22 @@ proc txnGet(ctx: ExecutorContext, key: string): KVOpResult[Option[string]] =
 
 proc execTxnScan(ctx: ExecutorContext, startKey, endKey: string,
     limit: uint32 = 0): KVOpResult[seq[tuple[key, value: string]]] =
-  ## Scan keys with MVCC awareness.
+  ## Scan keys with MVCC awareness (non-streaming, buffered).
   ctx.kv.scan(startKey, endKey, limit, txnId = ctx.txnId,
               readTimestamp = ctx.readTimestamp)
+
+proc execTxnStreamScan(ctx: ExecutorContext, startKey, endKey: string,
+    limit: uint32 = 0,
+    filter: Option[kvMsgs.WireFilterExpr] = none(
+        kvMsgs.WireFilterExpr)): Result[StreamingScanClient, ProtocolError] =
+  ## Streaming scan keys with MVCC awareness.
+  ## Returns a StreamingScanClient for lazy iteration.
+  ## Requires ctx.client to be a FractioClient (uses its streamScan method).
+  ## filter: optional server-side filter for reducing network traffic.
+  if ctx.client == nil:
+    return peErr(newProtocolError(peInternal,
+        "streaming scan requires FractioClient"))
+  ctx.client.streamScan(startKey, endKey, limit, ctx.txnId, ctx.readTimestamp, filter)
 
 # ---------------------------------------------------------------------------
 # Per-op executors
@@ -681,34 +871,85 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
 
     of poPointGet:
       let key = encodeDataRowKey(op.pgTableId, op.pgKey)
-      let res = txnGet(ctx, key)
-      if res.isErr:
-        return errorResult(&"failed to read: {res.err}")
-      if res.val.isNone:
-        return rowsResult(op.pgColumns, @[])
-      let row = decodeDataRow(res.val.get())
-      let vals = extractColumnsFromDataRow(row, op.pgColumns)
-      rowsResult(op.pgColumns, @[vals])
+
+      # Use server-side filter when FractioClient is available (PointGet optimization)
+      # Fall back to client-side filtering for MockKVStore tests
+      if ctx.client != nil and op.pgFilter.isSome:
+        # Convert Expr to WireFilterExpr for server-side evaluation
+        let wireFilter = exprToWireFilterExpr(op.pgFilter.get())
+        let res = ctx.client.getWithFilter(key, some(wireFilter),
+                                           ctx.txnId, ctx.readTimestamp)
+        if res.isErr:
+          return errorResult(&"failed to read: {res.err}")
+        if res.val.isNone:
+          # Row doesn't exist or doesn't pass server-side filter
+          return rowsResult(op.pgColumns, @[])
+        let row = decodeDataRow(res.val.get())
+        let vals = extractColumnsFromDataRow(row, op.pgColumns)
+        rowsResult(op.pgColumns, @[vals])
+      else:
+        # Fallback path: get value then apply filter client-side
+        let res = txnGet(ctx, key)
+        if res.isErr:
+          return errorResult(&"failed to read: {res.err}")
+        if res.val.isNone:
+          return rowsResult(op.pgColumns, @[])
+        let row = decodeDataRow(res.val.get())
+
+        # Apply remaining filter if present (pk = value AND other_cond)
+        if op.pgFilter.isSome and not matchesFilterDataRow(op.pgFilter, row):
+          return rowsResult(op.pgColumns, @[])
+
+        let vals = extractColumnsFromDataRow(row, op.pgColumns)
+        rowsResult(op.pgColumns, @[vals])
 
     of poScan:
-      let res = execTxnScan(ctx, op.scStartKey, op.scEndKey, 0)
-      if res.isErr:
-        return errorResult(&"failed to scan: {res.err}")
+      # Use streaming scan for SELECT queries when FractioClient is available
+      # Fall back to buffered scan for MockKVStore tests
+      if ctx.client != nil:
+        # Convert Expr to WireFilterExpr for server-side filtering
+        # Note: Server filter reduces network traffic, client-side filter handles
+        # complex conditions that can't be expressed in WireFilterExpr
+        var serverFilter: Option[kvMsgs.WireFilterExpr] = none(
+            kvMsgs.WireFilterExpr)
+        if op.scFilter.isSome:
+          serverFilter = some(exprToWireFilterExpr(op.scFilter.get()))
 
-      var resultRows: seq[seq[string]] = @[]
-      var count = 0
-      for entry in res.val:
-        try:
-          let row = decodeDataRow(entry.value)
-          if matchesFilterDataRow(op.scFilter, row):
-            resultRows.add(extractColumnsFromDataRow(row, op.scColumns))
-            inc count
-            if op.scLimit > 0 and count >= int(op.scLimit):
-              break
-        except ValueError:
-          discard # skip malformed rows
+        let streamRes = execTxnStreamScan(ctx, op.scStartKey, op.scEndKey, 0, serverFilter)
+        if streamRes.isErr:
+          return errorResult(&"failed to start streaming scan: {streamRes.error.msg}")
 
-      rowsResult(op.scColumns, resultRows)
+        # Create streaming row iterator that handles filtering and LIMIT
+        # Pass original Expr filter for complex client-side conditions
+        let rowIter = newStreamingRowIterator(
+          streamRes.value,
+          op.scFilter,
+          op.scColumns,
+          op.scAllColumns,
+          op.scLimit
+        )
+
+        streamingRowsResult(op.scColumns, rowIter)
+      else:
+        # Fallback to buffered scan for mock/testing contexts
+        let res = execTxnScan(ctx, op.scStartKey, op.scEndKey, 0)
+        if res.isErr:
+          return errorResult(&"failed to scan: {res.err}")
+
+        var resultRows: seq[seq[string]] = @[]
+        var count = 0
+        for entry in res.val:
+          try:
+            let row = decodeDataRow(entry.value)
+            if matchesFilterDataRow(op.scFilter, row):
+              resultRows.add(extractColumnsFromDataRow(row, op.scColumns))
+              inc count
+              if op.scLimit > 0 and count >= int(op.scLimit):
+                break
+          except ValueError:
+            discard # skip malformed rows
+
+        rowsResult(op.scColumns, resultRows)
 
     of poUpdate:
       # MVCC-aware UPDATE

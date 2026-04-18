@@ -1,12 +1,13 @@
 # Unit tests for fractio/protocol/messages/kv.nim
 # Tests Get, Put, Delete, Batch, Scan encoding/decoding
 
-import std/unittest
+import std/[unittest, options]
 import fractio/protocol/messages/kv
 import fractio/protocol/types
 import fractio/protocol/codec
 import fractio/core/types
 import fractio/distributed/raft/group_types
+import fractio/sql/data_row # for DataRow type in filter evaluation tests
 
 suite "Get Request Messages":
 
@@ -161,6 +162,82 @@ suite "Get Request Messages":
         "\x00\x00\x00\x00\x00\x00\x00\x00" # no key length
     let decoded = decodeGetRequest(invalid)
     check decoded.isErr
+
+  test "encodeGetRequest with filter":
+    let txnId = genULID()
+    let filterExpr = WireFilterExpr(
+      kind: wekBinOp,
+      binOpKind: wboEq,
+      binLeft: WireFilterExpr(kind: wekColumn, colName: "id"),
+      binRight: WireFilterExpr(kind: wekLiteral, litDataType: wdtInt, litIntVal: 1)
+    )
+    let req = GetRequest(
+      flags: 0x00'u8,
+      txnId: TransactionID(txnId),
+      readTimestamp: 0'u64,
+      key: "filter_key",
+      groupId: ZeroGroupID(),
+      filter: some(filterExpr)
+    )
+    let encoded = encodeGetRequest(req)
+    var pos = 2
+    let flagsR = readUint8(encoded, pos)
+    check (flagsR.value and GetFlagHasFilter) != 0'u8
+
+  test "decodeGetRequest with filter roundtrip":
+    let txnId = genULID()
+    let filterExpr = WireFilterExpr(
+      kind: wekBinOp,
+      binOpKind: wboEq,
+      binLeft: WireFilterExpr(kind: wekColumn, colName: "status"),
+      binRight: WireFilterExpr(kind: wekLiteral, litDataType: wdtString,
+          litStringVal: "active")
+    )
+    let req = GetRequest(
+      flags: 0x00'u8,
+      txnId: TransactionID(txnId),
+      readTimestamp: 0'u64,
+      key: "user:123",
+      groupId: ZeroGroupID(),
+      filter: some(filterExpr)
+    )
+    let encoded = encodeGetRequest(req)
+    let decoded = decodeGetRequest(encoded)
+    check decoded.isOk
+    check decoded.value.filter.isSome
+    let decodedFilter = decoded.value.filter.get()
+    check decodedFilter.kind == wekBinOp
+    check decodedFilter.binOpKind == wboEq
+    check decodedFilter.binLeft.colName == "status"
+    check decodedFilter.binRight.litDataType == wdtString
+    check decodedFilter.binRight.litStringVal == "active"
+
+  test "decodeGetRequest with filter and groupId":
+    let txnId = genULID()
+    let groupId = groupIDFromInt(5)
+    let filterExpr = WireFilterExpr(
+      kind: wekBinOp,
+      binOpKind: wboGt,
+      binLeft: WireFilterExpr(kind: wekColumn, colName: "age"),
+      binRight: WireFilterExpr(kind: wekLiteral, litDataType: wdtInt, litIntVal: 18)
+    )
+    let req = GetRequest(
+      flags: 0x00'u8,
+      txnId: TransactionID(txnId),
+      readTimestamp: 0'u64,
+      key: "person:456",
+      groupId: groupId,
+      filter: some(filterExpr)
+    )
+    let encoded = encodeGetRequest(req)
+    let decoded = decodeGetRequest(encoded)
+    check decoded.isOk
+    check decoded.value.groupId == groupId
+    check decoded.value.filter.isSome
+    check decoded.value.filter.get().binOpKind == wboGt
+
+  test "GetFlagHasFilter value":
+    check GetFlagHasFilter == 0x20'u8
 
 suite "Get Response Messages":
 
@@ -1367,3 +1444,583 @@ suite "KV Constants":
 
   test "ScanRespFlagEndOfScan value":
     check ScanRespFlagEndOfScan == 0x02'u8
+
+suite "WireFilterExpr encode/decode":
+
+  test "encode literal int":
+    let expr = WireFilterExpr(kind: wekLiteral, litDataType: wdtInt,
+        litIntVal: 42'i64)
+    let encoded = encodeWireFilterExpr(expr)
+    check encoded.len == 10 # 1 byte kind + 1 byte dataType + 8 bytes int
+    var pos = 0
+    let kindR = readUint8(encoded, pos)
+    check kindR.value == uint8(wekLiteral)
+    let dtR = readUint8(encoded, pos)
+    check dtR.value == uint8(wdtInt)
+    let valR = readInt64BE(encoded, pos)
+    check valR.value == 42'i64
+
+  test "encode literal float":
+    let expr = WireFilterExpr(kind: wekLiteral, litDataType: wdtFloat,
+        litFloatVal: 3.14)
+    let encoded = encodeWireFilterExpr(expr)
+    check encoded.len == 10 # 1 byte kind + 1 byte dataType + 8 bytes float
+    var pos = 0
+    let kindR = readUint8(encoded, pos)
+    check kindR.value == uint8(wekLiteral)
+    let dtR = readUint8(encoded, pos)
+    check dtR.value == uint8(wdtFloat)
+
+  test "encode literal string":
+    let expr = WireFilterExpr(kind: wekLiteral, litDataType: wdtString,
+        litStringVal: "hello")
+    let encoded = encodeWireFilterExpr(expr)
+    check encoded.len == 11 # 1 byte kind + 1 byte dataType + 4 byte len + 5 bytes
+    var pos = 0
+    let kindR = readUint8(encoded, pos)
+    check kindR.value == uint8(wekLiteral)
+    let dtR = readUint8(encoded, pos)
+    check dtR.value == uint8(wdtString)
+    let valR = readBytes(encoded, pos)
+    check valR.value == "hello"
+
+  test "encode literal bool true":
+    let expr = WireFilterExpr(kind: wekLiteral, litDataType: wdtBool,
+        litBoolVal: true)
+    let encoded = encodeWireFilterExpr(expr)
+    check encoded.len == 3 # 1 byte kind + 1 byte dataType + 1 byte bool
+    var pos = 0
+    let kindR = readUint8(encoded, pos)
+    check kindR.value == uint8(wekLiteral)
+    let dtR = readUint8(encoded, pos)
+    check dtR.value == uint8(wdtBool)
+    let valR = readUint8(encoded, pos)
+    check valR.value == 1'u8
+
+  test "encode literal bool false":
+    let expr = WireFilterExpr(kind: wekLiteral, litDataType: wdtBool,
+        litBoolVal: false)
+    let encoded = encodeWireFilterExpr(expr)
+    check encoded.len == 3
+    var pos = 0
+    discard readUint8(encoded, pos) # kind
+    discard readUint8(encoded, pos) # dataType
+    let valR = readUint8(encoded, pos)
+    check valR.value == 0'u8
+
+  test "encode literal null":
+    let expr = WireFilterExpr(kind: wekLiteral, litDataType: wdtNull)
+    let encoded = encodeWireFilterExpr(expr)
+    check encoded.len == 2 # 1 byte kind + 1 byte dataType
+
+  test "encode column reference":
+    let expr = WireFilterExpr(kind: wekColumn, colName: "id")
+    let encoded = encodeWireFilterExpr(expr)
+    check encoded.len == 7 # 1 byte kind + 4 byte len + 2 bytes "id"
+    var pos = 0
+    let kindR = readUint8(encoded, pos)
+    check kindR.value == uint8(wekColumn)
+    let nameR = readBytes(encoded, pos)
+    check nameR.value == "id"
+
+  test "encode binary op eq":
+    let left = WireFilterExpr(kind: wekColumn, colName: "id")
+    let right = WireFilterExpr(kind: wekLiteral, litDataType: wdtInt, litIntVal: 1)
+    let expr = WireFilterExpr(kind: wekBinOp, binOpKind: wboEq, binLeft: left,
+        binRight: right)
+    let encoded = encodeWireFilterExpr(expr)
+    var pos = 0
+    let kindR = readUint8(encoded, pos)
+    check kindR.value == uint8(wekBinOp)
+    let opR = readUint8(encoded, pos)
+    check opR.value == uint8(wboEq)
+
+  test "encode AND expression":
+    let left = WireFilterExpr(kind: wekLiteral, litDataType: wdtBool,
+        litBoolVal: true)
+    let right = WireFilterExpr(kind: wekLiteral, litDataType: wdtBool,
+        litBoolVal: false)
+    let expr = WireFilterExpr(kind: wekBinOp, binOpKind: wboAnd, binLeft: left,
+        binRight: right)
+    let encoded = encodeWireFilterExpr(expr)
+    var pos = 0
+    let kindR = readUint8(encoded, pos)
+    check kindR.value == uint8(wekBinOp)
+    let opR = readUint8(encoded, pos)
+    check opR.value == uint8(wboAnd)
+
+  test "encode NOT expression":
+    let inner = WireFilterExpr(kind: wekLiteral, litDataType: wdtBool,
+        litBoolVal: true)
+    let expr = WireFilterExpr(kind: wekUnaryOp, unaryOpKind: wuoNot,
+        unaryExpr: inner)
+    let encoded = encodeWireFilterExpr(expr)
+    var pos = 0
+    let kindR = readUint8(encoded, pos)
+    check kindR.value == uint8(wekUnaryOp)
+    let opR = readUint8(encoded, pos)
+    check opR.value == uint8(wuoNot)
+
+  test "encode IS NULL expression":
+    let inner = WireFilterExpr(kind: wekColumn, colName: "nullable")
+    let expr = WireFilterExpr(kind: wekIsNull, isNullExpr: inner,
+        isNullNot: false)
+    let encoded = encodeWireFilterExpr(expr)
+    var pos = 0
+    let kindR = readUint8(encoded, pos)
+    check kindR.value == uint8(wekIsNull)
+    let notR = readUint8(encoded, pos)
+    check notR.value == 0'u8
+
+  test "encode IS NOT NULL expression":
+    let inner = WireFilterExpr(kind: wekColumn, colName: "nullable")
+    let expr = WireFilterExpr(kind: wekIsNull, isNullExpr: inner,
+        isNullNot: true)
+    let encoded = encodeWireFilterExpr(expr)
+    var pos = 0
+    discard readUint8(encoded, pos) # kind
+    let notR = readUint8(encoded, pos)
+    check notR.value == 1'u8
+
+  test "encode BETWEEN expression":
+    let exprCol = WireFilterExpr(kind: wekColumn, colName: "age")
+    let lo = WireFilterExpr(kind: wekLiteral, litDataType: wdtInt, litIntVal: 18)
+    let hi = WireFilterExpr(kind: wekLiteral, litDataType: wdtInt, litIntVal: 65)
+    let expr = WireFilterExpr(kind: wekBetween, betweenExpr: exprCol,
+        betweenLo: lo, betweenHi: hi, betweenNot: false)
+    let encoded = encodeWireFilterExpr(expr)
+    var pos = 0
+    let kindR = readUint8(encoded, pos)
+    check kindR.value == uint8(wekBetween)
+
+  test "encode LIKE expression":
+    let exprCol = WireFilterExpr(kind: wekColumn, colName: "name")
+    let pattern = WireFilterExpr(kind: wekLiteral, litDataType: wdtString,
+        litStringVal: "%test%")
+    let expr = WireFilterExpr(kind: wekLike, likeExpr: exprCol,
+        likePattern: pattern, likeNot: false)
+    let encoded = encodeWireFilterExpr(expr)
+    var pos = 0
+    let kindR = readUint8(encoded, pos)
+    check kindR.value == uint8(wekLike)
+
+  test "decode literal int roundtrip":
+    let expr = WireFilterExpr(kind: wekLiteral, litDataType: wdtInt,
+        litIntVal: 42'i64)
+    let encoded = encodeWireFilterExpr(expr)
+    var pos = 0
+    let decodedR = decodeWireFilterExpr(encoded, pos)
+    check decodedR.isOk
+    let decoded = decodedR.value
+    check decoded.kind == wekLiteral
+    check decoded.litDataType == wdtInt
+    check decoded.litIntVal == 42'i64
+
+  test "decode literal string roundtrip":
+    let expr = WireFilterExpr(kind: wekLiteral, litDataType: wdtString,
+        litStringVal: "hello")
+    let encoded = encodeWireFilterExpr(expr)
+    var pos = 0
+    let decodedR = decodeWireFilterExpr(encoded, pos)
+    check decodedR.isOk
+    let decoded = decodedR.value
+    check decoded.kind == wekLiteral
+    check decoded.litDataType == wdtString
+    check decoded.litStringVal == "hello"
+
+  test "decode column reference roundtrip":
+    let expr = WireFilterExpr(kind: wekColumn, colName: "id")
+    let encoded = encodeWireFilterExpr(expr)
+    var pos = 0
+    let decodedR = decodeWireFilterExpr(encoded, pos)
+    check decodedR.isOk
+    let decoded = decodedR.value
+    check decoded.kind == wekColumn
+    check decoded.colName == "id"
+
+  test "decode binary op eq roundtrip":
+    let left = WireFilterExpr(kind: wekColumn, colName: "id")
+    let right = WireFilterExpr(kind: wekLiteral, litDataType: wdtInt, litIntVal: 1)
+    let expr = WireFilterExpr(kind: wekBinOp, binOpKind: wboEq, binLeft: left,
+        binRight: right)
+    let encoded = encodeWireFilterExpr(expr)
+    var pos = 0
+    let decodedR = decodeWireFilterExpr(encoded, pos)
+    check decodedR.isOk
+    let decoded = decodedR.value
+    check decoded.kind == wekBinOp
+    check decoded.binOpKind == wboEq
+    check decoded.binLeft.kind == wekColumn
+    check decoded.binLeft.colName == "id"
+    check decoded.binRight.kind == wekLiteral
+    check decoded.binRight.litIntVal == 1'i64
+
+  test "decode nested AND/OR roundtrip":
+    # (a > 5) AND (b < 10)
+    let left = WireFilterExpr(
+      kind: wekBinOp,
+      binOpKind: wboGt,
+      binLeft: WireFilterExpr(kind: wekColumn, colName: "a"),
+      binRight: WireFilterExpr(kind: wekLiteral, litDataType: wdtInt, litIntVal: 5)
+    )
+    let right = WireFilterExpr(
+      kind: wekBinOp,
+      binOpKind: wboLt,
+      binLeft: WireFilterExpr(kind: wekColumn, colName: "b"),
+      binRight: WireFilterExpr(kind: wekLiteral, litDataType: wdtInt, litIntVal: 10)
+    )
+    let expr = WireFilterExpr(kind: wekBinOp, binOpKind: wboAnd, binLeft: left,
+        binRight: right)
+    let encoded = encodeWireFilterExpr(expr)
+    var pos = 0
+    let decodedR = decodeWireFilterExpr(encoded, pos)
+    check decodedR.isOk
+    let decoded = decodedR.value
+    check decoded.kind == wekBinOp
+    check decoded.binOpKind == wboAnd
+    check decoded.binLeft.kind == wekBinOp
+    check decoded.binLeft.binOpKind == wboGt
+    check decoded.binRight.kind == wekBinOp
+    check decoded.binRight.binOpKind == wboLt
+
+  test "decode IS NULL roundtrip":
+    let inner = WireFilterExpr(kind: wekColumn, colName: "nullable")
+    let expr = WireFilterExpr(kind: wekIsNull, isNullExpr: inner,
+        isNullNot: false)
+    let encoded = encodeWireFilterExpr(expr)
+    var pos = 0
+    let decodedR = decodeWireFilterExpr(encoded, pos)
+    check decodedR.isOk
+    let decoded = decodedR.value
+    check decoded.kind == wekIsNull
+    check decoded.isNullNot == false
+    check decoded.isNullExpr.kind == wekColumn
+
+  test "decode BETWEEN roundtrip":
+    let exprCol = WireFilterExpr(kind: wekColumn, colName: "age")
+    let lo = WireFilterExpr(kind: wekLiteral, litDataType: wdtInt, litIntVal: 18)
+    let hi = WireFilterExpr(kind: wekLiteral, litDataType: wdtInt, litIntVal: 65)
+    let expr = WireFilterExpr(kind: wekBetween, betweenExpr: exprCol,
+        betweenLo: lo, betweenHi: hi, betweenNot: false)
+    let encoded = encodeWireFilterExpr(expr)
+    var pos = 0
+    let decodedR = decodeWireFilterExpr(encoded, pos)
+    check decodedR.isOk
+    let decoded = decodedR.value
+    check decoded.kind == wekBetween
+    check decoded.betweenNot == false
+    check decoded.betweenExpr.colName == "age"
+    check decoded.betweenLo.litIntVal == 18'i64
+    check decoded.betweenHi.litIntVal == 65'i64
+
+suite "ScanRequest with filter":
+
+  test "ScanRequest without filter":
+    let txnId = genULID()
+    let req = ScanRequest(
+      flags: ScanFlagStreaming,
+      txnId: TransactionID(txnId),
+      readTimestamp: 0'u64,
+      startKey: "",
+      endKey: "",
+      limit: 100'u32,
+      groupId: ZeroGroupID(),
+      chunkSize: 50'u32,
+      filter: none(WireFilterExpr)
+    )
+    let encoded = encodeScanRequest(req)
+    let decodedR = decodeScanRequest(encoded)
+    check decodedR.isOk
+    let decoded = decodedR.value
+    check decoded.filter.isNone
+
+  test "ScanRequest with filter":
+    let txnId = genULID()
+    let filterExpr = WireFilterExpr(
+      kind: wekBinOp,
+      binOpKind: wboEq,
+      binLeft: WireFilterExpr(kind: wekColumn, colName: "id"),
+      binRight: WireFilterExpr(kind: wekLiteral, litDataType: wdtInt, litIntVal: 1)
+    )
+    let req = ScanRequest(
+      flags: ScanFlagStreaming,
+      txnId: TransactionID(txnId),
+      readTimestamp: 0'u64,
+      startKey: "",
+      endKey: "",
+      limit: 100'u32,
+      groupId: ZeroGroupID(),
+      chunkSize: 50'u32,
+      filter: some(filterExpr)
+    )
+    let encoded = encodeScanRequest(req)
+    # Check HasFilter flag is set
+    var pos = 2
+    let flagsR = readUint8(encoded, pos)
+    check (flagsR.value and ScanFlagHasFilter) != 0
+
+    let decodedR = decodeScanRequest(encoded)
+    check decodedR.isOk
+    let decoded = decodedR.value
+    check decoded.filter.isSome
+    let decodedFilter = decoded.filter.get()
+    check decodedFilter.kind == wekBinOp
+    check decodedFilter.binOpKind == wboEq
+    check decodedFilter.binLeft.colName == "id"
+    check decodedFilter.binRight.litIntVal == 1'i64
+
+  test "ScanFlagHasFilter value":
+    check ScanFlagHasFilter == 0x40'u8
+
+suite "WireFilterExpr evaluation (matchesWireFilter)":
+
+  test "matchesWireFilter with no filter returns true":
+    var row = newDataRow()
+    row.columns.add(DataRowColumn(name: "id", value: newRowValue(1'i64)))
+    row.columns.add(DataRowColumn(name: "name", value: newRowValue("test")))
+    check matchesWireFilter(none(WireFilterExpr), row) == true
+
+  test "matchesWireFilter literal int equality":
+    var row = newDataRow()
+    row.columns.add(DataRowColumn(name: "id", value: newRowValue(42'i64)))
+    row.columns.add(DataRowColumn(name: "status", value: newRowValue("active")))
+    let filter = WireFilterExpr(kind: wekBinOp, binOpKind: wboEq,
+        binLeft: WireFilterExpr(kind: wekColumn, colName: "id"),
+        binRight: WireFilterExpr(kind: wekLiteral, litDataType: wdtInt,
+            litIntVal: 42))
+    check matchesWireFilter(some(filter), row) == true
+
+  test "matchesWireFilter literal int inequality":
+    var row = newDataRow()
+    row.columns.add(DataRowColumn(name: "id", value: newRowValue(10'i64)))
+    row.columns.add(DataRowColumn(name: "status", value: newRowValue("active")))
+    let filter = WireFilterExpr(kind: wekBinOp, binOpKind: wboEq,
+        binLeft: WireFilterExpr(kind: wekColumn, colName: "id"),
+        binRight: WireFilterExpr(kind: wekLiteral, litDataType: wdtInt,
+            litIntVal: 42))
+    check matchesWireFilter(some(filter), row) == false
+
+  test "matchesWireFilter literal string equality":
+    var row = newDataRow()
+    row.columns.add(DataRowColumn(name: "id", value: newRowValue(1'i64)))
+    row.columns.add(DataRowColumn(name: "status", value: newRowValue("active")))
+    let filter = WireFilterExpr(kind: wekBinOp, binOpKind: wboEq,
+        binLeft: WireFilterExpr(kind: wekColumn, colName: "status"),
+        binRight: WireFilterExpr(kind: wekLiteral, litDataType: wdtString,
+            litStringVal: "active"))
+    check matchesWireFilter(some(filter), row) == true
+
+  test "matchesWireFilter literal string inequality":
+    var row = newDataRow()
+    row.columns.add(DataRowColumn(name: "id", value: newRowValue(1'i64)))
+    row.columns.add(DataRowColumn(name: "status", value: newRowValue("inactive")))
+    let filter = WireFilterExpr(kind: wekBinOp, binOpKind: wboEq,
+        binLeft: WireFilterExpr(kind: wekColumn, colName: "status"),
+        binRight: WireFilterExpr(kind: wekLiteral, litDataType: wdtString,
+            litStringVal: "active"))
+    check matchesWireFilter(some(filter), row) == false
+
+  test "matchesWireFilter greater than":
+    var row = newDataRow()
+    row.columns.add(DataRowColumn(name: "age", value: newRowValue(25'i64)))
+    let filter = WireFilterExpr(kind: wekBinOp, binOpKind: wboGt,
+        binLeft: WireFilterExpr(kind: wekColumn, colName: "age"),
+        binRight: WireFilterExpr(kind: wekLiteral, litDataType: wdtInt,
+            litIntVal: 18))
+    check matchesWireFilter(some(filter), row) == true
+
+  test "matchesWireFilter less than":
+    var row = newDataRow()
+    row.columns.add(DataRowColumn(name: "age", value: newRowValue(15'i64)))
+    let filter = WireFilterExpr(kind: wekBinOp, binOpKind: wboLt,
+        binLeft: WireFilterExpr(kind: wekColumn, colName: "age"),
+        binRight: WireFilterExpr(kind: wekLiteral, litDataType: wdtInt,
+            litIntVal: 18))
+    check matchesWireFilter(some(filter), row) == true
+
+  test "matchesWireFilter AND expression true":
+    var row = newDataRow()
+    row.columns.add(DataRowColumn(name: "id", value: newRowValue(42'i64)))
+    row.columns.add(DataRowColumn(name: "status", value: newRowValue("active")))
+    let leftFilter = WireFilterExpr(kind: wekBinOp, binOpKind: wboEq,
+        binLeft: WireFilterExpr(kind: wekColumn, colName: "id"),
+        binRight: WireFilterExpr(kind: wekLiteral, litDataType: wdtInt,
+            litIntVal: 42))
+    let rightFilter = WireFilterExpr(kind: wekBinOp, binOpKind: wboEq,
+        binLeft: WireFilterExpr(kind: wekColumn, colName: "status"),
+        binRight: WireFilterExpr(kind: wekLiteral, litDataType: wdtString,
+            litStringVal: "active"))
+    let filter = WireFilterExpr(kind: wekBinOp, binOpKind: wboAnd,
+        binLeft: leftFilter, binRight: rightFilter)
+    check matchesWireFilter(some(filter), row) == true
+
+  test "matchesWireFilter AND expression false (left fails)":
+    var row = newDataRow()
+    row.columns.add(DataRowColumn(name: "id", value: newRowValue(10'i64)))
+    row.columns.add(DataRowColumn(name: "status", value: newRowValue("active")))
+    let leftFilter = WireFilterExpr(kind: wekBinOp, binOpKind: wboEq,
+        binLeft: WireFilterExpr(kind: wekColumn, colName: "id"),
+        binRight: WireFilterExpr(kind: wekLiteral, litDataType: wdtInt,
+            litIntVal: 42))
+    let rightFilter = WireFilterExpr(kind: wekBinOp, binOpKind: wboEq,
+        binLeft: WireFilterExpr(kind: wekColumn, colName: "status"),
+        binRight: WireFilterExpr(kind: wekLiteral, litDataType: wdtString,
+            litStringVal: "active"))
+    let filter = WireFilterExpr(kind: wekBinOp, binOpKind: wboAnd,
+        binLeft: leftFilter, binRight: rightFilter)
+    check matchesWireFilter(some(filter), row) == false
+
+  test "matchesWireFilter AND expression false (right fails)":
+    var row = newDataRow()
+    row.columns.add(DataRowColumn(name: "id", value: newRowValue(42'i64)))
+    row.columns.add(DataRowColumn(name: "status", value: newRowValue("inactive")))
+    let leftFilter = WireFilterExpr(kind: wekBinOp, binOpKind: wboEq,
+        binLeft: WireFilterExpr(kind: wekColumn, colName: "id"),
+        binRight: WireFilterExpr(kind: wekLiteral, litDataType: wdtInt,
+            litIntVal: 42))
+    let rightFilter = WireFilterExpr(kind: wekBinOp, binOpKind: wboEq,
+        binLeft: WireFilterExpr(kind: wekColumn, colName: "status"),
+        binRight: WireFilterExpr(kind: wekLiteral, litDataType: wdtString,
+            litStringVal: "active"))
+    let filter = WireFilterExpr(kind: wekBinOp, binOpKind: wboAnd,
+        binLeft: leftFilter, binRight: rightFilter)
+    check matchesWireFilter(some(filter), row) == false
+
+  test "matchesWireFilter OR expression true (left true)":
+    var row = newDataRow()
+    row.columns.add(DataRowColumn(name: "status", value: newRowValue("active")))
+    let leftFilter = WireFilterExpr(kind: wekBinOp, binOpKind: wboEq,
+        binLeft: WireFilterExpr(kind: wekColumn, colName: "status"),
+        binRight: WireFilterExpr(kind: wekLiteral, litDataType: wdtString,
+            litStringVal: "active"))
+    let rightFilter = WireFilterExpr(kind: wekBinOp, binOpKind: wboEq,
+        binLeft: WireFilterExpr(kind: wekColumn, colName: "status"),
+        binRight: WireFilterExpr(kind: wekLiteral, litDataType: wdtString,
+            litStringVal: "pending"))
+    let filter = WireFilterExpr(kind: wekBinOp, binOpKind: wboOr,
+        binLeft: leftFilter, binRight: rightFilter)
+    check matchesWireFilter(some(filter), row) == true
+
+  test "matchesWireFilter OR expression true (right true)":
+    var row = newDataRow()
+    row.columns.add(DataRowColumn(name: "status", value: newRowValue("pending")))
+    let leftFilter = WireFilterExpr(kind: wekBinOp, binOpKind: wboEq,
+        binLeft: WireFilterExpr(kind: wekColumn, colName: "status"),
+        binRight: WireFilterExpr(kind: wekLiteral, litDataType: wdtString,
+            litStringVal: "active"))
+    let rightFilter = WireFilterExpr(kind: wekBinOp, binOpKind: wboEq,
+        binLeft: WireFilterExpr(kind: wekColumn, colName: "status"),
+        binRight: WireFilterExpr(kind: wekLiteral, litDataType: wdtString,
+            litStringVal: "pending"))
+    let filter = WireFilterExpr(kind: wekBinOp, binOpKind: wboOr,
+        binLeft: leftFilter, binRight: rightFilter)
+    check matchesWireFilter(some(filter), row) == true
+
+  test "matchesWireFilter OR expression false":
+    var row = newDataRow()
+    row.columns.add(DataRowColumn(name: "status", value: newRowValue("inactive")))
+    let leftFilter = WireFilterExpr(kind: wekBinOp, binOpKind: wboEq,
+        binLeft: WireFilterExpr(kind: wekColumn, colName: "status"),
+        binRight: WireFilterExpr(kind: wekLiteral, litDataType: wdtString,
+            litStringVal: "active"))
+    let rightFilter = WireFilterExpr(kind: wekBinOp, binOpKind: wboEq,
+        binLeft: WireFilterExpr(kind: wekColumn, colName: "status"),
+        binRight: WireFilterExpr(kind: wekLiteral, litDataType: wdtString,
+            litStringVal: "pending"))
+    let filter = WireFilterExpr(kind: wekBinOp, binOpKind: wboOr,
+        binLeft: leftFilter, binRight: rightFilter)
+    check matchesWireFilter(some(filter), row) == false
+
+  test "matchesWireFilter NOT expression":
+    var row = newDataRow()
+    row.columns.add(DataRowColumn(name: "status", value: newRowValue("inactive")))
+    let innerFilter = WireFilterExpr(kind: wekBinOp, binOpKind: wboEq,
+        binLeft: WireFilterExpr(kind: wekColumn, colName: "status"),
+        binRight: WireFilterExpr(kind: wekLiteral, litDataType: wdtString,
+            litStringVal: "active"))
+    let filter = WireFilterExpr(kind: wekUnaryOp, unaryOpKind: wuoNot,
+        unaryExpr: innerFilter)
+    check matchesWireFilter(some(filter), row) == true
+
+  test "matchesWireFilter IS NULL true":
+    var row = newDataRow()
+    row.columns.add(DataRowColumn(name: "id", value: newRowValue(1'i64)))
+    # no "deleted_at" column
+    let filter = WireFilterExpr(kind: wekIsNull, isNullNot: false,
+        isNullExpr: WireFilterExpr(kind: wekColumn, colName: "deleted_at"))
+    check matchesWireFilter(some(filter), row) == true
+
+  test "matchesWireFilter IS NULL false":
+    var row = newDataRow()
+    row.columns.add(DataRowColumn(name: "id", value: newRowValue(1'i64)))
+    row.columns.add(DataRowColumn(name: "deleted_at", value: newRowValue("2024-01-01")))
+    let filter = WireFilterExpr(kind: wekIsNull, isNullNot: false,
+        isNullExpr: WireFilterExpr(kind: wekColumn, colName: "deleted_at"))
+    check matchesWireFilter(some(filter), row) == false
+
+  test "matchesFilter IS NOT NULL true":
+    var row = newDataRow()
+    row.columns.add(DataRowColumn(name: "id", value: newRowValue(1'i64)))
+    row.columns.add(DataRowColumn(name: "deleted_at", value: newRowValue("2024-01-01")))
+    let filter = WireFilterExpr(kind: wekIsNull, isNullNot: true,
+        isNullExpr: WireFilterExpr(kind: wekColumn, colName: "deleted_at"))
+    check matchesWireFilter(some(filter), row) == true
+
+  test "matchesFilter IS NOT NULL false":
+    var row = newDataRow()
+    row.columns.add(DataRowColumn(name: "id", value: newRowValue(1'i64)))
+    # no "deleted_at" column
+    let filter = WireFilterExpr(kind: wekIsNull, isNullNot: true,
+        isNullExpr: WireFilterExpr(kind: wekColumn, colName: "deleted_at"))
+    check matchesWireFilter(some(filter), row) == false
+
+  test "matchesWireFilter BETWEEN true":
+    var row = newDataRow()
+    row.columns.add(DataRowColumn(name: "age", value: newRowValue(30'i64)))
+    let filter = WireFilterExpr(kind: wekBetween, betweenNot: false,
+        betweenExpr: WireFilterExpr(kind: wekColumn, colName: "age"),
+        betweenLo: WireFilterExpr(kind: wekLiteral, litDataType: wdtInt,
+            litIntVal: 18),
+        betweenHi: WireFilterExpr(kind: wekLiteral, litDataType: wdtInt,
+            litIntVal: 65))
+    check matchesWireFilter(some(filter), row) == true
+
+  test "matchesWireFilter BETWEEN false (below range)":
+    var row = newDataRow()
+    row.columns.add(DataRowColumn(name: "age", value: newRowValue(10'i64)))
+    let filter = WireFilterExpr(kind: wekBetween, betweenNot: false,
+        betweenExpr: WireFilterExpr(kind: wekColumn, colName: "age"),
+        betweenLo: WireFilterExpr(kind: wekLiteral, litDataType: wdtInt,
+            litIntVal: 18),
+        betweenHi: WireFilterExpr(kind: wekLiteral, litDataType: wdtInt,
+            litIntVal: 65))
+    check matchesWireFilter(some(filter), row) == false
+
+  test "matchesWireFilter BETWEEN false (above range)":
+    var row = newDataRow()
+    row.columns.add(DataRowColumn(name: "age", value: newRowValue(70'i64)))
+    let filter = WireFilterExpr(kind: wekBetween, betweenNot: false,
+        betweenExpr: WireFilterExpr(kind: wekColumn, colName: "age"),
+        betweenLo: WireFilterExpr(kind: wekLiteral, litDataType: wdtInt,
+            litIntVal: 18),
+        betweenHi: WireFilterExpr(kind: wekLiteral, litDataType: wdtInt,
+            litIntVal: 65))
+    check matchesWireFilter(some(filter), row) == false
+
+  test "matchesWireFilter bool literal true":
+    var row = newDataRow()
+    row.columns.add(DataRowColumn(name: "active", value: newRowValue(true)))
+    let filter = WireFilterExpr(kind: wekBinOp, binOpKind: wboEq,
+        binLeft: WireFilterExpr(kind: wekColumn, colName: "active"),
+        binRight: WireFilterExpr(kind: wekLiteral, litDataType: wdtBool,
+            litBoolVal: true))
+    check matchesWireFilter(some(filter), row) == true
+
+  test "matchesWireFilter bool literal false":
+    var row = newDataRow()
+    row.columns.add(DataRowColumn(name: "active", value: newRowValue(false)))
+    let filter = WireFilterExpr(kind: wekBinOp, binOpKind: wboEq,
+        binLeft: WireFilterExpr(kind: wekColumn, colName: "active"),
+        binRight: WireFilterExpr(kind: wekLiteral, litDataType: wdtBool,
+            litBoolVal: false))
+    check matchesWireFilter(some(filter), row) == true

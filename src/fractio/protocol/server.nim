@@ -781,14 +781,23 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
       if metaRes.isOk:
         if metaRes.value.isSome:
           let meta = metaRes.value.get()
-          resp = GetResponse(
-            found: true,
-            hasTimestamp: (req.flags and GetFlagIncludeTimestamp) != 0,
-            hasVersion: (req.flags and GetFlagIncludeVersion) != 0,
-            timestamp: meta.timestamp,
-            version: meta.version,
-            value: meta.value,
-          )
+          # Apply server-side filter if present (PointGet optimization)
+          var passesFilter = true
+          if req.filter.isSome:
+            passesFilter = matchesWireFilterWithDecodedValue(req.filter, meta.value)
+
+          if passesFilter:
+            resp = GetResponse(
+              found: true,
+              hasTimestamp: (req.flags and GetFlagIncludeTimestamp) != 0,
+              hasVersion: (req.flags and GetFlagIncludeVersion) != 0,
+              timestamp: meta.timestamp,
+              version: meta.version,
+              value: meta.value,
+            )
+          else:
+            # Row exists but doesn't pass filter - return as not found
+            resp = GetResponse(found: false)
         else:
           resp = GetResponse(found: false)
       else:
@@ -1051,19 +1060,7 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
         # Filter by group routing if groupId is provided
         var filteredPairs: seq[tuple[key: string, value: string]] = @[]
         let needGroupFilter = req.groupId != ZeroGroupID()
-
-        # Debug: Log raw scan count for data tables
-        if res.value.len > 0 and res.value[0].key.startsWith("/t/0000000100"):
-          try:
-            {.cast(gcsafe).}:
-              {.cast(raises: []).}:
-                debug("handleScan: raw scan for data table", {
-                  "rawPairs": $res.value.len,
-                  "needGroupFilter": $needGroupFilter,
-                  "requestedGroupId": $req.groupId
-                }.toTable)
-          except:
-            discard
+        let needServerFilter = req.filter.isSome
 
         for p in res.value:
           # If groupId is specified, only include keys that route to this group
@@ -1073,12 +1070,17 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
             # Use the dual-read-aware routing check
             let routesToGroup = server.raftStore.keyRoutesToGroupIdDuringRebalance(
               p.key, req.groupId)
-            if routesToGroup:
-              filteredPairs.add(p)
-            # else: key doesn't route to this group, skip it
-          else:
-            filteredPairs.add(p)
+            if not routesToGroup:
+              continue # key doesn't route to this group, skip it
+          
+          # Apply server-side filter if present
+          if needServerFilter:
+            if not matchesWireFilterWithDecodedValue(req.filter, p.value):
+              continue # row doesn't match filter, skip it
 
+          filteredPairs.add(p)
+
+        # Convert filtered pairs to ScanPair with metadata
         var scanPairs = newSeq[ScanPair](filteredPairs.len)
         for i, p in filteredPairs:
           # Get version for this key
@@ -1091,12 +1093,42 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
             timestamp: uint64(currentTs),
             version: ver,
           )
-        let rf = ScanResponseFrame(
-          respFlags: ScanRespFlagEndOfScan,
-          pairs: scanPairs,
-          reqFlags: req.flags,
-        )
-        sendFrame(conn, encodeScanResponseFrame(rf), requestId)
+
+        # Check if streaming scan is requested
+        let isStreaming = (req.flags and ScanFlagStreaming) != 0
+        let chunkSize = if req.chunkSize > 0: int(req.chunkSize)
+                        else: DEFAULT_SCAN_CHUNK_SIZE
+
+        if isStreaming and scanPairs.len > chunkSize:
+          # Streaming scan: send multiple frames
+          var sent = 0
+          while sent < scanPairs.len:
+            let remaining = scanPairs.len - sent
+            let thisChunk = min(remaining, chunkSize)
+            let chunkPairs = scanPairs[sent ..< sent + thisChunk]
+            sent += thisChunk
+
+            let hasMore = sent < scanPairs.len
+            let respFlags = if hasMore: ScanRespFlagHasMore
+                            else: ScanRespFlagHasMore or ScanRespFlagEndOfScan
+
+            let rf = ScanResponseFrame(
+              respFlags: respFlags,
+              pairs: chunkPairs,
+              reqFlags: req.flags,
+            )
+            # Use FlagIsResponse for all frames, FlagEndOfStream for final frame
+            let frameFlags = if hasMore: FlagIsResponse
+                             else: FlagIsResponse or FlagEndOfStream
+            sendFrame(conn, encodeScanResponseFrame(rf), requestId, frameFlags)
+        else:
+          # Single-frame scan (non-streaming or small result)
+          let rf = ScanResponseFrame(
+            respFlags: ScanRespFlagEndOfScan,
+            pairs: scanPairs,
+            reqFlags: req.flags,
+          )
+          sendFrame(conn, encodeScanResponseFrame(rf), requestId)
       else:
         sendError(conn, requestId, ErrInternal, ErrCatKV, res.error.msg)
     else:
@@ -2263,3 +2295,10 @@ proc stop*(server: ProtocolServer) {.raises: [].} =
     except:
       discard
     gRebalThread = nil
+
+  # Clear global thread stores to break reference cycles (prevents ORC crash on cleanup)
+  # The Thread objects reference ClientLoopArgs which reference ProtocolServer,
+  # creating a cycle that ORC can't properly clean up at program exit.
+  withLock threadStoreMu:
+    threadStore = @[]
+    acceptThreadStore = @[]

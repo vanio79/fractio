@@ -8,6 +8,8 @@ import fractio/distributed/sharedtimer/timeprovider
 import fractio/distributed/sharedtimer/types
 import fractio/distributed/sharedtimer/monotonic
 import fractio/distributed/sharedtimer/wallclock
+import fractio/storage/backend # for StreamResultSet, StreamConfig
+import fractio/di/mocks # for MockStreamResultSet
 
 export options
 
@@ -204,6 +206,14 @@ proc clear*(s: InMemoryKVStore) =
   withLock(s.lock):
     s.data.clear()
 
+# Streaming scan for InMemoryKVStore
+proc streamScan*(s: InMemoryKVStore, prefix: string, limit: uint32,
+               config: StreamConfig = defaultStreamConfig()): MockStreamResultSet =
+  ## Create mock stream from in-memory store data.
+  ## Performs scan immediately but returns streaming interface.
+  let data = s.scan(prefix, limit)
+  newMockStreamResultSet(data, config)
+
 # =============================================================================
 # In-Memory Backend - Simple in-memory backend for testing
 # =============================================================================
@@ -270,6 +280,14 @@ proc stats*(b: InMemoryBackend): tables.Table[string, int64] =
     result["key_count"] = b.data.len.int64
     for k, v in b.statsData.pairs:
       result[k] = v
+
+# Streaming scan for InMemoryBackend
+proc streamScan*(b: InMemoryBackend, prefix: string, limit: uint32,
+               config: StreamConfig = defaultStreamConfig()): MockStreamResultSet =
+  ## Create mock stream from in-memory backend data.
+  ## Performs scan immediately but returns streaming interface.
+  let data = b.scan(prefix, limit)
+  newMockStreamResultSet(data, config)
 
 # =============================================================================
 # Logger Adapter - Makes fractio/utils/logging Logger work with DI pattern

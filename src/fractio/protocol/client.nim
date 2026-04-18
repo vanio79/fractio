@@ -10,7 +10,7 @@
 # socket.  Nim's net.recv(timeout=...) variant uses select() which does not
 # behave reliably in a multi-threaded context on Linux.
 
-import std/[net, strformat, atomics, locks]
+import std/[net, strformat, atomics, locks, options, strutils]
 import posix
 import ../utils/socket_utils
 import ../distributed/raft/group_types
@@ -21,7 +21,6 @@ import ./frame
 import ./messages/kv as kvMsgs
 import ./handshake
 import ./messages/core
-import ./messages/kv
 import ./messages/txn as txnMsgs
 import ./messages/admin as adminMsgs
 import ./messages/cluster as clusterMsgs
@@ -343,13 +342,50 @@ proc closeConn*(client: ProtocolClient, reason: string = "") {.gcsafe, raises: [
 # KV convenience procs (Phase 2)
 # ---------------------------------------------------------------------------
 
+# Forward declaration for streaming scan result type
+type
+  # Callback type for multi-group scan - starts next group's stream
+  NextGroupCallback* = proc(): Result[StreamingScanClient,
+      ProtocolError] {.closure, gcsafe, raises: [].}
+
+  StreamingScanClient* = ref object
+    ## Client-side streaming scan state - reads multiple frames from server.
+    ## Supports both single-group (direct) and multi-group (aggregated) modes.
+
+    # Single-group mode fields
+    client*: ProtocolClient
+    reqFlags*: uint8
+    streamId*: uint32
+    hasMore*: bool
+    exhausted*: bool
+    currentFrame*: ScanResponseFrame
+    framePos*: int
+    totalReceived*: int
+    error*: Option[ProtocolError]
+
+    # Multi-group mode fields (when multiGroupMode is true)
+    multiGroupMode*: bool
+      ## True when aggregating across multiple Raft groups
+    currentGroupStream*: StreamingScanClient
+      ## Current group's stream (nil when between groups)
+    nextGroupCallback*: NextGroupCallback
+      ## Callback to start next group's stream
+    pairsSent*: int
+      ## Count of pairs returned (for limit enforcement in multi-group mode)
+    scanLimit*: uint32
+      ## Original limit for multi-group scan (0 = no limit)
+
 proc kvGet*(client: ProtocolClient, key: string,
     flags: uint8 = 0, txnId: TransactionID = zeroTransactionID(),
-    readTimestamp: uint64 = 0): Result[GetResponse, ProtocolError] {.gcsafe,
+    readTimestamp: uint64 = 0,
+    filter: Option[WireFilterExpr] = none(WireFilterExpr)): Result[GetResponse,
+        ProtocolError] {.gcsafe,
     raises: [].} =
   ## Send a Get request and return the decoded response.
+  ## filter: optional server-side filter (PointGet optimization)
   let req = GetRequest(flags: flags, txnId: txnId,
-                       readTimestamp: readTimestamp, key: key)
+                       readTimestamp: readTimestamp, key: key,
+                       filter: filter)
   let r = client.send(encodeGetRequest(req))
   if r.isErr: return peErr(r.error)
   decodeGetResponse(r.value.payload)
@@ -380,12 +416,16 @@ proc kvDelete*(client: ProtocolClient, key: string,
 proc kvGetInGroup*(client: ProtocolClient, key: string,
     groupId: GroupID,
     flags: uint8 = 0, txnId: TransactionID = zeroTransactionID(),
-    readTimestamp: uint64 = 0): Result[GetResponse, ProtocolError] {.gcsafe,
+    readTimestamp: uint64 = 0,
+    filter: Option[WireFilterExpr] = none(WireFilterExpr)): Result[GetResponse,
+        ProtocolError] {.gcsafe,
     raises: [].} =
   ## Send a Get request routed to a specific Raft group.
+  ## filter: optional server-side filter (PointGet optimization)
   let req = GetRequest(flags: flags, txnId: txnId,
                        readTimestamp: readTimestamp, key: key,
-                       groupId: groupId)
+                       groupId: groupId,
+                       filter: filter)
   let r = client.send(encodeGetRequest(req))
   if r.isErr: return peErr(r.error)
   decodeGetResponse(r.value.payload)
@@ -462,6 +502,362 @@ proc kvScan*(client: ProtocolClient, startKey: string = "",
   let r = client.send(encodeScanRequest(req))
   if r.isErr: return peErr(r.error)
   decodeScanResponseFrame(r.value.payload, actualFlags)
+
+# ---------------------------------------------------------------------------
+# Streaming Scan (Phase 2 - Extended)
+# ---------------------------------------------------------------------------
+
+proc newStreamingScanClient*(client: ProtocolClient): StreamingScanClient =
+  ## Create a new streaming scan client state object for single-group mode.
+  new(result)
+  result.client = client
+  result.streamId = client.nextRequestId.fetchAdd(1)
+  result.hasMore = false
+  result.exhausted = false
+  result.currentFrame = ScanResponseFrame()
+  result.framePos = 0
+  result.totalReceived = 0
+  result.error = none(ProtocolError)
+  result.multiGroupMode = false
+  result.currentGroupStream = nil
+  result.nextGroupCallback = nil
+  result.pairsSent = 0
+  result.scanLimit = 0
+
+proc newMultiGroupStreamingScanClient*(firstStream: StreamingScanClient,
+    nextGroupCallback: NextGroupCallback,
+    limit: uint32 = 0): StreamingScanClient =
+  ## Create a new streaming scan client for multi-group mode.
+  ## firstStream: the initial group's streaming scan (already started)
+  ## nextGroupCallback: callback to start the next group's stream when current exhausted
+  ## limit: total limit across all groups (0 = no limit)
+  new(result)
+  result.client = nil # Not used in multi-group mode
+  result.streamId = firstStream.streamId # Use first stream's ID for tracking
+  result.hasMore = false # Not used in multi-group mode
+  result.exhausted = false
+  result.currentFrame = ScanResponseFrame()
+  result.framePos = 0
+  result.totalReceived = 0
+  result.error = none(ProtocolError)
+  result.multiGroupMode = true
+  result.currentGroupStream = firstStream
+  result.nextGroupCallback = nextGroupCallback
+  result.pairsSent = 0
+  result.scanLimit = limit
+
+proc startStreamScan*(ss: StreamingScanClient, startKey: string = "",
+    endKey: string = "", limit: uint32 = 0,
+    chunkSize: uint32 = 0,
+    flags: uint8 = 0, txnId: TransactionID = zeroTransactionID(),
+    readTimestamp: uint64 = 0,
+    groupId: GroupID = ZeroGroupID(),
+    filter: Option[WireFilterExpr] = none(WireFilterExpr)): Result[
+        ScanResponseFrame, ProtocolError] {.
+    gcsafe, raises: [].} =
+  ## Start a streaming scan. Sends the initial request and receives the first frame.
+  ## Returns the first frame of results.
+  ## chunkSize: number of items per frame (0 = DEFAULT_SCAN_CHUNK_SIZE)
+  ## filter: optional server-side filter for reducing network traffic
+  ## Note: Only valid for single-group mode (multiGroupMode must be false).
+  if ss.multiGroupMode:
+    return peErr(newProtocolError(peInternal,
+        "startStreamScan not valid for multi-group mode"))
+  if not ss.client.connected.load():
+    return peErr(newProtocolError(peInternal, "not connected"))
+
+  var actualFlags = flags or kvMsgs.ScanFlagStreaming
+  if groupId != ZeroGroupID():
+    actualFlags = actualFlags or kvMsgs.ScanFlagGroupRouted
+  if filter.isSome:
+    actualFlags = actualFlags or kvMsgs.ScanFlagHasFilter
+
+  ss.reqFlags = actualFlags
+
+  let req = ScanRequest(
+    flags: actualFlags,
+    txnId: txnId,
+    readTimestamp: readTimestamp,
+    startKey: startKey,
+    endKey: endKey,
+    limit: limit,
+    groupId: groupId,
+    chunkSize: chunkSize,
+    filter: filter,
+  )
+
+  let r = ss.client.send(encodeScanRequest(req))
+  if r.isErr:
+    ss.error = some(r.error)
+    ss.exhausted = true
+    return peErr(r.error)
+
+  let frameR = decodeScanResponseFrame(r.value.payload, actualFlags)
+  if frameR.isErr:
+    ss.error = some(frameR.error)
+    ss.exhausted = true
+    return peErr(frameR.error)
+
+  ss.currentFrame = frameR.value
+  ss.framePos = 0
+  ss.hasMore = (ss.currentFrame.respFlags and kvMsgs.ScanRespFlagHasMore) != 0
+  ss.exhausted = (ss.currentFrame.respFlags and kvMsgs.ScanRespFlagEndOfScan) != 0
+  ss.totalReceived = ss.currentFrame.pairs.len
+
+  # Check for end of stream
+  if ss.exhausted or not ss.hasMore:
+    ss.exhausted = true
+
+  peOk(ss.currentFrame)
+
+proc nextFrame*(ss: StreamingScanClient): Result[ScanResponseFrame,
+    ProtocolError] {.
+    gcsafe, raises: [].} =
+  ## Get the next frame from the streaming scan.
+  ## Returns empty frame if stream is exhausted.
+  if ss.exhausted:
+    return peOk(ScanResponseFrame(respFlags: kvMsgs.ScanRespFlagEndOfScan,
+                                  pairs: @[], reqFlags: ss.reqFlags))
+
+  if not ss.hasMore:
+    ss.exhausted = true
+    return peOk(ScanResponseFrame(respFlags: kvMsgs.ScanRespFlagEndOfScan,
+                                  pairs: @[], reqFlags: ss.reqFlags))
+
+  # Read next frame from server
+  let frameR = ss.client.readOneFrame()
+  if frameR.isErr:
+    ss.error = some(frameR.error)
+    ss.exhausted = true
+    return peErr(frameR.error)
+
+  let f = frameR.value
+  if (f.header.flags and FlagIsError) != 0:
+    var pos = 2
+    let codeR = readUint32BE(f.payload, pos)
+    let code = if codeR.isOk: codeR.value else: ErrProtocol
+    let err = newProtocolError(peInternal, "server error during scan: 0x" &
+                               code.toHex(8))
+    ss.error = some(err)
+    ss.exhausted = true
+    return peErr(err)
+
+  let decodedR = decodeScanResponseFrame(f.payload, ss.reqFlags)
+  if decodedR.isErr:
+    ss.error = some(decodedR.error)
+    ss.exhausted = true
+    return peErr(decodedR.error)
+
+  ss.currentFrame = decodedR.value
+  ss.framePos = 0
+  ss.hasMore = (ss.currentFrame.respFlags and kvMsgs.ScanRespFlagHasMore) != 0
+  ss.exhausted = (ss.currentFrame.respFlags and kvMsgs.ScanRespFlagEndOfScan) != 0
+  ss.totalReceived += ss.currentFrame.pairs.len
+
+  if ss.exhausted or not ss.hasMore:
+    ss.exhausted = true
+
+  peOk(ss.currentFrame)
+
+# Forward declaration for closeStream (needed by nextPair)
+proc closeStream*(ss: StreamingScanClient) {.gcsafe, raises: [].}
+
+proc nextPair*(ss: StreamingScanClient): Option[kvMsgs.ScanPair] {.gcsafe,
+    raises: [].} =
+  ## Get the next individual KV pair from the stream.
+  ## Returns some(pair) if available, none() if exhausted.
+  ## Automatically fetches next frame when current frame is exhausted.
+  ## In multi-group mode, automatically switches to next group when current exhausted.
+  ##
+  ## Important: For single-group mode, we check currentFrame.pairs BEFORE checking
+  ## exhausted, because a stream can be marked exhausted but still have pairs
+  ## in currentFrame that need to be consumed.
+
+  # Multi-group mode: delegate to current group stream with limit tracking
+  if ss.multiGroupMode:
+    if ss.exhausted:
+      return none(kvMsgs.ScanPair)
+
+    # Check limit
+    if ss.scanLimit > 0 and ss.pairsSent >= int(ss.scanLimit):
+      ss.exhausted = true
+      return none(kvMsgs.ScanPair)
+
+    # If no current stream, try to start one via callback
+    if ss.currentGroupStream == nil:
+      if ss.nextGroupCallback == nil:
+        ss.exhausted = true
+        return none(kvMsgs.ScanPair)
+      let nextStreamR = ss.nextGroupCallback()
+      if nextStreamR.isErr:
+        ss.error = some(nextStreamR.error)
+        ss.exhausted = true
+        return none(kvMsgs.ScanPair)
+      ss.currentGroupStream = nextStreamR.value
+
+    # Get next pair from current group stream
+    let pairOpt = ss.currentGroupStream.nextPair()
+    if pairOpt.isSome:
+      inc ss.totalReceived
+      inc ss.pairsSent
+      return pairOpt
+
+    # Current group stream exhausted - try next group
+    ss.currentGroupStream.closeStream()
+    if ss.nextGroupCallback == nil:
+      ss.exhausted = true
+      return none(kvMsgs.ScanPair)
+
+    # Check if current stream had an error
+    if ss.currentGroupStream.error.isSome:
+      ss.error = ss.currentGroupStream.error
+      ss.exhausted = true
+      return none(kvMsgs.ScanPair)
+
+    # Try next group
+    var attempts = 0
+    while ss.nextGroupCallback != nil and attempts < 100:
+      let nextStreamR = ss.nextGroupCallback()
+      if nextStreamR.isErr:
+        ss.error = some(nextStreamR.error)
+        ss.exhausted = true
+        return none(kvMsgs.ScanPair)
+
+      ss.currentGroupStream = nextStreamR.value
+      inc attempts
+
+      # Get first pair from new stream
+      let newPairOpt = ss.currentGroupStream.nextPair()
+      if newPairOpt.isSome:
+        inc ss.totalReceived
+        inc ss.pairsSent
+        return newPairOpt
+
+      # This group also empty, close and continue
+      ss.currentGroupStream.closeStream()
+
+    # All groups exhausted
+    ss.exhausted = true
+    return none(kvMsgs.ScanPair)
+
+  # Single-group mode - check currentFrame.pairs FIRST before exhausted
+  # A stream can be marked exhausted (EndOfScan flag) but still have pairs
+  # in currentFrame that need to be consumed.
+  if ss.framePos < ss.currentFrame.pairs.len:
+    let pair = ss.currentFrame.pairs[ss.framePos]
+    ss.framePos += 1
+    return some(pair)
+
+  # No more pairs in current frame - now check if stream is exhausted
+  if ss.exhausted:
+    return none(kvMsgs.ScanPair)
+
+  # Try to get next frame if server has more
+  if not ss.hasMore:
+    ss.exhausted = true
+    return none(kvMsgs.ScanPair)
+
+  let frameR = ss.nextFrame()
+  if frameR.isErr or frameR.value.pairs.len == 0:
+    ss.exhausted = true
+    return none(kvMsgs.ScanPair)
+
+  # Return first pair from new frame
+  let pair = ss.currentFrame.pairs[0]
+  ss.framePos = 1
+  return some(pair)
+
+proc hasNext*(ss: StreamingScanClient): bool {.gcsafe, raises: [].} =
+  ## Check if more pairs are available without consuming them.
+  ## For single-group mode, we can still return pairs from currentFrame even if exhausted.
+  ## For multi-group mode, exhausted means no more groups to try.
+
+  # Multi-group mode
+  if ss.multiGroupMode:
+    if ss.exhausted:
+      return false
+    # Check limit
+    if ss.scanLimit > 0 and ss.pairsSent >= int(ss.scanLimit):
+      return false
+
+    # If no current stream but have callback, we can potentially get more
+    if ss.currentGroupStream == nil:
+      let hasCallback = ss.nextGroupCallback != nil
+      return hasCallback
+
+    # Check if current stream has pairs
+    if ss.currentGroupStream.hasNext():
+      return true
+
+    # Current stream exhausted - check if we have more groups
+    let hasMoreGroups = ss.nextGroupCallback != nil
+    return hasMoreGroups
+
+  # Single-group mode - check for pairs in current frame first
+  # We can return pairs from currentFrame even if stream is exhausted
+  if ss.framePos < ss.currentFrame.pairs.len:
+    return true
+
+  # No more pairs in current frame - check if server has more
+  if ss.exhausted:
+    return false
+  return ss.hasMore
+
+proc closeStream*(ss: StreamingScanClient) {.gcsafe, raises: [].} =
+  ## Close the streaming scan and mark it exhausted.
+  ## Breaks reference cycles by clearing the nextGroupCallback closure.
+  ss.exhausted = true
+  ss.hasMore = false
+  # In multi-group mode, close current group stream and clear callback to break cycles
+  if ss.multiGroupMode:
+    if ss.currentGroupStream != nil:
+      ss.currentGroupStream.closeStream()
+      ss.currentGroupStream = nil
+    # Clear the callback to break the closure cycle (prevents ORC crash on cleanup)
+    ss.nextGroupCallback = nil
+
+proc getError*(ss: StreamingScanClient): Option[ProtocolError] {.gcsafe,
+    raises: [].} =
+  ## Get any error that occurred during the scan.
+  ss.error
+
+proc getTotalReceived*(ss: StreamingScanClient): int {.gcsafe, raises: [].} =
+  ## Get total number of pairs received across all frames/groups.
+  ss.totalReceived
+
+proc consumeStreamScan*(ss: StreamingScanClient): Result[seq[kvMsgs.ScanPair],
+    ProtocolError] {.gcsafe, raises: [].} =
+  ## Consume all remaining pairs from the stream and return them as a sequence.
+  ## Warning: For large result sets, this defeats the purpose of streaming.
+  var pairs: seq[kvMsgs.ScanPair] = @[]
+  while ss.hasNext():
+    let pairOpt = ss.nextPair()
+    if pairOpt.isSome:
+      pairs.add(pairOpt.get())
+  ss.closeStream()
+  if ss.error.isSome:
+    return peErr(ss.error.get())
+  peOk(pairs)
+
+proc kvStreamScan*(client: ProtocolClient, startKey: string = "",
+    endKey: string = "", limit: uint32 = 0,
+    chunkSize: uint32 = 0,
+    flags: uint8 = 0, txnId: TransactionID = zeroTransactionID(),
+    readTimestamp: uint64 = 0,
+    groupId: GroupID = ZeroGroupID(),
+    filter: Option[WireFilterExpr] = none(WireFilterExpr)): Result[
+        StreamingScanClient, ProtocolError] {.
+    gcsafe, raises: [].} =
+  ## Start a streaming scan and return a StreamingScanClient for iteration.
+  ## Use ss.nextPair() to get individual pairs, or ss.consumeStreamScan() to
+  ## get all results as a sequence.
+  ## filter: optional server-side filter for reducing network traffic
+  let ss = newStreamingScanClient(client)
+  let firstFrameR = ss.startStreamScan(startKey, endKey, limit, chunkSize, flags,
+                                        txnId, readTimestamp, groupId, filter)
+  if firstFrameR.isErr:
+    return peErr(firstFrameR.error)
+  peOk(ss)
 
 # ---------------------------------------------------------------------------
 # Transaction convenience procs (Phase 3)

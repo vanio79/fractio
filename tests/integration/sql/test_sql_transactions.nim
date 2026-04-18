@@ -39,6 +39,12 @@ proc cleanDir(path: string) =
   try: removeDir(path) except CatchableError: discard
   try: createDir(path) except CatchableError: discard
 
+proc exec(client: FractioClient, sql: string,
+    database = "default", schema = "public"): ExecResult =
+  ## Execute SQL and buffer streaming rows into regular rows for test assertions.
+  let res = client.query(sql, database = database, schema = schema)
+  bufferRows(res)
+
 proc makeTestEnv(suiteName: string): tuple[
     client: FractioClient, server: ProtocolServer, testDir: string] =
   let randomId = $rand(10000..99999)
@@ -161,7 +167,7 @@ suite "SQL Transactions - Basic Flow":
     check res1.kind == erkModified
     check res1.count == 1
 
-    let res2 = client.query("SELECT * FROM users WHERE id = 1")
+    let res2 = client.exec("SELECT * FROM users WHERE id = 1")
     check res2.kind == erkRows
     check res2.rows.len == 1
     check res2.rows[0][1] == "Alice"
@@ -177,7 +183,7 @@ suite "SQL Transactions - Data Isolation":
     discard client.query("INSERT INTO users (id, name) VALUES (1, 'Alice')")
 
     # Should see its own insert
-    let res = client.query("SELECT * FROM users WHERE id = 1")
+    let res = client.exec("SELECT * FROM users WHERE id = 1")
     check res.kind == erkRows
     check res.rows.len == 1
     check res.rows[0][1] == "Alice"
@@ -201,7 +207,7 @@ suite "SQL Transactions - Data Isolation":
     discard client1.query("INSERT INTO users (id, name) VALUES (1, 'Alice')")
 
     # Other client should NOT see uncommitted insert
-    let res = client2.query("SELECT * FROM users WHERE id = 1")
+    let res = client2.exec("SELECT * FROM users WHERE id = 1")
     check res.kind == erkRows
     check res.rows.len == 0
 
@@ -257,9 +263,9 @@ suite "SQL Transactions - Complex Scenarios":
     discard client.query("UPDATE accounts SET balance = balance + 100 WHERE id = 2")
     discard client.query("COMMIT")
 
-    let res1 = client.query("SELECT balance FROM accounts WHERE id = 1")
+    let res1 = client.exec("SELECT balance FROM accounts WHERE id = 1")
     check res1.rows[0][0] == "900"
-    let res2 = client.query("SELECT balance FROM accounts WHERE id = 2")
+    let res2 = client.exec("SELECT balance FROM accounts WHERE id = 2")
     check res2.rows[0][0] == "600"
 
   test "Explicit rollback":
@@ -273,5 +279,5 @@ suite "SQL Transactions - Complex Scenarios":
     discard client.query("UPDATE accounts SET balance = 0 WHERE id = 1")
     discard client.query("ROLLBACK")
 
-    let res = client.query("SELECT balance FROM accounts WHERE id = 1")
+    let res = client.exec("SELECT balance FROM accounts WHERE id = 1")
     check res.rows[0][0] == "1000"

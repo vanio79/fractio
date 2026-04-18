@@ -13,6 +13,7 @@ import ../client/fractio_client
 import ../core/types as coreTypes
 import ../core/primary_key
 import ../core/kv_interface # for KVOpResult isErr/isOk procs
+import ../protocol/messages/kv # for WireFilterExpr types
 
 # ---------------------------------------------------------------------------
 # Plan types
@@ -97,6 +98,7 @@ type
       pgPkSpec*: PrimaryKeySpec    # primary key spec for decoding
       pgColumns*: seq[string]      # columns to return (empty = all)
       pgAllColumns*: seq[string]   # all table columns for decoding
+      pgFilter*: Option[Expr]      # remaining filter after PK extraction (optional)
 
     of poScan:
       scTableId*: TableId
@@ -214,6 +216,245 @@ proc findPkColumn*(desc: TableDescriptor): string =
 proc columnNames*(desc: TableDescriptor): seq[string] =
   for col in desc.columns:
     result.add(col.name)
+
+# ---------------------------------------------------------------------------
+# Primary Key Range Extraction from WHERE Clause
+# ---------------------------------------------------------------------------
+
+# Forward declarations (functions defined later in this file)
+proc exprToDataRowValue*(e: Expr): DataRowValue
+proc dataRowValueToPkValue*(v: DataRowValue, colSpec: tuple[name: string,
+    dataType: ColumnDataType, maxLen: int]): PrimaryKeyColumnValue
+
+type
+  PkRangeBound* = object
+    ## A bound for primary key range scan
+    value*: string     ## Encoded primary key value
+    isInclusive*: bool ## Whether the bound is inclusive (<= or >=)
+    isExact*: bool     ## Whether this is an exact match (pk = value)
+
+  PkRangeInfo* = object
+    ## Information extracted from WHERE clause about PK range
+    startBound*: Option[PkRangeBound] ## Lower bound (start key)
+    endBound*: Option[PkRangeBound]   ## Upper bound (end key)
+    exactMatch*: Option[string]       ## Exact PK value for point get
+    remainingFilter*: Option[Expr]    ## Remaining conditions after PK extraction
+    isPointGet*: bool                 ## True if this is a single-row lookup
+
+proc extractPkValueFromLiteral(expr: Expr, pkSpec: PrimaryKeySpec): Option[string] =
+  ## Extract and encode a primary key value from a literal expression.
+  ## Returns the encoded PK value, or none if not a valid literal.
+  if expr.kind != exLiteral or expr.litValue == nil:
+    return none(string)
+
+  let dataVal = exprToDataRowValue(expr)
+  if pkSpec.columns.len == 1:
+    # Single-column PK
+    let colSpec = pkSpec.columns[0]
+    var pk: PrimaryKey = @[dataRowValueToPkValue(dataVal, colSpec)]
+    return some(encodePrimaryKey(pk, pkSpec))
+  else:
+    # Composite PK - not supported for simple literal extraction
+    # Would need tuple/list expression
+    return none(string)
+
+proc extractPkRangeFromCondition(cond: Expr, pkCol: string,
+    pkSpec: PrimaryKeySpec): Option[PkRangeInfo] =
+  ## Extract PK range info from a single condition.
+  ## Handles: pk = value, pk > value, pk >= value, pk < value, pk <= value
+  if cond.kind != exBinOp:
+    return none(PkRangeInfo)
+
+  let left = cond.binLeft
+  let right = cond.binRight
+
+  # Check if condition involves PK column
+  var pkLiteral: Expr = nil
+  var opKind = cond.binOp
+
+  # pk = value or value = pk
+  if left.kind == exColumn and left.colName == pkCol and right.kind == exLiteral:
+    pkLiteral = right
+  elif right.kind == exColumn and right.colName == pkCol and left.kind == exLiteral:
+    pkLiteral = left
+    # Flip operator for swapped operands
+    case opKind
+    of boLt: opKind = boGt
+    of boLte: opKind = boGte
+    of boGt: opKind = boLt
+    of boGte: opKind = boLte
+    else: discard # Eq and Neq don't need flipping
+
+  if pkLiteral == nil:
+    return none(PkRangeInfo)
+
+  let pkValueOpt = extractPkValueFromLiteral(pkLiteral, pkSpec)
+  if pkValueOpt.isNone:
+    return none(PkRangeInfo)
+
+  let pkValue = pkValueOpt.get()
+
+  result = some(PkRangeInfo())
+
+  case opKind
+  of boEq:
+    # Exact match - point get
+    result.get().exactMatch = some(pkValue)
+    result.get().isPointGet = true
+  of boGt:
+    # pk > value - exclusive lower bound
+    result.get().startBound = some(PkRangeBound(
+      value: pkValue, isInclusive: false, isExact: false
+    ))
+  of boGte:
+    # pk >= value - inclusive lower bound
+    result.get().startBound = some(PkRangeBound(
+      value: pkValue, isInclusive: true, isExact: false
+    ))
+  of boLt:
+    # pk < value - exclusive upper bound
+    result.get().endBound = some(PkRangeBound(
+      value: pkValue, isInclusive: false, isExact: false
+    ))
+  of boLte:
+    # pk <= value - inclusive upper bound
+    result.get().endBound = some(PkRangeBound(
+      value: pkValue, isInclusive: true, isExact: false
+    ))
+  else:
+    # Other operators (neq, and, or) - not handled as range
+    return none(PkRangeInfo)
+
+proc extractPkRangeFromWhere*(where: Option[Expr], pkCol: string,
+    pkSpec: PrimaryKeySpec): PkRangeInfo =
+  ## Extract primary key range information from WHERE clause.
+  ##
+  ## Handles:
+  ## - pk = value → PointGet (single row)
+  ## - pk > value AND other_cond → Scan with start key + remaining filter
+  ## - pk >= value AND pk <= value → Range scan
+  ## - pk = value AND other_cond → PointGet with remaining filter
+  ##
+  ## Returns PkRangeInfo with:
+  ## - exactMatch: for point get
+  ## - startBound/endBound: for range scan
+  ## - remainingFilter: conditions not pushed to key range
+  ## - isPointGet: whether this should be a single-row lookup
+
+  result = PkRangeInfo()
+
+  if where.isNone:
+    return result
+
+  let w = where.get()
+
+  # Handle AND conditions - extract PK conditions and collect remaining
+  if w.kind == exBinOp and w.binOp == boAnd:
+    # Split AND into individual conditions
+    var pkConditions: seq[Expr] = @[]
+    var otherConditions: seq[Expr] = @[]
+
+    # Recursively collect conditions from AND tree
+    proc collectAndConditions(expr: Expr, pkCol: string,
+        pkConditions: var seq[Expr], otherConditions: var seq[Expr]) =
+      if expr.kind == exBinOp and expr.binOp == boAnd:
+        collectAndConditions(expr.binLeft, pkCol, pkConditions, otherConditions)
+        collectAndConditions(expr.binRight, pkCol, pkConditions, otherConditions)
+      else:
+        # Single condition - check if it involves PK
+        if expr.kind == exBinOp and
+           (expr.binLeft.kind == exColumn and expr.binLeft.colName == pkCol or
+            expr.binRight.kind == exColumn and expr.binRight.colName == pkCol):
+          pkConditions.add(expr)
+        else:
+          otherConditions.add(expr)
+
+    collectAndConditions(w, pkCol, pkConditions, otherConditions)
+
+    # Process PK conditions
+    for pkCond in pkConditions:
+      let pkRangeOpt = extractPkRangeFromCondition(pkCond, pkCol, pkSpec)
+      if pkRangeOpt.isSome:
+        let pkRange = pkRangeOpt.get()
+
+        # Handle exact match (pk = value)
+        if pkRange.isPointGet:
+          result.exactMatch = pkRange.exactMatch
+          result.isPointGet = true
+          # Don't combine exact match with range bounds - it's a point get
+          break
+        elif pkRange.startBound.isSome:
+          # Merge start bound (take the tighter one)
+          if result.startBound.isNone or
+             pkRange.startBound.get().value > result.startBound.get().value:
+            result.startBound = pkRange.startBound
+        elif pkRange.endBound.isSome:
+          # Merge end bound (take the tighter one)
+          if result.endBound.isNone or
+             pkRange.endBound.get().value < result.endBound.get().value:
+            result.endBound = pkRange.endBound
+
+    # Build remaining filter from other conditions
+    if otherConditions.len > 0:
+      if otherConditions.len == 1:
+        result.remainingFilter = some(otherConditions[0])
+      else:
+        # Reconstruct AND tree
+        var combined = otherConditions[0]
+        for i in 1..<otherConditions.len:
+          combined = Expr(kind: exBinOp, binOp: boAnd,
+                          binLeft: combined, binRight: otherConditions[i])
+        result.remainingFilter = some(combined)
+
+    return result
+
+  # Handle single condition (not AND)
+  let pkRangeOpt = extractPkRangeFromCondition(w, pkCol, pkSpec)
+  if pkRangeOpt.isSome:
+    result = pkRangeOpt.get()
+    return result
+
+  # No PK condition found - full scan with original filter
+  result.remainingFilter = where
+
+proc makeScanKeysFromRange*(tableId: TableId, rangeInfo: PkRangeInfo): tuple[
+    startKey: string, endKey: string] =
+  ## Generate start and end keys for scan from PK range info.
+  ## For exact match, both keys are the same (point get).
+  ## For range scan, generates appropriate bounds.
+
+  if rangeInfo.isPointGet and rangeInfo.exactMatch.isSome:
+    # Point get - single key
+    let pkVal = rangeInfo.exactMatch.get()
+    result.startKey = encodeDataRowKey(tableId, pkVal)
+    result.endKey = result.startKey
+    return result
+
+  # Range scan
+  if rangeInfo.startBound.isSome:
+    let bound = rangeInfo.startBound.get()
+    result.startKey = encodeDataRowKey(tableId, bound.value)
+    # For exclusive lower bound (>), we need to skip exact match
+    # The scan will naturally skip it since we filter rows
+  else:
+    # No lower bound - start from beginning of table
+    result.startKey = encodeDataRowKey(tableId, "")
+
+  if rangeInfo.endBound.isSome:
+    let bound = rangeInfo.endBound.get()
+    # For upper bound, we need to create a key that includes/excludes the bound
+    # Key comparison is lexicographic, so:
+    # - For <= (inclusive): scan up to pk + 1 byte (to include pk)
+    # - For < (exclusive): scan up to pk (excludes pk)
+    if bound.isInclusive:
+      # Include the bound by appending a high byte
+      result.endKey = encodeDataRowKey(tableId, bound.value & "\xFF")
+    else:
+      # Exclude the bound - scan up to but not including
+      result.endKey = encodeDataRowKey(tableId, bound.value)
+  else:
+    # No upper bound - scan to end of table
+    result.endKey = makeDataRowScanEndKey(tableId)
 
 # ---------------------------------------------------------------------------
 # Catalog lookups
@@ -358,6 +599,89 @@ proc exprToJsonValue*(e: Expr): JsonNode =
   of dtString: newJString(e.litValue.strValue)
   of dtBool: newJBool(e.litValue.boolValue)
   else: newJNull()
+
+proc exprToWireFilterExpr*(e: Expr): WireFilterExpr =
+  ## Convert an SQL Expr to a WireFilterExpr for server-side filtering.
+  ## Only handles filter-compatible expression types (literals, columns,
+  ## comparison operators, AND/OR, IS NULL, BETWEEN, LIKE).
+  ## Arithmetic operators (Add, Sub, Mul, Div, Mod) and Neg are not supported.
+  case e.kind
+  of exLiteral:
+    result = WireFilterExpr(kind: wekLiteral)
+    if e.litValue == nil:
+      result.litDataType = wdtNull
+    else:
+      case e.litValue.kind
+      of dtInt:
+        result.litDataType = wdtInt
+        result.litIntVal = e.litValue.intValue
+      of dtFloat:
+        result.litDataType = wdtFloat
+        result.litFloatVal = e.litValue.floatValue
+      of dtString:
+        result.litDataType = wdtString
+        result.litStringVal = e.litValue.strValue
+      of dtBool:
+        result.litDataType = wdtBool
+        result.litBoolVal = e.litValue.boolValue
+      else:
+        # Other types (Date, DateTime, Bytes, ULID) encoded as null for now
+        result.litDataType = wdtNull
+
+  of exColumn:
+    result = WireFilterExpr(kind: wekColumn, colName: e.colName)
+
+  of exBinOp:
+    result = WireFilterExpr(kind: wekBinOp)
+    # Convert BinOpKind to WireBinOp
+    case e.binOp
+    of boEq: result.binOpKind = wboEq
+    of boNeq: result.binOpKind = wboNeq
+    of boLt: result.binOpKind = wboLt
+    of boLte: result.binOpKind = wboLte
+    of boGt: result.binOpKind = wboGt
+    of boGte: result.binOpKind = wboGte
+    of boAnd: result.binOpKind = wboAnd
+    of boOr: result.binOpKind = wboOr
+    else:
+      # Arithmetic operators - convert to a placeholder (equality with false)
+      # This effectively filters out all rows if arithmetic is used in filter
+      result = WireFilterExpr(kind: wekLiteral, litDataType: wdtBool,
+          litBoolVal: false)
+      return result
+    result.binLeft = exprToWireFilterExpr(e.binLeft)
+    result.binRight = exprToWireFilterExpr(e.binRight)
+
+  of exUnaryOp:
+    case e.unaryOp
+    of uoNot:
+      result = WireFilterExpr(kind: wekUnaryOp, unaryOpKind: wuoNot)
+      result.unaryExpr = exprToWireFilterExpr(e.unaryExpr)
+    of uoNeg:
+      # Negation not supported in filters - return false literal
+      result = WireFilterExpr(kind: wekLiteral, litDataType: wdtBool,
+          litBoolVal: false)
+
+  of exIsNull:
+    result = WireFilterExpr(kind: wekIsNull, isNullNot: e.isNullNot)
+    result.isNullExpr = exprToWireFilterExpr(e.isNullExpr)
+
+  of exBetween:
+    result = WireFilterExpr(kind: wekBetween, betweenNot: e.betweenNot)
+    result.betweenExpr = exprToWireFilterExpr(e.betweenExpr)
+    result.betweenLo = exprToWireFilterExpr(e.betweenLo)
+    result.betweenHi = exprToWireFilterExpr(e.betweenHi)
+
+  of exLike:
+    result = WireFilterExpr(kind: wekLike, likeNot: e.likeNot)
+    result.likeExpr = exprToWireFilterExpr(e.likeExpr)
+    result.likePattern = exprToWireFilterExpr(e.likePattern)
+
+  of exIn, exParam, exList, exStar:
+    # Not supported in wire filters - return true literal (no filtering)
+    # The client will need to apply these filters locally
+    result = WireFilterExpr(kind: wekLiteral, litDataType: wdtBool,
+        litBoolVal: true)
 
 # ---------------------------------------------------------------------------
 # Statement planners
@@ -527,32 +851,11 @@ proc planSelect(stmt: Stmt, client: FractioClient,
       else:
         reqCols.add("?")
 
-  # Check for point get: WHERE pk = literal
+  # Extract PK range information from WHERE clause
   let pkCol = findPkColumn(desc)
-  if stmt.selWhere.isSome:
-    let w = stmt.selWhere.get()
-    if w.kind == exBinOp and w.binOp == boEq:
-      if w.binLeft.kind == exColumn and w.binLeft.colName == pkCol and
-         w.binRight.kind == exLiteral:
-        # Build binary primary key from literal value
-        var pk: PrimaryKey
-        let colSpec = desc.pkSpec.columns[0]             # First PK column
-        let dataVal = exprToDataRowValue(w.binRight)
-        pk.add(dataRowValueToPkValue(dataVal, colSpec))
-        let pkVal = encodePrimaryKey(pk, desc.pkSpec)
+  let pkRangeInfo = extractPkRangeFromWhere(stmt.selWhere, pkCol, desc.pkSpec)
 
-        plan.add(PlanOp(kind: poPointGet,
-          pgTableId: desc.tableId,
-          pgKey: pkVal,
-          pgPkSpec: desc.pkSpec,
-          pgColumns: reqCols,
-          pgAllColumns: allCols,
-        ))
-        return plan
-
-  # Full scan with optional filter
-  let startKey = encodeDataRowKey(desc.tableId, "")
-  let endKey = makeDataRowScanEndKey(desc.tableId)
+  # Extract LIMIT value
   var limit: uint32 = 0
   if stmt.selLimit.isSome:
     let limExpr = stmt.selLimit.get()
@@ -560,12 +863,29 @@ proc planSelect(stmt: Stmt, client: FractioClient,
        limExpr.litValue.kind == dtInt:
       limit = uint32(limExpr.litValue.intValue)
 
+  # Generate plan based on PK range info
+  if pkRangeInfo.isPointGet and pkRangeInfo.exactMatch.isSome:
+    # Point get: single row lookup with optional remaining filter
+    let pkVal = pkRangeInfo.exactMatch.get()
+    plan.add(PlanOp(kind: poPointGet,
+      pgTableId: desc.tableId,
+      pgKey: pkVal,
+      pgPkSpec: desc.pkSpec,
+      pgColumns: reqCols,
+      pgAllColumns: allCols,
+      pgFilter: pkRangeInfo.remainingFilter, # Apply remaining conditions to row
+    ))
+    return plan
+
+  # Range scan (with optimized key bounds if available)
+  let (startKey, endKey) = makeScanKeysFromRange(desc.tableId, pkRangeInfo)
+
   plan.add(PlanOp(kind: poScan,
     scTableId: desc.tableId,
     scStartKey: startKey,
     scEndKey: endKey,
     scLimit: limit,
-    scFilter: stmt.selWhere,
+    scFilter: pkRangeInfo.remainingFilter, # Only non-PK conditions remain
     scColumns: reqCols,
     scAllColumns: allCols,
   ))

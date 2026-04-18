@@ -5,6 +5,7 @@ import std/[options, locks, deques, strformat, strutils, sequtils]
 import tables
 import fractio/core/types
 import fractio/core/errors
+import fractio/storage/backend # for StreamResultSet, StreamConfig, etc.
 
 # Import GroupID with all operators from distributed layer
 from fractio/distributed/raft/group_types import GroupID, `==`, hash, `$`,
@@ -385,6 +386,84 @@ proc assertClosed*(m: MockKVStore) =
     doAssert m.closed, "Expected store to be closed"
 
 # =============================================================================
+# Mock Stream ResultSet (for streaming scan testing)
+# =============================================================================
+
+type
+  MockStreamResultSet* = ref object of StreamResultSet
+    ## Mock streaming result set for testing.
+    ## Simulates streaming behavior without real background thread.
+    ## Allows controlled iteration for deterministic tests.
+    data*: seq[(string, string)]
+    position*: int
+    state*: StreamState
+    config*: StreamConfig
+
+proc newMockStreamResultSet*(data: seq[(string, string)],
+                            config: StreamConfig = defaultStreamConfig()): MockStreamResultSet =
+  ## Create mock stream with pre-populated data.
+  ## Data is consumed in order during iteration.
+  new(result)
+  result.data = data
+  result.position = 0
+  result.state = ssReading
+  result.config = config
+
+method init*(rs: MockStreamResultSet, backend: StorageBackend, startKey: string,
+            endKey: string, limit: int = 0,
+            config: StreamConfig = StreamConfig()): bool =
+  ## Initialize mock stream - usually not needed, use newMockStreamResultSet
+  rs.config = config
+  rs.state = ssReading
+  true
+
+method next*(rs: MockStreamResultSet): Option[KeyValuePair] =
+  ## Get next item from mock stream.
+  if rs.state == ssClosed or rs.state == ssError:
+    return none(KeyValuePair)
+  if rs.position >= rs.data.len:
+    rs.state = ssExhausted
+    return none(KeyValuePair)
+  let kv = rs.data[rs.position]
+  inc rs.position
+  return some(kv)
+
+method hasNext*(rs: MockStreamResultSet): bool =
+  ## Check if more data available.
+  if rs.state == ssClosed or rs.state == ssError:
+    return false
+  if rs.position >= rs.data.len:
+    rs.state = ssExhausted
+    return false
+  return true
+
+method close*(rs: MockStreamResultSet) =
+  ## Close mock stream.
+  rs.state = ssClosed
+  rs.data = @[]
+  rs.position = 0
+
+method getState*(rs: MockStreamResultSet): StreamState =
+  rs.state
+
+method getTotalRead*(rs: MockStreamResultSet): int =
+  rs.position
+
+method getError*(rs: MockStreamResultSet): Option[string] =
+  if rs.state == ssError:
+    return some("mock stream error")
+  return none(string)
+
+# Helper to create mock stream from MockKVStore scan
+proc mockStreamScan*(m: MockKVStore, prefix: string,
+    limit: uint32): MockStreamResultSet =
+  ## Create a mock stream result set from MockKVStore data.
+  ## Performs the scan immediately (no background thread) but allows
+  ## streaming-style iteration for testing.
+  let data = m.scan(prefix, limit)
+  newMockStreamResultSet(data)
+
+# =============================================================================
 # Mock Transaction Manager
 # =============================================================================
 
@@ -611,6 +690,14 @@ proc reset*(m: MockBackend) =
     m.flushCallCount = 0
     m.compactCallCount = 0
     m.closed = false
+
+# Mock streaming scan for MockBackend
+proc streamScan*(m: MockBackend, prefix: string, limit: uint32,
+               config: StreamConfig = defaultStreamConfig()): MockStreamResultSet =
+  ## Create mock stream from backend data.
+  ## Performs scan immediately but returns streaming interface.
+  let data = m.scan(prefix, limit)
+  newMockStreamResultSet(data, config)
 
 # =============================================================================
 # Mock Connection Handle

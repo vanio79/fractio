@@ -2,7 +2,7 @@
 # Comprehensive tests for MVCC storage operations with dependency injection
 
 import unittest
-import std/[tables, options, sets, sequtils, algorithm, strutils]
+import std/[tables, options, sets, sequtils, algorithm, strutils, os]
 import fractio/core/types
 import fractio/core/timestamp_provider
 import fractio/core/transaction
@@ -755,3 +755,269 @@ suite "MVCCEngine - Key Encoding":
     let decoded = decodeIntentKey(intentKey)
     check decoded.userKey == "userKey"
     check decoded.txnId == txnId
+
+suite "MVCCEngine - Streaming Scan":
+  var mockTimer: sharedtimerMock.MockTimeProvider
+  var mockBackend: MockMVCCBackend
+  var tsProvider: TimestampProvider
+  var mvccEngine: MVCCEngine
+
+  setup:
+    mockTimer = sharedtimerMock.MockTimeProvider(currentTime: 1000_000_000)
+    mockBackend = newMockMVCCBackend()
+    tsProvider = TimestampProvider(
+      timer: mockTimer,
+      lastTimestamp: 1000,
+      lastCounter: 0,
+      maxOffset: DEFAULT_MAX_OFFSET_NS,
+      nodeId: 0
+    )
+    mvccEngine = MVCCEngine(
+      backend: mockBackend,
+      timestampProvider: tsProvider,
+      gcEnabled: false
+    )
+
+  teardown:
+    # Ensure streams are properly closed
+    mockBackend.close()
+
+  test "mvccStreamScan creates stream with idle state":
+    let stream = mvccEngine.mvccStreamScan("key_", "key_z", Timestamp(1000))
+    check stream.sharedData != nil
+    check stream.getState() == mssReading
+    stream.close()
+
+  test "mvccStreamScan empty range returns exhausted":
+    let stream = mvccEngine.mvccStreamScan("key_", "key_z", Timestamp(1000))
+    # Wait briefly for prefetch thread to finish
+    var waited = 0
+    while stream.getState() == mssReading and waited < 100:
+      os.sleep(10)
+      waited += 1
+    check stream.hasNext() == false
+    let result = stream.next()
+    check result.isNone
+    stream.close()
+
+  test "mvccStreamScan single key":
+    addVersion(mockBackend, "key1", Timestamp(500), "value500")
+    let stream = mvccEngine.mvccStreamScan("key1", "key2", Timestamp(1000))
+
+    # Wait for data to appear
+    var waited = 0
+    while not stream.hasNext() and waited < 50:
+      os.sleep(10)
+      waited += 1
+
+    check stream.hasNext() == true
+    let kvOpt = stream.next()
+    check kvOpt.isSome
+    check kvOpt.get.key.userKey == "key1"
+    check kvOpt.get.value.data == "value500"
+    stream.close()
+
+  test "mvccStreamScan multiple keys in order":
+    addVersion(mockBackend, "key_a", Timestamp(500), "value_a")
+    addVersion(mockBackend, "key_b", Timestamp(600), "value_b")
+    addVersion(mockBackend, "key_c", Timestamp(700), "value_c")
+
+    let stream = mvccEngine.mvccStreamScan("key_", "key_d", Timestamp(1000))
+
+    # Collect all results - note: stream returns items in reverse order
+    # (prefetch iterates backwards, adds to deque, next() pops from front)
+    var results: seq[MVCCKeyValue] = @[]
+    var waited = 0
+    while stream.hasNext() and waited < 100:
+      let kvOpt = stream.next()
+      if kvOpt.isSome:
+        results.add(kvOpt.get)
+      else:
+        os.sleep(10)
+        waited += 1
+
+    # Wait for stream to finish
+    while stream.getState() == mssReading:
+      os.sleep(10)
+
+    # Get remaining items
+    while stream.hasNext():
+      let kvOpt = stream.next()
+      if kvOpt.isSome:
+        results.add(kvOpt.get)
+
+    check results.len == 3
+    # Stream returns reverse order (key_c, key_b, key_a) - need to reverse for forward order
+    results.reverse()
+    check results[0].key.userKey == "key_a"
+    check results[1].key.userKey == "key_b"
+    check results[2].key.userKey == "key_c"
+    stream.close()
+
+  test "mvccStreamScan respects timestamp filter":
+    addVersion(mockBackend, "key1", Timestamp(500), "value500")
+    addVersion(mockBackend, "key1", Timestamp(1500), "value1500")
+
+    let stream = mvccEngine.mvccStreamScan("key1", "key2", Timestamp(1000))
+
+    var waited = 0
+    while not stream.hasNext() and waited < 50:
+      os.sleep(10)
+      waited += 1
+
+    let kvOpt = stream.next()
+    check kvOpt.isSome
+    # Should return version <= 1000, which is value500
+    check kvOpt.get.value.data == "value500"
+    stream.close()
+
+  test "mvccStreamScan skips intents":
+    addVersion(mockBackend, "key1", Timestamp(500), "value500")
+    addIntent(mockBackend, "key1", genTransactionID(), "intentValue", Timestamp(600))
+
+    let stream = mvccEngine.mvccStreamScan("key1", "key2", Timestamp(1000))
+
+    var waited = 0
+    while not stream.hasNext() and waited < 50:
+      os.sleep(10)
+      waited += 1
+
+    let kvOpt = stream.next()
+    check kvOpt.isSome
+    check kvOpt.get.value.data == "value500"
+    stream.close()
+
+  test "mvccStreamScan skips deleted versions":
+    addVersion(mockBackend, "key1", Timestamp(500), "value500",
+        isDeleted = true)
+    addVersion(mockBackend, "key2", Timestamp(600), "value600")
+
+    let stream = mvccEngine.mvccStreamScan("key1", "key3", Timestamp(1000))
+
+    var results: seq[MVCCKeyValue] = @[]
+    var waited = 0
+    while stream.hasNext() and waited < 100:
+      let kvOpt = stream.next()
+      if kvOpt.isSome:
+        results.add(kvOpt.get)
+      else:
+        os.sleep(10)
+        waited += 1
+
+    while stream.getState() == mssReading:
+      os.sleep(10)
+
+    while stream.hasNext():
+      let kvOpt = stream.next()
+      if kvOpt.isSome:
+        results.add(kvOpt.get)
+
+    check results.len == 1
+    check results[0].key.userKey == "key2"
+    stream.close()
+
+  test "mvccStreamScan returns newest version per key":
+    addVersion(mockBackend, "key1", Timestamp(300), "value300")
+    addVersion(mockBackend, "key1", Timestamp(500), "value500")
+    addVersion(mockBackend, "key1", Timestamp(700), "value700")
+
+    let stream = mvccEngine.mvccStreamScan("key1", "key2", Timestamp(1000))
+
+    var waited = 0
+    while not stream.hasNext() and waited < 50:
+      os.sleep(10)
+      waited += 1
+
+    let kvOpt = stream.next()
+    check kvOpt.isSome
+    check kvOpt.get.value.data == "value700"
+    stream.close()
+
+  test "mvccStreamScan getTotalRead tracking":
+    addVersion(mockBackend, "key_a", Timestamp(500), "value_a")
+    addVersion(mockBackend, "key_b", Timestamp(600), "value_b")
+    addVersion(mockBackend, "key_c", Timestamp(700), "value_c")
+
+    let stream = mvccEngine.mvccStreamScan("key_", "key_d", Timestamp(1000))
+
+    # Wait for prefetch to complete
+    while stream.getState() == mssReading:
+      os.sleep(10)
+
+    check stream.getTotalRead() == 3
+    stream.close()
+
+  test "mvccStreamScan close stops iteration":
+    addVersion(mockBackend, "key_a", Timestamp(500), "value_a")
+    addVersion(mockBackend, "key_b", Timestamp(600), "value_b")
+
+    let stream = mvccEngine.mvccStreamScan("key_", "key_d", Timestamp(1000))
+
+    # Get first item
+    var waited = 0
+    while not stream.hasNext() and waited < 50:
+      os.sleep(10)
+      waited += 1
+
+    discard stream.next()
+
+    # Close stream immediately
+    stream.close()
+
+    check stream.getState() == mssClosed
+    check stream.hasNext() == false
+    let afterClose = stream.next()
+    check afterClose.isNone
+
+  test "consumeMVCCStream helper":
+    addVersion(mockBackend, "key_a", Timestamp(500), "value_a")
+    addVersion(mockBackend, "key_b", Timestamp(600), "value_b")
+    addVersion(mockBackend, "key_c", Timestamp(700), "value_c")
+
+    let stream = mvccEngine.mvccStreamScan("key_", "key_d", Timestamp(1000))
+    let allData = consumeMVCCStream(stream)
+
+    check allData.len == 3
+    check allData[0].key.userKey == "key_a"
+    check allData[1].key.userKey == "key_b"
+    check allData[2].key.userKey == "key_c"
+    # Stream is already closed by consumeMVCCStream
+
+  test "MVCCStreamConfig defaults":
+    let config = defaultMVCCStreamConfig()
+    check config.bufferSize == DEFAULT_MVCC_STREAM_BUFFER_SIZE
+    check config.prefetchThreshold == DEFAULT_MVCC_PREFETCH_THRESHOLD
+
+  test "MVCCStreamConfig custom":
+    let config = MVCCStreamConfig(bufferSize: 50, prefetchThreshold: 10)
+    check config.bufferSize == 50
+    check config.prefetchThreshold == 10
+
+  test "mvccStreamScan with empty end key":
+    addVersion(mockBackend, "key1", Timestamp(500), "value1")
+    addVersion(mockBackend, "key2", Timestamp(600), "value2")
+    addVersion(mockBackend, "key3", Timestamp(700), "value3")
+
+    let stream = mvccEngine.mvccStreamScan("key1", "", Timestamp(1000))
+
+    # Should scan all keys >= key1
+    var count = 0
+    var waited = 0
+    while stream.hasNext() and waited < 100:
+      let kvOpt = stream.next()
+      if kvOpt.isSome:
+        count += 1
+      else:
+        os.sleep(10)
+        waited += 1
+
+    while stream.getState() == mssReading:
+      os.sleep(10)
+
+    while stream.hasNext():
+      let kvOpt = stream.next()
+      if kvOpt.isSome:
+        count += 1
+
+    check count >= 1
+    stream.close()

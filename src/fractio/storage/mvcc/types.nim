@@ -1,9 +1,10 @@
 # MVCC Types - Key encoding, value format, and metadata definitions
 # for Multi-Version Concurrency Control storage
 
-import std/[options, hashes, strutils]
+import std/[options, hashes, strutils, locks, deques, atomics, typedthreads]
 import ../../core/types
 import ../../core/timestamp_provider
+import ../../storage/backend
 
 # Constants for key encoding
 const
@@ -306,6 +307,76 @@ proc intentConflict*(key: string, txnId: TransactionID): MVCCError =
 proc writeTooOld*(key: string, existingTs: Timestamp): MVCCError =
   mvccError(mvccWriteTooOld, "Write too old for key: " & key &
       ", existing ts: " & $existingTs)
+
+# ============================================================================
+# MVCC Streaming ResultSet Types
+# ============================================================================
+
+type
+  MVCCStreamConfig* = object
+    ## Configuration for MVCC streaming result sets
+    bufferSize*: int ## Number of MVCCKeyValue pairs to buffer (default: 1000)
+    prefetchThreshold*: int ## Items remaining before triggering prefetch (default: 100)
+
+  MVCCStreamState* = enum
+    mssIdle      ## Stream not started
+    mssReading   ## Stream actively reading (prefetch thread running)
+    mssExhausted ## Stream has read all data
+    mssError     ## Stream encountered error
+    mssClosed    ## Stream explicitly closed
+
+  MVCCStreamError* = object of CatchableError
+    ## Error during MVCC streaming operation
+    code*: MVCCStreamErrorCode
+
+  MVCCStreamErrorCode* = enum
+    msecStreamClosed
+    msecStreamExhausted
+    msecPrefetchError
+    msecInvalidState
+    msecIntentConflict
+
+  MVCCStreamSharedData* = object
+    ## Thread-safe shared data between consumer and prefetch thread
+    buffer*: Deque[MVCCKeyValue]
+    bufferLock*: Lock
+    state*: Atomic[MVCCStreamState]
+    errorMsg*: Atomic[string]
+    totalRead*: Atomic[int]
+    consumerPos*: Atomic[int]
+
+  MVCCStreamResultSet* = ref object
+    ## Streaming result set for MVCC range scans.
+    ## Uses a background thread to read ahead and buffer results.
+    ## Thread-safe: consumers can call next() while prefetch thread fills buffer.
+    engine*: pointer ## Cast to MVCCEngine (avoid circular import)
+    startKey*: string
+    endKey*: string
+    timestamp*: Timestamp
+    txnId*: TransactionID
+    config*: MVCCStreamConfig
+    sharedData*: ptr MVCCStreamSharedData
+    prefetchThread*: Thread[MVCCStreamResultSet]
+
+const
+  DEFAULT_MVCC_STREAM_BUFFER_SIZE* = 1000
+  DEFAULT_MVCC_PREFETCH_THRESHOLD* = 100
+
+proc defaultMVCCStreamConfig*(): MVCCStreamConfig =
+  result = MVCCStreamConfig(
+    bufferSize: DEFAULT_MVCC_STREAM_BUFFER_SIZE,
+    prefetchThreshold: DEFAULT_MVCC_PREFETCH_THRESHOLD
+  )
+
+proc smallMVCCStreamConfig*(): MVCCStreamConfig =
+  result = MVCCStreamConfig(
+    bufferSize: 100,
+    prefetchThreshold: 20
+  )
+
+proc newMVCCStreamError*(code: MVCCStreamErrorCode,
+    message: string): MVCCStreamError =
+  result = MVCCStreamError(code: code, msg: message)
 
 # Unit tests
 when isMainModule:

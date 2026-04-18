@@ -395,22 +395,6 @@ proc keyRoutesToGroupIdDuringRebalance*(store: RaftKVStoreExt, key: string,
             # Check if key routes to new group
             let newRoutedGid = routeToGroup(pk, newGroupIds)
             
-            # Debug logging for routing
-            when defined(debug):
-              try:
-                {.cast(gcsafe).}:
-                  {.cast(raises: []).}:
-                    debug("keyRoutesToGroupIdDuringRebalance", {
-                      "key": key[0..min(50, key.len-1)],
-                      "tableId": $tableId,
-                      "pk": pk,
-                      "newGroupIds": $newGroupIds.len,
-                      "targetGroupId": $targetGroupId,
-                      "newRoutedGid": $newRoutedGid
-                    }.toTable)
-              except:
-                discard
-            
             if newRoutedGid == targetGroupId:
               return true
 

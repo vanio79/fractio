@@ -1,7 +1,8 @@
 # MVCC Engine - Multi-Version Concurrency Control storage engine
 # Wraps StorageBackend to provide MVCC semantics
 
-import std/[options, sets, sequtils, algorithm, strutils]
+import std/[options, sets, algorithm, strutils, locks, deques,
+    atomics, typedthreads, os]
 import ../../core/types as core_types
 import ../../core/timestamp_provider
 import ../../core/transaction
@@ -365,6 +366,364 @@ proc getAllVersions*(engine: MVCCEngine, userKey: string): seq[KeyVersion] =
       discard
 
     discard iter.prev()
+
+# ============================================================================
+# MVCC Streaming Scan Implementation
+# ============================================================================
+
+proc mvccPrefetchWorker(stream: MVCCStreamResultSet) {.thread, gcsafe, raises: [].} =
+  ## Background thread that prefetches MVCC key-value pairs into the buffer.
+  ## Runs until stream is closed, exhausted, or encounters an error.
+  if stream.sharedData == nil or stream.engine == nil:
+    return
+
+  let engine = cast[MVCCEngine](stream.engine)
+  let backend = engine.backend
+  if backend == nil:
+    stream.sharedData.state.store(mssError, moRelaxed)
+    stream.sharedData.errorMsg.store("backend is nil", moRelaxed)
+    return
+
+  # Create iterator for reading
+  var iter: StorageIterator = nil
+  {.cast(raises: []).}:
+    try:
+      iter = backend.newIterator()
+    except:
+      stream.sharedData.state.store(mssError, moRelaxed)
+      stream.sharedData.errorMsg.store("failed to create iterator", moRelaxed)
+      return
+
+  if iter == nil:
+    stream.sharedData.state.store(mssError, moRelaxed)
+    stream.sharedData.errorMsg.store("iterator is nil", moRelaxed)
+    return
+
+  # Start from the end key (or from last key if no endKey)
+  var positioned = false
+  {.cast(raises: []).}:
+    try:
+      if stream.endKey.len > 0:
+        if not iter.seek(stream.endKey):
+          discard iter.seekToLast()
+        elif iter.key() >= stream.endKey:
+          discard iter.prev()
+      else:
+        discard iter.seekToLast()
+      positioned = true
+    except:
+      stream.sharedData.state.store(mssError, moRelaxed)
+      stream.sharedData.errorMsg.store("iterator positioning failed", moRelaxed)
+      return
+
+  if not positioned:
+    stream.sharedData.state.store(mssError, moRelaxed)
+    stream.sharedData.errorMsg.store("failed to position iterator", moRelaxed)
+    return
+
+  var seenKeys: HashSet[string] = initHashSet[string]()
+  var itemCount = 0
+
+  # Iterate backwards through keys
+  while stream.sharedData.state.load(moRelaxed) == mssReading:
+    # Check if we should pause (buffer full)
+    var shouldPause = false
+    acquire(stream.sharedData.bufferLock)
+    shouldPause = stream.sharedData.buffer.len >= stream.config.bufferSize
+    release(stream.sharedData.bufferLock)
+
+    if shouldPause:
+      # Wait for consumer to drain some items
+      os.sleep(10)
+      continue
+
+    # Read next item
+    var valid = false
+    {.cast(raises: []).}:
+      try:
+        valid = iter.valid()
+      except:
+        discard
+
+    if not valid:
+      # Exhausted
+      stream.sharedData.state.store(mssExhausted, moRelaxed)
+      break
+
+    var iterKey = ""
+    var iterValue = ""
+    {.cast(raises: []).}:
+      try:
+        iterKey = iter.key()
+        iterValue = iter.value()
+      except:
+        discard iter.prev()
+        continue
+
+    try:
+      let decoded = decodeMVCCKey(iterKey)
+      let userKey = decoded.userKey
+
+      # Stop if we've passed below the start key range
+      if userKey < stream.startKey:
+        stream.sharedData.state.store(mssExhausted, moRelaxed)
+        break
+
+      # Skip if above end key range (for open-ended scans)
+      if stream.endKey.len > 0 and userKey >= stream.endKey:
+        {.cast(raises: []).}:
+          try:
+            discard iter.prev()
+          except:
+            discard
+        continue
+
+      # Skip intents - they need special handling
+      if decoded.isIntent:
+        {.cast(raises: []).}:
+          try:
+            discard iter.prev()
+          except:
+            discard
+        continue
+
+      # Only include versions <= timestamp
+      if decoded.timestamp <= stream.timestamp:
+        # Skip if we've already seen this key (only keep newest)
+        if userKey in seenKeys:
+          {.cast(raises: []).}:
+            try:
+              discard iter.prev()
+            except:
+              discard
+          continue
+
+        seenKeys.incl(userKey)
+
+        let mvccValue = decodeMVCCValue(iterValue)
+
+        # Only include non-deleted values
+        if not mvccValue.isDeleted:
+          let kv = (MVCCKey(userKey: userKey, timestamp: decoded.timestamp,
+                           isIntent: false), mvccValue)
+
+          # Add to buffer
+          acquire(stream.sharedData.bufferLock)
+          stream.sharedData.buffer.addLast(kv)
+          discard stream.sharedData.totalRead.fetchAdd(1, moRelaxed)
+          release(stream.sharedData.bufferLock)
+          itemCount += 1
+
+    except MVCCError:
+      # Skip invalid keys
+      discard
+    except CatchableError:
+      discard
+
+    # Move to previous key
+    {.cast(raises: []).}:
+      try:
+        discard iter.prev()
+      except:
+        discard
+
+  # Clean up iterator
+  {.cast(raises: []).}:
+    try:
+      iter.destroy()
+    except:
+      discard
+
+proc newMVCCStreamResultSet*(engine: MVCCEngine, startKey: string,
+    endKey: string, timestamp: Timestamp,
+        txnId: TransactionID = InvalidTransactionID,
+    config: MVCCStreamConfig = defaultMVCCStreamConfig()): MVCCStreamResultSet =
+  ## Create a new MVCC streaming result set.
+  ## The stream must be initialized by calling start() before use.
+  new(result)
+  result.engine = cast[pointer](engine)
+  result.startKey = startKey
+  result.endKey = endKey
+  result.timestamp = timestamp
+  result.txnId = txnId
+  result.config = config
+
+  # Allocate shared data on heap
+  result.sharedData = create(MVCCStreamSharedData)
+  if result.sharedData != nil:
+    result.sharedData.buffer = initDeque[MVCCKeyValue]()
+    initLock(result.sharedData.bufferLock)
+    result.sharedData.state.store(mssIdle, moRelaxed)
+    result.sharedData.errorMsg.store("", moRelaxed)
+    result.sharedData.totalRead.store(0, moRelaxed)
+    result.sharedData.consumerPos.store(0, moRelaxed)
+
+proc start*(stream: MVCCStreamResultSet): bool =
+  ## Start the prefetch thread for this stream.
+  ## Returns true if started successfully.
+  if stream.sharedData == nil:
+    return false
+
+  let currentState = stream.sharedData.state.load(moRelaxed)
+  if currentState != mssIdle:
+    return false
+
+  stream.sharedData.state.store(mssReading, moRelaxed)
+
+  {.cast(raises: []).}:
+    try:
+      createThread(stream.prefetchThread, mvccPrefetchWorker, stream)
+      return true
+    except:
+      stream.sharedData.state.store(mssError, moRelaxed)
+      stream.sharedData.errorMsg.store("failed to start prefetch thread", moRelaxed)
+      return false
+
+proc next*(stream: MVCCStreamResultSet): Option[MVCCKeyValue] =
+  ## Get the next MVCC key-value pair from the stream.
+  ## Returns some(kv) if available, none() if exhausted or closed.
+  ## Thread-safe: blocks briefly if buffer empty but prefetch still running.
+  if stream.sharedData == nil:
+    return none(MVCCKeyValue)
+
+  let state = stream.sharedData.state.load(moRelaxed)
+
+  if state == mssClosed:
+    return none(MVCCKeyValue)
+
+  if state == mssError:
+    return none(MVCCKeyValue)
+
+  # Try to get item from buffer
+  acquire(stream.sharedData.bufferLock)
+  if stream.sharedData.buffer.len > 0:
+    # Buffer has items - get the first one (results are in forward key order after reversal)
+    let kv = stream.sharedData.buffer.popFirst()
+    discard stream.sharedData.consumerPos.fetchAdd(1, moRelaxed)
+    release(stream.sharedData.bufferLock)
+    return some(kv)
+  release(stream.sharedData.bufferLock)
+
+  # Buffer empty - check if stream is exhausted
+  if state == mssExhausted:
+    return none(MVCCKeyValue)
+
+  # Stream still reading - wait briefly for more data
+  for _ in 0 ..< 50: # Wait up to 500ms
+    os.sleep(10)
+    acquire(stream.sharedData.bufferLock)
+    if stream.sharedData.buffer.len > 0:
+      let kv = stream.sharedData.buffer.popFirst()
+      discard stream.sharedData.consumerPos.fetchAdd(1, moRelaxed)
+      release(stream.sharedData.bufferLock)
+      return some(kv)
+    release(stream.sharedData.bufferLock)
+
+    let newState = stream.sharedData.state.load(moRelaxed)
+    if newState == mssExhausted or newState == mssError or newState == mssClosed:
+      return none(MVCCKeyValue)
+
+  # Timeout waiting for data
+  return none(MVCCKeyValue)
+
+proc hasNext*(stream: MVCCStreamResultSet): bool =
+  ## Check if more data is available without consuming it.
+  ## Returns true if buffer has items or prefetch thread is still running.
+  if stream.sharedData == nil:
+    return false
+
+  let state = stream.sharedData.state.load(moRelaxed)
+  if state == mssClosed or state == mssError:
+    return false
+
+  acquire(stream.sharedData.bufferLock)
+  let bufferLen = stream.sharedData.buffer.len
+  release(stream.sharedData.bufferLock)
+
+  if bufferLen > 0:
+    return true
+
+  # Buffer empty - check if stream still reading
+  return state == mssReading
+
+proc close*(stream: MVCCStreamResultSet) =
+  ## Close the stream and stop the prefetch thread.
+  ## Must be called to release resources.
+  if stream.sharedData == nil:
+    return
+
+  let currentState = stream.sharedData.state.load(moRelaxed)
+  if currentState == mssClosed:
+    return
+
+  # Signal thread to stop
+  stream.sharedData.state.store(mssClosed, moRelaxed)
+
+  # Wait for thread to finish
+  {.cast(raises: []).}:
+    try:
+      joinThread(stream.prefetchThread)
+    except:
+      discard
+
+  # Clean up shared data
+  deinitLock(stream.sharedData.bufferLock)
+
+  # Free shared data memory
+  if stream.sharedData != nil:
+    dealloc(stream.sharedData)
+    stream.sharedData = nil
+
+proc getState*(stream: MVCCStreamResultSet): MVCCStreamState =
+  ## Get current stream state.
+  if stream.sharedData == nil:
+    return mssClosed
+  stream.sharedData.state.load(moRelaxed)
+
+proc getTotalRead*(stream: MVCCStreamResultSet): int =
+  ## Get total number of items read by the stream.
+  if stream.sharedData == nil:
+    return 0
+  stream.sharedData.totalRead.load(moRelaxed)
+
+proc getError*(stream: MVCCStreamResultSet): Option[string] =
+  ## Get error message if stream is in error state.
+  if stream.sharedData == nil:
+    return some("stream not initialized")
+  let state = stream.sharedData.state.load(moRelaxed)
+  if state != mssError:
+    return none(string)
+  let msg = stream.sharedData.errorMsg.load(moRelaxed)
+  if msg.len > 0:
+    return some(msg)
+  return some("unknown error")
+
+proc consumeMVCCStream*(stream: MVCCStreamResultSet): seq[MVCCKeyValue] =
+  ## Consume all remaining items from the stream and return them as a sequence.
+  ## This is a convenience helper for backward compatibility.
+  ## Warning: For large result sets, this defeats the purpose of streaming.
+  result = @[]
+  while stream.hasNext():
+    let kvOpt = stream.next()
+    if kvOpt.isSome:
+      # Add to end - the prefetch worker reads backwards and adds to deque,
+      # so we need to reverse at the end to get forward key order
+      result.add(kvOpt.get())
+  # Reverse to get forward key order
+  result.reverse()
+  stream.close()
+
+proc mvccStreamScan*(engine: MVCCEngine, startKey: string, endKey: string,
+    timestamp: Timestamp, txnId: TransactionID = InvalidTransactionID,
+    config: MVCCStreamConfig = defaultMVCCStreamConfig()): MVCCStreamResultSet =
+  ## Create a streaming scan for MVCC keys within a range at a specific timestamp.
+  ## Returns newest version of each key <= timestamp.
+  ## The caller must call start() to begin prefetch, then iterate with next(),
+  ## and finally call close() to release resources.
+  let stream = newMVCCStreamResultSet(engine, startKey, endKey, timestamp,
+      txnId, config)
+  discard stream.start()
+  stream
 
 # Unit tests
 when isMainModule:
