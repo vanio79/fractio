@@ -14,6 +14,7 @@ import ../core/types as coreTypes
 import ../core/primary_key
 import ../core/kv_interface # for KVOpResult isErr/isOk procs
 import ../protocol/messages/kv # for WireFilterExpr types
+import ../utils/external_merge_sort # for SortSpec, orderItemsToSortSpecs
 
 # ---------------------------------------------------------------------------
 # Plan types
@@ -30,6 +31,7 @@ type
     poInsert
     poPointGet
     poScan
+    poOrderBy ## Sort results by ORDER BY expressions
     poUpdate
     poDelete
     poShowDatabases
@@ -108,6 +110,12 @@ type
       scFilter*: Option[Expr]
       scColumns*: seq[string]      # columns to return (empty = all)
       scAllColumns*: seq[string]   # all table columns for decoding
+
+    of poOrderBy:
+      obSortSpecs*: seq[SortSpec]  ## Sort specifications from ORDER BY
+      obColumns*: seq[string]      ## Columns to return (passed from scan)
+      obAllColumns*: seq[string]   ## All fetched columns for expression evaluation
+      obLimit*: uint32             ## LIMIT to apply after sorting (0 = no limit)
 
     of poUpdate:
       upTableId*: TableId
@@ -863,32 +871,70 @@ proc planSelect(stmt: Stmt, client: FractioClient,
        limExpr.litValue.kind == dtInt:
       limit = uint32(limExpr.litValue.intValue)
 
+  # Convert ORDER BY items to SortSpecs and determine sort columns
+  var sortSpecs: seq[SortSpec] = @[]
+  var sortCols: seq[string] = @[] # Columns needed for sorting
+  if stmt.selOrderBy.len > 0:
+    sortSpecs = orderItemsToSortSpecs(stmt.selOrderBy, allCols)
+    # Extract column names referenced in ORDER BY expressions
+    for item in stmt.selOrderBy:
+      if item.expr.kind == exColumn:
+        let colName = item.expr.colName
+        # Add to sortCols if not already in reqCols (avoid duplicates)
+        if colName notin reqCols and colName notin sortCols:
+          sortCols.add(colName)
+
+  # Columns to fetch from storage = requested + ORDER BY referenced columns
+  let fetchCols = reqCols & sortCols
+
   # Generate plan based on PK range info
   if pkRangeInfo.isPointGet and pkRangeInfo.exactMatch.isSome:
     # Point get: single row lookup with optional remaining filter
+    # ORDER BY on a single row is trivial - still add the op for consistency
     let pkVal = pkRangeInfo.exactMatch.get()
     plan.add(PlanOp(kind: poPointGet,
       pgTableId: desc.tableId,
       pgKey: pkVal,
       pgPkSpec: desc.pkSpec,
-      pgColumns: reqCols,
+      pgColumns: fetchCols, # Fetch columns needed for ORDER BY
       pgAllColumns: allCols,
       pgFilter: pkRangeInfo.remainingFilter, # Apply remaining conditions to row
     ))
+    # ORDER BY is applied after point get for consistency
+    if sortSpecs.len > 0:
+      plan.add(PlanOp(kind: poOrderBy,
+        obSortSpecs: sortSpecs,
+        obColumns: reqCols, # Output columns (original requested)
+        obAllColumns: fetchCols, # Columns in the rows (for expression evaluation)
+      ))
     return plan
 
   # Range scan (with optimized key bounds if available)
   let (startKey, endKey) = makeScanKeysFromRange(desc.tableId, pkRangeInfo)
 
+  # When ORDER BY is present, fetch all rows for sorting, then apply LIMIT after
+  # When no ORDER BY, apply LIMIT during scan for efficiency
+  let scanLimit = if sortSpecs.len > 0: 0'u32 else: limit
+
   plan.add(PlanOp(kind: poScan,
     scTableId: desc.tableId,
     scStartKey: startKey,
     scEndKey: endKey,
-    scLimit: limit,
+    scLimit: scanLimit,
     scFilter: pkRangeInfo.remainingFilter, # Only non-PK conditions remain
-    scColumns: reqCols,
+    scColumns: fetchCols, # Fetch columns needed for ORDER BY
     scAllColumns: allCols,
   ))
+
+  # Add ORDER BY plan op if specified
+  if sortSpecs.len > 0:
+    plan.add(PlanOp(kind: poOrderBy,
+      obSortSpecs: sortSpecs,
+      obColumns: reqCols, # Output columns (original requested)
+      obAllColumns: fetchCols, # Columns in the rows (for expression evaluation)
+      obLimit: limit, # Apply LIMIT after sorting
+    ))
+
   plan
 
 proc planUpdate(stmt: Stmt, client: FractioClient,
@@ -1020,6 +1066,11 @@ proc formatPlanOp*(op: PlanOp): string =
       s &= &" filter=({formatExpr(op.scFilter.get())})"
     if op.scLimit > 0:
       s &= &" limit={op.scLimit}"
+    s
+  of poOrderBy:
+    var s = &"OrderBy specs=[{formatSortSpecs(op.obSortSpecs)}] cols={op.obColumns}"
+    if op.obLimit > 0:
+      s &= &" limit={op.obLimit}"
     s
   of poUpdate:
     var s = &"Update table={op.upTableName} (id={op.upTableId})"

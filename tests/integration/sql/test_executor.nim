@@ -851,3 +851,162 @@ suite "SQL Executor — EXPLAIN":
     let showRes = client.exec("SHOW TABLES")
     check showRes.kind == erkRows
     check showRes.rows.len == 0
+
+
+suite "SQL Executor — ORDER BY":
+  var client: FractioClient
+  var server: ProtocolServer
+  var testDir: string
+
+  setup:
+    (client, server, testDir) = createTestEnv("orderby")
+    # Create a test table with multiple columns
+    discard client.exec(
+        "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT, score INT)")
+    # Insert test data in random order
+    discard client.exec(
+        "INSERT INTO users (id, name, age, score) VALUES (1, 'Alice', 30, 85)")
+    discard client.exec(
+        "INSERT INTO users (id, name, age, score) VALUES (2, 'Bob', 25, 92)")
+    discard client.exec(
+        "INSERT INTO users (id, name, age, score) VALUES (3, 'Carol', 35, 78)")
+    discard client.exec(
+        "INSERT INTO users (id, name, age, score) VALUES (4, 'Dave', 25, 88)")
+    discard client.exec(
+        "INSERT INTO users (id, name, age, score) VALUES (5, 'Eve', 30, 95)")
+
+  teardown:
+    if client != nil: client.close()
+    if server != nil:
+      server.stop()
+      if server.raftStore != nil and server.raftStore.coordinator != nil:
+        server.raftStore.coordinator.stop()
+    cleanupTestDir(testDir)
+
+  test "ORDER BY single column ASC":
+    let res = client.exec("SELECT id, name FROM users ORDER BY name ASC")
+    check res.kind == erkRows
+    check res.rows.len == 5
+    check res.rows[0][1] == "Alice"
+    check res.rows[1][1] == "Bob"
+    check res.rows[2][1] == "Carol"
+    check res.rows[3][1] == "Dave"
+    check res.rows[4][1] == "Eve"
+
+  test "ORDER BY single column DESC":
+    let res = client.exec("SELECT id, name FROM users ORDER BY age DESC")
+    check res.kind == erkRows
+    check res.rows.len == 5
+    check res.rows[0][1] == "Carol" # age 35
+    check res.rows[1][1] == "Alice" or res.rows[1][1] == "Eve" # age 30
+    check res.rows[2][1] == "Eve" or res.rows[2][1] == "Alice" # age 30
+    check res.rows[3][1] == "Bob" or res.rows[3][1] == "Dave" # age 25
+    check res.rows[4][1] == "Dave" or res.rows[4][1] == "Bob" # age 25
+
+  test "ORDER BY multiple columns":
+    # Sort by age ASC, then name ASC within same age
+    let res = client.exec("SELECT name, age FROM users ORDER BY age ASC, name ASC")
+    check res.kind == erkRows
+    check res.rows.len == 5
+    # Age 25: Bob and Dave
+    check res.rows[0][0] == "Bob"
+    check res.rows[0][1] == "25"
+    check res.rows[1][0] == "Dave"
+    check res.rows[1][1] == "25"
+    # Age 30: Alice and Eve
+    check res.rows[2][0] == "Alice"
+    check res.rows[2][1] == "30"
+    check res.rows[3][0] == "Eve"
+    check res.rows[3][1] == "30"
+    # Age 35: Carol
+    check res.rows[4][0] == "Carol"
+    check res.rows[4][1] == "35"
+
+  test "ORDER BY multiple columns mixed ASC/DESC":
+    # Sort by age ASC, then score DESC within same age
+    let res = client.exec("SELECT name, age, score FROM users ORDER BY age ASC, score DESC")
+    check res.kind == erkRows
+    check res.rows.len == 5
+    # Age 25: Dave (88) then Bob (92) - wait, Bob has 92, Dave has 88
+    # Actually: age 25, score DESC: Bob (92), Dave (88)
+    check res.rows[0][0] == "Bob"
+    check res.rows[0][2] == "92"
+    check res.rows[1][0] == "Dave"
+    check res.rows[1][2] == "88"
+    # Age 30: Eve (95) then Alice (85)
+    check res.rows[2][0] == "Eve"
+    check res.rows[2][2] == "95"
+    check res.rows[3][0] == "Alice"
+    check res.rows[3][2] == "85"
+    # Age 35: Carol (78)
+    check res.rows[4][0] == "Carol"
+    check res.rows[4][2] == "78"
+
+  test "ORDER BY default ASC":
+    let res = client.exec("SELECT name FROM users ORDER BY name")
+    check res.kind == erkRows
+    check res.rows.len == 5
+    # Default should be ASC
+    check res.rows[0][0] == "Alice"
+    check res.rows[4][0] == "Eve"
+
+  test "ORDER BY with LIMIT":
+    let res = client.exec("SELECT name, score FROM users ORDER BY score DESC LIMIT 3")
+    check res.kind == erkRows
+    check res.rows.len == 3
+    check res.rows[0][0] == "Eve" # score 95
+    check res.rows[0][1] == "95"
+    check res.rows[1][0] == "Bob" # score 92
+    check res.rows[1][1] == "92"
+    check res.rows[2][0] == "Dave" # score 88
+    check res.rows[2][1] == "88"
+
+  test "ORDER BY with WHERE":
+    let res = client.exec("SELECT name, age FROM users WHERE age >= 30 ORDER BY name ASC")
+    check res.kind == erkRows
+    check res.rows.len == 3 # Alice (30), Carol (35), Eve (30)
+    check res.rows[0][0] == "Alice"
+    check res.rows[1][0] == "Carol"
+    check res.rows[2][0] == "Eve"
+
+  test "ORDER BY single row":
+    let res = client.exec("SELECT name FROM users WHERE id = 1 ORDER BY name DESC")
+    check res.kind == erkRows
+    check res.rows.len == 1
+    check res.rows[0][0] == "Alice"
+
+  test "ORDER BY empty result":
+    let res = client.exec("SELECT name FROM users WHERE id > 100 ORDER BY name ASC")
+    check res.kind == erkRows
+    check res.rows.len == 0
+
+  test "ORDER BY expression":
+    # ORDER BY id * 2 DESC - expression evaluation
+    let res = client.exec("SELECT id, name FROM users ORDER BY id * 2 DESC")
+    check res.kind == erkRows
+    check res.rows.len == 5
+    # id * 2: 10, 8, 6, 4, 2 DESC -> id 5, 4, 3, 2, 1
+    check res.rows[0][0] == "5"
+    check res.rows[0][1] == "Eve"
+    check res.rows[1][0] == "4"
+    check res.rows[1][1] == "Dave"
+    check res.rows[2][0] == "3"
+    check res.rows[2][1] == "Carol"
+    check res.rows[3][0] == "2"
+    check res.rows[3][1] == "Bob"
+    check res.rows[4][0] == "1"
+    check res.rows[4][1] == "Alice"
+
+  test "EXPLAIN ORDER BY":
+    discard client.exec(
+        "CREATE TABLE items (id INT PRIMARY KEY, price INT)")
+    let res = client.exec("EXPLAIN SELECT * FROM items ORDER BY price DESC")
+    check res.kind == erkRows
+    check res.rows.len >= 2 # Scan + OrderBy
+    # Check that OrderBy appears in the plan
+    var planText = ""
+    for row in res.rows:
+      planText.add(row[0] & "\n")
+    check "Scan" in planText
+    check "OrderBy" in planText
+    check "DESC" in planText

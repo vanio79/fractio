@@ -22,6 +22,7 @@ import ../core/kv_interface # KVStore interface for mockable testing
 import ../protocol/client # For StreamingScanClient
 import ../protocol/types # For ProtocolError, peErr
 import ../protocol/messages/kv as kvMsgs # For ScanPair
+import ../utils/external_merge_sort # For SortSpec, sortRowsInMemory, StreamingSortIterator
 
 # ---------------------------------------------------------------------------
 # Result types
@@ -239,6 +240,42 @@ proc consumeAllRows*(iter: StreamingRowIterator): seq[seq[string]] =
       rows.add(rowOpt.get())
   iter.closeIterator()
   rows
+
+proc extractRequestedColumns*(rows: seq[seq[string]],
+                              requestedCols: seq[string],
+                              allFetchedCols: seq[string]): seq[seq[string]] =
+  ## Extract only the requested columns from rows that contain all fetched columns.
+  ## Used after ORDER BY sorting to return only the original requested columns.
+  ## rows: rows containing all fetched columns (requested + ORDER BY columns)
+  ## requestedCols: columns to output (original SELECT columns)
+  ## allFetchedCols: all columns present in each row
+  if requestedCols.len == allFetchedCols.len:
+    # No columns to remove - return as-is
+    return rows
+
+  # Build column index mapping
+  var colIndices: seq[int] = @[]
+  for reqCol in requestedCols:
+    var found = false
+    for i, col in allFetchedCols:
+      if col == reqCol:
+        colIndices.add(i)
+        found = true
+        break
+    if not found:
+      # Column not found - add placeholder
+      colIndices.add(-1)
+
+  # Extract columns for each row
+  result = @[]
+  for row in rows:
+    var extractedRow: seq[string] = @[]
+    for idx in colIndices:
+      if idx >= 0 and idx < row.len:
+        extractedRow.add(row[idx])
+      else:
+        extractedRow.add("NULL")
+    result.add(extractedRow)
 
 proc bufferRows*(res: ExecResult): ExecResult =
   ## Convert streaming rows to buffered rows.
@@ -950,6 +987,56 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
             discard # skip malformed rows
 
         rowsResult(op.scColumns, resultRows)
+
+    of poOrderBy:
+      # ORDER BY operates on the previous result (should be erkRows or erkStreamingRows)
+      # The previous op is always poScan or poPointGet
+      # obAllColumns contains all columns fetched for sorting (requested + ORDER BY columns)
+      # obColumns contains the original requested columns for final output
+      # obLimit is applied after sorting (LIMIT semantics)
+      if lastResult.kind == erkRows:
+        # In-memory sort for buffered results
+        if lastResult.rows.len <= 1:
+          # No sorting needed for empty or single-row results
+          # Still apply LIMIT if present
+          if op.obLimit > 0 and lastResult.rows.len > int(op.obLimit):
+            rowsResult(op.obColumns, lastResult.rows[0..<int(op.obLimit)])
+          else:
+            lastResult
+        else:
+          let sortedRows = sortRowsInMemory(lastResult.rows, op.obSortSpecs,
+              op.obAllColumns)
+          # Extract only the requested columns after sorting
+          var outputRows = extractRequestedColumns(sortedRows, op.obColumns,
+              op.obAllColumns)
+          # Apply LIMIT after sorting
+          if op.obLimit > 0 and outputRows.len > int(op.obLimit):
+            outputRows = outputRows[0..<int(op.obLimit)]
+          rowsResult(op.obColumns, outputRows)
+      elif lastResult.kind == erkStreamingRows:
+        # Buffer all rows from streaming result, then sort in-memory
+        # For very large results, this could be memory-intensive
+        # TODO: Implement external merge sort for streaming with large datasets
+        let bufferedRows = lastResult.streamIterator.consumeAllRows()
+        if bufferedRows.len <= 1:
+          # Apply LIMIT if present
+          if op.obLimit > 0 and bufferedRows.len > int(op.obLimit):
+            rowsResult(op.obColumns, bufferedRows[0..<int(op.obLimit)])
+          else:
+            rowsResult(op.obColumns, bufferedRows)
+        else:
+          let sortedRows = sortRowsInMemory(bufferedRows, op.obSortSpecs,
+              op.obAllColumns)
+          # Extract only the requested columns after sorting
+          var outputRows = extractRequestedColumns(sortedRows, op.obColumns,
+              op.obAllColumns)
+          # Apply LIMIT after sorting
+          if op.obLimit > 0 and outputRows.len > int(op.obLimit):
+            outputRows = outputRows[0..<int(op.obLimit)]
+          rowsResult(op.obColumns, outputRows)
+      else:
+        # Previous result is not rows - ORDER BY is invalid here
+        errorResult("ORDER BY requires row results from previous operation")
 
     of poUpdate:
       # MVCC-aware UPDATE

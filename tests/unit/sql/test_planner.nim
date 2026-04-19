@@ -7,6 +7,7 @@ import fractio/core/types
 import fractio/core/primary_key
 import fractio/distributed/meta/system_schemas
 import fractio/protocol/messages/kv # for WireFilterExpr types
+import fractio/utils/external_merge_sort # for SortSpec
 
 suite "Planner Result Constructors":
 
@@ -1240,3 +1241,83 @@ suite "Planner exprToWireFilterExpr":
     check wire.likeNot == false
     check wire.likeExpr.colName == "name"
     check wire.likePattern.litStringVal == "%test%"
+
+suite "Planner ORDER BY":
+
+  test "formatSortSpecs single ascending":
+    let specs = @[SortSpec(expr: Expr(kind: exColumn, colName: "id"),
+        descending: false)]
+    let text = formatSortSpecs(specs)
+    check text == "id ASC"
+
+  test "formatSortSpecs single descending":
+    let specs = @[SortSpec(expr: Expr(kind: exColumn, colName: "name"),
+        descending: true)]
+    let text = formatSortSpecs(specs)
+    check text == "name DESC"
+
+  test "formatSortSpecs multiple specs":
+    let specs = @[
+      SortSpec(expr: Expr(kind: exColumn, colName: "age"), descending: false),
+      SortSpec(expr: Expr(kind: exColumn, colName: "score"), descending: true)
+    ]
+    let text = formatSortSpecs(specs)
+    check text == "age ASC, score DESC"
+
+  test "formatSortSpecs empty":
+    let specs: seq[SortSpec] = @[]
+    let text = formatSortSpecs(specs)
+    check text == ""
+
+  test "OrderItem to SortSpec conversion":
+    let orderItems = @[
+      OrderItem(expr: Expr(kind: exColumn, colName: "id"), desc: false),
+      OrderItem(expr: Expr(kind: exColumn, colName: "name"), desc: true)
+    ]
+    let columns = @["id", "name", "age"]
+    let specs = orderItemsToSortSpecs(orderItems, columns)
+    check specs.len == 2
+    check specs[0].expr.colName == "id"
+    check specs[0].descending == false
+    check specs[1].expr.colName == "name"
+    check specs[1].descending == true
+
+  test "poOrderBy PlanOp structure":
+    let sortExpr = Expr(kind: exColumn, colName: "price")
+    let op = PlanOp(
+      kind: poOrderBy,
+      obSortSpecs: @[SortSpec(expr: sortExpr, descending: true)],
+      obColumns: @["id", "name", "price"],
+      obAllColumns: @["id", "name", "price"]
+    )
+    check op.kind == poOrderBy
+    check op.obSortSpecs.len == 1
+    check op.obSortSpecs[0].expr.colName == "price"
+    check op.obSortSpecs[0].descending == true
+    check op.obColumns.len == 3
+
+  test "formatPlanOp poOrderBy single column":
+    let op = PlanOp(
+      kind: poOrderBy,
+      obSortSpecs: @[SortSpec(expr: Expr(kind: exColumn, colName: "name"),
+          descending: false)],
+      obColumns: @["id", "name"]
+    )
+    let text = formatPlanOp(op)
+    check "OrderBy" in text
+    check "name ASC" in text
+
+  test "formatPlanOp poOrderBy multiple columns":
+    let op = PlanOp(
+      kind: poOrderBy,
+      obSortSpecs: @[
+        SortSpec(expr: Expr(kind: exColumn, colName: "age"), descending: true),
+        SortSpec(expr: Expr(kind: exColumn, colName: "score"),
+            descending: false)
+      ],
+      obColumns: @["id", "age", "score"]
+    )
+    let text = formatPlanOp(op)
+    check "OrderBy" in text
+    check "age DESC" in text
+    check "score ASC" in text

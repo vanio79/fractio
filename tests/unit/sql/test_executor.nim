@@ -13,6 +13,7 @@ import fractio/distributed/meta/system_tables
 import fractio/distributed/raft/group_types
 import fractio/client/fractio_client
 import fractio/utils/binary
+import fractio/utils/external_merge_sort # for SortSpec
 
 # =============================================================================
 # Helper for PK encoding in tests
@@ -2842,3 +2843,338 @@ suite "Executor DDL Forbidden in Transaction Extended":
     let result = executeWithTxn(plan, ctx)
     check result.kind == erkError
     check "requires a real FractioClient" in result.error
+
+suite "Executor ORDER BY with MockKVStore":
+
+  test "executeWithTxn Scan with ORDER BY ASC":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    # Begin a transaction
+    var beginPlan = newPlan()
+    beginPlan.add(PlanOp(kind: poBeginTxn, btReadOnly: false))
+    discard executeWithTxn(beginPlan, ctx)
+
+    # Insert rows in reverse order
+    let tableId = genTableId()
+    let pkSpec = PrimaryKeySpec(columns: @[("id", cdtInt, 0)])
+
+    for i in countdown(5, 1):
+      var row = newDataRow()
+      row["id"] = DataRowValue(kind: drvkInt, intVal: int64(i))
+      row["name"] = DataRowValue(kind: drvkString, strVal: "name" & $i)
+      var insertPlan = newPlan()
+      insertPlan.add(PlanOp(
+        kind: poInsert,
+        insTableId: tableId,
+        insTableName: "test",
+        insColumns: @["id", "name"],
+        insPkColumn: "id",
+        insPkSpec: pkSpec,
+        insRows: @[encodeDataRow(row)],
+        insPkValues: @[bytesToString(encodeInt64BE(int64(i)))]
+      ))
+      discard executeWithTxn(insertPlan, ctx)
+
+    # Scan with ORDER BY id ASC
+    let startKey = encodeDataRowKey(tableId, "")
+    let endKey = makeDataRowScanEndKey(tableId)
+
+    let sortSpecs = @[SortSpec(
+      expr: Expr(kind: exColumn, colName: "id"),
+      descending: false
+    )]
+
+    let plan = newPlan()
+    plan.add(PlanOp(
+      kind: poScan,
+      scTableId: tableId,
+      scStartKey: startKey,
+      scEndKey: endKey,
+      scLimit: 0,
+      scFilter: none(Expr),
+      scColumns: @["id", "name"],
+      scAllColumns: @["id", "name"]
+    ))
+    plan.add(PlanOp(
+      kind: poOrderBy,
+      obSortSpecs: sortSpecs,
+      obColumns: @["id", "name"],
+      obAllColumns: @["id", "name"]
+    ))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkRows
+    check result.rows.len == 5
+    # Should be sorted ascending: 1, 2, 3, 4, 5
+    check result.rows[0][0] == "1"
+    check result.rows[1][0] == "2"
+    check result.rows[2][0] == "3"
+    check result.rows[3][0] == "4"
+    check result.rows[4][0] == "5"
+
+  test "executeWithTxn Scan with ORDER BY DESC":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    # Begin a transaction
+    var beginPlan = newPlan()
+    beginPlan.add(PlanOp(kind: poBeginTxn, btReadOnly: false))
+    discard executeWithTxn(beginPlan, ctx)
+
+    # Insert rows in ascending order
+    let tableId = genTableId()
+    let pkSpec = PrimaryKeySpec(columns: @[("id", cdtInt, 0)])
+
+    for i in 1..5:
+      var row = newDataRow()
+      row["id"] = DataRowValue(kind: drvkInt, intVal: int64(i))
+      row["score"] = DataRowValue(kind: drvkInt, intVal: int64(i * 10))
+      var insertPlan = newPlan()
+      insertPlan.add(PlanOp(
+        kind: poInsert,
+        insTableId: tableId,
+        insTableName: "test",
+        insColumns: @["id", "score"],
+        insPkColumn: "id",
+        insPkSpec: pkSpec,
+        insRows: @[encodeDataRow(row)],
+        insPkValues: @[bytesToString(encodeInt64BE(int64(i)))]
+      ))
+      discard executeWithTxn(insertPlan, ctx)
+
+    # Scan with ORDER BY score DESC
+    let startKey = encodeDataRowKey(tableId, "")
+    let endKey = makeDataRowScanEndKey(tableId)
+
+    let sortSpecs = @[SortSpec(
+      expr: Expr(kind: exColumn, colName: "score"),
+      descending: true
+    )]
+
+    let plan = newPlan()
+    plan.add(PlanOp(
+      kind: poScan,
+      scTableId: tableId,
+      scStartKey: startKey,
+      scEndKey: endKey,
+      scLimit: 0,
+      scFilter: none(Expr),
+      scColumns: @["id", "score"],
+      scAllColumns: @["id", "score"]
+    ))
+    plan.add(PlanOp(
+      kind: poOrderBy,
+      obSortSpecs: sortSpecs,
+      obColumns: @["id", "score"],
+      obAllColumns: @["id", "score"]
+    ))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkRows
+    check result.rows.len == 5
+    # Should be sorted descending by score: 50, 40, 30, 20, 10
+    check result.rows[0][1] == "50"
+    check result.rows[1][1] == "40"
+    check result.rows[2][1] == "30"
+    check result.rows[3][1] == "20"
+    check result.rows[4][1] == "10"
+
+  test "executeWithTxn Scan with ORDER BY multiple columns":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    # Begin a transaction
+    var beginPlan = newPlan()
+    beginPlan.add(PlanOp(kind: poBeginTxn, btReadOnly: false))
+    discard executeWithTxn(beginPlan, ctx)
+
+    # Insert rows with varying age and name
+    let tableId = genTableId()
+    let pkSpec = PrimaryKeySpec(columns: @[("id", cdtInt, 0)])
+
+    # Data: (id, name, age): (1, "Bob", 25), (2, "Alice", 30), (3, "Carol", 25), (4, "Dave", 30)
+    let testData = @[
+      (1, "Bob", 25),
+      (2, "Alice", 30),
+      (3, "Carol", 25),
+      (4, "Dave", 30)
+    ]
+
+    for (id, name, age) in testData:
+      var row = newDataRow()
+      row["id"] = DataRowValue(kind: drvkInt, intVal: int64(id))
+      row["name"] = DataRowValue(kind: drvkString, strVal: name)
+      row["age"] = DataRowValue(kind: drvkInt, intVal: int64(age))
+      var insertPlan = newPlan()
+      insertPlan.add(PlanOp(
+        kind: poInsert,
+        insTableId: tableId,
+        insTableName: "users",
+        insColumns: @["id", "name", "age"],
+        insPkColumn: "id",
+        insPkSpec: pkSpec,
+        insRows: @[encodeDataRow(row)],
+        insPkValues: @[bytesToString(encodeInt64BE(int64(id)))]
+      ))
+      discard executeWithTxn(insertPlan, ctx)
+
+    # Scan with ORDER BY age ASC, name ASC
+    let startKey = encodeDataRowKey(tableId, "")
+    let endKey = makeDataRowScanEndKey(tableId)
+
+    let sortSpecs = @[
+      SortSpec(expr: Expr(kind: exColumn, colName: "age"), descending: false),
+      SortSpec(expr: Expr(kind: exColumn, colName: "name"), descending: false)
+    ]
+
+    let plan = newPlan()
+    plan.add(PlanOp(
+      kind: poScan,
+      scTableId: tableId,
+      scStartKey: startKey,
+      scEndKey: endKey,
+      scLimit: 0,
+      scFilter: none(Expr),
+      scColumns: @["id", "name", "age"],
+      scAllColumns: @["id", "name", "age"]
+    ))
+    plan.add(PlanOp(
+      kind: poOrderBy,
+      obSortSpecs: sortSpecs,
+      obColumns: @["id", "name", "age"],
+      obAllColumns: @["id", "name", "age"]
+    ))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkRows
+    check result.rows.len == 4
+    # Age 25: Bob, Carol (alphabetically: Bob before Carol)
+    # Age 30: Alice, Dave (alphabetically: Alice before Dave)
+    check result.rows[0][1] == "Bob"
+    check result.rows[0][2] == "25"
+    check result.rows[1][1] == "Carol"
+    check result.rows[1][2] == "25"
+    check result.rows[2][1] == "Alice"
+    check result.rows[2][2] == "30"
+    check result.rows[3][1] == "Dave"
+    check result.rows[3][2] == "30"
+
+  test "executeWithTxn Scan ORDER BY empty result":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    # Begin a transaction
+    var beginPlan = newPlan()
+    beginPlan.add(PlanOp(kind: poBeginTxn, btReadOnly: false))
+    discard executeWithTxn(beginPlan, ctx)
+
+    # Insert a row
+    let tableId = genTableId()
+    let pkSpec = PrimaryKeySpec(columns: @[("id", cdtInt, 0)])
+
+    var row = newDataRow()
+    row["id"] = DataRowValue(kind: drvkInt, intVal: int64(1))
+    var insertPlan = newPlan()
+    insertPlan.add(PlanOp(
+      kind: poInsert,
+      insTableId: tableId,
+      insTableName: "test",
+      insColumns: @["id"],
+      insPkColumn: "id",
+      insPkSpec: pkSpec,
+      insRows: @[encodeDataRow(row)],
+      insPkValues: @[bytesToString(encodeInt64BE(int64(1)))]
+    ))
+    discard executeWithTxn(insertPlan, ctx)
+
+    # Scan with filter that returns nothing, then ORDER BY
+    let startKey = encodeDataRowKey(tableId, "")
+    let endKey = makeDataRowScanEndKey(tableId)
+
+    let filter = Expr(kind: exBinOp, binOp: boGt,
+      binLeft: Expr(kind: exColumn, colName: "id"),
+      binRight: Expr(kind: exLiteral, litValue: newValueRef(100'i64)))
+
+    let sortSpecs = @[SortSpec(
+      expr: Expr(kind: exColumn, colName: "id"),
+      descending: false
+    )]
+
+    let plan = newPlan()
+    plan.add(PlanOp(
+      kind: poScan,
+      scTableId: tableId,
+      scStartKey: startKey,
+      scEndKey: endKey,
+      scLimit: 0,
+      scFilter: some(filter),
+      scColumns: @["id"],
+      scAllColumns: @["id"]
+    ))
+    plan.add(PlanOp(
+      kind: poOrderBy,
+      obSortSpecs: sortSpecs,
+      obColumns: @["id"],
+      obAllColumns: @["id"]
+    ))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkRows
+    check result.rows.len == 0
+
+  test "executeWithTxn ORDER BY single row":
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    # Begin a transaction
+    var beginPlan = newPlan()
+    beginPlan.add(PlanOp(kind: poBeginTxn, btReadOnly: false))
+    discard executeWithTxn(beginPlan, ctx)
+
+    let tableId = genTableId()
+    let pkSpec = PrimaryKeySpec(columns: @[("id", cdtInt, 0)])
+    let pkValue = bytesToString(encodeInt64BE(42'i64))
+
+    var row = newDataRow()
+    row["id"] = DataRowValue(kind: drvkInt, intVal: int64(42))
+    row["name"] = DataRowValue(kind: drvkString, strVal: "Alice")
+    var insertPlan = newPlan()
+    insertPlan.add(PlanOp(
+      kind: poInsert,
+      insTableId: tableId,
+      insTableName: "test",
+      insColumns: @["id", "name"],
+      insPkColumn: "id",
+      insPkSpec: pkSpec,
+      insRows: @[encodeDataRow(row)],
+      insPkValues: @[pkValue]
+    ))
+    discard executeWithTxn(insertPlan, ctx)
+
+    # PointGet followed by ORDER BY
+    let sortSpecs = @[SortSpec(
+      expr: Expr(kind: exColumn, colName: "name"),
+      descending: true
+    )]
+
+    let plan = newPlan()
+    plan.add(PlanOp(
+      kind: poPointGet,
+      pgTableId: tableId,
+      pgKey: pkValue,
+      pgPkSpec: pkSpec,
+      pgColumns: @["id", "name"],
+      pgAllColumns: @["id", "name"]
+    ))
+    plan.add(PlanOp(
+      kind: poOrderBy,
+      obSortSpecs: sortSpecs,
+      obColumns: @["id", "name"],
+      obAllColumns: @["id", "name"]
+    ))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkRows
+    check result.rows.len == 1
+    check result.rows[0][1] == "Alice"
