@@ -510,3 +510,103 @@ suite "Format Sort Specs":
     ]
     let formatted = formatSortSpecs(specs)
     check formatted == "age ASC, name DESC"
+
+suite "Streaming Reverse (PK DESC Optimization)":
+  setup:
+    let testTempDir = "/tmp/fractio-reverse-test"
+    if dirExists(testTempDir):
+      try:
+        removeDir(testTempDir)
+      except OSError:
+        discard
+    createDir(testTempDir)
+
+  teardown:
+    if dirExists(testTempDir):
+      try:
+        removeDir(testTempDir)
+      except OSError:
+        discard
+
+  test "reverse small dataset in memory":
+    let rows = @[
+      @["1", "Alice"],
+      @["2", "Bob"],
+      @["3", "Carol"]
+    ]
+    let columns = @["id", "name"]
+    let reversed = reverseRowsWithTempFiles(rows, columns, columns, testTempDir,
+        chunkSize = 10)
+    check reversed.len == 3
+    check reversed[0] == @["3", "Carol"]
+    check reversed[1] == @["2", "Bob"]
+    check reversed[2] == @["1", "Alice"]
+
+  test "reverse large dataset with temp files":
+    # Create 25 rows, chunkSize = 5, so 5 chunks
+    var rows: seq[seq[string]] = @[]
+    for i in 1..25:
+      rows.add(@[$i, "name" & $i])
+    let columns = @["id", "name"]
+    let reversed = reverseRowsWithTempFiles(rows, columns, columns, testTempDir, chunkSize = 5)
+    check reversed.len == 25
+    # Should be reversed: 25, 24, 23, ... 1
+    check reversed[0][0] == "25"
+    check reversed[24][0] == "1"
+
+  test "reverse empty dataset":
+    let rows: seq[seq[string]] = @[]
+    let columns = @["id"]
+    let reversed = reverseRowsWithTempFiles(rows, columns, columns, testTempDir)
+    check reversed.len == 0
+
+  test "reverse single row":
+    let rows = @[@["42", "test"]]
+    let columns = @["id", "name"]
+    let reversed = reverseRowsWithTempFiles(rows, columns, columns, testTempDir)
+    check reversed.len == 1
+    check reversed[0] == @["42", "test"]
+
+  test "StreamingReverseIterator basic usage":
+    let columns = @["id", "name"]
+    let iter = newStreamingReverseIterator(columns, columns, testTempDir, chunkSize = 3)
+    # Add rows in chunks
+    iter.addChunkToReverse(@[@["1", "a"], @["2", "b"], @["3", "c"]])
+    iter.addChunkToReverse(@[@["4", "d"], @["5", "e"], @["6", "f"]])
+    iter.addChunkToReverse(@[@["7", "g"], @["8", "h"]])
+    # Initialize and read in reverse
+    iter.initReversePhase()
+    var resultRows: seq[seq[string]] = @[]
+    while iter.hasNextRow():
+      let rowOpt = iter.nextRow()
+      if rowOpt.isSome:
+        resultRows.add(rowOpt.get())
+    iter.closeIterator()
+    check resultRows.len == 8
+    # Should be reversed: 8, 7, 6, 5, 4, 3, 2, 1
+    check resultRows[0][0] == "8"
+    check resultRows[1][0] == "7"
+    check resultRows[2][0] == "6"
+    check resultRows[3][0] == "5"
+    check resultRows[7][0] == "1"
+
+  test "StreamingReverseIterator with limit simulation":
+    let columns = @["id"]
+    let iter = newStreamingReverseIterator(columns, columns, testTempDir, chunkSize = 2)
+    # Add 6 rows
+    iter.addChunkToReverse(@[@["1"], @["2"]])
+    iter.addChunkToReverse(@[@["3"], @["4"]])
+    iter.addChunkToReverse(@[@["5"], @["6"]])
+    iter.initReversePhase()
+    var resultRows: seq[seq[string]] = @[]
+    var count = 0
+    while iter.hasNextRow() and count < 3: # Simulate LIMIT 3
+      let rowOpt = iter.nextRow()
+      if rowOpt.isSome:
+        resultRows.add(rowOpt.get())
+        inc count
+    iter.closeIterator()
+    check resultRows.len == 3
+    check resultRows[0][0] == "6"
+    check resultRows[1][0] == "5"
+    check resultRows[2][0] == "4"

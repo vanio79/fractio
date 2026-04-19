@@ -1321,3 +1321,61 @@ suite "Planner ORDER BY":
     check "OrderBy" in text
     check "age DESC" in text
     check "score ASC" in text
+
+suite "Planner ORDER BY PK Optimization":
+
+  test "detectOrderByPkOptimization ASC match":
+    let orderItems = @[OrderItem(expr: Expr(kind: exColumn, colName: "id"), desc: false)]
+    let opt = detectOrderByPkOptimization(orderItems, "id")
+    check opt == oboPkAscMatch
+
+  test "detectOrderByPkOptimization DESC match":
+    let orderItems = @[OrderItem(expr: Expr(kind: exColumn, colName: "id"), desc: true)]
+    let opt = detectOrderByPkOptimization(orderItems, "id")
+    check opt == oboPkDescMatch
+
+  test "detectOrderByPkOptimization no match - different column":
+    let orderItems = @[OrderItem(expr: Expr(kind: exColumn, colName: "name"), desc: false)]
+    let opt = detectOrderByPkOptimization(orderItems, "id")
+    check opt == oboNone
+
+  test "detectOrderByPkOptimization no match - expression":
+    let orderItems = @[OrderItem(
+      expr: Expr(kind: exBinOp, binOp: boAdd,
+        binLeft: Expr(kind: exColumn, colName: "id"),
+        binRight: Expr(kind: exLiteral, litValue: newValueRef(10'i64))),
+      desc: false)
+    ]
+    let opt = detectOrderByPkOptimization(orderItems, "id")
+    check opt == oboNone
+
+  test "detectOrderByPkOptimization no match - multiple columns":
+    let orderItems = @[
+      OrderItem(expr: Expr(kind: exColumn, colName: "id"), desc: false),
+      OrderItem(expr: Expr(kind: exColumn, colName: "name"), desc: true)
+    ]
+    let opt = detectOrderByPkOptimization(orderItems, "id")
+    check opt == oboNone
+
+  test "formatPlanOp poOrderBy with PK ASC optimization":
+    let op = PlanOp(
+      kind: poOrderBy,
+      obSortSpecs: @[],
+      obColumns: @["id", "name"],
+      obOptimization: oboPkAscMatch
+    )
+    let text = formatPlanOp(op)
+    check "PK_ASC_SKIP" in text
+    check "specs" notin text
+
+  test "formatPlanOp poOrderBy with PK DESC optimization":
+    let op = PlanOp(
+      kind: poOrderBy,
+      obSortSpecs: @[],
+      obColumns: @["id", "name"],
+      obLimit: 10,
+      obOptimization: oboPkDescMatch
+    )
+    let text = formatPlanOp(op)
+    check "PK_DESC_REVERSE" in text
+    check "limit=10" in text

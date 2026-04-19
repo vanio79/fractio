@@ -1010,3 +1010,59 @@ suite "SQL Executor — ORDER BY":
     check "Scan" in planText
     check "OrderBy" in planText
     check "DESC" in planText
+
+  test "ORDER BY PK ASC - optimization skip":
+    # ORDER BY on primary key ASC should skip sorting (data already sorted)
+    let res = client.exec("SELECT id, name FROM users ORDER BY id ASC")
+    check res.kind == erkRows
+    check res.rows.len == 5
+    # Results should be in PK order: 1, 2, 3, 4, 5
+    check res.rows[0][0] == "1"
+    check res.rows[1][0] == "2"
+    check res.rows[2][0] == "3"
+    check res.rows[3][0] == "4"
+    check res.rows[4][0] == "5"
+
+  test "ORDER BY PK DESC - optimization reverse":
+    # ORDER BY on primary key DESC should use reverse optimization
+    let res = client.exec("SELECT id, name FROM users ORDER BY id DESC")
+    check res.kind == erkRows
+    check res.rows.len == 5
+    # Results should be reversed: 5, 4, 3, 2, 1
+    check res.rows[0][0] == "5"
+    check res.rows[0][1] == "Eve"
+    check res.rows[1][0] == "4"
+    check res.rows[1][1] == "Dave"
+    check res.rows[2][0] == "3"
+    check res.rows[2][1] == "Carol"
+    check res.rows[3][0] == "2"
+    check res.rows[3][1] == "Bob"
+    check res.rows[4][0] == "1"
+    check res.rows[4][1] == "Alice"
+
+  test "ORDER BY PK DESC with LIMIT":
+    # ORDER BY PK DESC with LIMIT should work correctly
+    let res = client.exec("SELECT id, name FROM users ORDER BY id DESC LIMIT 3")
+    check res.kind == erkRows
+    check res.rows.len == 3
+    check res.rows[0][0] == "5"
+    check res.rows[1][0] == "4"
+    check res.rows[2][0] == "3"
+
+  test "EXPLAIN ORDER BY PK ASC shows optimization":
+    let res = client.exec("EXPLAIN SELECT id FROM users ORDER BY id ASC")
+    check res.kind == erkRows
+    var planText = ""
+    for row in res.rows:
+      planText.add(row[0] & "\n")
+    # Should NOT have OrderBy op when PK ASC optimization applies
+    check "PK_ASC_SKIP" in planText or "Scan" in planText
+
+  test "EXPLAIN ORDER BY PK DESC shows optimization":
+    let res = client.exec("EXPLAIN SELECT id FROM users ORDER BY id DESC")
+    check res.kind == erkRows
+    var planText = ""
+    for row in res.rows:
+      planText.add(row[0] & "\n")
+    # Should show PK_DESC_REVERSE optimization
+    check "PK_DESC_REVERSE" in planText

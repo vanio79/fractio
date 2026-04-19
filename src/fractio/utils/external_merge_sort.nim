@@ -677,3 +677,234 @@ proc formatSortSpecs*(specs: seq[SortSpec]): string =
       result.add(" DESC")
     else:
       result.add(" ASC")
+
+# =============================================================================
+# Streaming Reverse (for PK DESC optimization)
+# =============================================================================
+
+# Helper functions for row serialization (defined before use)
+proc encodeRowStrings*(row: seq[string]): string =
+  ## Encode a row of strings to binary format.
+  var w = initBinaryWriter()
+  w.writeU32(uint32(row.len))
+  for col in row:
+    w.writeString(col)
+  w.finish()
+
+proc decodeRowStrings*(data: string): seq[string] =
+  ## Decode a row of strings from binary format.
+  var r = initBinaryReader(data)
+  let colCount = int(r.readU32())
+  result = newSeq[string](colCount)
+  for i in 0..<colCount:
+    result[i] = r.readString()
+
+type
+  StreamingReverseIterator* = ref object
+    ## Iterator that reverses rows from a streaming source using temp files.
+    ## Memory-limited: buffers rows in chunks, writes to temp files,
+    ## then reads chunks in reverse order.
+    chunks*: seq[ChunkFile] ## Temp files containing buffered chunks
+    currentChunkIdx*: int ## Current chunk being read (in reverse order)
+    currentChunkRows*: seq[seq[string]] ## Rows from current chunk (reversed)
+    currentRowIdx*: int ## Current row index within reversed chunk
+    columns*: seq[string] ## Column names for output
+    allColumns*: seq[string] ## All fetched columns
+    tempDir*: string ## Temp directory for chunk files
+    tempPrefix*: string ## Prefix for temp file names
+    chunkSize*: int ## Rows per chunk
+    exhausted*: bool ## Iterator exhausted flag
+    initialized*: bool ## Reverse phase initialized flag
+
+proc newStreamingReverseIterator*(columns, allColumns: seq[string],
+                                  tempDir: string = DEFAULT_TEMP_DIR,
+                                  chunkSize: int = DEFAULT_CHUNK_SIZE): StreamingReverseIterator =
+  ## Create a new streaming reverse iterator.
+  ## Used for PK DESC optimization where data needs to be reversed.
+  let ts = getTime().toUnix()
+  result = StreamingReverseIterator(
+    columns: columns,
+    allColumns: allColumns,
+    tempDir: tempDir,
+    tempPrefix: "reverse_" & $ts & "_" & $rand(100000),
+    chunkSize: chunkSize,
+    currentChunkIdx: -1,
+    currentRowIdx: -1,
+    exhausted: false,
+    initialized: false
+  )
+  # Ensure temp directory exists
+  if not dirExists(tempDir):
+    createDir(tempDir)
+
+proc addChunkToReverse*(iter: StreamingReverseIterator, rows: seq[seq[string]]) =
+  ## Add rows to a chunk for later reversal.
+  ## Rows are stored in order; will be read back in reverse.
+  if rows.len == 0:
+    return
+
+  let chunkIdx = iter.chunks.len
+  let filename = iter.tempPrefix & "_chunk_" & $chunkIdx & ".dat"
+  let path = iter.tempDir / filename
+
+  # Write rows to file (unsorted, just stored)
+  var w = initBinaryWriter()
+  w.writeU32(uint32(rows.len))
+  for row in rows:
+    let rowData = encodeRowStrings(row)
+    w.writeU32(uint32(rowData.len))
+    w.writeBytes(rowData)
+
+  writeFile(path, w.finish())
+  iter.chunks.add(ChunkFile(path: path, rowCount: rows.len, index: chunkIdx))
+
+proc initReversePhase*(iter: StreamingReverseIterator) =
+  ## Initialize the reverse phase: start reading chunks in reverse order.
+  if iter.initialized or iter.chunks.len == 0:
+    iter.initialized = true
+    iter.exhausted = iter.chunks.len == 0
+    return
+
+  iter.initialized = true
+  # Start from the last chunk
+  iter.currentChunkIdx = iter.chunks.len - 1
+  iter.currentRowIdx = -1 # Will be set after loading chunk
+
+proc loadNextChunkInReverse(iter: StreamingReverseIterator): bool =
+  ## Load the next chunk in reverse order and reverse its rows.
+  ## Returns false if no more chunks.
+  if iter.currentChunkIdx < 0:
+    iter.exhausted = true
+    return false
+
+  let chunk = iter.chunks[iter.currentChunkIdx]
+  let stream = newFileStream(chunk.path, fmRead)
+  if stream == nil:
+    iter.exhausted = true
+    return false
+
+  # Read row count
+  var lenBytes: array[4, byte]
+  if stream.readData(addr lenBytes[0], 4) != 4:
+    stream.close()
+    iter.exhausted = true
+    return false
+  let rowCount = int(fromBytesU32(lenBytes))
+
+  # Read all rows
+  var rows: seq[seq[string]] = @[]
+  for i in 0..<rowCount:
+    var rowLenBytes: array[4, byte]
+    if stream.readData(addr rowLenBytes[0], 4) != 4:
+      break
+    let rowLen = int(fromBytesU32(rowLenBytes))
+    if rowLen == 0 or rowLen > 10_000_000:
+      break
+    var rowData = newString(rowLen)
+    if stream.readData(addr rowData[0], rowLen) != rowLen:
+      break
+    rows.add(decodeRowStrings(rowData))
+
+  stream.close()
+
+  # Reverse rows within this chunk
+  rows.reverse()
+  iter.currentChunkRows = rows
+  iter.currentRowIdx = 0 # Start from first row of reversed chunk
+
+  # Move to next chunk (in reverse order = decrement index)
+  dec iter.currentChunkIdx
+
+  return true
+
+proc hasNextRow*(iter: StreamingReverseIterator): bool =
+  ## Check if there's another row available.
+  if iter.exhausted:
+    return false
+
+  if not iter.initialized:
+    iter.initReversePhase()
+
+  # Check if we have rows in current chunk
+  if iter.currentRowIdx >= 0 and iter.currentRowIdx < iter.currentChunkRows.len:
+    return true
+
+  # Need to load next chunk
+  return iter.loadNextChunkInReverse()
+
+proc nextRow*(iter: StreamingReverseIterator): Option[seq[string]] =
+  ## Get the next row in reverse order.
+  if iter.exhausted:
+    return none(seq[string])
+
+  if not iter.initialized:
+    iter.initReversePhase()
+
+  # Check if we need to load a new chunk
+  if iter.currentRowIdx < 0 or iter.currentRowIdx >= iter.currentChunkRows.len:
+    if not iter.loadNextChunkInReverse():
+      return none(seq[string])
+
+  # Return current row and advance
+  if iter.currentRowIdx >= 0 and iter.currentRowIdx < iter.currentChunkRows.len:
+    let row = iter.currentChunkRows[iter.currentRowIdx]
+    inc iter.currentRowIdx
+    return some(row)
+
+  return none(seq[string])
+
+proc consumeAllRows*(iter: StreamingReverseIterator): seq[seq[string]] =
+  ## Consume all remaining rows in reverse order.
+  var rows: seq[seq[string]] = @[]
+  while iter.hasNextRow():
+    let rowOpt = iter.nextRow()
+    if rowOpt.isSome:
+      rows.add(rowOpt.get())
+  rows
+
+proc closeIterator*(iter: StreamingReverseIterator) =
+  ## Close the iterator and clean up temp files.
+  for chunk in iter.chunks:
+    try:
+      if fileExists(chunk.path):
+        removeFile(chunk.path)
+    except OSError:
+      discard
+  iter.chunks = @[]
+  iter.exhausted = true
+
+proc reverseRowsWithTempFiles*(rows: seq[seq[string]],
+                               columns, allColumns: seq[string],
+                               tempDir: string = DEFAULT_TEMP_DIR,
+                               chunkSize: int = DEFAULT_CHUNK_SIZE): seq[seq[string]] =
+  ## Reverse rows using temp files for memory-limited operation.
+  ## Used for PK DESC optimization where data is already sorted by PK ASC
+  ## but needs to be returned in DESC order.
+  if rows.len <= 1:
+    return rows
+
+  # If rows fit in one chunk, just reverse in memory
+  if rows.len <= chunkSize:
+    result = rows
+    result.reverse()
+    return
+
+  # Use streaming reverse for large datasets
+  let iter = newStreamingReverseIterator(columns, allColumns, tempDir, chunkSize)
+
+  # Add rows in chunks
+  var currentChunk: seq[seq[string]] = @[]
+  for row in rows:
+    currentChunk.add(row)
+    if currentChunk.len >= chunkSize:
+      iter.addChunkToReverse(currentChunk)
+      currentChunk = @[]
+
+  # Add remaining rows
+  if currentChunk.len > 0:
+    iter.addChunkToReverse(currentChunk)
+
+  # Initialize and consume
+  iter.initReversePhase()
+  result = iter.consumeAllRows()
+  iter.closeIterator()

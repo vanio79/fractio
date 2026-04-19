@@ -994,49 +994,122 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
       # obAllColumns contains all columns fetched for sorting (requested + ORDER BY columns)
       # obColumns contains the original requested columns for final output
       # obLimit is applied after sorting (LIMIT semantics)
-      if lastResult.kind == erkRows:
-        # In-memory sort for buffered results
-        if lastResult.rows.len <= 1:
-          # No sorting needed for empty or single-row results
-          # Still apply LIMIT if present
-          if op.obLimit > 0 and lastResult.rows.len > int(op.obLimit):
-            rowsResult(op.obColumns, lastResult.rows[0..<int(op.obLimit)])
-          else:
-            lastResult
-        else:
-          let sortedRows = sortRowsInMemory(lastResult.rows, op.obSortSpecs,
-              op.obAllColumns)
-          # Extract only the requested columns after sorting
-          var outputRows = extractRequestedColumns(sortedRows, op.obColumns,
-              op.obAllColumns)
-          # Apply LIMIT after sorting
+      # obOptimization indicates PK-based optimization:
+      # - oboPkAscMatch: data already sorted, skip sorting
+      # - oboPkDescMatch: data needs reverse, use temp files
+      # - oboNone: full sort algorithm
+
+      # Handle optimization cases
+      if op.obOptimization == oboPkAscMatch:
+        # Data is already sorted by PK ASC - skip sorting
+        # Just extract requested columns and apply LIMIT
+        if lastResult.kind == erkRows:
+          var outputRows = lastResult.rows
+          # Extract only requested columns if needed
+          if op.obColumns.len != lastResult.columns.len:
+            outputRows = extractRequestedColumns(outputRows, op.obColumns,
+                op.obAllColumns)
+          # Apply LIMIT
           if op.obLimit > 0 and outputRows.len > int(op.obLimit):
             outputRows = outputRows[0..<int(op.obLimit)]
           rowsResult(op.obColumns, outputRows)
-      elif lastResult.kind == erkStreamingRows:
-        # Buffer all rows from streaming result, then sort in-memory
-        # For very large results, this could be memory-intensive
-        # TODO: Implement external merge sort for streaming with large datasets
-        let bufferedRows = lastResult.streamIterator.consumeAllRows()
-        if bufferedRows.len <= 1:
-          # Apply LIMIT if present
-          if op.obLimit > 0 and bufferedRows.len > int(op.obLimit):
-            rowsResult(op.obColumns, bufferedRows[0..<int(op.obLimit)])
-          else:
-            rowsResult(op.obColumns, bufferedRows)
-        else:
-          let sortedRows = sortRowsInMemory(bufferedRows, op.obSortSpecs,
-              op.obAllColumns)
-          # Extract only the requested columns after sorting
-          var outputRows = extractRequestedColumns(sortedRows, op.obColumns,
-              op.obAllColumns)
-          # Apply LIMIT after sorting
+        elif lastResult.kind == erkStreamingRows:
+          # For streaming, apply LIMIT during consumption
+          let bufferedRows = lastResult.streamIterator.consumeAllRows()
+          var outputRows = bufferedRows
+          if op.obColumns.len != lastResult.streamColumns.len:
+            outputRows = extractRequestedColumns(outputRows, op.obColumns,
+                op.obAllColumns)
           if op.obLimit > 0 and outputRows.len > int(op.obLimit):
             outputRows = outputRows[0..<int(op.obLimit)]
           rowsResult(op.obColumns, outputRows)
+        else:
+          errorResult("ORDER BY requires row results from previous operation")
+
+      elif op.obOptimization == oboPkDescMatch:
+        # Data is sorted by PK ASC but needs to be reversed to DESC
+        # Use temp-file based reversal for memory-limited operation
+        if lastResult.kind == erkRows:
+          if lastResult.rows.len <= 1:
+            # No reversal needed for empty or single-row results
+            var outputRows = lastResult.rows
+            if op.obColumns.len != lastResult.columns.len:
+              outputRows = extractRequestedColumns(outputRows, op.obColumns,
+                  op.obAllColumns)
+            rowsResult(op.obColumns, outputRows)
+          else:
+            # Reverse using temp files
+            let reversedRows = reverseRowsWithTempFiles(lastResult.rows,
+                op.obColumns, op.obAllColumns)
+            var outputRows = reversedRows
+            # Apply LIMIT after reversal
+            if op.obLimit > 0 and outputRows.len > int(op.obLimit):
+              outputRows = outputRows[0..<int(op.obLimit)]
+            rowsResult(op.obColumns, outputRows)
+        elif lastResult.kind == erkStreamingRows:
+          # Buffer streaming rows, then reverse
+          let bufferedRows = lastResult.streamIterator.consumeAllRows()
+          if bufferedRows.len <= 1:
+            var outputRows = bufferedRows
+            if op.obColumns.len != lastResult.streamColumns.len:
+              outputRows = extractRequestedColumns(outputRows, op.obColumns,
+                  op.obAllColumns)
+            rowsResult(op.obColumns, outputRows)
+          else:
+            let reversedRows = reverseRowsWithTempFiles(bufferedRows,
+                op.obColumns, op.obAllColumns)
+            var outputRows = reversedRows
+            if op.obLimit > 0 and outputRows.len > int(op.obLimit):
+              outputRows = outputRows[0..<int(op.obLimit)]
+            rowsResult(op.obColumns, outputRows)
+        else:
+          errorResult("ORDER BY requires row results from previous operation")
+
       else:
-        # Previous result is not rows - ORDER BY is invalid here
-        errorResult("ORDER BY requires row results from previous operation")
+        # No optimization - use full sort algorithm
+        if lastResult.kind == erkRows:
+          # In-memory sort for buffered results
+          if lastResult.rows.len <= 1:
+            # No sorting needed for empty or single-row results
+            # Still apply LIMIT if present
+            if op.obLimit > 0 and lastResult.rows.len > int(op.obLimit):
+              rowsResult(op.obColumns, lastResult.rows[0..<int(op.obLimit)])
+            else:
+              lastResult
+          else:
+            let sortedRows = sortRowsInMemory(lastResult.rows, op.obSortSpecs,
+                op.obAllColumns)
+            # Extract only the requested columns after sorting
+            var outputRows = extractRequestedColumns(sortedRows, op.obColumns,
+                op.obAllColumns)
+            # Apply LIMIT after sorting
+            if op.obLimit > 0 and outputRows.len > int(op.obLimit):
+              outputRows = outputRows[0..<int(op.obLimit)]
+            rowsResult(op.obColumns, outputRows)
+        elif lastResult.kind == erkStreamingRows:
+          # Buffer all rows from streaming result, then sort in-memory
+          # For very large results, this could be memory-intensive
+          # TODO: Implement external merge sort for streaming with large datasets
+          let bufferedRows = lastResult.streamIterator.consumeAllRows()
+          if bufferedRows.len <= 1:
+            # Apply LIMIT if present
+            if op.obLimit > 0 and bufferedRows.len > int(op.obLimit):
+              rowsResult(op.obColumns, bufferedRows[0..<int(op.obLimit)])
+            else:
+              rowsResult(op.obColumns, bufferedRows)
+          else:
+            let sortedRows = sortRowsInMemory(bufferedRows, op.obSortSpecs,
+                op.obAllColumns)
+            # Extract only the requested columns after sorting
+            var outputRows = extractRequestedColumns(sortedRows, op.obColumns,
+                op.obAllColumns)
+            # Apply LIMIT after sorting
+            if op.obLimit > 0 and outputRows.len > int(op.obLimit):
+              outputRows = outputRows[0..<int(op.obLimit)]
+            rowsResult(op.obColumns, outputRows)
+        else:
+          # Previous result is not rows - ORDER BY is invalid here
+          errorResult("ORDER BY requires row results from previous operation")
 
     of poUpdate:
       # MVCC-aware UPDATE
