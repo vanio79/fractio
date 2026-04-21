@@ -219,6 +219,7 @@ type
 proc findPkColumn*(desc: TableDescriptor): string =
   ## Find the primary key column name. Returns the first PK column or
   ## the first column from the table-level PK constraint.
+  ## For composite PKs, returns only the first column.
   if desc.primaryKey.len > 0:
     return desc.primaryKey[0]
   for col in desc.columns:
@@ -227,6 +228,22 @@ proc findPkColumn*(desc: TableDescriptor): string =
   if desc.columns.len > 0:
     return desc.columns[0].name
   ""
+
+proc findPkColumns*(desc: TableDescriptor): seq[string] =
+  ## Find all primary key column names for composite PK support.
+  ## Returns ordered sequence of PK columns.
+  if desc.primaryKey.len > 0:
+    return desc.primaryKey
+  var pkCols: seq[string] = @[]
+  for col in desc.columns:
+    if col.primaryKey:
+      pkCols.add(col.name)
+  if pkCols.len > 0:
+    return pkCols
+  # Fallback: first column as single PK
+  if desc.columns.len > 0:
+    return @[desc.columns[0].name]
+  @[]
 
 proc columnNames*(desc: TableDescriptor): seq[string] =
   for col in desc.columns:
@@ -845,32 +862,48 @@ proc planInsert(stmt: Stmt, client: FractioClient,
   plan
 
 proc detectOrderByPkOptimization*(orderItems: seq[OrderItem],
-                                  pkColumn: string): OrderByOptimization =
+                                  pkColumns: seq[string]): OrderByOptimization =
   ## Detect if ORDER BY matches PK ordering for optimization.
   ## Returns optimization type:
   ## - oboPkAscMatch: ORDER BY PK ASC (data already sorted)
   ## - oboPkDescMatch: ORDER BY PK DESC (needs reverse, memory-limited)
   ## - oboNone: No optimization possible
   ##
-  ## Only applies to simple single-column ORDER BY on the PK column.
-  ## Complex expressions or multi-column ORDER BY require full sorting.
-  if orderItems.len != 1:
+  ## Supports both single-column and composite primary keys.
+  ## ORDER BY must match all PK columns in exact order with same direction.
+  ## Complex expressions require full sorting.
+  if orderItems.len == 0 or pkColumns.len == 0:
     return oboNone
 
-  let item = orderItems[0]
-  # Must be a simple column reference, not an expression
-  if item.expr.kind != exColumn:
+  # ORDER BY must have exactly the same number of columns as PK
+  if orderItems.len != pkColumns.len:
     return oboNone
 
-  # Must be ordering by the primary key column
-  if item.expr.colName != pkColumn:
-    return oboNone
+  # Check each ORDER BY item matches corresponding PK column
+  var allAsc = true
+  var allDesc = true
+  for i, item in orderItems:
+    # Must be a simple column reference, not an expression
+    if item.expr.kind != exColumn:
+      return oboNone
 
-  # Determine optimization based on direction
-  if item.desc:
+    # Must match PK column in exact order
+    if item.expr.colName != pkColumns[i]:
+      return oboNone
+
+    # Track direction consistency
+    if item.desc:
+      allAsc = false
+    else:
+      allDesc = false
+
+  # All directions must be the same
+  if allAsc:
+    return oboPkAscMatch # Data is already sorted
+  elif allDesc:
     return oboPkDescMatch # Data needs to be reversed
   else:
-    return oboPkAscMatch # Data is already sorted
+    return oboNone # Mixed directions require full sort
 
 proc planSelect(stmt: Stmt, client: FractioClient,
     database, schema: string): Plan =
@@ -896,6 +929,7 @@ proc planSelect(stmt: Stmt, client: FractioClient,
 
   # Extract PK range information from WHERE clause
   let pkCol = findPkColumn(desc)
+  let pkColumns = findPkColumns(desc) # All PK columns for optimization detection
   let pkRangeInfo = extractPkRangeFromWhere(stmt.selWhere, pkCol, desc.pkSpec)
 
   # Extract LIMIT value
@@ -910,7 +944,7 @@ proc planSelect(stmt: Stmt, client: FractioClient,
   # When ORDER BY matches PK ordering, we can skip or simplify sorting
   var pkOptimization = oboNone
   if stmt.selOrderBy.len > 0:
-    pkOptimization = detectOrderByPkOptimization(stmt.selOrderBy, pkCol)
+    pkOptimization = detectOrderByPkOptimization(stmt.selOrderBy, pkColumns)
 
   # Convert ORDER BY items to SortSpecs and determine sort columns
   # Skip this if we have PK optimization (no extra columns needed)

@@ -1324,19 +1324,19 @@ suite "Planner ORDER BY":
 
 suite "Planner ORDER BY PK Optimization":
 
-  test "detectOrderByPkOptimization ASC match":
+  test "detectOrderByPkOptimization ASC match - single PK":
     let orderItems = @[OrderItem(expr: Expr(kind: exColumn, colName: "id"), desc: false)]
-    let opt = detectOrderByPkOptimization(orderItems, "id")
+    let opt = detectOrderByPkOptimization(orderItems, @["id"])
     check opt == oboPkAscMatch
 
-  test "detectOrderByPkOptimization DESC match":
+  test "detectOrderByPkOptimization DESC match - single PK":
     let orderItems = @[OrderItem(expr: Expr(kind: exColumn, colName: "id"), desc: true)]
-    let opt = detectOrderByPkOptimization(orderItems, "id")
+    let opt = detectOrderByPkOptimization(orderItems, @["id"])
     check opt == oboPkDescMatch
 
   test "detectOrderByPkOptimization no match - different column":
     let orderItems = @[OrderItem(expr: Expr(kind: exColumn, colName: "name"), desc: false)]
-    let opt = detectOrderByPkOptimization(orderItems, "id")
+    let opt = detectOrderByPkOptimization(orderItems, @["id"])
     check opt == oboNone
 
   test "detectOrderByPkOptimization no match - expression":
@@ -1346,15 +1346,54 @@ suite "Planner ORDER BY PK Optimization":
         binRight: Expr(kind: exLiteral, litValue: newValueRef(10'i64))),
       desc: false)
     ]
-    let opt = detectOrderByPkOptimization(orderItems, "id")
+    let opt = detectOrderByPkOptimization(orderItems, @["id"])
     check opt == oboNone
 
-  test "detectOrderByPkOptimization no match - multiple columns":
+  test "detectOrderByPkOptimization no match - extra ORDER BY columns":
     let orderItems = @[
       OrderItem(expr: Expr(kind: exColumn, colName: "id"), desc: false),
       OrderItem(expr: Expr(kind: exColumn, colName: "name"), desc: true)
     ]
-    let opt = detectOrderByPkOptimization(orderItems, "id")
+    let opt = detectOrderByPkOptimization(orderItems, @["id"])
+    check opt == oboNone
+
+  test "detectOrderByPkOptimization composite PK ASC match":
+    let orderItems = @[
+      OrderItem(expr: Expr(kind: exColumn, colName: "tenant_id"), desc: false),
+      OrderItem(expr: Expr(kind: exColumn, colName: "user_id"), desc: false)
+    ]
+    let opt = detectOrderByPkOptimization(orderItems, @["tenant_id", "user_id"])
+    check opt == oboPkAscMatch
+
+  test "detectOrderByPkOptimization composite PK DESC match":
+    let orderItems = @[
+      OrderItem(expr: Expr(kind: exColumn, colName: "tenant_id"), desc: true),
+      OrderItem(expr: Expr(kind: exColumn, colName: "user_id"), desc: true)
+    ]
+    let opt = detectOrderByPkOptimization(orderItems, @["tenant_id", "user_id"])
+    check opt == oboPkDescMatch
+
+  test "detectOrderByPkOptimization composite PK no match - wrong order":
+    let orderItems = @[
+      OrderItem(expr: Expr(kind: exColumn, colName: "user_id"), desc: false),
+      OrderItem(expr: Expr(kind: exColumn, colName: "tenant_id"), desc: false)
+    ]
+    let opt = detectOrderByPkOptimization(orderItems, @["tenant_id", "user_id"])
+    check opt == oboNone
+
+  test "detectOrderByPkOptimization composite PK no match - mixed direction":
+    let orderItems = @[
+      OrderItem(expr: Expr(kind: exColumn, colName: "tenant_id"), desc: false),
+      OrderItem(expr: Expr(kind: exColumn, colName: "user_id"), desc: true)
+    ]
+    let opt = detectOrderByPkOptimization(orderItems, @["tenant_id", "user_id"])
+    check opt == oboNone
+
+  test "detectOrderByPkOptimization composite PK no match - partial columns":
+    let orderItems = @[
+      OrderItem(expr: Expr(kind: exColumn, colName: "tenant_id"), desc: false)
+    ]
+    let opt = detectOrderByPkOptimization(orderItems, @["tenant_id", "user_id"])
     check opt == oboNone
 
   test "formatPlanOp poOrderBy with PK ASC optimization":
