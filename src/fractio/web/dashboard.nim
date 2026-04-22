@@ -600,10 +600,11 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
                 # Enrich with group member details
                 var groupsArr = newJArray()
                 for gid in rec.groupIds:
-                  var groupObj = %* {"groupId": gid}
+                  var groupObj = %* {"groupId": $gid}
                   var members = newJArray()
-                  if groupDescs.hasKey(gid):
-                    let desc = groupDescs[gid]
+                  let gidUlid = groupIDToULID(gid)
+                  if groupDescs.hasKey(gidUlid):
+                    let desc = groupDescs[gidUlid]
                     # Read persisted leader from group record
                     let leaderNid = desc.leader
                     for rep in desc.replicas:
@@ -612,7 +613,7 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
                                  else: "follower"
                       # Fallback: if no persisted leader, check local Raft state
                       if leaderNid == 0:
-                        if srv.raftStore.coordinator.isLeader(GroupID(gid)) and
+                        if srv.raftStore.coordinator.isLeader(gid) and
                             nid == uint32(srv.config.serverId):
                           role = "leader"
                       members.add(%* {"nodeId": nid, "role": role})
@@ -623,10 +624,11 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
                 # Enrich old groups (during rebalancing)
                 var oldGroupsArr = newJArray()
                 for gid in rec.oldGroupIds:
-                  var groupObj = %* {"groupId": gid}
+                  var groupObj = %* {"groupId": $gid}
                   var members = newJArray()
-                  if groupDescs.hasKey(gid):
-                    let desc = groupDescs[gid]
+                  let gidUlid = groupIDToULID(gid)
+                  if groupDescs.hasKey(gidUlid):
+                    let desc = groupDescs[gidUlid]
                     for rep in desc.replicas:
                       let nid = rep.nodeId
                       members.add(%* {"nodeId": nid, "role": "follower"})
@@ -670,6 +672,22 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
                 rowObj[col] = newJString(row[i])
             rowsJson.add(rowObj)
           return %* {"kind": "rows", "columns": execResult.columns,
+              "rows": rowsJson}
+        of erkStreamingRows:
+          # For streaming results, consume all rows and return as rows
+          var rowsJson = newJArray()
+          let iter = execResult.streamIterator
+          while iter.hasNextRow():
+            let rowOpt = iter.nextRow()
+            if rowOpt.isSome:
+              let row = rowOpt.get()
+              var rowObj = newJObject()
+              for i, col in execResult.streamColumns:
+                if i < row.len:
+                  rowObj[col] = newJString(row[i])
+              rowsJson.add(rowObj)
+          iter.closeIterator()
+          return %* {"kind": "rows", "columns": execResult.streamColumns,
               "rows": rowsJson}
         of erkModified:
           return %* {"kind": "modified", "count": execResult.count,

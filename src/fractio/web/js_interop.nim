@@ -50,6 +50,20 @@ proc jsLen*(obj: JsObject): cstring
 proc safeBool*(obj: JsObject, field: cstring): bool
     {.importjs: "(#[#]===true)".}
 
+# Safe role string - handles both string and numeric role values
+proc safeRoleStr*(obj: JsObject): cstring =
+  ## Get role string from JsObject - handles both string and numeric roles.
+  {.emit: """
+  var v = `obj`['role'];
+  if (typeof v === 'string') {
+    var s = v.toLowerCase();
+    `result` = (s === 'leader' ? 'Leader' : s === 'follower' ? 'Follower' : s === 'candidate' ? 'Candidate' : 'Unknown');
+  } else {
+    var n = Number(v) || 0;
+    `result` = (n === 1 ? 'Leader' : n === 2 ? 'Follower' : n === 3 ? 'Candidate' : 'Unknown');
+  }
+  """.}
+
 # WebSocket native JS interop
 proc jsParseJsonStr*(s: cstring): JsObject
     {.importjs: "JSON.parse(#)".}
@@ -94,7 +108,8 @@ proc jsSetTimeout*(fn: proc(), ms: int)
 proc jsCaptureClickInt*(el: JsObject, val: int, cb: proc(v: int))
     {.importjs: "(function(e,v,f){e.addEventListener('click',function(){f(v);})})(#,#,#)".}
 
-proc jsCaptureClickIntStr*(el: JsObject, id: int, name: cstring, cb: proc(id: int, name: cstring))
+proc jsCaptureClickIntStr*(el: JsObject, id: int, name: cstring, cb: proc(
+    id: int, name: cstring))
     {.importjs: "(function(e,i,n,f){e.addEventListener('click',function(){f(i,n);})})(#,#,#,#)".}
 
 # Safe float→integer-string for SVG attributes (avoids BigInt crash)
