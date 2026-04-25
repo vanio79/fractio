@@ -3178,3 +3178,284 @@ suite "Executor ORDER BY with MockKVStore":
     check result.kind == erkRows
     check result.rows.len == 1
     check result.rows[0][1] == "Alice"
+
+# =============================================================================
+# System Table Tests
+# =============================================================================
+
+suite "System Table Identification":
+
+  test "isSystemTableId detects system tables":
+    # System tables have well-known ULIDs with bytes 0-14 as zeros
+    # and byte 15 as the system table number (1-99)
+    let sysNodesId = SYS_NODES_TABLE_ID
+    let sysSpacesId = SYS_SPACES_TABLE_ID
+    let sysDatabasesId = SYS_DATABASES_TABLE_ID
+
+    # Check that system table IDs are detected
+    check isSystemTableId(sysNodesId)
+    check isSystemTableId(sysSpacesId)
+    check isSystemTableId(sysDatabasesId)
+
+    # Check that regular table IDs are not detected as system tables
+    let regularTableId = genTableId()
+    check not isSystemTableId(regularTableId)
+
+  test "isSystemTableId rejects tables outside 1-99 range":
+    # Create a ULID that looks like system but has byte 15 outside range
+    var ulid: ULID
+    for i in 0..<15:
+      ulid.data[i] = 0'u8
+    ulid.data[15] = 100'u8 # Outside system table range
+    let outsideId = TableId(ulid)
+    check not isSystemTableId(outsideId)
+
+    # Also check byte 15 = 0 (not a valid system table number)
+    ulid.data[15] = 0'u8
+    let zeroId = TableId(ulid)
+    check not isSystemTableId(zeroId)
+
+suite "System Table Record Decoding":
+
+  test "decodeSystemTableRecord for NodeRecord":
+    let nodeRec = NodeRecord(
+      nodeId: 42,
+      host: "test-host",
+      raftPort: 8301,
+      clientPort: 9001,
+      status: nsAlive
+    )
+    let encoded = encode(nodeRec)
+
+    # Decode with columns matching planner's system table descriptor
+    let columns = @["_key", "nodeId", "host", "raftPort", "clientPort", "status"]
+    let decoded = decodeSystemTableRecord(SYS_NODES_TABLE_ID, encoded, columns)
+
+    check decoded.len == columns.len
+    check decoded[0] == "42" # _key
+    check decoded[1] == "42" # nodeId
+    check decoded[2] == "test-host" # host
+    check decoded[3] == "8301" # raftPort
+    check decoded[4] == "9001" # clientPort
+    check decoded[5] == "alive" # status
+
+  test "decodeSystemTableRecord for SpaceRecord":
+    let groupId = genGroupID()
+    let spaceRec = SpaceRecord(
+      spaceId: SpaceID(genULID()),
+      name: "test-space",
+      replicas: 3,
+      groupCount: 1,
+      groupIds: @[groupId],
+      oldGroupIds: @[],
+      rebalancing: false,
+      rebalanceWorker: 0,
+      rebalanceHeartbeat: 0,
+      rebalanceCursor: "",
+      createdAtNs: 1234567890
+    )
+    let encoded = encode(spaceRec)
+
+    let columns = @["_key", "spaceId", "name", "replicas", "groupCount",
+        "groupIds", "createdAt"]
+    let decoded = decodeSystemTableRecord(SYS_SPACES_TABLE_ID, encoded, columns)
+
+    check decoded.len == columns.len
+    check decoded[1] == $spaceRec.spaceId # spaceId
+    check decoded[2] == "test-space" # name
+    check decoded[3] == "3" # replicas
+    check decoded[4] == "1" # groupCount
+    check decoded[5] == $groupId # groupIds (comma-separated)
+
+  test "decodeSystemTableRecord for DatabaseRecord":
+    let dbRec = DatabaseRecord(
+      name: "testdb",
+      createdAtNs: 1234567890000
+    )
+    let encoded = encode(dbRec)
+
+    let columns = @["_key", "name", "createdAt"]
+    let decoded = decodeSystemTableRecord(SYS_DATABASES_TABLE_ID, encoded, columns)
+
+    check decoded.len == columns.len
+    check decoded[0] == "testdb" # _key (same as name for databases)
+    check decoded[1] == "testdb" # name
+    check decoded[2] == "1234567890000" # createdAt
+
+  test "decodeSystemTableRecord for SchemaRecord":
+    let schemaRec = SchemaRecord(
+      name: "testschema",
+      database: "testdb",
+      createdAtNs: 1234567890000
+    )
+    let encoded = encode(schemaRec)
+
+    let columns = @["_key", "name", "database", "createdAt"]
+    let decoded = decodeSystemTableRecord(SYS_SCHEMAS_TABLE_ID, encoded, columns)
+
+    check decoded.len == columns.len
+    check decoded[0] == "testdb.testschema" # _key
+    check decoded[1] == "testschema" # name
+    check decoded[2] == "testdb" # database
+
+  test "decodeSystemTableRecord for GroupRecord":
+    let groupRec = GroupRecord(
+      groupId: genULID(),
+      spaceId: SpaceID(genULID()),
+      preferredLeader: 1,
+      leader: 2,
+      replicas: @[
+        GroupReplicaBin(nodeId: 1, replicaType: rtVoter),
+        GroupReplicaBin(nodeId: 2, replicaType: rtVoter),
+        GroupReplicaBin(nodeId: 3, replicaType: rtLearner)
+      ]
+    )
+    let encoded = encode(groupRec)
+
+    let columns = @["_key", "groupId", "spaceId", "preferredLeader", "leader", "replicas"]
+    let decoded = decodeSystemTableRecord(SYS_GROUPS_TABLE_ID, encoded, columns)
+
+    check decoded.len == columns.len
+    check decoded[4] == "2" # leader
+    check decoded[5].contains("replicas") # replicas summary
+
+  test "decodeSystemTableRecord for SettingRecord":
+    # SettingRecord only has 'value' field, no 'key' - key comes from KV store key
+    let settingRec = SettingRecord(value: "test-value")
+    let encoded = encode(settingRec)
+
+    let columns = @["_key", "value"]
+    let decoded = decodeSystemTableRecord(SYS_SETTINGS_TABLE_ID, encoded, columns)
+
+    check decoded.len == columns.len
+    check decoded[0] == "" # _key (empty, comes from KV key)
+    check decoded[1] == "test-value" # value
+
+suite "System Table Key Encoding":
+
+  test "System tables use encodeTableKey (no d/ prefix)":
+    # System tables should use encodeTableKey which generates /t/<tableId>/<pk>
+    # NOT encodeDataRowKey which generates /t/<tableId>/d/<pk>
+
+    let sysTableId = SYS_SPACES_TABLE_ID
+    let pkValue = "test-key"
+
+    # encodeTableKey: /t/<tableId>/<pk>
+    let sysKey = encodeTableKey(sysTableId, pkValue)
+    check sysKey.startsWith("/t/")
+    check sysKey.contains(pkValue)
+    # Should NOT contain "d/" prefix
+    check not sysKey.contains("/d/")
+
+    # encodeDataRowKey: /t/<tableId>/d/<pk>
+    let dataKey = encodeDataRowKey(sysTableId, pkValue)
+    check dataKey.startsWith("/t/")
+    check dataKey.contains("/d/")
+
+    # Keys should be different
+    check sysKey != dataKey
+
+  test "makeScanKeysFromRange uses correct encoding for system tables":
+    # Create a range info with no bounds (full table scan)
+    let rangeInfo = PkRangeInfo(
+      isPointGet: false,
+      startBound: none(PkRangeBound),
+      endBound: none(PkRangeBound),
+      exactMatch: none(string),
+      remainingFilter: none(Expr)
+    )
+
+    let sysTableId = SYS_NODES_TABLE_ID
+    let (startKey, endKey) = makeScanKeysFromRange(sysTableId, rangeInfo)
+
+    # System table keys should NOT have d/ prefix
+    check startKey.startsWith("/t/")
+    check not startKey.contains("/d/")
+    check endKey.startsWith("/t/")
+    check not endKey.contains("/d/")
+
+  test "makeScanKeysFromRange uses correct encoding for regular tables":
+    let rangeInfo = PkRangeInfo(
+      isPointGet: false,
+      startBound: none(PkRangeBound),
+      endBound: none(PkRangeBound),
+      exactMatch: none(string),
+      remainingFilter: none(Expr)
+    )
+
+    let regularTableId = genTableId()
+    let (startKey, endKey) = makeScanKeysFromRange(regularTableId, rangeInfo)
+
+    # Regular table keys SHOULD have d/ prefix
+    check startKey.contains("/d/")
+    check endKey.contains("/d/") or endKey.contains("/e/") # end key uses e/
+
+suite "System Table Scan via Executor":
+
+  test "poScan on system table uses binary decoding":
+    # Create a mock KV store with system table data
+    let mockKV = newMockKVStore()
+
+    # Seed a node record using system table key encoding (no d/ prefix)
+    let nodeRec = NodeRecord(
+      nodeId: 1,
+      host: "localhost",
+      raftPort: 8301,
+      clientPort: 9001,
+      status: nsAlive
+    )
+    let nodeKey = encodeTableKey(SYS_NODES_TABLE_ID, "1")
+    mockKV.data[nodeKey] = encode(nodeRec)
+
+    # Create executor context
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    # Create scan plan for system table
+    let startKey = encodeTableKey(SYS_NODES_TABLE_ID, "")
+    let endKey = makeScanEndKey(SYS_NODES_TABLE_ID)
+
+    let plan = newPlan()
+    plan.add(PlanOp(
+      kind: poScan,
+      scTableId: SYS_NODES_TABLE_ID,
+      scStartKey: startKey,
+      scEndKey: endKey,
+      scLimit: 0,
+      scFilter: none(Expr),
+      scColumns: @["_key", "nodeId", "host", "raftPort", "clientPort",
+          "status"],
+      scAllColumns: @["_key", "nodeId", "host", "raftPort", "clientPort", "status"]
+    ))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkRows
+    check result.rows.len == 1
+    check result.rows[0][2] == "localhost" # host column
+    check result.rows[0][5] == "alive" # status column
+
+  test "poPointGet on system table uses correct key encoding":
+    # Create a mock KV store with system table data
+    let mockKV = newMockKVStore()
+
+    # Seed a database record
+    let dbRec = DatabaseRecord(name: "testdb", createdAtNs: 123456)
+    let dbKey = encodeTableKey(SYS_DATABASES_TABLE_ID, "testdb")
+    mockKV.data[dbKey] = encode(dbRec)
+
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    # PointGet plan for system table
+    let plan = newPlan()
+    plan.add(PlanOp(
+      kind: poPointGet,
+      pgTableId: SYS_DATABASES_TABLE_ID,
+      pgKey: "testdb",
+      pgPkSpec: PrimaryKeySpec(columns: @[("_key", cdtString, 64)]),
+      pgColumns: @["_key", "name", "createdAt"],
+      pgAllColumns: @["_key", "name", "createdAt"]
+    ))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkRows
+    check result.rows.len == 1
+    check result.rows[0][1] == "testdb" # name column

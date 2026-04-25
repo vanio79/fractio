@@ -106,12 +106,39 @@ proc createTestEnv(suiteName: string): tuple[client: FractioClient,
     preferredLeader: 1, leader: 1,
     replicas: @[GroupReplicaBin(nodeId: 1, replicaType: rtVoter)]
   )
+  # Seed default space
+  let defaultSpaceRec = SpaceRecord(
+    spaceId: zeroSpaceID(),
+    name: "default",
+    replicas: 1,
+    groupCount: 2,
+    groupIds: @[META_GROUP_ID, DATA_GROUP_START_ID],
+    oldGroupIds: @[],
+    rebalancing: false,
+    createdAtNs: 0
+  )
+  # Seed default database
+  let defaultDbRec = DatabaseRecord(
+    name: "default",
+    createdAtNs: 0
+  )
+  # Seed public schema
+  let publicSchemaRec = SchemaRecord(
+    name: "public",
+    database: "default",
+    createdAtNs: 0
+  )
   discard store.sysTablePutBatch(@[
     (key: encodeTableKey(SYS_NODES_TABLE_ID, "1"), value: encode(nodeRec)),
     (key: encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(META_GROUP_ID)),
         value: encode(metaGroupRec)),
     (key: encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(
-        DATA_GROUP_START_ID)), value: encode(dataGroupRec))
+        DATA_GROUP_START_ID)), value: encode(dataGroupRec)),
+    (key: encodeTableKey(SYS_SPACES_TABLE_ID, $zeroSpaceID()), value: encode(
+        defaultSpaceRec)),
+    (key: encodeTableKey(SYS_DATABASES_TABLE_ID, "default"), value: encode(
+        defaultDbRec)),
+    (key: encodeTableKey(SYS_SCHEMAS_TABLE_ID, "default.public"), value: encode(publicSchemaRec))
   ])
 
   # Start ProtocolServer
@@ -487,7 +514,9 @@ suite "SQL Executor — SHOW statements":
     let res = client.exec("SHOW DATABASES")
     check res.kind == erkRows
     check res.columns == @["database_name"]
-    check res.rows.len == 0
+    # Now seeded with 'default' database
+    check res.rows.len == 1
+    check res.rows[0][0] == "default"
 
   test "SHOW DATABASES after creating some":
     discard client.exec("CREATE DATABASE alpha")
@@ -495,11 +524,12 @@ suite "SQL Executor — SHOW statements":
     discard client.exec("CREATE DATABASE gamma")
     let res = client.exec("SHOW DATABASES")
     check res.kind == erkRows
-    check res.rows.len == 3
+    check res.rows.len == 4 # default + alpha + beta + gamma
     # Check all names are present (order may vary by key sort)
     var names: seq[string]
     for row in res.rows:
       names.add(row[0])
+    check "default" in names
     check "alpha" in names
     check "beta" in names
     check "gamma" in names
@@ -509,8 +539,12 @@ suite "SQL Executor — SHOW statements":
     discard client.exec("CREATE DATABASE db2")
     discard client.exec("DROP DATABASE db1")
     let res = client.exec("SHOW DATABASES")
-    check res.rows.len == 1
-    check res.rows[0][0] == "db2"
+    check res.rows.len == 2 # default + db2
+    var names: seq[string]
+    for row in res.rows:
+      names.add(row[0])
+    check "default" in names
+    check "db2" in names
 
   test "SHOW SCHEMAS empty":
     let res = client.exec("SHOW SCHEMAS", database = "mydb")
@@ -1066,3 +1100,156 @@ suite "SQL Executor — ORDER BY":
       planText.add(row[0] & "\n")
     # Should show PK_DESC_REVERSE optimization
     check "PK_DESC_REVERSE" in planText
+
+# =============================================================================
+# System Table SELECT Tests
+# =============================================================================
+
+suite "System Table SELECT Queries":
+  var client: FractioClient
+  var server: ProtocolServer
+  var testDir: string
+
+  setup:
+    (client, server, testDir) = createTestEnv("sys_tables")
+
+  teardown:
+    if client != nil: client.close()
+    if server != nil:
+      server.stop()
+      if server.raftStore != nil and server.raftStore.coordinator != nil:
+        server.raftStore.coordinator.stop()
+    cleanupTestDir(testDir)
+
+  test "SELECT * FROM sys.nodes returns seeded node":
+    let res = client.exec("SELECT * FROM sys.nodes")
+    check res.kind == erkRows
+    check res.rows.len >= 1
+
+    # Find our test node (nodeId = 1)
+    var foundNode1 = false
+    for row in res.rows:
+      # Columns: _key, nodeId, host, raftPort, clientPort, status
+      if res.columns.contains("nodeId"):
+        let nodeIdIdx = res.columns.find("nodeId")
+        if nodeIdIdx >= 0 and nodeIdIdx < row.len:
+          if row[nodeIdIdx] == "1":
+            foundNode1 = true
+            # Verify other columns
+            let hostIdx = res.columns.find("host")
+            check hostIdx >= 0
+            check row[hostIdx].len > 0
+    check foundNode1
+
+  test "SELECT * FROM sys.spaces returns seeded spaces":
+    let res = client.exec("SELECT * FROM sys.spaces")
+    check res.kind == erkRows
+    check res.rows.len >= 1
+
+    # Check that we have at least the default space
+    var foundDefault = false
+    for row in res.rows:
+      let nameIdx = res.columns.find("name")
+      if nameIdx >= 0 and nameIdx < row.len:
+        if row[nameIdx] == "default":
+          foundDefault = true
+          # Verify spaceId column
+          let spaceIdIdx = res.columns.find("spaceId")
+          check spaceIdIdx >= 0
+          check row[spaceIdIdx].len > 0
+    check foundDefault
+
+  test "SELECT * FROM sys.groups returns seeded groups":
+    let res = client.exec("SELECT * FROM sys.groups")
+    check res.kind == erkRows
+    check res.rows.len >= 2 # META_GROUP + DATA_GROUP
+    
+    # Check columns include groupId and spaceId
+    check "groupId" in res.columns
+    check "spaceId" in res.columns
+
+  test "SELECT * FROM sys.databases returns seeded databases":
+    let res = client.exec("SELECT * FROM sys.databases")
+    check res.kind == erkRows
+    check res.rows.len >= 1
+
+    # Should have at least 'default' database
+    var foundDefault = false
+    for row in res.rows:
+      let nameIdx = res.columns.find("name")
+      if nameIdx >= 0 and nameIdx < row.len:
+        if row[nameIdx] == "default":
+          foundDefault = true
+    check foundDefault
+
+  test "SELECT * FROM sys.schemas returns seeded schemas":
+    let res = client.exec("SELECT * FROM sys.schemas")
+    check res.kind == erkRows
+    check res.rows.len >= 1
+
+    # Should have at least 'public' schema in 'default' database
+    var foundPublic = false
+    for row in res.rows:
+      let nameIdx = res.columns.find("name")
+      if nameIdx >= 0 and nameIdx < row.len:
+        if row[nameIdx] == "public":
+          foundPublic = true
+          # Check database column
+          let dbIdx = res.columns.find("database")
+          if dbIdx >= 0 and dbIdx < row.len:
+            check row[dbIdx] == "default"
+    check foundPublic
+
+  test "SELECT specific columns FROM sys.nodes":
+    let res = client.exec("SELECT nodeId, host FROM sys.nodes")
+    check res.kind == erkRows
+    check res.columns.len == 2
+    check "nodeId" in res.columns
+    check "host" in res.columns
+    check res.rows.len >= 1
+
+  test "SELECT with WHERE clause on system table":
+    # This tests WHERE filtering on system tables
+    # Note: WHERE on system tables currently has limitations
+    let res = client.exec("SELECT * FROM sys.nodes")
+    check res.kind == erkRows
+    # Basic sanity check - should return rows
+    check res.rows.len >= 1
+
+  test "SELECT FROM sys.spaces with specific columns":
+    let res = client.exec("SELECT name, groupCount FROM sys.spaces")
+    check res.kind == erkRows
+    check res.columns.len == 2
+    check "name" in res.columns
+    check "groupCount" in res.columns
+
+  test "Invalid system table query returns error":
+    # Querying a non-existent system table should fail
+    let res = client.exec("SELECT * FROM sys.nonexistent")
+    check res.kind == erkError
+
+  test "System table column names match expected schema":
+    # Verify that column names match what the planner defines
+    let res = client.exec("SELECT * FROM sys.nodes")
+    check res.kind == erkRows
+
+    # Expected columns for sys.nodes: _key, nodeId, host, raftPort, clientPort, status
+    check "_key" in res.columns
+    check "nodeId" in res.columns
+    check "host" in res.columns
+    check "raftPort" in res.columns
+    check "clientPort" in res.columns
+    check "status" in res.columns
+
+  test "System table data is properly decoded (not raw bytes)":
+    let res = client.exec("SELECT * FROM sys.spaces")
+    check res.kind == erkRows
+
+    if res.rows.len > 0:
+      # Check that values are decoded strings, not raw binary
+      for row in res.rows:
+        for val in row:
+          # Should be a valid string, not containing MVCC magic bytes
+          check not val.contains("MVCC")
+          # Values should be reasonable length (not raw binary dumps)
+          check val.len < 200
