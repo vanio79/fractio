@@ -12,7 +12,7 @@ proc getNodeField(node: JsObject, field: cstring): JsObject =
   {.emit: "return `node`[`field`];".}
 
 proc getIntField(node: JsObject, field: cstring): int =
-  {.emit: "return `node`[`field`] || 0;".}
+  {.emit: "return parseInt(`node`[`field`]) || 0;".}
 
 proc getStrField(node: JsObject, field: cstring): cstring =
   {.emit: "return `node`[`field`] || '';".}
@@ -21,7 +21,7 @@ proc getBoolField(node: JsObject, field: cstring): bool =
   {.emit: "return `node`[`field`] || false;".}
 
 proc getArrayLen(arr: JsObject): int =
-  {.emit: "return `arr`.length || 0;".}
+  {.emit: "return (`arr` && `arr`.length) || 0;".}
 
 proc getArrayElem(arr: JsObject, idx: int): JsObject =
   {.emit: "return `arr`[`idx`];".}
@@ -50,13 +50,13 @@ component StorageDetails:
 
 component NodeRow:
   node: JsObject
-  expanded: bool
 
   `html`:
     let dark = gDarkMode.get()
     let node = self.node.get() # unwrap State to get JsObject
-    let isExpanded = self.expanded.get() # unwrap State to get bool
+    let expandedNodes = gExpandedNodes.get()         # read global state directly
     let nodeId = getIntField(node, "nodeId")
+    let isExpanded = nodeId in expandedNodes # compute from global state
     let host = getStrField(node, "host")
     let role = getStrField(node, "role")
     let alive = getBoolField(node, "alive")
@@ -91,7 +91,6 @@ component NodeList:
     let dark = gDarkMode.get()
     let arr = gNodes.get()
     let arrLen = getArrayLen(arr)
-    let expanded = gExpandedNodes.get()
     let titleStyle = "font-size:1.05rem;font-weight:700;color:" & (
         if dark: DarkText else: "#111")
 
@@ -105,6 +104,4 @@ component NodeList:
       tDiv:
         for i in 0 ..< arrLen:
           let node = getArrayElem(arr, i)
-          let nodeId = getIntField(node, "nodeId")
-          let isExpanded = nodeId in expanded
-          NodeRow(node = node, expanded = isExpanded)
+          NodeRow(node = node)

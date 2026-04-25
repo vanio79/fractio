@@ -92,5 +92,14 @@ src/fractio/protocol/mvcc_store
 src/fractio/protocol/raft_store
 src/fractio/sql/executor
 src/fractio/storage/mvcc/types
+src/fractio/cli/main
+src/fractio/web/dashboard
 *.gcov
 generated_not_to_break_here
+
+# Debug JS build
+src/fractio/web/static/app_debug.js
+
+# Integration test binaries
+tests/integration/web/start_test_cluster
+tests/integration/web/test_rest_api

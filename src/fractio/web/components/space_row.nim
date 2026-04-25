@@ -12,16 +12,16 @@ proc getSpaceField(space: JsObject, field: cstring): JsObject =
   {.emit: "return `space`[`field`];".}
 
 proc getSpaceInt(space: JsObject, field: cstring): int =
-  {.emit: "return `space`[`field`] || 0;".}
+  {.emit: "return parseInt(`space`[`field`]) || 0;".}
 
 proc getSpaceStr(space: JsObject, field: cstring): cstring =
   {.emit: "return `space`[`field`] || '';".}
 
 proc getGroupsLen(groups: JsObject): int =
-  {.emit: "return `groups`.length || 0;".}
+  {.emit: "return (`groups` && `groups`.length) || 0;".}
 
 proc getArrayLen(arr: JsObject): int =
-  {.emit: "return `arr`.length || 0;".}
+  {.emit: "return (`arr` && `arr`.length) || 0;".}
 
 proc getArrayElem(arr: JsObject, idx: int): JsObject =
   {.emit: "return `arr`[`idx`];".}
@@ -44,14 +44,14 @@ proc hashSpaceId(sid: cstring): int =
 
 component SpaceRow:
   space: JsObject
-  expanded: bool
 
   `html`:
     let dark = gDarkMode.get()
     let space = self.space.get() # unwrap State
-    let isExpanded = self.expanded.get() # unwrap State
+    let expandedSpaces = gExpandedSpaces.get() # read global state directly
     let sidStr = $getSpaceIdStr(space)
     let sidHash = hashSpaceId(getSpaceIdStr(space))
+    let isExpanded = sidHash in expandedSpaces # compute from global state
     let sname = $getSpaceStr(space, "name")
     let srep = getSpaceInt(space, "replicas")
     let srepStr = if srep == 0: "ALL" else: $srep & " replicas"
@@ -94,7 +94,6 @@ component SpaceList:
     let dark = gDarkMode.get()
     let spacesArr = gSpaces.get()
     let spacesLen = getArrayLen(spacesArr)
-    let expandedSpaces = gExpandedSpaces.get()
     let titleStyle = "font-size:1.05rem;font-weight:700;color:" & (
         if dark: DarkText else: "#111")
 
@@ -111,6 +110,4 @@ component SpaceList:
       tDiv:
         for si in 0 ..< spacesLen:
           let sp = getArrayElem(spacesArr, si)
-          let sidHash = hashSpaceId(getSpaceIdStr(sp))
-          let isSpaceExpanded = sidHash in expandedSpaces
-          SpaceRow(space = sp, expanded = isSpaceExpanded)
+          SpaceRow(space = sp)

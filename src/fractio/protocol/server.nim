@@ -96,6 +96,8 @@ type
     vlogCleanThreshold*: int64  ## Garbage records to trigger vlog GC; 0 = default (100000)
     vlogMinCleanThreshold*: int64 ## Minimum garbage records for manual cleanup; 0 = default (1000)
     vlogCleanBufferSize*: int64 ## Write buffer for vlog GC in bytes; 0 = default (64 MB)
+    tempDir*: string            ## Base directory for temporary files (default: dataDir/tmp)
+                                ## Operations use subdirectories: sort/, reverse/, etc.
 
 proc defaultServerConfig*(): ServerConfig =
   ServerConfig(
@@ -119,6 +121,7 @@ proc defaultServerConfig*(): ServerConfig =
     sharedTimerNumericNodeId: 0,
     sharedTimerPeers: @[],
     dataDir: "",
+    tempDir: "",
     webPort: 0,
   )
 
@@ -2052,8 +2055,12 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
   # Reload group membership cache after space group recovery
   store.loadGroupMembers()
 
+  # Check if we have existing persisted data (spaces already exist)
+  # If so, skip seeding entirely - data was already seeded from a previous run
+  let hasExistingSpaces = store.spaces.len > 0
+
 # Wait for meta group leader before seeding (max 5 seconds)
-  if startAsLeader and not isRejoining:
+  if startAsLeader and not isRejoining and not hasExistingSpaces:
     let waitDeadline = getTime().toUnixFloat() * 1000 + 5000.0
     while getTime().toUnixFloat() * 1000 < waitDeadline:
       if coord.isLeader(META_GROUP_ID) or coord.getLeader(META_GROUP_ID) > 0:
@@ -2061,8 +2068,8 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
       sleep(100)
 
 # Seed system tables: sys.nodes (table 5) and sys.groups (table 4)
-  # Only seed when starting as fresh leader (not rejoining and not joining)
-  if startAsLeader and not isRejoining:
+  # Only seed when starting as fresh leader with NO existing data
+  if startAsLeader and not isRejoining and not hasExistingSpaces:
     # Use a single transaction for all seeding operations
     discard mvccStore.withAutoTransaction(proc(
         sessionId: uint64): MvccVoidResult =
