@@ -9,6 +9,7 @@
 ##   client-port = 9001
 ##   data-dir = "/var/lib/fractio/node1"
 ##   web-port = 9876
+##   temp-dir = "/var/lib/fractio/node1/tmp"  # Optional, defaults to data-dir/tmp
 ##
 ##   [storage]
 ##   write-buffer-size-mb = 4
@@ -17,8 +18,13 @@
 ##   vlog-clean-threshold = 100000
 ##   vlog-min-clean-threshold = 1000
 ##   vlog-clean-buffer-size-mb = 64
+##
+##   [daemon]
+##   foreground = false      # Run in foreground (daemonizes by default on Unix)
+##   pid-file = "/var/run/fractio/node1.pid"
+##   log-file = "/var/log/fractio/node1.log"
 
-import std/[strutils]
+import std/os
 import parsetoml
 
 type
@@ -28,6 +34,8 @@ type
     raftPort*: int
     clientPort*: int
     dataDir*: string
+    tempDir*: string ## Directory for temporary files (default: dataDir/tmp)
+                     ## Subdirectories are used per operation: sort/, etc.
     webPort*: int
     writeBufferSizeMB*: int
     blockCacheSizeMB*: int
@@ -35,6 +43,10 @@ type
     vlogCleanThreshold*: int
     vlogMinCleanThreshold*: int
     vlogCleanBufferSizeMB*: int
+    ## Daemonization options
+    foreground*: bool ## Run in foreground instead of daemonizing (default: false)
+    pidFile*: string ## Path to PID file (default: /var/run/fractio/node{id}.pid)
+    logFile*: string ## Path to log file for stdout/stderr redirection
 
 proc die(msg: string, code: int = 1) {.noreturn.} =
   writeLine(stderr, "error: " & msg)
@@ -68,6 +80,13 @@ proc loadConfig*(path: string): FractioConfig =
   if dataDirVal.isNil or dataDirVal.getStr() == "":
     die("config: node.data-dir is required")
   result.dataDir = dataDirVal.getStr()
+
+  # Optional: temp-dir (defaults to data-dir/tmp)
+  let tempDirVal = node.getOrDefault("temp-dir")
+  result.tempDir = if tempDirVal.isNil or tempDirVal.getStr() == "":
+                     result.dataDir / "tmp"
+                   else:
+                     tempDirVal.getStr()
 
   # Optional fields with defaults
   let hostVal = node.getOrDefault("host")
@@ -109,3 +128,19 @@ proc loadConfig*(path: string): FractioConfig =
     result.vlogCleanThreshold = 100_000
     result.vlogMinCleanThreshold = 1000
     result.vlogCleanBufferSizeMB = 64
+
+# Daemon section (optional)
+  let daemon = toml.getOrDefault("daemon")
+  if not daemon.isNil and daemon.kind == TomlValueKind.Table:
+    let fgVal = daemon.getOrDefault("foreground")
+    result.foreground = not fgVal.isNil and fgVal.getBool()
+
+    let pidVal = daemon.getOrDefault("pid-file")
+    result.pidFile = if pidVal.isNil: "" else: pidVal.getStr()
+
+    let logVal = daemon.getOrDefault("log-file")
+    result.logFile = if logVal.isNil: "" else: logVal.getStr()
+  else:
+    result.foreground = false
+    result.pidFile = ""
+    result.logFile = ""

@@ -20,10 +20,8 @@ import ../client/sql_client
 import ../distributed/meta/system_tables
 import ../distributed/meta/system_schemas
 import ../protocol/raft_store
-import ../protocol/mvcc_store
 import ../distributed/raft/nuraft_coordinator
 import ../distributed/raft/group_types
-import ../distributed/raft/multigroup_types
 import ../storage/wisckey_backend
 
 # ---------------------------------------------------------------------------
@@ -161,6 +159,34 @@ proc parseLevelSizes(stats: string): seq[float] =
         except ValueError:
           discard
 
+proc rowsToJsonArray(execResult: ExecResult): JsonNode =
+  ## Convert erkRows or erkStreamingRows to a simple JSON array of row objects.
+  ## Returns empty array for other result types.
+  case execResult.kind
+  of erkRows:
+    result = newJArray()
+    for row in execResult.rows:
+      var rowObj = newJObject()
+      for i, col in execResult.columns:
+        if i < row.len:
+          rowObj[col] = newJString(row[i])
+      result.add(rowObj)
+  of erkStreamingRows:
+    result = newJArray()
+    let iter = execResult.streamIterator
+    while iter.hasNextRow():
+      let rowOpt = iter.nextRow()
+      if rowOpt.isSome:
+        let row = rowOpt.get()
+        var rowObj = newJObject()
+        for i, col in execResult.streamColumns:
+          if i < row.len:
+            rowObj[col] = newJString(row[i])
+        result.add(rowObj)
+    iter.closeIterator()
+  else:
+    result = newJArray()
+
 
 # ---------------------------------------------------------------------------
 # Web server thread
@@ -294,22 +320,16 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
         if srv.isNil:
           statusCode = 503
           return %* {"error": "server not ready"}
-        var arr = newJArray()
-        if not srv.raftStore.isNil:
-          let startKey = encodeTableKey(SYS_NODES_TABLE_ID, "")
-          let endKey = makeScanEndKey(SYS_NODES_TABLE_ID)
-          {.cast(gcsafe).}:
-            let sr = srv.raftStore.raftScan(startKey, endKey, 0,
-                includeSystemKeys = true)
-            if sr.isOk:
-              for (key, entry) in sr.value:
-                try:
-                  let rec = decodeNodeRecord(entry.value)
-                  arr.add(system_schemas.toJson(rec))
-                except ValueError:
-                  discard
-        else:
-          # Fallback to local registry when raft store is not available
+        
+        # Query sys.nodes via SQL
+        var nodesResult: ExecResult
+        {.cast(gcsafe).}:
+          nodesResult = getClient().query("SELECT * FROM sys.nodes")
+        
+        var arr = rowsToJsonArray(nodesResult)
+        
+        # Fallback: if SQL query failed or returned empty, use local registry
+        if arr.len == 0 and not srv.raftStore.isNil:
           let entries = srv.nodeRegistry.listNodes()
           for e in entries:
             arr.add( %* {
@@ -319,6 +339,7 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
               "clientPort": e.clientPort.int,
               "status": e.status.int,
             })
+        
         # Enrich each node entry with live role and alive status
         for entry in arr:
           let entryNodeId = entry.getOrDefault("nodeId").getInt(0)
@@ -562,13 +583,19 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
           statusCode = 503
           return %* {"error": "server not ready"}
 
-        # Build groups lookup from sys.groups (binary -> JSON for enrichment)
+        # Query sys.groups via SQL to build groups lookup
         var groupDescs = initTable[coreTypes.ULID, GroupRecord]()
         {.cast(gcsafe).}:
-          let gStartKey = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
-          let gEndKey = makeScanEndKey(SYS_GROUPS_TABLE_ID)
-          let gsr = srv.raftStore.raftScan(gStartKey, gEndKey, 0,
-              includeSystemKeys = true)
+          let groupsResult = getClient().query("SELECT * FROM sys.groups")
+        
+        # Parse group records for enrichment
+        # The SQL executor returns groupIds as strings, but we need the full GroupRecord
+        # for replica details. We'll do a hybrid approach: SQL for spaces, direct scan for groups
+        # since groups have nested replica structures that SQL doesn't fully expose yet.
+        let gStartKey = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
+        let gEndKey = makeScanEndKey(SYS_GROUPS_TABLE_ID)
+        {.cast(gcsafe).}:
+          let gsr = srv.raftStore.raftScan(gStartKey, gEndKey, 0, includeSystemKeys = true)
           if gsr.isOk:
             for (key, entry) in gsr.value:
               try:
@@ -585,23 +612,28 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
               except ValueError:
                 discard
 
-        let startKey = encodeTableKey(SYS_SPACES_TABLE_ID, "")
-        let endKey = makeScanEndKey(SYS_SPACES_TABLE_ID)
-        var arr = newJArray()
+        # Query sys.spaces via SQL
+        var spacesResult: ExecResult
         {.cast(gcsafe).}:
-          let sr = srv.raftStore.raftScan(startKey, endKey, 0,
-              includeSystemKeys = true)
-          if sr.isOk:
-            for (key, entry) in sr.value:
-              try:
-                let rec = decodeSpaceRecord(entry.value)
-                var j = system_schemas.toJson(rec)
-
-                # Enrich with group member details
-                var groupsArr = newJArray()
-                for gid in rec.groupIds:
-                  var groupObj = %* {"groupId": $gid}
-                  var members = newJArray()
+          spacesResult = getClient().query("SELECT * FROM sys.spaces")
+        
+        let spacesArr = rowsToJsonArray(spacesResult)
+        
+        # Enrich with group member details
+        var arr = newJArray()
+        for spaceEntry in spacesArr:
+          var j = spaceEntry
+          
+          # Parse groupIds from string to enrich with members
+          let groupIdsStr = j.getOrDefault("groupIds").getStr("")
+          var groupsArr = newJArray()
+          if groupIdsStr.len > 0:
+            for gidStr in groupIdsStr.split(','):
+              if gidStr.len > 0:
+                var groupObj = %* {"groupId": gidStr}
+                var members = newJArray()
+                try:
+                  let gid = parseGroupID(gidStr)
                   let gidUlid = groupIDToULID(gid)
                   if groupDescs.hasKey(gidUlid):
                     let desc = groupDescs[gidUlid]
@@ -617,28 +649,35 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
                             nid == uint32(srv.config.serverId):
                           role = "leader"
                       members.add(%* {"nodeId": nid, "role": role})
-                  groupObj["members"] = members
-                  groupsArr.add(groupObj)
-                j["groups"] = groupsArr
+                except ValueError:
+                  discard
+                groupObj["members"] = members
+                groupsArr.add(groupObj)
+          j["groups"] = groupsArr
 
-                # Enrich old groups (during rebalancing)
-                var oldGroupsArr = newJArray()
-                for gid in rec.oldGroupIds:
-                  var groupObj = %* {"groupId": $gid}
-                  var members = newJArray()
+          # Parse oldGroupIds from string
+          let oldGroupIdsStr = j.getOrDefault("oldGroupIds").getStr("")
+          var oldGroupsArr = newJArray()
+          if oldGroupIdsStr.len > 0:
+            for gidStr in oldGroupIdsStr.split(','):
+              if gidStr.len > 0:
+                var groupObj = %* {"groupId": gidStr}
+                var members = newJArray()
+                try:
+                  let gid = parseGroupID(gidStr)
                   let gidUlid = groupIDToULID(gid)
                   if groupDescs.hasKey(gidUlid):
                     let desc = groupDescs[gidUlid]
                     for rep in desc.replicas:
                       let nid = rep.nodeId
                       members.add(%* {"nodeId": nid, "role": "follower"})
-                  groupObj["members"] = members
-                  oldGroupsArr.add(groupObj)
-                j["oldGroups"] = oldGroupsArr
+                except ValueError:
+                  discard
+                groupObj["members"] = members
+                oldGroupsArr.add(groupObj)
+          j["oldGroups"] = oldGroupsArr
 
-                arr.add(j)
-              except ValueError:
-                discard
+          arr.add(j)
         return arr
 
       # ---- REST: SQL query ----
@@ -812,58 +851,44 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
         if tid < 1 or tid > MAX_SYSTEM_TABLE_NUM:
           statusCode = 400
           return %* {"error": "invalid system table ID"}
-        # Convert system table number to well-known TableId
-        let tableIdObj = TableId(systemTableULID(tid))
-        let startKey = encodeTableKey(tableIdObj, "")
-        let endKey = makeScanEndKey(tableIdObj)
-        var rows = newJArray()
+        
+        # Map system table number to SQL table name
+        let tableName = case tid
+          of SYS_DATABASES_TABLE_NUM: "sys.databases"
+          of SYS_SCHEMAS_TABLE_NUM: "sys.schemas"
+          of SYS_TABLES_TABLE_NUM: "sys.tables"
+          of SYS_GROUPS_TABLE_NUM: "sys.groups"
+          of SYS_NODES_TABLE_NUM: "sys.nodes"
+          of SYS_SETTINGS_TABLE_NUM: "sys.settings"
+          of SYS_SPACES_TABLE_NUM: "sys.spaces"
+          of SYS_NODE_METRICS_NUM: "sys.node_metrics"
+          of SYS_GROUP_METRICS_NUM: "sys.group_metrics"
+          of SYS_EVENTS_TABLE_NUM: "sys.events"
+          else: ""
+        
+        if tableName.len == 0:
+          statusCode = 400
+          return %* {"error": "unknown system table ID"}
+        
+        # Execute SQL query via FractioClient
+        var execResult: ExecResult
         {.cast(gcsafe).}:
-          let sr = srv.raftStore.raftScan(startKey, endKey, 0,
-              includeSystemKeys = true)
-          if sr.isOk:
-            for (key, entry) in sr.value:
-              let decoded = decodeTableKey(key)
-              var rowObj = %* {"_key": decoded.primaryKey}
-              try:
-                # Decode binary records based on table ID
-                var j: JsonNode
-                case tid
-                of SYS_DATABASES_TABLE_NUM:
-                  let rec = decodeDatabaseRecord(entry.value)
-                  j = system_schemas.toJson(rec)
-                of SYS_SCHEMAS_TABLE_NUM:
-                  let rec = decodeSchemaRecord(entry.value)
-                  j = system_schemas.toJson(rec)
-                of SYS_TABLES_TABLE_NUM:
-                  let rec = decodeTableRecord(entry.value)
-                  j = system_schemas.toJson(rec)
-                of SYS_GROUPS_TABLE_NUM:
-                  let rec = decodeGroupRecord(entry.value)
-                  j = system_schemas.toJson(rec)
-                of SYS_NODES_TABLE_NUM:
-                  let rec = decodeNodeRecord(entry.value)
-                  j = system_schemas.toJson(rec)
-                of SYS_SETTINGS_TABLE_NUM:
-                  let rec = decodeSettingRecord(entry.value)
-                  j = system_schemas.toJson(rec)
-                of SYS_SPACES_TABLE_NUM:
-                  let rec = decodeSpaceRecord(entry.value)
-                  j = system_schemas.toJson(rec)
-                else:
-                  # Unknown table - try JSON parse for backward compatibility
-                  j = parseJson(entry.value)
-                for k, v in j:
-                  rowObj[k] = v
-              except ValueError, JsonParsingError:
-                rowObj["_value"] = newJString(entry.value)
-              rows.add(rowObj)
-        # Column names: from first row if available, otherwise from schema
+          execResult = getClient().query("SELECT * FROM " & tableName)
+        
+        # Convert result to expected format
+        let rowsArr = rowsToJsonArray(execResult)
+        
+        # Extract columns from result
         var columns = newJArray()
-        if rows.len > 0:
-          for k, v in rows[0]:
-            columns.add(newJString(k))
+        case execResult.kind
+        of erkRows:
+          for col in execResult.columns:
+            columns.add(newJString(col))
+        of erkStreamingRows:
+          for col in execResult.streamColumns:
+            columns.add(newJString(col))
         else:
-          # Hardcoded schemas for empty system tables
+          # Hardcoded schemas for empty/error results
           let sysColumns = case tid
             of SYS_DATABASES_TABLE_NUM: @["_key", "name", "createdAt"]
             of SYS_SCHEMAS_TABLE_NUM: @["_key", "name", "database", "createdAt"]
@@ -875,17 +900,15 @@ proc webServeThread(_: int) {.thread, gcsafe.} =
                 "clientPort", "status"]
             of SYS_SETTINGS_TABLE_NUM: @["_key", "value"]
             of SYS_SPACES_TABLE_NUM: @["_key", "spaceId", "name", "replicas", "groupCount",
-                "groupIds", "oldGroupIds", "rebalancing"]
-            of SYS_NODE_METRICS_NUM: @["_key", "nodeId", "cpuPercent",
-                "memUsedBytes", "diskUsedBytes"]
-            of SYS_GROUP_METRICS_NUM: @["_key", "groupId", "keyCount",
-                "sizeBytes", "readQps", "writeQps"]
-            of SYS_EVENTS_TABLE_NUM: @["_key", "timestamp", "eventType",
-                "nodeId", "message"]
+                "groupIds", "oldGroupIds", "rebalancing", "createdAt"]
+            of SYS_NODE_METRICS_NUM: @["_key", "_value"]
+            of SYS_GROUP_METRICS_NUM: @["_key", "_value"]
+            of SYS_EVENTS_TABLE_NUM: @["_key", "_value"]
             else: @["_key", "_value"]
           for c in sysColumns:
             columns.add(newJString(c))
-        return %* {"tableId": int(tid), "columns": columns, "rows": rows}
+        
+        return %* {"tableId": int(tid), "columns": columns, "rows": rowsArr}
 
       # ---- WebSocket: clock drift stream ----
       ws "/ws/drift":

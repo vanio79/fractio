@@ -32,7 +32,7 @@
 #   2 — connection / protocol error
 #   3 — server returned failure response
 
-import std/[os, parseopt, strformat, strutils, tables, times, json, httpclient]
+import std/[os, parseopt, strformat, strutils, tables, json, httpclient]
 import fractio/protocol/types
 import fractio/protocol/client
 import fractio/protocol/server
@@ -40,6 +40,9 @@ import fractio/protocol/messages/cluster as clusterMsgs
 import fractio/protocol/messages/admin as adminMsgs
 import fractio/web/dashboard
 import fractio/cli/config
+
+when defined(posix):
+  import fractio/cli/daemon
 
 const FractioVersion = "0.1.0"
 
@@ -71,9 +74,20 @@ Global options:
   --format FORMAT  Output format: table (default) | json
 
 Commands:
-  start           Start a Fractio node
+  start           Start a Fractio node (daemonizes by default on Unix)
     --config=PATH     Path to fractio.toml config file (required)
     --join=HOST:PORT  Peer to register with on startup
+    --foreground      Run in foreground (don't daemonize)
+    --pid-file=PATH   PID file path (overrides config, default: /var/run/fractio/node{id}.pid)
+    --log-file=PATH   Log file for daemon output (overrides config)
+
+  stop            Stop a running daemon (Unix only)
+    --config=PATH     Path to fractio.toml config file
+    --pid-file=PATH   PID file path (overrides config)
+
+  status          Check if daemon is running (Unix only)
+    --config=PATH     Path to fractio.toml config file
+    --pid-file=PATH   PID file path (overrides config)
 
   node ls           List all cluster nodes
   node status [ID]  Show status of all nodes, or detail for one node
@@ -119,12 +133,64 @@ proc cmdStart(flags: Table[string, string]) =
   let configPath = flags.getOrDefault("config", "")
   let joinPeer = flags.getOrDefault("join", "")
 
-  if configPath == "": die("start requires --config PATH")
+  # Check for --foreground CLI flag (prevents daemonization)
+  let foregroundFlag = flags.getOrDefault("foreground", "false").toLowerAscii() == "true" or
+                       flags.hasKey("foreground") and flags["foreground"] == ""
+  let pidFileOverride = flags.getOrDefault("pid-file", "")
+  let logFileOverride = flags.getOrDefault("log-file", "")
+
+  if configPath == "":
+    die("start requires --config PATH")
 
   let conf = loadConfig(configPath)
 
   try: createDir(conf.dataDir)
   except CatchableError as e: die("cannot create data-dir: " & e.msg)
+
+  # Create temp directory (used for sort, reverse, and other operations)
+  try: createDir(conf.tempDir)
+  except CatchableError as e: die("cannot create temp-dir: " & e.msg)
+
+  # Determine foreground setting (CLI overrides config)
+  # Default: daemonize on POSIX unless foreground is specified
+  let runForeground = when defined(posix): foregroundFlag or
+      conf.foreground else: true
+  let pidFile = when defined(posix):
+    if pidFileOverride != "": pidFileOverride
+    elif conf.pidFile != "": conf.pidFile
+    else: "/var/run/fractio/node" & $conf.nodeId & ".pid"
+  else: ""
+  let logFile = when defined(posix):
+    if logFileOverride != "": logFileOverride
+    elif conf.logFile != "": conf.logFile
+    else: ""
+  else: ""
+
+  # Daemonize before initializing server (unless foreground mode)
+  when defined(posix):
+    if not runForeground:
+      # Check if daemon is already running
+      if isDaemonRunning(pidFile):
+        die("daemon already running with PID " & $getDaemonPid(pidFile))
+
+      echo "Starting fractio daemon (node " & $conf.nodeId & ")..."
+      echo "PID file: " & pidFile
+      if logFile != "":
+        echo "Log file: " & logFile
+
+      let daemonCfg = DaemonConfig(
+        pidFile: pidFile,
+        logFile: logFile,
+        workingDir: conf.dataDir,
+        umask: 0o022
+      )
+
+      try:
+        daemonize(daemonCfg)
+        # After daemonize(), this process is the daemon child
+        # stdout/stderr are now redirected, so any logging goes to log file
+      except DaemonError as e:
+        die("daemonization failed: " & e.msg)
 
   var cfg = defaultServerConfig()
   cfg.host = conf.host
@@ -132,6 +198,7 @@ proc cmdStart(flags: Table[string, string]) =
   cfg.serverId = uint16(conf.nodeId)
   cfg.serverName = "fractio-" & $conf.nodeId
   cfg.dataDir = conf.dataDir
+  cfg.tempDir = conf.tempDir # Base temp directory for sort, reverse, etc.
   cfg.webPort = conf.webPort
   cfg.writeBufferSize = conf.writeBufferSizeMB * 1024 * 1024
   cfg.blockCacheSize = conf.blockCacheSizeMB * 1024 * 1024
@@ -156,7 +223,12 @@ proc cmdStart(flags: Table[string, string]) =
 
   if conf.webPort > 0:
     launchWebDashboard(server)
-    echo &"web dashboard: http://{conf.host}:{conf.webPort}"
+    # Only print web dashboard URL in foreground mode
+    when defined(posix):
+      if runForeground:
+        echo &"web dashboard: http://{conf.host}:{conf.webPort}"
+    else:
+      echo &"web dashboard: http://{conf.host}:{conf.webPort}"
 
   if isJoining:
     sleep(200)
@@ -181,7 +253,12 @@ proc cmdStart(flags: Table[string, string]) =
       "webPort": conf.webPort,
     }
 
-    echo &"joining cluster via {joinUrl} ..."
+    # Only print join message in foreground mode
+    when defined(posix):
+      if runForeground:
+        echo &"joining cluster via {joinUrl} ..."
+    else:
+      echo &"joining cluster via {joinUrl} ..."
 
     try:
       let httpClient = newHttpClient(timeout = 10_000)
@@ -191,7 +268,11 @@ proc cmdStart(flags: Table[string, string]) =
       let rj = parseJson(respBody)
 
       if rj.getOrDefault("success").getBool(false):
-        echo "join successful"
+        when defined(posix):
+          if runForeground:
+            echo "join successful"
+        else:
+          echo "join successful"
         # Add all returned cluster members as Raft peers
         let members = rj.getOrDefault("members")
         if not members.isNil and members.kind == JArray:
@@ -200,7 +281,6 @@ proc cmdStart(flags: Table[string, string]) =
             let mHost = m.getOrDefault("host").getStr("")
             let mRaftPort = m.getOrDefault("raftPort").getInt(0)
             if mNodeId > 0 and mHost != "" and mRaftPort > 0:
-              echo &"  adding peer: node {mNodeId} at {mHost}:{mRaftPort}"
               server.addPeerToRaft(mNodeId, mHost, mRaftPort)
       else:
         let errMsg = rj.getOrDefault("error").getStr("unknown error")
@@ -211,6 +291,69 @@ proc cmdStart(flags: Table[string, string]) =
 
   while true:
     sleep(1000)
+
+# ---------------------------------------------------------------------------
+# stop daemon
+# ---------------------------------------------------------------------------
+
+proc cmdStop(flags: Table[string, string]) =
+  when defined(posix):
+    let configPath = flags.getOrDefault("config", "")
+    let pidFileOverride = flags.getOrDefault("pid-file", "")
+
+    var pidFile: string
+    if pidFileOverride != "":
+      pidFile = pidFileOverride
+    elif configPath != "":
+      let conf = loadConfig(configPath)
+      pidFile = if conf.pidFile != "": conf.pidFile
+                else: "/var/run/fractio/node" & $conf.nodeId & ".pid"
+    else:
+      die("stop requires --config PATH or --pid-file PATH")
+
+    if not isDaemonRunning(pidFile):
+      echo "Daemon is not running (PID file: " & pidFile & ")"
+      quit(0)
+
+    let pid = getDaemonPid(pidFile)
+    echo "Stopping daemon with PID " & $pid & "..."
+
+    if stopDaemon(pidFile):
+      echo "Daemon stopped successfully"
+      quit(0)
+    else:
+      die("failed to stop daemon")
+  else:
+    die("stop command is only supported on POSIX systems")
+
+# ---------------------------------------------------------------------------
+# daemon status
+# ---------------------------------------------------------------------------
+
+proc cmdDaemonStatus(flags: Table[string, string]) =
+  when defined(posix):
+    let configPath = flags.getOrDefault("config", "")
+    let pidFileOverride = flags.getOrDefault("pid-file", "")
+
+    var pidFile: string
+    if pidFileOverride != "":
+      pidFile = pidFileOverride
+    elif configPath != "":
+      let conf = loadConfig(configPath)
+      pidFile = if conf.pidFile != "": conf.pidFile
+                else: "/var/run/fractio/node" & $conf.nodeId & ".pid"
+    else:
+      die("status requires --config PATH or --pid-file PATH")
+
+    let pid = getDaemonPid(pidFile)
+    if pid < 0:
+      echo "Daemon is not running"
+      quit(1)
+    else:
+      echo "Daemon is running with PID " & $pid
+      quit(0)
+  else:
+    die("status command is only supported on POSIX systems")
 
 # ---------------------------------------------------------------------------
 # node ls
@@ -224,7 +367,7 @@ proc cmdNodeLs(c: ProtocolClient, fmt: OutputFormat) =
   if fmt == fmtJson:
     var arr = newJArray()
     for n in resp.nodes:
-      arr.add(%* {
+      arr.add( %* {
         "nodeId": n.nodeId.int,
         "host": n.host,
         "raftPort": n.raftPort.int,
@@ -261,7 +404,7 @@ proc cmdNodeStatus(c: ProtocolClient, nodeIdStr: string, fmt: OutputFormat) =
     for n in resp.nodes:
       if n.nodeId == uint16(targetId):
         if fmt == fmtJson:
-          echo $(%* {
+          echo $( %* {
             "nodeId": n.nodeId.int,
             "host": n.host,
             "raftPort": n.raftPort.int,
@@ -360,7 +503,7 @@ proc cmdClusterInfo(c: ProtocolClient, fmt: OutputFormat) =
   if r.isErr: die("protocol error: " & $r.error, 2)
   let resp = r.value
   if fmt == fmtJson:
-    echo $(%* {
+    echo $( %* {
       "nodeId": resp.nodeId.int,
       "version": resp.version,
       "uptimeSecs": resp.uptimeSecs,
@@ -385,7 +528,7 @@ proc cmdClusterHealth(c: ProtocolClient, fmt: OutputFormat) =
   if r.isErr: die("protocol error: " & $r.error, 2)
   let resp = r.value
   if fmt == fmtJson:
-    echo $(%* {
+    echo $( %* {
       "status": healthStatusStr(resp.status),
       "leaderOK": resp.leaderOK,
       "replicaCount": resp.replicaCount.int,
@@ -408,7 +551,7 @@ proc cmdClusterMetrics(c: ProtocolClient, fmt: OutputFormat) =
   if r.isErr: die("protocol error: " & $r.error, 2)
   let resp = r.value
   if fmt == fmtJson:
-    echo $(%* {
+    echo $( %* {
       "requestsTotal": resp.requestsTotal,
       "requestsOK": resp.requestsOK,
       "requestsErr": resp.requestsErr,
@@ -443,7 +586,7 @@ proc cmdClusterRebalance(c: ProtocolClient, fmt: OutputFormat) =
   if r.isErr: die("protocol error: " & $r.error, 2)
   let resp = r.value
   if fmt == fmtJson:
-    echo $(%* {
+    echo $( %* {
       "pending": resp.pending,
       "inProgress": resp.inProgress,
       "completed": resp.completed,
@@ -513,6 +656,17 @@ proc main() =
   of "start":
     cmdStart(flags)
     quit(0)
+  of "stop":
+    when defined(posix):
+      cmdStop(flags)
+      quit(0)
+    else:
+      die("stop command is only supported on POSIX systems")
+  of "status":
+    when defined(posix):
+      cmdDaemonStatus(flags)
+    else:
+      die("status command is only supported on POSIX systems")
   of "-h", "--help", "help":
     printUsage()
     quit(0)
