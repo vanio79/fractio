@@ -2,12 +2,12 @@
 #
 # Recursive-descent parser that transforms a Token stream into a Stmt AST.
 # Supported statements:
-#   CREATE TABLE [IF NOT EXISTS] t (col type [constraints], ...)
-#   DROP TABLE [IF EXISTS] t
-#   SELECT [DISTINCT] cols FROM t [WHERE expr] [ORDER BY ...] [LIMIT n] [OFFSET n]
-#   INSERT INTO t [(cols)] VALUES (row), ...
-#   UPDATE t SET col=expr [, col=expr] [WHERE expr]
-#   DELETE FROM t [WHERE expr]
+#   CREATE TABLE [IF NOT EXISTS] [database].[schema].table (col type [constraints], ...)
+#   DROP TABLE [IF EXISTS] [database].[schema].table
+#   SELECT [DISTINCT] cols FROM [database].[schema].table [WHERE expr] [ORDER BY ...] [LIMIT n] [OFFSET n]
+#   INSERT INTO [database].[schema].table [(cols)] VALUES (row), ...
+#   UPDATE [database].[schema].table SET col=expr [, col=expr] [WHERE expr]
+#   DELETE FROM [database].[schema].table [WHERE expr]
 #   BEGIN [TRANSACTION | WORK]
 #   COMMIT [TRANSACTION | WORK]
 #   ROLLBACK [TRANSACTION | WORK]
@@ -84,6 +84,34 @@ proc expectIdent(p: var Parser): string =
     t.value
   else:
     raise parseError(&"expected identifier but got '{t.value}' ({t.kind})", t)
+
+# ---------------------------------------------------------------------------
+# Qualified table reference parsing
+# ---------------------------------------------------------------------------
+
+proc parseQualifiedTableRef(p: var Parser): TableRef =
+  ## Parse a qualified table reference: [database].[schema].table
+  ## Supports:
+  ##   "table"                  -> (database: "", schema: "", table: "table")
+  ##   "schema.table"           -> (database: "", schema: "schema", table: "table")
+  ##   "database.schema.table"  -> (database: "database", schema: "schema", table: "table")
+  let first = p.expectIdent
+
+  if p.check(tkDot):
+    discard p.advance # consume first dot
+    let second = p.expectIdent
+
+    if p.check(tkDot):
+      discard p.advance # consume second dot
+      let third = p.expectIdent
+      # database.schema.table
+      TableRef(database: first, schema: second, table: third)
+    else:
+      # schema.table
+      TableRef(database: "", schema: first, table: second)
+  else:
+    # just table
+    TableRef(database: "", schema: "", table: first)
 
 # ---------------------------------------------------------------------------
 # Literal helpers
@@ -335,7 +363,7 @@ proc parseCreateTable(p: var Parser): Stmt =
   ## Called after CREATE TABLE has been consumed.
   let ifNotExists = p.parseIfNotExists
 
-  let tableName = p.expectIdent
+  let tableRef = p.parseQualifiedTableRef
   discard p.expect(tkLParen)
 
   var cols: seq[ColDef]
@@ -365,7 +393,7 @@ proc parseCreateTable(p: var Parser): Stmt =
   discard p.expect(tkRParen)
   let replicas = p.parseWithReplicas
   let spaceName = p.parseInSpace
-  result = Stmt(kind: stmtCreateTable, ctTable: tableName,
+  result = Stmt(kind: stmtCreateTable, ctTableRef: tableRef,
                 ctIfNotExists: ifNotExists, ctColumns: cols,
                 ctPrimaryKey: tablePK, ctReplicas: replicas,
                 ctSpaceName: spaceName)
@@ -377,8 +405,8 @@ proc parseCreateTable(p: var Parser): Stmt =
 proc parseDropTable(p: var Parser): Stmt =
   ## Called after DROP TABLE has been consumed.
   let ifExists = p.parseIfExists
-  let tableName = p.expectIdent
-  result = Stmt(kind: stmtDropTable, dtTable: tableName, dtIfExists: ifExists)
+  let tableRef = p.parseQualifiedTableRef
+  result = Stmt(kind: stmtDropTable, dtTableRef: tableRef, dtIfExists: ifExists)
 
 # ---------------------------------------------------------------------------
 # SELECT
@@ -407,7 +435,7 @@ proc parseSelect(p: var Parser): Stmt =
   let cols = p.parseSelectCols
 
   discard p.expect(tkFrom)
-  let fromTable = p.expectIdent
+  let fromTable = p.parseQualifiedTableRef
   var fromAlias = ""
   if p.peekKind == tkIdent and p.peek.value.toUpperAscii == "AS":
     discard p.advance
@@ -456,7 +484,7 @@ proc parseSelect(p: var Parser): Stmt =
 proc parseInsert(p: var Parser): Stmt =
   ## Called after INSERT has been consumed.
   discard p.expect(tkInto)
-  let tableName = p.expectIdent
+  let tableRef = p.parseQualifiedTableRef
 
   # optional column list
   var cols: seq[string]
@@ -480,7 +508,7 @@ proc parseInsert(p: var Parser): Stmt =
     rows.add(row)
     if not p.match(tkComma): break
 
-  result = Stmt(kind: stmtInsert, intoTable: tableName,
+  result = Stmt(kind: stmtInsert, intoTableRef: tableRef,
                 intoCols: cols, intoValues: rows)
 
 # ---------------------------------------------------------------------------
@@ -489,7 +517,7 @@ proc parseInsert(p: var Parser): Stmt =
 
 proc parseUpdate(p: var Parser): Stmt =
   ## Called after UPDATE has been consumed.
-  let tableName = p.expectIdent
+  let tableRef = p.parseQualifiedTableRef
   var alias = ""
   if p.peekKind == tkIdent and p.peek.value.toUpperAscii == "AS":
     discard p.advance
@@ -511,7 +539,7 @@ proc parseUpdate(p: var Parser): Stmt =
   if p.match(tkWhere):
     whereExpr = some(p.parseExpr)
 
-  result = Stmt(kind: stmtUpdate, updTable: tableName, updAlias: alias,
+  result = Stmt(kind: stmtUpdate, updTableRef: tableRef, updAlias: alias,
                 updSets: sets, updWhere: whereExpr)
 
 # ---------------------------------------------------------------------------
@@ -521,7 +549,7 @@ proc parseUpdate(p: var Parser): Stmt =
 proc parseDelete(p: var Parser): Stmt =
   ## Called after DELETE has been consumed.
   discard p.expect(tkFrom)
-  let tableName = p.expectIdent
+  let tableRef = p.parseQualifiedTableRef
   var alias = ""
   if p.peekKind == tkIdent and p.peek.value.toUpperAscii == "AS":
     discard p.advance
@@ -533,7 +561,7 @@ proc parseDelete(p: var Parser): Stmt =
   if p.match(tkWhere):
     whereExpr = some(p.parseExpr)
 
-  result = Stmt(kind: stmtDelete, delTable: tableName, delAlias: alias,
+  result = Stmt(kind: stmtDelete, delTableRef: tableRef, delAlias: alias,
                 delWhere: whereExpr)
 
 # ---------------------------------------------------------------------------
@@ -594,12 +622,12 @@ proc parseCreateSchema(p: var Parser): Stmt =
   let name = p.expectIdent
   let replicas = p.parseWithReplicas
   Stmt(kind: stmtCreateSchema, csName: name, csIfNotExists: ine,
-       csReplicas: replicas)
+       csReplicas: replicas, csDatabase: "")
 
 proc parseDropSchema(p: var Parser): Stmt =
   let ie = p.parseIfExists
   let name = p.expectIdent
-  Stmt(kind: stmtDropSchema, dsName: name, dsIfExists: ie)
+  Stmt(kind: stmtDropSchema, dsName: name, dsIfExists: ie, dsDatabase: "")
 
 # ---------------------------------------------------------------------------
 # CREATE / DROP SPACE

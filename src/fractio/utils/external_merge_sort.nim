@@ -38,11 +38,17 @@ proc `<=>`(a, b: string): int =
 # =============================================================================
 # Constants
 # =============================================================================
+# Note: These defaults are for backward compatibility. In production, tempDir
+# should be configured via FractioConfig.tempDir, and subdirectories are used:
+#   tempDir/sort/  - for external merge sort chunk files
+#   tempDir/...    - future operations can use other subdirectories
 
 const
-  DEFAULT_CHUNK_SIZE* = 10000             ## Rows per sorted chunk
-  DEFAULT_MAX_OPEN_FILES* = 32            ## Maximum open chunk files during merge
-  DEFAULT_TEMP_DIR* = "/tmp/fractio-sort" ## Temporary directory for chunk files
+  DEFAULT_CHUNK_SIZE* = 10000  ## Rows per sorted chunk
+  DEFAULT_MAX_OPEN_FILES* = 32 ## Maximum open chunk files during merge
+  DEFAULT_TEMP_DIR* = "/tmp/fractio" ## Base temporary directory (backward compat)
+  SORT_SUBDIR* = "sort"        ## Subdirectory for sort operations
+  REVERSE_SUBDIR* = "reverse"  ## Subdirectory for reverse operations
 
 # =============================================================================
 # Types
@@ -117,20 +123,40 @@ proc externalSortError(code: ExternalSortErrorCode,
 # =============================================================================
 
 proc defaultSortConfig*(): SortConfig =
-  ## Create default sort configuration
+  ## Create default sort configuration.
+  ## Uses DEFAULT_TEMP_DIR/sort/ as the temp directory.
   SortConfig(
     chunkSize: DEFAULT_CHUNK_SIZE,
     maxOpenFiles: DEFAULT_MAX_OPEN_FILES,
-    tempDir: DEFAULT_TEMP_DIR,
+    tempDir: DEFAULT_TEMP_DIR / SORT_SUBDIR,
     memoryBudget: 0 # unlimited
   )
 
 proc newSortConfig*(chunkSize: int, tempDir: string = DEFAULT_TEMP_DIR): SortConfig =
-  ## Create a custom sort configuration
+  ## Create a custom sort configuration.
+  ## If base tempDir is provided, uses tempDir/sort/ for sort files.
+  ## If tempDir already ends with '/sort', uses it directly (backward compat).
+  let sortDir = if tempDir.endsWith(SORT_SUBDIR) or tempDir.endsWith(
+      SORT_SUBDIR & "/"):
+                  tempDir
+                else:
+                  tempDir / SORT_SUBDIR
   SortConfig(
     chunkSize: chunkSize,
     maxOpenFiles: DEFAULT_MAX_OPEN_FILES,
-    tempDir: tempDir,
+    tempDir: sortDir,
+    memoryBudget: 0
+  )
+
+proc newSortConfigWithBaseDir*(chunkSize: int,
+    baseTempDir: string): SortConfig =
+  ## Create a sort configuration using a base temp directory.
+  ## Automatically adds 'sort' subdirectory: baseTempDir/sort/
+  ## Use this when you have a configured tempDir from FractioConfig.
+  SortConfig(
+    chunkSize: chunkSize,
+    maxOpenFiles: DEFAULT_MAX_OPEN_FILES,
+    tempDir: baseTempDir / SORT_SUBDIR,
     memoryBudget: 0
   )
 
@@ -529,10 +555,12 @@ type
     rowsReturned*: int ## Count of rows returned
 
 proc newStreamingSortIterator*(specs: seq[SortSpec], allColumns: seq[string],
-                                chunkSize: int = DEFAULT_CHUNK_SIZE): StreamingSortIterator =
+                                chunkSize: int = DEFAULT_CHUNK_SIZE,
+                                baseTempDir: string = DEFAULT_TEMP_DIR): StreamingSortIterator =
   ## Create a new streaming sort iterator.
+  ## baseTempDir is the base temp directory; uses baseTempDir/sort/ for chunk files.
   new(result)
-  let config = newSortConfig(chunkSize)
+  let config = newSortConfigWithBaseDir(chunkSize, baseTempDir)
   result.sorter = newExternalMergeSorter(specs, allColumns, config)
   result.pendingRows = @[]
   result.sourceExhausted = false
@@ -717,15 +745,17 @@ type
     initialized*: bool ## Reverse phase initialized flag
 
 proc newStreamingReverseIterator*(columns, allColumns: seq[string],
-                                  tempDir: string = DEFAULT_TEMP_DIR,
+                                  baseTempDir: string = DEFAULT_TEMP_DIR,
                                   chunkSize: int = DEFAULT_CHUNK_SIZE): StreamingReverseIterator =
   ## Create a new streaming reverse iterator.
   ## Used for PK DESC optimization where data needs to be reversed.
+  ## baseTempDir is the base temp directory; uses baseTempDir/reverse/ for chunk files.
+  let reverseDir = baseTempDir / REVERSE_SUBDIR
   let ts = getTime().toUnix()
   result = StreamingReverseIterator(
     columns: columns,
     allColumns: allColumns,
-    tempDir: tempDir,
+    tempDir: reverseDir,
     tempPrefix: "reverse_" & $ts & "_" & $rand(100000),
     chunkSize: chunkSize,
     currentChunkIdx: -1,
@@ -734,8 +764,8 @@ proc newStreamingReverseIterator*(columns, allColumns: seq[string],
     initialized: false
   )
   # Ensure temp directory exists
-  if not dirExists(tempDir):
-    createDir(tempDir)
+  if not dirExists(reverseDir):
+    createDir(reverseDir)
 
 proc addChunkToReverse*(iter: StreamingReverseIterator, rows: seq[seq[string]]) =
   ## Add rows to a chunk for later reversal.
@@ -875,11 +905,12 @@ proc closeIterator*(iter: StreamingReverseIterator) =
 
 proc reverseRowsWithTempFiles*(rows: seq[seq[string]],
                                columns, allColumns: seq[string],
-                               tempDir: string = DEFAULT_TEMP_DIR,
+                               baseTempDir: string = DEFAULT_TEMP_DIR,
                                chunkSize: int = DEFAULT_CHUNK_SIZE): seq[seq[string]] =
   ## Reverse rows using temp files for memory-limited operation.
   ## Used for PK DESC optimization where data is already sorted by PK ASC
   ## but needs to be returned in DESC order.
+  ## baseTempDir is the base temp directory; uses baseTempDir/reverse/ for chunk files.
   if rows.len <= 1:
     return rows
 
@@ -890,7 +921,7 @@ proc reverseRowsWithTempFiles*(rows: seq[seq[string]],
     return
 
   # Use streaming reverse for large datasets
-  let iter = newStreamingReverseIterator(columns, allColumns, tempDir, chunkSize)
+  let iter = newStreamingReverseIterator(columns, allColumns, baseTempDir, chunkSize)
 
   # Add rows in chunks
   var currentChunk: seq[seq[string]] = @[]

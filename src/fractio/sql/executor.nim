@@ -8,7 +8,7 @@
 # Pure expression evaluation functions are in expr_eval.nim and are
 # fully testable without I/O dependencies.
 
-import std/[options, strutils, strformat]
+import std/[options, strutils, strformat, sequtils]
 import ./ast
 import ./planner
 import ./data_row
@@ -70,6 +70,8 @@ type
     exhausted*: bool ## True when no more rows available
     pendingRow*: Option[seq[string]] ## Next row ready for consumption
     error*: Option[string] ## Error message if stream failed
+    isSystemTable*: bool ## True if scanning a system table
+    systemTableId*: TableId ## Table ID for system table decoding
 
   ExecutorContext* = ref object
     ## Execution context for a session, holding transaction state.
@@ -83,6 +85,7 @@ type
     hasActiveTransaction*: bool
     database*: string
     schema*: string
+    tempDir*: string ## Base directory for temporary files (sort, etc.)
 
   KVEntry* = object
     key*: string
@@ -108,12 +111,137 @@ proc streamingRowsResult*(columns: seq[string],
              streamIterator: rowIter)
 
 # ---------------------------------------------------------------------------
+# System table detection and decoding helpers
+# ---------------------------------------------------------------------------
+
+proc decodeSystemTableRecord*(tableId: TableId, rawValue: string, columns: seq[
+    string]): seq[string] =
+  ## Decode a system table record based on its table ID.
+  ## Returns column values as strings.
+  let ulid = ULID(tableId)
+  let sysTableNum = ulid.data[15]
+
+  # Strip MVCC header first
+  let (payload, isDeleted) = stripMVCCHeader(rawValue)
+  if isDeleted or payload.len == 0:
+    return @[]
+
+  # Decode based on system table number
+  case sysTableNum
+  of SYS_DATABASES_TABLE_NUM:
+    let rec = decodeDatabaseRecord(payload)
+    result = newSeq[string](columns.len)
+    for i, col in columns:
+      case col.toLowerAscii()
+      of "_key": result[i] = rec.name
+      of "name": result[i] = rec.name
+      of "createdat": result[i] = $rec.createdAtNs
+      else: result[i] = ""
+
+  of SYS_SCHEMAS_TABLE_NUM:
+    let rec = decodeSchemaRecord(payload)
+    result = newSeq[string](columns.len)
+    for i, col in columns:
+      case col.toLowerAscii()
+      of "_key": result[i] = rec.database & "." & rec.name
+      of "name": result[i] = rec.name
+      of "database": result[i] = rec.database
+      of "createdat": result[i] = $rec.createdAtNs
+      else: result[i] = ""
+
+  of SYS_TABLES_TABLE_NUM:
+    let rec = decodeTableRecord(payload)
+    result = newSeq[string](columns.len)
+    for i, col in columns:
+      case col.toLowerAscii()
+      of "_key": result[i] = rec.database & "." & rec.schema & "." & rec.name
+      of "tableid": result[i] = $rec.tableId
+      of "name": result[i] = rec.name
+      of "schema": result[i] = rec.schema
+      of "database": result[i] = rec.database
+      of "spaceid": result[i] = $rec.spaceId
+      of "primarykey": result[i] = rec.primaryKey.join(",")
+      of "columns": result[i] = $rec.columns.len & " columns" # Summary
+      else: result[i] = ""
+
+  of SYS_GROUPS_TABLE_NUM:
+    let rec = decodeGroupRecord(payload)
+    result = newSeq[string](columns.len)
+    for i, col in columns:
+      case col.toLowerAscii()
+      of "_key": result[i] = $rec.groupId
+      of "groupid": result[i] = $rec.groupId
+      of "spaceid": result[i] = $rec.spaceId
+      of "preferredleader": result[i] = $rec.preferredLeader
+      of "leader": result[i] = $rec.leader
+      of "replicas": result[i] = $rec.replicas.len & " replicas" # Summary
+      else: result[i] = ""
+
+  of SYS_NODES_TABLE_NUM:
+    let rec = decodeNodeRecord(payload)
+    result = newSeq[string](columns.len)
+    for i, col in columns:
+      case col.toLowerAscii()
+      of "_key": result[i] = $rec.nodeId
+      of "nodeid": result[i] = $rec.nodeId
+      of "host": result[i] = rec.host
+      of "raftport": result[i] = $rec.raftPort
+      of "clientport": result[i] = $rec.clientPort
+      of "status":
+        # Strip the 'ns' prefix from enum value for cleaner output
+        let statusStr = $rec.status
+        if statusStr.startsWith("ns"):
+          result[i] = statusStr[2..^1].toLowerAscii() # Remove 'ns' prefix and lowercase
+        else:
+          result[i] = statusStr.toLowerAscii()
+      else: result[i] = ""
+
+  of SYS_SETTINGS_TABLE_NUM:
+    let rec = decodeSettingRecord(payload)
+    result = newSeq[string](columns.len)
+    for i, col in columns:
+      case col.toLowerAscii()
+      of "_key": result[i] = "" # Key comes from KV store key, not record
+      of "value": result[i] = rec.value
+      else: result[i] = ""
+
+  of SYS_SPACES_TABLE_NUM:
+    let rec = decodeSpaceRecord(payload)
+    result = newSeq[string](columns.len)
+    for i, col in columns:
+      case col.toLowerAscii()
+      of "_key": result[i] = $rec.spaceId
+      of "spaceid": result[i] = $rec.spaceId
+      of "name": result[i] = rec.name
+      of "replicas": result[i] = $rec.replicas
+      of "groupcount": result[i] = $rec.groupCount
+      of "groupids": result[i] = rec.groupIds.mapIt($it).join(",")
+      of "oldgroupids": result[i] = rec.oldGroupIds.mapIt($it).join(",")
+      of "rebalancing": result[i] = $rec.rebalancing
+      of "createdat": result[i] = $rec.createdAtNs
+      else: result[i] = ""
+
+  of SYS_NODE_METRICS_NUM, SYS_GROUP_METRICS_NUM, SYS_EVENTS_TABLE_NUM:
+    # For metrics and events tables, return raw _key and _value
+    result = newSeq[string](columns.len)
+    for i, col in columns:
+      case col.toLowerAscii()
+      of "_key": result[i] = "" # Would need key decoding
+      of "_value": result[i] = payload # Raw binary
+      else: result[i] = ""
+
+  else:
+    # Unknown system table - return empty
+    result = newSeq[string](columns.len)
+
+# ---------------------------------------------------------------------------
 # StreamingRowIterator implementation
 # ---------------------------------------------------------------------------
 
 proc newStreamingRowIterator*(stream: StreamingScanClient,
     filter: Option[Expr], columns: seq[string], allColumns: seq[string],
-    limit: uint32): StreamingRowIterator =
+    limit: uint32, isSystemTable: bool = false,
+        systemTableId: TableId = zeroTableId()): StreamingRowIterator =
   ## Create a new streaming row iterator.
   new(result)
   result.stream = stream
@@ -125,6 +253,8 @@ proc newStreamingRowIterator*(stream: StreamingScanClient,
   result.exhausted = false
   result.pendingRow = none(seq[string])
   result.error = none(string)
+  result.isSystemTable = isSystemTable
+  result.systemTableId = systemTableId
 
 proc fetchNextMatchingRow*(iter: StreamingRowIterator): Option[seq[string]] =
   ## Fetch the next row that matches the filter (if any).
@@ -144,9 +274,7 @@ proc fetchNextMatchingRow*(iter: StreamingRowIterator): Option[seq[string]] =
     return none(seq[string])
 
   # Search for next matching row
-  var callCount = 0
-  while iter.stream.hasNext() and callCount < 1000:
-    inc callCount
+  while iter.stream.hasNext():
     let pairOpt = iter.stream.nextPair()
     if pairOpt.isNone:
       iter.exhausted = true
@@ -154,16 +282,25 @@ proc fetchNextMatchingRow*(iter: StreamingRowIterator): Option[seq[string]] =
 
     let pair = pairOpt.get()
     try:
-      let dataRow = decodeDataRow(pair.value)
+      if iter.isSystemTable:
+        # System tables use binary encoding
+        let rowVals = decodeSystemTableRecord(iter.systemTableId, pair.value, iter.columns)
+        if rowVals.len > 0:
+          # Note: System table filter matching needs special handling
+          # For now, skip filter matching on system tables
+          inc iter.rowsReturned
+          return some(rowVals)
+      else:
+        let dataRow = decodeDataRow(pair.value)
 
-      # Apply filter if present
-      if not matchesFilterDataRow(iter.filter, dataRow):
-        continue # Skip non-matching row
-      
-      # Extract requested columns
-      let extracted = extractColumnsFromDataRow(dataRow, iter.columns)
-      inc iter.rowsReturned
-      return some(extracted)
+        # Apply filter if present
+        if not matchesFilterDataRow(iter.filter, dataRow):
+          continue # Skip non-matching row
+        
+        # Extract requested columns
+        let extracted = extractColumnsFromDataRow(dataRow, iter.columns)
+        inc iter.rowsReturned
+        return some(extracted)
     except ValueError:
       # Skip malformed rows
       continue
@@ -299,9 +436,10 @@ proc bufferRows*(res: ExecResult): ExecResult =
 # ---------------------------------------------------------------------------
 
 proc newExecutorContext*(client: FractioClient, database: string = "default",
-    schema: string = "public"): ExecutorContext =
+    schema: string = "public", tempDir: string = ""): ExecutorContext =
   ## Create a new executor context with default settings.
   ## Uses the FractioClient as the KVStore implementation.
+  ## tempDir is the base directory for temporary files; if empty, uses default.
   ExecutorContext(
     kv: client, # FractioClient implements KVStoreWithRouting
     client: client,
@@ -309,13 +447,14 @@ proc newExecutorContext*(client: FractioClient, database: string = "default",
     readTimestamp: client.activeReadTs,
     hasActiveTransaction: not isZero(client.activeTxnId),
     database: database,
-    schema: schema
+    schema: schema,
+    tempDir: tempDir
   )
 
 proc newExecutorContextWithKV*(kv: KVStore, client: FractioClient = nil,
     database: string = "default", schema: string = "public",
     txnId: TransactionID = zeroTransactionID(),
-    readTimestamp: uint64 = 0): ExecutorContext =
+    readTimestamp: uint64 = 0, tempDir: string = ""): ExecutorContext =
   ## Create a new executor context with a custom KVStore implementation.
   ## This is useful for testing with MockKVStore.
   ## If client is nil, space operations (CREATE/DROP SPACE) will fail.
@@ -326,7 +465,8 @@ proc newExecutorContextWithKV*(kv: KVStore, client: FractioClient = nil,
     readTimestamp: readTimestamp,
     hasActiveTransaction: not isZero(txnId),
     database: database,
-    schema: schema
+    schema: schema,
+    tempDir: tempDir
   )
 
 # ---------------------------------------------------------------------------
@@ -764,7 +904,7 @@ proc execShowSpacesTxn(ctx: ExecutorContext): ExecResult =
 proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult
 
 proc execute*(plan: Plan, client: FractioClient,
-    database: string = "default"): ExecResult =
+    database: string = "default", tempDir: string = ""): ExecResult =
   ## Execute a Plan against a FractioClient, returning an ExecResult.
   ## Processes ops sequentially; returns the result of the last op
   ## (or the first error).
@@ -773,11 +913,12 @@ proc execute*(plan: Plan, client: FractioClient,
   ## - DDL operations use internal auto-commit transactions
   ## - DML operations use implicit transactions if not in an explicit one
   ##
+  ## tempDir is the base directory for temporary files (sort, etc.).
   ## This is the simplified unified entry point.
   if client == nil:
     return errorResult("FractioClient is required for all operations")
 
-  let ctx = newExecutorContext(client, database)
+  let ctx = newExecutorContext(client, database, "public", tempDir)
   executeWithTxn(plan, ctx)
 
 # ---------------------------------------------------------------------------
@@ -907,42 +1048,66 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
       modifiedResult(count, &"INSERT {count}")
 
     of poPointGet:
-      let key = encodeDataRowKey(op.pgTableId, op.pgKey)
+      let isSysTable = isSystemTableId(op.pgTableId)
 
-      # Use server-side filter when FractioClient is available (PointGet optimization)
-      # Fall back to client-side filtering for MockKVStore tests
-      if ctx.client != nil and op.pgFilter.isSome:
-        # Convert Expr to WireFilterExpr for server-side evaluation
-        let wireFilter = exprToWireFilterExpr(op.pgFilter.get())
-        let res = ctx.client.getWithFilter(key, some(wireFilter),
-                                           ctx.txnId, ctx.readTimestamp)
-        if res.isErr:
-          return errorResult(&"failed to read: {res.err}")
-        if res.val.isNone:
-          # Row doesn't exist or doesn't pass server-side filter
-          return rowsResult(op.pgColumns, @[])
-        let row = decodeDataRow(res.val.get())
-        let vals = extractColumnsFromDataRow(row, op.pgColumns)
-        rowsResult(op.pgColumns, @[vals])
+      # Use correct key encoding based on table type
+      let key = if isSysTable:
+        encodeTableKey(op.pgTableId, op.pgKey)
       else:
-        # Fallback path: get value then apply filter client-side
+        encodeDataRowKey(op.pgTableId, op.pgKey)
+
+      if isSysTable:
+        # System table lookup - use binary decoding
         let res = txnGet(ctx, key)
         if res.isErr:
           return errorResult(&"failed to read: {res.err}")
         if res.val.isNone:
           return rowsResult(op.pgColumns, @[])
-        let row = decodeDataRow(res.val.get())
 
-        # Apply remaining filter if present (pk = value AND other_cond)
-        if op.pgFilter.isSome and not matchesFilterDataRow(op.pgFilter, row):
+        let rowVals = decodeSystemTableRecord(op.pgTableId, res.val.get(), op.pgColumns)
+        if rowVals.len == 0:
           return rowsResult(op.pgColumns, @[])
+        rowsResult(op.pgColumns, @[rowVals])
+      else:
+        # User table lookup - use DataRow decoding
+        # Use server-side filter when FractioClient is available (PointGet optimization)
+        # Fall back to client-side filtering for MockKVStore tests
+        if ctx.client != nil and op.pgFilter.isSome:
+          # Convert Expr to WireFilterExpr for server-side evaluation
+          let wireFilter = exprToWireFilterExpr(op.pgFilter.get())
+          let res = ctx.client.getWithFilter(key, some(wireFilter),
+                                             ctx.txnId, ctx.readTimestamp)
+          if res.isErr:
+            return errorResult(&"failed to read: {res.err}")
+          if res.val.isNone:
+            # Row doesn't exist or doesn't pass server-side filter
+            return rowsResult(op.pgColumns, @[])
+          let row = decodeDataRow(res.val.get())
+          let vals = extractColumnsFromDataRow(row, op.pgColumns)
+          rowsResult(op.pgColumns, @[vals])
+        else:
+          # Fallback path: get value then apply filter client-side
+          let res = txnGet(ctx, key)
+          if res.isErr:
+            return errorResult(&"failed to read: {res.err}")
+          if res.val.isNone:
+            return rowsResult(op.pgColumns, @[])
+          let row = decodeDataRow(res.val.get())
 
-        let vals = extractColumnsFromDataRow(row, op.pgColumns)
-        rowsResult(op.pgColumns, @[vals])
+          # Apply remaining filter if present (pk = value AND other_cond)
+          if op.pgFilter.isSome and not matchesFilterDataRow(op.pgFilter, row):
+            return rowsResult(op.pgColumns, @[])
+
+          let vals = extractColumnsFromDataRow(row, op.pgColumns)
+          rowsResult(op.pgColumns, @[vals])
 
     of poScan:
       # Use streaming scan for SELECT queries when FractioClient is available
       # Fall back to buffered scan for MockKVStore tests
+      # Handle system tables specially - they use binary encoding, not DataRow
+
+      let isSysTable = isSystemTableId(op.scTableId)
+
       if ctx.client != nil:
         # Convert Expr to WireFilterExpr for server-side filtering
         # Note: Server filter reduces network traffic, client-side filter handles
@@ -958,12 +1123,15 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
 
         # Create streaming row iterator that handles filtering and LIMIT
         # Pass original Expr filter for complex client-side conditions
+        # For system tables, use special decoder
         let rowIter = newStreamingRowIterator(
           streamRes.value,
           op.scFilter,
           op.scColumns,
           op.scAllColumns,
-          op.scLimit
+          op.scLimit,
+          isSysTable,
+          op.scTableId
         )
 
         streamingRowsResult(op.scColumns, rowIter)
@@ -977,12 +1145,22 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
         var count = 0
         for entry in res.val:
           try:
-            let row = decodeDataRow(entry.value)
-            if matchesFilterDataRow(op.scFilter, row):
-              resultRows.add(extractColumnsFromDataRow(row, op.scColumns))
-              inc count
-              if op.scLimit > 0 and count >= int(op.scLimit):
-                break
+            if isSysTable:
+              # System tables use binary encoding
+              let rowVals = decodeSystemTableRecord(op.scTableId, entry.value, op.scColumns)
+              if rowVals.len > 0:
+                # Note: System table filter matching would need special handling
+                resultRows.add(rowVals)
+                inc count
+                if op.scLimit > 0 and count >= int(op.scLimit):
+                  break
+            else:
+              let row = decodeDataRow(entry.value)
+              if matchesFilterDataRow(op.scFilter, row):
+                resultRows.add(extractColumnsFromDataRow(row, op.scColumns))
+                inc count
+                if op.scLimit > 0 and count >= int(op.scLimit):
+                  break
           except ValueError:
             discard # skip malformed rows
 

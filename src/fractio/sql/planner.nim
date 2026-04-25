@@ -454,23 +454,37 @@ proc makeScanKeysFromRange*(tableId: TableId, rangeInfo: PkRangeInfo): tuple[
   ## Generate start and end keys for scan from PK range info.
   ## For exact match, both keys are the same (point get).
   ## For range scan, generates appropriate bounds.
+  ##
+  ## System tables use encodeTableKey (no "d/" prefix).
+  ## User tables use encodeDataRowKey (with "d/" prefix for data rows).
+
+  let isSysTable = isSystemTableId(tableId)
 
   if rangeInfo.isPointGet and rangeInfo.exactMatch.isSome:
     # Point get - single key
     let pkVal = rangeInfo.exactMatch.get()
-    result.startKey = encodeDataRowKey(tableId, pkVal)
+    if isSysTable:
+      result.startKey = encodeTableKey(tableId, pkVal)
+    else:
+      result.startKey = encodeDataRowKey(tableId, pkVal)
     result.endKey = result.startKey
     return result
 
   # Range scan
   if rangeInfo.startBound.isSome:
     let bound = rangeInfo.startBound.get()
-    result.startKey = encodeDataRowKey(tableId, bound.value)
+    if isSysTable:
+      result.startKey = encodeTableKey(tableId, bound.value)
+    else:
+      result.startKey = encodeDataRowKey(tableId, bound.value)
     # For exclusive lower bound (>), we need to skip exact match
     # The scan will naturally skip it since we filter rows
   else:
     # No lower bound - start from beginning of table
-    result.startKey = encodeDataRowKey(tableId, "")
+    if isSysTable:
+      result.startKey = encodeTableKey(tableId, "")
+    else:
+      result.startKey = encodeDataRowKey(tableId, "")
 
   if rangeInfo.endBound.isSome:
     let bound = rangeInfo.endBound.get()
@@ -480,13 +494,22 @@ proc makeScanKeysFromRange*(tableId: TableId, rangeInfo: PkRangeInfo): tuple[
     # - For < (exclusive): scan up to pk (excludes pk)
     if bound.isInclusive:
       # Include the bound by appending a high byte
-      result.endKey = encodeDataRowKey(tableId, bound.value & "\xFF")
+      if isSysTable:
+        result.endKey = encodeTableKey(tableId, bound.value & "\xFF")
+      else:
+        result.endKey = encodeDataRowKey(tableId, bound.value & "\xFF")
     else:
       # Exclude the bound - scan up to but not including
-      result.endKey = encodeDataRowKey(tableId, bound.value)
+      if isSysTable:
+        result.endKey = encodeTableKey(tableId, bound.value)
+      else:
+        result.endKey = encodeDataRowKey(tableId, bound.value)
   else:
     # No upper bound - scan to end of table
-    result.endKey = makeDataRowScanEndKey(tableId)
+    if isSysTable:
+      result.endKey = makeScanEndKey(tableId)
+    else:
+      result.endKey = makeDataRowScanEndKey(tableId)
 
 # ---------------------------------------------------------------------------
 # Catalog lookups
@@ -503,6 +526,168 @@ proc columnDataTypeToDataType(cdt: ColumnDataType): DataType =
   of cdtDate: dtDate
   of cdtDateTime: dtDateTime
   of cdtULID: dtULID
+
+# ---------------------------------------------------------------------------
+# System table descriptors for sys schema queries
+# ---------------------------------------------------------------------------
+
+proc getSystemTableDescriptor(tableName: string): Option[TableDescriptor] =
+  ## Return a table descriptor for a system table when querying from sys schema.
+  ## System tables have well-known IDs and fixed schemas.
+  let name = tableName.toLowerAscii()
+
+  # All system tables have a single primary key column named "_key"
+  let pkCol = ColDef(name: "_key", dataType: dtString, maxLen: 64,
+      primaryKey: true, notNull: true)
+  let pkSpec = PrimaryKeySpec(columns: @[(name: "_key", dataType: cdtString, maxLen: 64)])
+
+  if name == "databases":
+    return some(TableDescriptor(
+      tableId: SYS_DATABASES_TABLE_ID,
+      name: "databases",
+      schema: "sys",
+      database: "sys",
+      columns: @[pkCol, ColDef(name: "name", dataType: dtString), ColDef(
+          name: "createdAt", dataType: dtDateTime)],
+      primaryKey: @["_key"],
+      pkSpec: pkSpec,
+      spaceId: zeroSpaceID()
+    ))
+
+  if name == "schemas":
+    return some(TableDescriptor(
+      tableId: SYS_SCHEMAS_TABLE_ID,
+      name: "schemas",
+      schema: "sys",
+      database: "sys",
+      columns: @[pkCol, ColDef(name: "name", dataType: dtString), ColDef(
+          name: "database", dataType: dtString), ColDef(name: "createdAt",
+          dataType: dtDateTime)],
+      primaryKey: @["_key"],
+      pkSpec: pkSpec,
+      spaceId: zeroSpaceID()
+    ))
+
+  if name == "tables":
+    return some(TableDescriptor(
+      tableId: SYS_TABLES_TABLE_ID,
+      name: "tables",
+      schema: "sys",
+      database: "sys",
+      columns: @[pkCol, ColDef(name: "tableId", dataType: dtULID), ColDef(
+          name: "name", dataType: dtString), ColDef(name: "schema",
+          dataType: dtString), ColDef(name: "database", dataType: dtString),
+          ColDef(name: "spaceId", dataType: dtULID), ColDef(name: "primaryKey",
+          dataType: dtString), ColDef(name: "columns", dataType: dtBytes)],
+      primaryKey: @["_key"],
+      pkSpec: pkSpec,
+      spaceId: zeroSpaceID()
+    ))
+
+  if name == "groups":
+    return some(TableDescriptor(
+      tableId: SYS_GROUPS_TABLE_ID,
+      name: "groups",
+      schema: "sys",
+      database: "sys",
+      columns: @[pkCol, ColDef(name: "groupId", dataType: dtULID), ColDef(
+          name: "spaceId", dataType: dtULID), ColDef(name: "preferredLeader",
+          dataType: dtInt), ColDef(name: "leader", dataType: dtInt), ColDef(
+          name: "replicas", dataType: dtBytes)],
+      primaryKey: @["_key"],
+      pkSpec: pkSpec,
+      spaceId: zeroSpaceID()
+    ))
+
+  if name == "nodes":
+    return some(TableDescriptor(
+      tableId: SYS_NODES_TABLE_ID,
+      name: "nodes",
+      schema: "sys",
+      database: "sys",
+      columns: @[pkCol, ColDef(name: "nodeId", dataType: dtInt), ColDef(
+          name: "host", dataType: dtString), ColDef(name: "raftPort",
+          dataType: dtInt), ColDef(name: "clientPort", dataType: dtInt), ColDef(
+          name: "webPort", dataType: dtInt), ColDef(name: "status",
+          dataType: dtInt)],
+      primaryKey: @["_key"],
+      pkSpec: pkSpec,
+      spaceId: zeroSpaceID()
+    ))
+
+  if name == "settings":
+    return some(TableDescriptor(
+      tableId: SYS_SETTINGS_TABLE_ID,
+      name: "settings",
+      schema: "sys",
+      database: "sys",
+      columns: @[pkCol, ColDef(name: "value", dataType: dtString)],
+      primaryKey: @["_key"],
+      pkSpec: pkSpec,
+      spaceId: zeroSpaceID()
+    ))
+
+  if name == "spaces":
+    return some(TableDescriptor(
+      tableId: SYS_SPACES_TABLE_ID,
+      name: "spaces",
+      schema: "sys",
+      database: "sys",
+      columns: @[pkCol, ColDef(name: "spaceId", dataType: dtULID), ColDef(
+          name: "name", dataType: dtString), ColDef(name: "replicas",
+          dataType: dtInt), ColDef(name: "groupCount", dataType: dtInt), ColDef(
+          name: "groupIds", dataType: dtBytes), ColDef(name: "oldGroupIds",
+          dataType: dtBytes), ColDef(name: "rebalancing", dataType: dtBool),
+          ColDef(name: "createdAt", dataType: dtDateTime)],
+      primaryKey: @["_key"],
+      pkSpec: pkSpec,
+      spaceId: zeroSpaceID()
+    ))
+
+  if name == "node_metrics":
+    return some(TableDescriptor(
+      tableId: SYS_NODE_METRICS_ID,
+      name: "node_metrics",
+      schema: "sys",
+      database: "sys",
+      columns: @[pkCol, ColDef(name: "nodeId", dataType: dtInt), ColDef(
+          name: "cpuPercent", dataType: dtFloat), ColDef(name: "memUsedBytes",
+          dataType: dtInt), ColDef(name: "diskUsedBytes", dataType: dtInt)],
+      primaryKey: @["_key"],
+      pkSpec: pkSpec,
+      spaceId: zeroSpaceID()
+    ))
+
+  if name == "group_metrics":
+    return some(TableDescriptor(
+      tableId: SYS_GROUP_METRICS_ID,
+      name: "group_metrics",
+      schema: "sys",
+      database: "sys",
+      columns: @[pkCol, ColDef(name: "groupId", dataType: dtULID), ColDef(
+          name: "keyCount", dataType: dtInt), ColDef(name: "sizeBytes",
+          dataType: dtInt), ColDef(name: "readQps", dataType: dtFloat), ColDef(
+          name: "writeQps", dataType: dtFloat)],
+      primaryKey: @["_key"],
+      pkSpec: pkSpec,
+      spaceId: zeroSpaceID()
+    ))
+
+  if name == "events":
+    return some(TableDescriptor(
+      tableId: SYS_EVENTS_TABLE_ID,
+      name: "events",
+      schema: "sys",
+      database: "sys",
+      columns: @[pkCol, ColDef(name: "timestamp", dataType: dtDateTime), ColDef(
+          name: "eventType", dataType: dtString), ColDef(name: "nodeId",
+          dataType: dtInt), ColDef(name: "message", dataType: dtString)],
+      primaryKey: @["_key"],
+      pkSpec: pkSpec,
+      spaceId: zeroSpaceID()
+    ))
+
+  none(TableDescriptor)
 
 proc resolveTable*(client: FractioClient,
     database, schema, tableName: string): Option[TableDescriptor] =
@@ -537,6 +722,28 @@ proc resolveTable*(client: FractioClient,
     cd.notNull = (col.flags and 0x02) != 0
     desc.columns.add(cd)
   some(desc)
+
+proc resolveQualifiedTableRef*(client: FractioClient,
+    defaultDatabase, defaultSchema: string,
+    tableRef: TableRef): Option[TableDescriptor] =
+  ## Resolve a qualified table reference to a table descriptor.
+  ## Handles:
+  ##   - "table" (uses default database/schema)
+  ##   - "schema.table" (uses default database, explicit schema)
+  ##   - "database.schema.table" (fully qualified)
+  ##   - "sys.table" (system table, returns built-in descriptor)
+
+  # Check for sys schema first (system tables)
+  let schemaName = if tableRef.schema != "": tableRef.schema else: defaultSchema
+  if schemaName.toLowerAscii() == "sys":
+    # System table - return built-in descriptor
+    return getSystemTableDescriptor(tableRef.table)
+
+  # Resolve database and schema from tableRef or defaults
+  let dbName = if tableRef.database != "": tableRef.database else: defaultDatabase
+  let scName = if tableRef.schema != "": tableRef.schema else: defaultSchema
+
+  resolveTable(client, dbName, scName, tableRef.table)
 
 proc genNewTableId*(): TableId =
   ## Generate a new globally unique TableId using ULID.
@@ -772,6 +979,13 @@ proc planCreateTable(stmt: Stmt, client: FractioClient,
     database, schema: string): Plan =
   let plan = newPlan()
 
+  # Resolve database and schema from tableRef or defaults
+  let dbName = if stmt.ctTableRef.database !=
+      "": stmt.ctTableRef.database else: database
+  let scName = if stmt.ctTableRef.schema !=
+      "": stmt.ctTableRef.schema else: schema
+  let tableName = stmt.ctTableRef.table
+
   # Build column definitions in binary format
   var columns: seq[ColumnDefBin]
   for col in stmt.ctColumns:
@@ -802,20 +1016,20 @@ proc planCreateTable(stmt: Stmt, client: FractioClient,
   let placeholderSpaceId = zeroSpaceID()
   let rec = TableRecord(
     tableId: tableId,
-    name: stmt.ctTable,
-    schema: schema,
-    database: database,
+    name: tableName,
+    schema: scName,
+    database: dbName,
     spaceId: placeholderSpaceId, # Will be resolved at execution time
     primaryKey: pk,
     columns: columns
   )
 
   plan.add(PlanOp(kind: poCreateTable,
-    ctName: stmt.ctTable,
+    ctName: tableName,
     ctIfNotExists: stmt.ctIfNotExists,
     ctValue: encode(rec),
-    ctSchema: schema,
-    ctDatabase: database,
+    ctSchema: scName,
+    ctDatabase: dbName,
     ctSpaceName: stmt.ctSpaceName,
   ))
   plan
@@ -823,9 +1037,10 @@ proc planCreateTable(stmt: Stmt, client: FractioClient,
 proc planInsert(stmt: Stmt, client: FractioClient,
     database, schema: string): Plan =
   let plan = newPlan()
-  let descOpt = resolveTable(client, database, schema, stmt.intoTable)
+  let descOpt = resolveQualifiedTableRef(client, database, schema,
+      stmt.intoTableRef)
   if descOpt.isNone:
-    raise planError(&"table '{stmt.intoTable}' not found")
+    raise planError(&"table '{stmt.intoTableRef.fullName()}' not found")
   let desc = descOpt.get()
   let pkCol = findPkColumn(desc)
   let colNames = if stmt.intoCols.len > 0: stmt.intoCols
@@ -908,9 +1123,9 @@ proc detectOrderByPkOptimization*(orderItems: seq[OrderItem],
 proc planSelect(stmt: Stmt, client: FractioClient,
     database, schema: string): Plan =
   let plan = newPlan()
-  let descOpt = resolveTable(client, database, schema, stmt.selFrom)
+  let descOpt = resolveQualifiedTableRef(client, database, schema, stmt.selFrom)
   if descOpt.isNone:
-    raise planError(&"table '{stmt.selFrom}' not found")
+    raise planError(&"table '{stmt.selFrom.fullName()}' not found")
   let desc = descOpt.get()
   let allCols = columnNames(desc)
 
@@ -1043,9 +1258,10 @@ proc planSelect(stmt: Stmt, client: FractioClient,
 proc planUpdate(stmt: Stmt, client: FractioClient,
     database, schema: string): Plan =
   let plan = newPlan()
-  let descOpt = resolveTable(client, database, schema, stmt.updTable)
+  let descOpt = resolveQualifiedTableRef(client, database, schema,
+      stmt.updTableRef)
   if descOpt.isNone:
-    raise planError(&"table '{stmt.updTable}' not found")
+    raise planError(&"table '{stmt.updTableRef.fullName()}' not found")
   let desc = descOpt.get()
 
   plan.add(PlanOp(kind: poUpdate,
@@ -1061,9 +1277,10 @@ proc planUpdate(stmt: Stmt, client: FractioClient,
 proc planDelete(stmt: Stmt, client: FractioClient,
     database, schema: string): Plan =
   let plan = newPlan()
-  let descOpt = resolveTable(client, database, schema, stmt.delTable)
+  let descOpt = resolveQualifiedTableRef(client, database, schema,
+      stmt.delTableRef)
   if descOpt.isNone:
-    raise planError(&"table '{stmt.delTable}' not found")
+    raise planError(&"table '{stmt.delTableRef.fullName()}' not found")
   let desc = descOpt.get()
 
   plan.add(PlanOp(kind: poDelete,
@@ -1230,11 +1447,16 @@ proc planStatement*(stmt: Stmt, client: FractioClient,
   of stmtCreateTable: planCreateTable(stmt, client, database, schema)
   of stmtDropTable:
     let plan = newPlan()
+    # Resolve database and schema from tableRef or defaults
+    let dbName = if stmt.dtTableRef.database !=
+        "": stmt.dtTableRef.database else: database
+    let scName = if stmt.dtTableRef.schema !=
+        "": stmt.dtTableRef.schema else: schema
     plan.add(PlanOp(kind: poDropTable,
-      dtName: stmt.dtTable,
+      dtName: stmt.dtTableRef.table,
       dtIfExists: stmt.dtIfExists,
-      dtSchema: schema,
-      dtDatabase: database,
+      dtSchema: scName,
+      dtDatabase: dbName,
     ))
     plan
   of stmtInsert: planInsert(stmt, client, database, schema)

@@ -4,7 +4,7 @@
 #         BEGIN TRANSACTION, COMMIT, ROLLBACK.
 # No JOINs.
 
-import std/options
+import std/[options, strutils]
 import ../core/types as coreTypes # DataType, ColumnDef, Constraint, ValueRef
 
 # ---------------------------------------------------------------------------
@@ -13,6 +13,38 @@ import ../core/types as coreTypes # DataType, ColumnDef, Constraint, ValueRef
 
 export coreTypes.DataType, coreTypes.ColumnDef, coreTypes.Constraint,
        coreTypes.ValueRef
+
+# ---------------------------------------------------------------------------
+# Qualified table reference
+# ---------------------------------------------------------------------------
+
+type
+  TableRef* = object
+    ## A qualified table reference: [database].[schema].table
+    ## All components except table are optional.
+    ## Examples:
+    ##   "users"                  -> database="", schema="", table="users"
+    ##   "public.users"           -> database="", schema="public", table="users"
+    ##   "mydb.public.users"      -> database="mydb", schema="public", table="users"
+    ##   "sys.spaces"             -> database="", schema="sys", table="spaces"
+    database*: string ## Optional database name (empty = current database)
+    schema*: string ## Optional schema name (empty = current schema)
+    table*: string ## Required table name
+
+proc `==`*(a, b: TableRef): bool =
+  ## Equality check for TableRef (case-insensitive for names)
+  a.database.toLowerAscii == b.database.toLowerAscii and
+  a.schema.toLowerAscii == b.schema.toLowerAscii and
+  a.table.toLowerAscii == b.table.toLowerAscii
+
+proc fullName*(t: TableRef): string =
+  ## Returns the fully qualified name for debugging/logging
+  if t.database != "" and t.schema != "":
+    t.database & "." & t.schema & "." & t.table
+  elif t.schema != "":
+    t.schema & "." & t.table
+  else:
+    t.table
 
 # ---------------------------------------------------------------------------
 # Expressions
@@ -144,7 +176,7 @@ type
 
     # ---- CREATE TABLE ----
     of stmtCreateTable:
-      ctTable*: string
+      ctTableRef*: TableRef        ## qualified table reference
       ctIfNotExists*: bool
       ctColumns*: seq[ColDef]
       ctPrimaryKey*: seq[string]   ## multi-column PK from table constraint
@@ -153,7 +185,7 @@ type
 
     # ---- DROP TABLE ----
     of stmtDropTable:
-      dtTable*: string
+      dtTableRef*: TableRef        ## qualified table reference
       dtIfExists*: bool
 
     # ---- CREATE DATABASE ----
@@ -172,17 +204,19 @@ type
       csName*: string
       csIfNotExists*: bool
       csReplicas*: Option[int]     ## WITH REPLICAS = N; none → inherit from database
+      csDatabase*: string          ## database to create schema in (empty = current)
 
     # ---- DROP SCHEMA ----
     of stmtDropSchema:
       dsName*: string
       dsIfExists*: bool
+      dsDatabase*: string          ## database containing schema (empty = current)
 
     # ---- SELECT ----
     of stmtSelect:
       selDistinct*: bool
       selCols*: seq[SelectCol]     ## empty slice = SELECT *
-      selFrom*: string             ## table name (no JOINs)
+      selFrom*: TableRef           ## qualified table reference (no JOINs)
       selFromAlias*: string
       selWhere*: Option[Expr]
       selOrderBy*: seq[OrderItem]
@@ -191,20 +225,20 @@ type
 
     # ---- INSERT ----
     of stmtInsert:
-      intoTable*: string
+      intoTableRef*: TableRef      ## qualified table reference
       intoCols*: seq[string]       ## may be empty (insert positionally)
       intoValues*: seq[seq[Expr]]  ## one seq per row
 
     # ---- UPDATE ----
     of stmtUpdate:
-      updTable*: string
+      updTableRef*: TableRef       ## qualified table reference
       updAlias*: string
       updSets*: seq[tuple[col: string, val: Expr]]
       updWhere*: Option[Expr]
 
     # ---- DELETE ----
     of stmtDelete:
-      delTable*: string
+      delTableRef*: TableRef       ## qualified table reference
       delAlias*: string
       delWhere*: Option[Expr]
 
