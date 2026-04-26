@@ -182,34 +182,39 @@ proc totalPages*(p: PaginationState): int =
   if p.pageSize == 0: return 1
   max(1, p.totalRows div p.pageSize + (if p.totalRows mod p.pageSize > 0: 1 else: 0))
 
-proc nextPage*() =
+proc nextPage*(): int =
   var p = gTablePagination.get()
   if p.page < p.totalPages:
     p.page += 1
     gTablePagination.set(p)
+  0
 
-proc prevPage*() =
+proc prevPage*(): int =
   var p = gTablePagination.get()
   if p.page > 1:
     p.page -= 1
     gTablePagination.set(p)
+  0
 
-proc setPage*(n: int) =
+proc setPage*(n: int): int =
   var p = gTablePagination.get()
   p.page = max(1, min(n, p.totalPages))
   gTablePagination.set(p)
+  0
 
-proc setPageSize*(size: int) =
+proc setPageSize*(size: int): int =
   var p = gTablePagination.get()
   p.pageSize = max(10, min(500, size))
   p.page = 1 # Reset to first page
   gTablePagination.set(p)
+  0
 
-proc setSearchQuery*(query: string) =
+proc setSearchQuery*(query: string): int =
   var p = gTablePagination.get()
   p.searchQuery = query
   p.page = 1 # Reset to first page
   gTablePagination.set(p)
+  0
 
 # =============================================================================
 # Data Loaded State - Track what has been fetched

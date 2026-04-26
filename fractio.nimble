@@ -6,7 +6,7 @@ license       = "MIT"
 
 # Dependencies
 requires "nim >= 2.0.0"
-requires "happyx >= 3.0.0"
+requires "httpbeast >= 0.4.0"
 requires "zippy >= 0.10.0"
 requires "parsetoml >= 0.7.0"
 
@@ -177,7 +177,7 @@ task test_integration_protocol, "Run protocol integration tests":
 task build_web, "Compile frontend SPA to JS, minify, then build server binary":
   exec "nim js -d:release -o:src/fractio/web/static/app.js src/fractio/web/frontend.nim"
   exec "npx terser src/fractio/web/static/app.js --compress --mangle -o src/fractio/web/static/app.js"
-  exec "nim c -d:beast --mm:atomicArc --threads:on -p:src -o:bin/fractio_web src/fractio/cli/main.nim"
+  exec "nim c --mm:atomicArc --threads:on -p:src -o:bin/fractio_web src/fractio/cli/main.nim"
 
 # =============================================================================
 # Code Coverage Tasks

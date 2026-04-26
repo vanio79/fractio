@@ -77,9 +77,14 @@ proc fetchAllCore*() {.async.} =
     setLoading("storage", false)
     setLoading("spaces", false)
 
+# Forward declaration for fetchDatabases (used by refreshAll)
+proc fetchDatabases*() {.async.}
+
 proc refreshAll*() {.async.} =
   ## Full refresh with error handling
   await fetchAllCore()
+  # Also load databases for data browser
+  await fetchDatabases()
   # Re-inject clock DOM after HappyX re-renders
   jsSetTimeout(proc() = injectClockDom(), 0)
 
@@ -462,13 +467,16 @@ proc downloadFile*(content: cstring, filename: cstring, mimeType: cstring) =
   URL.revokeObjectURL(url);
   """.}
 
-proc downloadJsonExport*(data: JsObject, filename: string) =
+proc downloadJsonExport*(data: JsObject, filename: string): int =
   let jsonStr = exportToJson(data)
   downloadFile(jsonStr, cstring(filename), "application/json")
+  0
 
-proc downloadCsvExport*(columns: JsObject, rows: JsObject, filename: string) =
+proc downloadCsvExport*(columns: JsObject, rows: JsObject,
+    filename: string): int =
   let csvStr = exportToCsv(columns, rows)
   downloadFile(csvStr, cstring(filename), "text/csv")
+  0
 
 # =============================================================================
 # Trigger Wrappers (for HappyX DSL compatibility)
@@ -492,6 +500,30 @@ proc triggerLoadTables*(db: string, schema: string): int =
     return 0
   jsSetTimeout(proc() = discard fetchTables(db, schema), 0)
   0
+
+# =============================================================================
+# Force-Load Functions (bypass cache for data browser selections)
+# =============================================================================
+
+proc forceLoadSchemas*(db: string) =
+  ## Force reload schemas for the given database, bypassing the cache.
+  ## Used when user changes database selection in data browser.
+  loadedSchemasKey = "" # Clear cache to allow reload
+  jsSetTimeout(proc() = discard fetchSchemas(db), 0)
+
+proc forceLoadTables*(db: string, schema: string) =
+  ## Force reload tables for the given db.schema, bypassing the cache.
+  ## Used when user changes schema selection in data browser.
+  loadedTablesKey = "" # Clear cache to allow reload
+  jsSetTimeout(proc() = discard fetchTables(db, schema), 0)
+
+proc forceLoadTableData*(db: string, schema: string, table: string) =
+  ## Force reload table data, bypassing the cache.
+  ## Used when user clicks on a table in data browser.
+  loadedTableDataKey = "" # Clear cache to allow reload
+  let p = gTablePagination.get()
+  jsSetTimeout(proc() = discard fetchTableData(db, schema, table, p.pageSize, (
+      p.page - 1) * p.pageSize, p.searchQuery), 0)
 
 proc triggerLoadTableData*(db: string, schema: string, table: string): int =
   let p = gTablePagination.get()

@@ -15,7 +15,9 @@ import ./js_interop
 import ./dom
 import ./utils/helpers
 import ./components/[stat_card, node_row, space_row, header, footer, toast,
-    modal, dashboard_stats]
+    modal, dashboard_stats, data_browser]
+# Note: routes/*.nim use mount-based routing which conflicts with appRoutes.
+# They need to be integrated differently or the routes here need API trigger calls.
 
 # =============================================================================
 # Helper procs for JsObject field access
@@ -109,7 +111,6 @@ appRoutes "app":
         tH2(style = titleSt):
           "Metrics"
         tDiv(style = cardStyle(dark)):
-          # Display key metrics from the metrics object
           let mLen = getObjLen(metrics)
           if mLen > 0:
             tDiv(style = "display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:1rem"):
@@ -165,7 +166,6 @@ appRoutes "app":
         tH2(style = titleSt):
           "Storage (LevelDB Stats)"
         tDiv(style = cardStyle(dark)):
-          # Display storage stats
           let sLen = getObjLen(storage)
           if sLen > 0:
             tDiv(style = "display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:1rem"):
@@ -182,9 +182,6 @@ appRoutes "app":
 
   "/data":
     let dark = gDarkMode.get()
-    let databases = gDatabases.get()
-    let schemas = gSchemas.get()
-    let tables = gTables.get()
     let titleSt = titleStyle(dark)
 
     tDiv(style = shellStyle(dark)):
@@ -193,62 +190,8 @@ appRoutes "app":
         tH2(style = titleSt):
           "Data Browser"
 
-        # Databases section
-        tDiv(style = sectionStyle()):
-          tH3(style = "font-size:0.9rem;font-weight:600;color:" & (
-              if dark: DarkText else: "#333") & ";margin-bottom:0.5rem"):
-            "Databases"
-          tDiv(style = cardStyle(dark)):
-            let dbLen = databases.len
-            if dbLen > 0:
-              tDiv(style = "display:flex;flex-wrap:wrap;gap:0.5rem"):
-                for db in databases:
-                  tDiv(style = "padding:0.5rem 1rem;background:" & (
-                      if dark: DarkBorder else: LightBorder) &
-                      ";border-radius:4px"):
-                    {db}
-            else:
-              tDiv(style = "text-align:center;padding:1rem;color:" & (
-                  if dark: DarkTextMuted else: "#666")):
-                "No databases found"
-
-        # Schemas section
-        tDiv(style = sectionStyle()):
-          tH3(style = "font-size:0.9rem;font-weight:600;color:" & (
-              if dark: DarkText else: "#333") & ";margin-bottom:0.5rem"):
-            "Schemas"
-          tDiv(style = cardStyle(dark)):
-            let schLen = schemas.len
-            if schLen > 0:
-              tDiv(style = "display:flex;flex-wrap:wrap;gap:0.5rem"):
-                for sch in schemas:
-                  tDiv(style = "padding:0.5rem 1rem;background:" & (
-                      if dark: DarkBorder else: LightBorder) &
-                      ";border-radius:4px"):
-                    {sch}
-            else:
-              tDiv(style = "text-align:center;padding:1rem;color:" & (
-                  if dark: DarkTextMuted else: "#666")):
-                "No schemas found"
-
-        # Tables section
-        tDiv(style = sectionStyle()):
-          tH3(style = "font-size:0.9rem;font-weight:600;color:" & (
-              if dark: DarkText else: "#333") & ";margin-bottom:0.5rem"):
-            "Tables"
-          tDiv(style = cardStyle(dark)):
-            let tblLen = tables.len
-            if tblLen > 0:
-              tDiv(style = "display:flex;flex-wrap:wrap;gap:0.5rem"):
-                for tbl in tables:
-                  tDiv(style = "padding:0.5rem 1rem;background:" & (
-                      if dark: DarkBorder else: LightBorder) &
-                      ";border-radius:4px"):
-                    {tbl}
-            else:
-              tDiv(style = "text-align:center;padding:1rem;color:" & (
-                  if dark: DarkTextMuted else: "#666")):
-                "No tables found"
+        # Data browser component with selectors + table grid
+        DataBrowser()
       AppFooter()
 
   "/sql":

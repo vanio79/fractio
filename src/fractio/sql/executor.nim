@@ -850,6 +850,9 @@ proc execShowSchemasTxn(op: PlanOp, ctx: ExecutorContext): ExecResult =
     return errorResult(&"failed to scan schemas: {res.err}")
 
   var resultRows: seq[seq[string]]
+  # sys is a special implicit schema that always exists on all databases
+  resultRows.add(@["sys"])
+
   for entry in res.val:
     let (rec, isDeleted) = decodeSchemaRecordFromMVCC(entry.value)
     if not isDeleted and (rec.database == op.ssDatabase or op.ssDatabase.len == 0):
@@ -865,6 +868,17 @@ proc execShowTablesTxn(op: PlanOp, ctx: ExecutorContext): ExecResult =
     return errorResult(&"failed to scan tables: {res.err}")
 
   var resultRows: seq[seq[string]]
+
+  # sys schema contains implicit/virtual system tables that are always present
+  if op.stDatabase == "default" and op.stSchema == "sys":
+    resultRows.add(@["databases"])
+    resultRows.add(@["schemas"])
+    resultRows.add(@["tables"])
+    resultRows.add(@["groups"])
+    resultRows.add(@["nodes"])
+    resultRows.add(@["settings"])
+    resultRows.add(@["spaces"])
+
   for entry in res.val:
     let (rec, isDeleted) = decodeTableRecordFromMVCC(entry.value)
     if not isDeleted and
