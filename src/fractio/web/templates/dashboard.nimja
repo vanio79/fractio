@@ -1,0 +1,80 @@
+{% extends shell.nimja %}
+
+{% block content %}
+<div class='stats-grid'>
+  <div class='stat-card'>
+    <div class='stat-label'>Node ID</div>
+    <div class='stat-value'>{{ nodeId }}</div>
+  </div>
+  <div class='stat-card'>
+    <div class='stat-label'>Role</div>
+    <div class='stat-value'>{{ role }}</div>
+  </div>
+  <div class='stat-card'>
+    <div class='stat-label'>Uptime</div>
+    <div class='stat-value'>{{ uptime }}</div>
+  </div>
+  <div class='stat-card'>
+    <div class='stat-label'>Clients</div>
+    <div class='stat-value'>{{ clients }}</div>
+  </div>
+  <div class='stat-card'>
+    <div class='stat-label'>Shards</div>
+    <div class='stat-value'>{{ shards }}</div>
+  </div>
+  <div class='stat-card'>
+    <div class='stat-label'>Version</div>
+    <div class='stat-value'>{{ version }}</div>
+  </div>
+  <div class='stat-card'>
+    <div class='stat-label'>Cluster</div>
+    <div class='stat-value'>{{ clusterName }}</div>
+  </div>
+  <div class='stat-card'>
+    <div class='stat-label'>Healthy</div>
+    <div class='stat-value'>{{ healthyCount }}/{{ totalNodes }}</div>
+  </div>
+</div>
+
+{% if nodesData.len > 0 %}
+<div class='panel'>
+  <div class='panel-header'>
+    <h2 class='panel-title'>Cluster Nodes</h2>
+  </div>
+  <table class='data-table'>
+    <thead><tr><th>ID</th><th>Host</th><th>Raft Port</th><th>Client Port</th><th>Status</th></tr></thead>
+    <tbody>
+      {% for node in nodesData %}
+      <tr>
+        <td>{{ node[0] }}</td>
+        <td>{{ node[1] }}</td>
+        <td>{{ node[2] }}</td>
+        <td>{{ node[3] }}</td>
+        <td>{{ node[4] }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
+{% if spacesData.len > 0 %}
+<div class='panel'>
+  <div class='panel-header'>
+    <h2 class='panel-title'>Spaces</h2>
+  </div>
+  <table class='data-table'>
+    <thead><tr><th>Name</th><th>Database</th><th>Groups</th></tr></thead>
+    <tbody>
+      {% for space in spacesData %}
+      <tr>
+        <td>{{ space[0] }}</td>
+        <td>{{ space[1] }}</td>
+        <td>{{ space[2] }} groups</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,26 @@
+{% if sqlStats %}
+<div class='sql-stats'>Executed in {{ sqlStats.elapsedMs }}ms{% if sqlStats.rows %} • {{ sqlStats.rows }} rows{% endif %}</div>
+{% endif %}
+
+{% if resultKind == "rows" %}
+<table class='data-table'>
+  <thead><tr>
+    {% for col in columns %}
+    <th>{{ col }}</th>
+    {% endfor %}
+  </tr></thead>
+  <tbody>
+    {% for row in rows %}
+    <tr>
+      {% for i, col in columns %}
+      <td>{{ row[i] }}</td>
+      {% endfor %}
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% elif resultKind == "modified" %}
+<div class='form-msg ok'>{{ modifiedCount }} rows affected</div>
+{% elif resultKind == "error" %}
+<div class='form-msg err'>Error: {{ errorMsg }}</div>
+{% endif %}

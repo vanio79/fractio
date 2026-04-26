@@ -1,0 +1,29 @@
+{% extends shell.nimja %}
+
+{% block content %}
+<div class='panel'>
+  <div class='panel-header'>
+    <h2 class='panel-title'>Server Configuration</h2>
+  </div>
+  <table class='data-table'>
+    <thead><tr><th>Setting</th><th>Value</th></tr></thead>
+    <tbody>
+      <tr><td>Node ID</td><td>{{ nodeId }}</td></tr>
+      <tr><td>Host</td><td>{{ host }}</td></tr>
+      <tr><td>Port</td><td>{{ port }}</td></tr>
+      <tr><td>Web Port</td><td>{{ webPort }}</td></tr>
+      <tr><td>Cluster Name</td><td>{{ clusterName }}</td></tr>
+      <tr><td>Data Directory</td><td>{{ dataDir }}</td></tr>
+      <tr><td>Version</td><td>{{ version }}</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class='panel'>
+  <div class='panel-header'>
+    <h2 class='panel-title'>Cluster Actions</h2>
+  </div>
+  <sl-button hx-post='/api/rebalance' hx-target='#rebalance-msg'>Rebalance Spaces</sl-button>
+  <div id='rebalance-msg' class='form-msg'></div>
+</div>
+{% endblock %}

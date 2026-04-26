@@ -1,0 +1,30 @@
+{% extends shell.nimja %}
+
+{% block content %}
+<div class='panel'>
+  <div class='panel-header'>
+    <h2 class='panel-title'>Cluster Nodes</h2>
+    <sl-button size='small' hx-get='/htmx/nodes/add-form' hx-target='#node-form-area'>Add Node</sl-button>
+  </div>
+  <div id='node-form-area'></div>
+  <table class='data-table'>
+    <thead><tr><th>ID</th><th>Host</th><th>Raft</th><th>Client</th><th>Web</th><th>Role</th><th>Status</th><th>Action</th></tr></thead>
+    <tbody>
+      {% for node in nodesData %}
+      <tr>
+        <td>{{ node[0] }}</td>
+        <td>{{ node[1] }}</td>
+        <td>{{ node[2] }}</td>
+        <td>{{ node[3] }}</td>
+        <td>{{ node[4] }}</td>
+        <td>{{ node[5] }}</td>
+        <td style='color:{% if node[6] == "alive" %}#1a7f37{% else %}#c41010{% endif %}'>{{ node[6] }}</td>
+        <td>
+          <sl-button size='small' variant='danger' hx-delete='/api/nodes/{{ node[0] }}' hx-target='#content' hx-get='/htmx/nodes' hx-swap='outerHTML'>Remove</sl-button>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

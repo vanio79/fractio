@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fractio</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@shoelace-style/shoelace@2.18.0/cdn/themes/light.css">
+<script type="module" src="https://cdn.jsdelivr.net/npm/@shoelace-style/shoelace@2.18.0/cdn/shoelace-autoloader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.4/dist/htmx.min.js"></script>
+<script src="/app.js"></script>
+<style>
+:root{--sl-color-primary-500:#e81c1c;--sl-color-primary-600:#c41010;--sl-font-sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{font-family:var(--sl-font-sans);background:#f8f8f8;color:#111;min-height:100vh;display:flex;flex-direction:column}
+header{display:flex;align-items:center;gap:1rem;padding:0 1.75rem;height:60px;background:#e81c1c;box-shadow:0 2px 8px rgba(0,0,0,.18);position:sticky;top:0;z-index:100}
+.logo{font-size:1.1rem;font-weight:800;color:#fff;letter-spacing:.1em;display:flex;align-items:center;gap:.45rem}
+.status-badge{background:#fff;color:#e81c1c;padding:.25rem .5rem;border-radius:4px;font-size:.75rem;font-weight:600}
+nav{background:#2d2d2d;display:flex;gap:0;padding:0 1.25rem}
+nav a{color:#bbb;text-decoration:none;padding:.6rem 1rem;font-size:.82rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em;border-bottom:2px solid transparent;transition:color .15s,border-color .15s;cursor:pointer}
+nav a:hover{color:#fff;border-bottom-color:#e81c1c}
+nav a.active{color:#fff;border-bottom-color:#e81c1c}
+main{flex:1;padding:1.75rem;max-width:1260px;width:100%;margin:0 auto}
+footer{padding:.75rem 1.75rem;background:#2d2d2d;color:#999;font-size:.75rem;text-align:center;letter-spacing:.03em}
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:1rem;margin-bottom:1.5rem}
+.stat-card{background:#fff;border-radius:6px;padding:1rem;border-top:3px solid #e81c1c;text-align:center}
+.stat-label{font-size:.68rem;color:#666;text-transform:uppercase;letter-spacing:.07em;margin-bottom:.5rem;font-weight:600}
+.stat-value{font-size:1.5rem;font-weight:700;color:#e81c1c}
+.panel{background:#fff;border-radius:6px;padding:1.25rem;margin-bottom:1.5rem;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+.panel-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:1rem}
+.panel-title{font-size:1.05rem;font-weight:700;color:#111}
+.data-table{width:100%;border-collapse:collapse;font-size:.875rem}
+.data-table th{background:#3a3a3a;color:#fff;padding:.55rem .85rem;text-align:left;font-size:.7rem;text-transform:uppercase;letter-spacing:.07em;font-weight:600}
+.data-table td{padding:.55rem .85rem;border-bottom:1px solid #eee;color:#222}
+.data-table tbody tr:hover td{background:#fff5f5}
+.data-table tbody tr:last-child td{border-bottom:none}
+.form-row{display:flex;gap:.5rem;flex-wrap:wrap;align-items:flex-end;margin-bottom:.5rem}
+.form-msg{font-size:.82rem;margin-top:.4rem}
+.form-msg.ok{color:#1a7f37}
+.form-msg.err{color:#c41010}
+.sql-editor{width:100%;min-height:150px;font-family:"SF Mono",monospace;font-size:.9rem;padding:.75rem;border:1px solid #e0e0e0;border-radius:4px;resize:vertical}
+.sql-stats{font-size:.8rem;color:#666;background:#f5f5f5;padding:.4rem .6rem;border-radius:4px;margin-bottom:.5rem;font-family:"SF Mono",monospace}
+.sql-results{overflow-x:auto;margin-top:1rem}
+.clock-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:1rem}
+.clock-card{background:#fff;border-radius:6px;padding:1rem;text-align:center}
+.clock-time{font-size:1.5rem;font-weight:700;color:#e81c1c;font-family:"SF Mono",monospace}
+.clock-drift{font-size:.75rem;color:#666;margin-top:.5rem}
+.htmx-indicator{opacity:0;transition:opacity 200ms ease-in}
+.htmx-request .htmx-indicator{opacity:1}
+.htmx-request.htmx-indicator{opacity:1}
+.htmx-data-browser{display:flex;gap:1rem;min-height:400px}
+.htmx-left-panel{width:260px;display:flex;flex-direction:column;gap:1rem;padding:1rem;background:#fff;border-radius:6px;border:1px solid #e0e0e0}
+.htmx-right-panel{flex:1;background:#fff;border-radius:6px;border:1px solid #e0e0e0;overflow:hidden}
+.htmx-selector-group{margin-bottom:.5rem}
+.htmx-label{font-size:.85rem;font-weight:600;margin-bottom:.5rem;color:#333;display:block}
+.htmx-tables-list{flex:1;overflow-y:auto;max-height:300px;display:flex;flex-direction:column;gap:4px}
+.htmx-table-item{padding:.5rem .75rem;border-radius:4px;cursor:pointer;border:1px solid #e0e0e0;background:transparent;color:#333;transition:background .15s;width:100%;text-align:left}
+.htmx-table-item:hover{background:#fff5f5}
+.htmx-table-item.active{background:#e81c1c;color:#fff;border-color:#e81c1c}
+.htmx-data-grid{padding:1rem;height:100%;overflow:auto}
+.htmx-data-table{width:100%;border-collapse:collapse;font-size:.875rem}
+.htmx-data-table th{background:#3a3a3a;color:#fff;padding:.55rem .85rem;text-align:left;font-size:.7rem;text-transform:uppercase;letter-spacing:.07em;font-weight:600}
+.htmx-data-table td{padding:.55rem .85rem;border-bottom:1px solid #eee;color:#222}
+.htmx-empty-state{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;color:#888;gap:.5rem}
+.metrics-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:1rem;margin-top:1rem}
+.metric-card{background:#fff;border-radius:6px;padding:1rem;border-top:3px solid #3a3a3a}
+.metric-title{font-size:.9rem;font-weight:700;color:#111;margin-bottom:.75rem}
+.metric-table{width:100%;font-size:.85rem}
+.metric-table td{padding:.25rem .5rem;border-bottom:1px solid #eee}
+.metric-table td:first-child{color:#666}
+.metric-table td:last-child{font-weight:600;text-align:right;color:#e81c1c}
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">⬡ FRACTIO</div>
+  <div class="status-badge" id="status-badge" hx-get="/htmx/status" hx-trigger="every 5s">OK</div>
+</header>
+<nav>
+  <a hx-get="/htmx/dashboard" hx-target="#content" hx-push-url="/dashboard" hx-trigger="click" hx-swap="innerHTML" class="{% if activeTab == \"dashboard\" %}active{% endif %}">Dashboard</a>
+  <a hx-get="/htmx/nodes" hx-target="#content" hx-push-url="/nodes" hx-trigger="click" hx-swap="innerHTML" class="{% if activeTab == \"nodes\" %}active{% endif %}">Nodes</a>
+  <a hx-get="/htmx/metrics" hx-target="#content" hx-push-url="/metrics" hx-trigger="click" hx-swap="innerHTML" class="{% if activeTab == \"metrics\" %}active{% endif %}">Metrics</a>
+  <a hx-get="/htmx/clock" hx-target="#content" hx-push-url="/clock" hx-trigger="click" hx-swap="innerHTML" class="{% if activeTab == \"clock\" %}active{% endif %}">Clock</a>
+  <a hx-get="/htmx/storage" hx-target="#content" hx-push-url="/storage" hx-trigger="click" hx-swap="innerHTML" class="{% if activeTab == \"storage\" %}active{% endif %}">Storage</a>
+  <a hx-get="/htmx/data" hx-target="#content" hx-push-url="/data" hx-trigger="click" hx-swap="innerHTML" class="{% if activeTab == \"data\" %}active{% endif %}">Data</a>
+  <a hx-get="/htmx/sql" hx-target="#content" hx-push-url="/sql" hx-trigger="click" hx-swap="innerHTML" class="{% if activeTab == \"sql\" %}active{% endif %}">SQL</a>
+  <a hx-get="/htmx/settings" hx-target="#content" hx-push-url="/settings" hx-trigger="click" hx-swap="innerHTML" class="{% if activeTab == \"settings\" %}active{% endif %}">Settings</a>
+</nav>
+<main id="content">
+{% block content %}
+<div class="htmx-indicator" style="text-align:center;padding:2rem;color:#888">Loading...</div>
+{% endblock %}
+</main>
+<footer>Fractio Management Console · Auto-refresh every 5s</footer>
+<script>
+// Shoelace emits 'sl-change' which HTMX handles directly when hx-trigger='sl-change' is set
+document.addEventListener('htmx:afterSwap', function(e) {
+  const target = e.detail.target;
+  if (target) {
+    const shoelaceComponents = target.querySelectorAll('sl-select, sl-button, sl-input, sl-dialog');
+    shoelaceComponents.forEach(function(comp) {
+      if (comp.requestUpdate) comp.requestUpdate();
+    });
+  }
+});
+</script>
+<script>
+// Initial load - wait for HTMX to be ready, then trigger correct tab
+document.addEventListener('DOMContentLoaded', function() {
+  var path = window.location.pathname;
+  var tabMap = {
+    '/': '/htmx/dashboard',
+    '/dashboard': '/htmx/dashboard',
+    '/nodes': '/htmx/nodes',
+    '/metrics': '/htmx/metrics',
+    '/clock': '/htmx/clock',
+    '/storage': '/htmx/storage',
+    '/data': '/htmx/data',
+    '/sql': '/htmx/sql',
+    '/settings': '/htmx/settings'
+  };
+  var htmxPath = tabMap[path] || '/htmx/dashboard';
+  htmx.ajax('GET', htmxPath, {target: '#content', swap: 'innerHTML'});
+});
+// Update active nav state after HTMX navigation
+document.addEventListener('htmx:afterSwap', function(e) {
+  if (e.detail.target && e.detail.target.id === 'content') {
+    var path = window.location.pathname;
+    document.querySelectorAll('nav a').forEach(function(a) {
+      var href = a.getAttribute('hx-push-url');
+      var isActive = (href === path) || (path === '/' && href === '/dashboard');
+      a.classList.toggle('active', isActive);
+    });
+  }
+});
+</script>
+</body>
+</html>

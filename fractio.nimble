@@ -7,6 +7,7 @@ license       = "MIT"
 # Dependencies
 requires "nim >= 2.0.0"
 requires "httpbeast >= 0.4.0"
+requires "nimja >= 0.1.0"
 requires "zippy >= 0.10.0"
 requires "parsetoml >= 0.7.0"
 

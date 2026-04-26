@@ -1,0 +1,26 @@
+{% extends shell.nimja %}
+
+{% block content %}
+<div class='panel'>
+  <div class='panel-header'>
+    <h2 class='panel-title'>SQL Query</h2>
+  </div>
+  <form hx-post='/api/sql' hx-target='#sql-results'>
+    <div class='form-row'>
+      <sl-select name='database' size='small' value='default'>
+        {% for db in databases %}
+        <sl-option value='{{ db }}'>{{ db }}</sl-option>
+        {% endfor %}
+      </sl-select>
+      <sl-select name='schema' size='small' value='public'>
+        {% for schema in schemas %}
+        <sl-option value='{{ schema }}'>{{ schema }}</sl-option>
+        {% endfor %}
+      </sl-select>
+      <sl-button type='submit' variant='primary'>Execute</sl-button>
+    </div>
+    <textarea class='sql-editor' name='sql' placeholder='SELECT * FROM sys.nodes'>{{ defaultQuery }}</textarea>
+  </form>
+  <div id='sql-results' class='sql-results'></div>
+</div>
+{% endblock %}

@@ -1,0 +1,37 @@
+{% extends shell.nimja %}
+
+{% block content %}
+<div class='stats-grid'>
+  <div class='stat-card'>
+    <div class='stat-label'>Requests</div>
+    <div class='stat-value'>{{ requests }}</div>
+  </div>
+  <div class='stat-card'>
+    <div class='stat-label'>OK</div>
+    <div class='stat-value'>{{ okCount }}</div>
+  </div>
+  <div class='stat-card'>
+    <div class='stat-label'>Errors</div>
+    <div class='stat-value'>{{ errors }}</div>
+  </div>
+  <div class='stat-card'>
+    <div class='stat-label'>Bytes In</div>
+    <div class='stat-value'>{{ bytesIn }}</div>
+  </div>
+  <div class='stat-card'>
+    <div class='stat-label'>Bytes Out</div>
+    <div class='stat-value'>{{ bytesOut }}</div>
+  </div>
+</div>
+
+<div class='metrics-grid'>
+  <div class='metric-card'>
+    <div class='metric-title'>KV Operations</div>
+    <table class='metric-table'>
+      <tr><td>GETs</td><td>{{ kvGets }}</td></tr>
+      <tr><td>PUTs</td><td>{{ kvPuts }}</td></tr>
+      <tr><td>DELETEs</td><td>{{ kvDeletes }}</td></tr>
+    </table>
+  </div>
+</div>
+{% endblock %}

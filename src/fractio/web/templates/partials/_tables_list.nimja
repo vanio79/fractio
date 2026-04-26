@@ -1,0 +1,11 @@
+{% if tables.len > 0 %}
+{% for table in tables %}
+<button class='htmx-table-item{% if table == selectedTable %} active{% endif %}'
+  hx-get='/htmx/data/{{ dbName }}/{{ schemaName }}/{{ table }}'
+  hx-target='#data-grid'>
+  {{ table }}
+</button>
+{% endfor %}
+{% else %}
+<div class='htmx-empty-state'>No tables found</div>
+{% endif %}

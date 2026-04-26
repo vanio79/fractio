@@ -1,0 +1,10 @@
+{% extends shell.nimja %}
+
+{% block content %}
+<div class='panel'>
+  <div class='panel-header'>
+    <h2 class='panel-title'>Storage Statistics</h2>
+  </div>
+  <pre style='font-size:.85rem;background:#f5f5f5;padding:1rem;border-radius:4px;overflow-x:auto'>{{ storageStats }}</pre>
+</div>
+{% endblock %}

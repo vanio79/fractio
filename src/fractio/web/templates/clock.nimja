@@ -1,0 +1,21 @@
+{% extends shell.nimja %}
+
+{% block content %}
+<div class='panel'>
+  <div class='panel-header'>
+    <h2 class='panel-title'>Clock Sync</h2>
+  </div>
+  <div class='clock-grid'>
+    <div class='clock-card'>
+      <div class='stat-label'>Local Time</div>
+      <div class='clock-time'>{{ localTime }}</div>
+      <div class='clock-drift'>unix: {{ unixTime }}</div>
+    </div>
+    <div class='clock-card'>
+      <div class='stat-label'>Drift Status</div>
+      <div class='clock-time'>{{ driftStatus }}</div>
+      <div class='clock-drift'>{{ driftDetail }}</div>
+    </div>
+  </div>
+</div>
+{% endblock %}

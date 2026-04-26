@@ -1,0 +1,41 @@
+{% extends shell.nimja %}
+
+{% block content %}
+<div class='htmx-data-browser'>
+  <div class='htmx-left-panel'>
+    <div class='htmx-selector-group'>
+      <label class='htmx-label'>Database</label>
+      <sl-select id='db-select' placeholder='Select database' size='small' hoist
+        hx-get='/htmx/schemas' hx-trigger='sl-change' hx-target='#schema-select' 
+        hx-swap='outerHTML settle:50ms'
+        hx-vals="js:{'db-select':event.target.value}">
+        {% for db in databases %}
+        <sl-option value='{{ db }}'>{{ db }}</sl-option>
+        {% endfor %}
+      </sl-select>
+    </div>
+    <div class='htmx-selector-group'>
+      <label class='htmx-label'>Schema</label>
+      <sl-select id='schema-select' placeholder='Select schema' size='small' hoist disabled
+        hx-get='/htmx/tables' hx-trigger='sl-change' hx-target='#tables-list'
+        hx-vals="js:{'db-select':document.getElementById('db-select').value,'schema-select':event.target.value}">
+        <sl-option value='' disabled>Select database first</sl-option>
+      </sl-select>
+    </div>
+    <div class='htmx-selector-group'>
+      <label class='htmx-label'>Tables</label>
+      <div id='tables-list' class='htmx-tables-list'>
+        <div class='htmx-empty-state'>Select schema</div>
+      </div>
+    </div>
+  </div>
+  <div class='htmx-right-panel'>
+    <div id='data-grid' class='htmx-data-grid'>
+      <div class='htmx-empty-state'>
+        <span style='font-size:2rem'>📊</span>
+        <div>Select table</div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
