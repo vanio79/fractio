@@ -44,21 +44,16 @@ proc getTemplateDir(): string =
   getScriptDir() / "templates"
 
 # ---------------------------------------------------------------------------
-# Static assets
+# Static assets (embedded at compile time)
 # ---------------------------------------------------------------------------
 
-const appJs = """
-// Shoelace emits 'sl-change' which HTMX handles directly when hx-trigger='sl-change' is set
-document.addEventListener('htmx:afterSwap', function(e) {
-  const target = e.detail.target;
-  if (target) {
-    const shoelaceComponents = target.querySelectorAll('sl-select, sl-button, sl-input, sl-dialog');
-    shoelaceComponents.forEach(function(comp) {
-      if (comp.requestUpdate) comp.requestUpdate();
-    });
-  }
-});
-"""
+# Bundled JS: HTMX 2.0.4 + app initialization (minified)
+const bundleJs = staticRead("static/bundle.min.js")
+const bundleJsGz = staticRead("static/bundle.min.js.gz")
+
+# Shoelace light theme CSS (for local loading, component JS still from CDN)
+const shoelaceCss = staticRead("static/shoelace-light.css")
+const shoelaceCssGz = staticRead("static/shoelace-light.css.gz")
 
 # ---------------------------------------------------------------------------
 # Helper procs
@@ -155,9 +150,32 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
     else:
       req.send(code, data, "Content-Type: text/html; charset=utf-8")
 
-  # ---- Static: app.js ----
-  if path == "/app.js" and httpMethod == HttpGet:
-    sendHtml(Http200, appJs)
+  # ---- Static: bundle.js (HTMX + app code, minified) ----
+  if path == "/bundle.js" and (httpMethod == HttpGet or httpMethod == HttpHead):
+    var body: string
+    var hdrs = "Content-Type: application/javascript; charset=utf-8\nCache-Control: public, max-age=31536000\nVary: Accept-Encoding"
+    {.cast(gcsafe).}:
+      body = if wantsGzip: bundleJsGz else: bundleJs
+    if wantsGzip:
+      hdrs.add("\nContent-Encoding: gzip")
+    if httpMethod == HttpHead:
+      req.send(Http200, "", hdrs)
+    else:
+      req.send(Http200, body, hdrs)
+    return fut
+
+  # ---- Static: shoelace-light.css ----
+  if path == "/shoelace-light.css" and (httpMethod == HttpGet or httpMethod == HttpHead):
+    var body: string
+    var hdrs = "Content-Type: text/css; charset=utf-8\nCache-Control: public, max-age=31536000\nVary: Accept-Encoding"
+    {.cast(gcsafe).}:
+      body = if wantsGzip: shoelaceCssGz else: shoelaceCss
+    if wantsGzip:
+      hdrs.add("\nContent-Encoding: gzip")
+    if httpMethod == HttpHead:
+      req.send(Http200, "", hdrs)
+    else:
+      req.send(Http200, body, hdrs)
     return fut
 
   # ---- Static: root and all tab paths (return shell) ----
