@@ -4,25 +4,11 @@
 ## Tests that run against a Fractio cluster started as external processes.
 ## Uses the TestCluster infrastructure to manage server lifecycle.
 
-import std/[unittest, options, os, osproc, strutils]
-
+import std/[unittest, options, os]
 import ../test_cluster
 
-# Global cleanup helper: kill any orphan fractio processes from previous runs
-proc cleanupOrphanProcesses() =
-  try:
-    # Find and kill any fractio processes started by tests
-    let output = execProcess("ps aux | grep 'bin/fractio' | grep -v grep | awk '{print $2}'")
-    for line in output.strip().splitLines():
-      if line.len > 0:
-        let pid = parseInt(line.strip())
-        # Only kill processes owned by current user and running from this project
-        discard execProcess("kill -9 " & $pid)
-  except:
-    discard
-
-# Run cleanup before tests start
-cleanupOrphanProcesses()
+# Kill orphaned daemons from previous test runs at startup
+killOrphanedDaemons()
 
 suite "External Cluster Integration Tests":
   test "1-node cluster starts and responds to health check":

@@ -55,11 +55,13 @@ type
   NodeProcess = object
     id: int
     process: Process
+    pid: int           # Store PID for cleanup
     raftPort: int
     clientPort: int
     webPort: int
     dataDir: string
     configPath: string
+    pidFile: string    # Path to PID file for cleanup after crash
 
   TestCluster* = ref object
     ## A Fractio cluster running as external processes
@@ -69,6 +71,37 @@ type
     leaderId: Atomic[int]
     running: Atomic[bool]
     lock: Lock
+
+# ---------------------------------------------------------------------------
+# Cleanup helper - kill orphaned daemons from previous runs
+# ---------------------------------------------------------------------------
+
+proc killOrphanedDaemons*() =
+  ## Kill any fractio daemons left from previous test runs.
+  ## Scans /tmp for fractio_test_cluster_* directories and reads PID files.
+  try:
+    for dir in walkDirs("/tmp/fractio_test_cluster_*"):
+      if dirExists(dir):
+        # Look for node.pid files in node subdirectories
+        for nodeDir in walkDirs(dir / "node*"):
+          let pidFile = nodeDir / "node.pid"
+          if fileExists(pidFile):
+            let pidStr = readFile(pidFile).strip()
+            if pidStr.len > 0:
+              try:
+                let pid = parseInt(pidStr)
+                # Try to kill the process - will fail silently if already dead
+                let procPath = "/proc/" & $pid
+                if dirExists(procPath):
+                  # Process is still running, kill it
+                  discard execShellCmd("kill -9 " & $pid & " 2>/dev/null")
+              except:
+                discard
+        # Clean up the test directory
+        try: removeDir(dir)
+        except: discard
+  except:
+    discard
 
 # ---------------------------------------------------------------------------
 # TestCluster creation
@@ -206,14 +239,20 @@ proc start*(cluster: TestCluster): bool =
       # Redirect output to /dev/null to avoid pipe buffer issues
       startProcess(exePath, args = args, options = {})
 
+    # Capture PID and pidFile for cleanup
+    let pid = process.processID
+    let pidFilePath = pidFile
+
     var node = NodeProcess(
       id: nodeId,
       process: process,
+      pid: pid,
       raftPort: raftPort,
       clientPort: clientPort,
       webPort: webPort,
       dataDir: dataDir,
-      configPath: configPath
+      configPath: configPath,
+      pidFile: pidFilePath
     )
 
     cluster.nodes.add(node)
@@ -226,6 +265,7 @@ proc start*(cluster: TestCluster): bool =
 proc stop*(cluster: TestCluster) =
   ## Stop all nodes in the cluster
   ## This method always attempts cleanup regardless of running state
+  ## Uses direct PID kill as backup if process handle is stale
   cluster.running.store(false)
 
   # Close all clients
@@ -234,25 +274,42 @@ proc stop*(cluster: TestCluster) =
     except: discard
   cluster.clients = @[]
 
-  # Terminate all processes - always try, even if running was false
+  # Terminate all processes - use both process handle and direct PID kill
   for i in 0 ..< cluster.nodes.len:
-    if not cluster.nodes[i].process.isNil:
+    let node = cluster.nodes[i]
+    # First try via process handle
+    if not node.process.isNil:
       try:
-        # Check if process is still running before trying to terminate
-        if cluster.nodes[i].process.running:
-          cluster.nodes[i].process.terminate()
+        if node.process.running:
+          node.process.terminate()
           # Give process time to exit
-          for j in 0 ..< 20:
-            if not cluster.nodes[i].process.running:
+          for j in 0 ..< 10:
+            if not node.process.running:
               break
             sleep(50)
           # Force kill if still running
-          if cluster.nodes[i].process.running:
-            cluster.nodes[i].process.kill()
-        # Close the process handle even if not running
-        cluster.nodes[i].process.close()
+          if node.process.running:
+            node.process.kill()
+        # Close the process handle
+        node.process.close()
       except:
         discard
+    
+    # Backup: kill via PID directly (handles stale process handles)
+    if node.pid > 0:
+      try:
+        # Check if PID is still alive
+        let procPath = "/proc/" & $node.pid
+        if dirExists(procPath):
+          # Use execShellCmd to bypass potential Nim issues
+          discard execShellCmd("kill -9 " & $node.pid & " 2>/dev/null")
+      except:
+        discard
+    
+    # Also clean up PID file
+    if node.pidFile.len > 0 and fileExists(node.pidFile):
+      try: removeFile(node.pidFile)
+      except: discard
 
   cluster.nodes = @[]
 
