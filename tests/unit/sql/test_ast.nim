@@ -265,14 +265,15 @@ suite "AST ColDef":
 suite "AST Stmt Kind":
 
   test "stmtCreateTable basic":
-    let s = Stmt(kind: stmtCreateTable, ctTable: "users", ctIfNotExists: false,
-                 ctColumns: @[], ctPrimaryKey: @[])
+    let s = Stmt(kind: stmtCreateTable, ctTableRef: TableRef(table: "users"),
+                 ctIfNotExists: false, ctColumns: @[], ctPrimaryKey: @[])
     check s.kind == stmtCreateTable
-    check s.ctTable == "users"
+    check s.ctTableRef.table == "users"
     check s.ctIfNotExists == false
 
   test "stmtCreateTable IF NOT EXISTS":
-    let s = Stmt(kind: stmtCreateTable, ctTable: "t", ctIfNotExists: true)
+    let s = Stmt(kind: stmtCreateTable, ctTableRef: TableRef(table: "t"),
+                 ctIfNotExists: true)
     check s.ctIfNotExists == true
 
   test "stmtCreateTable with columns":
@@ -280,30 +281,33 @@ suite "AST Stmt Kind":
       ColDef(name: "id", dataType: dtInt, primaryKey: true),
       ColDef(name: "name", dataType: dtString, maxLen: 100)
     ]
-    let s = Stmt(kind: stmtCreateTable, ctTable: "users", ctColumns: cols)
+    let s = Stmt(kind: stmtCreateTable, ctTableRef: TableRef(table: "users"),
+                 ctColumns: cols)
     check s.ctColumns.len == 2
     check s.ctColumns[0].primaryKey == true
 
   test "stmtCreateTable with replicas":
-    let s = Stmt(kind: stmtCreateTable, ctTable: "t", ctColumns: @[],
-                 ctReplicas: some(3))
+    let s = Stmt(kind: stmtCreateTable, ctTableRef: TableRef(table: "t"),
+                 ctColumns: @[], ctReplicas: some(3))
     check s.ctReplicas.isSome
     check s.ctReplicas.get() == 3
 
   test "stmtCreateTable with space":
-    let s = Stmt(kind: stmtCreateTable, ctTable: "t", ctColumns: @[],
-                 ctSpaceName: some("space1"))
+    let s = Stmt(kind: stmtCreateTable, ctTableRef: TableRef(table: "t"),
+                 ctColumns: @[], ctSpaceName: some("space1"))
     check s.ctSpaceName.isSome
     check s.ctSpaceName.get() == "space1"
 
   test "stmtDropTable":
-    let s = Stmt(kind: stmtDropTable, dtTable: "old_table", dtIfExists: false)
+    let s = Stmt(kind: stmtDropTable, dtTableRef: TableRef(table: "old_table"),
+                 dtIfExists: false)
     check s.kind == stmtDropTable
-    check s.dtTable == "old_table"
+    check s.dtTableRef.table == "old_table"
     check s.dtIfExists == false
 
   test "stmtDropTable IF EXISTS":
-    let s = Stmt(kind: stmtDropTable, dtTable: "t", dtIfExists: true)
+    let s = Stmt(kind: stmtDropTable, dtTableRef: TableRef(table: "t"),
+                 dtIfExists: true)
     check s.dtIfExists == true
 
 suite "AST Stmt DML":
@@ -311,36 +315,38 @@ suite "AST Stmt DML":
   test "stmtSelect basic":
     let cols = @[SelectCol(expr: Expr(kind: exStar), alias: "")]
     let s = Stmt(kind: stmtSelect, selDistinct: false, selCols: cols,
-                 selFrom: "users")
+                 selFrom: TableRef(table: "users"))
     check s.kind == stmtSelect
     check s.selDistinct == false
     check s.selCols.len == 1
-    check s.selFrom == "users"
+    check s.selFrom.table == "users"
 
   test "stmtSelect DISTINCT":
-    let s = Stmt(kind: stmtSelect, selDistinct: true, selCols: @[], selFrom: "t")
+    let s = Stmt(kind: stmtSelect, selDistinct: true, selCols: @[],
+                 selFrom: TableRef(table: "t"))
     check s.selDistinct == true
 
   test "stmtSelect with WHERE":
     let whereExpr = Expr(kind: exBinOp, binOp: boEq,
       binLeft: Expr(kind: exColumn, colName: "id"),
       binRight: Expr(kind: exLiteral, litValue: newValueRef(1'i64)))
-    let s = Stmt(kind: stmtSelect, selCols: @[], selFrom: "t",
-                 selWhere: some(whereExpr))
+    let s = Stmt(kind: stmtSelect, selCols: @[],
+                 selFrom: TableRef(table: "t"), selWhere: some(whereExpr))
     check s.selWhere.isSome
     check s.selWhere.get().kind == exBinOp
 
   test "stmtSelect with ORDER BY":
     let orderBy = @[OrderItem(expr: Expr(kind: exColumn, colName: "name"), desc: false)]
-    let s = Stmt(kind: stmtSelect, selCols: @[], selFrom: "t",
-        selOrderBy: orderBy)
+    let s = Stmt(kind: stmtSelect, selCols: @[],
+                 selFrom: TableRef(table: "t"), selOrderBy: orderBy)
     check s.selOrderBy.len == 1
     check s.selOrderBy[0].desc == false
 
   test "stmtSelect with LIMIT/OFFSET":
     let limitExpr = Expr(kind: exLiteral, litValue: newValueRef(10'i64))
     let offsetExpr = Expr(kind: exLiteral, litValue: newValueRef(5'i64))
-    let s = Stmt(kind: stmtSelect, selCols: @[], selFrom: "t",
+    let s = Stmt(kind: stmtSelect, selCols: @[],
+                 selFrom: TableRef(table: "t"),
                  selLimit: some(limitExpr), selOffset: some(offsetExpr))
     check s.selLimit.isSome
     check s.selOffset.isSome
@@ -350,10 +356,10 @@ suite "AST Stmt DML":
       @[Expr(kind: exLiteral, litValue: newValueRef(1'i64)),
         Expr(kind: exLiteral, litValue: newValueRef("Alice"))]
     ]
-    let s = Stmt(kind: stmtInsert, intoTable: "users", intoCols: @["id", "name"],
-                 intoValues: values)
+    let s = Stmt(kind: stmtInsert, intoTableRef: TableRef(table: "users"),
+                 intoCols: @["id", "name"], intoValues: values)
     check s.kind == stmtInsert
-    check s.intoTable == "users"
+    check s.intoTableRef.table == "users"
     check s.intoCols.len == 2
     check s.intoValues.len == 1
     check s.intoValues[0].len == 2
@@ -364,14 +370,16 @@ suite "AST Stmt DML":
       @[Expr(kind: exLiteral, litValue: newValueRef(2'i64))],
       @[Expr(kind: exLiteral, litValue: newValueRef(3'i64))]
     ]
-    let s = Stmt(kind: stmtInsert, intoTable: "t", intoValues: values)
+    let s = Stmt(kind: stmtInsert, intoTableRef: TableRef(table: "t"),
+                 intoValues: values)
     check s.intoValues.len == 3
 
   test "stmtUpdate basic":
     let sets = @[("name", Expr(kind: exLiteral, litValue: newValueRef("Bob")))]
-    let s = Stmt(kind: stmtUpdate, updTable: "users", updSets: sets)
+    let s = Stmt(kind: stmtUpdate, updTableRef: TableRef(table: "users"),
+                 updSets: sets)
     check s.kind == stmtUpdate
-    check s.updTable == "users"
+    check s.updTableRef.table == "users"
     check s.updSets.len == 1
     check s.updSets[0].col == "name"
 
@@ -379,20 +387,21 @@ suite "AST Stmt DML":
     let whereExpr = Expr(kind: exBinOp, binOp: boEq,
       binLeft: Expr(kind: exColumn, colName: "id"),
       binRight: Expr(kind: exLiteral, litValue: newValueRef(1'i64)))
-    let s = Stmt(kind: stmtUpdate, updTable: "t", updSets: @[],
-                 updWhere: some(whereExpr))
+    let s = Stmt(kind: stmtUpdate, updTableRef: TableRef(table: "t"),
+                 updSets: @[], updWhere: some(whereExpr))
     check s.updWhere.isSome
 
   test "stmtDelete basic":
-    let s = Stmt(kind: stmtDelete, delTable: "logs")
+    let s = Stmt(kind: stmtDelete, delTableRef: TableRef(table: "logs"))
     check s.kind == stmtDelete
-    check s.delTable == "logs"
+    check s.delTableRef.table == "logs"
 
   test "stmtDelete with WHERE":
     let whereExpr = Expr(kind: exBinOp, binOp: boGt,
       binLeft: Expr(kind: exColumn, colName: "age"),
       binRight: Expr(kind: exLiteral, litValue: newValueRef(90'i64)))
-    let s = Stmt(kind: stmtDelete, delTable: "t", delWhere: some(whereExpr))
+    let s = Stmt(kind: stmtDelete, delTableRef: TableRef(table: "t"),
+                 delWhere: some(whereExpr))
     check s.delWhere.isSome
 
 suite "AST Stmt Transactions":
@@ -494,7 +503,8 @@ suite "AST Stmt SHOW/USE":
 suite "AST Stmt EXPLAIN":
 
   test "stmtExplain":
-    let inner = Stmt(kind: stmtSelect, selCols: @[], selFrom: "t")
+    let inner = Stmt(kind: stmtSelect, selCols: @[],
+                     selFrom: TableRef(table: "t"))
     let s = Stmt(kind: stmtExplain, explainStmt: inner)
     check s.kind == stmtExplain
     check s.explainStmt.kind == stmtSelect

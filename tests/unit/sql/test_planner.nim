@@ -910,7 +910,7 @@ suite "Planner planCreateTable":
   test "planCreateTable creates correct plan structure":
     let stmt = Stmt(
       kind: stmtCreateTable,
-      ctTable: "users",
+      ctTableRef: TableRef(table: "users"),
       ctIfNotExists: false,
       ctColumns: @[
         ColDef(name: "id", dataType: dtInt, primaryKey: true, notNull: true),
@@ -932,7 +932,7 @@ suite "Planner planCreateTable":
   test "planCreateTable with IF NOT EXISTS":
     let stmt = Stmt(
       kind: stmtCreateTable,
-      ctTable: "products",
+      ctTableRef: TableRef(table: "products"),
       ctIfNotExists: true,
       ctColumns: @[ColDef(name: "id", dataType: dtInt)],
       ctPrimaryKey: @[],
@@ -945,7 +945,7 @@ suite "Planner planCreateTable":
   test "planCreateTable with IN SPACE":
     let stmt = Stmt(
       kind: stmtCreateTable,
-      ctTable: "orders",
+      ctTableRef: TableRef(table: "orders"),
       ctIfNotExists: false,
       ctColumns: @[ColDef(name: "id", dataType: dtInt)],
       ctPrimaryKey: @["id"],
@@ -959,7 +959,7 @@ suite "Planner planCreateTable":
   test "planCreateTable with table-level primary key":
     let stmt = Stmt(
       kind: stmtCreateTable,
-      ctTable: "composite_pk_table",
+      ctTableRef: TableRef(table: "composite_pk_table"),
       ctIfNotExists: false,
       ctColumns: @[
         ColDef(name: "user_id", dataType: dtInt),
@@ -976,7 +976,7 @@ suite "Planner planDropTable":
   test "planDropTable creates correct plan":
     let stmt = Stmt(
       kind: stmtDropTable,
-      dtTable: "old_table",
+      dtTableRef: TableRef(table: "old_table"),
       dtIfExists: false
     )
     let plan = planStatement(stmt, nil, database = "mydb", schema = "public")
@@ -990,7 +990,7 @@ suite "Planner planDropTable":
   test "planDropTable with IF EXISTS":
     let stmt = Stmt(
       kind: stmtDropTable,
-      dtTable: "deprecated_table",
+      dtTableRef: TableRef(table: "deprecated_table"),
       dtIfExists: true
     )
     let plan = planStatement(stmt, nil)

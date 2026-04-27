@@ -390,8 +390,10 @@ suite "External Merge Sort (Chunk-based)":
     sorter.addRowsToChunk(rows[2..3]) # chunk 1
     sorter.addRowsToChunk(rows[4..5]) # chunk 2
 
-    # Check that chunk files were created
-    let chunkFiles = walkFiles(testTempDir / "*_chunk_*.dat").toSeq
+    # Check that chunk files were created in the sorter's actual tempDir
+    # newSortConfig adds "/sort" subdirectory unless tempDir already ends with "sort"
+    let actualTempDir = sorter.config.tempDir
+    let chunkFiles = walkFiles(actualTempDir / "*_chunk_*.dat").toSeq
     check chunkFiles.len == 3 # Should have 3 chunk files
 
     # Verify each file exists and has content

@@ -61,7 +61,7 @@ suite "SQL Parser — DDL":
       )
     """)
     check s.kind == stmtCreateTable
-    check s.ctTable == "users"
+    check s.ctTableRef.table == "users"
     check s.ctIfNotExists == false
     check s.ctColumns.len == 5
     check s.ctColumns[0].name == "id"
@@ -75,7 +75,7 @@ suite "SQL Parser — DDL":
     let s = parseStatement("CREATE TABLE IF NOT EXISTS t (x INT)")
     check s.kind == stmtCreateTable
     check s.ctIfNotExists == true
-    check s.ctTable == "t"
+    check s.ctTableRef.table == "t"
 
   test "CREATE TABLE with table-level PRIMARY KEY":
     let s = parseStatement("""
@@ -91,7 +91,7 @@ suite "SQL Parser — DDL":
   test "DROP TABLE":
     let s = parseStatement("DROP TABLE products")
     check s.kind == stmtDropTable
-    check s.dtTable == "products"
+    check s.dtTableRef.table == "products"
     check s.dtIfExists == false
 
   test "DROP TABLE IF EXISTS":
@@ -106,7 +106,7 @@ suite "SQL Parser — DML: SELECT":
     check s.kind == stmtSelect
     check s.selCols.len == 1
     check s.selCols[0].expr.kind == exStar
-    check s.selFrom == "users"
+    check s.selFrom.table == "users"
 
   test "SELECT with WHERE":
     let s = parseStatement("SELECT id, name FROM users WHERE age > 18")
@@ -172,7 +172,7 @@ suite "SQL Parser — DML: SELECT":
 
   test "SELECT with table alias":
     let s = parseStatement("SELECT u.name FROM users u WHERE u.id = 1")
-    check s.selFrom == "users"
+    check s.selFrom.table == "users"
     check s.selFromAlias == "u"
 
   test "SELECT with column alias":
@@ -184,7 +184,7 @@ suite "SQL Parser — DML: INSERT":
   test "INSERT with column list":
     let s = parseStatement("INSERT INTO users (id, name) VALUES (1, 'Alice')")
     check s.kind == stmtInsert
-    check s.intoTable == "users"
+    check s.intoTableRef.table == "users"
     check s.intoCols == @["id", "name"]
     check s.intoValues.len == 1
     check s.intoValues[0].len == 2
@@ -208,7 +208,7 @@ suite "SQL Parser — DML: UPDATE":
   test "UPDATE basic":
     let s = parseStatement("UPDATE users SET name = 'Bob' WHERE id = 1")
     check s.kind == stmtUpdate
-    check s.updTable == "users"
+    check s.updTableRef.table == "users"
     check s.updSets.len == 1
     check s.updSets[0].col == "name"
     check s.updWhere.isSome
@@ -226,7 +226,7 @@ suite "SQL Parser — DML: DELETE":
   test "DELETE with WHERE":
     let s = parseStatement("DELETE FROM users WHERE id = 99")
     check s.kind == stmtDelete
-    check s.delTable == "users"
+    check s.delTableRef.table == "users"
     check s.delWhere.isSome
 
   test "DELETE without WHERE":
@@ -332,7 +332,7 @@ suite "SQL Parser — DDL: SCHEMA":
   test "DATABASE and SCHEMA names are usable as identifiers in table DDL":
     let s = parseStatement("CREATE TABLE schema (database INT)")
     check s.kind == stmtCreateTable
-    check s.ctTable == "schema"
+    check s.ctTableRef.table == "schema"
     check s.ctColumns[0].name == "database"
 
 suite "SQL Parser — WITH REPLICAS":
@@ -377,7 +377,7 @@ suite "SQL Parser — WITH REPLICAS":
       ) WITH REPLICAS = 5
     """)
     check s.kind == stmtCreateTable
-    check s.ctTable == "users"
+    check s.ctTableRef.table == "users"
     check s.ctColumns.len == 2
     check s.ctReplicas == some(5)
 
@@ -396,7 +396,7 @@ suite "SQL Parser — WITH REPLICAS":
 
   test "'with' and 'replicas' can be used as identifiers":
     let s = parseStatement("CREATE TABLE with (replicas INT)")
-    check s.ctTable == "with"
+    check s.ctTableRef.table == "with"
     check s.ctColumns[0].name == "replicas"
 
   test "replicas value must be >= 1":
@@ -572,7 +572,7 @@ suite "SQL Parser — IN SPACE Clause":
   test "CREATE TABLE IN SPACE":
     let s = parseStatement("CREATE TABLE users (id INT) IN SPACE myspace")
     check s.kind == stmtCreateTable
-    check s.ctTable == "users"
+    check s.ctTableRef.table == "users"
     check s.ctSpaceName == some("myspace")
 
 suite "SQL Parser — Error Recovery":

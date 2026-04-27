@@ -456,7 +456,7 @@ suite "Parser Keyword Reuse":
 
   test "keywords as table name":
     let s = parseStatement("CREATE TABLE select (x INT)")
-    check s.ctTable == "select"
+    check s.ctTableRef.table == "select"
 
   test "keywords in SHOW":
     let s = parseStatement("SHOW SCHEMAS IN database")
@@ -477,4 +477,4 @@ suite "Parser EXPLAIN":
   test "EXPLAIN nested":
     let inner = parseStatement("SELECT * FROM t")
     let s = Stmt(kind: stmtExplain, explainStmt: inner)
-    check s.explainStmt.selFrom == "t"
+    check s.explainStmt.selFrom.table == "t"
