@@ -206,37 +206,37 @@ suite "EXPLAIN — parser":
     let stmt = parseStatement("EXPLAIN SELECT * FROM users")
     check stmt.kind == stmtExplain
     check stmt.explainStmt.kind == stmtSelect
-    check stmt.explainStmt.selFrom == "users"
+    check stmt.explainStmt.selFrom.table == "users"
 
   test "EXPLAIN INSERT parses correctly":
     let stmt = parseStatement("EXPLAIN INSERT INTO t (a) VALUES (1)")
     check stmt.kind == stmtExplain
     check stmt.explainStmt.kind == stmtInsert
-    check stmt.explainStmt.intoTable == "t"
+    check stmt.explainStmt.intoTableRef.table == "t"
 
   test "EXPLAIN UPDATE parses correctly":
     let stmt = parseStatement("EXPLAIN UPDATE t SET a = 1 WHERE b = 2")
     check stmt.kind == stmtExplain
     check stmt.explainStmt.kind == stmtUpdate
-    check stmt.explainStmt.updTable == "t"
+    check stmt.explainStmt.updTableRef.table == "t"
 
   test "EXPLAIN DELETE parses correctly":
     let stmt = parseStatement("EXPLAIN DELETE FROM t WHERE a = 1")
     check stmt.kind == stmtExplain
     check stmt.explainStmt.kind == stmtDelete
-    check stmt.explainStmt.delTable == "t"
+    check stmt.explainStmt.delTableRef.table == "t"
 
   test "EXPLAIN CREATE TABLE parses correctly":
     let stmt = parseStatement("EXPLAIN CREATE TABLE t (id INT PRIMARY KEY)")
     check stmt.kind == stmtExplain
     check stmt.explainStmt.kind == stmtCreateTable
-    check stmt.explainStmt.ctTable == "t"
+    check stmt.explainStmt.ctTableRef.table == "t"
 
   test "EXPLAIN DROP TABLE parses correctly":
     let stmt = parseStatement("EXPLAIN DROP TABLE t")
     check stmt.kind == stmtExplain
     check stmt.explainStmt.kind == stmtDropTable
-    check stmt.explainStmt.dtTable == "t"
+    check stmt.explainStmt.dtTableRef.table == "t"
 
   test "EXPLAIN CREATE DATABASE parses correctly":
     let stmt = parseStatement("EXPLAIN CREATE DATABASE mydb")
