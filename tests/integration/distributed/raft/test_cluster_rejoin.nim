@@ -114,20 +114,33 @@ proc startNode(id: int; join = ""): TestNode =
 
 proc stopNode(node: var TestNode) =
   ## Stop a running node process.
-  ## Uses PID file as backup if process handle is stale.
+  ##
+  ## IMPORTANT: Since fractio daemonizes via double-fork, the PID in Nim's
+  ## process.handle is the parent PID which exits immediately. The ACTUAL
+  ## daemon PID is written to the PID file by the daemon itself. We must
+  ## read from PID file first.
+  let pidFile = node.dataDir / "node.pid"
+
+  # PRIMARY: Read actual daemon PID from PID file and kill it
+  if fileExists(pidFile):
+    try:
+      let pidStr = readFile(pidFile).strip()
+      if pidStr.len > 0:
+        let daemonPid = parseInt(pidStr)
+        if daemonPid > 1:
+          discard execShellCmd("kill -9 " & $daemonPid & " 2>/dev/null")
+          sleep(100)
+      # Clean up PID file
+      removeFile(pidFile)
+    except:
+      discard
+
+  # BACKUP: Try process handle (parent PID, likely already exited)
   if node.process != nil and node.process.running:
     discard kill(Pid(node.process.processID), cint(SIGTERM))
     discard node.process.waitForExit(timeout = 5000)
     node.process.close()
     node.process = nil
-  # Backup cleanup via PID file
-  let pidFile = node.dataDir / "node.pid"
-  if fileExists(pidFile):
-    try:
-      let pid = parseInt(readFile(pidFile).strip())
-      discard execShellCmd("kill -9 " & $pid & " 2>/dev/null")
-    except:
-      discard
 
 proc cleanNodeData(id: int) =
   removeDir(nodeDataDir(id))

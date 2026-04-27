@@ -265,7 +265,11 @@ proc start*(cluster: TestCluster): bool =
 proc stop*(cluster: TestCluster) =
   ## Stop all nodes in the cluster
   ## This method always attempts cleanup regardless of running state
-  ## Uses direct PID kill as backup if process handle is stale
+  ## 
+  ## IMPORTANT: Since fractio daemonizes via double-fork, Nim's process.handle
+  ## captures the parent PID which exits immediately. The ACTUAL daemon PID
+  ## is written to the PID file by the daemon itself. We must read the PID
+  ## from the PID file to kill the correct process.
   cluster.running.store(false)
 
   # Close all clients
@@ -274,42 +278,56 @@ proc stop*(cluster: TestCluster) =
     except: discard
   cluster.clients = @[]
 
-  # Terminate all processes - use both process handle and direct PID kill
+  # Terminate all processes
+  # The key insight: daemonization writes the PID file AFTER the daemon is running,
+  # so the PID in the file is the actual daemon PID, NOT the parent process PID.
   for i in 0 ..< cluster.nodes.len:
     let node = cluster.nodes[i]
-    # First try via process handle
+    
+    # PRIMARY: Read actual daemon PID from PID file and kill it
+    # This is the correct PID because daemon.nim writes posix.getpid() after fork
+    if node.pidFile.len > 0 and fileExists(node.pidFile):
+      try:
+        let pidStr = readFile(node.pidFile).strip()
+        if pidStr.len > 0:
+          let daemonPid = parseInt(pidStr)
+          if daemonPid > 1:
+            # Check if this PID is actually running
+            let procPath = "/proc/" & $daemonPid
+            if dirExists(procPath):
+              # Kill the actual daemon process
+              discard execShellCmd("kill -9 " & $daemonPid & " 2>/dev/null")
+              # Wait briefly for process to die
+              sleep(100)
+      except:
+        discard
+      # Clean up PID file
+      try: removeFile(node.pidFile)
+      except: discard
+    
+    # BACKUP: Try process handle (will likely be dead since parent exited)
     if not node.process.isNil:
       try:
         if node.process.running:
           node.process.terminate()
-          # Give process time to exit
           for j in 0 ..< 10:
             if not node.process.running:
               break
             sleep(50)
-          # Force kill if still running
           if node.process.running:
             node.process.kill()
-        # Close the process handle
         node.process.close()
       except:
         discard
     
-    # Backup: kill via PID directly (handles stale process handles)
+    # BACKUP: Kill via stored PID (parent PID, likely already dead)
     if node.pid > 0:
       try:
-        # Check if PID is still alive
         let procPath = "/proc/" & $node.pid
         if dirExists(procPath):
-          # Use execShellCmd to bypass potential Nim issues
           discard execShellCmd("kill -9 " & $node.pid & " 2>/dev/null")
       except:
         discard
-    
-    # Also clean up PID file
-    if node.pidFile.len > 0 and fileExists(node.pidFile):
-      try: removeFile(node.pidFile)
-      except: discard
 
   cluster.nodes = @[]
 
