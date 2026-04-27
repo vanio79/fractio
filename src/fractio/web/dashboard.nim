@@ -550,6 +550,32 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
     sendHtml(Http200, html)
     return fut
 
+  # ---- REST: Health check ----
+  if path == "/api/health" and httpMethod == HttpGet:
+    ## Health check endpoint for tests and monitoring.
+    ## Returns status=0 if healthy, metaLeaderOK if meta group has a leader.
+    let srv = getSrv()
+    if srv.isNil:
+      sendJson(Http503, %* {"status": 1, "error": "server not ready"})
+      return fut
+    var status = 0
+    var metaLeaderOK = false
+    # Check if meta group has a leader
+    if srv.raftCoord != nil and srv.raftCoord.running.load():
+      let metaLeader = srv.raftCoord.getLeader(system_tables.META_GROUP_ID)
+      metaLeaderOK = metaLeader > 0
+      if not metaLeaderOK:
+        status = 2  # No meta leader
+    else:
+      status = 1  # Server not fully initialized
+    sendJson(Http200, %* {
+      "status": status,
+      "metaLeaderOK": metaLeaderOK,
+      "nodeId": srv.config.serverId.int,
+      "version": srv.config.serverVersion
+    })
+    return fut
+
   # ---- REST: Add node ----
   if path == "/api/nodes" and httpMethod == HttpPost:
     let srv = getSrv()
@@ -642,6 +668,68 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
     let elapsed = cpuTime() - startTime
     let elapsedMs = (elapsed * 1000).formatFloat(format = ffDecimal, precision = 2)
 
+    # Check if client wants JSON response (via Accept header or JSON content type)
+    let acceptHeader = getHeader(req, "Accept")
+    let wantsJson = contentType.contains("application/json") or
+                     acceptHeader.contains("application/json")
+
+    if wantsJson:
+      # Return JSON response for API clients
+      case execResult.kind
+      of erkRows:
+        var rowsJson: seq[JsonNode] = @[]
+        for row in execResult.rows:
+          var rowObj = newJObject()
+          for i, col in execResult.columns:
+            if i < row.len:
+              rowObj[col] = %row[i]
+            else:
+              rowObj[col] = %""
+          rowsJson.add(rowObj)
+        sendJson(Http200, %* {
+          "kind": "rows",
+          "columns": execResult.columns,
+          "rows": rowsJson,
+          "elapsedMs": elapsedMs
+        })
+      of erkStreamingRows:
+        var rowsJson: seq[JsonNode] = @[]
+        let iter = execResult.streamIterator
+        while iter.hasNextRow():
+          let rowOpt = iter.nextRow()
+          if rowOpt.isSome:
+            let row = rowOpt.get()
+            var rowObj = newJObject()
+            for i, col in execResult.streamColumns:
+              if i < row.len:
+                rowObj[col] = %row[i]
+              else:
+                rowObj[col] = %""
+            rowsJson.add(rowObj)
+        iter.closeIterator()
+        sendJson(Http200, %* {
+          "kind": "rows",
+          "columns": execResult.streamColumns,
+          "rows": rowsJson,
+          "elapsedMs": elapsedMs
+        })
+      of erkModified:
+        sendJson(Http200, %* {
+          "kind": "modified",
+          "count": execResult.count,
+          "elapsedMs": elapsedMs
+        })
+      of erkError:
+        sendJson(Http400, %* {
+          "kind": "error",
+          "error": execResult.error,
+          "elapsedMs": elapsedMs
+        })
+      else:
+        sendJson(Http200, %* {"kind": "ok", "elapsedMs": elapsedMs})
+      return fut
+
+    # HTML response for web dashboard
     var html = "<div class='sql-stats'>Executed in " & elapsedMs & "ms"
     case execResult.kind
     of erkRows:
