@@ -225,9 +225,7 @@ proc start*(cluster: TestCluster): bool =
 
 proc stop*(cluster: TestCluster) =
   ## Stop all nodes in the cluster
-  if not cluster.running.load(moRelaxed):
-    return
-
+  ## This method always attempts cleanup regardless of running state
   cluster.running.store(false)
 
   # Close all clients
@@ -236,19 +234,23 @@ proc stop*(cluster: TestCluster) =
     except: discard
   cluster.clients = @[]
 
-  # Terminate all processes
+  # Terminate all processes - always try, even if running was false
   for i in 0 ..< cluster.nodes.len:
     if not cluster.nodes[i].process.isNil:
       try:
-        cluster.nodes[i].process.terminate()
-        # Give process time to exit
-        for j in 0 ..< 20:
-          if not cluster.nodes[i].process.running:
-            break
-          sleep(50)
-        # Force kill if still running
+        # Check if process is still running before trying to terminate
         if cluster.nodes[i].process.running:
-          cluster.nodes[i].process.kill()
+          cluster.nodes[i].process.terminate()
+          # Give process time to exit
+          for j in 0 ..< 20:
+            if not cluster.nodes[i].process.running:
+              break
+            sleep(50)
+          # Force kill if still running
+          if cluster.nodes[i].process.running:
+            cluster.nodes[i].process.kill()
+        # Close the process handle even if not running
+        cluster.nodes[i].process.close()
       except:
         discard
 
