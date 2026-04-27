@@ -181,7 +181,8 @@ proc start*(cluster: TestCluster): bool =
     if exePath == "":
       raise newException(ValueError, "Could not find bin/fractio executable")
 
-    var args = @["start", "--config=" & configPath]
+    let pidFile = dataDir & "/node.pid"
+    var args = @["start", "--config=" & configPath, "--pid-file=" & pidFile]
 
     # First node starts as leader, others join
     if nodeId > 1:
