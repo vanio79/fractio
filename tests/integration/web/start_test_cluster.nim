@@ -12,6 +12,9 @@
 import std/os, std/httpclient, std/json, std/strformat, std/strutils
 import ../../test_cluster
 
+# Kill orphaned daemons from previous runs at startup
+killOrphanedDaemons()
+
 const BASE_PORT_OFFSET = 0 # Use default ports
 
 proc httpGetJson(url: string): JsonNode =

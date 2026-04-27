@@ -20,6 +20,9 @@ import std/[json, httpclient, strutils, os, times]
 import ../../test_cluster
 import ../../test_config
 
+# Kill orphaned daemons from previous test runs at startup
+killOrphanedDaemons()
+
 const
   BASE_PORT_OFFSET = 5000 # Offset to avoid port conflicts
   HTTP_TIMEOUT_MS = 10_000

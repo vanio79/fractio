@@ -14,6 +14,22 @@ import std/[os, osproc, strutils, json, httpclient, times, strformat, posix]
 import fractio/protocol/types
 import ../../../test_config
 
+# Kill orphaned fractio_web processes from previous runs
+proc cleanupOrphanProcesses() =
+  try:
+    for dir in walkDirs("/tmp/fractio-rejoin-test-node*"):
+      if dirExists(dir):
+        let pidFile = dir / "node.pid"
+        if fileExists(pidFile):
+          let pid = parseInt(readFile(pidFile).strip())
+          discard execShellCmd("kill -9 " & $pid & " 2>/dev/null")
+        removeDir(dir)
+  except:
+    discard
+
+# Clean up at startup
+cleanupOrphanProcesses()
+
 const
   BinaryPath = "bin/fractio_web"
   TestHost = "127.0.0.1"
@@ -71,6 +87,7 @@ data-dir = "{dataDir}"
 
 proc startNode(id: int; join = ""): TestNode =
   ## Start a fractio_web node as a background process.
+  ## Writes PID file for crash recovery cleanup.
   result.id = id
   result.raftPort = BaseRaftPort + (id - 1) * 1000
   result.clientPort = BaseClientPort + (id - 1)
@@ -83,6 +100,7 @@ proc startNode(id: int; join = ""): TestNode =
   var args = @[
     "start",
     &"--config={configPath}",
+    &"--pid-file={result.dataDir}/node.pid", # Write PID file for cleanup
   ]
   if join != "":
     args.add(&"--join={join}")
@@ -96,11 +114,20 @@ proc startNode(id: int; join = ""): TestNode =
 
 proc stopNode(node: var TestNode) =
   ## Stop a running node process.
+  ## Uses PID file as backup if process handle is stale.
   if node.process != nil and node.process.running:
     discard kill(Pid(node.process.processID), cint(SIGTERM))
     discard node.process.waitForExit(timeout = 5000)
     node.process.close()
     node.process = nil
+  # Backup cleanup via PID file
+  let pidFile = node.dataDir / "node.pid"
+  if fileExists(pidFile):
+    try:
+      let pid = parseInt(readFile(pidFile).strip())
+      discard execShellCmd("kill -9 " & $pid & " 2>/dev/null")
+    except:
+      discard
 
 proc cleanNodeData(id: int) =
   removeDir(nodeDataDir(id))

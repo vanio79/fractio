@@ -5,8 +5,11 @@
 #
 # Port range: Uses dynamic ports assigned by test_cluster
 
-import std/[unittest, json, strutils, sequtils]
+import std/[unittest, json, strutils, sequtils, os]
 import ../../test_cluster
+
+# Kill orphaned daemons from previous test runs at startup
+killOrphanedDaemons()
 
 # ---------------------------------------------------------------------------
 # Helpers
