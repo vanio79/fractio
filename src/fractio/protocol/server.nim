@@ -537,8 +537,15 @@ proc srvRecvExact(sock: Socket, buf: var string,
 
 proc sendRaw(conn: ClientConnection, data: string) {.gcsafe, raises: [].} =
   ## Send raw data on the socket. Silently ignore errors if socket is closed.
+  ##
+  ## IMPORTANT: Nim's socket.send() with SafeDisconn flag has a bug where
+  ## EPIPE causes an infinite loop (socketError returns without raising,
+  ## but the while loop in send() continues forever). We use trySend()
+  ## which calls the low-level send() directly and returns false on error.
   try:
-    conn.socket.send(data)
+    # Use trySend to avoid Nim's SafeDisconn infinite loop bug
+    # trySend calls low-level send() directly and returns false on any error
+    discard conn.socket.trySend(data)
   except CatchableError:
     discard
   except Defect:
