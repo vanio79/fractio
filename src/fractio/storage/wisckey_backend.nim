@@ -4,9 +4,16 @@
 import std/[options, locks, atomics, typedthreads, deques, os]
 import backend
 
-# WiscKey C bindings - static linking
-{.passL: "/usr/local/lib/libleveldb.a".}
-{.passC: "-I/usr/local/include".}
+# WiscKey C bindings - cross-platform linking
+const
+  LevelDbLib = when defined(macosx): "libleveldb.dylib" else: "libleveldb.so"
+
+when defined(macosx):
+  {.passL: "-L/opt/homebrew/lib -lleveldb -Wl,-rpath,/opt/homebrew/lib".}
+  {.passC: "-I/opt/homebrew/include".}
+else:
+  {.passL: "/usr/local/lib/libleveldb.a".}
+  {.passC: "-I/usr/local/include".}
 
 type
   WiscKeyBackend* {.acyclic.} = ref object of StorageBackend
@@ -43,99 +50,99 @@ type
 # Forward declarations for C functions
 proc c_leveldb_open(options: pointer, name: cstring,
     err: ptr cstring): pointer {.
-  importc: "leveldb_open", dynlib: "libleveldb.so".}
+  importc: "leveldb_open", dynlib: LevelDbLib.}
 proc c_leveldb_close(db: pointer) {.
-  importc: "leveldb_close", dynlib: "libleveldb.so".}
+  importc: "leveldb_close", dynlib: LevelDbLib.}
 proc c_leveldb_put(db, writeOptions: pointer; key: cstring, keylen: csize_t;
     val: cstring, vallen: csize_t; err: ptr cstring) {.
-  importc: "leveldb_put", dynlib: "libleveldb.so".}
+  importc: "leveldb_put", dynlib: LevelDbLib.}
 proc c_leveldb_get(db, readOptions: pointer; key: cstring, keylen: csize_t;
     vallen: ptr csize_t; err: ptr cstring): cstring {.
-  importc: "leveldb_get", dynlib: "libleveldb.so".}
+  importc: "leveldb_get", dynlib: LevelDbLib.}
 proc c_leveldb_delete(db, writeOptions: pointer; key: cstring, keylen: csize_t;
     err: ptr cstring) {.
-  importc: "leveldb_delete", dynlib: "libleveldb.so".}
+  importc: "leveldb_delete", dynlib: LevelDbLib.}
 proc c_leveldb_create_iterator(db, readOptions: pointer): pointer {.
-  importc: "leveldb_create_iterator", dynlib: "libleveldb.so".}
+  importc: "leveldb_create_iterator", dynlib: LevelDbLib.}
 proc c_leveldb_iter_destroy(iter: pointer) {.
-  importc: "leveldb_iter_destroy", dynlib: "libleveldb.so".}
+  importc: "leveldb_iter_destroy", dynlib: LevelDbLib.}
 proc c_leveldb_iter_valid(iter: pointer): uint8 {.
-  importc: "leveldb_iter_valid", dynlib: "libleveldb.so".}
+  importc: "leveldb_iter_valid", dynlib: LevelDbLib.}
 proc c_leveldb_iter_seek_to_first(iter: pointer) {.
-  importc: "leveldb_iter_seek_to_first", dynlib: "libleveldb.so".}
+  importc: "leveldb_iter_seek_to_first", dynlib: LevelDbLib.}
 proc c_leveldb_iter_seek_to_last(iter: pointer) {.
-  importc: "leveldb_iter_seek_to_last", dynlib: "libleveldb.so".}
+  importc: "leveldb_iter_seek_to_last", dynlib: LevelDbLib.}
 proc c_leveldb_iter_seek(iter: pointer; key: cstring, keylen: csize_t) {.
-  importc: "leveldb_iter_seek", dynlib: "libleveldb.so".}
+  importc: "leveldb_iter_seek", dynlib: LevelDbLib.}
 proc c_leveldb_iter_next(iter: pointer) {.
-  importc: "leveldb_iter_next", dynlib: "libleveldb.so".}
+  importc: "leveldb_iter_next", dynlib: LevelDbLib.}
 proc c_leveldb_iter_prev(iter: pointer) {.
-  importc: "leveldb_iter_prev", dynlib: "libleveldb.so".}
+  importc: "leveldb_iter_prev", dynlib: LevelDbLib.}
 proc c_leveldb_iter_key(iter: pointer; keylen: ptr csize_t): cstring {.
-  importc: "leveldb_iter_key", dynlib: "libleveldb.so".}
+  importc: "leveldb_iter_key", dynlib: LevelDbLib.}
 proc c_leveldb_iter_value(iter: pointer; vallen: ptr csize_t): cstring {.
-  importc: "leveldb_iter_value", dynlib: "libleveldb.so".}
+  importc: "leveldb_iter_value", dynlib: LevelDbLib.}
 proc c_leveldb_iter_get_error(iter: pointer; err: ptr cstring) {.
-  importc: "leveldb_iter_get_error", dynlib: "libleveldb.so".}
+  importc: "leveldb_iter_get_error", dynlib: LevelDbLib.}
 proc c_leveldb_write(db, writeOptions, batch: pointer; err: ptr cstring) {.
-  importc: "leveldb_write", dynlib: "libleveldb.so".}
+  importc: "leveldb_write", dynlib: LevelDbLib.}
 proc c_leveldb_compact_range(db: pointer; startKey: cstring,
     startKeyLen: csize_t; limitKey: cstring, limitKeyLen: csize_t) {.
-  importc: "leveldb_compact_range", dynlib: "libleveldb.so".}
+  importc: "leveldb_compact_range", dynlib: LevelDbLib.}
 proc c_leveldb_approximate_sizes(db: pointer; numRanges: cint;
     startKeys, startKeyLens, limitKeys, limitKeyLens: pointer;
     sizes: ptr uint64) {.
-  importc: "leveldb_approximate_sizes", dynlib: "libleveldb.so".}
+  importc: "leveldb_approximate_sizes", dynlib: LevelDbLib.}
 proc c_leveldb_destroy_db(options: pointer; name: cstring; err: ptr cstring) {.
-  importc: "leveldb_destroy_db", dynlib: "libleveldb.so".}
+  importc: "leveldb_destroy_db", dynlib: LevelDbLib.}
 proc c_leveldb_free(p: pointer) {.
-  importc: "leveldb_free", dynlib: "libleveldb.so".}
+  importc: "leveldb_free", dynlib: LevelDbLib.}
 proc c_leveldb_property_value(db: pointer, name: cstring): cstring {.
-  importc: "leveldb_property_value", dynlib: "libleveldb.so".}
+  importc: "leveldb_property_value", dynlib: LevelDbLib.}
 proc c_leveldb_options_create(): pointer {.
-  importc: "leveldb_options_create", dynlib: "libleveldb.so".}
+  importc: "leveldb_options_create", dynlib: LevelDbLib.}
 proc c_leveldb_options_destroy(options: pointer) {.
-  importc: "leveldb_options_destroy", dynlib: "libleveldb.so".}
+  importc: "leveldb_options_destroy", dynlib: LevelDbLib.}
 proc c_leveldb_options_set_create_if_missing(options: pointer; value: uint8) {.
-  importc: "leveldb_options_set_create_if_missing", dynlib: "libleveldb.so".}
+  importc: "leveldb_options_set_create_if_missing", dynlib: LevelDbLib.}
 proc c_leveldb_options_set_error_if_exists(options: pointer; value: uint8) {.
-  importc: "leveldb_options_set_error_if_exists", dynlib: "libleveldb.so".}
+  importc: "leveldb_options_set_error_if_exists", dynlib: LevelDbLib.}
 proc c_leveldb_options_set_write_buffer_size(options: pointer; size: csize_t) {.
-  importc: "leveldb_options_set_write_buffer_size", dynlib: "libleveldb.so".}
+  importc: "leveldb_options_set_write_buffer_size", dynlib: LevelDbLib.}
 proc c_leveldb_options_set_max_open_files(options: pointer; maxFiles: cint) {.
-  importc: "leveldb_options_set_max_open_files", dynlib: "libleveldb.so".}
+  importc: "leveldb_options_set_max_open_files", dynlib: LevelDbLib.}
 proc c_leveldb_options_set_block_size(options: pointer; size: csize_t) {.
-  importc: "leveldb_options_set_block_size", dynlib: "libleveldb.so".}
+  importc: "leveldb_options_set_block_size", dynlib: LevelDbLib.}
 proc c_leveldb_options_set_compression(options: pointer; compression: cint) {.
-  importc: "leveldb_options_set_compression", dynlib: "libleveldb.so".}
+  importc: "leveldb_options_set_compression", dynlib: LevelDbLib.}
 proc c_leveldb_cache_create_lru(capacity: csize_t): pointer {.
-  importc: "leveldb_cache_create_lru", dynlib: "libleveldb.so".}
+  importc: "leveldb_cache_create_lru", dynlib: LevelDbLib.}
 proc c_leveldb_cache_destroy(cache: pointer) {.
-  importc: "leveldb_cache_destroy", dynlib: "libleveldb.so".}
+  importc: "leveldb_cache_destroy", dynlib: LevelDbLib.}
 proc c_leveldb_options_set_cache(options, cache: pointer) {.
-  importc: "leveldb_options_set_cache", dynlib: "libleveldb.so".}
+  importc: "leveldb_options_set_cache", dynlib: LevelDbLib.}
 proc c_leveldb_readoptions_create(): pointer {.
-  importc: "leveldb_readoptions_create", dynlib: "libleveldb.so".}
+  importc: "leveldb_readoptions_create", dynlib: LevelDbLib.}
 proc c_leveldb_readoptions_destroy(options: pointer) {.
-  importc: "leveldb_readoptions_destroy", dynlib: "libleveldb.so".}
+  importc: "leveldb_readoptions_destroy", dynlib: LevelDbLib.}
 proc c_leveldb_writeoptions_create(): pointer {.
-  importc: "leveldb_writeoptions_create", dynlib: "libleveldb.so".}
+  importc: "leveldb_writeoptions_create", dynlib: LevelDbLib.}
 proc c_leveldb_writeoptions_destroy(options: pointer) {.
-  importc: "leveldb_writeoptions_destroy", dynlib: "libleveldb.so".}
+  importc: "leveldb_writeoptions_destroy", dynlib: LevelDbLib.}
 proc c_leveldb_writeoptions_set_sync(options: pointer; value: uint8) {.
-  importc: "leveldb_writeoptions_set_sync", dynlib: "libleveldb.so".}
+  importc: "leveldb_writeoptions_set_sync", dynlib: LevelDbLib.}
 proc c_leveldb_writebatch_create(): pointer {.
-  importc: "leveldb_writebatch_create", dynlib: "libleveldb.so".}
+  importc: "leveldb_writebatch_create", dynlib: LevelDbLib.}
 proc c_leveldb_writebatch_destroy(batch: pointer) {.
-  importc: "leveldb_writebatch_destroy", dynlib: "libleveldb.so".}
+  importc: "leveldb_writebatch_destroy", dynlib: LevelDbLib.}
 proc c_leveldb_writebatch_clear(batch: pointer) {.
-  importc: "leveldb_writebatch_clear", dynlib: "libleveldb.so".}
+  importc: "leveldb_writebatch_clear", dynlib: LevelDbLib.}
 proc c_leveldb_writebatch_put(batch: pointer; key: cstring, keylen: csize_t;
     val: cstring, vallen: csize_t) {.
-  importc: "leveldb_writebatch_put", dynlib: "libleveldb.so".}
+  importc: "leveldb_writebatch_put", dynlib: LevelDbLib.}
 proc c_leveldb_writebatch_delete(batch: pointer; key: cstring,
     keylen: csize_t) {.
-  importc: "leveldb_writebatch_delete", dynlib: "libleveldb.so".}
+  importc: "leveldb_writebatch_delete", dynlib: LevelDbLib.}
 
 proc newWiscKeyBackend*(config: StorageConfig): WiscKeyBackend =
   ## Create a new WiscKey backend
@@ -663,7 +670,7 @@ proc prefetchWorker(args: PrefetchWorkerArgs) {.thread.} =
     while bufferLen >= config.bufferSize and
           shared.state.load(moRelaxed) != ssClosed:
       # Small sleep to avoid busy waiting
-      os.sleep(1)
+      os.sleep(10)
       acquire(shared.bufferLock)
       let currentLen = shared.buffer.len
       release(shared.bufferLock)

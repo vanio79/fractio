@@ -392,7 +392,7 @@ proc cancelAllTimersForContext(ctx: pointer) =
 # Timer thread that polls for expired timers and invokes them
 proc timerThreadProc() {.thread, gcsafe.} =
   while gTimerThreadRunning.load(moRelaxed):
-    sleep(5) # 5ms poll interval
+    sleep(20) # 20ms poll interval
 
     # Collect expired timers under lock
     var expiredTimers: seq[tuple[timerId: int32, rpcCtx: pointer]] = @[]
@@ -1196,7 +1196,7 @@ proc proposeAndWait*(c: NuRaftCoordinator, groupId: GroupID,
         let elapsed = (getTime().toUnixFloat() * 1000.0) - startTime
         if elapsed > float(timeoutMs):
           return RaftResult(success: false, error: "Timeout waiting for commit")
-        sleep(1) # 1ms poll interval
+        sleep(5) # 5ms poll interval
       result = RaftResult(success: true, index: logIdx)
     else:
       result = RaftResult(success: false,

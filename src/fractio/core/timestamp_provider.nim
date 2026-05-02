@@ -1,7 +1,7 @@
 # Timestamp Provider - HLC (Hybrid Logical Clock) for MVCC transactions
 # Provides globally consistent timestamps using the shared timer
 
-import std/[atomics, times, options]
+import std/[atomics, times, options, os]
 import ../distributed/sharedtimer
 import ../distributed/sharedtimer/timeprovider
 import ./types
@@ -82,6 +82,7 @@ proc acquireCommitTimestamp*(tp: TimestampProvider,
 
   # Ensure commit timestamp is after the min timestamp
   while ts <= minTimestamp:
+    os.sleep(0) # Yield to avoid spinning on sub-microsecond clocks
     ts = tp.now()
 
   result = ts

@@ -527,7 +527,7 @@ proc acceptLoop(t: MultiplexedRaftTransport) {.thread.} =
         var toRemove: seq[int] = @[]
         for i, client in activeClients:
           var fds = @[client.getFd()]
-          let ready = nativesockets.selectRead(fds, 0) # No timeout - just check
+          let ready = nativesockets.selectRead(fds, 1) # 1ms timeout per client
           if ready > 0:
             # Data available - try to read a message
             if not readOneMessage(client, t):
@@ -542,7 +542,7 @@ proc acceptLoop(t: MultiplexedRaftTransport) {.thread.} =
             discard
           activeClients.del(toRemove[i])
 
-      sleep(1) # Small yield to prevent busy-waiting
+      sleep(10) # Yield to prevent busy-waiting
 
     except:
       if t.serverRunning.load():

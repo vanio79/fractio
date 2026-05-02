@@ -215,7 +215,7 @@ proc start*(cluster: TestCluster): bool =
       raise newException(ValueError, "Could not find bin/fractio executable")
 
     let pidFile = dataDir & "/node.pid"
-    var args = @["start", "--config=" & configPath, "--pid-file=" & pidFile]
+    var args = @["start", "--config=" & configPath, "--pid-file=" & pidFile, "--foreground"]
 
     # First node starts as leader, others join
     if nodeId > 1:
@@ -298,11 +298,8 @@ proc stop*(cluster: TestCluster) =
     # Backup: kill via PID directly (handles stale process handles)
     if node.pid > 0:
       try:
-        # Check if PID is still alive
-        let procPath = "/proc/" & $node.pid
-        if dirExists(procPath):
-          # Use execShellCmd to bypass potential Nim issues
-          discard execShellCmd("kill -9 " & $node.pid & " 2>/dev/null")
+        # Use execShellCmd to bypass potential Nim issues
+        discard execShellCmd("kill -9 " & $node.pid & " 2>/dev/null")
       except:
         discard
     
