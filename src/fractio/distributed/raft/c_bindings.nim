@@ -6,10 +6,16 @@
 const wrapperPath = "src/fractio/distributed/raft/wrapper/build"
 const nuraftPath = "thirdparty/NuRaft/build"
 
-{.passL: "-L" & wrapperPath & " -lnuraft_shim".}
-{.passL: "-L" & nuraftPath & " -lnuraft".}
-{.passL: "-lssl -lcrypto -lpthread -ldl -lstdc++".}
-{.passL: "-Wl,-rpath," & wrapperPath & " -Wl,-rpath," & nuraftPath.}
+when defined(macosx):
+  # Static linking on macOS to avoid dylib runtime path issues
+  {.passL: wrapperPath & "/libnuraft_shim.a".}
+  {.passL: nuraftPath & "/libnuraft.a".}
+  {.passL: "-lssl -lcrypto -lpthread -lstdc++".}
+else:
+  {.passL: "-L" & wrapperPath & " -lnuraft_shim".}
+  {.passL: "-L" & nuraftPath & " -lnuraft".}
+  {.passL: "-lssl -lcrypto -lpthread -ldl -lstdc++".}
+  {.passL: "-Wl,-rpath," & wrapperPath & " -Wl,-rpath," & nuraftPath.}
 {.passC: "-I" & "src/fractio/distributed/raft/wrapper".}
 {.passC: "-I" & "thirdparty/NuRaft/src".}
 

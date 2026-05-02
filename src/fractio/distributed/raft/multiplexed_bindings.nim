@@ -6,7 +6,8 @@ import fractio/distributed/raft/c_bindings
 
 const wrapperPath = "src/fractio/distributed/raft/wrapper/build"
 
-{.passL: "-L" & wrapperPath & " -lnuraft_shim".}
+when not defined(macosx):
+  {.passL: "-L" & wrapperPath & " -lnuraft_shim".}
 {.passC: "-I" & "src/fractio/distributed/raft/wrapper".}
 
 # =============================================================================
