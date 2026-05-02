@@ -8,6 +8,7 @@ import std/[json, strutils, strformat, times, os, atomics,
 import zippy
 import ../core/types as coreTypes except Table
 import ../protocol/server as pserver
+import ../protocol/txn_manager
 import ../protocol/messages/cluster as clusterMsgs
 import ../sql/executor
 import ../client/fractio_client
@@ -124,6 +125,17 @@ proc getRoleString(role: int): string =
   of 2: "Follower"
   else: "Unknown"
 
+proc jsonValStr(j: JsonNode, key: string, defaultVal: string = ""): string =
+  ## Extract a string value from a JsonNode field, handling both JString and JInt.
+  if j.isNil or not j.hasKey(key): return defaultVal
+  let n = j[key]
+  case n.kind
+  of JString: return n.getStr(defaultVal)
+  of JInt: return $n.getInt()
+  of JFloat: return $n.getFloat()
+  of JBool: return $n.getBool()
+  else: return defaultVal
+
 # ---------------------------------------------------------------------------
 # HTTP handler
 # ---------------------------------------------------------------------------
@@ -150,8 +162,30 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
     else:
       req.send(code, data, "Content-Type: text/html; charset=utf-8")
 
+  proc trackRequest(srv: pserver.ProtocolServer, isError: bool = false) =
+    if srv.isNil: return
+    discard srv.metrics.requestsTotal.fetchAdd(1)
+    if isError:
+      discard srv.metrics.requestsErr.fetchAdd(1)
+    else:
+      discard srv.metrics.requestsOK.fetchAdd(1)
+
   # ---- Static: bundle.js (HTMX + app code, minified) ----
   if path == "/bundle.js" and (httpMethod == HttpGet or httpMethod == HttpHead):
+    var body: string
+    var hdrs = "Content-Type: application/javascript; charset=utf-8\nCache-Control: public, max-age=31536000\nVary: Accept-Encoding"
+    {.cast(gcsafe).}:
+      body = if wantsGzip: bundleJsGz else: bundleJs
+    if wantsGzip:
+      hdrs.add("\nContent-Encoding: gzip")
+    if httpMethod == HttpHead:
+      req.send(Http200, "", hdrs)
+    else:
+      req.send(Http200, body, hdrs)
+    return fut
+
+  # ---- Static: app.js (alias for bundle.js) ----
+  if path == "/app.js" and (httpMethod == HttpGet or httpMethod == HttpHead):
     var body: string
     var hdrs = "Content-Type: application/javascript; charset=utf-8\nCache-Control: public, max-age=31536000\nVary: Accept-Encoding"
     {.cast(gcsafe).}:
@@ -554,19 +588,48 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
   if path == "/api/nodes" and httpMethod == HttpPost:
     let srv = getSrv()
     if srv.isNil:
-      sendJson(Http503, %* {"error": "server not ready"})
+      sendJson(Http503, %* {"success": false, "error": "server not ready"})
       return fut
     let bodyOpt = req.body()
     if bodyOpt.isNone:
-      sendJson(Http400, %* {"error": "missing body"})
+      sendJson(Http400, %* {"success": false, "error": "missing body"})
       return fut
-    let formData = parseFormData(bodyOpt.get())
-    let host = formData.getOrDefault("host")
-    let raftPort = parseInt(formData.getOrDefault("raftPort"))
-    let clientPort = parseInt(formData.getOrDefault("clientPort"))
-    let webPort = parseInt(formData.getOrDefault("webPort"))
+    let contentType = getHeader(req, "Content-Type")
+    var host, raftPortStr, clientPortStr, webPortStr, nodeIdStr: string
+    if contentType.contains("application/json"):
+      var j: JsonNode
+      try:
+        j = parseJson(bodyOpt.get())
+      except JsonParsingError:
+        sendJson(Http400, %* {"success": false, "error": "invalid JSON"})
+        return fut
+      nodeIdStr = jsonValStr(j, "nodeId")
+      host = jsonValStr(j, "host")
+      raftPortStr = jsonValStr(j, "raftPort")
+      clientPortStr = jsonValStr(j, "clientPort")
+      webPortStr = jsonValStr(j, "webPort")
+    else:
+      let formData = parseFormData(bodyOpt.get())
+      nodeIdStr = formData.getOrDefault("nodeId")
+      host = formData.getOrDefault("host")
+      raftPortStr = formData.getOrDefault("raftPort")
+      clientPortStr = formData.getOrDefault("clientPort")
+      webPortStr = formData.getOrDefault("webPort")
+    if nodeIdStr.len == 0:
+      sendJson(Http400, %* {"success": false, "message": "missing nodeId"})
+      return fut
+    if host.len == 0:
+      sendJson(Http400, %* {"success": false, "message": "missing host"})
+      return fut
+    let nodeId = parseInt(nodeIdStr)
+    if nodeId == 0:
+      sendJson(Http400, %* {"success": false, "message": "nodeId 0 is reserved"})
+      return fut
+    let raftPort = parseInt(raftPortStr)
+    let clientPort = parseInt(clientPortStr)
+    let webPort = parseInt(webPortStr)
     let newNode = pserver.ClusterNodeEntry(
-      nodeId: uint16(srv.nodeRegistry.nodes.len + 1),
+      nodeId: uint16(nodeId),
       host: host,
       raftPort: uint16(raftPort),
       clientPort: uint16(clientPort),
@@ -576,30 +639,114 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
     srv.nodeRegistry.addNode(newNode)
     if srv.config.dataDir != "":
       pserver.saveRegistry(srv.nodeRegistry, srv.config.dataDir / "node_registry.dat")
-    sendHtml(Http200, "<div hx-get='/htmx/nodes' hx-trigger='load' hx-target='#content'></div>")
+    # Add the joining node as a Raft peer to local groups
+    if not srv.raftCoord.isNil:
+      discard srv.raftCoord.addServerToGroup(META_GROUP_ID, uint32(nodeId), host, raftPort)
+      discard srv.raftCoord.addServerToGroup(DATA_GROUP_START_ID, uint32(nodeId), host, raftPort)
+    var membersArr = newJArray()
+    for e in srv.nodeRegistry.listNodes():
+      membersArr.add(%* {
+        "nodeId": e.nodeId.int,
+        "host": e.host,
+        "raftPort": e.raftPort.int,
+        "clientPort": e.clientPort.int,
+      })
+    sendJson(Http200, %* {"success": true, "nodeId": nodeId, "members": membersArr})
     return fut
 
   # ---- REST: Remove node ----
   if path.startsWith("/api/nodes/") and httpMethod == HttpDelete:
     let srv = getSrv()
     if srv.isNil:
-      sendJson(Http503, %* {"error": "server not ready"})
+      sendJson(Http503, %* {"success": false, "error": "server not ready"})
       return fut
     let idStr = path[11..path.len-1]
     let id = parseInt(idStr)
     let removed = srv.nodeRegistry.removeNode(uint16(id))
     if removed and srv.config.dataDir != "":
       pserver.saveRegistry(srv.nodeRegistry, srv.config.dataDir / "node_registry.dat")
-    sendHtml(Http200, "<div hx-get='/htmx/nodes' hx-trigger='load' hx-target='#content'></div>")
+    sendJson(Http200, %* {"success": removed})
     return fut
 
   # ---- REST: Rebalance spaces ----
   if path == "/api/rebalance" and httpMethod == HttpPost:
     let srv = getSrv()
     if srv.isNil:
-      sendHtml(Http200, "<div class='form-msg err'>Server not ready</div>")
+      sendJson(Http503, %* {"error": "server not ready"})
       return fut
-    sendHtml(Http200, "<div class='form-msg ok'>Rebalance completed</div>")
+    sendJson(Http200, %* {"success": true, "message": "Rebalance completed"})
+    return fut
+
+  # ---- REST: System tables list ----
+  if path == "/api/sql/system-tables" and httpMethod == HttpGet:
+    var arr = newJArray()
+    let sysTables = @[
+      (id: 1, name: "sys.databases", desc: "Database catalog"),
+      (id: 2, name: "sys.schemas", desc: "Schema catalog"),
+      (id: 3, name: "sys.tables", desc: "Table descriptors"),
+      (id: 4, name: "sys.groups", desc: "Raft group metadata"),
+      (id: 5, name: "sys.nodes", desc: "Cluster node registry"),
+      (id: 6, name: "sys.settings", desc: "Cluster config"),
+      (id: 7, name: "sys.spaces", desc: "Space catalog"),
+    ]
+    for st in sysTables:
+      arr.add(%* {
+        "id": st.id,
+        "name": st.name,
+        "description": st.desc,
+        "rowCount": 0
+      })
+    sendJson(Http200, arr)
+    return fut
+
+  # ---- REST: System table data ----
+  if path.startsWith("/api/sql/system-table/") and httpMethod == HttpGet:
+    let idStr = path[22..path.len-1]
+    var tableId: int
+    try:
+      tableId = parseInt(idStr)
+    except ValueError:
+      sendJson(Http404, %* {"error": "invalid table id"})
+      return fut
+    var tableName = ""
+    case tableId
+    of 1: tableName = "sys.databases"
+    of 2: tableName = "sys.schemas"
+    of 3: tableName = "sys.tables"
+    of 4: tableName = "sys.groups"
+    of 5: tableName = "sys.nodes"
+    of 6: tableName = "sys.settings"
+    of 7: tableName = "sys.spaces"
+    else:
+      sendJson(Http404, %* {"error": "system table not found"})
+      return fut
+    var execResult: ExecResult
+    {.cast(gcsafe).}:
+      execResult = getClient().query("SELECT * FROM " & tableName)
+    case execResult.kind
+    of erkRows:
+      var rowsJson = newJArray()
+      for row in execResult.rows:
+        var rowObj = newJObject()
+        for i, col in execResult.columns:
+          if i < row.len: rowObj[col] = newJString(row[i])
+        rowsJson.add(rowObj)
+      sendJson(Http200, %* {"tableId": tableId, "columns": execResult.columns, "rows": rowsJson})
+    of erkStreamingRows:
+      var rowsJson = newJArray()
+      let iter = execResult.streamIterator
+      while iter.hasNextRow():
+        let rowOpt = iter.nextRow()
+        if rowOpt.isSome:
+          let row = rowOpt.get()
+          var rowObj = newJObject()
+          for i, col in execResult.streamColumns:
+            if i < row.len: rowObj[col] = newJString(row[i])
+          rowsJson.add(rowObj)
+      iter.closeIterator()
+      sendJson(Http200, %* {"tableId": tableId, "columns": execResult.streamColumns, "rows": rowsJson})
+    else:
+      sendJson(Http200, %* {"tableId": tableId, "columns": newJArray(), "rows": newJArray()})
     return fut
 
   # ---- REST: SQL query ----
@@ -635,6 +782,7 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
     if sql.len == 0:
       sendJson(Http400, %* {"error": "missing sql"})
       return fut
+    trackRequest(srv)
     let startTime = cpuTime()
     var execResult: ExecResult
     {.cast(gcsafe).}:
@@ -642,53 +790,359 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
     let elapsed = cpuTime() - startTime
     let elapsedMs = (elapsed * 1000).formatFloat(format = ffDecimal, precision = 2)
 
-    var html = "<div class='sql-stats'>Executed in " & elapsedMs & "ms"
-    case execResult.kind
-    of erkRows:
-      html.add(" • " & $execResult.rows.len & " rows</div>")
-      html.add("<table class='data-table'><thead><tr>")
-      for col in execResult.columns:
-        html.add("<th>" & col & "</th>")
-      html.add("</tr></thead><tbody>")
-      for row in execResult.rows:
-        html.add("<tr>")
-        for i, col in execResult.columns:
-          if i < row.len:
-            html.add("<td>" & row[i] & "</td>")
-          else:
-            html.add("<td></td>")
-        html.add("</tr>")
-      html.add("</tbody></table>")
-    of erkStreamingRows:
-      var rowCount = 0
-      html.add("</div><table class='data-table'><thead><tr>")
-      for col in execResult.streamColumns:
-        html.add("<th>" & col & "</th>")
-      html.add("</tr></thead><tbody>")
-      let iter = execResult.streamIterator
-      while iter.hasNextRow():
-        let rowOpt = iter.nextRow()
-        if rowOpt.isSome:
-          rowCount += 1
-          let row = rowOpt.get()
+    if contentType.contains("application/json"):
+      # REST API: return JSON
+      case execResult.kind
+      of erkRows:
+        var rowsJson = newJArray()
+        for row in execResult.rows:
+          var rowObj = newJObject()
+          for i, col in execResult.columns:
+            if i < row.len:
+              rowObj[col] = newJString(row[i])
+          rowsJson.add(rowObj)
+        sendJson(Http200, %* {"kind": "rows", "columns": execResult.columns,
+            "rows": rowsJson})
+      of erkStreamingRows:
+        var rowsJson = newJArray()
+        let iter = execResult.streamIterator
+        while iter.hasNextRow():
+          let rowOpt = iter.nextRow()
+          if rowOpt.isSome:
+            let row = rowOpt.get()
+            var rowObj = newJObject()
+            for i, col in execResult.streamColumns:
+              if i < row.len:
+                rowObj[col] = newJString(row[i])
+            rowsJson.add(rowObj)
+        iter.closeIterator()
+        sendJson(Http200, %* {"kind": "rows", "columns": execResult.streamColumns,
+            "rows": rowsJson})
+      of erkModified:
+        sendJson(Http200, %* {"kind": "modified", "count": execResult.count,
+            "message": execResult.message})
+      of erkOk:
+        sendJson(Http200, %* {"kind": "ok", "message": execResult.okMessage})
+      of erkError:
+        sendJson(Http400, %* {"kind": "error", "error": execResult.error})
+      of erkUseDatabase:
+        sendJson(Http200, %* {"kind": "useDatabase", "database": execResult.newDatabase})
+      of erkUseSchema:
+        sendJson(Http200, %* {"kind": "useSchema", "schema": execResult.newSchema})
+      else:
+        sendJson(Http200, %* {"kind": "ok"})
+    else:
+      # HTMX: return HTML
+      var html = "<div class='sql-stats'>Executed in " & elapsedMs & "ms"
+      case execResult.kind
+      of erkRows:
+        html.add(" • " & $execResult.rows.len & " rows</div>")
+        html.add("<table class='data-table'><thead><tr>")
+        for col in execResult.columns:
+          html.add("<th>" & col & "</th>")
+        html.add("</tr></thead><tbody>")
+        for row in execResult.rows:
           html.add("<tr>")
-          for i, col in execResult.streamColumns:
+          for i, col in execResult.columns:
             if i < row.len:
               html.add("<td>" & row[i] & "</td>")
             else:
               html.add("<td></td>")
           html.add("</tr>")
-      iter.closeIterator()
-      html.add("</tbody></table>")
-      html = "<div class='sql-stats'>Executed in " & elapsedMs & "ms • " &
-          $rowCount & " rows</div>" & html[html.find("</div>") + 6..html.len-1]
-    of erkModified:
-      html.add("</div><div class='form-msg ok'>" & $execResult.count & " rows affected</div>")
-    of erkError:
-      html.add("</div><div class='form-msg err'>Error: " & execResult.error & "</div>")
+        html.add("</tbody></table>")
+      of erkStreamingRows:
+        var rowCount = 0
+        html.add("</div><table class='data-table'><thead><tr>")
+        for col in execResult.streamColumns:
+          html.add("<th>" & col & "</th>")
+        html.add("</tr></thead><tbody>")
+        let iter = execResult.streamIterator
+        while iter.hasNextRow():
+          let rowOpt = iter.nextRow()
+          if rowOpt.isSome:
+            rowCount += 1
+            let row = rowOpt.get()
+            html.add("<tr>")
+            for i, col in execResult.streamColumns:
+              if i < row.len:
+                html.add("<td>" & row[i] & "</td>")
+              else:
+                html.add("<td></td>")
+            html.add("</tr>")
+        iter.closeIterator()
+        html.add("</tbody></table>")
+        html = "<div class='sql-stats'>Executed in " & elapsedMs & "ms • " &
+            $rowCount & " rows</div>" & html[html.find("</div>") + 6..html.len-1]
+      of erkModified:
+        html.add("</div><div class='form-msg ok'>" & $execResult.count & " rows affected</div>")
+      of erkError:
+        html.add("</div><div class='form-msg err'>Error: " & execResult.error & "</div>")
+      else:
+        html.add("</div><div class='form-msg ok'>OK</div>")
+      sendHtml(Http200, html)
+    return fut
+
+  # ---- REST: health ----
+  if path == "/api/health" and httpMethod == HttpGet:
+    let srv = getSrv()
+    if srv.isNil:
+      sendJson(Http503, %* {"error": "server not ready"})
+      return fut
+    trackRequest(srv)
+    let nodes = srv.nodeRegistry.listNodes()
+    let rc = nodes.len
+    var metaLeaderOK = false
+    if not srv.raftStore.isNil and not srv.raftStore.coordinator.isNil:
+      metaLeaderOK = srv.raftStore.coordinator.isLeader(META_GROUP_ID) or
+          srv.raftStore.coordinator.getLeader(META_GROUP_ID) > 0
+    sendJson(Http200, %* {
+      "status": if metaLeaderOK: 0 else: 1,
+      "leaderOK": true,
+      "metaLeaderOK": metaLeaderOK,
+      "replicaCount": rc,
+      "healthyReplicas": rc,
+      "clusterName": srv.config.clusterName,
+    })
+    return fut
+
+  # ---- REST: info ----
+  if path == "/api/info" and httpMethod == HttpGet:
+    let srv = getSrv()
+    if srv.isNil:
+      sendJson(Http503, %* {"error": "server not ready"})
+      return fut
+    trackRequest(srv)
+    let nowSecs = getTime().toUnix()
+    let uptime = uint64(max(0'i64, nowSecs - srv.startedAt))
+    let role = block:
+      if srv.raftStore.isNil: "unknown"
+      else:
+        if srv.raftStore.coordinator.isLeader(META_GROUP_ID): "leader"
+        else: "follower"
+    let shards = if srv.raftStore.isNil: 0
+                 else: srv.raftStore.coordinator.getGroupCount()
+    sendJson(Http200, %* {
+      "nodeId": srv.config.serverId.int,
+      "version": srv.config.serverVersion,
+      "uptimeSecs": uptime,
+      "role": role,
+      "shardCount": shards,
+      "clientCount": srv.clientCount(),
+      "clusterName": srv.config.clusterName,
+    })
+    return fut
+
+  # ---- REST: metrics ----
+  if path == "/api/metrics" and httpMethod == HttpGet:
+    let srv = getSrv()
+    if srv.isNil:
+      sendJson(Http503, %* {"error": "server not ready"})
+      return fut
+    trackRequest(srv)
+    let m = srv.metrics
+    var snap = m.snapshot()
+    snap.activeTxns = uint32(srv.txnMgr.activeTxnCount())
+    sendJson(Http200, %* {
+      "requestsTotal": snap.requestsTotal,
+      "requestsOK": snap.requestsOK,
+      "requestsErr": snap.requestsErr,
+      "bytesIn": snap.bytesIn,
+      "bytesOut": snap.bytesOut,
+      "kvGets": snap.kvGets,
+      "kvPuts": snap.kvPuts,
+      "kvDeletes": snap.kvDeletes,
+      "activeTxns": snap.activeTxns,
+      "committedTxns": snap.committedTxns,
+      "abortedTxns": snap.abortedTxns,
+    })
+    return fut
+
+  # ---- REST: storage ----
+  if path == "/api/storage" and httpMethod == HttpGet:
+    let srv = getSrv()
+    if srv.isNil or srv.raftStore.isNil:
+      sendJson(Http503, %* {"error": "server not ready"})
+      return fut
+    trackRequest(srv)
+    let backend = srv.raftStore.coordinator.store
+    let stats = backend.getProperty("leveldb.stats")
+    var numFiles = newJArray()
+    for level in 0 .. 6:
+      numFiles.add(newJString(backend.getProperty(
+          "leveldb.num-files-at-level" & $level)))
+    var sizes = newSeq[float](7)
+    for line in stats.splitLines():
+      let stripped = line.strip()
+      if stripped.len > 0 and stripped[0] in '0'..'6':
+        let parts = stripped.splitWhitespace()
+        if parts.len >= 3:
+          try:
+            let level = parseInt(parts[0])
+            let sizeMB = parseFloat(parts[2])
+            if level >= 0 and level <= 6:
+              sizes[level] = sizeMB
+          except ValueError:
+            discard
+    var levelSizes = newJArray()
+    for s in sizes:
+      levelSizes.add(newJFloat(s))
+    sendJson(Http200, %* {
+      "stats": stats,
+      "numFiles": numFiles,
+      "levelSizes": levelSizes,
+      "path": backend.path,
+    })
+    return fut
+
+  # ---- REST: Cluster join ----
+  if path == "/api/cluster/join" and httpMethod == HttpPost:
+    let srv = getSrv()
+    if srv.isNil:
+      sendJson(Http503, %* {"success": false, "error": "server not ready"})
+      return fut
+    let bodyOpt = req.body()
+    if bodyOpt.isNone:
+      sendJson(Http400, %* {"success": false, "error": "missing body"})
+      return fut
+    let contentType = getHeader(req, "Content-Type")
+    var host, raftPortStr, clientPortStr, webPortStr, nodeIdStr: string
+    if contentType.contains("application/json"):
+      var j: JsonNode
+      try:
+        j = parseJson(bodyOpt.get())
+      except JsonParsingError:
+        sendJson(Http400, %* {"success": false, "error": "invalid JSON"})
+        return fut
+      nodeIdStr = jsonValStr(j, "nodeId")
+      host = jsonValStr(j, "host")
+      raftPortStr = jsonValStr(j, "raftPort")
+      clientPortStr = jsonValStr(j, "clientPort")
+      webPortStr = jsonValStr(j, "webPort")
     else:
-      html.add("</div><div class='form-msg ok'>OK</div>")
-    sendHtml(Http200, html)
+      let formData = parseFormData(bodyOpt.get())
+      nodeIdStr = formData.getOrDefault("nodeId")
+      host = formData.getOrDefault("host")
+      raftPortStr = formData.getOrDefault("raftPort")
+      clientPortStr = formData.getOrDefault("clientPort")
+      webPortStr = formData.getOrDefault("webPort")
+    if nodeIdStr.len == 0:
+      sendJson(Http400, %* {"success": false, "message": "missing nodeId"})
+      return fut
+    if host.len == 0:
+      sendJson(Http400, %* {"success": false, "message": "missing host"})
+      return fut
+    let nodeId = parseInt(nodeIdStr)
+    if nodeId == 0:
+      sendJson(Http400, %* {"success": false, "message": "nodeId 0 is reserved"})
+      return fut
+    let raftPort = parseInt(raftPortStr)
+    let clientPort = parseInt(clientPortStr)
+    let webPort = parseInt(webPortStr)
+    let newNode = pserver.ClusterNodeEntry(
+      nodeId: uint16(nodeId),
+      host: host,
+      raftPort: uint16(raftPort),
+      clientPort: uint16(clientPort),
+      webPort: uint16(webPort),
+      status: 0
+    )
+    srv.nodeRegistry.addNode(newNode)
+    if srv.config.dataDir != "":
+      pserver.saveRegistry(srv.nodeRegistry, srv.config.dataDir / "node_registry.dat")
+    sendJson(Http200, %* {"success": true, "nodeId": nodeId})
+    return fut
+
+  # ---- REST: SQL metadata endpoints ----
+  if path == "/api/sql/databases" and httpMethod == HttpGet:
+    var execResult: ExecResult
+    {.cast(gcsafe).}:
+      execResult = getClient().query("SELECT name FROM sys.databases")
+    var arr = newJArray()
+    case execResult.kind
+    of erkRows:
+      for row in execResult.rows:
+        if row.len > 0: arr.add(newJString(row[0]))
+    of erkStreamingRows:
+      let iter = execResult.streamIterator
+      while iter.hasNextRow():
+        let rowOpt = iter.nextRow()
+        if rowOpt.isSome:
+          let row = rowOpt.get()
+          if row.len > 0: arr.add(newJString(row[0]))
+      iter.closeIterator()
+    else:
+      discard
+    sendJson(Http200, arr)
+    return fut
+
+  if path == "/api/sql/schemas" and httpMethod == HttpGet:
+    let dbHeader = getHeader(req, "X-Database")
+    let db = if dbHeader.len > 0: dbHeader else: "default"
+    var execResult: ExecResult
+    {.cast(gcsafe).}:
+      execResult = getClient().query("SELECT name FROM sys.schemas WHERE database = '" & db & "'")
+    var arr = newJArray()
+    case execResult.kind
+    of erkRows:
+      for row in execResult.rows:
+        if row.len > 0: arr.add(newJString(row[0]))
+    of erkStreamingRows:
+      let iter = execResult.streamIterator
+      while iter.hasNextRow():
+        let rowOpt = iter.nextRow()
+        if rowOpt.isSome:
+          let row = rowOpt.get()
+          if row.len > 0: arr.add(newJString(row[0]))
+      iter.closeIterator()
+    else:
+      discard
+    sendJson(Http200, arr)
+    return fut
+
+  if path == "/api/sql/tables" and httpMethod == HttpGet:
+    let dbHeader = getHeader(req, "X-Database")
+    let scHeader = getHeader(req, "X-Schema")
+    let db = if dbHeader.len > 0: dbHeader else: "default"
+    let sc = if scHeader.len > 0: scHeader else: "public"
+    var execResult: ExecResult
+    {.cast(gcsafe).}:
+      execResult = getClient().query("SELECT name FROM sys.tables WHERE database = '" & db & "' AND schema = '" & sc & "'")
+    var arr = newJArray()
+    case execResult.kind
+    of erkRows:
+      for row in execResult.rows:
+        if row.len > 0: arr.add(newJString(row[0]))
+    of erkStreamingRows:
+      let iter = execResult.streamIterator
+      while iter.hasNextRow():
+        let rowOpt = iter.nextRow()
+        if rowOpt.isSome:
+          let row = rowOpt.get()
+          if row.len > 0: arr.add(newJString(row[0]))
+      iter.closeIterator()
+    else:
+      discard
+    sendJson(Http200, arr)
+    return fut
+
+  # ---- REST: nodes GET ----
+  if path == "/api/nodes" and httpMethod == HttpGet:
+    let srv = getSrv()
+    if srv.isNil:
+      sendJson(Http503, %* {"error": "server not ready"})
+      return fut
+    trackRequest(srv)
+    var arr = newJArray()
+    let entries = srv.nodeRegistry.listNodes()
+    for e in entries:
+      arr.add(%* {
+        "nodeId": e.nodeId.int,
+        "host": e.host,
+        "raftPort": e.raftPort.int,
+        "clientPort": e.clientPort.int,
+        "status": e.status.int,
+      })
+    sendJson(Http200, arr)
     return fut
 
   # ---- 404 Not Found ----

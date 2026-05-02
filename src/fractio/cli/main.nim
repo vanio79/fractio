@@ -211,6 +211,16 @@ proc cmdStart(flags: Table[string, string]) =
   let server = newProtocolServer(cfg)
   server.start()
 
+  # Register self in node registry so /api/nodes reports correctly
+  server.nodeRegistry.addNode(ClusterNodeEntry(
+    nodeId: uint16(conf.nodeId),
+    host: conf.host,
+    raftPort: uint16(conf.raftPort),
+    clientPort: uint16(conf.clientPort),
+    webPort: uint16(conf.webPort),
+    status: 0
+  ))
+
   let isJoining = joinPeer != ""
 
   try:
@@ -273,15 +283,25 @@ proc cmdStart(flags: Table[string, string]) =
             echo "join successful"
         else:
           echo "join successful"
-        # Add all returned cluster members as Raft peers
+        # Add all returned cluster members as Raft peers and to node registry
         let members = rj.getOrDefault("members")
         if not members.isNil and members.kind == JArray:
           for m in members:
             let mNodeId = uint32(m.getOrDefault("nodeId").getInt(0))
             let mHost = m.getOrDefault("host").getStr("")
             let mRaftPort = m.getOrDefault("raftPort").getInt(0)
+            let mClientPort = m.getOrDefault("clientPort").getInt(0)
+            let mWebPort = m.getOrDefault("webPort").getInt(0)
             if mNodeId > 0 and mHost != "" and mRaftPort > 0:
               server.addPeerToRaft(mNodeId, mHost, mRaftPort)
+              server.nodeRegistry.addNode(ClusterNodeEntry(
+                nodeId: uint16(mNodeId),
+                host: mHost,
+                raftPort: uint16(mRaftPort),
+                clientPort: uint16(mClientPort),
+                webPort: uint16(mWebPort),
+                status: 0
+              ))
       else:
         let errMsg = rj.getOrDefault("error").getStr("unknown error")
         writeLine(stderr, "warning: join refused: " & errMsg)

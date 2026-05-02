@@ -17,6 +17,10 @@ killOrphanedDaemons()
 
 proc checkExplainResult(res: JsonNode, expectedOp: string) =
   ## Check that an EXPLAIN result contains the expected operation
+  if res.hasKey("error"):
+    checkpoint("SQL execution error: " & res["error"].getStr)
+    check false
+    return
   check res.hasKey("kind")
   check res["kind"].getStr == "rows"
   check "plan" in res["columns"].getElems.mapIt(it.getStr)

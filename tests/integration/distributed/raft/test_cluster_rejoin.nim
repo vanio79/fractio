@@ -101,16 +101,21 @@ proc startNode(id: int; join = ""): TestNode =
     "start",
     &"--config={configPath}",
     &"--pid-file={result.dataDir}/node.pid", # Write PID file for cleanup
+    "--foreground",
   ]
   if join != "":
     args.add(&"--join={join}")
 
+  let logFile = result.dataDir / "node.log"
   result.process = startProcess(
     BinaryPath,
     workingDir = getCurrentDir(),
     args = args,
-    options = {poStdErrToStdOut},
+    options = {poStdErrToStdOut, poParentStreams},
   )
+  echo "[test] started node ", id, " on ports raft=", result.raftPort,
+      " client=", result.clientPort, " web=", result.webPort,
+      " join=", join, " log=", logFile
 
 proc stopNode(node: var TestNode) =
   ## Stop a running node process.
@@ -156,26 +161,31 @@ proc getNodes(node: TestNode): JsonNode =
 proc waitForReady(node: TestNode; timeoutMs = 10_000) =
   ## Wait until a node's web server is reachable.
   let deadline = epochTime() + timeoutMs.float / 1000.0
+  echo "[test] waiting for node ", node.id, " to be ready..."
   while epochTime() < deadline:
     try:
       let client = newHttpClient(timeout = 1000)
-      discard client.request(webUrl(node) & "/api/nodes", httpMethod = HttpGet)
+      let resp = client.request(webUrl(node) & "/api/nodes", httpMethod = HttpGet)
       client.close()
+      echo "[test] node ", node.id, " ready, /api/nodes returned: ", resp.body[0..min(200, resp.body.len-1)]
       return
-    except CatchableError:
+    except CatchableError as e:
       sleep(TEST_POLL_INTERVAL_MS)
   raise newException(IOError, &"node {node.id} did not become ready within {timeoutMs}ms")
 
 proc waitForNodeCount(node: TestNode; expected: int; timeoutMs = 15_000) =
   ## Wait until the node reports the expected number of cluster members.
   let deadline = epochTime() + timeoutMs.float / 1000.0
+  echo "[test] waiting for node ", node.id, " to have ", expected, " members..."
   while epochTime() < deadline:
     try:
       let nodes = getNodes(node)
+      echo "[test] node ", node.id, " /api/nodes => kind=", nodes.kind, " len=", (if nodes.kind == JArray: $nodes.len else: "N/A"), " body=", $nodes[0..min(200, ($nodes).len-1)]
       if nodes.kind == JArray and nodes.len == expected:
+        echo "[test] node ", node.id, " reached ", expected, " members"
         return
-    except CatchableError:
-      discard
+    except CatchableError as e:
+      echo "[test] node ", node.id, " getNodes error: ", e.msg
     sleep(TEST_POLL_INTERVAL_MS)
   raise newException(IOError,
     &"node {node.id} did not reach {expected} members within {timeoutMs}ms")
@@ -184,15 +194,18 @@ proc waitForData(node: TestNode; sql: string; expectedRows: int;
                  timeoutMs = 15_000) =
   ## Wait until a SELECT query returns the expected number of rows.
   let deadline = epochTime() + timeoutMs.float / 1000.0
+  echo "[test] waiting for node ", node.id, " query '", sql, "' to return ", expectedRows, " rows..."
   while epochTime() < deadline:
     try:
       let res = sqlQuery(node, sql)
+      echo "[test] node ", node.id, " sqlQuery => ", $res[0..min(300, ($res).len-1)]
       if res.getOrDefault("kind").getStr("") == "rows":
         let rows = res.getOrDefault("rows")
         if not rows.isNil and rows.kind == JArray and rows.len == expectedRows:
+          echo "[test] node ", node.id, " query returned ", expectedRows, " rows"
           return
-    except CatchableError:
-      discard
+    except CatchableError as e:
+      echo "[test] node ", node.id, " sqlQuery error: ", e.msg
     sleep(TEST_POLL_INTERVAL_MS)
   raise newException(IOError,
     &"node {node.id} did not reach {expectedRows} rows within {timeoutMs}ms")

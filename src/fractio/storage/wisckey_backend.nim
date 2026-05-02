@@ -670,7 +670,7 @@ proc prefetchWorker(args: PrefetchWorkerArgs) {.thread.} =
     while bufferLen >= config.bufferSize and
           shared.state.load(moRelaxed) != ssClosed:
       # Small sleep to avoid busy waiting
-      os.sleep(1)
+      os.sleep(10)
       acquire(shared.bufferLock)
       let currentLen = shared.buffer.len
       release(shared.bufferLock)
