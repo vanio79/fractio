@@ -547,10 +547,17 @@ suite "SQL Executor — SHOW statements":
     check "db2" in names
 
   test "SHOW SCHEMAS empty":
+    discard client.exec("CREATE DATABASE mydb")
     let res = client.exec("SHOW SCHEMAS", database = "mydb")
     check res.kind == erkRows
     check res.columns == @["schema_name"]
-    check res.rows.len == 0
+    # Note: CREATE DATABASE auto-creates "public" schema, "sys" is implicit, so we have 2 schemas
+    check res.rows.len == 2
+    var names: seq[string]
+    for row in res.rows:
+      names.add(row[0])
+    check "sys" in names # implicit system schema
+    check "public" in names # auto-created
 
   test "SHOW SCHEMAS after creating some":
     discard client.exec("CREATE DATABASE mydb")
@@ -560,11 +567,12 @@ suite "SQL Executor — SHOW statements":
     discard client.exec("CREATE SCHEMA other", database = "otherdb")
     let res = client.exec("SHOW SCHEMAS", database = "mydb")
     check res.kind == erkRows
-    # Note: CREATE DATABASE auto-creates "public" schema, so we have 3 schemas
-    check res.rows.len == 3
+    # Note: CREATE DATABASE auto-creates "public" schema, "sys" is implicit, so we have 4 schemas
+    check res.rows.len == 4
     var names: seq[string]
     for row in res.rows:
       names.add(row[0])
+    check "sys" in names # implicit system schema
     check "public" in names # auto-created
     check "api" in names
     check "internal" in names
@@ -575,11 +583,12 @@ suite "SQL Executor — SHOW statements":
     discard client.exec("CREATE SCHEMA s1", database = "db1")
     discard client.exec("CREATE SCHEMA s2", database = "db2")
     let res = client.exec("SHOW SCHEMAS IN db1")
-    # Note: CREATE DATABASE auto-creates "public" schema, so we have 2 schemas
-    check res.rows.len == 2
+    # Note: CREATE DATABASE auto-creates "public" schema, "sys" is implicit, so we have 3 schemas
+    check res.rows.len == 3
     var names: seq[string]
     for row in res.rows:
       names.add(row[0])
+    check "sys" in names # implicit system schema
     check "public" in names # auto-created
     check "s1" in names
 
