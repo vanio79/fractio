@@ -602,6 +602,7 @@ proc sysTablePut*(store: RaftKVStoreExt, key: string, value: string): bool {.
   ## Returns true on success, false on failure.
   let backend = store.getBackend()
   if backend == nil or not backend.isOpen:
+    {.cast(gcsafe).}: echo "[sysTablePut] ERROR: backend not ready"
     return false
 
   # Get timestamp - use current nanosecond time
@@ -611,9 +612,14 @@ proc sysTablePut*(store: RaftKVStoreExt, key: string, value: string): bool {.
 
   # Encode value with MVCC header
   let encoded = mvccTypes.encodeMVCCValue(value, ts, false)
+  {.cast(gcsafe).}: echo "[sysTablePut] key=", key, " valueLen=", value.len, " encodedLen=", encoded.len, " ts=", ts
 
   # Write via Raft for replication
   let res = store.raftPut(key, encoded)
+  if res.isOk:
+    {.cast(gcsafe).}: echo "[sysTablePut] SUCCESS: raftPut returned OK"
+  else:
+    {.cast(gcsafe).}: echo "[sysTablePut] ERROR: raftPut failed - ", res.error.msg
   return res.isOk
 
 proc sysTablePutBatch*(store: RaftKVStoreExt,
@@ -703,15 +709,19 @@ proc applyBatchToSM*(storePtr: pointer, rid: GroupID,
   ## to break the raft_store → coordinator → raft_store circular import.
   ##
   ## This callback receives raw C data (cstring + len) because it's called from
-  ## NuRaft's ASIO thread where we must not allocate Nim GC memory. We copy
-  ## the data here into Nim-managed memory.
+  ## NuRaft's ASIO thread where we must not allocate Nim GC memory. We copy the
+  ## data here into Nim-managed memory.
   ##
-## Durability model: the Raft log entry was already written with fdatasync
+  ## DEBUG: Log all batch applications to trace replication.
+  {.cast(gcsafe).}: echo "[Nim] applyBatchToSM: groupId=", $rid, " len=", len, " storePtr=", storePtr != nil
+  
+  ## Durability model: the Raft log entry was already written with fdatasync
   ## in putEntryAndState, so the commit is durable before this callback fires.
   ## The WiscKey write here uses writeBatchNoSync (no second fdatasync) — it
   ## keeps committed data readable after a clean restart.  On a crash the Raft
   ## log is replayed from lastApplied to reconstruct any missing SM state.
   if storePtr == nil or data == nil or len == 0:
+    {.cast(gcsafe).}: echo "[Nim] applyBatchToSM: EARLY RETURN storePtr=", storePtr == nil, " data=", data == nil, " len=", len
     return
 
   let store = cast[RaftKVStoreExt](storePtr)
@@ -724,24 +734,48 @@ proc applyBatchToSM*(storePtr: pointer, rid: GroupID,
   var batch: WriteBatch = nil
   try:
     batch = nuraft_coordinator.deserializeWriteBatch(payload)
-  except CatchableError:
+    {.cast(gcsafe).}: echo "[Nim] applyBatchToSM: parsed batch puts=", batch.puts.len, " deletes=", batch.deletes.len
+  except CatchableError as e:
+    {.cast(gcsafe).}: echo "[Nim] applyBatchToSM: FAILED to parse batch: ", e.msg
     return
 
   if batch == nil:
+    {.cast(gcsafe).}: echo "[Nim] applyBatchToSM: batch=nil after parse"
     return
 
   # --- Persist to WiscKey (no fdatasync — Raft log is the durability guarantee) ---
   let backend = store.coordinator.store
+  {.cast(gcsafe).}: echo "[Nim] applyBatchToSM: backend=", backend != nil, " isOpen=", backend != nil and backend.isOpen
   if backend != nil and backend.isOpen:
     {.cast(raises: []).}:
       var pairs: seq[KeyValuePair] = @[]
       var delKeys: seq[string] = @[]
+      
+      # Prefix for sys.groups for debug logging
+      let groupsPrefixDebug = "/t/" & align($SYS_GROUPS_TABLE_ID, 10, '0') & "/"
 
       for (k, v) in batch.puts:
         pairs.add((key: fromBytes(k), value: fromBytes(v)))
+        # Log full keys to understand what data is being replicated
+        let keyStr = fromBytes(k)
+        let valStr = fromBytes(v)
+        {.cast(gcsafe).}: echo "[Nim] applyBatchToSM: PUT key=", keyStr, " valueLen=", valStr.len
+        if keyStr.startsWith(groupsPrefixDebug):
+          # Check if value is MVCC-encoded
+          if mvccTypes.isLikelyMVCCValue(valStr):
+            let mvccVal = mvccTypes.decodeMVCCValueFast(valStr)
+            {.cast(gcsafe).}: echo "[Nim] applyBatchToSM: sys.groups MVCC-encoded payloadLen=", mvccVal.data.len
+            try:
+              let rec = decodeGroupRecord(mvccVal.data)
+              {.cast(gcsafe).}: echo "[Nim] applyBatchToSM: sys.groups replicas.len=", rec.replicas.len
+            except:
+              {.cast(gcsafe).}: echo "[Nim] applyBatchToSM: sys.groups decode failed"
+          else:
+            {.cast(gcsafe).}: echo "[Nim] applyBatchToSM: sys.groups NOT MVCC-encoded"
       for k in batch.deletes:
         delKeys.add(fromBytes(k))
       discard backend.writeBatchNoSync(pairs, delKeys)
+      {.cast(gcsafe).}: echo "[Nim] applyBatchToSM: WROTE ", pairs.len, " puts, ", delKeys.len, " deletes"
 
   # No in-memory state machine to update — reads go through WiscKey directly.
 
@@ -796,17 +830,20 @@ proc processLeaderPersistReq*(s: RaftKVStoreExt,
   ## This runs in the background rebalance thread, avoiding deadlock with
   ## ongoing proposeAndWait calls in the main client threads.
   ## Exported for testing purposes.
+  {.cast(gcsafe).}: echo "[Nim] processLeaderPersistReq: groupId=", req.groupId, " leaderNodeId=", req.leaderNodeId
   try:
     let groupId = req.groupId
     let leaderNodeId = req.leaderNodeId
 
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupId)
     let ts = int64(epochTime() * 1_000_000_000)
+    {.cast(gcsafe).}: echo "[Nim] processLeaderPersistReq: key=", key
 
     # Get the current group record from local storage
     let backend = s.coordinator.store
     if backend != nil:
       let valOpt = backend.get(key)
+      {.cast(gcsafe).}: echo "[Nim] processLeaderPersistReq: valOpt.isSome=", valOpt.isSome
       if valOpt.isSome:
         var groupVal = valOpt.get()
         # Strip MVCC encoding if present
@@ -816,19 +853,25 @@ proc processLeaderPersistReq*(s: RaftKVStoreExt,
             groupVal = mvccVal.data
         # Decode binary GroupRecord, update leader, re-encode
         var groupRec = decodeGroupRecord(groupVal)
+        {.cast(gcsafe).}: echo "[Nim] processLeaderPersistReq: old leader=", groupRec.leader, " new leader=", leaderNodeId
         groupRec.leader = leaderNodeId
         let groupData = encode(groupRec)
         # Encode with MVCC header for consistency
         let encoded = mvccTypes.encodeMVCCValue(groupData, ts, false)
         # Forward to meta leader (will do local write if we're the meta leader)
         let putRes = forwardPutToLeader(s, META_GROUP_ID, key, encoded)
+        {.cast(gcsafe).}: echo "[Nim] processLeaderPersistReq: putRes.isOk=", putRes.isOk
         if not putRes.isOk:
           {.cast(gcsafe).}: {.cast(raises: []).}:
             debug("processLeaderPersistReq: failed to persist", {
               "groupId": $groupId,
               "error": $putRes.error
             }.toTable)
-  except Exception:
+          {.cast(gcsafe).}: echo "[Nim] processLeaderPersistReq: ERROR ", $putRes.error
+    else:
+      {.cast(gcsafe).}: echo "[Nim] processLeaderPersistReq: backend is nil"
+  except Exception as e:
+    {.cast(gcsafe).}: echo "[Nim] processLeaderPersistReq: EXCEPTION ", e.msg
     discard
 
 proc rebalanceLeadershipTask(s: RaftKVStoreExt) {.thread, gcsafe, raises: [].} =
@@ -1032,12 +1075,8 @@ proc wireApplyCallback*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
       withLock s.groupMu:
         s.groupLeaders[groupId] = leaderNodeId.uint32
 
-      # Skip persisting leader for default data group (no space association)
-      if groupId == DATA_GROUP_START_ID:
-        return
-
       # For space groups, check if this group belongs to a rebalancing space
-      if groupId != META_GROUP_ID:
+      if groupId != META_GROUP_ID and groupId != DATA_GROUP_START_ID:
         var isRebalancingOldGroup = false
         withLock s.spacesMu:
           for spaceId, space in s.spaces:
@@ -1049,6 +1088,7 @@ proc wireApplyCallback*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
           return
 
       # Queue async persistence request (safe from callback - no blocking)
+      # Persist leader for META_GROUP and DATA_GROUP_START_ID
       try:
         s.leaderPersistChan.send(LeaderPersistReq(
           groupId: groupId,
@@ -1878,9 +1918,23 @@ proc forwardGetToLeaderRemote(store: RaftKVStoreExt, groupId: GroupID,
 proc findLeaderForGroup*(store: RaftKVStoreExt,
     groupId: GroupID): Option[uint32] {.gcsafe, raises: [].} =
   ## Look up node ID for the leader of `groupId`.
-  ## Tries groupLeaders first, then falls back to groupMembers.
-  ## Returns local nodeId if this node is the leader.
+  ## Multi-tier lookup:
+  ## 1. Check if we're the leader (via coordinator.isLeader)
+  ## 2. Query coordinator.getLeader() for authoritative leader info from NuRaft
+  ## 3. Fall back to cached groupLeaders table
+  ## 4. Fall back to any other group member
   let localNodeId = store.coordinator.nodeId.uint32
+
+  # First check if we're the leader (fastest, authoritative)
+  if store.coordinator.isLeader(groupId):
+    return some(localNodeId)
+
+  # Query NuRaft directly for leader info (authoritative)
+  let raftLeaderId = store.coordinator.getLeader(groupId)
+  if raftLeaderId > 0:
+    return some(uint32(raftLeaderId))
+
+  # Fall back to cached leader (may be stale but better than nothing)
   var targetNode: uint32 = 0
   withLock store.groupMu:
     targetNode = store.groupLeaders.getOrDefault(groupId, 0)

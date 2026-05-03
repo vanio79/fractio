@@ -18,6 +18,7 @@ import std/[net, tables as stdtables, strformat, strutils, times, atomics,
     locks, options, algorithm, os]
 import posix as posixSys
 import nativesockets
+import ../utils/socket_utils
 import ./types
 import ./codec as protoCodec
 import ./frame
@@ -47,6 +48,7 @@ import ../distributed/meta/system_tables
 import ../distributed/meta/system_schemas
 import ../distributed/space_manager
 import ../core/timestamp_provider
+import ../storage/backend
 import ../storage/mvcc/types as mvccValueTypes
 
 # ---------------------------------------------------------------------------
@@ -515,21 +517,18 @@ proc clientCount*(server: ProtocolServer): int {.gcsafe, raises: [].} =
     result = server.clients.len
 
 # ---------------------------------------------------------------------------
-# Low-level recv helper (posix.recv — truly blocking in multi-threaded context)
+# Low-level recv helper (non-blocking with select polling)
 # ---------------------------------------------------------------------------
 
+const SERVER_RECV_TIMEOUT_MS = 30_000 # 30 seconds default timeout
+
 proc srvRecvExact(sock: Socket, buf: var string,
-    size: int): int {.gcsafe, raises: [].} =
-  ## Read exactly `size` bytes using posix.recv.  Returns bytes read; < size means EOF/error.
-  buf.setLen(size)
-  var total = 0
-  while total < size:
-    let got = posixSys.recv(sock.getFd(), addr buf[total], size - total, 0)
-    if got <= 0:
-      buf.setLen(total)
-      return total
-    total += got
-  total
+    size: int, timeoutMs: int = SERVER_RECV_TIMEOUT_MS): int {.gcsafe, raises: [].} =
+  ## Read exactly `size` bytes using non-blocking recv with select polling.
+  ## Returns bytes read; < size means EOF/error/timeout.
+  ## Uses shared recvExactNonBlocking from socket_utils.
+  let fd = sock.getFd().cint
+  recvExactNonBlocking(fd, buf, size, timeoutMs)
 
 # ---------------------------------------------------------------------------
 # Send helpers
@@ -682,9 +681,12 @@ proc performHandshake(server: ProtocolServer,
 # ---------------------------------------------------------------------------
 
 proc readOneFrame(sock: Socket,
-    maxBytes: uint32): Result[Frame, ProtocolError] {.gcsafe, raises: [].} =
+    maxBytes: uint32, timeoutMs: int = 500): Result[Frame,
+        ProtocolError] {.gcsafe, raises: [].} =
+  ## Read one frame from the socket using non-blocking recv with timeout.
+  ## timeoutMs: how long to wait for data (default 500ms, short to allow periodic idle checks)
   var hdrBuf = newString(FRAME_HEADER_SIZE)
-  let hn = srvRecvExact(sock, hdrBuf, FRAME_HEADER_SIZE)
+  let hn = srvRecvExact(sock, hdrBuf, FRAME_HEADER_SIZE, timeoutMs)
   if hn != FRAME_HEADER_SIZE:
     return peErr(newProtocolError(peInvalidFrame,
       &"short header: got {hn}, need {FRAME_HEADER_SIZE}"))
@@ -700,7 +702,7 @@ proc readOneFrame(sock: Socket,
 
   var payload = newString(int(hdr.payloadLen))
   if hdr.payloadLen > 0:
-    let pn = srvRecvExact(sock, payload, int(hdr.payloadLen))
+    let pn = srvRecvExact(sock, payload, int(hdr.payloadLen), timeoutMs)
     if pn != int(hdr.payloadLen):
       return peErr(newProtocolError(peInvalidFrame,
         &"short payload: got {pn}, need {hdr.payloadLen}"))
@@ -1769,9 +1771,15 @@ proc clientLoop(server: ProtocolServer,
       server.logger.logInfo(&"[{conn.address}] idle timeout")
       break
 
-    let frameR = readOneFrame(conn.socket, server.config.maxFrameBytes)
+    # Read frame with short timeout (500ms) to allow periodic idle checks
+    let frameR = readOneFrame(conn.socket, server.config.maxFrameBytes, 500)
     if frameR.isErr:
       let e = frameR.error
+      # On timeout, just loop back and check idle status again
+      if e.kind == peInvalidFrame and "short header" in $e:
+        # Timeout - no data received within 500ms
+        # Loop back to check running flag and idle timeout
+        continue
       if e.kind != peInternal:
         sendError(conn, 0, ErrProtocol, ErrCatProtocol, $e)
         discard server.metrics.requestsErr.fetchAdd(1)
@@ -1853,6 +1861,14 @@ proc acceptLoop(args: AcceptLoopArgs) {.thread.} =
         sock.accept(clientSock)
         let (peerAddr, _) = clientSock.getPeerAddr()
         address = peerAddr
+
+        # Set client socket to non-blocking mode for all subsequent recv operations
+        # This prevents the per-client thread from blocking indefinitely
+        let clientFd = clientSock.getFd().cint
+        if not setSocketNonBlocking(clientFd):
+          server.logger.logWarn("failed to set client socket non-blocking: " & address)
+          try: clientSock.close() except CatchableError: discard
+          continue
       except CatchableError as e:
         if server.running.load():
           server.logger.logWarn("accept error: " & e.msg)
@@ -1889,9 +1905,14 @@ proc saveClusterState*(server: ProtocolServer) =
   ## Persist current cluster membership to disk so a restarted node can
   ## rejoin as a follower without requiring --join.
   ## Uses binary serialization for efficiency.
-  if server.config.dataDir == "": return
+  echo "[DEBUG saveClusterState] dataDir=" & server.config.dataDir
+  if server.config.dataDir == "":
+    echo "[DEBUG saveClusterState] dataDir is empty, skipping"
+    return
   let coord = server.raftCoord
-  if coord.isNil: return
+  if coord.isNil:
+    echo "[DEBUG saveClusterState] coord is nil, skipping"
+    return
 
   # Build persisted cluster state
   var state = newPersistedClusterState()
@@ -1905,9 +1926,14 @@ proc saveClusterState*(server: ProtocolServer) =
   for nid, info in coord.peerInfo:
     state.peers[nid] = (host: info.host, port: info.port)
 
+  echo "[DEBUG saveClusterState] peers.len=" & $state.peers.len & " path=" &
+      server.clusterStatePath
   try:
     saveClusterStateToFile(state, server.clusterStatePath)
-  except CatchableError: discard
+    echo "[DEBUG saveClusterState] saved successfully"
+  except CatchableError as e:
+    echo "[DEBUG saveClusterState] error: " & e.msg
+    discard
 
 proc loadClusterStateFromBinary(dataDir: string): Option[
     PersistedClusterState] =
@@ -1921,9 +1947,13 @@ proc loadClusterStateFromBinary(dataDir: string): Option[
 # ---------------------------------------------------------------------------
 
 proc addPeerToRaft*(server: ProtocolServer, peerNodeId: uint32,
-                     host: string, raftPort: int) =
+                     host: string, raftPort: int, clientPort: int = 0,
+                     webPort: int = 0) =
   ## Dynamically add a peer to the NuRaft coordinator for system groups.
   ## Called when a new node joins the cluster.
+  ## Also inserts the node into sys.nodes table (only if this node is the leader).
+  ## CRITICAL: Sends JoinGroup RPCs to the joining node so it can replace its
+  ## single-member groups with proper multi-member groups.
   let coord = server.raftCoord
   if coord.isNil: return
 
@@ -1931,8 +1961,167 @@ proc addPeerToRaft*(server: ProtocolServer, peerNodeId: uint32,
   coord.peerInfo[peerNodeId] = (host: host, port: raftPort)
 
   # Add the peer as a server to the meta and default data groups only
+  # CRITICAL: We must be the leader for each group to add servers.
+  # META_GROUP leader is established immediately (single-node election).
+  # DATA_GROUP may still be electing - wait for leadership before adding.
   discard coord.addServerToGroup(META_GROUP_ID, peerNodeId, host, raftPort)
-  discard coord.addServerToGroup(DATA_GROUP_START_ID, peerNodeId, host, raftPort)
+
+  # Wait for DATA_GROUP leadership before calling addServerToGroup
+  # (add_srv requires the caller to be leader, returns NOT_LEADER otherwise)
+  const maxWaitMs = 5000
+  const pollIntervalMs = 100
+  var waited = 0
+  {.cast(gcsafe).}: echo "[addPeerToRaft] Waiting for DATA_GROUP leadership before addServerToGroup..."
+  while not coord.isLeader(DATA_GROUP_START_ID) and waited < maxWaitMs:
+    os.sleep(pollIntervalMs)
+    waited += pollIntervalMs
+  if coord.isLeader(DATA_GROUP_START_ID):
+    {.cast(gcsafe).}: echo "[addPeerToRaft] DATA_GROUP leadership established after ",
+        waited, " ms"
+    discard coord.addServerToGroup(DATA_GROUP_START_ID, peerNodeId, host, raftPort)
+  else:
+    {.cast(gcsafe).}: echo "[addPeerToRaft] WARNING: DATA_GROUP leadership not established after ",
+        maxWaitMs, " ms"
+
+  # CRITICAL: Send JoinGroup RPCs to the joining node for META and DATA groups.
+  # The joining node created single-member groups at startup (main.nim lines 324-328).
+  # Those groups are separate from the leader's groups and need to be merged.
+  # The JoinGroup RPC tells the joining node to replace its single-member instance
+  # with a proper multi-member instance that can participate in Raft.
+
+  # Build members list from peerInfo - includes all known cluster members
+  var members: seq[clusterMsgs.CreateGroupMember] = @[]
+  for (nodeId, peerData) in coord.peerInfo.pairs:
+    # For clientPort, look up from sys.nodes if available, otherwise use raftPort + 100
+    var memberClientPort = peerData.port + 100         # default convention
+    if nodeId == peerNodeId:
+      memberClientPort = clientPort # use the provided clientPort for joining node
+    elif nodeId == uint32(server.config.serverId):
+      memberClientPort = server.config.port # this node's clientPort
+    members.add(clusterMsgs.CreateGroupMember(
+      nodeId: uint16(nodeId),
+      host: peerData.host,
+      raftPort: uint16(peerData.port),
+      clientPort: uint16(memberClientPort)
+    ))
+
+  # Send JoinGroup RPCs for both system groups
+  let myNodeId = server.config.serverId
+  let myRaftPort = coord.port
+  let myHost = server.config.host
+
+  for groupId in [META_GROUP_ID, DATA_GROUP_START_ID]:
+    let groupUlid = groupIDToULID(groupId)
+    let groupIdBytes = ulidToBytes(groupUlid)
+
+    let joinReq = clusterMsgs.JoinGroupRequest(
+      groupId: groupIdBytes,
+      creatorNodeId: uint16(myNodeId),
+      creatorHost: myHost,
+      creatorPort: uint16(myRaftPort),
+      members: members
+    )
+
+    # Connect to the joining node's client port and send JoinGroup RPC
+    # Use the clientPort provided in the join request (raftPort + 100 by convention)
+    let targetClientPort = if clientPort > 0: clientPort else: raftPort + 100
+    try:
+      let cfg = ClientConfig(
+        host: host,
+        port: targetClientPort,
+        timeoutMs: 5000
+      )
+      let pc = newProtocolClient(cfg)
+      let cr = pc.connect()
+      if cr.isOk:
+        defer: pc.disconnect()
+        let jr = pc.joinGroup(joinReq)
+        # Wait for response - joining node must have updated its instance
+        if jr.isOk and jr.value.success:
+          {.cast(gcsafe).}: echo "[addPeerToRaft] JoinGroup RPC succeeded for group " & $groupUlid
+        else:
+          let errMsg = if jr.isOk: jr.value.error else: $jr.error
+          {.cast(gcsafe).}: echo "[addPeerToRaft] JoinGroup RPC failed for group " &
+              $groupUlid & ": " & errMsg
+      else:
+        {.cast(gcsafe).}: echo "[addPeerToRaft] Failed to connect to joining node at " &
+            host & ":" & $targetClientPort
+    except CatchableError as e:
+      {.cast(gcsafe).}: echo "[addPeerToRaft] Exception sending JoinGroup: " & e.msg
+
+  # Only insert into sys.nodes and update sys.groups if we're the meta group leader
+  # (joining nodes are followers and can't write)
+  # CRITICAL: These writes MUST go through Raft (raftStore.raftPut) so they are
+  # replicated to all nodes. Using mvccStore.txnPut would only write locally!
+  {.cast(gcsafe).}: echo "[addPeerToRaft] Checking leader status for META_GROUP, isLeader=",
+      coord.isLeader(META_GROUP_ID)
+  if coord.isLeader(META_GROUP_ID):
+    let raftStore = server.raftStore
+    {.cast(gcsafe).}: echo "[addPeerToRaft] raftStore.isNil=", raftStore.isNil
+    if not raftStore.isNil:
+      let backend = raftStore.getBackend()
+      {.cast(gcsafe).}: echo "[addPeerToRaft] backend.isNil=", backend.isNil,
+          " backend.isOpen=", (if backend.isNil: false else: backend.isOpen)
+      if not backend.isNil and backend.isOpen:
+        # Insert into sys.nodes (replicated through Raft with MVCC encoding)
+        let nodeKey = encodeTableKey(SYS_NODES_TABLE_ID, $peerNodeId)
+        let nodeRec = NodeRecord(
+          nodeId: uint16(peerNodeId),
+          host: host,
+          raftPort: uint16(raftPort),
+          clientPort: uint16(clientPort),
+          webPort: uint16(webPort),
+          status: nsAlive
+        )
+        if raftStore.sysTablePut(nodeKey, encode(nodeRec)):
+          {.cast(gcsafe).}: echo "[addPeerToRaft] Inserted node " &
+              $peerNodeId & " into sys.nodes via Raft (MVCC-encoded)"
+        else:
+          {.cast(gcsafe).}: echo "[addPeerToRaft] WARNING: Failed to insert into sys.nodes"
+
+        # CRITICAL: Update sys.groups to add the new replica to each group's replica list
+        # This ensures clients can find all replicas when looking for a working connection
+        try:
+          for groupId in [META_GROUP_ID, DATA_GROUP_START_ID]:
+            let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupId)
+            # Read current group record from backend (local read on leader is consistent)
+            # MUST strip MVCC header - sys.groups is MVCC-encoded
+            let valOpt = backend.get(groupKey)
+            if valOpt.isSome:
+              let (payload, isDeleted) = stripMVCCHeader(valOpt.get)
+              if isDeleted or payload.len == 0:
+                {.cast(gcsafe).}: echo "[addPeerToRaft] WARNING: sys.groups for group " &
+                    $groupId & " is deleted or empty"
+                continue
+              let currentRec = decodeGroupRecord(payload)
+              # Check if replica already exists (avoid duplicates)
+              var alreadyExists = false
+              for rep in currentRec.replicas:
+                if rep.nodeId == peerNodeId:
+                  alreadyExists = true
+                  break
+              if not alreadyExists:
+                # Add the new replica as a voter
+                var updatedRec = currentRec
+                updatedRec.replicas.add(GroupReplicaBin(
+                  nodeId: peerNodeId,
+                  replicaType: rtVoter
+                ))
+                # Write via sysTablePut - this MVCC-encodes AND replicates through Raft!
+                if raftStore.sysTablePut(groupKey, encode(updatedRec)):
+                  {.cast(gcsafe).}: echo "[addPeerToRaft] Added replica " &
+                      $peerNodeId & " to sys.groups for group " & $groupId & " via Raft (MVCC-encoded)"
+                else:
+                  {.cast(gcsafe).}: echo "[addPeerToRaft] WARNING: Failed to update sys.groups"
+              else:
+                {.cast(gcsafe).}: echo "[addPeerToRaft] Replica " &
+                    $peerNodeId & " already exists in sys.groups for group " & $groupId
+            else:
+              {.cast(gcsafe).}: echo "[addPeerToRaft] WARNING: Could not read sys.groups for group " &
+                  $groupId & " to update replicas"
+        except CatchableError:
+          {.cast(gcsafe).}: echo "[addPeerToRaft] Error updating sys.groups: " &
+              getCurrentExceptionMsg()
 
   # Persist membership so restarts can rejoin without --join
   server.saveClusterState()
@@ -1942,6 +2131,7 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
   ## Wire a NuRaft + WiscKey stack into the server.
   ## raftPort is the base port for NuRaft ASIO (group ports = raftPort + groupId).
   ## startAsLeader: when true and no peers, this is a fresh single-node cluster.
+  ## When false (joining mode), groups are created later via addPeerToRaft.
 
   let nodeId = rangeTypes.NodeID(uint32(server.config.serverId))
   let raftDir = server.config.dataDir / "raft"
@@ -1956,15 +2146,23 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
   var isRejoining = false
   if startAsLeader:
     let saved = loadClusterStateFromBinary(server.config.dataDir)
+    echo "[DEBUG setupRaftNode] loadClusterStateFromBinary result: " &
+        (if saved.isSome: "some" else: "none") &
+        " dataDir=" & server.config.dataDir
     if saved.isSome:
       let ss = saved.get
+      echo "[DEBUG setupRaftNode] saved.peers.len=" & $ss.peers.len
       if ss.peers.len > 0:
         isRejoining = true
         for nid, info in ss.peers.pairs():
-          if nid > 0 and info.host != "" and info.port > 0:
+          # Skip self - we don't want to include ourselves in the peers list
+          if nid > 0 and nid != nodeId.uint32 and info.host != "" and
+              info.port > 0:
             peers.add((nodeId: nid, host: info.host, port: info.port))
         if peers.len > 0:
           echo "recovered cluster membership from disk: " & $peers.len & " peers"
+
+  let isJoining = not startAsLeader
 
   # NuRaft Coordinator
   let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
@@ -1972,9 +2170,9 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
     port: raftPort,
     host: server.config.host,
     dataDir: raftDir,
-    electionTimeoutLowerMs: 200,
-    electionTimeoutUpperMs: 400,
-    heartbeatIntervalMs: 100,
+    electionTimeoutLowerMs: 1000,
+    electionTimeoutUpperMs: 2000,
+    heartbeatIntervalMs: 500,
     writeBufferSize: server.config.writeBufferSize,
     blockCacheSize: server.config.blockCacheSize,
     vlogMaxSize: server.config.vlogMaxSize,
@@ -2011,9 +2209,27 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
   # Wire callbacks and pre-create state machines before starting NuRaft
   store.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])
 
-  # Create NuRaft groups: meta group (Group 1) and data group (Group 2)
-  for groupId in [META_GROUP_ID, DATA_GROUP_START_ID]:
-    discard coord.createAndStartGroup(groupId, initialMembers)
+  # When joining or rejoining, don't create groups yet - they already exist
+  # on the cluster. We'll receive append_entries from the leaders.
+  # - isJoining: explicit --join flag, groups created by addPeerToRaft
+  # - isRejoining: saved cluster.bin with peers, groups exist on other nodes
+  if not isJoining and not isRejoining:
+    # Create NuRaft groups: meta group (Group 1) and data group (Group 2)
+    # This is for a fresh single-node cluster start
+    for groupId in [META_GROUP_ID, DATA_GROUP_START_ID]:
+      discard coord.createAndStartGroup(groupId, initialMembers)
+  elif isRejoining:
+    # For rejoining, create groups but skip initial election to prevent
+    # conflicting with existing leaders. We'll receive append_entries
+    # and catch up from the current leaders.
+    # Use any peer's nodeId as preferredLeader (different from our nodeId)
+    # to make createAndStartGroup skip the initial election internally.
+    let rejoinPreferredLeader = if peers.len > 0: peers[0].nodeId else: 1'u32
+    echo "rejoining cluster: creating groups with preferredLeader=" & $rejoinPreferredLeader
+    for groupId in [META_GROUP_ID, DATA_GROUP_START_ID]:
+      discard coord.createAndStartGroup(groupId, initialMembers,
+          preferredLeader = rejoinPreferredLeader)
+
   coord.start()
 
   # NuRaft handles log replay internally — no manual applyUpTo needed.

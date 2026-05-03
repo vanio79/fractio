@@ -247,6 +247,7 @@ type
     host*: string
     raftPort*: uint16
     clientPort*: uint16
+    webPort*: uint16
     status*: NodeStatus
 
 proc encode*(rec: NodeRecord): string =
@@ -255,6 +256,7 @@ proc encode*(rec: NodeRecord): string =
   w.writeString(rec.host)
   w.writeU16(rec.raftPort)
   w.writeU16(rec.clientPort)
+  w.writeU16(rec.webPort)
   w.writeU8(uint8(rec.status))
   w.finish()
 
@@ -264,6 +266,7 @@ proc decodeNodeRecord*(data: string): NodeRecord =
   result.host = r.readString()
   result.raftPort = r.readU16()
   result.clientPort = r.readU16()
+  result.webPort = r.readU16()
   result.status = NodeStatus(r.readU8())
 
 proc stripMVCCHeader*(data: string): tuple[payload: string, isDeleted: bool] =

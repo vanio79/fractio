@@ -40,6 +40,9 @@ import fractio/protocol/messages/cluster as clusterMsgs
 import fractio/protocol/messages/admin as adminMsgs
 import fractio/web/dashboard
 import fractio/cli/config
+import fractio/distributed/meta/system_tables
+import fractio/distributed/raft/nuraft_coordinator
+import fractio/distributed/raft/group_types
 
 when defined(posix):
   import fractio/cli/daemon
@@ -273,15 +276,65 @@ proc cmdStart(flags: Table[string, string]) =
             echo "join successful"
         else:
           echo "join successful"
-        # Add all returned cluster members as Raft peers
+# Add all returned cluster members as Raft peers
         let members = rj.getOrDefault("members")
+        let preferredLeader = uint32(rj.getOrDefault("preferredLeader").getInt(0))
         if not members.isNil and members.kind == JArray:
+          # Build peer info table from join response, but create Raft groups
+          # with ONLY ourselves (single-member config for join protocol).
+          var leaderHost = ""
+          var leaderPort = 0
           for m in members:
             let mNodeId = uint32(m.getOrDefault("nodeId").getInt(0))
             let mHost = m.getOrDefault("host").getStr("")
             let mRaftPort = m.getOrDefault("raftPort").getInt(0)
             if mNodeId > 0 and mHost != "" and mRaftPort > 0:
-              server.addPeerToRaft(mNodeId, mHost, mRaftPort)
+              # Populate peerInfo for future RPC, but don't include in Raft config
+              server.raftCoord.peerInfo[mNodeId] = (host: mHost, port: mRaftPort)
+              if mNodeId == preferredLeader:
+                leaderHost = mHost
+                leaderPort = mRaftPort
+          
+          # Create single-member group: just ourselves
+          var singleMember: seq[tuple[nodeId: uint32, host: string, port: int]] = @[]
+          singleMember.add((nodeId: uint32(conf.nodeId), host: conf.host, port: conf.raftPort))
+          
+          echo "[DEBUG] preferredLeader=" & $preferredLeader & " creating single-member config for join"
+          
+          # CRITICAL: Create Raft groups with ONLY ourselves initially.
+          # 
+          # NuRaft's join protocol requires joining nodes to start with a
+          # single-member configuration (just themselves). This allows:
+          #
+          # 1. handle_join_cluster_req at line 170 checks if size > 1
+          # 2. If size = 1 (single-member), join is accepted without comparison
+          # 3. Leader then commits new config [leader, joining_node]
+          # 4. Node becomes proper follower via reconfigure
+          #
+          # If we start with multi-member config [1, 2]:
+          # - size > 1 → enters comparison logic
+          # - After join, config [1] is saved (doesn't include us!)
+          # - reconfigure removes us from peers but catching_up prevents step-down
+          # - Node enters inconsistent state and may act as leader
+          #
+          # peerInfo table is already populated above, so we know how to reach
+          # other members. We just don't include them in initial Raft config.
+          #
+          # skipInitialElection=true prevents self-promotion before join.
+          # IMPORTANT: Check if groups already exist before creating.
+          # The JoinGroup RPC (sent by leader during addPeerToRaft) may have
+          # already created multi-member groups. If so, skip creation.
+          for groupId in [META_GROUP_ID, DATA_GROUP_START_ID]:
+            let ulid = groupIDToULID(groupId)
+            if server.raftCoord.hasGroup(groupId):
+              echo "[DEBUG] Group " & $ulid & " already exists (from JoinGroup RPC), skipping single-member creation"
+            else:
+              echo "[DEBUG] Creating group " & $ulid & " with single-member config"
+              discard server.raftCoord.createAndStartGroup(groupId, singleMember,
+                  preferredLeader)
+          
+          # Save cluster state for restart recovery
+          server.saveClusterState()
       else:
         let errMsg = rj.getOrDefault("error").getStr("unknown error")
         writeLine(stderr, "warning: join refused: " & errMsg)

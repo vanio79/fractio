@@ -22,6 +22,8 @@
 #include <vector>
 #include <map>
 #include <functional>
+#include <fstream>
+#include <sys/stat.h>
 
 using namespace nuraft;
 
@@ -43,6 +45,10 @@ public:
 
 static std::mutex g_handlers_lock;
 static std::map<std::tuple<std::string, int32_t, int32_t>, rpc_handler> g_pending_handlers;
+
+// =============================================================================
+// Message Serialization
+// =============================================================================
 
 // =============================================================================
 // Message Serialization
@@ -302,17 +308,55 @@ private:
 };
 
 // =============================================================================
-// State Manager (In-memory with dynamic config)
+// State Manager (In-memory with dynamic config + persistent state)
 // =============================================================================
+// 
+// State persistence: srv_state (term, voted_for) is saved to a file on disk.
+// This ensures restarted nodes maintain their term and don't trigger
+// unnecessary elections when rejoining a cluster.
+//
+// File format (binary, 16 bytes):
+//   [term:8 bytes BE][voted_for:4 bytes BE][padding:4 bytes]
+//
+// The catching_up flag is NOT persisted - it's set fresh on each restart
+// based on whether the node is joining as a new member.
 
 class dynamic_state_mgr : public state_mgr {
 public:
+    // Constructor with optional state file path for persistence
     dynamic_state_mgr(int32 my_id, const std::string& my_endpoint,
-                      const std::vector<std::pair<int32, std::string>>& servers)
+                      const std::vector<std::pair<int32, std::string>>& servers,
+                      bool catching_up = false,
+                      const std::string& state_file_path = "")
         : my_id_(my_id), my_endpoint_(my_endpoint),
-          cur_log_store_(cs_new<inmem_log_store>()) {
+          cur_log_store_(cs_new<inmem_log_store>()),
+          state_file_path_(state_file_path),
+          config_change_cb_(nullptr), config_change_ctx_(nullptr),
+          quorum_update_cb_(nullptr), quorum_update_ctx_(nullptr),
+          raft_server_ptr_(nullptr) {
         saved_config_ = cs_new<cluster_config>();
+        
+        // Initialize state - load from file if path provided and file exists
+        saved_state_ = cs_new<srv_state>();
+        if (!state_file_path_.empty()) {
+            load_state_from_file();
+        }
+        
+        // Apply catching_up flag (not persisted, set fresh each restart)
+        if (catching_up) {
+            saved_state_->set_catching_up(true);
+            saved_state_->allow_election_timer(false);
+        }
+        
+        std::cerr << "[NuRaft] dynamic_state_mgr constructor: my_id=" << my_id_
+                  << " servers=" << servers.size()
+                  << " catching_up=" << catching_up
+                  << " state_file=" << (state_file_path_.empty() ? "(none)" : state_file_path_)
+                  << " loaded_term=" << saved_state_->get_term()
+                  << " loaded_voted_for=" << saved_state_->get_voted_for()
+                  << std::endl;
         for (auto& kv : servers) {
+            std::cerr << "[NuRaft]   - server " << kv.first << " endpoint=" << kv.second << std::endl;
             auto sc = cs_new<srv_config>(kv.first, kv.second);
             saved_config_->get_servers().push_back(sc);
         }
@@ -320,18 +364,87 @@ public:
 
     ~dynamic_state_mgr() {}
 
+    void set_raft_server(void* server_ptr) {
+        raft_server_ptr_ = server_ptr;
+    }
+
+    void set_quorum_update_callback(void* ctx, nuraft_quorum_update_cb cb) {
+        quorum_update_ctx_ = ctx;
+        quorum_update_cb_ = cb;
+    }
+
     ptr<cluster_config> load_config() override {
+        std::cerr << "[NuRaft] load_config: my_id=" << my_id_
+                  << " returning config with "
+                  << saved_config_->get_servers().size() << " servers:" << std::endl;
+        for (auto& srv : saved_config_->get_servers()) {
+            std::cerr << "[NuRaft]   - server " << srv->get_id()
+                      << " endpoint=" << srv->get_endpoint() << std::endl;
+        }
         return saved_config_;
     }
 
     void save_config(const cluster_config& config) override {
         ptr<buffer> buf = config.serialize();
         saved_config_ = cluster_config::deserialize(*buf);
+        
+        // Check if the new config includes this server
+        bool includes_self = false;
+        for (auto& srv : saved_config_->get_servers()) {
+            if (srv->get_id() == my_id_) {
+                includes_self = true;
+                break;
+            }
+        }
+        
+        size_t num_servers = saved_config_->get_servers().size();
+        std::cerr << "[NuRaft] save_config: my_id=" << my_id_
+                  << " new_config_servers=" << num_servers
+                  << " includes_self=" << includes_self << std::endl;
+
+        // Notify Nim about each server in the new config
+        // This is critical for follower nodes to learn about new peers
+        // when the leader adds them via add_srv
+        if (config_change_cb_) {
+            std::cerr << "[NuRaft] save_config: calling callback for "
+                      << num_servers << " servers" << std::endl;
+            for (auto& srv : saved_config_->get_servers()) {
+                int32_t server_id = srv->get_id();
+                const std::string& endpoint = srv->get_endpoint();
+                std::cerr << "[NuRaft] save_config: server " << server_id
+                          << " endpoint=" << endpoint << std::endl;
+                // Call Nim callback to update peerInfo table
+                config_change_cb_(config_change_ctx_, server_id, endpoint.c_str());
+            }
+        }
+        
+        // Update quorum based on new server count
+        if (quorum_update_cb_ && num_servers > 0) {
+            int32_t majority = (int32_t)(num_servers / 2) + 1;
+            int32_t quorum_size = majority;
+            std::cerr << "[NuRaft] save_config: calling quorum update callback, "
+                      << "num_servers=" << num_servers
+                      << " majority=" << majority
+                      << " quorum_size=" << quorum_size
+                      << " (quorum_for_election=" << (quorum_size - 1) << ")" << std::endl;
+            quorum_update_cb_(quorum_update_ctx_, my_id_, quorum_size);
+        }
     }
 
     void save_state(const srv_state& state) override {
         ptr<buffer> buf = state.serialize();
         saved_state_ = srv_state::deserialize(*buf);
+        std::cerr << "[NuRaft] save_state: my_id=" << my_id_
+                  << " term=" << saved_state_->get_term()
+                  << " voted_for=" << saved_state_->get_voted_for()
+                  << " catching_up=" << (saved_state_->is_catching_up() ? 1 : 0)
+                  << " election_timer_allowed=" << (saved_state_->is_election_timer_allowed() ? 1 : 0)
+                  << std::endl;
+        
+        // Persist state to file if path is set
+        if (!state_file_path_.empty()) {
+            save_state_to_file();
+        }
     }
 
     ptr<srv_state> read_state() override {
@@ -350,12 +463,110 @@ public:
         std::cerr << "NuRaft system_exit called with code " << exit_code << std::endl;
     }
 
+    void set_config_change_callback(void* ctx, nuraft_config_change_cb cb) {
+        config_change_ctx_ = ctx;
+        config_change_cb_ = cb;
+    }
+
 private:
     int32 my_id_;
     std::string my_endpoint_;
     ptr<inmem_log_store> cur_log_store_;
     ptr<cluster_config> saved_config_;
     ptr<srv_state> saved_state_;
+    std::string state_file_path_;  // Path for persistent state file
+    nuraft_config_change_cb config_change_cb_;
+    void* config_change_ctx_;
+    nuraft_quorum_update_cb quorum_update_cb_;
+    void* quorum_update_ctx_;
+    void* raft_server_ptr_;
+    
+    // Load srv_state from file (term, voted_for)
+    // File format: [term:8B BE][voted_for:4B BE][padding:4B] = 16 bytes
+    void load_state_from_file() {
+        std::ifstream file(state_file_path_, std::ios::binary);
+        if (!file.is_open()) {
+            std::cerr << "[NuRaft] load_state_from_file: file not found or cannot open: "
+                      << state_file_path_ << ", using default state (term=0, voted_for=-1)"
+                      << std::endl;
+            saved_state_->set_term(0);
+            saved_state_->set_voted_for(-1);
+            return;
+        }
+        
+        char buf[16];
+        file.read(buf, 16);
+        if (file.gcount() != 16) {
+            std::cerr << "[NuRaft] load_state_from_file: incomplete file (read "
+                      << file.gcount() << " bytes), using default state" << std::endl;
+            saved_state_->set_term(0);
+            saved_state_->set_voted_for(-1);
+            return;
+        }
+        
+        // Parse term (8 bytes big-endian)
+        uint64_t term = 0;
+        for (int i = 0; i < 8; i++) {
+            term = (term << 8) | (uint8_t)buf[i];
+        }
+        
+        // Parse voted_for (4 bytes big-endian)
+        int32_t voted_for = 0;
+        for (int i = 8; i < 12; i++) {
+            voted_for = (voted_for << 8) | (int8_t)buf[i];
+        }
+        
+        saved_state_->set_term(term);
+        saved_state_->set_voted_for(voted_for);
+        
+        std::cerr << "[NuRaft] load_state_from_file: loaded from " << state_file_path_
+                  << " term=" << term << " voted_for=" << voted_for << std::endl;
+    }
+    
+    // Save srv_state to file (term, voted_for)
+    void save_state_to_file() {
+        // Ensure parent directory exists
+        size_t last_slash = state_file_path_.find_last_of('/');
+        if (last_slash != std::string::npos) {
+            std::string dir = state_file_path_.substr(0, last_slash);
+            mkdir(dir.c_str(), 0755);  // Ignore error if already exists
+        }
+        
+        std::ofstream file(state_file_path_, std::ios::binary);
+        if (!file.is_open()) {
+            std::cerr << "[NuRaft] save_state_to_file: ERROR cannot open file: "
+                      << state_file_path_ << std::endl;
+            return;
+        }
+        
+        char buf[16];
+        
+        // Write term (8 bytes big-endian)
+        uint64_t term = saved_state_->get_term();
+        for (int i = 7; i >= 0; i--) {
+            buf[i] = (char)(term & 0xFF);
+            term >>= 8;
+        }
+        
+        // Write voted_for (4 bytes big-endian)
+        int32_t voted_for = saved_state_->get_voted_for();
+        for (int i = 11; i >= 8; i--) {
+            buf[i] = (char)(voted_for & 0xFF);
+            voted_for >>= 8;
+        }
+        
+        // Padding (4 bytes)
+        for (int i = 12; i < 16; i++) {
+            buf[i] = 0;
+        }
+        
+        file.write(buf, 16);
+        file.flush();
+        
+        std::cerr << "[NuRaft] save_state_to_file: saved to " << state_file_path_
+                  << " term=" << saved_state_->get_term()
+                  << " voted_for=" << saved_state_->get_voted_for() << std::endl;
+    }
 };
 
 // =============================================================================
@@ -376,6 +587,13 @@ public:
     }
 
     ~mp_rpc_client() {}
+
+    // Update group ID (called when factory's group ID changes)
+    void set_group_id(const char* group_id_bytes) {
+        if (group_id_bytes) {
+            std::memcpy(group_id_bytes_, group_id_bytes, 16);
+        }
+    }
 
     void send(ptr<req_msg>& req, rpc_handler& when_done, uint64_t timeout_ms = 0) override {
         if (abandoned_.load()) {
@@ -469,10 +687,12 @@ public:
     void set_group_id(const char* group_id_bytes) {
         if (group_id_bytes) {
             std::memcpy(group_id_bytes_, group_id_bytes, 16);
-            // Update all existing clients
+            // Update all existing clients with the new group_id
             std::lock_guard<std::mutex> lock(clients_lock_);
             for (auto& pair : clients_) {
-                // Note: clients already have their own copy of group_id_bytes
+                // Each client has its own copy of group_id_bytes_
+                // We need to update it via the set_group_id method
+                pair.second->set_group_id(group_id_bytes);
             }
         }
     }
@@ -534,11 +754,29 @@ private:
     nuraft_send_cb send_resp_cb_;
 };
 
+// Forward declare mp_timer for mp_context_t
+class mp_timer;
+
+// =============================================================================
+// Multiplexed Context (bundles all components)
+// =============================================================================
+
+struct mp_context_t {
+    ptr<mp_rpc_client_factory> client_factory;
+    ptr<mp_rpc_listener> listener;
+    ptr<mp_timer> timer;
+    int32_t server_id;
+    char group_id_bytes[16] = {0};
+};
+
+// =============================================================================
 // Timer - delegates to Nim callbacks
+// =============================================================================
+
 class mp_timer : public delayed_task_scheduler {
 public:
-    mp_timer(void* timer_ctx, nuraft_schedule_timer_cb schedule_cb, nuraft_cancel_timer_cb cancel_cb)
-        : timer_ctx_(timer_ctx), schedule_cb_(schedule_cb), cancel_cb_(cancel_cb),
+    mp_timer(mp_context_t* parent_ctx, void* timer_ctx, nuraft_schedule_timer_cb schedule_cb, nuraft_cancel_timer_cb cancel_cb)
+        : parent_ctx_(parent_ctx), timer_ctx_(timer_ctx), schedule_cb_(schedule_cb), cancel_cb_(cancel_cb),
           next_timer_id_(1), stopped_(false) {}
 
     ~mp_timer() { stop(); }
@@ -546,11 +784,39 @@ public:
     void schedule(ptr<delayed_task>& task, int32 milliseconds) override {
         if (stopped_.load()) return;
 
+        // CRITICAL: Reset the cancelled_ flag before scheduling.
+        // NuRaft reuses the same task object (election_task_) when
+        // restart_election_timer() is called. The cancel() method
+        // sets cancelled_=true, and if we don't reset it here,
+        // execute() will skip calling exec() even for the newly
+        // scheduled timer. This is what asio_service::schedule() does.
+        task->reset();
+
         int32_t timer_id = next_timer_id_.fetch_add(1);
         {
             std::lock_guard<std::mutex> lock(tasks_lock_);
             tasks_[timer_id] = task;
         }
+
+        // Log timer type for debugging (include group_id)
+        std::string type_str = "unknown";
+        if (task) {
+            int32 ttype = task->get_type();
+            if (ttype == 1) type_str = "election";  // timer_task_type::election_timer
+            else if (ttype == 2) type_str = "heartbeat";  // timer_task_type::heartbeat_timer
+        }
+        // Format group_id as hex string (last 4 bytes for brevity)
+        std::string group_id_str = "unknown";
+        if (parent_ctx_) {
+            char hex_buf[9];
+            for (int i = 12; i < 16; i++) {
+                sprintf(hex_buf + (i-12)*2, "%02x", (unsigned char)parent_ctx_->group_id_bytes[i]);
+            }
+            group_id_str = std::string(hex_buf);
+        }
+        std::cerr << "[NuRaft] schedule_timer: server_id=" << (parent_ctx_ ? parent_ctx_->server_id : -1)
+                  << " group_id=" << group_id_str
+                  << " timer_id=" << timer_id << " type=" << type_str << " delay_ms=" << milliseconds << std::endl;
 
         if (schedule_cb_) {
             schedule_cb_(timer_ctx_, timer_id, milliseconds);
@@ -561,6 +827,18 @@ public:
         std::lock_guard<std::mutex> lock(tasks_lock_);
         for (auto it = tasks_.begin(); it != tasks_.end(); ++it) {
             if (it->second == task) {
+                // Format group_id as hex string (last 4 bytes for brevity)
+                std::string group_id_str = "unknown";
+                if (parent_ctx_) {
+                    char hex_buf[9];
+                    for (int i = 12; i < 16; i++) {
+                        sprintf(hex_buf + (i-12)*2, "%02x", (unsigned char)parent_ctx_->group_id_bytes[i]);
+                    }
+                    group_id_str = std::string(hex_buf);
+                }
+                std::cerr << "[NuRaft] cancel_timer: server_id=" << (parent_ctx_ ? parent_ctx_->server_id : -1)
+                          << " group_id=" << group_id_str
+                          << " timer_id=" << it->first << std::endl;
                 if (cancel_cb_) {
                     cancel_cb_(timer_ctx_, it->first);
                 }
@@ -576,18 +854,82 @@ public:
             std::lock_guard<std::mutex> lock(tasks_lock_);
             auto it = tasks_.find(timer_id);
             if (it == tasks_.end()) {
+                // Format group_id as hex string (last 4 bytes for brevity)
+                std::string group_id_str = "unknown";
+                if (parent_ctx_) {
+                    char hex_buf[9];
+                    for (int i = 12; i < 16; i++) {
+                        sprintf(hex_buf + (i-12)*2, "%02x", (unsigned char)parent_ctx_->group_id_bytes[i]);
+                    }
+                    group_id_str = std::string(hex_buf);
+                }
+                std::cerr << "[NuRaft] invoke_timer: server_id=" << (parent_ctx_ ? parent_ctx_->server_id : -1)
+                          << " group_id=" << group_id_str
+                          << " timer_id=" << timer_id
+                          << " NOT FOUND (cancelled or expired)" << std::endl;
                 return false;
             }
             task = it->second;
             tasks_.erase(it);
         }
         if (task) {
+            int32 ttype = task->get_type();
+            std::string type_str = "unknown";
+            if (ttype == 1) type_str = "election";
+            else if (ttype == 2) type_str = "heartbeat";
+            
+            // Format group_id as hex string (last 4 bytes for brevity)
+            std::string group_id_str = "unknown";
+            if (parent_ctx_) {
+                char hex_buf[9];
+                for (int i = 12; i < 16; i++) {
+                    sprintf(hex_buf + (i-12)*2, "%02x", (unsigned char)parent_ctx_->group_id_bytes[i]);
+                }
+                group_id_str = std::string(hex_buf);
+            }
+            
+            std::cerr << std::unitbuf;  // Force unbuffered
+            
+            // Count active timers BEFORE execution
+            size_t count_before = 0;
+            {
+                std::lock_guard<std::mutex> lock(tasks_lock_);
+                count_before = tasks_.size();
+            }
+            
+            std::cerr << "[NuRaft shim] invoke_timer START: server_id=" << (parent_ctx_ ? parent_ctx_->server_id : -1)
+                      << " group_id=" << group_id_str
+                      << " ctx_ptr=" << (void*)parent_ctx_
+                      << " timer_id=" << timer_id << " type=" << type_str 
+                      << " active_before=" << count_before << std::endl;
+            
+            // Call execute() - internally checks cancelled_ flag
             task->execute();
+            
+            // Confirm that execute() was actually called
+            std::cerr << "[NuRaft shim] invoke_timer EXECUTED: server_id=" << (parent_ctx_ ? parent_ctx_->server_id : -1)
+                      << " group_id=" << group_id_str
+                      << " timer_id=" << timer_id << std::endl;
+            
+            // Note: if task was cancelled, execute() returns silently without calling exec()
+            // This would explain why HE_TIMEOUT doesn appear
+            
+            // Count active timers AFTER execution to see if new timer was scheduled
+            size_t count_after = 0;
+            {
+                std::lock_guard<std::mutex> lock(tasks_lock_);
+                count_after = tasks_.size();
+            }
+            
+            std::cerr << "[NuRaft shim] invoke_timer END: server_id=" << (parent_ctx_ ? parent_ctx_->server_id : -1)
+                      << " group_id=" << group_id_str
+                      << " ctx_ptr=" << (void*)parent_ctx_
+                      << " timer_id=" << timer_id << " type=" << type_str << " active_after=" << count_after << std::endl;
             return true;
         }
         return false;
-    }
-
+}
+             
     void stop() {
         stopped_.store(true);
         std::lock_guard<std::mutex> lock(tasks_lock_);
@@ -595,6 +937,7 @@ public:
     }
 
 private:
+    mp_context_t* parent_ctx_;  // Pointer to parent context for server_id access
     void* timer_ctx_;
     nuraft_schedule_timer_cb schedule_cb_;
     nuraft_cancel_timer_cb cancel_cb_;
@@ -602,18 +945,6 @@ private:
     std::atomic<bool> stopped_;
     std::mutex tasks_lock_;
     std::map<int32_t, ptr<delayed_task>> tasks_;
-};
-
-// =============================================================================
-// Multiplexed Context (bundles all components)
-// =============================================================================
-
-struct mp_context_t {
-    ptr<mp_rpc_client_factory> client_factory;
-    ptr<mp_rpc_listener> listener;
-    ptr<mp_timer> timer;
-    int32_t server_id;
-    char group_id_bytes[16] = {0};
 };
 
 // =============================================================================
@@ -737,6 +1068,13 @@ void nuraft_params_set_leadership_transfer_min_wait_time(void* params, int32_t m
     static_cast<raft_params*>(params)->leadership_transfer_min_wait_time_ = ms;
 }
 
+void nuraft_params_set_custom_election_quorum_size(void* params, int32_t size) {
+    if (!params) return;
+    static_cast<raft_params*>(params)->custom_election_quorum_size_ = size;
+    fprintf(stderr, "[NuRaft Shim] Set custom election quorum size to %d (actual quorum will be %d)\n",
+            size, size > 0 ? size - 1 : 0);
+}
+
 // =============================================================================
 // State Machine
 // =============================================================================
@@ -768,7 +1106,32 @@ void* nuraft_smgr_create(int32_t my_server_id, const char* my_endpoint,
     for (int i = 0; i < num_servers; i++) {
         servers.push_back({server_ids[i], std::string(endpoints[i])});
     }
-    auto smgr = cs_new<dynamic_state_mgr>(my_server_id, std::string(my_endpoint), servers);
+    auto smgr = cs_new<dynamic_state_mgr>(my_server_id, std::string(my_endpoint), servers, false);
+    return new ptr<dynamic_state_mgr>(smgr);
+}
+
+void* nuraft_smgr_create_with_catching_up(int32_t my_server_id, const char* my_endpoint,
+                                           int32_t num_servers, const int32_t* server_ids,
+                                           const char** endpoints, bool catching_up) {
+    std::vector<std::pair<int32, std::string>> servers;
+    for (int i = 0; i < num_servers; i++) {
+        servers.push_back({server_ids[i], std::string(endpoints[i])});
+    }
+    auto smgr = cs_new<dynamic_state_mgr>(my_server_id, std::string(my_endpoint), servers, catching_up);
+    return new ptr<dynamic_state_mgr>(smgr);
+}
+
+void* nuraft_smgr_create_with_persistence(int32_t my_server_id, const char* my_endpoint,
+                                           int32_t num_servers, const int32_t* server_ids,
+                                           const char** endpoints, bool catching_up,
+                                           const char* state_file_path) {
+    std::vector<std::pair<int32, std::string>> servers;
+    for (int i = 0; i < num_servers; i++) {
+        servers.push_back({server_ids[i], std::string(endpoints[i])});
+    }
+    std::string path_str = state_file_path ? std::string(state_file_path) : "";
+    auto smgr = cs_new<dynamic_state_mgr>(my_server_id, std::string(my_endpoint),
+                                          servers, catching_up, path_str);
     return new ptr<dynamic_state_mgr>(smgr);
 }
 
@@ -776,6 +1139,24 @@ void nuraft_smgr_destroy(void* smgr) {
     if (smgr) {
         delete static_cast<ptr<dynamic_state_mgr>*>(smgr);
     }
+}
+
+void nuraft_smgr_set_config_cb(void* smgr, void* ctx, nuraft_config_change_cb cb) {
+    if (!smgr) return;
+    auto& sp = *static_cast<ptr<dynamic_state_mgr>*>(smgr);
+    sp->set_config_change_callback(ctx, cb);
+}
+
+void nuraft_smgr_set_quorum_cb(void* smgr, void* ctx, nuraft_quorum_update_cb cb) {
+    if (!smgr) return;
+    auto& sp = *static_cast<ptr<dynamic_state_mgr>*>(smgr);
+    sp->set_quorum_update_callback(ctx, cb);
+}
+
+void nuraft_smgr_set_raft_server(void* smgr, void* server) {
+    if (!smgr) return;
+    auto& sp = *static_cast<ptr<dynamic_state_mgr>*>(smgr);
+    sp->set_raft_server(server);
 }
 
 // =============================================================================
@@ -795,7 +1176,7 @@ void* nuraft_mp_context_create(
     ctx->client_factory = cs_new<mp_rpc_client_factory>(server_id, transport_ctx, send_cb);
     ctx->listener = cs_new<mp_rpc_listener>();
     // Pass the mp_context itself as timer_ctx so Nim can invoke timers
-    ctx->timer = cs_new<mp_timer>(ctx, schedule_cb, cancel_cb);
+    ctx->timer = cs_new<mp_timer>(ctx, ctx, schedule_cb, cancel_cb);
     return ctx;
 }
 
@@ -865,11 +1246,21 @@ void nuraft_mp_listener_destroy(void* listener_ptr) {
 void nuraft_mp_deliver_message(void* mp_context, void* server,
                                const char* msg_data, size_t msg_len) {
     if (!mp_context || !msg_data || msg_len == 0) {
+        std::cerr << "[shim] deliver_message: early return (null or zero len)" << std::endl;
         return;
     }
 
     auto* mp_ctx = static_cast<mp_context_t*>(mp_context);
     auto* wrapper = static_cast<server_wrapper*>(server);
+
+    // Build group_id hex for logging
+    std::string gid_hex;
+    for (int i = 0; i < 16; i++) {
+        char hex[3];
+        sprintf(hex, "%02x", (unsigned char)mp_ctx->group_id_bytes[i]);
+        gid_hex += hex;
+    }
+    std::string gid_short = gid_hex.substr(24, 8);  // Last 4 bytes for brevity
 
     // Deserialize message - allocate buffer and copy data
     // IMPORTANT: buffer::alloc creates buffer with given size, and pos=0
@@ -879,20 +1270,33 @@ void nuraft_mp_deliver_message(void* mp_context, void* server,
 
     msg_type type = get_msg_type(*msg_buf);
 
-    // Build group_id hex for handler lookup
-    std::string gid_hex;
-    for (int i = 0; i < 16; i++) {
-        char hex[3];
-        sprintf(hex, "%02x", (unsigned char)mp_ctx->group_id_bytes[i]);
-        gid_hex += hex;
-    }
+    std::cerr << "[shim] deliver_message: server_id=" << mp_ctx->server_id
+              << " group=" << gid_short << " msg_type=" << static_cast<int>(type)
+              << " len=" << msg_len << std::endl;
 
     if (is_response_type(type)) {
         // It's a response - match to pending handler
         ptr<resp_msg> resp = deserialize_resp_msg(*msg_buf);
 
+        std::cerr << "[shim] deliver_message RESPONSE: src=" << resp->get_src()
+                  << " dst=" << resp->get_dst() << " accepted=" << resp->get_accepted()
+                  << " term=" << resp->get_term() << std::endl;
+
         // Key: (groupId_hex, our_server_id, responder_id)
         auto key = std::make_tuple(gid_hex, mp_ctx->server_id, resp->get_src());
+
+        std::cerr << "[shim] deliver_message: lookup key=(" << gid_short << ", " << mp_ctx->server_id << ", " << resp->get_src() << ")" << std::endl;
+
+        // Dump all pending handlers for debugging
+        {
+            std::lock_guard<std::mutex> lock(g_handlers_lock);
+            std::cerr << "[shim] deliver_message: pending handlers count=" << g_pending_handlers.size() << std::endl;
+            for (const auto& entry : g_pending_handlers) {
+                const auto& k = entry.first;
+                std::string k_gid = std::get<0>(k).substr(24, 8);
+                std::cerr << "[shim]   handler: (" << k_gid << ", " << std::get<1>(k) << ", " << std::get<2>(k) << ")" << std::endl;
+            }
+        }
 
         rpc_handler handler;
         {
@@ -901,29 +1305,51 @@ void nuraft_mp_deliver_message(void* mp_context, void* server,
             if (it != g_pending_handlers.end()) {
                 handler = it->second;
                 g_pending_handlers.erase(it);
+                std::cerr << "[shim] deliver_message: FOUND handler for key" << std::endl;
+            } else {
+                std::cerr << "[shim] deliver_message: NO handler found for key" << std::endl;
             }
         }
 
         if (handler) {
+            std::cerr << "[shim] deliver_message: invoking handler" << std::endl;
             ptr<rpc_exception> no_err;
             handler(resp, no_err);
+            std::cerr << "[shim] deliver_message: handler completed" << std::endl;
         }
     } else {
         // It's a request - process and send response
         ptr<req_msg> req = deserialize_req_msg(*msg_buf);
 
+        std::cerr << "[shim] deliver_message REQUEST: src=" << req->get_src()
+                  << " dst=" << req->get_dst() << " term=" << req->get_term()
+                  << " last_log_idx=" << req->get_last_log_idx() << std::endl;
+
         raft_server* srv = wrapper ? wrapper->server.get() : nullptr;
-        if (!srv) return;
+        if (!srv) {
+            std::cerr << "[shim] deliver_message: server is null, returning" << std::endl;
+            return;
+        }
+
+        std::cerr << "[shim] deliver_message: calling process_req for msg_type=" 
+                  << static_cast<int>(req->get_type()) << std::endl;
 
         ptr<resp_msg> resp = raft_server_access::call_process_req(srv, *req);
 
+        std::cerr << "[shim] deliver_message: process_req returned, resp=" 
+                  << (resp ? "non-null" : "null") << std::endl;
+
         if (resp) {
+            std::cerr << "[shim] deliver_message: got response, sending via listener" << std::endl;
             // Send response via listener's callback
             auto& listener = mp_ctx->listener;
             if (listener && listener->has_send_response_callback()) {
                 ptr<buffer> resp_buf = serialize_resp_msg(resp);
                 const char* resp_data = reinterpret_cast<const char*>(resp_buf->data_begin());
                 size_t resp_len = resp_buf->size();
+
+                std::cerr << "[shim] deliver_message: response src=" << resp->get_src()
+                          << " dst=" << resp->get_dst() << " accepted=" << resp->get_accepted() << std::endl;
 
                 listener->get_send_resp_cb()(
                     listener->get_send_resp_ctx(),
@@ -933,6 +1359,9 @@ void nuraft_mp_deliver_message(void* mp_context, void* server,
                     resp_data,
                     resp_len
                 );
+                std::cerr << "[shim] deliver_message: response sent" << std::endl;
+            } else {
+                std::cerr << "[shim] deliver_message: no listener or callback" << std::endl;
             }
         }
     }
@@ -971,6 +1400,12 @@ void* nuraft_server_create(
     auto& smgr_sp = *static_cast<ptr<dynamic_state_mgr>*>(smgr);
     auto* rp = static_cast<raft_params*>(params);
 
+    // Log params values to trace what's being passed to raft_server
+    std::cerr << "[NuRaft shim] nuraft_server_create: params="
+              << " election_timeout_lower=" << rp->election_timeout_lower_bound_
+              << " election_timeout_upper=" << rp->election_timeout_upper_bound_
+              << " heartbeat_interval=" << rp->heart_beat_interval_ << std::endl;
+
     // Create context with custom RPC components
     context* ctx = new context(
         std::static_pointer_cast<state_mgr>(smgr_sp),
@@ -985,6 +1420,10 @@ void* nuraft_server_create(
     // Wire event callback
     if (event_cb) {
         ctx->set_cb_func([event_cb, event_ctx](cb_func::Type type, cb_func::Param* param) -> cb_func::ReturnCode {
+            std::cerr << "[NuRaft cb_func] type=" << static_cast<int>(type)
+                      << " (BecomeLeader=" << static_cast<int>(cb_func::BecomeLeader)
+                      << ", BecomeFollower=" << static_cast<int>(cb_func::BecomeFollower) << ")"
+                      << " leaderId=" << param->leaderId << std::endl;
             if (type == cb_func::BecomeLeader || type == cb_func::BecomeFollower) {
                 event_cb(event_ctx, static_cast<int>(type), param->leaderId,
                          param->ctx ? *static_cast<uint64_t*>(param->ctx) : 0);
@@ -1110,11 +1549,20 @@ int nuraft_server_add_srv(void* server, int32_t srv_id, const char* endpoint) {
     auto* wrapper = static_cast<server_wrapper*>(server);
     if (!wrapper->server) return -1;
 
+    std::cerr << "[NuRaft shim] add_srv: srv_id=" << srv_id
+              << " endpoint=" << endpoint << std::endl;
+
     srv_config sc(srv_id, std::string(endpoint));
     auto result = wrapper->server->add_srv(sc);
-    if (!result) return -1;
+    if (!result) {
+        std::cerr << "[NuRaft shim] add_srv: result is NULL!" << std::endl;
+        return -1;
+    }
 
-    return result->get_accepted() ? 0 : static_cast<int>(result->get_result_code());
+    int rc = result->get_accepted() ? 0 : static_cast<int>(result->get_result_code());
+    std::cerr << "[NuRaft shim] add_srv: accepted=" << result->get_accepted()
+              << " result_code=" << rc << std::endl;
+    return rc;
 }
 
 int nuraft_server_remove_srv(void* server, int32_t srv_id) {
@@ -1144,6 +1592,24 @@ void nuraft_server_yield_leadership(void* server, bool immediate, int32_t succes
     if (wrapper->server) {
         wrapper->server->yield_leadership(immediate, successor_id);
     }
+}
+
+void nuraft_server_update_quorum(void* server, int32_t quorum_size) {
+    if (!server) return;
+    auto* wrapper = static_cast<server_wrapper*>(server);
+    if (!wrapper->server || !wrapper->raft_ctx) return;
+    
+    // Get current params and modify only the quorum size
+    ptr<raft_params> current_params = wrapper->raft_ctx->get_params();
+    raft_params new_params(*current_params);  // Copy existing params (preserves hb_interval!)
+    new_params.custom_election_quorum_size_ = quorum_size;
+    
+    std::cerr << "[NuRaft Shim] update_quorum: server_id=" << wrapper->server->get_id()
+              << " quorum_size=" << quorum_size
+              << " (actual quorum=" << (quorum_size > 0 ? quorum_size - 1 : 0) << ")"
+              << " hb_interval=" << new_params.heart_beat_interval_ << std::endl;
+    
+    wrapper->server->update_params(new_params);
 }
 
 } // extern "C"

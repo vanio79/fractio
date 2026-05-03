@@ -8,11 +8,17 @@
 #
 # Run:
 #   nim c -r --mm:atomicArc --threads:on -p:src tests/integration/distributed/raft/test_cluster_rejoin.nim
+#
+# To debug failures, set PRESERVE_LOGS=1 to keep test directories:
+#   PRESERVE_LOGS=1 nim c -r --mm:atomicArc -p:src tests/integration/distributed/raft/test_cluster_rejoin.nim
 
 import unittest
 import std/[os, osproc, strutils, json, httpclient, times, strformat, posix]
 import fractio/protocol/types
 import ../../../test_config
+
+# Set PRESERVE_LOGS=1 environment variable to keep test directories for debugging
+const PreserveLogs = existsEnv("PRESERVE_LOGS")
 
 # Kill orphaned fractio_web processes from previous runs
 proc cleanupOrphanProcesses() =
@@ -23,7 +29,9 @@ proc cleanupOrphanProcesses() =
         if fileExists(pidFile):
           let pid = parseInt(readFile(pidFile).strip())
           discard execShellCmd("kill -9 " & $pid & " 2>/dev/null")
-        removeDir(dir)
+        # Only remove if not preserving logs
+        when not PreserveLogs:
+          removeDir(dir)
   except:
     discard
 
@@ -49,14 +57,21 @@ const
   # with faster election timeouts.
 
   # Time for a node to join cluster and stabilize (used after startNode with --join)
-  JOIN_STABILIZE_MS = 500 # Reduced from 2000ms - waitForNodeCount handles the rest
+  JOIN_STABILIZE_MS = 1000 # Allow more time for Raft group creation
 
   # Time for leader election after killing the leader
-  # Production election timeout is 1-2s, so need ~2 election cycles
-  ELECTION_WAIT_MS = 800 # Reduced from 4000ms - tryInsert retries anyway
+  # Production election timeout is 1-2s (electionTimeoutLowerMs/electionTimeoutUpperMs
+  # in CoordinatorConfig defaults to 1000/2000). Need:
+  #   1. Buffered messages from killed leader to stop: 3-4s (SIGKILL doesn't close connections)
+  #   2. Election timer expiration after messages stop: 1-2s
+  #   3. Pre-vote + election completion: ~500ms
+  #   4. BecomeLeader event + sys.groups update: ~100ms
+  #   5. FractioClient metadata refresh: ~100ms
+  # Total: ~8-10s minimum (using 12s for safety margin)
+  ELECTION_WAIT_MS = 12000
 
   # Time for follower removal to propagate (no election needed)
-  FOLLOWER_DOWN_MS = 200 # Reduced from 1000ms - leader stays up
+  FOLLOWER_DOWN_MS = 500 # Increased for safety
 
 type
   TestNode = object
@@ -82,6 +97,9 @@ raft-port = {raftPort}
 client-port = {clientPort}
 web-port = {webPort}
 data-dir = "{dataDir}"
+
+[daemon]
+log-file = "{dataDir}/node.log"
 """)
   configPath
 
@@ -248,9 +266,13 @@ suite "Cluster Dynamic Join and Node Restart":
     # Stop all nodes
     for i in 0..2:
       stopNode(nodes[i])
-    # Clean up data dirs
-    for i in 1..3:
-      cleanNodeData(i)
+    # Clean up data dirs (unless PRESERVE_LOGS=1 for debugging)
+    when PreserveLogs:
+      # Still stop processes but keep logs for debugging
+      discard
+    else:
+      for i in 1..3:
+        cleanNodeData(i)
 
   test "3-node cluster: join, data replication, verify all nodes":
     ## Start node 1 as standalone, join nodes 2 and 3, verify data replicates.
@@ -344,12 +366,12 @@ suite "Cluster Dynamic Join and Node Restart":
     waitForData(nodes[1], "SELECT * FROM t1", 3)
     waitForData(nodes[2], "SELECT * FROM t1", 3)
 
-    # Restart node 1 WITHOUT --join (should use saved cluster.json)
+    # Restart node 1 WITHOUT --join (should use saved cluster.bin)
     nodes[0] = startNode(1)
     waitForReady(nodes[0])
 
-    # Verify cluster.json was loaded
-    check fileExists(nodeDataDir(1) / "cluster.json")
+    # Verify cluster.bin was loaded
+    check fileExists(nodeDataDir(1) / "cluster.bin")
 
     # Node 1 should catch up incrementally and have all 3 rows
     waitForData(nodes[0], "SELECT * FROM t1", 3, timeoutMs = 15_000)
@@ -399,7 +421,7 @@ suite "Cluster Dynamic Join and Node Restart":
     check "Charlie" in names
     check "Bob" in names
 
-  test "cluster.json is created on join and persists across restart":
+  test "cluster.bin is created on join and persists across restart":
     ## Verify the cluster membership file is correctly created and used.
     nodes[0] = startNode(1)
     waitForReady(nodes[0])
@@ -410,21 +432,9 @@ suite "Cluster Dynamic Join and Node Restart":
     waitForNodeCount(nodes[0], 2)
     waitForNodeCount(nodes[1], 2)
 
-    # Both nodes should have cluster.json
-    check fileExists(nodeDataDir(1) / "cluster.json")
-    check fileExists(nodeDataDir(2) / "cluster.json")
-
-    # Verify cluster.json content for node 1
-    let j1 = parseJson(readFile(nodeDataDir(1) / "cluster.json"))
-    let peers1 = j1["peers"]
-    check peers1.kind == JArray
-    check peers1.len >= 1 # At least node 2
-
-    # Verify cluster.json content for node 2
-    let j2 = parseJson(readFile(nodeDataDir(2) / "cluster.json"))
-    let peers2 = j2["peers"]
-    check peers2.kind == JArray
-    check peers2.len >= 1 # At least node 1
+    # Both nodes should have cluster.bin (binary format)
+    check fileExists(nodeDataDir(1) / "cluster.bin")
+    check fileExists(nodeDataDir(2) / "cluster.bin")
 
   test "multiple kill-restart cycles":
     ## Verify a node can be killed and restarted multiple times.

@@ -81,9 +81,33 @@ uint64_t nuraft_sm_last_commit_index(void* sm);
 // State Manager
 // =============================================================================
 
+// Callback type for configuration changes (called when add_srv is committed)
+typedef int32_t (*nuraft_config_change_cb)(void* ctx, int32_t server_id, const char* endpoint);
+
+// Callback type for quorum updates (called when config changes)
+typedef void (*nuraft_quorum_update_cb)(void* ctx, int32_t server_id, int32_t quorum_size);
+
+// Create state manager (in-memory, no persistence)
 void* nuraft_smgr_create(int32_t my_server_id, const char* my_endpoint,
                          int32_t num_servers, const int32_t* server_ids, const char** endpoints);
+
+// Create state manager with catching_up flag (in-memory, no persistence)
+void* nuraft_smgr_create_with_catching_up(int32_t my_server_id, const char* my_endpoint,
+                                          int32_t num_servers, const int32_t* server_ids,
+                                          const char** endpoints, bool catching_up);
+
+// Create state manager with persistent state file
+// state_file_path: path to file for persisting term and voted_for
+// The file is created if it doesn't exist, and updated on every save_state()
+void* nuraft_smgr_create_with_persistence(int32_t my_server_id, const char* my_endpoint,
+                                          int32_t num_servers, const int32_t* server_ids,
+                                          const char** endpoints, bool catching_up,
+                                          const char* state_file_path);
+
 void nuraft_smgr_destroy(void* smgr);
+void nuraft_smgr_set_config_cb(void* smgr, void* ctx, nuraft_config_change_cb cb);
+void nuraft_smgr_set_quorum_cb(void* smgr, void* ctx, nuraft_quorum_update_cb cb);
+void nuraft_smgr_set_raft_server(void* smgr, void* server);
 
 // =============================================================================
 // Multiplexed Context (RPC + Timer)
@@ -163,6 +187,7 @@ int nuraft_server_add_srv(void* server, int32_t srv_id, const char* endpoint);
 int nuraft_server_remove_srv(void* server, int32_t srv_id);
 int nuraft_server_set_priority(void* server, int32_t srv_id, int32_t priority);
 void nuraft_server_yield_leadership(void* server, bool immediate, int32_t successor_id);
+void nuraft_server_update_quorum(void* server, int32_t quorum_size);
 
 #ifdef __cplusplus
 }

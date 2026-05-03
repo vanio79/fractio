@@ -1,5 +1,7 @@
 # TCP Transport - TCP-based network transport for distributed Fractio
 # Provides both server and client functionality for TCP communication
+# 
+# All sockets use NON-BLOCKING mode with select() polling to prevent hanging.
 
 import std/[net, nativesockets, tables, locks, times, options, atomics,
     typedthreads, endians]
@@ -129,7 +131,7 @@ proc getHandler*(t: TCPTransport, msgType: uint16): Option[proc(
     return none(proc(msg: string): string {.gcsafe.})
 
 # =============================================================================
-# Low-level Socket Operations
+# Low-level Socket Operations (Non-blocking with select polling)
 # =============================================================================
 
 proc readFrameNoLog(socket: Socket, timeoutMs: int,
@@ -137,14 +139,20 @@ proc readFrameNoLog(socket: Socket, timeoutMs: int,
   ## GC-safe version of readFrame without logging.
   ## Sets connClosed=true when the remote end closes the connection (recv=0),
   ## as distinct from a plain timeout which leaves connClosed=false.
+  ## Uses NON-BLOCKING socket with select() polling.
   connClosed = false
   try:
+    # Set socket to non-blocking mode if not already
+    let fd = socket.getFd().cint
+    # Note: socket may already be non-blocking from accept
+
     var headerBuf = newString(FRAME_HEADER_SIZE)
-    let n = socket.recv(headerBuf, FRAME_HEADER_SIZE, timeoutMs)
+    let n = recvExactNonBlocking(fd, headerBuf, FRAME_HEADER_SIZE, timeoutMs)
     if n == 0:
       connClosed = true
       return none(string)
     if n < FRAME_HEADER_SIZE:
+      # Timeout or incomplete read
       return none(string)
 
     let (header, _) = decodeFrameHeader(headerBuf)
@@ -154,8 +162,11 @@ proc readFrameNoLog(socket: Socket, timeoutMs: int,
 
     var payload = newString(header.payloadLen.int)
     if header.payloadLen > 0:
-      let n2 = socket.recv(payload, header.payloadLen.int)
-      if n2 == 0 or n2 < header.payloadLen.int:
+      let n2 = recvExactNonBlocking(fd, payload, header.payloadLen.int, timeoutMs)
+      if n2 == 0:
+        connClosed = true
+        return none(string)
+      if n2 < header.payloadLen.int:
         return none(string)
 
     let computedChecksum = computeCRC32(payload)
@@ -168,9 +179,12 @@ proc readFrameNoLog(socket: Socket, timeoutMs: int,
     return none(string)
 
 proc readFrame*(socket: Socket, timeoutMs: int = 30000): Option[string] =
+  ## Read a complete frame using non-blocking I/O with select polling.
   try:
+    let fd = socket.getFd().cint
+
     var headerBuf = newString(FRAME_HEADER_SIZE)
-    let n = socket.recv(headerBuf, FRAME_HEADER_SIZE, timeoutMs)
+    let n = recvExactNonBlocking(fd, headerBuf, FRAME_HEADER_SIZE, timeoutMs)
     if n == 0:
       return none(string)
     if n < FRAME_HEADER_SIZE:
@@ -186,7 +200,7 @@ proc readFrame*(socket: Socket, timeoutMs: int = 30000): Option[string] =
 
     var payload = newString(header.payloadLen.int)
     if header.payloadLen > 0:
-      let n2 = socket.recv(payload, header.payloadLen.int)
+      let n2 = recvExactNonBlocking(fd, payload, header.payloadLen.int, timeoutMs)
       if n2 == 0 or n2 < header.payloadLen.int:
         return none(string)
 
@@ -210,10 +224,12 @@ proc readFrame*(socket: Socket, timeoutMs: int = 30000): Option[string] =
 
 proc writeFrame*(socket: Socket, payload: string,
     timeoutMs: int = 30000): bool =
+  ## Write a complete frame using non-blocking I/O with select polling.
   try:
+    let fd = socket.getFd().cint
     let frame = encodeFrame(payload)
-    socket.send(frame)
-    return true
+    let sent = sendNonBlocking(fd, frame, timeoutMs)
+    return sent == frame.len
   except TimeoutError:
     return false
   except CatchableError as e:
@@ -375,8 +391,12 @@ proc connHandlerProc(ctx: ConnHandlerCtx) {.thread.} =
 
       if response.len > 0 and conn.state == csConnected:
         try:
+          # Use non-blocking writeFrame
+          let fd = conn.socket.getFd().cint
           let frame = encodeFrame(response)
-          conn.socket.send(frame)
+          let sent = sendNonBlocking(fd, frame, 5000) # 5 second timeout
+          if sent != frame.len:
+            break # Send failed - exit handler loop
         except Exception:
           break # socket closed or error; exit handler loop
 
@@ -441,6 +461,14 @@ proc acceptLoopWrapper(t: TCPTransport) {.thread.} =
       t.serverSocket.acceptAddr(client, clientAddr)
 
       if client.isNil:
+        continue
+
+      # Set client socket to non-blocking mode for all I/O operations
+      # This prevents blocking in recv/send calls during frame handling
+      let clientFd = client.getFd().cint
+      if not setSocketNonBlocking(clientFd):
+        # If we can't set non-blocking, close and skip this connection
+        try: client.close() except CatchableError: discard
         continue
 
       client.setSockOpt(OptNoDelay, t.config.tcpNoDelay,

@@ -7,7 +7,7 @@
 #   - Conflict detection on commit
 #   - Automatic rollback on abort
 
-import std/[tables, locks, options, atomics, strutils, algorithm, times]
+import std/[tables, locks, options, atomics, strutils, algorithm, times, sets]
 import ../core/types as coreTypes
 import ../core/transaction as coreTxn
 import ../core/timestamp_provider
@@ -770,6 +770,7 @@ proc snapshotScan*(store: MvccTransactionStore,
   ## Optimized for single-statement SELECT/SCAN queries.
   ## Note: We scan without limit at the storage layer because MVCC keys can
   ## have multiple versions per user key. We apply the limit after deduplication.
+
   let scanRes = store.raftStore.raftScan(startKey, endKey, 0, # no limit at storage level
     includeSystemKeys = true)
   if not scanRes.isOk:
@@ -780,7 +781,7 @@ proc snapshotScan*(store: MvccTransactionStore,
       isDeleted: bool, timestamp: coreTypes.Timestamp]] = initTable[string,
       tuple[value: string, isDeleted: bool, timestamp: coreTypes.Timestamp]]()
 
-  # Pass 1: Collect latest versioned keys
+  # Pass 1: Collect latest versioned keys (keys with \x00\x00 + timestamp suffix)
   for (k, entry) in scanRes.value:
     if isIntentKeyMvcc(k): continue
     if isVersionKey(k):
@@ -795,20 +796,25 @@ proc snapshotScan*(store: MvccTransactionStore,
       except:
         discard
 
-  # Pass 2: For keys not in Pass 1, if not an intent or version key, check if likely MVCC.
-  # If MVCC and ts <= readTs, add to keyVersions. If not MVCC, add as-is.
+  # Pass 2: For keys not an intent or version key, check if likely MVCC.
+  # IMPORTANT: We must compare timestamps even if key already exists from Pass 1!
+  # This handles the case where newer data is stored without version key suffix
+  # but with MVCC-encoded timestamp in the value header.
   for (k, entry) in scanRes.value:
     if isIntentKeyMvcc(k) or isVersionKey(k): continue
-    if not keyVersions.hasKey(k):
-      if mvccTypes.isLikelyMVCCValue(entry.value):
-        try:
-          let mvccVal = mvccTypes.decodeMVCCValue(entry.value)
-          if mvccVal.timestamp <= readTs:
+    if mvccTypes.isLikelyMVCCValue(entry.value):
+      try:
+        let mvccVal = mvccTypes.decodeMVCCValue(entry.value)
+        if mvccVal.timestamp <= readTs:
+          # Compare with existing entry if present - take newer version
+          if not keyVersions.hasKey(k) or mvccVal.timestamp > keyVersions[k].timestamp:
             keyVersions[k] = (mvccVal.data, mvccVal.isDeleted,
                 mvccVal.timestamp)
-        except:
-          keyVersions[k] = (entry.value, false, coreTypes.Timestamp(0))
-      else:
+      except:
+        keyVersions[k] = (entry.value, false, coreTypes.Timestamp(0))
+    else:
+      # Not MVCC-encoded, add as-is (only if not already present)
+      if not keyVersions.hasKey(k):
         keyVersions[k] = (entry.value, false, coreTypes.Timestamp(0))
 
   var results: seq[tuple[key: string, value: string]] = @[]
@@ -821,6 +827,7 @@ proc snapshotScan*(store: MvccTransactionStore,
   if limit > 0 and uint32(results.len) > limit:
     results.setLen(int(limit))
 
+  {.cast(gcsafe).}: echo "[snapshotScan] returning ", results.len, " results"
   return mvccOk(results)
 
 proc getCurrentTimestamp*(store: MvccTransactionStore): coreTypes.Timestamp {.

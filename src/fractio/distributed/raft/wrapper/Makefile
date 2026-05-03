@@ -24,8 +24,8 @@ SRCS := nuraft_shim.cxx
 EXT_SRCS := $(NURAFT_BASE)/thirdparty/NuRaft/examples/in_memory_log_store.cxx
 OBJS := nuraft_shim.o in_memory_log_store.o
 
-# NuRaft library
-NURAFT_LIB := $(NURAFT_BASE)/thirdparty/NuRaft/build/libnuraft.so
+# NuRaft library (located at project root, not build subdir)
+NURAFT_LIB := $(NURAFT_BASE)/thirdparty/NuRaft/libnuraft.so
 
 .PHONY: all clean
 
@@ -33,7 +33,8 @@ all: $(LIB)
 
 $(LIB): $(OBJS)
 	@mkdir -p build
-	$(CXX) -shared -o $@ $^ -L$(NURAFT_BASE)/thirdparty/NuRaft/build -lnuraft -lssl -lcrypto -lpthread -ldl
+	$(CXX) -shared -o $@ $^ -L$(NURAFT_BASE)/thirdparty/NuRaft -lnuraft -lssl -lcrypto -lpthread -ldl \
+		-Wl,-rpath,/home/ingrid/devel/fractio/thirdparty/NuRaft
 
 nuraft_shim.o: nuraft_shim.cxx nuraft_shim.h
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c -o $@ $<

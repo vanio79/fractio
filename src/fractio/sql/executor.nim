@@ -166,6 +166,9 @@ proc decodeSystemTableRecord*(tableId: TableId, rawValue: string, columns: seq[
 
   of SYS_GROUPS_TABLE_NUM:
     let rec = decodeGroupRecord(payload)
+    {.cast(gcsafe).}: echo "[executor] SYS_GROUPS: groupId=", rec.groupId,
+        " replicas.len=", rec.replicas.len, " replicas=", rec.replicas.mapIt(
+        it.nodeId).join(",")
     result = newSeq[string](columns.len)
     for i, col in columns:
       case col.toLowerAscii()

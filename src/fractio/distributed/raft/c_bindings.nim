@@ -4,12 +4,14 @@
 # All business logic (logging, serialization) is in Nim.
 
 const wrapperPath = "src/fractio/distributed/raft/wrapper/build"
-const nuraftPath = "thirdparty/NuRaft/build"
+const nuraftPath = "thirdparty/NuRaft"
 
 {.passL: "-L" & wrapperPath & " -lnuraft_shim".}
 {.passL: "-L" & nuraftPath & " -lnuraft".}
 {.passL: "-lssl -lcrypto -lpthread -ldl -lstdc++".}
-{.passL: "-Wl,-rpath," & wrapperPath & " -Wl,-rpath," & nuraftPath.}
+# Use absolute rpath to ensure local library is found before system library
+{.passL: "-Wl,-rpath,/home/ingrid/devel/fractio/" & wrapperPath &
+    " -Wl,-rpath,/home/ingrid/devel/fractio/" & nuraftPath.}
 {.passC: "-I" & "src/fractio/distributed/raft/wrapper".}
 {.passC: "-I" & "thirdparty/NuRaft/src".}
 
@@ -61,6 +63,19 @@ type
   CancelTimerCb* = proc(ctx: pointer, timerId: int32) {.cdecl.}
     ## Called when NuRaft wants to cancel a timer.
 
+  ConfigChangeCb* = proc(ctx: pointer, serverId: int32,
+      endpoint: cstring): int32 {.cdecl.}
+    ## Called when NuRaft configuration changes (new server added).
+    ## endpoint format: "serverId@host:port" - we parse and update peerInfo.
+    ## Returns 0 on success.
+
+  QuorumUpdateCb* = proc(ctx: pointer, serverId: int32,
+      quorumSize: int32) {.cdecl.}
+    ## Called when quorum should be updated based on new server count.
+    ## quorumSize = majority + 1 = floor(N/2) + 2
+
+# ============================================
+# NuRaft event type constants
 # ============================================
 # NuRaft event type constants
 # ============================================
@@ -100,6 +115,8 @@ proc nuraftParamsSetMaxAppendSize*(params: NuRaftParams,
     size: int32) {.importc: "nuraft_params_set_max_append_size".}
 proc nuraftParamsSetLeadershipTransferMinWaitTime*(params: NuRaftParams,
     ms: int32) {.importc: "nuraft_params_set_leadership_transfer_min_wait_time".}
+proc nuraftParamsSetCustomElectionQuorumSize*(params: NuRaftParams,
+    size: int32) {.importc: "nuraft_params_set_custom_election_quorum_size".}
 
 # ============================================
 # State Machine
@@ -118,7 +135,34 @@ proc nuraftSmLastCommitIndex*(
 proc nuraftSmgrCreate*(myServerId: int32, myEndpoint: cstring,
     numServers: int32, serverIds: ptr int32,
     endpoints: ptr cstring): NuRaftSMgr {.importc: "nuraft_smgr_create".}
+
+proc nuraftSmgrCreateWithCatchingUp*(myServerId: int32, myEndpoint: cstring,
+    numServers: int32, serverIds: ptr int32,
+    endpoints: ptr cstring, catchingUp: bool): NuRaftSMgr
+    {.importc: "nuraft_smgr_create_with_catching_up".}
+  ## Create state manager with catching_up=true to prevent auto-leader promotion
+  ## for joining nodes (single-member clusters should not become leaders).
+
+proc nuraftSmgrCreateWithPersistence*(myServerId: int32, myEndpoint: cstring,
+    numServers: int32, serverIds: ptr int32,
+    endpoints: ptr cstring, catchingUp: bool,
+    stateFilePath: cstring): NuRaftSMgr
+    {.importc: "nuraft_smgr_create_with_persistence".}
+  ## Create state manager with persistent state file.
+  ## The file stores term and voted_for, ensuring restarted nodes
+  ## maintain their term and don't trigger unnecessary elections.
+  ## stateFilePath: path to file for persisting state (e.g., "data/raft_state.bin")
+
 proc nuraftSmgrDestroy*(smgr: NuRaftSMgr) {.importc: "nuraft_smgr_destroy".}
+proc nuraftSmgrSetConfigCb*(smgr: NuRaftSMgr, ctx: pointer,
+    cb: ConfigChangeCb) {.importc: "nuraft_smgr_set_config_cb".}
+  ## Set callback for configuration changes (called when add_srv is committed).
+proc nuraftSmgrSetQuorumCb*(smgr: NuRaftSMgr, ctx: pointer,
+    cb: QuorumUpdateCb) {.importc: "nuraft_smgr_set_quorum_cb".}
+  ## Set callback for quorum updates (called when config changes affect server count).
+proc nuraftSmgrSetRaftServer*(smgr: NuRaftSMgr, server: NuRaftServer)
+  {.importc: "nuraft_smgr_set_raft_server".}
+  ## Set raft server pointer for dynamic state manager (needed for quorum updates).
 
 # ============================================
 # Multiplexed Context
@@ -208,3 +252,6 @@ proc nuraftServerSetPriority*(server: NuRaftServer, srvId: int32,
     priority: int32): int32 {.importc: "nuraft_server_set_priority".}
 proc nuraftServerYieldLeadership*(server: NuRaftServer, immediate: bool,
     successorId: int32) {.importc: "nuraft_server_yield_leadership".}
+proc nuraftServerUpdateQuorum*(server: NuRaftServer, quorumSize: int32)
+  {.importc: "nuraft_server_update_quorum".}
+  ## Dynamically update the election quorum size for a running server.

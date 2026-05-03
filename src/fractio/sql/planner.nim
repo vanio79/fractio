@@ -696,7 +696,13 @@ proc resolveTable*(client: FractioClient,
   let catalogKey = encodeTableKey(SYS_TABLES_TABLE_ID,
       database & "." & schema & "." & tableName)
 
+  {.cast(gcsafe).}: echo "[Nim] resolveTable: catalogKey=", catalogKey
+
   let res = client.kvGet(catalogKey)
+  {.cast(gcsafe).}: echo "[Nim] resolveTable: kvGet res.isOk=", res.isOk,
+      " res.val.isSome=", res.val.isSome
+  if res.isErr:
+    {.cast(gcsafe).}: echo "[Nim] resolveTable: kvGet error=", res.err
   if res.isErr or res.val.isNone:
     return none(TableDescriptor)
 

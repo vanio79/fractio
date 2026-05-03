@@ -20,6 +20,7 @@ import std/times
 import std/typedthreads
 import std/algorithm
 import std/logging
+import std/sequtils
 
 import fractio/core/types as core_types
 import fractio/distributed/raft/c_bindings
@@ -210,22 +211,32 @@ proc deserializeWriteBatch*(data: string): WriteBatch =
 
 proc nuraftCommitCb(ctx: pointer, logIdx: uint64,
     data: cstring, len: csize_t) {.cdecl.} =
-  discard logIdx
+  ## Called by NuRaft when a log entry is committed.
+  ## DEBUG: Log all commit callbacks to trace replication.
+  {.cast(gcsafe).}: echo "[Nim] nuraftCommitCb: logIdx=", logIdx, " groupId=",
+      $cast[NuRaftGroupInstancePtr](ctx).groupId, " len=", len
+
   if ctx == nil or data == nil or len == 0:
+    {.cast(gcsafe).}: echo "[Nim] nuraftCommitCb: EARLY RETURN ctx=", ctx ==
+        nil, " data=", data == nil, " len=", len
     return
 
   let inst = cast[NuRaftGroupInstancePtr](ctx)
   if inst.stopped:
+    {.cast(gcsafe).}: echo "[Nim] nuraftCommitCb: SKIPPED stopped=true"
     return
   let coord = cast[NuRaftCoordinator](inst.coordPtr)
   if coord == nil or coord.kvStorePtr == nil:
+    {.cast(gcsafe).}: echo "[Nim] nuraftCommitCb: SKIPPED coord=", coord == nil,
+        " kvStorePtr=", coord.kvStorePtr == nil
     return
 
   {.cast(gcsafe).}:
     if applyBatchCallback != nil:
+      {.cast(gcsafe).}: echo "[Nim] nuraftCommitCb: CALLING applyBatchCallback"
       applyBatchCallback(coord.kvStorePtr, inst.groupId, data, len.int)
     else:
-      discard
+      {.cast(gcsafe).}: echo "[Nim] nuraftCommitCb: SKIPPED applyBatchCallback=nil"
 
 # ============================================================================
 # NuRaft Event Callback (leader/follower changes)
@@ -233,6 +244,10 @@ proc nuraftCommitCb(ctx: pointer, logIdx: uint64,
 
 proc nuraftEventCb(ctx: pointer, eventType: int32,
     leaderId: int32, term: uint64) {.cdecl, gcsafe.} =
+  ## Called when a node's Raft state changes (becomes leader or follower).
+  ## When a node becomes a follower, `leaderId` contains the new leader's ID.
+  ## This is critical for propagating leadership changes to all nodes, not just
+  ## the new leader itself.
   if ctx == nil: return
 
   {.cast(gcsafe).}:
@@ -242,8 +257,93 @@ proc nuraftEventCb(ctx: pointer, eventType: int32,
     if coord == nil: return
 
     if eventType == NuRaftBecomeLeader:
+      # This node became leader - notify with our own nodeId
       if onLeaderChanged != nil and coord.kvStorePtr != nil:
         onLeaderChanged(coord.kvStorePtr, inst.groupId, coord.nodeId)
+    elif eventType == NuRaftBecomeFollower:
+      # This node became follower - `leaderId` is the new leader
+      # This is critical: followers learn about new leaders here
+      if leaderId > 0 and onLeaderChanged != nil and coord.kvStorePtr != nil:
+        onLeaderChanged(coord.kvStorePtr, inst.groupId, group_types.NodeID(leaderId))
+
+# ============================================================================
+# Config Change Callback (called when NuRaft cluster config changes)
+# ============================================================================
+
+proc nuraftConfigChangeCb(ctx: pointer, serverId: int32,
+    endpoint: cstring): int32 {.cdecl, gcsafe.} =
+  ## Called when NuRaft configuration changes (e.g., add_srv is committed).
+  ## The endpoint format is "serverId@host:port" - we parse it and update peerInfo.
+  ## This is critical for follower nodes to learn about new peers.
+  if ctx == nil or endpoint == nil:
+    {.cast(gcsafe).}: echo "[Nim] nuraftConfigChangeCb: ctx or endpoint is nil"
+    return -1
+
+  let inst = cast[NuRaftGroupInstancePtr](ctx)
+  if inst.stopped:
+    {.cast(gcsafe).}: echo "[Nim] nuraftConfigChangeCb: instance is stopped"
+    return -1
+
+  let coord = cast[NuRaftCoordinator](inst.coordPtr)
+  if coord == nil:
+    {.cast(gcsafe).}: echo "[Nim] nuraftConfigChangeCb: coordinator is nil"
+    return -1
+
+  # Parse endpoint format: "serverId@host:port"
+  let endpointStr = $endpoint
+  {.cast(gcsafe).}: echo "[Nim] nuraftConfigChangeCb: serverId=" & $serverId &
+      " endpoint=" & endpointStr
+
+  let atPos = endpointStr.find('@')
+  if atPos < 0:
+    {.cast(gcsafe).}: echo "[Nim] nuraftConfigChangeCb: no @ in endpoint"
+    return -1
+
+  let hostPort = endpointStr[atPos + 1 ..< endpointStr.len]
+  let colonPos = hostPort.find(':')
+  if colonPos < 0:
+    {.cast(gcsafe).}: echo "[Nim] nuraftConfigChangeCb: no : in hostPort"
+    return -1
+
+  let host = hostPort[0 ..< colonPos]
+  let portStr = hostPort[colonPos + 1 ..< hostPort.len]
+  let port = parseInt(portStr)
+
+  # Update peerInfo table
+  withLock coord.groupsLock:
+    coord.peerInfo[uint32(serverId)] = (host, port)
+
+  {.cast(gcsafe).}: echo "[Nim] nuraftConfigChangeCb: updated peerInfo[" &
+      $serverId & "] = (" & host & ", " & $port & ")"
+  return 0
+
+# ============================================================================
+# Quorum Update Callback (called when cluster config changes server count)
+# ============================================================================
+
+proc nuraftQuorumUpdateCb(ctx: pointer, serverId: int32,
+    quorumSize: int32) {.cdecl, gcsafe.} =
+  ## Called when NuRaft config changes and quorum needs to be updated.
+  ## This ensures election quorum is correct after add_srv commits.
+  ## quorumSize = majority + 1 = floor(N/2) + 2 (the value to set in custom_election_quorum_size)
+  if ctx == nil:
+    {.cast(gcsafe).}: echo "[Nim] nuraftQuorumUpdateCb: ctx is nil"
+    return
+
+  let inst = cast[NuRaftGroupInstancePtr](ctx)
+  if inst.stopped:
+    {.cast(gcsafe).}: echo "[Nim] nuraftQuorumUpdateCb: instance is stopped"
+    return
+
+  if inst.server.isNil:
+    {.cast(gcsafe).}: echo "[Nim] nuraftQuorumUpdateCb: server is nil"
+    return
+
+  {.cast(gcsafe).}: echo "[Nim] nuraftQuorumUpdateCb: serverId=" & $serverId &
+      " quorumSize=" & $quorumSize & " (actual quorum=" & $(quorumSize - 1) & ")"
+
+  # Update the quorum on the running server
+  nuraftServerUpdateQuorum(inst.server, quorumSize)
 
 # ============================================================================
 # Send Callback (called from C++ when NuRaft wants to send a message)
@@ -252,19 +352,84 @@ proc nuraftEventCb(ctx: pointer, eventType: int32,
 proc multiplexedSendCb(ctx: pointer, groupIdBytes: cstring, srcNodeId: int32,
     dstNodeId: int32, msgData: cstring, msgLen: csize_t): int32 {.cdecl, gcsafe.} =
   if ctx == nil or msgData == nil or msgLen == 0:
+    {.cast(gcsafe).}: echo "[Nim] multiplexedSendCb: ctx/msgData nil or msgLen=0"
     return -1
 
   let inst = cast[NuRaftGroupInstancePtr](ctx)
   if inst.stopped:
+    {.cast(gcsafe).}: echo "[Nim] multiplexedSendCb: instance stopped"
     return -1
 
   let coord = cast[NuRaftCoordinator](inst.coordPtr)
   if coord == nil or coord.transport == nil:
+    {.cast(gcsafe).}: echo "[Nim] multiplexedSendCb: coord or transport nil"
     return -1
 
   # Use the instance's groupId (C++ passes a placeholder of zeros)
   let groupId = inst.groupId
   let ulid = groupIDToULID(groupId)
+
+  # Debug: print groupId being sent
+  var gidHex = ""
+  for i in 12..<16:
+    gidHex.add(toHex(ulid.data[i], 2))
+  {.cast(gcsafe).}: echo "[Nim] multiplexedSendCb: inst.groupId=" & gidHex &
+      " src=" & $srcNodeId & " dst=" & $dstNodeId
+
+  # Decode message type for debugging (first 4 bytes of serialized message)
+  # NuRaft uses buffer_serializer which serializes integers in native byte order
+  # (little-endian on x86). We need to read as little-endian.
+  # Message types from NuRaft (see msg_type.hxx) - enum values start at 1:
+  # 1 = request_vote_request, 2 = request_vote_response
+  # 3 = append_entries_request (heartbeat FROM leader)
+  # 4 = append_entries_response (response FROM follower)
+  # 16 = install_snapshot_request
+  # 17 = install_snapshot_response
+  # etc.
+  var msgType = -1
+  if msgLen >= 4:
+    # Little-endian: first byte is LSB
+    let b0 = int(msgData[0])
+    let b1 = int(msgData[1])
+    let b2 = int(msgData[2])
+    let b3 = int(msgData[3])
+    msgType = b0 or (b1 shl 8) or (b2 shl 16) or (b3 shl 24)
+
+  # Use a table for lookup since NuRaft enum values start at 1 and have gaps
+  const MsgTypeTable: array[1..29, string] = [
+    "request_vote_request",        # 1
+    "request_vote_response",       # 2
+    "append_entries_request",      # 3 - heartbeat FROM leader
+    "append_entries_response",     # 4 - response FROM follower
+    "client_request",              # 5
+    "add_server_request",          # 6
+    "add_server_response",         # 7
+    "remove_server_request",       # 8
+    "remove_server_response",      # 9
+    "sync_log_request",            # 10
+    "sync_log_response",           # 11
+    "join_cluster_request",        # 12
+    "join_cluster_response",       # 13
+    "leave_cluster_request",       # 14
+    "leave_cluster_response",      # 15
+    "install_snapshot_request",    # 16
+    "install_snapshot_response",   # 17
+    "ping_request",                # 18
+    "ping_response",               # 19
+    "pre_vote_request",            # 20
+    "pre_vote_response",           # 21
+    "other_request",               # 22
+    "other_response",              # 23
+    "priority_change_request",     # 24
+    "priority_change_response",    # 25
+    "reconnect_request",           # 26
+    "reconnect_response",          # 27
+    "custom_notification_request", # 28
+    "custom_notification_response" # 29
+  ]
+  var msgTypeName = "unknown(" & $msgType & ")"
+  if msgType >= MsgTypeTable.low and msgType <= MsgTypeTable.high:
+    msgTypeName = MsgTypeTable[msgType]
 
   # Look up peer info
   var peerHost = ""
@@ -273,9 +438,19 @@ proc multiplexedSendCb(ctx: pointer, groupIdBytes: cstring, srcNodeId: int32,
   withLock coord.groupsLock:
     if coord.peerInfo.hasKey(uint32(dstNodeId)):
       (peerHost, peerPort) = coord.peerInfo[uint32(dstNodeId)]
+    else:
+      {.cast(gcsafe).}: echo "[Nim] multiplexedSendCb: peerInfo missing for dstNodeId=" &
+          $dstNodeId & " msgType=" & msgTypeName & " peerInfo keys=" &
+              $coord.peerInfo.keys.toSeq
 
   if peerHost == "":
+    {.cast(gcsafe).}: echo "[Nim] multiplexedSendCb: peerHost empty for dstNodeId=" &
+        $dstNodeId & " msgType=" & msgTypeName
     return -1
+
+  {.cast(gcsafe).}: echo "[Nim] multiplexedSendCb: src=" & $srcNodeId &
+      " dst=" & $dstNodeId & " msgType=" & msgTypeName & " -> " & peerHost &
+          ":" & $peerPort
 
   # Build frame: magic(4) + groupId(16) + length(4) + payload
   const RaftMagic = 0x52414654'u32
@@ -352,11 +527,18 @@ proc multiplexedScheduleTimerCb(ctx: pointer, timerId: int32,
       let expireNs = nowNs + delayMs.int64 * 1_000_000
       # Use (timerId, ctx) as key to avoid collisions between groups
       gActiveTimers[(timerId: timerId, rpcCtx: ctx)] = (expireNs: expireNs)
+      # Log timer scheduling (timerId 1 is typically election timer, 2 is heartbeat)
+      {.cast(gcsafe).}: echo "[Nim] scheduleTimerCb: timerId=" & $timerId &
+          " delayMs=" & $delayMs & " ctx=" & $cast[int](ctx)
 
 proc multiplexedCancelTimerCb(ctx: pointer, timerId: int32) {.cdecl, gcsafe.} =
   {.cast(gcsafe).}:
     withLock gTimerLock:
-      gActiveTimers.del((timerId: timerId, rpcCtx: ctx))
+      let key = (timerId: timerId, rpcCtx: ctx)
+      let hadTimer = gActiveTimers.hasKey(key)
+      gActiveTimers.del(key)
+      echo "[Nim] cancelTimerCb: timerId=" & $timerId & " ctx=" & $cast[int](
+          ctx) & " hadTimer=" & $hadTimer
 
 proc registerValidContext(ctx: pointer) =
   ## Register a context as valid for timer invocation.
@@ -391,20 +573,35 @@ proc cancelAllTimersForContext(ctx: pointer) =
 
 # Timer thread that polls for expired timers and invokes them
 proc timerThreadProc() {.thread, gcsafe.} =
+  echo "[Nim] timerThreadProc: thread STARTED"
+  var pollCount = 0
   while gTimerThreadRunning.load(moRelaxed):
     sleep(5) # 5ms poll interval
+    pollCount += 1
 
     # Collect expired timers under lock
     var expiredTimers: seq[tuple[timerId: int32, rpcCtx: pointer]] = @[]
     var activeTimerCount = 0
+    var detailsToLog: seq[string] = @[]
     {.cast(gcsafe).}:
       withLock gTimerLock:
         let nowNs = int64(getTime().toUnixFloat() * 1_000_000_000)
         activeTimerCount = gActiveTimers.len
+        # Log active timer count periodically (every 40 polls = ~200ms)
+        if pollCount mod 40 == 0:
+          echo "[Nim] timerThreadProc: poll #" & $pollCount &
+              " activeTimerCount=" & $activeTimerCount
+          for key, entry in gActiveTimers:
+            let remainingMs = (entry.expireNs - nowNs) / 1_000_000
+            echo "[Nim] timerThreadProc: active timer timerId=" & $key.timerId &
+              " ctx=" & $cast[int](key.rpcCtx) & " remainingMs=" &
+                  $remainingMs.int
         # Collect all expired timers
         for key, entry in gActiveTimers:
           if entry.expireNs <= nowNs:
             expiredTimers.add(key)
+            echo "[Nim] timerThreadProc: timer EXPIRED timerId=" &
+                $key.timerId & " ctx=" & $cast[int](key.rpcCtx)
         # Delete expired timers
         for key in expiredTimers:
           gActiveTimers.del(key)
@@ -414,20 +611,28 @@ proc timerThreadProc() {.thread, gcsafe.} =
     for item in expiredTimers:
       # Check if context is still valid before invoking
       if not isValidContext(item.rpcCtx):
+        echo "[Nim] timerThreadProc: timer SKIPPED (invalid context) timerId=" & $item.timerId
         continue
       try:
+        {.cast(gcsafe).}: echo "[Nim] timerThreadProc: invoking timer timerId=" & $item.timerId
         let rpcCtx = cast[MultiplexedContext](item.rpcCtx)
         discard nuraftMpInvokeTimer(rpcCtx, item.timerId)
       except:
+        echo "[Nim] timerThreadProc: EXCEPTION invoking timer timerId=" & $item.timerId
         discard
+  echo "[Nim] timerThreadProc: thread STOPPED"
 
 proc startTimerThread() =
   {.cast(gcsafe).}:
     withLock gTimerLock:
       inc gTimerThreadRefCount
+      echo "[Nim] startTimerThread: refCount=" & $gTimerThreadRefCount &
+          " running=" & $gTimerThreadRunning.load(moRelaxed)
       if not gTimerThreadRunning.load(moRelaxed):
         gTimerThreadRunning.store(true)
+        echo "[Nim] startTimerThread: creating timer thread"
         createThread(gTimerThread, timerThreadProc)
+        echo "[Nim] startTimerThread: thread created"
 
 proc stopTimerThread() =
   {.cast(gcsafe).}:
@@ -489,6 +694,14 @@ proc deliverMessageToGroup(c: NuRaftCoordinator, groupId: GroupID,
   if not c.running.load(moRelaxed):
     return
 
+  # Debug: print groupId being delivered (last 4 bytes of ULID)
+  let gidUlid = groupIDToULID(groupId)
+  var gidHex = ""
+  for i in 12..<16:
+    gidHex.add(toHex(gidUlid.data[i], 2))
+  {.cast(gcsafe).}: echo "[Nim] deliverMessageToGroup: groupId=" & gidHex &
+      " msgLen=" & $msgLen
+
   var shouldBuffer = false
   var inst: NuRaftGroupInstancePtr
 
@@ -507,8 +720,16 @@ proc deliverMessageToGroup(c: NuRaftCoordinator, groupId: GroupID,
       shouldBuffer = true
 
   if shouldBuffer:
+    {.cast(gcsafe).}: echo "[Nim] deliverMessageToGroup: BUFFERING groupId=" & gidHex
     bufferMessage(c, groupId, msgData, msgLen)
   elif inst != nil:
+    # Debug: show instance's groupId
+    let instGidUlid = groupIDToULID(inst.groupId)
+    var instGidHex = ""
+    for i in 12..<16:
+      instGidHex.add(toHex(instGidUlid.data[i], 2))
+    {.cast(gcsafe).}: echo "[Nim] deliverMessageToGroup: INST groupId=" &
+        instGidHex & " rpcContext=" & $cast[int](inst.rpcContext)
     # Deliver message using the new API
     # IMPORTANT: msgData is binary data, must copy with explicit length (not $cstring)
     var binaryMsg = newString(msgLen.int)
@@ -870,19 +1091,37 @@ proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
     freeInstance(inst)
     return false
 
-  # Create state manager
+  # Determine if we're a joining node (not the preferred leader)
+  # For SINGLE-MEMBER clusters only, use catching_up=true to prevent auto-leader
+  # promotion. For multi-member clusters, we need election timers enabled so
+  # nodes can participate in failover when the leader dies.
+  # IMPORTANT: catching_up=true disables election_timer_allowed, preventing
+  # the node from starting elections even when heartbeats stop!
+  let isJoiningNode = (preferredLeader > 0'u32 and
+                       preferredLeader != uint32(c.nodeId))
+  let useCatchingUp = isJoiningNode and members.len == 1
+
+  # Create state manager with persistence
+  # State file stores term and voted_for to ensure restarted nodes
+  # maintain their term and don't trigger unnecessary elections.
+  let stateFilePath = c.dataDir & "/raft_state_" & $groupId & ".bin"
   var cServerIds = newSeq[int32](members.len)
   var cEndpoints = newSeq[cstring](members.len)
   for i in 0 ..< members.len:
     cServerIds[i] = serverIds[i]
     cEndpoints[i] = cstring(endpoints[i])
 
-  inst.smgr = nuraftSmgrCreate(
+  {.cast(gcsafe).}: echo "[Nim] createAndStartGroup: creating smgr with persistence, path=",
+      stateFilePath, " catching_up=", useCatchingUp, " members=", members.len
+
+  inst.smgr = nuraftSmgrCreateWithPersistence(
     int32(c.nodeId.uint32),
     cstring(myEndpoint),
     int32(members.len),
     addr cServerIds[0],
-    addr cEndpoints[0]
+    addr cEndpoints[0],
+    useCatchingUp,
+    cstring(stateFilePath)
   )
 
   if inst.smgr.isNil:
@@ -891,6 +1130,10 @@ proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
     cleanupOnFailure()
     freeInstance(inst)
     return false
+
+  # Set config change callback so followers learn about new peers
+  # when add_srv is committed
+  nuraftSmgrSetConfigCb(inst.smgr, cast[pointer](inst), nuraftConfigChangeCb)
 
   # Create raft params
   # Use standard NuRaft election timeouts with random jitter.
@@ -906,6 +1149,25 @@ proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
   nuraftParamsSetClientReqTimeout(params, 5000)
   nuraftParamsSetMaxAppendSize(params, 100)
   nuraftParamsSetLeadershipTransferMinWaitTime(params, 1000)
+
+  # Set proper election quorum: majority = floor(N/2) + 1
+  # NuRaft's default get_quorum_for_election() uses num_voting_members / 2,
+  # which gives 1 for a 3-node cluster (wrong!). We need majority quorum.
+  #
+  # NuRaft's pre-vote uses election_quorum_size = get_quorum_for_election() + 1
+  # For pre-vote to succeed, we need:
+  #   election_quorum_size = majorityQuorum (so dead >= majorityQuorum triggers vote)
+  # This means get_quorum_for_election() = majorityQuorum - 1
+  # And custom_election_quorum_size = get_quorum_for_election() + 1 = majorityQuorum
+  #
+  # For 3 nodes: majorityQuorum = 2, custom = 2
+  # Then get_quorum_for_election() = 2 - 1 = 1
+  # And election_quorum_size = 1 + 1 = 2 ✓
+  #
+# For pre-vote: dead = 2 (self + surviving node) >= election_quorum_size = 2 ✓
+  let majorityQuorum = int32(members.len div 2 + 1)
+  let quorumSize = majorityQuorum # Fixed: was majorityQuorum + 1 (too high)
+  nuraftParamsSetCustomElectionQuorumSize(params, quorumSize)
 
   # Create per-group RPC context
   inst.rpcContext = nuraftMpContextCreate(
@@ -961,6 +1223,10 @@ proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
   let skipInitialElection = (preferredLeader > 0'u32 and
                              preferredLeader != uint32(c.nodeId))
 
+  {.cast(gcsafe).}: echo "[Nim] createAndStartGroup: groupId=" & $groupId &
+      " nodeId=" & $c.nodeId & " preferredLeader=" & $preferredLeader &
+      " skipInitialElection=" & $skipInitialElection & " members=" & $members.len
+
   # Create raft server with multiplexed context
   inst.server = nuraftServerCreate(
     inst.rpcContext,
@@ -987,6 +1253,10 @@ proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
     cleanupOnFailure()
     freeInstance(inst)
     return false
+
+  # Set the quorum update callback so quorum is dynamically updated
+  # when servers are added/removed via add_srv
+  nuraftSmgrSetQuorumCb(inst.smgr, cast[pointer](inst), nuraftQuorumUpdateCb)
 
   # Mark this instance as ready BEFORE delivering buffered messages
   # This ensures new messages arriving during delivery won't be double-buffered

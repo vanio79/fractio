@@ -550,6 +550,189 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
     sendHtml(Http200, html)
     return fut
 
+  # ---- REST: List nodes ----
+  if path == "/api/nodes" and httpMethod == HttpGet:
+    ## Get list of cluster nodes as JSON array.
+    ## Used by integration tests to verify cluster membership.
+    let srv = getSrv()
+    if srv.isNil:
+      sendJson(Http503, %* {"error": "server not ready"})
+      return fut
+    var nodesJson: seq[JsonNode] = @[]
+    # Query nodes from sys.nodes table
+    var nodesResult: ExecResult
+    {.cast(gcsafe).}:
+      nodesResult = getClient().query("SELECT * FROM sys.nodes")
+    case nodesResult.kind
+    of erkRows:
+      for row in nodesResult.rows:
+        # Columns: _key, nodeId, host, raftPort, clientPort, webPort, status
+        var nodeObj = newJObject()
+        if row.len >= 2:
+          nodeObj["nodeId"] = %row[1]
+        if row.len >= 3:
+          nodeObj["host"] = %row[2]
+        if row.len >= 4:
+          nodeObj["raftPort"] = %row[3]
+        if row.len >= 5:
+          nodeObj["clientPort"] = %row[4]
+        if row.len >= 6:
+          nodeObj["webPort"] = %row[5]
+        if row.len >= 7:
+          nodeObj["status"] = %row[6]
+        else:
+          nodeObj["status"] = %"alive"
+        nodesJson.add(nodeObj)
+    of erkStreamingRows:
+      let iter = nodesResult.streamIterator
+      while iter.hasNextRow():
+        let rowOpt = iter.nextRow()
+        if rowOpt.isSome:
+          let row = rowOpt.get()
+          var nodeObj = newJObject()
+          if row.len >= 2:
+            nodeObj["nodeId"] = %row[1]
+          if row.len >= 3:
+            nodeObj["host"] = %row[2]
+          if row.len >= 4:
+            nodeObj["raftPort"] = %row[3]
+          if row.len >= 5:
+            nodeObj["clientPort"] = %row[4]
+          if row.len >= 6:
+            nodeObj["webPort"] = %row[5]
+          if row.len >= 7:
+            nodeObj["status"] = %row[6]
+          else:
+            nodeObj["status"] = %"alive"
+          nodesJson.add(nodeObj)
+      iter.closeIterator()
+    of erkError:
+      sendJson(Http500, %* {"error": nodesResult.error})
+      return fut
+    else:
+      discard
+    sendJson(Http200, %* nodesJson)
+    return fut
+
+  # ---- REST: Cluster join ----
+  if path == "/api/cluster/join" and httpMethod == HttpPost:
+    ## Handle join request from a new node wanting to join the cluster.
+    ## The joining node sends its nodeId, host, raftPort, clientPort, webPort.
+    ## This node (leader) adds the new node as a Raft peer and returns
+    ## all cluster members so the joining node can add them too.
+    {.cast(gcsafe).}: echo "[dashboard] === JOIN REQUEST RECEIVED ==="
+    {.cast(gcsafe).}: echo "[dashboard] path=", path, " method=", httpMethod
+    let srv = getSrv()
+    {.cast(gcsafe).}: echo "[dashboard] srv.isNil=", srv.isNil
+    if srv.isNil:
+      sendJson(Http503, %* {"success": false, "error": "server not ready"})
+      return fut
+    let bodyOpt = req.body()
+    if bodyOpt.isNone:
+      sendJson(Http400, %* {"success": false, "error": "missing body"})
+      return fut
+    let contentType = getHeader(req, "Content-Type")
+    var newNodeId: int
+    var newHost: string
+    var newRaftPort: int
+    var newClientPort: int
+    var newWebPort: int
+    if contentType.contains("application/json"):
+      try:
+        let j = parseJson(bodyOpt.get())
+        newNodeId = j.getOrDefault("nodeId").getInt(0)
+        newHost = j.getOrDefault("host").getStr("")
+        newRaftPort = j.getOrDefault("raftPort").getInt(0)
+        newClientPort = j.getOrDefault("clientPort").getInt(0)
+        newWebPort = j.getOrDefault("webPort").getInt(0)
+      except JsonParsingError:
+        sendJson(Http400, %* {"success": false, "error": "invalid JSON"})
+        return fut
+    else:
+      let formData = parseFormData(bodyOpt.get())
+      try:
+        newNodeId = parseInt(formData.getOrDefault("nodeId"))
+        newHost = formData.getOrDefault("host")
+        newRaftPort = parseInt(formData.getOrDefault("raftPort"))
+        newClientPort = parseInt(formData.getOrDefault("clientPort"))
+        newWebPort = parseInt(formData.getOrDefault("webPort"))
+      except ValueError:
+        sendJson(Http400, %* {"success": false, "error": "invalid numeric value"})
+        return fut
+    if newNodeId <= 0 or newHost == "" or newRaftPort <= 0:
+      sendJson(Http400, %* {"success": false, "error": "missing required fields"})
+      return fut
+    {.cast(gcsafe).}: echo "[dashboard] Parsed join request: nodeId=", newNodeId,
+        " host=", newHost, " raftPort=", newRaftPort,
+        " clientPort=", newClientPort, " webPort=", newWebPort
+    # Add the new node as a Raft peer and insert into sys.nodes
+    {.cast(gcsafe).}: echo "[dashboard] Calling addPeerToRaft..."
+    {.cast(gcsafe).}:
+      srv.addPeerToRaft(uint32(newNodeId), newHost, newRaftPort, newClientPort, newWebPort)
+    {.cast(gcsafe).}: echo "[dashboard] addPeerToRaft completed"
+    # Build list of all cluster members to return
+    var membersJson: seq[JsonNode] = @[]
+    # Query nodes from sys.nodes table
+    var nodesResult: ExecResult
+    {.cast(gcsafe).}:
+      nodesResult = getClient().query("SELECT * FROM sys.nodes")
+    case nodesResult.kind
+    of erkRows:
+      for row in nodesResult.rows:
+        if row.len >= 4:
+          let nodeId = try: parseInt(row[1]) except: 0
+          if nodeId > 0:
+            let raftPort = try: parseInt(row[3]) except: 0
+            let clientPort = try: parseInt(row[4]) except: 0
+            let webPort = if row.len >= 6: (try: parseInt(row[5]) except: 0) else: 0
+            membersJson.add(%* {
+              "nodeId": nodeId,
+              "host": row[2],
+              "raftPort": raftPort,
+              "clientPort": clientPort,
+              "webPort": webPort
+            })
+    of erkStreamingRows:
+      let iter = nodesResult.streamIterator
+      while iter.hasNextRow():
+        let rowOpt = iter.nextRow()
+        if rowOpt.isSome:
+          let row = rowOpt.get()
+          if row.len >= 4:
+            let nodeId = try: parseInt(row[1]) except: 0
+            if nodeId > 0:
+              let raftPort = try: parseInt(row[3]) except: 0
+              let clientPort = try: parseInt(row[4]) except: 0
+              let webPort = if row.len >= 6: (try: parseInt(row[5]) except: 0) else: 0
+              membersJson.add(%* {
+                "nodeId": nodeId,
+                "host": row[2],
+                "raftPort": raftPort,
+                "clientPort": clientPort,
+                "webPort": webPort
+              })
+      iter.closeIterator()
+    else:
+      discard
+    # Get the current leader to pass as preferred leader for joining node
+    # If no leader yet (election in progress), use this node's ID
+    # since this node is the one adding the new member
+    var leaderId = 0
+    {.cast(gcsafe).}:
+      if srv.raftCoord != nil:
+        leaderId = srv.raftCoord.getLeader(system_tables.META_GROUP_ID)
+        if leaderId <= 0:
+          # No leader elected yet, use this node's ID as preferred leader
+          # This node called addServerToGroup, so it will be the leader
+          leaderId = srv.config.serverId.int
+    sendJson(Http200, %* {
+      "success": true,
+      "message": "node " & $newNodeId & " joined cluster",
+      "members": membersJson,
+      "preferredLeader": leaderId
+    })
+    return fut
+
   # ---- REST: Health check ----
   if path == "/api/health" and httpMethod == HttpGet:
     ## Health check endpoint for tests and monitoring.

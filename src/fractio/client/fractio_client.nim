@@ -219,16 +219,16 @@ proc fetchNodesTable(client: FractioClient, conn: ProtocolClient): bool =
 
   withLock client.lock:
     for pair in scanRes.value.pairs:
-      # Use MVCC decoder
-      let (nodeRec, isDeleted) = decodeNodeRecordFromMVCC(pair.value)
-      if not isDeleted:
-        client.nodes[nodeRec.nodeId] = NodeInfo(
-          nodeId: nodeRec.nodeId,
-          host: nodeRec.host,
-          clientPort: nodeRec.clientPort,
-          status: nodeRec.status,
-          client: nil # Will be created on-demand
-        )
+      # Server already stripped MVCC header - use direct decoder
+      let nodeRec = decodeNodeRecord(pair.value)
+      # Always add to cache (server filters out deleted entries)
+      client.nodes[nodeRec.nodeId] = NodeInfo(
+        nodeId: nodeRec.nodeId,
+        host: nodeRec.host,
+        clientPort: nodeRec.clientPort,
+        status: nodeRec.status,
+        client: nil # Will be created on-demand
+      )
 
   return true
 
@@ -243,19 +243,19 @@ proc fetchGroupsTable(client: FractioClient, conn: ProtocolClient): bool =
 
   withLock client.lock:
     for pair in scanRes.value.pairs:
-      # Use MVCC decoder
-      let (groupRec, isDeleted) = decodeGroupRecordFromMVCC(pair.value)
-      if not isDeleted:
-        var replicaNodeIds: seq[uint32] = @[]
-        for rep in groupRec.replicas:
-          replicaNodeIds.add(rep.nodeId)
+      # Server already stripped MVCC header - use direct decoder
+      let groupRec = decodeGroupRecord(pair.value)
+      # Always add to cache (server filters out deleted entries)
+      var replicaNodeIds: seq[uint32] = @[]
+      for rep in groupRec.replicas:
+        replicaNodeIds.add(rep.nodeId)
 
-        client.groups[groupIDFromULID(groupRec.groupId)] = GroupInfo(
-          groupId: groupIDFromULID(groupRec.groupId),
-          spaceId: groupRec.spaceId,
-          leaderNodeId: groupRec.leader,
-          replicaNodeIds: replicaNodeIds
-        )
+      client.groups[groupIDFromULID(groupRec.groupId)] = GroupInfo(
+        groupId: groupIDFromULID(groupRec.groupId),
+        spaceId: groupRec.spaceId,
+        leaderNodeId: groupRec.leader,
+        replicaNodeIds: replicaNodeIds
+      )
 
   return true
 
@@ -270,14 +270,14 @@ proc fetchTablesTable(client: FractioClient, conn: ProtocolClient): bool =
 
   withLock client.lock:
     for pair in scanRes.value.pairs:
-      # Use MVCC decoder
-      let (tableRec, isDeleted) = decodeTableRecordFromMVCC(pair.value)
-      if not isDeleted:
-        client.tables[tableRec.tableId] = TableInfo(
-          tableId: tableRec.tableId,
-          name: tableRec.name,
-          spaceId: tableRec.spaceId
-        )
+      # Server already stripped MVCC header - use direct decoder
+      let tableRec = decodeTableRecord(pair.value)
+      # Always add to cache (server filters out deleted entries)
+      client.tables[tableRec.tableId] = TableInfo(
+        tableId: tableRec.tableId,
+        name: tableRec.name,
+        spaceId: tableRec.spaceId
+      )
 
   return true
 
@@ -292,16 +292,16 @@ proc fetchSpacesTable(client: FractioClient, conn: ProtocolClient): bool =
 
   withLock client.lock:
     for pair in scanRes.value.pairs:
-      # Use MVCC decoder
-      let (spaceRec, isDeleted) = decodeSpaceRecordFromMVCC(pair.value)
-      if not isDeleted:
-        client.spaces[spaceRec.spaceId] = SpaceInfo(
-          spaceId: spaceRec.spaceId,
-          name: spaceRec.name,
-          groupIds: spaceRec.groupIds,
-          oldGroupIds: spaceRec.oldGroupIds,
-          rebalancing: spaceRec.rebalancing
-        )
+      # Server already stripped MVCC header - use direct decoder
+      let spaceRec = decodeSpaceRecord(pair.value)
+      # Always add to cache (server filters out deleted entries)
+      client.spaces[spaceRec.spaceId] = SpaceInfo(
+        spaceId: spaceRec.spaceId,
+        name: spaceRec.name,
+        groupIds: spaceRec.groupIds,
+        oldGroupIds: spaceRec.oldGroupIds,
+        rebalancing: spaceRec.rebalancing
+      )
 
   return true
 
@@ -377,12 +377,17 @@ proc getGroupLeaderConnection*(client: FractioClient, groupId: GroupID): Option[
   ## Get a connection to the leader of a specific group.
   ## Uses cached leader info, falls back to trying all replicas.
 
+  {.cast(gcsafe).}: echo "[Nim] getGroupLeaderConnection: groupId=", groupId
+
   withLock client.lock:
     # Check if we have cached group info
     if groupId notin client.groups:
+      {.cast(gcsafe).}: echo "[Nim] getGroupLeaderConnection: groupId not in client.groups"
       return none(ProtocolClient)
 
     let groupInfo = client.groups[groupId]
+    {.cast(gcsafe).}: echo "[Nim] getGroupLeaderConnection: leaderNodeId=",
+        groupInfo.leaderNodeId, " replicas=", groupInfo.replicaNodeIds.len
 
     # If we know the leader and have a connection, use it
     if groupInfo.leaderNodeId != 0:
@@ -390,22 +395,33 @@ proc getGroupLeaderConnection*(client: FractioClient, groupId: GroupID): Option[
       if groupId in client.leaderConnections:
         let cached = client.leaderConnections[groupId]
         if cached != nil and cached.connected.load(moRelaxed):
+          {.cast(gcsafe).}: echo "[Nim] getGroupLeaderConnection: using cached connection"
           return some(cached)
 
       # Try to connect to leader (use internal version since we hold the lock)
+      {.cast(gcsafe).}: echo "[Nim] getGroupLeaderConnection: trying to connect to leader nodeId=",
+          groupInfo.leaderNodeId
       let connOpt = client.getNodeConnectionInternal(groupInfo.leaderNodeId)
       if connOpt.isSome:
         client.leaderConnections[groupId] = connOpt.get()
+        {.cast(gcsafe).}: echo "[Nim] getGroupLeaderConnection: connected to leader nodeId=",
+            groupInfo.leaderNodeId
         return connOpt
+      {.cast(gcsafe).}: echo "[Nim] getGroupLeaderConnection: leader connection FAILED nodeId=",
+          groupInfo.leaderNodeId
+      # Leader connection failed - fall through to try replicas
 
-    # Leader unknown - try all replicas until we find one that works
+    # Leader unknown or connection to known leader failed - try all replicas
+    {.cast(gcsafe).}: echo "[Nim] getGroupLeaderConnection: trying replicas"
     for nodeId in groupInfo.replicaNodeIds:
       let connOpt = client.getNodeConnectionInternal(nodeId)
       if connOpt.isSome:
+        {.cast(gcsafe).}: echo "[Nim] getGroupLeaderConnection: connected to replica nodeId=", nodeId
         # We'll try this connection; if it's not the leader,
         # the operation will fail and we'll retry
         return connOpt
 
+  {.cast(gcsafe).}: echo "[Nim] getGroupLeaderConnection: returning none"
   return none(ProtocolClient)
 
 proc invalidateGroupLeader*(client: FractioClient, groupId: GroupID) =
@@ -499,7 +515,7 @@ method get*(client: FractioClient, key: string,
   const maxRetries = 100
   const baseBackoffMs = 50
 
-  # Try multiple times (in case of leader changes)
+  # Try multiple times (in case of leader changes or connection failures)
   for attempt in 0 ..< maxRetries:
     let connOpt = client.getGroupLeaderConnection(groupId)
     if connOpt.isNone:
@@ -525,6 +541,15 @@ method get*(client: FractioClient, key: string,
       if attempt < maxRetries - 1:
         sleep(baseBackoffMs + attempt * 5)
       continue
+
+    # Handle connection failures (peInternal) - invalidate connection and retry
+    if res.error.kind == peInternal:
+      # Invalidate the cached connection for this group
+      client.invalidateGroupLeader(groupId)
+      if attempt < maxRetries - 1:
+        discard client.refreshMetadata()
+        sleep(baseBackoffMs + attempt * 5)
+        continue
 
     return kvOpErr[Option[string]](res.error.msg)
 
