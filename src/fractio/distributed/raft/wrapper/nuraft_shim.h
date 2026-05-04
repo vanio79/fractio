@@ -70,6 +70,12 @@ void nuraft_params_set_max_append_size(void* params, int32_t size);
 void nuraft_params_set_leadership_transfer_min_wait_time(void* params, int32_t ms);
 
 // =============================================================================
+// Limits (global settings)
+// =============================================================================
+
+void nuraft_limits_set_busy_connection_limit(int32_t limit);
+
+// =============================================================================
 // State Machine
 // =============================================================================
 

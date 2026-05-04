@@ -2679,13 +2679,14 @@ proc updateSpaceRecord*(store: RaftKVStoreExt, space: SpaceInfo): bool {.gcsafe,
     createdAtNs: 0'i64, # Not tracked in SpaceInfo
   )
   let encoded = encode(spaceRec)
-  # Update in-memory cache immediately
-  acquire(store.spacesMu)
-  store.spaces[space.spaceId] = space
-  release(store.spacesMu)
-  # Write to Raft
-  discard store.sysTablePut(spaceKey, encoded)
-  result = true
+  # Write to Raft first (before updating cache)
+  let writeOk = store.sysTablePut(spaceKey, encoded)
+  if writeOk:
+    # Update in-memory cache only after successful Raft write
+    acquire(store.spacesMu)
+    store.spaces[space.spaceId] = space
+    release(store.spacesMu)
+  result = writeOk
 
 proc rebalanceSpaces*(store: RaftKVStoreExt) {.raises: [].} =
   ## Check all spaces and initiate rebalancing for any space whose group count
@@ -3031,7 +3032,10 @@ proc rebalanceSpaces*(store: RaftKVStoreExt) {.raises: [].} =
           rebalanceHeartbeat: 0,
           rebalanceCursor: "",
         )
-        discard store.updateSpaceRecord(space)
+        if not store.updateSpaceRecord(space):
+          {.cast(raises: []).}:
+            {.cast(gcsafe).}:
+              echo "[rebalanceSpaces] WARNING: failed to update space record for ", spaceId
       except:
         discard
 
@@ -3069,7 +3073,12 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: SpaceID) {.raises: [
     let nowSecs = getTime().toUnix()
     space.rebalanceWorker = myNodeId
     space.rebalanceHeartbeat = nowSecs
-    discard store.updateSpaceRecord(space)
+    if not store.updateSpaceRecord(space):
+      # Cannot claim worker role - not the leader or Raft issue
+      {.cast(raises: []).}:
+        {.cast(gcsafe).}:
+          echo "[runRebalanceMigration] ERROR: failed to claim worker role for space ", spaceId
+      return
     # Note: Don't call loadSpaces() here - it would read stale data from backend
     # before raftPut completes. The in-memory cache is already updated by updateSpaceRecord.
 
@@ -3218,7 +3227,10 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: SpaceID) {.raises: [
 
             space.rebalanceCursor = k
             space.rebalanceHeartbeat = curNow
-            discard store.updateSpaceRecord(space)
+            if not store.updateSpaceRecord(space):
+              {.cast(raises: []).}:
+                {.cast(gcsafe).}:
+                  echo "[runRebalanceMigration] WARNING: failed to update cursor/heartbeat for space ", spaceId
             # Note: Don't call loadSpaces() here - it would read stale data
             lastHeartbeat = curNow
         except:
@@ -3241,13 +3253,18 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: SpaceID) {.raises: [
       if coord.hasGroup(oldGid):
         coord.removeGroup(oldGid)
 
-    # Clear rebalance state (in-memory cache was already updated by updateSpaceRecord)
+    # Clear rebalance state
     space.oldGroupIds = @[]
     space.rebalancing = false
     space.rebalanceWorker = 0
     space.rebalanceHeartbeat = 0
     space.rebalanceCursor = ""
-    discard store.updateSpaceRecord(space)
+    if not store.updateSpaceRecord(space):
+      # Raft write failed - cannot clear rebalance state
+      {.cast(raises: []).}:
+        {.cast(gcsafe).}:
+          echo "[runRebalanceMigration] ERROR: failed to clear rebalance state for space ", spaceId
+      return
     # Verify state was updated
     {.cast(raises: []).}:
       {.cast(gcsafe).}:

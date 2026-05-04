@@ -24,6 +24,13 @@ import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/group_types
 import fractio/distributed/raft/multigroup_types
 
+# Import NuRaft shim to disable busy_connection_limit during tests
+import fractio/distributed/raft/c_bindings
+
+# Disable busy_connection_limit to prevent NuRaft system_exit(-22) during test shutdown
+# When peers are disconnected during coordinator.stop(), NuRaft would otherwise call system_exit
+nuraftLimitsSetBusyConnectionLimit(0)
+
 # Helper for tests: create a deterministic test table ID
 var testTableIdCounter {.global.} = 0
 proc testTableId(): TableId =

@@ -1076,6 +1076,18 @@ void nuraft_params_set_custom_election_quorum_size(void* params, int32_t size) {
 }
 
 // =============================================================================
+// Limits (global settings)
+// =============================================================================
+
+void nuraft_limits_set_busy_connection_limit(int32_t limit) {
+    // Get current limits, modify busy_connection_limit, and set back
+    raft_server::limits current = raft_server::get_raft_limits();
+    current.busy_connection_limit_ = limit;
+    raft_server::set_raft_limits(current);
+    fprintf(stderr, "[NuRaft Shim] Set busy_connection_limit to %d\n", limit);
+}
+
+// =============================================================================
 // State Machine
 // =============================================================================
 

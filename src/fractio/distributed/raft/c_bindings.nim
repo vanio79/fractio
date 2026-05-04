@@ -119,6 +119,16 @@ proc nuraftParamsSetCustomElectionQuorumSize*(params: NuRaftParams,
     size: int32) {.importc: "nuraft_params_set_custom_election_quorum_size".}
 
 # ============================================
+# Limits (global settings)
+# ============================================
+
+proc nuraftLimitsSetBusyConnectionLimit*(limit: int32)
+    {.importc: "nuraft_limits_set_busy_connection_limit".}
+  ## Set the busy connection limit for NuRaft.
+  ## When set to 0, disables the system_exit(-22) behavior during connection failures.
+  ## This is useful during tests where shutdown causes expected connection failures.
+
+# ============================================
 # State Machine
 # ============================================
 

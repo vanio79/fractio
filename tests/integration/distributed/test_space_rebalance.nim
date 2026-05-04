@@ -36,6 +36,15 @@ import fractio/distributed/space_manager
 # Import optimized test configuration
 import ../../test_config
 
+# Import NuRaft shim to disable busy_connection_limit during tests
+# This prevents system_exit(-22) during shutdown when peers are disconnected
+import fractio/distributed/raft/c_bindings
+
+# Disable busy_connection_limit to prevent NuRaft system_exit(-22) during test shutdown
+# When peers are disconnected during stopCluster, NuRaft would otherwise call system_exit
+# after 20 connection failures, causing the next test to fail
+nuraftLimitsSetBusyConnectionLimit(0)
+
 
 
 # ---------------------------------------------------------------------------
