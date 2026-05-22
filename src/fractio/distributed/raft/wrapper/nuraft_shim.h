@@ -68,6 +68,8 @@ void nuraft_params_set_reserved_log_items(void* params, int32_t count);
 void nuraft_params_set_client_req_timeout(void* params, int32_t ms);
 void nuraft_params_set_max_append_size(void* params, int32_t size);
 void nuraft_params_set_leadership_transfer_min_wait_time(void* params, int32_t ms);
+void nuraft_params_set_custom_election_quorum_size(void* params, int32_t size);
+void nuraft_params_set_auto_adjust_quorum(void* params, int32_t enable);
 
 // =============================================================================
 // Limits (global settings)
@@ -194,6 +196,18 @@ int nuraft_server_remove_srv(void* server, int32_t srv_id);
 int nuraft_server_set_priority(void* server, int32_t srv_id, int32_t priority);
 void nuraft_server_yield_leadership(void* server, bool immediate, int32_t successor_id);
 void nuraft_server_update_quorum(void* server, int32_t quorum_size);
+
+// Peer info (for checking if preferred leader is online and caught-up)
+typedef struct {
+    uint64_t last_log_idx;
+    uint64_t last_succ_resp_us;  // microseconds since last successful response
+    int32_t  exists;
+} nuraft_peer_info;
+
+int32_t nuraft_server_get_peer_info(void* server, int32_t peer_id, nuraft_peer_info* out_info);
+
+// Get the number of servers in the current cluster config (peers + self).
+int32_t nuraft_server_get_server_count(void* server);
 
 #ifdef __cplusplus
 }

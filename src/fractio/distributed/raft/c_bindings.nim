@@ -117,6 +117,8 @@ proc nuraftParamsSetLeadershipTransferMinWaitTime*(params: NuRaftParams,
     ms: int32) {.importc: "nuraft_params_set_leadership_transfer_min_wait_time".}
 proc nuraftParamsSetCustomElectionQuorumSize*(params: NuRaftParams,
     size: int32) {.importc: "nuraft_params_set_custom_election_quorum_size".}
+proc nuraftParamsSetAutoAdjustQuorum*(params: NuRaftParams,
+    enable: int32) {.importc: "nuraft_params_set_auto_adjust_quorum".}
 
 # ============================================
 # Limits (global settings)
@@ -264,4 +266,20 @@ proc nuraftServerYieldLeadership*(server: NuRaftServer, immediate: bool,
     successorId: int32) {.importc: "nuraft_server_yield_leadership".}
 proc nuraftServerUpdateQuorum*(server: NuRaftServer, quorumSize: int32)
   {.importc: "nuraft_server_update_quorum".}
+
+# Peer info
+
+type
+  NuRaftPeerInfo* = object
+    lastLogIdx*: uint64
+    lastSuccRespUs*: uint64
+    exists*: int32
+
+proc nuraftServerGetPeerInfo*(server: NuRaftServer, peerId: int32,
+    outInfo: ptr NuRaftPeerInfo): int32
+  {.importc: "nuraft_server_get_peer_info".}
   ## Dynamically update the election quorum size for a running server.
+
+proc nuraftServerGetServerCount*(server: NuRaftServer): int32
+  {.importc: "nuraft_server_get_server_count".}
+  ## Get the number of servers in the current cluster config (peers + self).

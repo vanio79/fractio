@@ -563,13 +563,169 @@ proc sendError(conn: ClientConnection, requestId: uint32,
 # Leader redirect helpers
 # ---------------------------------------------------------------------------
 
+proc lookupNodeFromKVStore(server: ProtocolServer,
+    nodeId: uint32): tuple[host: string, clientPort: uint16] {.gcsafe.} =
+  ## Look up a node's host and client port from the local sys.nodes KV store.
+  ## Returns empty string and 0 port if not found.
+  try:
+    if server.raftStore == nil:
+      return
+    let backend = server.raftStore.getBackend()
+    if backend == nil or not backend.isOpen:
+      return
+    let nodeKey = encodeTableKey(SYS_NODES_TABLE_ID, $nodeId)
+    let valOpt = backend.get(nodeKey)
+    if valOpt.isNone:
+      return
+    var nodeVal = valOpt.get()
+    # Strip MVCC encoding if present
+    if mvccValueTypes.isLikelyMVCCValue(nodeVal):
+      let mvccVal = mvccValueTypes.decodeMVCCValueFast(nodeVal)
+      if not mvccVal.isDeleted:
+        nodeVal = mvccVal.data
+    let nodeRec = system_schemas.decodeNodeRecord(nodeVal)
+    result.host = nodeRec.host
+    result.clientPort = nodeRec.clientPort
+  except Exception:
+    discard
+
 proc getLeaderRedirect(server: ProtocolServer,
     groupId: GroupID): LeaderRedirect {.gcsafe, raises: [].} =
   ## Get leader redirect info for a group.
-  ## Simplified: returns empty redirect. Client will refresh metadata to find leader.
-  ## This removes the complexity of server-side leader tracking which can be stale.
-  discard groupId
-  LeaderRedirect(leaderId: 0)
+  ## Queries the Raft coordinator for the current leader and returns
+  ## the leader's node ID, host, and client port so the client can
+  ## connect directly instead of retrying through followers.
+  ##
+  ## If this node doesn't have the group (not a member), falls back to
+  ## looking up the group's replicas from sys.groups and redirecting to
+  ## the first replica, which can forward the request to the actual leader.
+  if server.raftCoord == nil or not server.raftCoord.running.load():
+    return LeaderRedirect(leaderId: 0)
+
+  let leaderId = server.raftCoord.getLeader(groupId)
+  if leaderId > 0:
+    let nodeId = uint32(leaderId)
+
+    # Look up the leader's host and client port from multiple sources
+    var leaderHost = ""
+    var leaderClientPort = uint16(0)
+
+    # 1. Try node registry first (in-memory, fast)
+    if server.nodeRegistry != nil:
+      withLock server.nodeRegistry.mu:
+        try:
+          if uint16(nodeId) in server.nodeRegistry.nodes:
+            let entry = server.nodeRegistry.nodes[uint16(nodeId)]
+            leaderHost = entry.host
+            leaderClientPort = entry.clientPort
+        except KeyError:
+          discard
+
+    # 2. Try sys.nodes table from local KV store (slower, but always up-to-date)
+    if leaderClientPort == 0:
+      let (kvHost, kvClientPort) = server.lookupNodeFromKVStore(nodeId)
+      if kvClientPort > 0:
+        leaderHost = kvHost
+        leaderClientPort = kvClientPort
+
+    # 3. Fall back to peerInfo from the Raft coordinator (host only, no client port)
+    if leaderHost.len == 0 and server.raftCoord.peerInfo.len > 0:
+      withLock server.raftCoord.groupsLock:
+        try:
+          if nodeId in server.raftCoord.peerInfo:
+            let (peerHost, _) = server.raftCoord.peerInfo[nodeId]
+            leaderHost = peerHost
+        except KeyError:
+          discard
+
+    if leaderHost.len == 0:
+      # Return just the leader ID without host/port
+      return LeaderRedirect(leaderId: nodeId)
+
+    LeaderRedirect(
+      leaderId: nodeId,
+      leaderHost: leaderHost,
+      leaderClientPort: leaderClientPort
+    )
+  else:
+    # This node doesn't know the leader for this group (either it's not
+    # a member, or no leader has been elected yet). Try to find a replica
+    # node from sys.groups so the client can connect to a group member.
+    if server.raftStore != nil:
+      let gidStr = $groupId
+      let key = encodeTableKey(SYS_GROUPS_TABLE_ID, gidStr)
+      let getRes = server.raftStore.raftGet(key)
+      if getRes.isOk and getRes.value.isSome:
+        try:
+          let data = getRes.value.get().value
+          var groupRec: GroupRecord
+          # Handle MVCC-encoded data
+          var payload = data
+          if mvccValueTypes.isLikelyMVCCValue(payload):
+            try:
+              let mvccVal = mvccValueTypes.decodeMVCCValue(payload)
+              if not mvccVal.isDeleted:
+                payload = mvccVal.data
+              else:
+                return LeaderRedirect(leaderId: 0)
+            except CatchableError:
+              discard
+          groupRec = decodeGroupRecord(payload)
+          # Find a replica to redirect to, preferring nodes OTHER than this one.
+          # Redirecting to the same node that doesn't have the group would
+          # create an infinite retry loop.
+          if groupRec.replicas.len > 0:
+            var replicaNodeId = uint32(0)
+            let myNodeId = uint32(server.config.serverId)
+            # First try a replica that is NOT this node
+            for rep in groupRec.replicas:
+              if rep.nodeId != myNodeId:
+                replicaNodeId = rep.nodeId
+                break
+            # Fall back to the first replica if all are this node (shouldn't happen)
+            if replicaNodeId == 0:
+              replicaNodeId = groupRec.replicas[0].nodeId
+            var replicaHost = ""
+            var replicaClientPort = uint16(0)
+
+            # Look up the replica's address
+            if server.nodeRegistry != nil:
+              withLock server.nodeRegistry.mu:
+                try:
+                  if uint16(replicaNodeId) in server.nodeRegistry.nodes:
+                    let entry = server.nodeRegistry.nodes[uint16(replicaNodeId)]
+                    replicaHost = entry.host
+                    replicaClientPort = entry.clientPort
+                except KeyError:
+                  discard
+
+            if replicaClientPort == 0:
+              let (kvHost, kvClientPort) = server.lookupNodeFromKVStore(replicaNodeId)
+              if kvClientPort > 0:
+                replicaHost = kvHost
+                replicaClientPort = kvClientPort
+
+            if replicaHost.len == 0 and server.raftCoord.peerInfo.len > 0:
+              withLock server.raftCoord.groupsLock:
+                try:
+                  if replicaNodeId in server.raftCoord.peerInfo:
+                    let (peerHost, _) = server.raftCoord.peerInfo[replicaNodeId]
+                    replicaHost = peerHost
+                except KeyError:
+                  discard
+
+            if replicaHost.len > 0 and replicaClientPort > 0:
+              return LeaderRedirect(
+                leaderId: replicaNodeId,
+                leaderHost: replicaHost,
+                leaderClientPort: replicaClientPort
+              )
+            elif replicaHost.len > 0:
+              return LeaderRedirect(leaderId: replicaNodeId)
+        except CatchableError:
+          discard
+
+    LeaderRedirect(leaderId: 0)
 
 proc sendNotLeaderError(conn: ClientConnection, requestId: uint32,
     msg: string, redirect: LeaderRedirect) {.gcsafe, raises: [].} =
@@ -765,6 +921,23 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
     if req.key.len == 0 or req.key.len > int(server.config.maxKeyBytes):
       sendError(conn, requestId, ErrProtocol, ErrCatKV, "invalid key length")
       return
+
+    # Enforce leader-only reads for linearizability.
+    # Use isWriteReady (not just isLeader) to ensure the leader has committed
+    # its no-op entry and the state machine is up to date. Without this,
+    # a newly elected leader may serve stale reads before it has caught up.
+    if not server.raftStore.isNil and server.raftStore.coordinator != nil:
+      # Use the client-provided groupId if present (GroupRouted flag),
+      # otherwise resolve from the key. During rebalancing, the client
+      # routes reads to old groups but the server's resolveGroupId would
+      # return new groups — causing a routing mismatch and infinite retries.
+      let groupId = if req.groupId != ZeroGroupID(): req.groupId
+                    else: server.getGroupIdForKey(req.key)
+      if not server.raftStore.coordinator.isWriteReady(groupId):
+        let redirect = server.getLeaderRedirect(groupId)
+        sendNotLeaderError(conn, requestId, "not leader for group", redirect)
+        return
+
     # Transactional read: register the key as read by the transaction manager
     if not isZero(req.txnId):
       if not server.mvccStore.isNil:
@@ -876,13 +1049,15 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
           if res.error.msg.contains("not the leader") or
              res.error.msg.contains("Not the leader") or
              res.error.msg.contains("Raft append failed (code -3)"):
-            let groupId = server.getGroupIdForKey(req.key)
+            let groupId = if req.groupId != ZeroGroupID(): req.groupId
+                         else: server.getGroupIdForKey(req.key)
             let redirect = server.getLeaderRedirect(groupId)
             sendNotLeaderError(conn, requestId, res.error.msg, redirect)
           elif res.error.msg.contains("Group not found"):
             # Group not found - node doesn't have this group (topology change)
             # Return not leader error to trigger retry on different node
-            let groupId = server.getGroupIdForKey(req.key)
+            let groupId = if req.groupId != ZeroGroupID(): req.groupId
+                         else: server.getGroupIdForKey(req.key)
             let redirect = server.getLeaderRedirect(groupId)
             sendNotLeaderError(conn, requestId, res.error.msg, redirect)
           else:
@@ -906,13 +1081,15 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
           if res.error.msg.contains("not the leader") or
              res.error.msg.contains("Not the leader") or
              res.error.msg.contains("Raft append failed (code -3)"):
-            let groupId = server.getGroupIdForKey(req.key)
+            let groupId = if req.groupId != ZeroGroupID(): req.groupId
+                         else: server.getGroupIdForKey(req.key)
             let redirect = server.getLeaderRedirect(groupId)
             sendNotLeaderError(conn, requestId, res.error.msg, redirect)
           elif res.error.msg.contains("Group not found"):
             # Group not found - node doesn't have this group (topology change)
             # Return not leader error to trigger retry on different node
-            let groupId = server.getGroupIdForKey(req.key)
+            let groupId = if req.groupId != ZeroGroupID(): req.groupId
+                         else: server.getGroupIdForKey(req.key)
             let redirect = server.getLeaderRedirect(groupId)
             sendNotLeaderError(conn, requestId, res.error.msg, redirect)
           else:
@@ -947,12 +1124,14 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
         else:
           # Check for "not leader" error and return appropriate error code
           if res.error.msg.contains("not the leader") or res.error.msg.contains("Not the leader"):
-            let groupId = server.getGroupIdForKey(req.key)
+            let groupId = if req.groupId != ZeroGroupID(): req.groupId
+                         else: server.getGroupIdForKey(req.key)
             let redirect = server.getLeaderRedirect(groupId)
             sendNotLeaderError(conn, requestId, res.error.msg, redirect)
           elif res.error.msg.contains("Group not found"):
             # Group not found - node doesn't have this group (topology change)
-            let groupId = server.getGroupIdForKey(req.key)
+            let groupId = if req.groupId != ZeroGroupID(): req.groupId
+                         else: server.getGroupIdForKey(req.key)
             let redirect = server.getLeaderRedirect(groupId)
             sendNotLeaderError(conn, requestId, res.error.msg, redirect)
           else:
@@ -971,12 +1150,14 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
         else:
           # Check for "not leader" error and return appropriate error code
           if res.error.msg.contains("not the leader") or res.error.msg.contains("Not the leader"):
-            let groupId = server.getGroupIdForKey(req.key)
+            let groupId = if req.groupId != ZeroGroupID(): req.groupId
+                         else: server.getGroupIdForKey(req.key)
             let redirect = server.getLeaderRedirect(groupId)
             sendNotLeaderError(conn, requestId, res.error.msg, redirect)
           elif res.error.msg.contains("Group not found"):
             # Group not found - node doesn't have this group (topology change)
-            let groupId = server.getGroupIdForKey(req.key)
+            let groupId = if req.groupId != ZeroGroupID(): req.groupId
+                         else: server.getGroupIdForKey(req.key)
             let redirect = server.getLeaderRedirect(groupId)
             sendNotLeaderError(conn, requestId, res.error.msg, redirect)
           else:
@@ -1058,6 +1239,16 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
       sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
       return
     let req = reqR.value
+
+    # Reject scans routed to a specific group if this node is not the leader.
+    # Prevents stale/partial reads from followers when the client falls back
+    # to replicas after a leader connection failure.
+    if req.groupId != ZeroGroupID() and not server.raftCoord.isNil:
+      if not server.raftCoord.isLeader(req.groupId):
+        let redirect = server.getLeaderRedirect(req.groupId)
+        sendNotLeaderError(conn, requestId,
+            "not the leader for group " & $req.groupId, redirect)
+        return
 
     if not server.mvccStore.isNil:
       let res = if not isZero(req.txnId):
@@ -1357,6 +1548,12 @@ proc handleBuiltinAdmin(server: ProtocolServer, conn: ClientConnection,
 # ---------------------------------------------------------------------------
 # Built-in Cluster Admin handlers (JoinNode, RemoveNode, ListNodes, RebalanceStatus)
 # ---------------------------------------------------------------------------
+
+# Forward declaration (addPeerToRaft is defined after handleBuiltinCluster
+# but the RejoinNode handler needs to call it)
+proc addPeerToRaft*(server: ProtocolServer, peerNodeId: uint32,
+                   host: string, raftPort: int, clientPort: int = 0,
+                   webPort: int = 0) {.gcsafe.}
 
 proc handleBuiltinCluster(server: ProtocolServer, conn: ClientConnection,
     requestId: uint32, flags: uint16,
@@ -1673,6 +1870,15 @@ proc handleBuiltinCluster(server: ProtocolServer, conn: ClientConnection,
         nuraftMembers.add((nodeId: uint32(m.nodeId),
                            host: m.host,
                            port: int(m.raftPort)))
+        # Also add to node registry for correct leader redirect info
+        if server.nodeRegistry != nil and m.clientPort > 0:
+          server.nodeRegistry.addNode(ClusterNodeEntry(
+            nodeId: m.nodeId,
+            host: m.host,
+            raftPort: m.raftPort,
+            clientPort: m.clientPort,
+            status: clusterMsgs.NodeStatusActive
+          ))
 
     # If no members in request, look up the group record from sys.groups
     if nuraftMembers.len == 0:
@@ -1743,6 +1949,98 @@ proc handleBuiltinCluster(server: ProtocolServer, conn: ClientConnection,
       )
 
     sendFrame(conn, clusterMsgs.encodeJoinGroupResponse(resp), requestId)
+
+  of uint16(mtFindMetaLeader):
+    # Any node can answer this — return who we think the meta leader is
+    var resp: clusterMsgs.FindMetaLeaderResponse
+    if not server.raftCoord.isNil and server.raftCoord.running.load():
+      let leaderId = server.raftCoord.getLeader(META_GROUP_ID)
+      if leaderId > 0:
+        resp.leaderKnown = true
+        resp.leaderNodeId = uint16(leaderId)
+        # Look up host and client port
+        let redirect = server.getLeaderRedirect(META_GROUP_ID)
+        resp.leaderHost = redirect.leaderHost
+        resp.leaderClientPort = redirect.leaderClientPort
+    sendFrame(conn, clusterMsgs.encodeFindMetaLeaderResponse(resp), requestId)
+
+  of uint16(mtRejoinNode):
+    # Meta-leader-only operation: re-add a returning node to all its groups
+    let reqR = clusterMsgs.decodeRejoinNodeRequest(payload)
+    if reqR.isErr:
+      sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
+      return
+    let req = reqR.value
+
+    # Only the meta leader can process rejoin requests
+    if server.raftCoord.isNil or not server.raftCoord.isLeader(META_GROUP_ID):
+      let redirect = server.getLeaderRedirect(META_GROUP_ID)
+      sendNotLeaderError(conn, requestId,
+          "not the meta leader, cannot process rejoin", redirect)
+      return
+
+    var resp: clusterMsgs.RejoinNodeResponse
+    try:
+      # Re-add the node via addPeerToRaft (handles add_srv + JoinGroup RPCs)
+      server.addPeerToRaft(
+        uint32(req.nodeId),
+        req.host,
+        int(req.raftPort),
+        clientPort = int(req.clientPort),
+        webPort = 0
+      )
+      # Collect all groups this node is now a member of
+      var rejoinedGroups: seq[string] = @[]
+      withLock server.raftCoord.groupsLock:
+        for gid, inst in server.raftCoord.groups:
+          # Convert GroupID to 16-byte ULID binary string (safe for null bytes)
+          let ulid = groupIDToULID(gid)
+          rejoinedGroups.add(ulidToBytes(ulid))
+      resp = clusterMsgs.RejoinNodeResponse(
+        success: true,
+        groupIds: rejoinedGroups
+      )
+    except Exception as e:
+      resp = clusterMsgs.RejoinNodeResponse(
+        success: false,
+        error: "rejoin failed: " & e.msg
+      )
+    sendFrame(conn, clusterMsgs.encodeRejoinNodeResponse(resp), requestId)
+
+  of uint16(mtAddServerToGroup):
+    # Forward add_srv to the group leader (called by meta leader when it's not
+    # the leader of a specific group).
+    let reqR = clusterMsgs.decodeAddServerToGroupRequest(payload)
+    if reqR.isErr:
+      sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
+      return
+    let req = reqR.value
+    var resp: clusterMsgs.AddServerToGroupResponse
+    try:
+      let groupId = groupIDFromBytes(req.groupId)
+      if server.raftCoord.isNil:
+        resp = clusterMsgs.AddServerToGroupResponse(
+          success: false, error: "coordinator not initialized")
+      elif not server.raftCoord.hasGroup(groupId):
+        resp = clusterMsgs.AddServerToGroupResponse(
+          success: false, error: "group not found on this node")
+      elif not server.raftCoord.isLeader(groupId):
+        let redirect = server.getLeaderRedirect(groupId)
+        resp = clusterMsgs.AddServerToGroupResponse(
+          success: false,
+          error: "not the leader of group, leader is " & $redirect.leaderId)
+      else:
+        let rc = server.raftCoord.addServerToGroup(
+          groupId, uint32(req.serverId), req.host, int(req.raftPort))
+        if rc >= 0:
+          resp = clusterMsgs.AddServerToGroupResponse(success: true)
+        else:
+          resp = clusterMsgs.AddServerToGroupResponse(
+            success: false, error: "add_srv returned " & $rc)
+    except Exception as e:
+      resp = clusterMsgs.AddServerToGroupResponse(
+        success: false, error: "exception: " & e.msg)
+    sendFrame(conn, clusterMsgs.encodeAddServerToGroupResponse(resp), requestId)
 
   else:
     sendError(conn, requestId, ErrProtocol, ErrCatSystem,
@@ -1905,13 +2203,10 @@ proc saveClusterState*(server: ProtocolServer) =
   ## Persist current cluster membership to disk so a restarted node can
   ## rejoin as a follower without requiring --join.
   ## Uses binary serialization for efficiency.
-  echo "[DEBUG saveClusterState] dataDir=" & server.config.dataDir
   if server.config.dataDir == "":
-    echo "[DEBUG saveClusterState] dataDir is empty, skipping"
     return
   let coord = server.raftCoord
   if coord.isNil:
-    echo "[DEBUG saveClusterState] coord is nil, skipping"
     return
 
   # Build persisted cluster state
@@ -1924,15 +2219,23 @@ proc saveClusterState*(server: ProtocolServer) =
   )
 
   for nid, info in coord.peerInfo:
-    state.peers[nid] = (host: info.host, port: info.port)
+    # Look up client port from node registry or sys.nodes KV store
+    var peerClientPort = 0
+    if server.nodeRegistry != nil:
+      withLock server.nodeRegistry.mu:
+        if uint16(nid) in server.nodeRegistry.nodes:
+          peerClientPort = int(server.nodeRegistry.nodes[uint16(
+              nid)].clientPort)
+    if peerClientPort == 0:
+      let (_, kvPort) = server.lookupNodeFromKVStore(nid)
+      if kvPort > 0:
+        peerClientPort = int(kvPort)
+    state.peers[nid] = (host: info.host, port: info.port,
+        clientPort: peerClientPort)
 
-  echo "[DEBUG saveClusterState] peers.len=" & $state.peers.len & " path=" &
-      server.clusterStatePath
   try:
     saveClusterStateToFile(state, server.clusterStatePath)
-    echo "[DEBUG saveClusterState] saved successfully"
-  except CatchableError as e:
-    echo "[DEBUG saveClusterState] error: " & e.msg
+  except CatchableError:
     discard
 
 proc loadClusterStateFromBinary(dataDir: string): Option[
@@ -1957,52 +2260,111 @@ proc addPeerToRaft*(server: ProtocolServer, peerNodeId: uint32,
   let coord = server.raftCoord
   if coord.isNil: return
 
+  # Only the meta leader should drive peer addition; followers return immediately.
+  if not coord.isLeader(META_GROUP_ID):
+    # Still register peer info so this node knows about the new peer
+    coord.peerInfo[peerNodeId] = (host: host, port: raftPort)
+    return
+
   # Register peer info for future group creation
   coord.peerInfo[peerNodeId] = (host: host, port: raftPort)
 
-  # Add the peer as a server to the meta and default data groups only
-  # CRITICAL: We must be the leader for each group to add servers.
-  # META_GROUP leader is established immediately (single-node election).
-  # DATA_GROUP may still be electing - wait for leadership before adding.
+  # Also add to the node registry so redirect info includes correct client port
+  if server.nodeRegistry != nil and clientPort > 0:
+    server.nodeRegistry.addNode(ClusterNodeEntry(
+      nodeId: uint16(peerNodeId),
+      host: host,
+      raftPort: uint16(raftPort),
+      clientPort: uint16(clientPort),
+      webPort: uint16(webPort),
+      status: clusterMsgs.NodeStatusActive
+    ))
+
+  # Add the peer as a server to the meta and default data groups.
+  # CRITICAL: The data group leader may not be elected yet (election timeout
+  # 300-600ms). Retry up to 3 times with a short delay to avoid silently
+  # skipping the data group addition.
   discard coord.addServerToGroup(META_GROUP_ID, peerNodeId, host, raftPort)
-
-  # Wait for DATA_GROUP leadership before calling addServerToGroup
-  # (add_srv requires the caller to be leader, returns NOT_LEADER otherwise)
-  const maxWaitMs = 5000
-  const pollIntervalMs = 100
-  var waited = 0
-  {.cast(gcsafe).}: echo "[addPeerToRaft] Waiting for DATA_GROUP leadership before addServerToGroup..."
-  while not coord.isLeader(DATA_GROUP_START_ID) and waited < maxWaitMs:
-    os.sleep(pollIntervalMs)
-    waited += pollIntervalMs
-  if coord.isLeader(DATA_GROUP_START_ID):
-    {.cast(gcsafe).}: echo "[addPeerToRaft] DATA_GROUP leadership established after ",
-        waited, " ms"
-    discard coord.addServerToGroup(DATA_GROUP_START_ID, peerNodeId, host, raftPort)
-  else:
-    {.cast(gcsafe).}: echo "[addPeerToRaft] WARNING: DATA_GROUP leadership not established after ",
-        maxWaitMs, " ms"
-
-  # CRITICAL: Send JoinGroup RPCs to the joining node for META and DATA groups.
-  # The joining node created single-member groups at startup (main.nim lines 324-328).
-  # Those groups are separate from the leader's groups and need to be merged.
-  # The JoinGroup RPC tells the joining node to replace its single-member instance
-  # with a proper multi-member instance that can participate in Raft.
+  for attempt in 0 .. 2:
+    if coord.isLeader(DATA_GROUP_START_ID):
+      let dataRc = coord.addServerToGroup(DATA_GROUP_START_ID, peerNodeId,
+          host, raftPort)
+      break
+    else:
+      let dataLeaderId = coord.getLeader(DATA_GROUP_START_ID)
+      if dataLeaderId > 0:
+        # Forward add_srv to the data group leader
+        let dataLeaderInfo = coord.peerInfo.getOrDefault(uint32(dataLeaderId),
+            (host: "", port: 0))
+        if dataLeaderInfo.host.len > 0 and dataLeaderInfo.port > 0:
+          var dataLeaderClientPort = 0
+          # Look up client port from node registry or KV store
+          if server.nodeRegistry != nil:
+            withLock server.nodeRegistry.mu:
+              if uint16(dataLeaderId) in server.nodeRegistry.nodes:
+                dataLeaderClientPort = int(
+                    server.nodeRegistry.nodes[uint16(dataLeaderId)].clientPort)
+          if dataLeaderClientPort == 0:
+            let (kvHost, kvPort) = server.lookupNodeFromKVStore(
+                uint32(dataLeaderId))
+            if kvPort > 0:
+              dataLeaderClientPort = int(kvPort)
+          if dataLeaderClientPort > 0:
+            try:
+              let cfg = ClientConfig(
+                host: dataLeaderInfo.host,
+                port: dataLeaderClientPort,
+                timeoutMs: 5000
+              )
+              let pc = newProtocolClient(cfg)
+              let cr = pc.connect()
+              if cr.isOk:
+                defer: pc.disconnect()
+                let groupUlid = groupIDToULID(DATA_GROUP_START_ID)
+                let groupIdBytes = ulidToBytes(groupUlid)
+                let addSrvReq = clusterMsgs.AddServerToGroupRequest(
+                  groupId: groupIdBytes,
+                  serverId: uint16(peerNodeId),
+                  host: host,
+                  raftPort: uint16(raftPort)
+                )
+                let addSrvResp = pc.addServerToGroup(addSrvReq)
+                if addSrvResp.isOk and addSrvResp.value.success:
+                  break
+            except CatchableError:
+              discard
+        break # data leader exists but we can't forward - don't retry
+      # No data group leader yet, wait and retry
+      sleep(200)
 
   # Build members list from peerInfo - includes all known cluster members
   var members: seq[clusterMsgs.CreateGroupMember] = @[]
   for (nodeId, peerData) in coord.peerInfo.pairs:
-    # For clientPort, look up from sys.nodes if available, otherwise use raftPort + 100
-    var memberClientPort = peerData.port + 100         # default convention
+    # Look up the correct client port from the node registry or KV store.
+    # peerData.port is the RAFT port, NOT the client port — deriving it
+    # as raft+100 is wrong because the mapping is config-dependent.
+    var memberClientPort = uint16(0)
     if nodeId == peerNodeId:
-      memberClientPort = clientPort # use the provided clientPort for joining node
+      memberClientPort = uint16(clientPort)
     elif nodeId == uint32(server.config.serverId):
-      memberClientPort = server.config.port # this node's clientPort
+      memberClientPort = uint16(server.config.port)
+    else:
+      # Try node registry first (fast, in-memory)
+      if server.nodeRegistry != nil:
+        withLock server.nodeRegistry.mu:
+          if uint16(nodeId) in server.nodeRegistry.nodes:
+            memberClientPort = server.nodeRegistry.nodes[uint16(
+                nodeId)].clientPort
+      # Fall back to sys.nodes KV store
+      if memberClientPort == 0:
+        let (kvHost, kvPort) = server.lookupNodeFromKVStore(nodeId)
+        if kvPort > 0:
+          memberClientPort = kvPort
     members.add(clusterMsgs.CreateGroupMember(
       nodeId: uint16(nodeId),
       host: peerData.host,
       raftPort: uint16(peerData.port),
-      clientPort: uint16(memberClientPort)
+      clientPort: memberClientPort
     ))
 
   # Send JoinGroup RPCs for both system groups
@@ -2022,9 +2384,20 @@ proc addPeerToRaft*(server: ProtocolServer, peerNodeId: uint32,
       members: members
     )
 
-    # Connect to the joining node's client port and send JoinGroup RPC
-    # Use the clientPort provided in the join request (raftPort + 100 by convention)
-    let targetClientPort = if clientPort > 0: clientPort else: raftPort + 100
+    # Determine client port for connecting to the joining node
+    var targetClientPort = clientPort
+    if targetClientPort == 0 and server.nodeRegistry != nil:
+      withLock server.nodeRegistry.mu:
+        if uint16(peerNodeId) in server.nodeRegistry.nodes:
+          targetClientPort = int(server.nodeRegistry.nodes[uint16(
+              peerNodeId)].clientPort)
+    if targetClientPort == 0:
+      let (_, kvPort) = server.lookupNodeFromKVStore(peerNodeId)
+      if kvPort > 0:
+        targetClientPort = int(kvPort)
+    if targetClientPort == 0:
+      # Cannot determine client port — skip sending JoinGroup RPC
+      continue
     try:
       let cfg = ClientConfig(
         host: host,
@@ -2035,35 +2408,16 @@ proc addPeerToRaft*(server: ProtocolServer, peerNodeId: uint32,
       let cr = pc.connect()
       if cr.isOk:
         defer: pc.disconnect()
-        let jr = pc.joinGroup(joinReq)
-        # Wait for response - joining node must have updated its instance
-        if jr.isOk and jr.value.success:
-          {.cast(gcsafe).}: echo "[addPeerToRaft] JoinGroup RPC succeeded for group " & $groupUlid
-        else:
-          let errMsg = if jr.isOk: jr.value.error else: $jr.error
-          {.cast(gcsafe).}: echo "[addPeerToRaft] JoinGroup RPC failed for group " &
-              $groupUlid & ": " & errMsg
-      else:
-        {.cast(gcsafe).}: echo "[addPeerToRaft] Failed to connect to joining node at " &
-            host & ":" & $targetClientPort
-    except CatchableError as e:
-      {.cast(gcsafe).}: echo "[addPeerToRaft] Exception sending JoinGroup: " & e.msg
+        discard pc.joinGroup(joinReq)
+    except CatchableError:
+      discard
 
   # Only insert into sys.nodes and update sys.groups if we're the meta group leader
-  # (joining nodes are followers and can't write)
-  # CRITICAL: These writes MUST go through Raft (raftStore.raftPut) so they are
-  # replicated to all nodes. Using mvccStore.txnPut would only write locally!
-  {.cast(gcsafe).}: echo "[addPeerToRaft] Checking leader status for META_GROUP, isLeader=",
-      coord.isLeader(META_GROUP_ID)
   if coord.isLeader(META_GROUP_ID):
     let raftStore = server.raftStore
-    {.cast(gcsafe).}: echo "[addPeerToRaft] raftStore.isNil=", raftStore.isNil
     if not raftStore.isNil:
       let backend = raftStore.getBackend()
-      {.cast(gcsafe).}: echo "[addPeerToRaft] backend.isNil=", backend.isNil,
-          " backend.isOpen=", (if backend.isNil: false else: backend.isOpen)
       if not backend.isNil and backend.isOpen:
-        # Insert into sys.nodes (replicated through Raft with MVCC encoding)
         let nodeKey = encodeTableKey(SYS_NODES_TABLE_ID, $peerNodeId)
         let nodeRec = NodeRecord(
           nodeId: uint16(peerNodeId),
@@ -2073,55 +2427,31 @@ proc addPeerToRaft*(server: ProtocolServer, peerNodeId: uint32,
           webPort: uint16(webPort),
           status: nsAlive
         )
-        if raftStore.sysTablePut(nodeKey, encode(nodeRec)):
-          {.cast(gcsafe).}: echo "[addPeerToRaft] Inserted node " &
-              $peerNodeId & " into sys.nodes via Raft (MVCC-encoded)"
-        else:
-          {.cast(gcsafe).}: echo "[addPeerToRaft] WARNING: Failed to insert into sys.nodes"
+        discard raftStore.sysTablePut(nodeKey, encode(nodeRec))
 
-        # CRITICAL: Update sys.groups to add the new replica to each group's replica list
-        # This ensures clients can find all replicas when looking for a working connection
         try:
           for groupId in [META_GROUP_ID, DATA_GROUP_START_ID]:
             let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupId)
-            # Read current group record from backend (local read on leader is consistent)
-            # MUST strip MVCC header - sys.groups is MVCC-encoded
             let valOpt = backend.get(groupKey)
             if valOpt.isSome:
               let (payload, isDeleted) = stripMVCCHeader(valOpt.get)
               if isDeleted or payload.len == 0:
-                {.cast(gcsafe).}: echo "[addPeerToRaft] WARNING: sys.groups for group " &
-                    $groupId & " is deleted or empty"
                 continue
               let currentRec = decodeGroupRecord(payload)
-              # Check if replica already exists (avoid duplicates)
               var alreadyExists = false
               for rep in currentRec.replicas:
                 if rep.nodeId == peerNodeId:
                   alreadyExists = true
                   break
               if not alreadyExists:
-                # Add the new replica as a voter
                 var updatedRec = currentRec
                 updatedRec.replicas.add(GroupReplicaBin(
                   nodeId: peerNodeId,
                   replicaType: rtVoter
                 ))
-                # Write via sysTablePut - this MVCC-encodes AND replicates through Raft!
-                if raftStore.sysTablePut(groupKey, encode(updatedRec)):
-                  {.cast(gcsafe).}: echo "[addPeerToRaft] Added replica " &
-                      $peerNodeId & " to sys.groups for group " & $groupId & " via Raft (MVCC-encoded)"
-                else:
-                  {.cast(gcsafe).}: echo "[addPeerToRaft] WARNING: Failed to update sys.groups"
-              else:
-                {.cast(gcsafe).}: echo "[addPeerToRaft] Replica " &
-                    $peerNodeId & " already exists in sys.groups for group " & $groupId
-            else:
-              {.cast(gcsafe).}: echo "[addPeerToRaft] WARNING: Could not read sys.groups for group " &
-                  $groupId & " to update replicas"
+                discard raftStore.sysTablePut(groupKey, encode(updatedRec))
         except CatchableError:
-          {.cast(gcsafe).}: echo "[addPeerToRaft] Error updating sys.groups: " &
-              getCurrentExceptionMsg()
+          discard
 
   # Persist membership so restarts can rejoin without --join
   server.saveClusterState()
@@ -2138,29 +2468,25 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
 
   createDir(raftDir)
 
-  # Peer info: (nodeId, host, port) tuples
-  type PeerInfo = tuple[nodeId: uint32, host: string, port: int]
+  # Peer info: (nodeId, host, raft port, client port) tuples
+  type PeerInfo = tuple[nodeId: uint32, host: string, port: int,
+      clientPort: int]
   var peers: seq[PeerInfo] = @[]
 
   # Check for saved cluster state (from a previous run as part of a cluster).
   var isRejoining = false
   if startAsLeader:
     let saved = loadClusterStateFromBinary(server.config.dataDir)
-    echo "[DEBUG setupRaftNode] loadClusterStateFromBinary result: " &
-        (if saved.isSome: "some" else: "none") &
-        " dataDir=" & server.config.dataDir
     if saved.isSome:
       let ss = saved.get
-      echo "[DEBUG setupRaftNode] saved.peers.len=" & $ss.peers.len
       if ss.peers.len > 0:
         isRejoining = true
         for nid, info in ss.peers.pairs():
           # Skip self - we don't want to include ourselves in the peers list
           if nid > 0 and nid != nodeId.uint32 and info.host != "" and
               info.port > 0:
-            peers.add((nodeId: nid, host: info.host, port: info.port))
-        if peers.len > 0:
-          echo "recovered cluster membership from disk: " & $peers.len & " peers"
+            peers.add((nodeId: nid, host: info.host, port: info.port,
+                      clientPort: info.clientPort))
 
   let isJoining = not startAsLeader
 
@@ -2170,9 +2496,9 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
     port: raftPort,
     host: server.config.host,
     dataDir: raftDir,
-    electionTimeoutLowerMs: 1000,
-    electionTimeoutUpperMs: 2000,
-    heartbeatIntervalMs: 500,
+    electionTimeoutLowerMs: 300,
+    electionTimeoutUpperMs: 600,
+    heartbeatIntervalMs: 100,
     writeBufferSize: server.config.writeBufferSize,
     blockCacheSize: server.config.blockCacheSize,
     vlogMaxSize: server.config.vlogMaxSize,
@@ -2219,20 +2545,101 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
     for groupId in [META_GROUP_ID, DATA_GROUP_START_ID]:
       discard coord.createAndStartGroup(groupId, initialMembers)
   elif isRejoining:
-    # For rejoining, create groups but skip initial election to prevent
-    # conflicting with existing leaders. We'll receive append_entries
-    # and catch up from the current leaders.
-    # Use any peer's nodeId as preferredLeader (different from our nodeId)
-    # to make createAndStartGroup skip the initial election internally.
-    let rejoinPreferredLeader = if peers.len > 0: peers[0].nodeId else: 1'u32
-    echo "rejoining cluster: creating groups with preferredLeader=" & $rejoinPreferredLeader
+    # Rejoin protocol: create groups with members from cluster.bin so the
+    # node can immediately receive heartbeats and append_entries from the
+    # leader. Use the first peer as preferredLeader so the node starts in
+    # follower mode (skipInitialElection=true) instead of triggering an
+    # election that would disrupt the cluster.
+    var rejoinPreferredLeader: uint32 = 0
+    if peers.len > 0:
+      rejoinPreferredLeader = peers[0].nodeId
     for groupId in [META_GROUP_ID, DATA_GROUP_START_ID]:
       discard coord.createAndStartGroup(groupId, initialMembers,
-          preferredLeader = rejoinPreferredLeader)
+          rejoinPreferredLeader)
 
   coord.start()
 
-  # NuRaft handles log replay internally — no manual applyUpTo needed.
+  if isRejoining and peers.len > 0:
+    # RejoinNode RPC: tell the meta leader to re-add us to the Raft config
+    # so it starts sending append_entries. This is an optimization — the
+    # groups already exist (created above), but without add_srv the leader
+    # doesn't know to replicate to us.
+    # Retry a few times because the leader might be mid-election.
+    var rejoinSucceeded = false
+    for attempt in 0 ..< 3:
+      if rejoinSucceeded: break
+      if attempt > 0:
+        sleep(500)
+      # Ask each peer for the meta leader until we find one
+      var metaLeaderHost = ""
+      var metaLeaderClientPort = 0
+      for p in peers:
+        if metaLeaderHost.len > 0: break
+        let peerClientPort = if p.clientPort > 0: p.clientPort else: p.port + 100
+        try:
+          let cfg = ClientConfig(
+            host: p.host,
+            port: peerClientPort,
+            timeoutMs: 2000
+          )
+          let pc = newProtocolClient(cfg)
+          let cr = pc.connect()
+          if cr.isOk:
+            defer: pc.disconnect()
+            let leaderResp = pc.findMetaLeader()
+            if leaderResp.isOk and leaderResp.value.leaderKnown:
+              metaLeaderHost = leaderResp.value.leaderHost
+              metaLeaderClientPort = int(leaderResp.value.leaderClientPort)
+        except CatchableError:
+          discard
+
+      if metaLeaderHost.len > 0 and metaLeaderClientPort > 0:
+        try:
+          let cfg = ClientConfig(
+            host: metaLeaderHost,
+            port: metaLeaderClientPort,
+            timeoutMs: 5000
+          )
+          let pc = newProtocolClient(cfg)
+          let cr = pc.connect()
+          if cr.isOk:
+            defer: pc.disconnect()
+            let rejoinReq = clusterMsgs.RejoinNodeRequest(
+              nodeId: uint16(server.config.serverId),
+              host: server.config.host,
+              raftPort: uint16(raftPort),
+              clientPort: uint16(server.config.port)
+            )
+            let rejoinResp = pc.rejoinNode(rejoinReq)
+            if rejoinResp.isOk and rejoinResp.value.success:
+              rejoinSucceeded = true
+        except CatchableError:
+          discard
+
+    if not rejoinSucceeded:
+      # Groups were created with cluster.bin members above, so the node can
+      # still catch up via append_entries once the leader recognizes it.
+      # This is a degraded path — the leader won't actively replicate to us
+      # until it adds us via add_srv (which happens when it detects our
+      # heartbeat response or when a human operator triggers add_srv).
+      discard
+
+  # For rejoining nodes, wait for leaders to be known and for some data to
+  # replicate before loading space metadata. The groups already exist (created
+  # above), so we just need to wait for append_entries to arrive.
+  if isRejoining:
+    # Wait for leaders to be known (max 5 seconds)
+    for i in 0 ..< 50:
+      let metaLeader = coord.getLeader(META_GROUP_ID)
+      let dataLeader = coord.getLeader(DATA_GROUP_START_ID)
+      if metaLeader > 0 and dataLeader > 0:
+        break
+      sleep(100)
+    # Give Raft time to replicate data from the leader. With heartbeats at
+    # 100ms interval, the leader needs a few rounds to catch up a restarted
+    # node that may have missed multiple entries. 2 seconds covers 20 heartbeat
+    # cycles plus log replay time.
+    sleep(2000)
 
   # Load space caches from recovered state machine
   store.loadSpaces()
@@ -2282,11 +2689,17 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
   # If so, skip seeding entirely - data was already seeded from a previous run
   let hasExistingSpaces = store.spaces.len > 0
 
-# Wait for meta group leader before seeding (max 5 seconds)
+# Wait for both meta and data group leaders before seeding (max 5 seconds).
+  # Both groups must have leaders so that addPeerToRaft can add servers
+  # to the data group (not just the meta group) when new nodes join.
   if startAsLeader and not isRejoining and not hasExistingSpaces:
     let waitDeadline = getTime().toUnixFloat() * 1000 + 5000.0
     while getTime().toUnixFloat() * 1000 < waitDeadline:
-      if coord.isLeader(META_GROUP_ID) or coord.getLeader(META_GROUP_ID) > 0:
+      let metaOk = coord.isLeader(META_GROUP_ID) or coord.getLeader(
+          META_GROUP_ID) > 0
+      let dataOk = coord.isLeader(DATA_GROUP_START_ID) or coord.getLeader(
+          DATA_GROUP_START_ID) > 0
+      if metaOk and dataOk:
         break
       sleep(100)
 
@@ -2478,8 +2891,6 @@ proc stop*(server: ProtocolServer) {.raises: [].} =
   server.logger.logInfo("server stopping")
 
   # Close the accept socket FIRST to unblock the accept loop thread.
-  # This must happen before trying to join threads, otherwise joinThread
-  # will block forever waiting for the accept loop to exit.
   if not server.acceptSock.isNil:
     try:
       server.acceptSock.close()
@@ -2487,12 +2898,10 @@ proc stop*(server: ProtocolServer) {.raises: [].} =
       discard
     server.acceptSock = nil
 
-  # Stop SharedTimer background sync thread and close network transport
   if not server.sharedTimer.isNil:
     try: server.sharedTimer.stop()
     except Exception as e: server.logger.logError("SharedTimer stop failed: " & e.msg)
 
-  # Close all client sockets to unblock their threads
   withLock server.clientsMu:
     for id, conn in server.clients:
       try:
@@ -2500,24 +2909,34 @@ proc stop*(server: ProtocolServer) {.raises: [].} =
       except:
         discard
 
-  # Wait for client threads to exit (they should exit quickly after sockets are closed)
-  for _ in 0 ..< 50: # 5 seconds max
+  for _ in 0 ..< 50:
     if server.clientThreadCount.load() == 0:
       break
     sleep(100)
 
-  # Wait for accept thread to exit
-  for _ in 0 ..< 50: # 5 seconds max
+  for _ in 0 ..< 50:
     if server.acceptThreadCount.load() == 0:
       break
     sleep(100)
 
-  # Stop the Raft coordinator if it was set
+  if not server.raftStore.isNil:
+    try: server.raftStore.stop()
+    except Exception as e: server.logger.logError("RaftStore stop failed: " & e.msg)
+
   if not server.raftCoord.isNil:
     try: server.raftCoord.stop()
     except Exception as e: server.logger.logError("RaftCoord stop failed: " & e.msg)
 
-  # Stop and join global rebalance monitor thread
+  # Drain the leader persistence channel AFTER coordinator is stopped.
+  # ASIO threads fire onLeaderChanged callbacks that send() to this channel.
+  # The stopped flag prevents new sends; draining clears any remaining messages.
+  # We do NOT close the channel because Nim's Channel.close() destroys the
+  # channel lock while other threads may still reference it, causing SIGSEGV.
+  if not server.raftStore.isNil:
+    try: server.raftStore.closeChannels()
+    except Exception as e: server.logger.logError(
+        "RaftStore closeChannels failed: " & e.msg)
+
   gRebalRunning.store(false)
   if gRebalThread != nil:
     try:
@@ -2526,9 +2945,6 @@ proc stop*(server: ProtocolServer) {.raises: [].} =
       discard
     gRebalThread = nil
 
-  # Clear global thread stores to break reference cycles (prevents ORC crash on cleanup)
-  # The Thread objects reference ClientLoopArgs which reference ProtocolServer,
-  # creating a cycle that ORC can't properly clean up at program exit.
   withLock threadStoreMu:
     threadStore = @[]
     acceptThreadStore = @[]

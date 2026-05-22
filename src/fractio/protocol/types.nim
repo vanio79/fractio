@@ -82,19 +82,26 @@ type
     mtHealth = 0x0702
 
     # Cluster Admin (0x0703-0x0706)
-    mtJoinNode = 0x0703        ## Add a node to the cluster
-    mtRemoveNode = 0x0704      ## Remove a node from the cluster
-    mtListNodes = 0x0705       ## List all known cluster nodes
-    mtRebalanceStatus = 0x0706 ## Query rebalance operation status
-    mtDrainNode = 0x0707       ## Mark a node as draining (graceful shutdown)
+    mtJoinNode = 0x0703         ## Add a node to the cluster
+    mtRemoveNode = 0x0704       ## Remove a node from the cluster
+    mtListNodes = 0x0705        ## List all known cluster nodes
+    mtRebalanceStatus = 0x0706  ## Query rebalance operation status
+    mtDrainNode = 0x0707        ## Mark a node as draining (graceful shutdown)
 
     # Space Management (0x0708-0x0709)
-    mtCreateSpace = 0x0708     ## Create a new space with Raft groups
-    mtDropSpace = 0x0709       ## Drop an existing space and its groups
+    mtCreateSpace = 0x0708      ## Create a new space with Raft groups
+    mtDropSpace = 0x0709        ## Drop an existing space and its groups
 
     # Directed Group Creation (0x070A-0x070B)
-    mtCreateGroup = 0x070A     ## Request a node to create a Raft group as leader
-    mtJoinGroup = 0x070B       ## Request a node to join an existing Raft group
+    mtCreateGroup = 0x070A      ## Request a node to create a Raft group as leader
+    mtJoinGroup = 0x070B        ## Request a node to join an existing Raft group
+
+    # Rejoin Protocol (0x070C-0x070D)
+    mtFindMetaLeader = 0x070C   ## Ask a node who the current meta leader is
+    mtRejoinNode = 0x070D       ## Request re-admission to the cluster after restart
+
+    # Cross-node add_srv forwarding (0x070E)
+    mtAddServerToGroup = 0x070E ## Forward add_srv to the group leader
 
 # ---------------------------------------------------------------------------
 # Authentication methods

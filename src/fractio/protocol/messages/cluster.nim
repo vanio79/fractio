@@ -584,3 +584,221 @@ proc decodeJoinGroupResponse*(payload: string): Result[JoinGroupResponse,
     resp.error = errR.value
 
   peOk(resp)
+
+# ---------------------------------------------------------------------------
+# FindMetaLeader (0x070C) — Discover the current meta leader
+# ---------------------------------------------------------------------------
+# Any node can answer this — it just returns who it thinks the meta leader is.
+#
+# FindMetaLeader Request:
+#   [MessageType:2]
+# FindMetaLeader Response:
+#   [MessageType:2][leaderKnown:1]
+#   If leaderKnown:
+#     [leaderNodeId:2][leaderHost:1+N][leaderClientPort:2]
+
+type
+  FindMetaLeaderResponse* = object
+    leaderKnown*: bool
+    leaderNodeId*: uint16
+    leaderHost*: string
+    leaderClientPort*: uint16
+
+proc encodeFindMetaLeaderRequest*(): string =
+  var buf = ""
+  buf.writeUint16BE(uint16(mtFindMetaLeader))
+  buf
+
+proc decodeFindMetaLeaderRequest*(payload: string): bool =
+  ## Returns true if payload is valid (just needs 2-byte message type).
+  payload.len >= 2
+
+proc encodeFindMetaLeaderResponse*(resp: FindMetaLeaderResponse): string =
+  var buf = ""
+  buf.writeUint16BE(uint16(mtFindMetaLeader))
+  buf.writeUint8(if resp.leaderKnown: 0x01'u8 else: 0x00'u8)
+  if resp.leaderKnown:
+    buf.writeUint16BE(resp.leaderNodeId)
+    buf.writeBytes8(resp.leaderHost)
+    buf.writeUint16BE(resp.leaderClientPort)
+  buf
+
+proc decodeFindMetaLeaderResponse*(payload: string): Result[
+    FindMetaLeaderResponse, ProtocolError] =
+  var pos = 2
+  var resp: FindMetaLeaderResponse
+  let knownR = readUint8(payload, pos)
+  if knownR.isErr: return peErr(knownR.error)
+  resp.leaderKnown = knownR.value != 0
+  if resp.leaderKnown:
+    let nodeIdR = readUint16BE(payload, pos)
+    if nodeIdR.isErr: return peErr(nodeIdR.error)
+    resp.leaderNodeId = nodeIdR.value
+    let hostR = readBytes8(payload, pos)
+    if hostR.isErr: return peErr(hostR.error)
+    resp.leaderHost = hostR.value
+    let portR = readUint16BE(payload, pos)
+    if portR.isErr: return peErr(portR.error)
+    resp.leaderClientPort = portR.value
+  peOk(resp)
+
+# ---------------------------------------------------------------------------
+# RejoinNode (0x070D) — Request re-admission to the cluster after restart
+# ---------------------------------------------------------------------------
+# The meta leader handles this. It re-adds the node via add_srv to all groups
+# the node was a member of, then sends JoinGroup RPCs for each group so the
+# rejoining node can create the proper multi-member instances.
+#
+# RejoinNode Request:
+#   [MessageType:2][nodeId:2][host:1+N][raftPort:2][clientPort:2]
+# RejoinNode Response:
+#   [MessageType:2][success:1]
+#   On success: [groupCount:2][groupCount x (groupId:16)]
+#   On failure: [errorLen:2][error:N]
+
+type
+  RejoinNodeRequest* = object
+    nodeId*: uint16
+    host*: string
+    raftPort*: uint16
+    clientPort*: uint16
+
+  RejoinNodeResponse* = object
+    success*: bool
+    groupIds*: seq[string]
+    error*: string
+
+proc encodeRejoinNodeRequest*(req: RejoinNodeRequest): string =
+  var buf = ""
+  buf.writeUint16BE(uint16(mtRejoinNode))
+  buf.writeUint16BE(req.nodeId)
+  buf.writeBytes8(req.host)
+  buf.writeUint16BE(req.raftPort)
+  buf.writeUint16BE(req.clientPort)
+  buf
+
+proc decodeRejoinNodeRequest*(payload: string): Result[RejoinNodeRequest,
+    ProtocolError] =
+  var pos = 2
+  var req: RejoinNodeRequest
+  let nodeIdR = readUint16BE(payload, pos)
+  if nodeIdR.isErr: return peErr(nodeIdR.error)
+  req.nodeId = nodeIdR.value
+  let hostR = readBytes8(payload, pos)
+  if hostR.isErr: return peErr(hostR.error)
+  req.host = hostR.value
+  let raftPortR = readUint16BE(payload, pos)
+  if raftPortR.isErr: return peErr(raftPortR.error)
+  req.raftPort = raftPortR.value
+  let clientPortR = readUint16BE(payload, pos)
+  if clientPortR.isErr: return peErr(clientPortR.error)
+  req.clientPort = clientPortR.value
+  peOk(req)
+
+proc encodeRejoinNodeResponse*(resp: RejoinNodeResponse): string =
+  var buf = ""
+  buf.writeUint16BE(uint16(mtRejoinNode))
+  buf.writeUint8(if resp.success: 0x01'u8 else: 0x00'u8)
+  if resp.success:
+    buf.writeUint16BE(uint16(resp.groupIds.len))
+    for gid in resp.groupIds:
+      buf.add(gid)
+  else:
+    buf.writeBytes16(resp.error)
+  buf
+
+proc decodeRejoinNodeResponse*(payload: string): Result[RejoinNodeResponse,
+    ProtocolError] =
+  var pos = 2
+  var resp: RejoinNodeResponse
+  let successR = readUint8(payload, pos)
+  if successR.isErr: return peErr(successR.error)
+  resp.success = successR.value != 0
+  if resp.success:
+    let countR = readUint16BE(payload, pos)
+    if countR.isErr: return peErr(countR.error)
+    let count = int(countR.value)
+    for i in 0..<count:
+      if pos + 16 > payload.len:
+        return peErr(ProtocolError(kind: peBoundsOverflow,
+            msg: "payload too short for groupId"))
+      resp.groupIds.add(payload[pos..pos+15])
+      pos += 16
+  else:
+    let errR = readBytes16(payload, pos)
+    if errR.isErr: return peErr(errR.error)
+    resp.error = errR.value
+  peOk(resp)
+
+# ---------------------------------------------------------------------------
+# AddServerToGroup (0x070E) — Forward add_srv to the group leader
+# ---------------------------------------------------------------------------
+# When the meta leader is not the leader of a data group, it sends this
+# message to the data group leader to request adding a server to that group.
+#
+# AddServerToGroup Request:
+#   [MessageType:2][groupId:16][serverId:2][host:1+N][raftPort:2]
+# AddServerToGroup Response:
+#   [MessageType:2][success:1]
+#   On failure: [errorLen:2][error:N]
+
+type
+  AddServerToGroupRequest* = object
+    groupId*: string ## 16-byte ULID binary
+    serverId*: uint16
+    host*: string
+    raftPort*: uint16
+
+  AddServerToGroupResponse* = object
+    success*: bool
+    error*: string
+
+proc encodeAddServerToGroupRequest*(req: AddServerToGroupRequest): string =
+  var buf = ""
+  buf.writeUint16BE(uint16(mtAddServerToGroup))
+  buf.add(req.groupId)
+  buf.writeUint16BE(req.serverId)
+  buf.writeBytes8(req.host)
+  buf.writeUint16BE(req.raftPort)
+  buf
+
+proc decodeAddServerToGroupRequest*(payload: string): Result[
+    AddServerToGroupRequest, ProtocolError] =
+  var pos = 2
+  var req: AddServerToGroupRequest
+  if pos + 16 > payload.len:
+    return peErr(ProtocolError(kind: peBoundsOverflow,
+        msg: "payload too short for groupId"))
+  req.groupId = payload[pos..pos+15]
+  pos += 16
+  let serverIdR = readUint16BE(payload, pos)
+  if serverIdR.isErr: return peErr(serverIdR.error)
+  req.serverId = serverIdR.value
+  let hostR = readBytes8(payload, pos)
+  if hostR.isErr: return peErr(hostR.error)
+  req.host = hostR.value
+  let portR = readUint16BE(payload, pos)
+  if portR.isErr: return peErr(portR.error)
+  req.raftPort = portR.value
+  peOk(req)
+
+proc encodeAddServerToGroupResponse*(resp: AddServerToGroupResponse): string =
+  var buf = ""
+  buf.writeUint16BE(uint16(mtAddServerToGroup))
+  buf.writeUint8(if resp.success: 0x01'u8 else: 0x00'u8)
+  if not resp.success:
+    buf.writeBytes16(resp.error)
+  buf
+
+proc decodeAddServerToGroupResponse*(payload: string): Result[
+    AddServerToGroupResponse, ProtocolError] =
+  var pos = 2
+  var resp: AddServerToGroupResponse
+  let successR = readUint8(payload, pos)
+  if successR.isErr: return peErr(successR.error)
+  resp.success = successR.value != 0
+  if not resp.success:
+    let errR = readBytes16(payload, pos)
+    if errR.isErr: return peErr(errR.error)
+    resp.error = errR.value
+  peOk(resp)

@@ -13,15 +13,16 @@ import fractio/utils/binary
 
 const
   CLUSTER_STATE_MAGIC* = [0x43'u8, 0x53'u8, 0x42'u8] # "CSB" - Cluster State Binary
-  CLUSTER_STATE_VERSION* = 0x01'u8 # Current binary format version
+  CLUSTER_STATE_VERSION* = 0x02'u8 # v2: adds clientPort to PeerInfo
 
 # =============================================================================
 # Persisted Cluster State Types
 # =============================================================================
 
 type
-  PeerInfo* = tuple[host: string, port: int]
+  PeerInfo* = tuple[host: string, port: int, clientPort: int]
     ## Information about a peer node in the cluster
+    ## port: Raft port, clientPort: client protocol port
 
   SelfNodeInfo* = object
     ## Information about this node (self)
@@ -59,7 +60,7 @@ proc encodeClusterState*(state: PersistedClusterState): string =
   ##
   ## Binary format (little-endian):
   ## - Magic: 3 bytes (0x43 0x53 0x42 = "CSB")
-  ## - Version: 1 byte (0x01)
+  ## - Version: 1 byte (0x02)
   ## - Self node info:
   ##   - NodeId: 4 bytes (uint32)
   ##   - Host: length-prefixed string
@@ -70,9 +71,10 @@ proc encodeClusterState*(state: PersistedClusterState): string =
   ##   - For each peer:
   ##     - NodeId: 4 bytes (uint32)
   ##     - Host: length-prefixed string
-  ##     - Port: 4 bytes (int32)
+  ##     - Port: 4 bytes (int32, Raft port)
+  ##     - ClientPort: 4 bytes (int32)
   ##
-  ## Total minimum: 23 bytes (empty host strings, 0 peers)
+  ## Total minimum: 27 bytes (empty host strings, 0 peers)
   var w = initBinaryWriter()
 
   # Magic and version
@@ -91,6 +93,7 @@ proc encodeClusterState*(state: PersistedClusterState): string =
     w.writeU32(nodeId)
     w.writeString(info.host)
     w.writeI32(int32(info.port))
+    w.writeI32(int32(info.clientPort))
 
   w.finish()
 
@@ -115,7 +118,7 @@ proc decodeClusterState*(data: string): PersistedClusterState =
 
   # Verify version
   let version = r.readU8()
-  if version != CLUSTER_STATE_VERSION:
+  if version != 0x01'u8 and version != 0x02'u8:
     raise newException(ValueError, "ClusterState: unsupported version " & $version)
 
   # Read self node info
@@ -138,7 +141,9 @@ proc decodeClusterState*(data: string): PersistedClusterState =
     let nodeId = r.readU32()
     let host = r.readString()
     let port = int(r.readI32())
-    result.peers[nodeId] = (host: host, port: port)
+    # v2 format includes clientPort; v1 does not (default to 0)
+    let clientPort = if version >= 0x02: int(r.readI32()) else: 0
+    result.peers[nodeId] = (host: host, port: port, clientPort: clientPort)
 
 # =============================================================================
 # File I/O Helpers

@@ -87,8 +87,9 @@ proc getGroupForKey*(state: RoutingState, key: string): GroupID =
   ## Pure function - fully testable with RoutingState.
   ##
   ## Returns META_GROUP_ID if the group cannot be determined.
-
-  {.cast(gcsafe).}: echo "[routing] getGroupForKey: key=", key
+  ##
+  ## During rebalancing, routes reads to oldGroupIds since data has not yet
+  ## migrated to the new groups. Writes continue to new groups.
 
   # System tables (tableId 1-7) are in the meta group
   if key.startsWith(TABLE_KEY_PREFIX):
@@ -97,29 +98,23 @@ proc getGroupForKey*(state: RoutingState, key: string): GroupID =
       try:
         let tableIdStr = afterPrefix[0 ..< TABLE_ID_WIDTH]
         let tableId = tableIdFromString(tableIdStr)
-        {.cast(gcsafe).}: echo "[routing] getGroupForKey: tableIdStr=",
-            tableIdStr, " tables.len=", state.tables.len
         if isMetaGroupTableId(tableId):
-          {.cast(gcsafe).}: echo "[routing] getGroupForKey: isMetaGroupTableId=true, returning META_GROUP_ID"
           return META_GROUP_ID
         else:
           # For data tables, look up table->space->group mapping
-          {.cast(gcsafe).}: echo "[routing] getGroupForKey: tableId in state.tables?=",
-              (tableId in state.tables)
           if tableId in state.tables:
             let tableInfo = state.tables[tableId]
             let spaceId = tableInfo.spaceId
-            {.cast(gcsafe).}: echo "[routing] getGroupForKey: tableInfo.spaceId=", $spaceId
-
-            # Check if spaceId is valid
-            {.cast(gcsafe).}: echo "[routing] getGroupForKey: isValidSpaceId?=",
-                isValidSpaceId(spaceId), " spaceId in state.spaces?=", (
-              spaceId in state.spaces)
             if isValidSpaceId(spaceId) and spaceId in state.spaces:
               let spaceInfo = state.spaces[spaceId]
-              {.cast(gcsafe).}: echo "[routing] getGroupForKey: spaceInfo.groupIds.len=",
-                  spaceInfo.groupIds.len
-              if spaceInfo.groupIds.len > 0:
+              let activeGroupIds = if spaceInfo.rebalancing and
+                  spaceInfo.oldGroupIds.len > 0:
+                # During rebalancing, data still lives in old groups; route reads there
+                spaceInfo.oldGroupIds
+              else:
+                spaceInfo.groupIds
+
+              if activeGroupIds.len > 0:
                 # Extract the primary key portion for hashing
                 # Key format: /t/<tableId>/<pk> or /t/<tableId>/d/<pk>
                 let afterTableId = afterPrefix[TABLE_ID_WIDTH .. ^1]
@@ -134,19 +129,14 @@ proc getGroupForKey*(state: RoutingState, key: string): GroupID =
                   pk = pk[2 .. ^1]
 
                 # Hash-based routing for multi-group spaces
-                let result = routeToGroup(pk, spaceInfo.groupIds)
-                {.cast(gcsafe).}: echo "[routing] getGroupForKey: routeToGroup returned ", $result
-                return result
+                return routeToGroup(pk, activeGroupIds)
 
           # Fall back to default data group for tables without space assignment
-          {.cast(gcsafe).}: echo "[routing] getGroupForKey: falling back to DATA_GROUP_START_ID"
           return DATA_GROUP_START_ID
       except ValueError:
-        {.cast(gcsafe).}: echo "[routing] getGroupForKey: ValueError exception"
         discard
 
   # Default to meta group for non-table keys or if parsing failed
-  {.cast(gcsafe).}: echo "[routing] getGroupForKey: defaulting to META_GROUP_ID (key doesn't start with prefix or parsing failed)"
   return META_GROUP_ID
 
 proc getGroupsForTable*(state: RoutingState, tableId: TableId): seq[GroupID] =
@@ -165,16 +155,13 @@ proc getGroupsForTable*(state: RoutingState, tableId: TableId): seq[GroupID] =
     if isValidSpaceId(spaceId) and spaceId in state.spaces:
       let spaceInfo = state.spaces[spaceId]
 
-      # During rebalancing, return both old and new groups
+      # During rebalancing, return only old groups for full scans.
+      # Old groups contain all existing data; new groups are empty
+      # until migration runs. Scanning both would return duplicates
+      # because keyRoutesToGroupIdDuringRebalance allows old-group
+      # keys to appear in new-group scans (dual-read for point gets).
       if spaceInfo.rebalancing and spaceInfo.oldGroupIds.len > 0:
-        var allGroups: seq[GroupID] = @[]
-        for gid in spaceInfo.groupIds:
-          if gid notin allGroups:
-            allGroups.add(gid)
-        for gid in spaceInfo.oldGroupIds:
-          if gid notin allGroups:
-            allGroups.add(gid)
-        return allGroups
+        return spaceInfo.oldGroupIds
       else:
         return spaceInfo.groupIds
 

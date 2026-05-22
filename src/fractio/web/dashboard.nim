@@ -28,17 +28,55 @@ var gSrvPtr {.global.}: pointer
 var gWebPort {.global.}: int
 var gClient {.global.}: FractioClient
 var gWebThread {.global.}: Thread[int]
+var gClientLastRefresh {.global.}: float64 = 0.0  # epochTime of last successful refresh
 
 template getSrv(): pserver.ProtocolServer =
   cast[pserver.ProtocolServer](gSrvPtr)
 
 proc getClient(): FractioClient =
+  ## Get or create the global FractioClient.
+  ## If the client metadata is stale (older than 2 seconds), force a refresh
+  ## to ensure we know the current leader. This prevents long retry loops when
+  ## the leader changes after a failover.
   if gClient == nil:
     let srv = getSrv()
     let host = if srv.config.host == "0.0.0.0": "127.0.0.1" else: srv.config.host
-    gClient = newFractioClient(host, srv.config.port)
+    var cfg = newFractioClientConfig(host, srv.config.port)
+    # Dashboard client: balance between responsiveness and reliability.
+    # With fast election timeouts (300-600ms), a 1-second timeout per retry
+    # allows enough time for a leader election to complete. 3 retries gives
+    # up to 3 seconds total blocking time, which is acceptable for HTTP.
+    cfg.maxKvRetries = 3
+    cfg.connectionTimeoutMs = 500
+    cfg.requestTimeoutMs = 1000
+    gClient = newFractioClient(cfg)
     discard gClient.initialize()
+    gClientLastRefresh = epochTime()
+  else:
+    # Proactively refresh metadata if it's stale (older than 10 seconds).
+    # This prevents long retry loops after a leader failover.
+    # NOTE: The previous 2-second threshold caused excessive refreshes that
+    # blocked the event loop. 10 seconds is a better balance between freshness
+    # and not blocking the HTTP handler.
+    let now = epochTime()
+    if now - gClientLastRefresh > 10.0:
+      try:
+        discard gClient.forceMetadataRefresh()
+        gClientLastRefresh = epochTime()
+      except CatchableError:
+        # Refresh failed — don't block the event loop, just use stale metadata.
+        # The next request will try again.
+        discard
   gClient
+
+proc resetClient() =
+  ## Reset the global FractioClient by closing all connections and
+  ## setting it to nil. The next call to getClient() will create a fresh client.
+  if gClient != nil:
+    try:
+      gClient.close()
+    except: discard
+    gClient = nil
 
 proc getTemplateDir(): string =
   getScriptDir() / "templates"
@@ -554,64 +592,58 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
   if path == "/api/nodes" and httpMethod == HttpGet:
     ## Get list of cluster nodes as JSON array.
     ## Used by integration tests to verify cluster membership.
+    ##
+    ## CRITICAL: Reads directly from the local Raft backend (sys.nodes table)
+    ## without going through FractioClient. FractioClient does synchronous
+    ## network I/O which blocks the httpbeast event loop, making ALL HTTP
+    ## endpoints unresponsive during that time.
+    ##
+    ## The sys.nodes table is replicated by Raft, so every node has the same
+    ## data locally (may be slightly stale on followers, but that's fine).
     let srv = getSrv()
     if srv.isNil:
       sendJson(Http503, %* {"error": "server not ready"})
       return fut
     var nodesJson: seq[JsonNode] = @[]
-    # Query nodes from sys.nodes table
-    var nodesResult: ExecResult
-    {.cast(gcsafe).}:
-      nodesResult = getClient().query("SELECT * FROM sys.nodes")
-    case nodesResult.kind
-    of erkRows:
-      for row in nodesResult.rows:
-        # Columns: _key, nodeId, host, raftPort, clientPort, webPort, status
-        var nodeObj = newJObject()
-        if row.len >= 2:
-          nodeObj["nodeId"] = %row[1]
-        if row.len >= 3:
-          nodeObj["host"] = %row[2]
-        if row.len >= 4:
-          nodeObj["raftPort"] = %row[3]
-        if row.len >= 5:
-          nodeObj["clientPort"] = %row[4]
-        if row.len >= 6:
-          nodeObj["webPort"] = %row[5]
-        if row.len >= 7:
-          nodeObj["status"] = %row[6]
-        else:
-          nodeObj["status"] = %"alive"
-        nodesJson.add(nodeObj)
-    of erkStreamingRows:
-      let iter = nodesResult.streamIterator
-      while iter.hasNextRow():
-        let rowOpt = iter.nextRow()
-        if rowOpt.isSome:
-          let row = rowOpt.get()
-          var nodeObj = newJObject()
-          if row.len >= 2:
-            nodeObj["nodeId"] = %row[1]
-          if row.len >= 3:
-            nodeObj["host"] = %row[2]
-          if row.len >= 4:
-            nodeObj["raftPort"] = %row[3]
-          if row.len >= 5:
-            nodeObj["clientPort"] = %row[4]
-          if row.len >= 6:
-            nodeObj["webPort"] = %row[5]
-          if row.len >= 7:
-            nodeObj["status"] = %row[6]
-          else:
-            nodeObj["status"] = %"alive"
-          nodesJson.add(nodeObj)
-      iter.closeIterator()
-    of erkError:
-      sendJson(Http500, %* {"error": nodesResult.error})
-      return fut
-    else:
-      discard
-    sendJson(Http200, %* nodesJson)
+    var foundLocal = false
+    # Read directly from local backend to avoid blocking the event loop
+    if srv.raftStore != nil:
+      let backend = srv.raftStore.getBackend()
+      if backend != nil and backend.isOpen:
+        let sysNodesPrefix = encodeTableKey(system_tables.SYS_NODES_TABLE_ID, "")
+        let sysNodesEnd = makeScanEndKey(system_tables.SYS_NODES_TABLE_ID)
+        let scanResult = scan(backend, sysNodesPrefix, sysNodesEnd)
+        for item in scanResult:
+          let k = item.key
+          let rawV = item.value
+          if k.len < sysNodesPrefix.len + 1: continue
+          let nodeIdStr = k[sysNodesPrefix.len..^1]
+          let nodeId = try: parseInt(nodeIdStr) except: 0
+          if nodeId <= 0: continue
+          let (payload, isDeleted) = stripMVCCHeader(rawV)
+          if isDeleted or payload.len == 0: continue
+          let rec = try: decodeNodeRecord(payload) except: continue
+          if uint16(nodeId) == srv.config.serverId:
+            foundLocal = true
+          nodesJson.add(%* {
+            "nodeId": $rec.nodeId,
+            "host": rec.host,
+            "raftPort": $rec.raftPort,
+            "clientPort": $rec.clientPort,
+            "webPort": $rec.webPort,
+            "status": "alive"
+          })
+    # Fallback: local node not found in sys.nodes yet (during bootstrap)
+    if not foundLocal:
+      nodesJson.add(%* {
+        "nodeId": $srv.config.serverId,
+        "host": srv.config.host,
+        "raftPort": $srv.config.port,
+        "clientPort": $srv.config.port,
+        "webPort": $srv.config.webPort,
+        "status": "alive"
+      })
+    sendJson(Http200, %nodesJson)
     return fut
 
   # ---- REST: Cluster join ----
@@ -620,10 +652,7 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
     ## The joining node sends its nodeId, host, raftPort, clientPort, webPort.
     ## This node (leader) adds the new node as a Raft peer and returns
     ## all cluster members so the joining node can add them too.
-    {.cast(gcsafe).}: echo "[dashboard] === JOIN REQUEST RECEIVED ==="
-    {.cast(gcsafe).}: echo "[dashboard] path=", path, " method=", httpMethod
     let srv = getSrv()
-    {.cast(gcsafe).}: echo "[dashboard] srv.isNil=", srv.isNil
     if srv.isNil:
       sendJson(Http503, %* {"success": false, "error": "server not ready"})
       return fut
@@ -662,58 +691,36 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
     if newNodeId <= 0 or newHost == "" or newRaftPort <= 0:
       sendJson(Http400, %* {"success": false, "error": "missing required fields"})
       return fut
-    {.cast(gcsafe).}: echo "[dashboard] Parsed join request: nodeId=", newNodeId,
-        " host=", newHost, " raftPort=", newRaftPort,
-        " clientPort=", newClientPort, " webPort=", newWebPort
     # Add the new node as a Raft peer and insert into sys.nodes
-    {.cast(gcsafe).}: echo "[dashboard] Calling addPeerToRaft..."
     {.cast(gcsafe).}:
       srv.addPeerToRaft(uint32(newNodeId), newHost, newRaftPort, newClientPort, newWebPort)
-    {.cast(gcsafe).}: echo "[dashboard] addPeerToRaft completed"
-    # Build list of all cluster members to return
+    # Build list of all cluster members to return.
+    # CRITICAL: Read directly from local backend to avoid blocking the httpbeast
+    # event loop with FractioClient synchronous network I/O.
     var membersJson: seq[JsonNode] = @[]
-    # Query nodes from sys.nodes table
-    var nodesResult: ExecResult
-    {.cast(gcsafe).}:
-      nodesResult = getClient().query("SELECT * FROM sys.nodes")
-    case nodesResult.kind
-    of erkRows:
-      for row in nodesResult.rows:
-        if row.len >= 4:
-          let nodeId = try: parseInt(row[1]) except: 0
-          if nodeId > 0:
-            let raftPort = try: parseInt(row[3]) except: 0
-            let clientPort = try: parseInt(row[4]) except: 0
-            let webPort = if row.len >= 6: (try: parseInt(row[5]) except: 0) else: 0
-            membersJson.add(%* {
-              "nodeId": nodeId,
-              "host": row[2],
-              "raftPort": raftPort,
-              "clientPort": clientPort,
-              "webPort": webPort
-            })
-    of erkStreamingRows:
-      let iter = nodesResult.streamIterator
-      while iter.hasNextRow():
-        let rowOpt = iter.nextRow()
-        if rowOpt.isSome:
-          let row = rowOpt.get()
-          if row.len >= 4:
-            let nodeId = try: parseInt(row[1]) except: 0
-            if nodeId > 0:
-              let raftPort = try: parseInt(row[3]) except: 0
-              let clientPort = try: parseInt(row[4]) except: 0
-              let webPort = if row.len >= 6: (try: parseInt(row[5]) except: 0) else: 0
-              membersJson.add(%* {
-                "nodeId": nodeId,
-                "host": row[2],
-                "raftPort": raftPort,
-                "clientPort": clientPort,
-                "webPort": webPort
-              })
-      iter.closeIterator()
-    else:
-      discard
+    if srv.raftStore != nil:
+      let backend = srv.raftStore.getBackend()
+      if backend != nil and backend.isOpen:
+        let sysNodesPrefix = encodeTableKey(system_tables.SYS_NODES_TABLE_ID, "")
+        let sysNodesEnd = makeScanEndKey(system_tables.SYS_NODES_TABLE_ID)
+        let scanResult = scan(backend, sysNodesPrefix, sysNodesEnd)
+        for item in scanResult:
+          let k = item.key
+          let rawV = item.value
+          if k.len < sysNodesPrefix.len + 1: continue
+          let nodeIdStr = k[sysNodesPrefix.len..^1]
+          let nodeId = try: parseInt(nodeIdStr) except: 0
+          if nodeId <= 0: continue
+          let (payload, isDeleted) = stripMVCCHeader(rawV)
+          if isDeleted or payload.len == 0: continue
+          let rec = try: decodeNodeRecord(payload) except: continue
+          membersJson.add(%* {
+            "nodeId": rec.nodeId.int,
+            "host": rec.host,
+            "raftPort": rec.raftPort.int,
+            "clientPort": rec.clientPort.int,
+            "webPort": rec.webPort.int
+          })
     # Get the current leader to pass as preferred leader for joining node
     # If no leader yet (election in progress), use this node's ID
     # since this node is the one adding the new member
@@ -736,25 +743,42 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
   # ---- REST: Health check ----
   if path == "/api/health" and httpMethod == HttpGet:
     ## Health check endpoint for tests and monitoring.
-    ## Returns status=0 if healthy, metaLeaderOK if meta group has a leader.
+    ## Returns status=0 if healthy, metaLeaderOK if meta group has a leader,
+    ## dataLeaderOK if the default data group has a leader.
     let srv = getSrv()
     if srv.isNil:
       sendJson(Http503, %* {"status": 1, "error": "server not ready"})
       return fut
     var status = 0
     var metaLeaderOK = false
+    var dataLeaderOK = false
     # Check if meta group has a leader
     if srv.raftCoord != nil and srv.raftCoord.running.load():
       let metaLeader = srv.raftCoord.getLeader(system_tables.META_GROUP_ID)
       metaLeaderOK = metaLeader > 0
+      let dataLeader = srv.raftCoord.getLeader(system_tables.DATA_GROUP_START_ID)
+      dataLeaderOK = dataLeader > 0
       if not metaLeaderOK:
         status = 2  # No meta leader
+      elif not dataLeaderOK:
+        status = 3  # Meta leader OK but data group leader missing
     else:
       status = 1  # Server not fully initialized
+    # Include server counts in response for diagnostics
+    var metaSrvCount = -1
+    var dataSrvCount = -1
+    if srv.raftCoord != nil and srv.raftCoord.running.load():
+      metaSrvCount = srv.raftCoord.getGroupServerCount(
+          system_tables.META_GROUP_ID)
+      dataSrvCount = srv.raftCoord.getGroupServerCount(
+          system_tables.DATA_GROUP_START_ID)
     sendJson(Http200, %* {
       "status": status,
-      "leaderOK": metaLeaderOK,
+      "leaderOK": metaLeaderOK and dataLeaderOK,
       "metaLeaderOK": metaLeaderOK,
+      "dataLeaderOK": dataLeaderOK,
+      "metaServerCount": metaSrvCount,
+      "dataServerCount": dataSrvCount,
       "clusterName": srv.config.clusterName,
       "nodeId": srv.config.serverId.int,
       "version": srv.config.serverVersion
@@ -893,7 +917,31 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
     let startTime = cpuTime()
     var execResult: ExecResult
     {.cast(gcsafe).}:
-      execResult = getClient().query(sql, db, sc)
+      # Proactively refresh stale metadata before attempting the query.
+      # After a leader failover, the gClient's cached leader info may point
+      # to the dead leader. Refreshing metadata ensures we know the current
+      # leader and avoids long retry loops that block the HTTP response.
+      let cl = getClient()
+      if not cl.initialized.load(moRelaxed) or cl.groups.len == 0:
+        discard cl.forceMetadataRefresh()
+      execResult = cl.query(sql, db, sc)
+      # If the query failed with a connection/leader error, reset the client
+      # and retry once. This handles stale cached connections after a failover.
+      # The retry is limited to ONE attempt to avoid blocking the event loop.
+      if execResult.kind == erkError:
+        let errLower = execResult.error.toLowerAscii()
+        if errLower.contains("no connection") or
+           errLower.contains("not leader") or
+           errLower.contains("not the leader") or
+           errLower.contains("send incomplete") or
+           errLower.contains("not connected") or
+           errLower.contains("connection refused") or
+           errLower.contains("too many retries") or
+           errLower.contains("failed to initialize client") or
+           errLower.contains("short header"):
+          {.cast(gcsafe).}:
+            resetClient()
+            execResult = getClient().query(sql, db, sc)
     let elapsed = cpuTime() - startTime
     let elapsedMs = (elapsed * 1000).formatFloat(format = ffDecimal, precision = 2)
 

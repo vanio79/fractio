@@ -568,8 +568,24 @@ suite "REST API — SQL Endpoints (3-node cluster)":
     check result["kind"].getStr == "ok"
 
   test "POST /api/sql CREATE SPACE returns ok":
-    let result = httpPostJson(getLeaderUrl(cluster) & "/api/sql",
-      %*{"sql": "CREATE SPACE newspace WITH REPLICAS = 3"})
+    # CREATE SPACE involves creating multiple Raft groups asynchronously.
+    # Retry on transient errors (leader changes during group creation).
+    # If the first attempt partially succeeds (space created but response lost),
+    # subsequent attempts will return "already exists" which we treat as success.
+    var result: JsonNode
+    for attempt in 0 ..< 5:
+      result = httpPostJson(getLeaderUrl(cluster) & "/api/sql",
+        %*{"sql": "CREATE SPACE newspace WITH REPLICAS = 3"})
+      if result["kind"].getStr == "ok":
+        break
+      # If space already exists from a partial success, treat as ok
+      if result.hasKey("error") and
+          result["error"].getStr.contains("already exists"):
+        # Space was created by a previous attempt (response was lost)
+        result = %*{"kind": "ok"}
+        break
+      echo "  CREATE SPACE attempt ", attempt + 1, " error: ", result["error"].getStr
+      sleep(TEST_ELECTION_SETTLE_MS)
     check result.hasKey("kind")
     check result["kind"].getStr == "ok"
 

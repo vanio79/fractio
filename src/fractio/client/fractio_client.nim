@@ -70,6 +70,7 @@ type
     requestTimeoutMs*: int    ## Timeout for requests
     refreshIntervalMs*: int   ## How often to refresh metadata
     autoRefresh*: bool        ## Automatically refresh metadata
+    maxKvRetries*: int        ## Max retries for KV operations (0 = use default per-method)
 
   FractioClient* = ref object of KVStoreWithRouting
     ## Main client for Fractio with leader-aware routing.
@@ -85,6 +86,8 @@ type
     # Active connections to leaders
     leaderConnections*: stdtables.Table[GroupID,
         ProtocolClient] # groupId -> connection to leader
+    leaderConnectionNodes*: stdtables.Table[GroupID,
+        uint32] # groupId -> nodeId the connection belongs to
 
     # Key prefix to group mapping (for routing)
     keyPrefixToGroup*: stdtables.Table[string, GroupID]
@@ -97,6 +100,9 @@ type
     lastRefreshNs*: Atomic[int64]
     activeTxnId*: TransactionID
     activeReadTs*: uint64
+
+    # Transaction group tracking: which groups participated in each txn
+    txnGroups*: stdtables.Table[TransactionID, HashSet[GroupID]]
 
 # =============================================================================
 # Backward-compatible KV operation wrappers (kvGet, kvPut, kvDelete, kvScan)
@@ -139,7 +145,8 @@ proc newFractioClientConfig*(host: string, port: int): FractioClientConfig =
     connectionTimeoutMs: 5000,
     requestTimeoutMs: 30000,
     refreshIntervalMs: 30000,
-    autoRefresh: true
+    autoRefresh: true,
+    maxKvRetries: 0 # 0 means use per-method defaults
   )
 
 proc newFractioClient*(config: FractioClientConfig): FractioClient =
@@ -159,18 +166,22 @@ proc newFractioClient*(host: string, port: int): FractioClient =
 proc connectToNode(client: FractioClient, host: string, port: int): Option[
     ProtocolClient] =
   ## Connect to a specific node
-  ## Use requestTimeoutMs for socket operations since requests (like CREATE SPACE)
-  ## can take longer than connection establishment.
+  ## Uses connectionTimeoutMs for the initial connection attempt (shorter timeout
+  ## to avoid blocking on dead nodes) and requestTimeoutMs for subsequent
+  ## socket operations after connection is established.
+  ## After successful connect, update the timeout to requestTimeoutMs for I/O.
   let cfg = ClientConfig(
     host: host,
     port: port,
-    timeoutMs: client.config.requestTimeoutMs,
+    timeoutMs: client.config.connectionTimeoutMs,
     clientId: "fractio-client",
     authMethod: amNone,
     authData: ""
   )
   let protoClient = newProtocolClient(cfg)
   if protoClient.connect().isOk:
+    # Upgrade timeout for normal I/O operations after connection established
+    protoClient.config.timeoutMs = client.config.requestTimeoutMs
     return some(protoClient)
   return none(ProtocolClient)
 
@@ -205,17 +216,45 @@ proc getNodeConnection(client: FractioClient, nodeId: uint32): Option[
     return client.getNodeConnectionInternal(nodeId)
 
 # =============================================================================
+# Metadata fetch result
+# =============================================================================
+
+type
+  MetadataFetchResult* = object
+    ## Result of a metadata fetch operation.
+    ## When the server returns NOT_LEADER, includes redirect info
+    ## so the caller can connect directly to the correct leader.
+    success*: bool
+    leaderRedirect*: LeaderRedirect ## Set when success=false and reason is NOT_LEADER
+
+proc okFetch*(): MetadataFetchResult =
+  MetadataFetchResult(success: true)
+
+proc errFetch*(redirect: LeaderRedirect = LeaderRedirect()): MetadataFetchResult =
+  MetadataFetchResult(success: false, leaderRedirect: redirect)
+
+# =============================================================================
 # Metadata refresh
 # =============================================================================
 
-proc fetchNodesTable(client: FractioClient, conn: ProtocolClient): bool =
-  ## Fetch the sys.nodes table and update the cache
+proc fetchNodesTable(client: FractioClient, conn: ProtocolClient,
+    requireLeader: bool = false): MetadataFetchResult =
+  ## Fetch the sys.nodes table and update the cache.
+  ## If requireLeader is true, routes the scan to META_GROUP_ID so the
+  ## server rejects it if this node is not the leader. Use this for
+  ## refreshMetadata to avoid stale follower reads.
+  ## Returns MetadataFetchResult with leaderRedirect when the server
+  ## returns NOT_LEADER, so callers can redirect to the correct leader.
   let startKey = encodeTableKey(SYS_NODES_TABLE_ID, "")
   let endKey = makeScanEndKey(SYS_NODES_TABLE_ID)
 
-  let scanRes = conn.kvScan(startKey, endKey, limit = 1000)
+  let gid = if requireLeader: META_GROUP_ID else: ZeroGroupID()
+  let scanRes = conn.kvScan(startKey, endKey, limit = 1000, groupId = gid)
   if scanRes.isErr:
-    return false
+    # If this was a NOT_LEADER error, include redirect info
+    if scanRes.error.kind == peNotLeader:
+      return errFetch(scanRes.error.leaderRedirect)
+    return errFetch()
 
   withLock client.lock:
     for pair in scanRes.value.pairs:
@@ -230,16 +269,20 @@ proc fetchNodesTable(client: FractioClient, conn: ProtocolClient): bool =
         client: nil # Will be created on-demand
       )
 
-  return true
+  return okFetch()
 
-proc fetchGroupsTable(client: FractioClient, conn: ProtocolClient): bool =
+proc fetchGroupsTable(client: FractioClient, conn: ProtocolClient,
+    requireLeader: bool = false): MetadataFetchResult =
   ## Fetch the sys.groups table and update the cache
   let startKey = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
   let endKey = makeScanEndKey(SYS_GROUPS_TABLE_ID)
 
-  let scanRes = conn.kvScan(startKey, endKey, limit = 1000)
+  let gid = if requireLeader: META_GROUP_ID else: ZeroGroupID()
+  let scanRes = conn.kvScan(startKey, endKey, limit = 1000, groupId = gid)
   if scanRes.isErr:
-    return false
+    if scanRes.error.kind == peNotLeader:
+      return errFetch(scanRes.error.leaderRedirect)
+    return errFetch()
 
   withLock client.lock:
     for pair in scanRes.value.pairs:
@@ -257,16 +300,20 @@ proc fetchGroupsTable(client: FractioClient, conn: ProtocolClient): bool =
         replicaNodeIds: replicaNodeIds
       )
 
-  return true
+  return okFetch()
 
-proc fetchTablesTable(client: FractioClient, conn: ProtocolClient): bool =
+proc fetchTablesTable(client: FractioClient, conn: ProtocolClient,
+    requireLeader: bool = false): MetadataFetchResult =
   ## Fetch the sys.tables table and update the cache
   let startKey = encodeTableKey(SYS_TABLES_TABLE_ID, "")
   let endKey = makeScanEndKey(SYS_TABLES_TABLE_ID)
 
-  let scanRes = conn.kvScan(startKey, endKey, limit = 1000)
+  let gid = if requireLeader: META_GROUP_ID else: ZeroGroupID()
+  let scanRes = conn.kvScan(startKey, endKey, limit = 1000, groupId = gid)
   if scanRes.isErr:
-    return false
+    if scanRes.error.kind == peNotLeader:
+      return errFetch(scanRes.error.leaderRedirect)
+    return errFetch()
 
   withLock client.lock:
     for pair in scanRes.value.pairs:
@@ -279,16 +326,20 @@ proc fetchTablesTable(client: FractioClient, conn: ProtocolClient): bool =
         spaceId: tableRec.spaceId
       )
 
-  return true
+  return okFetch()
 
-proc fetchSpacesTable(client: FractioClient, conn: ProtocolClient): bool =
+proc fetchSpacesTable(client: FractioClient, conn: ProtocolClient,
+    requireLeader: bool = false): MetadataFetchResult =
   ## Fetch the sys.spaces table and update the cache
   let startKey = encodeTableKey(SYS_SPACES_TABLE_ID, "")
   let endKey = makeScanEndKey(SYS_SPACES_TABLE_ID)
 
-  let scanRes = conn.kvScan(startKey, endKey, limit = 1000)
+  let gid = if requireLeader: META_GROUP_ID else: ZeroGroupID()
+  let scanRes = conn.kvScan(startKey, endKey, limit = 1000, groupId = gid)
   if scanRes.isErr:
-    return false
+    if scanRes.error.kind == peNotLeader:
+      return errFetch(scanRes.error.leaderRedirect)
+    return errFetch()
 
   withLock client.lock:
     for pair in scanRes.value.pairs:
@@ -303,7 +354,7 @@ proc fetchSpacesTable(client: FractioClient, conn: ProtocolClient): bool =
         rebalancing: spaceRec.rebalancing
       )
 
-  return true
+  return okFetch()
 
 proc initialize*(client: FractioClient): bool =
   ## Initialize the client by fetching metadata from the cluster.
@@ -321,52 +372,182 @@ proc initialize*(client: FractioClient): bool =
   defer: conn.disconnect()
 
   # Fetch system tables
-  if not client.fetchNodesTable(conn):
+  let nodesResult = client.fetchNodesTable(conn)
+  if not nodesResult.success:
     return false
-  if not client.fetchGroupsTable(conn):
+  let groupsResult = client.fetchGroupsTable(conn)
+  if not groupsResult.success:
     return false
-  if not client.fetchTablesTable(conn):
+  let tablesResult = client.fetchTablesTable(conn)
+  if not tablesResult.success:
     # Not fatal - tables may not exist yet
     discard
-  if not client.fetchSpacesTable(conn):
+  let spacesResult = client.fetchSpacesTable(conn)
+  if not spacesResult.success:
     # Not fatal - spaces may not exist yet
     discard
 
   client.initialized.store(true, moRelaxed)
   return true
 
+# Forward declaration (defined in Leader connection management section)
+proc getGroupLeaderConnection*(client: FractioClient, groupId: GroupID): Option[
+    ProtocolClient] {.gcsafe.}
+proc invalidateGroupLeader*(client: FractioClient, groupId: GroupID) {.gcsafe.}
+proc updateLeaderFromRedirect*(client: FractioClient, groupId: GroupID,
+    redirect: LeaderRedirect) {.gcsafe.}
+
 proc refreshMetadata*(client: FractioClient): bool =
-  ## Refresh cached metadata from the cluster
+  ## Refresh cached metadata from the cluster.
+  ## ONLY reads from the META group leader. Followers may have stale
+  ## metadata; reading from them causes split-brain catalog views.
+  ## Uses NOT_LEADER redirect info to quickly find the correct leader
+  ## instead of blindly retrying through followers.
   if not client.initialized.load(moRelaxed):
     return client.initialize()
 
-  # Try to use an existing connection, or connect to initial node
-  var conn: ProtocolClient = nil
-  var shouldDisconnect = false
+  # Use fewer attempts for dashboard mode (low maxKvRetries).
+  # With NOT_LEADER redirect info, most attempts resolve in 1-2 tries.
+  let maxAttempts = if client.config.maxKvRetries > 0 and
+                       client.config.maxKvRetries <= 5:
+                      client.config.maxKvRetries
+                    elif client.config.maxKvRetries > 0 and
+                         client.config.maxKvRetries <= 15:
+                      10
+                    else:
+                      30
+  const baseBackoffMs = 50
+  var failedNodeIds = initHashSet[uint32]()
 
-  withLock client.lock:
-    # Try to find an existing connection
-    for nodeId, nodeInfo in client.nodes:
-      if nodeInfo.client != nil and nodeInfo.client.connected.load(moRelaxed):
-        conn = nodeInfo.client
-        break
+  for attempt in 0 ..< maxAttempts:
+    var conn: ProtocolClient = nil
+    var shouldDisconnect = false
 
-  if conn.isNil:
-    # Connect to initial node
-    let connOpt = client.connectToNode(client.config.initialHost,
-        client.config.initialPort)
-    if connOpt.isNone:
-      return false
-    conn = connOpt.get()
-    shouldDisconnect = true
+    # 1. Try the META group leader first (freshest metadata)
+    let metaConnOpt = client.getGroupLeaderConnection(META_GROUP_ID)
+    if metaConnOpt.isSome:
+      conn = metaConnOpt.get()
+    else:
+      # 2. Try all known nodes, skipping nodes that already returned NOT_LEADER
+      var connected = false
+      withLock client.lock:
+        var nodeIds = newSeq[uint32]()
+        for nid in client.nodes.keys:
+          nodeIds.add(nid)
+        nodeIds.sort()
+        # Try nodes that haven't failed first
+        for nid in nodeIds:
+          if nid in failedNodeIds:
+            continue
+          let nodeInfo = client.nodes[nid]
+          let connOpt = client.connectToNode(nodeInfo.host, int(
+              nodeInfo.clientPort))
+          if connOpt.isSome:
+            conn = connOpt.get()
+            shouldDisconnect = true
+            connected = true
+            break
+        # If all known nodes failed, try the failed ones (leader may have changed)
+        if not connected:
+          for nid in nodeIds:
+            if nid notin failedNodeIds:
+              continue # Already tried above
+            let nodeInfo = client.nodes[nid]
+            let connOpt = client.connectToNode(nodeInfo.host, int(
+                nodeInfo.clientPort))
+            if connOpt.isSome:
+              conn = connOpt.get()
+              shouldDisconnect = true
+              connected = true
+              break
+      if not connected:
+        # 3. Last resort: connect to the initial node
+        let connOpt = client.connectToNode(client.config.initialHost,
+            client.config.initialPort)
+        if connOpt.isSome:
+          conn = connOpt.get()
+          shouldDisconnect = true
 
-  # Perform the refresh
-  result = client.fetchNodesTable(conn) and client.fetchGroupsTable(conn) and
-           client.fetchTablesTable(conn) and client.fetchSpacesTable(conn)
+    if conn.isNil:
+      # No connection available - wait and retry
+      if attempt < maxAttempts - 1:
+        sleep(baseBackoffMs + attempt * 10)
+      continue
 
-  # Disconnect if we created a temporary connection
-  if shouldDisconnect:
-    conn.disconnect()
+    # Try fetching metadata. If this connection is NOT the leader,
+    # the server will return NOT_LEADER with redirect info.
+    let nodesResult = client.fetchNodesTable(conn, requireLeader = true)
+    if not nodesResult.success:
+      if nodesResult.leaderRedirect.leaderId != 0:
+        # Server told us who the leader is! Use the redirect info
+        # to update our cache and connect directly on the next attempt.
+        client.updateLeaderFromRedirect(META_GROUP_ID,
+            nodesResult.leaderRedirect)
+        # Also try connecting directly to the redirected leader now
+        if shouldDisconnect:
+          conn.disconnect()
+        let redirectConn = client.connectToNode(
+            nodesResult.leaderRedirect.leaderHost,
+            int(nodesResult.leaderRedirect.leaderClientPort))
+        if redirectConn.isSome:
+          let leaderConn = redirectConn.get()
+          let nodesOk2 = client.fetchNodesTable(leaderConn,
+              requireLeader = true)
+          if nodesOk2.success:
+            # Success! Fetch remaining tables from the leader
+            discard client.fetchGroupsTable(leaderConn, requireLeader = true)
+            discard client.fetchTablesTable(leaderConn, requireLeader = true)
+            discard client.fetchSpacesTable(leaderConn, requireLeader = true)
+            leaderConn.disconnect()
+            return true
+          elif nodesOk2.leaderRedirect.leaderId != 0:
+            # Another redirect — update and retry
+            client.updateLeaderFromRedirect(META_GROUP_ID,
+                nodesOk2.leaderRedirect)
+          leaderConn.disconnect()
+        # Clear failed set since leader info changed
+        failedNodeIds = initHashSet[uint32]()
+        if attempt < maxAttempts - 1:
+          sleep(baseBackoffMs)
+        continue
+
+      # No redirect info — connection is to a follower that doesn't know
+      # the leader. Remember this node and try others.
+      withLock client.lock:
+        for nid, nodeInfo in client.nodes:
+          if nodeInfo.client == conn or
+             (nodeInfo.host == conn.config.host and
+              nodeInfo.clientPort == conn.config.port.uint16):
+            failedNodeIds.incl(nid)
+            break
+      client.invalidateGroupLeader(META_GROUP_ID)
+      if shouldDisconnect:
+        conn.disconnect()
+      if attempt < maxAttempts - 1:
+        sleep(baseBackoffMs + attempt * 10)
+      continue
+
+    # We have a verified leader connection. Fetch remaining tables.
+    let groupsOk = client.fetchGroupsTable(conn, requireLeader = true)
+    # If groups table fetch returned NOT_LEADER with redirect, follow it
+    if not groupsOk.success and groupsOk.leaderRedirect.leaderId != 0:
+      client.updateLeaderFromRedirect(META_GROUP_ID,
+          groupsOk.leaderRedirect)
+      if shouldDisconnect:
+        conn.disconnect()
+      continue
+
+    discard client.fetchTablesTable(conn, requireLeader = true)
+    discard client.fetchSpacesTable(conn, requireLeader = true)
+
+    if shouldDisconnect:
+      conn.disconnect()
+
+    return true
+
+  # All retries exhausted - could not find META leader.
+  # Return false rather than reading stale follower data.
+  false
 
 # =============================================================================
 # Leader connection management
@@ -377,51 +558,46 @@ proc getGroupLeaderConnection*(client: FractioClient, groupId: GroupID): Option[
   ## Get a connection to the leader of a specific group.
   ## Uses cached leader info, falls back to trying all replicas.
 
-  {.cast(gcsafe).}: echo "[Nim] getGroupLeaderConnection: groupId=", groupId
-
   withLock client.lock:
     # Check if we have cached group info
     if groupId notin client.groups:
-      {.cast(gcsafe).}: echo "[Nim] getGroupLeaderConnection: groupId not in client.groups"
       return none(ProtocolClient)
 
     let groupInfo = client.groups[groupId]
-    {.cast(gcsafe).}: echo "[Nim] getGroupLeaderConnection: leaderNodeId=",
-        groupInfo.leaderNodeId, " replicas=", groupInfo.replicaNodeIds.len
 
     # If we know the leader and have a connection, use it
     if groupInfo.leaderNodeId != 0:
-      # Check cached connection
-      if groupId in client.leaderConnections:
+      # Check cached connection - validate it matches current leader
+      if groupId in client.leaderConnections and groupId in
+          client.leaderConnectionNodes:
         let cached = client.leaderConnections[groupId]
-        if cached != nil and cached.connected.load(moRelaxed):
-          {.cast(gcsafe).}: echo "[Nim] getGroupLeaderConnection: using cached connection"
+        let cachedNodeId = client.leaderConnectionNodes[groupId]
+        if cached != nil and cached.connected.load(moRelaxed) and
+            cachedNodeId == groupInfo.leaderNodeId:
           return some(cached)
+        # Stale cache - disconnect and remove
+        try:
+          cached.disconnect()
+        except: discard
+        client.leaderConnections.del(groupId)
+        client.leaderConnectionNodes.del(groupId)
 
       # Try to connect to leader (use internal version since we hold the lock)
-      {.cast(gcsafe).}: echo "[Nim] getGroupLeaderConnection: trying to connect to leader nodeId=",
-          groupInfo.leaderNodeId
       let connOpt = client.getNodeConnectionInternal(groupInfo.leaderNodeId)
       if connOpt.isSome:
         client.leaderConnections[groupId] = connOpt.get()
-        {.cast(gcsafe).}: echo "[Nim] getGroupLeaderConnection: connected to leader nodeId=",
-            groupInfo.leaderNodeId
+        client.leaderConnectionNodes[groupId] = groupInfo.leaderNodeId
         return connOpt
-      {.cast(gcsafe).}: echo "[Nim] getGroupLeaderConnection: leader connection FAILED nodeId=",
-          groupInfo.leaderNodeId
       # Leader connection failed - fall through to try replicas
 
     # Leader unknown or connection to known leader failed - try all replicas
-    {.cast(gcsafe).}: echo "[Nim] getGroupLeaderConnection: trying replicas"
     for nodeId in groupInfo.replicaNodeIds:
       let connOpt = client.getNodeConnectionInternal(nodeId)
       if connOpt.isSome:
-        {.cast(gcsafe).}: echo "[Nim] getGroupLeaderConnection: connected to replica nodeId=", nodeId
         # We'll try this connection; if it's not the leader,
         # the operation will fail and we'll retry
         return connOpt
 
-  {.cast(gcsafe).}: echo "[Nim] getGroupLeaderConnection: returning none"
   return none(ProtocolClient)
 
 proc invalidateGroupLeader*(client: FractioClient, groupId: GroupID) =
@@ -433,10 +609,91 @@ proc invalidateGroupLeader*(client: FractioClient, groupId: GroupID) =
         client.leaderConnections[groupId].disconnect()
       except: discard
       client.leaderConnections.del(groupId)
+    if groupId in client.leaderConnectionNodes:
+      client.leaderConnectionNodes.del(groupId)
     if groupId in client.groups:
       var info = client.groups[groupId]
       info.leaderNodeId = 0
       client.groups[groupId] = info
+
+proc updateLeaderFromRedirect*(client: FractioClient, groupId: GroupID,
+    redirect: LeaderRedirect) {.gcsafe.} =
+  ## Update the cached leader info for a group based on a NOT_LEADER redirect.
+  ## This allows the client to immediately connect to the correct leader on
+  ## the next attempt, avoiding repeated NOT_LEADER errors.
+  if redirect.leaderId == 0:
+    return
+  withLock client.lock:
+    if groupId in client.groups:
+      var info = client.groups[groupId]
+      info.leaderNodeId = redirect.leaderId
+      client.groups[groupId] = info
+    # Invalidate cached connection for this group (it points to a follower)
+    if groupId in client.leaderConnections:
+      try:
+        client.leaderConnections[groupId].disconnect()
+      except: discard
+      client.leaderConnections.del(groupId)
+    if groupId in client.leaderConnectionNodes:
+      client.leaderConnectionNodes.del(groupId)
+    # Also update the node cache with the redirect info so we can connect
+    # directly to the leader on the next attempt.
+    if redirect.leaderHost.len > 0 and redirect.leaderClientPort > 0:
+      let nid = redirect.leaderId
+      if nid in client.nodes:
+        # Update existing node info with correct host/port if needed
+        var nodeInfo = client.nodes[nid]
+        if nodeInfo.host != redirect.leaderHost or
+           nodeInfo.clientPort != redirect.leaderClientPort:
+          # Disconnect stale connection if any
+          if nodeInfo.client != nil:
+            try: nodeInfo.client.disconnect() except: discard
+            nodeInfo.client = nil
+          nodeInfo.host = redirect.leaderHost
+          nodeInfo.clientPort = redirect.leaderClientPort
+          client.nodes[nid] = nodeInfo
+      else:
+        # Add this node to the cache
+        client.nodes[nid] = NodeInfo(
+          nodeId: nid,
+          host: redirect.leaderHost,
+          clientPort: redirect.leaderClientPort,
+          status: nsAlive,
+          client: nil
+        )
+
+proc invalidateAllLeaderConnections*(client: FractioClient) =
+  ## Invalidate ALL cached leader connections. Used when a leadership
+  ## change is detected (e.g., after errors that suggest stale metadata).
+  withLock client.lock:
+    for groupId, conn in client.leaderConnections:
+      try:
+        conn.disconnect()
+      except: discard
+    client.leaderConnections.clear()
+    client.leaderConnectionNodes.clear()
+    # Also clear node-level cached connections (they may point to dead nodes)
+    for nid, nodeInfo in client.nodes:
+      if nodeInfo.client != nil:
+        try:
+          nodeInfo.client.disconnect()
+        except: discard
+        var mutableInfo = nodeInfo
+        mutableInfo.client = nil
+        client.nodes[nid] = mutableInfo
+    # Reset all group leader IDs to force re-discovery
+    for gid, info in client.groups:
+      var mutableInfo = info
+      mutableInfo.leaderNodeId = 0
+      client.groups[gid] = mutableInfo
+
+proc forceMetadataRefresh*(client: FractioClient): bool =
+  ## Force a full metadata refresh by first invalidating all cached
+  ## connections and leader info, then refreshing metadata from the cluster.
+  ## This is more aggressive than refreshMetadata() and should be used
+  ## when the client detects stale state (e.g., after connection failures).
+  client.invalidateAllLeaderConnections()
+  client.refreshMetadata()
 
 proc refreshGroupLeader(client: FractioClient, groupId: GroupID): bool =
   ## Refresh leader info for a specific group after a "not leader" error
@@ -448,6 +705,8 @@ proc refreshGroupLeader(client: FractioClient, groupId: GroupID): bool =
         client.leaderConnections[groupId].disconnect()
       except: discard
       client.leaderConnections.del(groupId)
+    if groupId in client.leaderConnectionNodes:
+      client.leaderConnectionNodes.del(groupId)
 
   # Refresh metadata
   if not client.refreshMetadata():
@@ -460,6 +719,13 @@ proc refreshGroupLeader(client: FractioClient, groupId: GroupID): bool =
     discard posix.sleep(50)
 
   true
+
+proc getMaxRetries(client: FractioClient): int {.inline.} =
+  ## Get the max retry count for KV operations.
+  ## If maxKvRetries is configured (> 0), use it; otherwise use the default.
+  if client.config.maxKvRetries > 0:
+    return client.config.maxKvRetries
+  return 100
 
 # =============================================================================
 # Routing state conversion
@@ -512,7 +778,7 @@ method get*(client: FractioClient, key: string,
 
   let groupId = client.getGroupForKey(key)
 
-  const maxRetries = 100
+  let maxRetries = client.getMaxRetries()
   const baseBackoffMs = 50
 
   # Try multiple times (in case of leader changes or connection failures)
@@ -526,7 +792,8 @@ method get*(client: FractioClient, key: string,
       return kvOpErr[Option[string]]("no connection to group leader")
 
     let conn = connOpt.get()
-    let res = conn.kvGet(key, txnId = txnId, readTimestamp = readTimestamp)
+    let res = conn.kvGetInGroup(key, groupId, txnId = txnId,
+        readTimestamp = readTimestamp)
 
     if res.isOk:
       if res.value.found:
@@ -534,10 +801,12 @@ method get*(client: FractioClient, key: string,
       else:
         return kvOpOk(none(string))
 
-    # Check for "not leader" error - refresh metadata to find new leader
+    # Check for "not leader" error - use redirect info and refresh metadata
     if res.error.kind == peNotLeader:
-      if not client.refreshMetadata():
-        discard
+      if res.error.leaderRedirect.leaderId != 0:
+        client.updateLeaderFromRedirect(groupId, res.error.leaderRedirect)
+      else:
+        discard client.refreshMetadata()
       if attempt < maxRetries - 1:
         sleep(baseBackoffMs + attempt * 5)
       continue
@@ -569,7 +838,7 @@ proc getWithFilter*(client: FractioClient, key: string,
 
   let groupId = client.getGroupForKey(key)
 
-  const maxRetries = 100
+  let maxRetries = client.getMaxRetries()
   const baseBackoffMs = 50
 
   # Try multiple times (in case of leader changes)
@@ -583,7 +852,7 @@ proc getWithFilter*(client: FractioClient, key: string,
       return kvOpErr[Option[string]]("no connection to group leader")
 
     let conn = connOpt.get()
-    let res = conn.kvGet(key, filter = filter, txnId = txnId,
+    let res = conn.kvGetInGroup(key, groupId, filter = filter, txnId = txnId,
                          readTimestamp = readTimestamp)
 
     if res.isOk:
@@ -593,13 +862,23 @@ proc getWithFilter*(client: FractioClient, key: string,
         # Row either doesn't exist or doesn't pass filter
         return kvOpOk(none(string))
 
-    # Check for "not leader" error - refresh metadata to find new leader
+    # Check for "not leader" error - use redirect info and refresh metadata
     if res.error.kind == peNotLeader:
-      if not client.refreshMetadata():
-        discard
+      if res.error.leaderRedirect.leaderId != 0:
+        client.updateLeaderFromRedirect(groupId, res.error.leaderRedirect)
+      else:
+        discard client.refreshMetadata()
       if attempt < maxRetries - 1:
         sleep(baseBackoffMs + attempt * 5)
       continue
+
+    if res.error.kind == peInternal:
+      # Connection failure - invalidate cached connection and retry
+      client.invalidateGroupLeader(groupId)
+      discard client.refreshMetadata()
+      if attempt < maxRetries - 1:
+        sleep(baseBackoffMs + attempt * 5)
+        continue
 
     return kvOpErr[Option[string]](res.error.msg)
 
@@ -614,9 +893,16 @@ method put*(client: FractioClient, key: string, value: string,
 
   let groupId = client.getGroupForKey(key)
 
+  # Track group participation for distributed transaction resolution
+  if txnId != zeroTransactionID():
+    withLock client.lock:
+      if txnId notin client.txnGroups:
+        client.txnGroups[txnId] = initHashSet[GroupID]()
+      client.txnGroups[txnId].incl(groupId)
+
   # Retry with backoff to handle leader election races during group creation.
   # New groups may need time for leader election, especially during CREATE SPACE.
-  const maxRetries = 100
+  let maxRetries = client.getMaxRetries()
   const baseBackoffMs = 50
 
   for attempt in 0 ..< maxRetries:
@@ -629,7 +915,7 @@ method put*(client: FractioClient, key: string, value: string,
       return kvVoidErr("no connection to group leader")
 
     let conn = connOpt.get()
-    let res = conn.kvPut(key, value, txnId = txnId)
+    let res = conn.kvPutInGroup(key, value, groupId, txnId = txnId)
 
     if res.isOk and res.value.status == kvMsgs.PutStatusOK:
       return kvVoidOk()
@@ -637,13 +923,27 @@ method put*(client: FractioClient, key: string, value: string,
     # Check for "not leader" error
     if res.isErr:
       if res.error.kind == peNotLeader:
-        # Refresh metadata to find new leader
-        discard client.refreshMetadata()
+        # Use redirect info to find new leader quickly.
+        # Only refresh metadata if we don't have valid redirect info,
+        # since refreshMetadata can overwrite the redirect-based leader
+        # with stale data from the groups table.
+        if res.error.leaderRedirect.leaderId != 0:
+          client.updateLeaderFromRedirect(groupId, res.error.leaderRedirect)
+        else:
+          discard client.refreshMetadata()
         if attempt < maxRetries - 1:
           sleep(baseBackoffMs + attempt * 5)
         continue
       elif isNotLeaderError(res.error.msg):
         # Legacy: check message content for backward compatibility
+        discard client.refreshMetadata()
+        if attempt < maxRetries - 1:
+          sleep(baseBackoffMs + attempt * 5)
+        continue
+      elif res.error.kind == peInternal:
+        # Connection failure (e.g. "send incomplete") - invalidate cached
+        # connection and retry with refreshed metadata.
+        client.invalidateGroupLeader(groupId)
         discard client.refreshMetadata()
         if attempt < maxRetries - 1:
           sleep(baseBackoffMs + attempt * 5)
@@ -664,7 +964,14 @@ method delete*(client: FractioClient, key: string,
 
   let groupId = client.getGroupForKey(key)
 
-  const maxRetries = 100
+  # Track group participation for distributed transaction resolution
+  if txnId != zeroTransactionID():
+    withLock client.lock:
+      if txnId notin client.txnGroups:
+        client.txnGroups[txnId] = initHashSet[GroupID]()
+      client.txnGroups[txnId].incl(groupId)
+
+  let maxRetries = client.getMaxRetries()
   const baseBackoffMs = 50
 
   for attempt in 0 ..< maxRetries:
@@ -677,14 +984,26 @@ method delete*(client: FractioClient, key: string,
       return kvVoidErr("no connection to group leader")
 
     let conn = connOpt.get()
-    let res = conn.kvDelete(key, txnId = txnId)
+    let res = conn.kvDeleteInGroup(key, groupId, txnId = txnId)
 
     if res.isOk and res.value.status in {kvMsgs.DelStatusDeleted,
         kvMsgs.DelStatusNotFound}:
       return kvVoidOk()
 
     if res.isErr and res.error.kind == peNotLeader:
-      # Refresh metadata to find new leader
+      # Use redirect info to find new leader quickly
+      if res.error.leaderRedirect.leaderId != 0:
+        client.updateLeaderFromRedirect(groupId, res.error.leaderRedirect)
+      else:
+        discard client.refreshMetadata()
+      if attempt < maxRetries - 1:
+        sleep(baseBackoffMs + attempt * 5)
+      continue
+
+    if res.isErr and res.error.kind == peInternal:
+      # Connection failure (e.g. "send incomplete") - invalidate cached
+      # connection and retry with refreshed metadata.
+      client.invalidateGroupLeader(groupId)
       discard client.refreshMetadata()
       if attempt < maxRetries - 1:
         sleep(baseBackoffMs + attempt * 5)
@@ -742,8 +1061,17 @@ method scan*(client: FractioClient, startKey: string, endKey: string,
         break # Success, move to next group
 
       if res.error.kind == peNotLeader:
-        discard client.refreshMetadata()
+        if res.error.leaderRedirect.leaderId != 0:
+          client.updateLeaderFromRedirect(groupId, res.error.leaderRedirect)
+        else:
+          discard client.refreshMetadata()
         continue # Retry this group
+
+      if res.error.kind == peInternal:
+        # Connection failure - invalidate cached connection and retry
+        client.invalidateGroupLeader(groupId)
+        discard client.refreshMetadata()
+        continue
 
       break # Other error, skip this group
 
@@ -817,7 +1145,11 @@ proc startNextGroupStream(ctx: MultiGroupScanContext): Result[
   if streamRes.isErr:
     # Check if it's a not-leader error and retry
     if streamRes.error.kind == peNotLeader:
-      discard ctx.fractioClient.refreshMetadata()
+      if streamRes.error.leaderRedirect.leaderId != 0:
+        ctx.fractioClient.updateLeaderFromRedirect(groupId,
+            streamRes.error.leaderRedirect)
+      else:
+        discard ctx.fractioClient.refreshMetadata()
       try:
         connOpt = ctx.fractioClient.getGroupLeaderConnection(groupId)
       except KeyError:
@@ -839,7 +1171,7 @@ proc createNextGroupCallback(ctx: MultiGroupScanContext): NextGroupCallback =
       raises: [].} =
     try:
       startNextGroupStream(ctx)
-    except CatchableError as e:
+    except Exception as e:
       peErr(newProtocolError(peInternal, "exception in multi-group callback: " & e.msg))
 
 proc consumeMultiGroupStream(ss: StreamingScanClient): seq[kvMsgs.ScanPair] =
@@ -919,61 +1251,185 @@ ProtocolError] =
   return peOk(multiGroupClient)
 
 method beginTxn*(client: FractioClient): KVOpResult[TxnBeginResult] =
-  ## Begin a new transaction by contacting any node (prefers meta group leader).
-  ## Implements KVStore interface.
+  ## Begin a new transaction by contacting the meta group leader.
+  ## Implements KVStore interface with retry for leader changes and
+  ## connection failures.
   if not client.initialized.load(moRelaxed):
     if not client.initialize():
       return kvOpErr[TxnBeginResult]("failed to initialize client")
 
-  # Use meta group leader if possible, otherwise any connection
-  let connOpt = client.getGroupLeaderConnection(META_GROUP_ID)
-  if connOpt.isNone:
-    return kvOpErr[TxnBeginResult]("no connection for beginTxn")
+  const maxRetries = 10
+  const baseBackoffMs = 50
 
-  let conn = connOpt.get()
-  let res = conn.beginTxn()
-  if res.isOk:
-    return kvOpOk((txnId: res.value.txnId,
-        readTimestamp: res.value.readTimestamp))
-  else:
+  for attempt in 0 ..< maxRetries:
+    let connOpt = client.getGroupLeaderConnection(META_GROUP_ID)
+    if connOpt.isNone:
+      if attempt < maxRetries - 1:
+        discard client.refreshMetadata()
+        sleep(baseBackoffMs + attempt * 10)
+        continue
+      return kvOpErr[TxnBeginResult]("no connection for beginTxn")
+
+    let conn = connOpt.get()
+    let res = conn.beginTxn()
+    if res.isOk:
+      return kvOpOk((txnId: res.value.txnId,
+          readTimestamp: res.value.readTimestamp))
+
+    # Handle "not leader" error - use redirect info and retry
+    if res.error.kind == peNotLeader or isNotLeaderError(res.error.msg):
+      if res.error.kind == peNotLeader:
+        if res.error.leaderRedirect.leaderId != 0:
+          client.updateLeaderFromRedirect(META_GROUP_ID,
+              res.error.leaderRedirect)
+        else:
+          discard client.refreshMetadata()
+      else:
+        discard client.refreshMetadata()
+      if attempt < maxRetries - 1:
+        sleep(baseBackoffMs + attempt * 10)
+      continue
+
+    # Handle connection failure (peInternal) - invalidate and retry
+    if res.error.kind == peInternal:
+      client.invalidateGroupLeader(META_GROUP_ID)
+      discard client.refreshMetadata()
+      if attempt < maxRetries - 1:
+        sleep(baseBackoffMs + attempt * 10)
+      continue
+
     return kvOpErr[TxnBeginResult](res.error.msg)
 
-method commitTxn*(client: FractioClient, txnId: TransactionID): KVOpVoidResult =
-  ## Commit a transaction.
-  ## Implements KVStore interface.
-  # We should send commit to the node that started it, or any node if they share txn state.
-  # For now, use meta group leader.
-  let connOpt = client.getGroupLeaderConnection(META_GROUP_ID)
-  if connOpt.isNone:
-    return kvVoidErr("no connection for commitTxn")
+  return kvOpErr[TxnBeginResult]("too many retries for beginTxn")
 
-  let conn = connOpt.get()
-  let res = conn.commitTxn(txnId)
-  if res.isOk and res.value.status == txnMsgs.TxnCommitOK:
+method commitTxn*(client: FractioClient, txnId: TransactionID): KVOpVoidResult =
+  ## Commit a transaction by sending commit to all group leaders that
+  ## participated in writes. This ensures intents are resolved even when
+  ## the META leader does not replicate the target group.
+  var groupsToCommit: seq[GroupID] = @[]
+  withLock client.lock:
+    if txnId in client.txnGroups:
+      for gid in client.txnGroups[txnId]:
+        groupsToCommit.add(gid)
+      client.txnGroups.del(txnId)
+
+  if groupsToCommit.len == 0:
+    # Fallback: no tracked groups (legacy non-transactional path)
+    let connOpt = client.getGroupLeaderConnection(META_GROUP_ID)
+    if connOpt.isNone:
+      return kvVoidErr("no connection for commitTxn")
+    let conn = connOpt.get()
+    let res = conn.commitTxn(txnId)
+    if res.isOk and res.value.status == txnMsgs.TxnCommitOK:
+      return kvVoidOk()
+    else:
+      let errMsg = if res.isOk:
+                     if res.value.status == txnMsgs.TxnCommitConflict:
+                       "commit failed due to conflict"
+                     else:
+                       "commit failed with status " & $res.value.status
+                   else: res.error.msg
+      return kvVoidErr(errMsg)
+
+  var lastErr = ""
+  var anyOk = false
+  for gid in groupsToCommit:
+    for attempt in 0 ..< 3:
+      let connOpt = client.getGroupLeaderConnection(gid)
+      if connOpt.isNone:
+        break
+      let conn = connOpt.get()
+      let res = conn.commitTxn(txnId)
+      if res.isOk and res.value.status == txnMsgs.TxnCommitOK:
+        anyOk = true
+        break
+      if res.isOk and res.value.status == txnMsgs.TxnCommitConflict:
+        lastErr = "commit failed due to conflict"
+        break
+      if res.isErr:
+        if isNotLeaderError(res.error.msg) or res.error.kind == peNotLeader:
+          if res.error.kind == peNotLeader:
+            if res.error.leaderRedirect.leaderId != 0:
+              client.updateLeaderFromRedirect(gid, res.error.leaderRedirect)
+            else:
+              discard client.refreshMetadata()
+          else:
+            discard client.refreshMetadata()
+          sleep(50)
+          continue
+        if res.error.kind == peInternal:
+          client.invalidateGroupLeader(gid)
+          discard client.refreshMetadata()
+          sleep(50)
+          continue
+        lastErr = res.error.msg
+        break
+
+  if anyOk:
     return kvVoidOk()
-  else:
-    let errMsg = if res.isOk:
-                   if res.value.status == txnMsgs.TxnCommitConflict:
-                     "commit failed due to conflict"
-                   else:
-                     "commit failed with status " & $res.value.status
-                 else: res.error.msg
-    return kvVoidErr(errMsg)
+  if lastErr.len > 0:
+    return kvVoidErr(lastErr)
+  return kvVoidErr("commit failed on all groups")
 
 method rollbackTxn*(client: FractioClient,
     txnId: TransactionID): KVOpVoidResult =
-  ## Rollback a transaction.
-  ## Implements KVStore interface.
-  let connOpt = client.getGroupLeaderConnection(META_GROUP_ID)
-  if connOpt.isNone:
-    return kvVoidErr("no connection for rollbackTxn")
+  ## Rollback a transaction by sending rollback to all group leaders that
+  ## participated in writes.
+  var groupsToRollback: seq[GroupID] = @[]
+  withLock client.lock:
+    if txnId in client.txnGroups:
+      for gid in client.txnGroups[txnId]:
+        groupsToRollback.add(gid)
+      client.txnGroups.del(txnId)
 
-  let conn = connOpt.get()
-  let res = conn.rollbackTxn(txnId)
-  if res.isOk:
+  if groupsToRollback.len == 0:
+    # Fallback: no tracked groups (legacy path)
+    let connOpt = client.getGroupLeaderConnection(META_GROUP_ID)
+    if connOpt.isNone:
+      return kvVoidErr("no connection for rollbackTxn")
+    let conn = connOpt.get()
+    let res = conn.rollbackTxn(txnId)
+    if res.isOk:
+      return kvVoidOk()
+    else:
+      return kvVoidErr(res.error.msg)
+
+  var lastErr = ""
+  var anyOk = false
+  for gid in groupsToRollback:
+    for attempt in 0 ..< 3:
+      let connOpt = client.getGroupLeaderConnection(gid)
+      if connOpt.isNone:
+        break
+      let conn = connOpt.get()
+      let res = conn.rollbackTxn(txnId)
+      if res.isOk:
+        anyOk = true
+        break
+      if res.isErr:
+        if isNotLeaderError(res.error.msg) or res.error.kind == peNotLeader:
+          if res.error.kind == peNotLeader:
+            if res.error.leaderRedirect.leaderId != 0:
+              client.updateLeaderFromRedirect(gid, res.error.leaderRedirect)
+            else:
+              discard client.refreshMetadata()
+          else:
+            discard client.refreshMetadata()
+          sleep(50)
+          continue
+        if res.error.kind == peInternal:
+          client.invalidateGroupLeader(gid)
+          discard client.refreshMetadata()
+          sleep(50)
+          continue
+        lastErr = res.error.msg
+        break
+
+  if anyOk:
     return kvVoidOk()
-  else:
-    return kvVoidErr(res.error.msg)
+  if lastErr.len > 0:
+    return kvVoidErr(lastErr)
+  return kvVoidErr("rollback failed on all groups")
 
 # =============================================================================
 # KVStoreWithRouting group-specific operations
@@ -987,7 +1443,7 @@ method getInGroup*(client: FractioClient, key: string, groupId: GroupID,
   if not client.initialized.load(moRelaxed):
     return kvOpErr[Option[string]]("client not initialized")
 
-  const maxRetries = 100
+  let maxRetries = client.getMaxRetries()
   const baseBackoffMs = 50
 
   for attempt in 0 ..< maxRetries:
@@ -1000,7 +1456,8 @@ method getInGroup*(client: FractioClient, key: string, groupId: GroupID,
       return kvOpErr[Option[string]]("no connection to group leader")
 
     let conn = connOpt.get()
-    let res = conn.kvGet(key, txnId = txnId, readTimestamp = readTimestamp)
+    let res = conn.kvGetInGroup(key, groupId, txnId = txnId,
+        readTimestamp = readTimestamp)
 
     if res.isOk:
       if res.value.found:
@@ -1009,8 +1466,17 @@ method getInGroup*(client: FractioClient, key: string, groupId: GroupID,
         return kvOpOk(none(string))
 
     if res.error.kind == peNotLeader:
-      if not client.refreshMetadata():
-        discard
+      if res.error.leaderRedirect.leaderId != 0:
+        client.updateLeaderFromRedirect(groupId, res.error.leaderRedirect)
+      else:
+        discard client.refreshMetadata()
+      if attempt < maxRetries - 1:
+        sleep(baseBackoffMs + attempt * 5)
+      continue
+
+    if res.error.kind == peInternal:
+      client.invalidateGroupLeader(groupId)
+      discard client.refreshMetadata()
       if attempt < maxRetries - 1:
         sleep(baseBackoffMs + attempt * 5)
       continue
@@ -1026,7 +1492,7 @@ method putInGroup*(client: FractioClient, key: string, value: string, groupId: G
   if not client.initialized.load(moRelaxed):
     return kvVoidErr("client not initialized")
 
-  const maxRetries = 100
+  let maxRetries = client.getMaxRetries()
   const baseBackoffMs = 50
 
   for attempt in 0 ..< maxRetries:
@@ -1038,18 +1504,27 @@ method putInGroup*(client: FractioClient, key: string, value: string, groupId: G
       return kvVoidErr("no connection to group leader")
 
     let conn = connOpt.get()
-    let res = conn.kvPut(key, value, txnId = txnId)
+    let res = conn.kvPutInGroup(key, value, groupId, txnId = txnId)
 
     if res.isOk and res.value.status == kvMsgs.PutStatusOK:
       return kvVoidOk()
 
     if res.isErr:
       if res.error.kind == peNotLeader:
-        discard client.refreshMetadata()
+        if res.error.leaderRedirect.leaderId != 0:
+          client.updateLeaderFromRedirect(groupId, res.error.leaderRedirect)
+        else:
+          discard client.refreshMetadata()
         if attempt < maxRetries - 1:
           sleep(baseBackoffMs + attempt * 5)
         continue
       elif isNotLeaderError(res.error.msg):
+        discard client.refreshMetadata()
+        if attempt < maxRetries - 1:
+          sleep(baseBackoffMs + attempt * 5)
+        continue
+      elif res.error.kind == peInternal:
+        client.invalidateGroupLeader(groupId)
         discard client.refreshMetadata()
         if attempt < maxRetries - 1:
           sleep(baseBackoffMs + attempt * 5)
@@ -1068,7 +1543,7 @@ method deleteInGroup*(client: FractioClient, key: string, groupId: GroupID,
   if not client.initialized.load(moRelaxed):
     return kvVoidErr("client not initialized")
 
-  const maxRetries = 100
+  let maxRetries = client.getMaxRetries()
   const baseBackoffMs = 50
 
   for attempt in 0 ..< maxRetries:
@@ -1081,13 +1556,23 @@ method deleteInGroup*(client: FractioClient, key: string, groupId: GroupID,
       return kvVoidErr("no connection to group leader")
 
     let conn = connOpt.get()
-    let res = conn.kvDelete(key, txnId = txnId)
+    let res = conn.kvDeleteInGroup(key, groupId, txnId = txnId)
 
     if res.isOk and res.value.status in {kvMsgs.DelStatusDeleted,
         kvMsgs.DelStatusNotFound}:
       return kvVoidOk()
 
     if res.isErr and res.error.kind == peNotLeader:
+      if res.error.leaderRedirect.leaderId != 0:
+        client.updateLeaderFromRedirect(groupId, res.error.leaderRedirect)
+      else:
+        discard client.refreshMetadata()
+      if attempt < maxRetries - 1:
+        sleep(baseBackoffMs + attempt * 5)
+      continue
+
+    if res.isErr and res.error.kind == peInternal:
+      client.invalidateGroupLeader(groupId)
       discard client.refreshMetadata()
       if attempt < maxRetries - 1:
         sleep(baseBackoffMs + attempt * 5)
@@ -1146,7 +1631,11 @@ proc createSpace*(client: FractioClient, name: string,
     if res.isErr:
       # Refresh metadata on not leader error
       if res.error.kind == peNotLeader:
-        discard client.refreshMetadata()
+        if res.error.leaderRedirect.leaderId != 0:
+          client.updateLeaderFromRedirect(META_GROUP_ID,
+              res.error.leaderRedirect)
+        else:
+          discard client.refreshMetadata()
         continue
       return spaceOpErr(res.error.msg)
 
@@ -1210,7 +1699,11 @@ proc dropSpace*(client: FractioClient, name: string): SpaceOpResult =
     if res.isErr:
       # Refresh metadata on not leader error
       if res.error.kind == peNotLeader:
-        discard client.refreshMetadata()
+        if res.error.leaderRedirect.leaderId != 0:
+          client.updateLeaderFromRedirect(META_GROUP_ID,
+              res.error.leaderRedirect)
+        else:
+          discard client.refreshMetadata()
         continue
       return spaceOpErr(res.error.msg)
 
@@ -1235,7 +1728,13 @@ proc dropSpace*(client: FractioClient, name: string): SpaceOpResult =
       # Remove all deleted groups
       for gid in resp.deletedGroupIds:
         client.groups.del(gid)
-        client.leaderConnections.del(gid)
+        if gid in client.leaderConnections:
+          try:
+            client.leaderConnections[gid].disconnect()
+          except: discard
+          client.leaderConnections.del(gid)
+        if gid in client.leaderConnectionNodes:
+          client.leaderConnectionNodes.del(gid)
 
     return spaceOpOk(resp.spaceId, resp.deletedGroupIds.len.int32,
       resp.deletedGroupIds)
@@ -1267,4 +1766,6 @@ proc close*(client: FractioClient) =
     client.tables.clear()
     client.spaces.clear()
     client.leaderConnections.clear()
+    client.leaderConnectionNodes.clear()
+    client.txnGroups.clear()
     client.initialized.store(false, moRelaxed)

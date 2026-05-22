@@ -248,6 +248,7 @@ type
     rebalThread*: Thread[RaftKVStoreExt]
     rebalRunning*: Atomic[bool]
     triggerRebal*: Atomic[bool]
+    stopped*: Atomic[bool] ## Set to true when stop() is called; prevents send() on closed channel
 
 
 
@@ -267,6 +268,7 @@ proc newRaftKVStoreExt*(coord: NuRaftCoordinator,
   )
   result.rebalRunning.store(false)
   result.triggerRebal.store(false)
+  result.stopped.store(false)
   initLock(result.smMu)
   initLock(result.spacesMu)
   initLock(result.groupMu)
@@ -602,7 +604,6 @@ proc sysTablePut*(store: RaftKVStoreExt, key: string, value: string): bool {.
   ## Returns true on success, false on failure.
   let backend = store.getBackend()
   if backend == nil or not backend.isOpen:
-    {.cast(gcsafe).}: echo "[sysTablePut] ERROR: backend not ready"
     return false
 
   # Get timestamp - use current nanosecond time
@@ -612,14 +613,9 @@ proc sysTablePut*(store: RaftKVStoreExt, key: string, value: string): bool {.
 
   # Encode value with MVCC header
   let encoded = mvccTypes.encodeMVCCValue(value, ts, false)
-  {.cast(gcsafe).}: echo "[sysTablePut] key=", key, " valueLen=", value.len, " encodedLen=", encoded.len, " ts=", ts
 
   # Write via Raft for replication
   let res = store.raftPut(key, encoded)
-  if res.isOk:
-    {.cast(gcsafe).}: echo "[sysTablePut] SUCCESS: raftPut returned OK"
-  else:
-    {.cast(gcsafe).}: echo "[sysTablePut] ERROR: raftPut failed - ", res.error.msg
   return res.isOk
 
 proc sysTablePutBatch*(store: RaftKVStoreExt,
@@ -712,16 +708,12 @@ proc applyBatchToSM*(storePtr: pointer, rid: GroupID,
   ## NuRaft's ASIO thread where we must not allocate Nim GC memory. We copy the
   ## data here into Nim-managed memory.
   ##
-  ## DEBUG: Log all batch applications to trace replication.
-  {.cast(gcsafe).}: echo "[Nim] applyBatchToSM: groupId=", $rid, " len=", len, " storePtr=", storePtr != nil
-  
   ## Durability model: the Raft log entry was already written with fdatasync
   ## in putEntryAndState, so the commit is durable before this callback fires.
   ## The WiscKey write here uses writeBatchNoSync (no second fdatasync) — it
   ## keeps committed data readable after a clean restart.  On a crash the Raft
   ## log is replayed from lastApplied to reconstruct any missing SM state.
   if storePtr == nil or data == nil or len == 0:
-    {.cast(gcsafe).}: echo "[Nim] applyBatchToSM: EARLY RETURN storePtr=", storePtr == nil, " data=", data == nil, " len=", len
     return
 
   let store = cast[RaftKVStoreExt](storePtr)
@@ -734,48 +726,24 @@ proc applyBatchToSM*(storePtr: pointer, rid: GroupID,
   var batch: WriteBatch = nil
   try:
     batch = nuraft_coordinator.deserializeWriteBatch(payload)
-    {.cast(gcsafe).}: echo "[Nim] applyBatchToSM: parsed batch puts=", batch.puts.len, " deletes=", batch.deletes.len
-  except CatchableError as e:
-    {.cast(gcsafe).}: echo "[Nim] applyBatchToSM: FAILED to parse batch: ", e.msg
+  except CatchableError:
     return
 
   if batch == nil:
-    {.cast(gcsafe).}: echo "[Nim] applyBatchToSM: batch=nil after parse"
     return
 
   # --- Persist to WiscKey (no fdatasync — Raft log is the durability guarantee) ---
   let backend = store.coordinator.store
-  {.cast(gcsafe).}: echo "[Nim] applyBatchToSM: backend=", backend != nil, " isOpen=", backend != nil and backend.isOpen
   if backend != nil and backend.isOpen:
     {.cast(raises: []).}:
       var pairs: seq[KeyValuePair] = @[]
       var delKeys: seq[string] = @[]
-      
-      # Prefix for sys.groups for debug logging
-      let groupsPrefixDebug = "/t/" & align($SYS_GROUPS_TABLE_ID, 10, '0') & "/"
 
       for (k, v) in batch.puts:
         pairs.add((key: fromBytes(k), value: fromBytes(v)))
-        # Log full keys to understand what data is being replicated
-        let keyStr = fromBytes(k)
-        let valStr = fromBytes(v)
-        {.cast(gcsafe).}: echo "[Nim] applyBatchToSM: PUT key=", keyStr, " valueLen=", valStr.len
-        if keyStr.startsWith(groupsPrefixDebug):
-          # Check if value is MVCC-encoded
-          if mvccTypes.isLikelyMVCCValue(valStr):
-            let mvccVal = mvccTypes.decodeMVCCValueFast(valStr)
-            {.cast(gcsafe).}: echo "[Nim] applyBatchToSM: sys.groups MVCC-encoded payloadLen=", mvccVal.data.len
-            try:
-              let rec = decodeGroupRecord(mvccVal.data)
-              {.cast(gcsafe).}: echo "[Nim] applyBatchToSM: sys.groups replicas.len=", rec.replicas.len
-            except:
-              {.cast(gcsafe).}: echo "[Nim] applyBatchToSM: sys.groups decode failed"
-          else:
-            {.cast(gcsafe).}: echo "[Nim] applyBatchToSM: sys.groups NOT MVCC-encoded"
       for k in batch.deletes:
         delKeys.add(fromBytes(k))
       discard backend.writeBatchNoSync(pairs, delKeys)
-      {.cast(gcsafe).}: echo "[Nim] applyBatchToSM: WROTE ", pairs.len, " puts, ", delKeys.len, " deletes"
 
   # No in-memory state machine to update — reads go through WiscKey directly.
 
@@ -829,21 +797,19 @@ proc processLeaderPersistReq*(s: RaftKVStoreExt,
   ## Process a queued leader persistence request from the async channel.
   ## This runs in the background rebalance thread, avoiding deadlock with
   ## ongoing proposeAndWait calls in the main client threads.
+  ## Retries up to 3 times with backoff to handle transient leader transitions.
   ## Exported for testing purposes.
-  {.cast(gcsafe).}: echo "[Nim] processLeaderPersistReq: groupId=", req.groupId, " leaderNodeId=", req.leaderNodeId
+  const maxRetries = 3
   try:
     let groupId = req.groupId
     let leaderNodeId = req.leaderNodeId
 
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupId)
-    let ts = int64(epochTime() * 1_000_000_000)
-    {.cast(gcsafe).}: echo "[Nim] processLeaderPersistReq: key=", key
 
     # Get the current group record from local storage
     let backend = s.coordinator.store
     if backend != nil:
       let valOpt = backend.get(key)
-      {.cast(gcsafe).}: echo "[Nim] processLeaderPersistReq: valOpt.isSome=", valOpt.isSome
       if valOpt.isSome:
         var groupVal = valOpt.get()
         # Strip MVCC encoding if present
@@ -853,25 +819,30 @@ proc processLeaderPersistReq*(s: RaftKVStoreExt,
             groupVal = mvccVal.data
         # Decode binary GroupRecord, update leader, re-encode
         var groupRec = decodeGroupRecord(groupVal)
-        {.cast(gcsafe).}: echo "[Nim] processLeaderPersistReq: old leader=", groupRec.leader, " new leader=", leaderNodeId
         groupRec.leader = leaderNodeId
         let groupData = encode(groupRec)
         # Encode with MVCC header for consistency
+        let ts = int64(epochTime() * 1_000_000_000)
         let encoded = mvccTypes.encodeMVCCValue(groupData, ts, false)
-        # Forward to meta leader (will do local write if we're the meta leader)
-        let putRes = forwardPutToLeader(s, META_GROUP_ID, key, encoded)
-        {.cast(gcsafe).}: echo "[Nim] processLeaderPersistReq: putRes.isOk=", putRes.isOk
-        if not putRes.isOk:
-          {.cast(gcsafe).}: {.cast(raises: []).}:
-            debug("processLeaderPersistReq: failed to persist", {
-              "groupId": $groupId,
-              "error": $putRes.error
-            }.toTable)
-          {.cast(gcsafe).}: echo "[Nim] processLeaderPersistReq: ERROR ", $putRes.error
+
+        # Retry loop: after a failover, we may not yet recognize ourselves
+        # as the meta leader, so forwardPutToLeader can fail transiently.
+        for attempt in 0 ..< maxRetries:
+          let putRes = forwardPutToLeader(s, META_GROUP_ID, key, encoded)
+          if putRes.isOk:
+            break
+          if attempt < maxRetries - 1:
+            {.cast(gcsafe).}: {.cast(raises: []).}:
+              debug("processLeaderPersistReq: retry attempt", {
+                "groupId": $groupId, "attempt": $(attempt + 1)}.toTable)
+            sleep(200) # Wait for leadership state to stabilize
+          else:
+            {.cast(gcsafe).}: {.cast(raises: []).}:
+              debug("processLeaderPersistReq: failed to persist after retries", {
+                "groupId": $groupId, "error": $putRes.error}.toTable)
     else:
-      {.cast(gcsafe).}: echo "[Nim] processLeaderPersistReq: backend is nil"
-  except Exception as e:
-    {.cast(gcsafe).}: echo "[Nim] processLeaderPersistReq: EXCEPTION ", e.msg
+      discard
+  except Exception:
     discard
 
 proc rebalanceLeadershipTask(s: RaftKVStoreExt) {.thread, gcsafe, raises: [].} =
@@ -945,17 +916,26 @@ proc rebalanceLeadershipTask(s: RaftKVStoreExt) {.thread, gcsafe, raises: [].} =
             # Only yield if we are leader, not preferred, and have held
             # leadership for at least 5 seconds (leader lease).
             let since = leaderSince.getOrDefault(gid, now)
+            # Check if the preferred leader is alive before attempting yield.
+            # Yielding to a dead node is pointless and causes the "revert"
+            # detection to fire on every cycle.
+            let preferredAlive = s.coordinator.isPeerAlive(gid, preferredId)
             # Skip if we've had too many consecutive failures
             if s.coordinator.nodeId.uint32 != preferredId and
                (now - since >= 5.0) and
-               failures < maxYieldFailures:
+               failures < maxYieldFailures and
+               preferredAlive:
               toYield.add((gid, preferredId))
-            elif failures >= maxYieldFailures:
-              # Log when we're backing off due to failures
+            elif failures >= maxYieldFailures or not preferredAlive:
+              # Log when we're backing off due to failures or dead preferred leader
               {.cast(raises: []).}:
                 {.cast(gcsafe).}:
-                  debug("Skipping leadership yield due to failures", {
-                       "groupId": $gid, "failures": $failures}.toTable)
+                  if not preferredAlive and failures == 0:
+                    debug("Skipping leadership yield: preferred leader not alive", {
+                        "groupId": $gid, "preferred": $preferredId}.toTable)
+                  elif failures >= maxYieldFailures:
+                    debug("Skipping leadership yield due to failures", {
+                        "groupId": $gid, "failures": $failures}.toTable)
           else:
             # No longer leader - clear tracking for this group
             leaderSince.del(gid)
@@ -1089,6 +1069,8 @@ proc wireApplyCallback*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
 
       # Queue async persistence request (safe from callback - no blocking)
       # Persist leader for META_GROUP and DATA_GROUP_START_ID
+      # Check stopped flag to prevent send() on a closed channel
+      if s.stopped.load(): return
       try:
         s.leaderPersistChan.send(LeaderPersistReq(
           groupId: groupId,
@@ -1115,6 +1097,10 @@ proc bootstrapStore*(store: RaftKVStoreExt,
 proc stop*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
   ## Stop the rebalancing thread and clean up resources.
   ## Must be called before coordinator.stop() to ensure clean shutdown.
+  # Set stopped flag FIRST to prevent onLeaderChanged callbacks from
+  # sending to leaderPersistChan after we start shutting down.
+  store.stopped.store(true)
+
   if store.rebalRunning.load():
     store.rebalRunning.store(false)
     # Wake up the thread if it's sleeping
@@ -1146,8 +1132,18 @@ proc stop*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
   withLock store.smMu:
     store.stateMachines.clear()
 
-  # Close the leader persistence channel
-  store.leaderPersistChan.close()
+proc closeChannels*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
+  ## Drain and finalize the leader persistence channel.
+  ## Must be called AFTER the NuRaft coordinator is stopped and after the
+  ## rebalancing thread has been joined. The stopped flag prevents new sends.
+  ## We drain any remaining messages but do NOT close the channel, because
+  ## the Nim Channel.close() calls deinitRawChannel which destroys the
+  ## channel's lock while other threads (ASIO timer) may still hold a
+  ## reference to it. Instead, we drain and leave the channel for GC cleanup.
+  while true:
+    let reqOpt = store.leaderPersistChan.tryRecv()
+    if not reqOpt.dataAvailable:
+      break
 
 proc proposeWrite(store: RaftKVStoreExt, groupId: GroupID,
     batch: WriteBatch): RSVoidResult {.gcsafe, raises: [].} =
@@ -3035,7 +3031,8 @@ proc rebalanceSpaces*(store: RaftKVStoreExt) {.raises: [].} =
         if not store.updateSpaceRecord(space):
           {.cast(raises: []).}:
             {.cast(gcsafe).}:
-              echo "[rebalanceSpaces] WARNING: failed to update space record for ", spaceId
+              warn("rebalanceSpaces: failed to update space record",
+                {"spaceId": $spaceId}.toTable)
       except:
         discard
 
@@ -3077,7 +3074,8 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: SpaceID) {.raises: [
       # Cannot claim worker role - not the leader or Raft issue
       {.cast(raises: []).}:
         {.cast(gcsafe).}:
-          echo "[runRebalanceMigration] ERROR: failed to claim worker role for space ", spaceId
+          error("runRebalanceMigration: failed to claim worker role",
+            {"spaceId": $spaceId}.toTable)
       return
     # Note: Don't call loadSpaces() here - it would read stale data from backend
     # before raftPut completes. The in-memory cache is already updated by updateSpaceRecord.
@@ -3230,7 +3228,8 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: SpaceID) {.raises: [
             if not store.updateSpaceRecord(space):
               {.cast(raises: []).}:
                 {.cast(gcsafe).}:
-                  echo "[runRebalanceMigration] WARNING: failed to update cursor/heartbeat for space ", spaceId
+                  warn("runRebalanceMigration: failed to update cursor/heartbeat",
+                    {"spaceId": $spaceId}.toTable)
             # Note: Don't call loadSpaces() here - it would read stale data
             lastHeartbeat = curNow
         except:
@@ -3263,7 +3262,8 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: SpaceID) {.raises: [
       # Raft write failed - cannot clear rebalance state
       {.cast(raises: []).}:
         {.cast(gcsafe).}:
-          echo "[runRebalanceMigration] ERROR: failed to clear rebalance state for space ", spaceId
+          error("runRebalanceMigration: failed to clear rebalance state",
+            {"spaceId": $spaceId}.toTable)
       return
     # Verify state was updated
     {.cast(raises: []).}:

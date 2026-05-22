@@ -273,16 +273,29 @@ proc commitTransaction*(store: MvccTransactionStore,
         let intentKey = encodeIntentKey(key, state.txn.id)
         if entry.isDelete:
           let tombstone = mvccTypes.encodeMVCCValue("", commitTs, true, state.txn.id)
-          discard store.raftStore.raftPut(versionKey, tombstone)
-          # Requirement 6: Also put to primary key
-          discard store.raftStore.raftPut(key, tombstone)
+          let r1 = store.raftStore.raftPut(versionKey, tombstone)
+          if not r1.isOk:
+            return mvccErr[coreTypes.Timestamp](MvccStoreError(
+              kind: mseStorageError, msg: "Failed to write version tombstone: " & r1.error.msg))
+          let r2 = store.raftStore.raftPut(key, tombstone)
+          if not r2.isOk:
+            return mvccErr[coreTypes.Timestamp](MvccStoreError(
+              kind: mseStorageError, msg: "Failed to write primary tombstone: " & r2.error.msg))
         else:
           let committedValue = mvccTypes.encodeMVCCValue(entry.value, commitTs,
               false, state.txn.id)
-          discard store.raftStore.raftPut(versionKey, committedValue)
-          # Requirement 6: Also put to primary key
-          discard store.raftStore.raftPut(key, committedValue)
-        discard store.raftStore.raftDelete(intentKey)
+          let r1 = store.raftStore.raftPut(versionKey, committedValue)
+          if not r1.isOk:
+            return mvccErr[coreTypes.Timestamp](MvccStoreError(
+              kind: mseStorageError, msg: "Failed to write version key: " & r1.error.msg))
+          let r2 = store.raftStore.raftPut(key, committedValue)
+          if not r2.isOk:
+            return mvccErr[coreTypes.Timestamp](MvccStoreError(
+              kind: mseStorageError, msg: "Failed to write primary key: " & r2.error.msg))
+        let r3 = store.raftStore.raftDelete(intentKey)
+        if not r3.isOk:
+          return mvccErr[coreTypes.Timestamp](MvccStoreError(
+            kind: mseStorageError, msg: "Failed to delete intent: " & r3.error.msg))
 
       state.intents = initTable[string, coreTxn.WriteEntry]()
       state.txn = nil
@@ -827,7 +840,6 @@ proc snapshotScan*(store: MvccTransactionStore,
   if limit > 0 and uint32(results.len) > limit:
     results.setLen(int(limit))
 
-  {.cast(gcsafe).}: echo "[snapshotScan] returning ", results.len, " results"
   return mvccOk(results)
 
 proc getCurrentTimestamp*(store: MvccTransactionStore): coreTypes.Timestamp {.
@@ -846,21 +858,23 @@ proc getCurrentTimestamp*(store: MvccTransactionStore): coreTypes.Timestamp {.
 # Convenience: latest reads (no timestamp required)
 # ---------------------------------------------------------------------------
 
+const LATEST_READ_TIMESTAMP = coreTypes.Timestamp(high(int64))
+
 proc latestGet*(store: MvccTransactionStore,
     key: string): MvccResult[Option[string]] {.gcsafe, raises: [].} =
   ## Get the latest value for a key without transaction overhead.
-  ## Equivalent to snapshotGet with the current timestamp.
-  let ts = store.getCurrentTimestamp()
-  store.snapshotGet(key, ts)
+  ## Uses max timestamp so committed writes are never invisible due to
+  ## clock skew between getCurrentTimestamp and allocTimestamp.
+  store.snapshotGet(key, LATEST_READ_TIMESTAMP)
 
 proc latestScan*(store: MvccTransactionStore,
     startKey: string, endKey: string,
     limit: uint32 = 0): MvccResult[seq[tuple[key: string,
         value: string]]] {.gcsafe, raises: [].} =
   ## Scan the latest values without transaction overhead.
-  ## Equivalent to snapshotScan with the current timestamp.
-  let ts = store.getCurrentTimestamp()
-  store.snapshotScan(startKey, endKey, ts, limit)
+  ## Uses max timestamp so committed writes are never invisible due to
+  ## clock skew between getCurrentTimestamp and allocTimestamp.
+  store.snapshotScan(startKey, endKey, LATEST_READ_TIMESTAMP, limit)
 
 # ---------------------------------------------------------------------------
 # KV operations with metadata (for protocol server)
@@ -869,7 +883,9 @@ proc latestScan*(store: MvccTransactionStore,
 proc latestGetWithMeta*(store: MvccTransactionStore,
     key: string): MvccResult[Option[MvccValueWithMeta]] {.gcsafe, raises: [].} =
   ## Get the latest value for a key with MVCC metadata.
-  let ts = store.getCurrentTimestamp()
+  ## Uses max timestamp so committed writes are never invisible due to
+  ## clock skew between getCurrentTimestamp and allocTimestamp.
+  let ts = LATEST_READ_TIMESTAMP
 
   # First check for existing version
   let directRes = store.raftStore.raftGet(key)
@@ -889,7 +905,7 @@ proc latestGetWithMeta*(store: MvccTransactionStore,
           if not decoded.isDeleted:
             latestValue = decoded.data
             found = true
-      except:
+      except CatchableError:
         discard
     else:
       # Non-MVCC value (backward compat)
@@ -917,7 +933,8 @@ proc latestGetWithMeta*(store: MvccTransactionStore,
             else:
               # Tombstone - clear found flag since this version is deleted
               found = false
-        except: discard
+        except CatchableError:
+          discard
 
   if not found or isDeleted:
     return mvccOk(none(MvccValueWithMeta))

@@ -5,7 +5,7 @@
 # 
 # All sockets use NON-BLOCKING mode with select() polling to prevent hanging.
 
-import std/[asyncdispatch, asyncnet, locks, nativesockets, net, os, hashes, strutils]
+import std/[locks, nativesockets, net, os, hashes, strutils]
 import std/atomics
 import std/typedthreads
 import std/tables as nimtables
@@ -89,7 +89,6 @@ type
   PeerConnection = ref object
     ## Represents a connection to a peer node
     nodeId*: core_types.NodeID ## core_types.NodeID (distinct string)
-    socket*: AsyncSocket
     syncSocket*: Socket        ## Synchronous socket for sending from callbacks
     lastActivity*: times.Time
     sendLock*: Lock
@@ -225,10 +224,15 @@ proc decodeRaftFrame(data: string): tuple[groupId: GroupID, payload: string] =
 
 proc connectToPeer*(t: MultiplexedRaftTransport, nodeId: core_types.NodeID,
     host: string, port: int): bool =
-  ## Connect to a peer node.
-  ## Connects with blocking socket (with timeout), then switches to non-blocking for sends.
-  ## This prevents handler callbacks from blocking indefinitely on send operations.
-  echo "[transport] connectToPeer: nodeId=", $nodeId, " host=", host, " port=", port
+  ## Connect to a peer node using synchronous blocking socket with timeout.
+  ##
+  ## Thread-safe: checks for existing connection under lock before connecting.
+
+  # Check if connection already exists (avoid duplicate connections)
+  withLock t.connectionsLock:
+    if t.connections.hasKey(nodeId):
+      return true
+
   var conn: PeerConnection
   new(conn)
   conn.nodeId = nodeId
@@ -236,7 +240,7 @@ proc connectToPeer*(t: MultiplexedRaftTransport, nodeId: core_types.NodeID,
   initLock(conn.sendLock)
 
   try:
-    # Create synchronous socket first (for sending from callbacks)
+    # Create synchronous socket (used for all sends via sendSync)
     conn.syncSocket = newSocket()
     # Enable address/port reuse and zero linger for quick cleanup
     conn.syncSocket.setSockOpt(OptReuseAddr, true)
@@ -244,36 +248,36 @@ proc connectToPeer*(t: MultiplexedRaftTransport, nodeId: core_types.NodeID,
     setZeroLinger(conn.syncSocket.getFd())
 
     # Connect in blocking mode (with timeout)
-    # Use select to timeout the connect
     let fd = conn.syncSocket.getFd()
     setBlocking(fd, true)
 
-    # Set connect timeout using SO_SNDTIMEO (works for connect too)
-    var tv = posix.Timeval(tv_sec: posix.Time(5), tv_usec: posix.Suseconds(
-        0)) # 5 second timeout
+    # Set connect timeout using SO_SNDTIMEO.
+    # On localhost, connects are sub-millisecond. 200ms is more than enough
+    # and prevents blocking the timer thread if a peer is slow to respond.
+    var tv = posix.Timeval(tv_sec: posix.Time(0), tv_usec: posix.Suseconds(
+        200000)) # 200ms timeout
     if setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, addr tv, sizeof(tv).SockLen) < 0:
       discard
 
     conn.syncSocket.connect(host, Port(port))
-    echo "[transport] connectToPeer: syncSocket connected to ", host, ":", port
 
-    # NOW switch to non-blocking for all subsequent operations
+    # Switch to non-blocking for all subsequent send operations
     setBlocking(fd, false)
 
-    # Also create async socket for async operations
-    conn.socket = newAsyncSocket()
-    # Same options for async socket
-    conn.socket.setSockOpt(OptReuseAddr, true)
-    conn.socket.setSockOpt(OptReusePort, true)
-    setZeroLinger(conn.socket.getFd())
-    waitFor conn.socket.connect(host, Port(port))
-    echo "[transport] connectToPeer: asyncSocket connected to ", host, ":", port
+    # Double-check: another thread may have connected while we were connecting
     withLock t.connectionsLock:
+      if t.connections.hasKey(nodeId):
+        # Another thread beat us — close our connection and return success
+        try: conn.syncSocket.close() except: discard
+        deinitLock(conn.sendLock)
+        return true
       t.connections[nodeId] = conn
     return true
   except Exception as e:
-    echo "[transport] connectToPeer FAILED: nodeId=", $nodeId, " host=", host,
-        " port=", port, " error=", e.msg
+    # Clean up on failure
+    if conn.syncSocket != nil:
+      try: conn.syncSocket.close() except: discard
+    deinitLock(conn.sendLock)
     return false
 
 proc disconnectPeer*(t: MultiplexedRaftTransport, nodeId: core_types.NodeID) =
@@ -285,10 +289,6 @@ proc disconnectPeer*(t: MultiplexedRaftTransport, nodeId: core_types.NodeID) =
       t.connections.del(nodeId)
 
   if conn != nil:
-    try:
-      conn.socket.close()
-    except:
-      discard
     try:
       if conn.syncSocket != nil:
         conn.syncSocket.close()
@@ -312,131 +312,92 @@ proc getOrCreateConnection*(t: MultiplexedRaftTransport,
 proc sendSync*(t: MultiplexedRaftTransport, nodeId: core_types.NodeID,
     data: string, host: string = "", port: int = 0): bool =
   ## Send data synchronously to a peer. Used from C++ callbacks.
-  ## Uses non-blocking socket with select() and posix.send() to ensure we never block indefinitely.
-  ## If host/port are provided and connection doesn't exist, creates one.
-  ## If connection is broken (EPIPE/ECONNRESET), disconnects and reconnects.
-  ## Retries up to 3 times for connection/reconnection.
+  ##
+  ## If no existing connection exists, tries to establish one using connectToPeer.
+  ## On localhost, connects are sub-millisecond, so this is safe to call from
+  ## any thread including the timer thread.
+  ##
+  ## If the connection is broken (EPIPE/ECONNRESET), disconnects and returns false.
+  ## The caller (NuRaft) will retry on the next heartbeat/election cycle.
 
-  {.cast(gcsafe).}: echo "[transport] sendSync: nodeId=" & $nodeId &
-      " dataLen=" & $data.len & " host=" & host & " port=" & $port
+  var conn: PeerConnection
+  withLock t.connectionsLock:
+    conn = t.connections.getOrDefault(nodeId, nil)
 
-  # Retry loop for connection/reconnection
-  for attempt in 0 ..< 3:
-    var conn: PeerConnection
-    withLock t.connectionsLock:
-      conn = t.connections.getOrDefault(nodeId, nil)
-
-    if conn == nil:
-      # Try to create connection if host/port provided
-      if host.len > 0 and port > 0:
-        {.cast(gcsafe).}: echo "[transport] sendSync: no existing connection, creating..."
-        if not t.connectToPeer(nodeId, host, port):
-          if attempt < 2:
-            sleep(50) # 50ms delay before retry
-            continue
-          {.cast(gcsafe).}: echo "[transport] sendSync: FAILED to connect to " &
-              host & ":" & $port
-          return false
-
-        withLock t.connectionsLock:
-          conn = t.connections.getOrDefault(nodeId, nil)
-      else:
-        {.cast(gcsafe).}: echo "[transport] sendSync: FAILED - no host/port provided"
+  if conn == nil:
+    # No existing connection — try to establish one.
+    # connectToPeer uses a 200ms timeout, which is safe even from the timer
+    # thread on localhost (connects are sub-ms).
+    if host.len > 0 and port > 0:
+      if not t.connectToPeer(nodeId, host, port):
         return false
-
-    if conn == nil or conn.syncSocket == nil:
-      if attempt < 2:
-        sleep(50)
-        continue
-      {.cast(gcsafe).}: echo "[transport] sendSync: FAILED - conn or socket nil"
+      # Re-acquire the connection after connecting
+      withLock t.connectionsLock:
+        conn = t.connections.getOrDefault(nodeId, nil)
+      if conn == nil:
+        return false
+    else:
+      # No host/port info, can't connect
       return false
 
-    # Try to send on this connection
-    var sendFailed = false
-    var needReconnect = false
+  if conn.syncSocket == nil:
+    return false
 
-    withLock conn.sendLock:
-      try:
-        let fd = conn.syncSocket.getFd()
-        var totalSent = 0
-        var retryCount = 0
-        const MaxRetries = 100 # Prevent infinite loop
-        const SendTimeoutMs = 5000 # 5 seconds total timeout
+  # Try to send on this connection
+  var sendFailed = false
+  var needReconnect = false
 
-        {.cast(gcsafe).}: echo "[transport] sendSync: sending " & $data.len &
-            " bytes to " & $nodeId & " via syncSocket (non-blocking)"
+  withLock conn.sendLock:
+    try:
+      let fd = conn.syncSocket.getFd()
+      var totalSent = 0
+      var retryCount = 0
+      const MaxRetries = 100
+      const SendTimeoutMs = 500
 
-        # Loop until all data sent, using select() when socket would block
-        while totalSent < data.len and retryCount < MaxRetries:
-          # Wait for socket to be writable (with timeout)
-          var writeFds: seq[SocketHandle] = @[fd]
-          let ready = nativesockets.selectWrite(writeFds, SendTimeoutMs)
+      while totalSent < data.len and retryCount < MaxRetries:
+        var writeFds: seq[SocketHandle] = @[fd]
+        let ready = nativesockets.selectWrite(writeFds, SendTimeoutMs)
 
-          if ready <= 0:
-            {.cast(gcsafe).}: echo "[transport] sendSync: FAILED - select timeout after " &
-                $totalSent & " bytes sent"
+        if ready <= 0:
+          sendFailed = true
+          break
+
+        let remaining = data.len - totalSent
+        let sent = posix.send(fd, addr data[totalSent], remaining.cint, 0.cint)
+
+        if sent < 0:
+          let errno = posix.errno
+          if errno == EAGAIN or errno == EWOULDBLOCK:
+            inc retryCount
+            sleep(10)
+            continue
+          if errno == EPIPE or errno == ECONNRESET or errno == ECONNABORTED:
+            needReconnect = true
             sendFailed = true
             break
+          sendFailed = true
+          break
+        elif sent == 0:
+          sendFailed = true
+          break
+        else:
+          totalSent += sent.int
+          retryCount = 0
 
-          # Try to send remaining data using posix.send (non-blocking)
-          let remaining = data.len - totalSent
-          let sent = posix.send(fd, addr data[totalSent], remaining.cint, 0.cint)
+      if not sendFailed:
+        if totalSent < data.len:
+          sendFailed = true
+        else:
+          conn.lastActivity = getTime()
+          return true
+    except Exception:
+      sendFailed = true
 
-          if sent < 0:
-            let errno = posix.errno
-            # EAGAIN/EWOULDBLOCK means socket buffer full - need to wait and retry
-            if errno == EAGAIN or errno == EWOULDBLOCK:
-              inc retryCount
-              sleep(10) # Small delay before retry
-              continue
-            # EPIPE/ECONNRESET means broken connection - need to reconnect
-            if errno == EPIPE or errno == ECONNRESET or errno == ECONNABORTED:
-              {.cast(gcsafe).}: echo "[transport] sendSync: connection broken (errno=" &
-                  $errno & "), disconnecting and will reconnect..."
-              needReconnect = true
-              sendFailed = true
-              break
-            # Real error
-            {.cast(gcsafe).}: echo "[transport] sendSync: FAILED - posix.send error errno=" & $errno
-            sendFailed = true
-            break
-          elif sent == 0:
-            # Connection closed
-            {.cast(gcsafe).}: echo "[transport] sendSync: FAILED - connection closed"
-            sendFailed = true
-            break
-          else:
-            # Sent some data
-            totalSent += sent.int
-            retryCount = 0 # Reset retry count on successful send
+  # If send failed due to broken connection, disconnect
+  if needReconnect:
+    t.disconnectPeer(nodeId)
 
-        if not sendFailed:
-          if totalSent < data.len:
-            {.cast(gcsafe).}: echo "[transport] sendSync: FAILED - only sent " &
-                $totalSent & " of " & $data.len & " bytes"
-            sendFailed = true
-          else:
-            conn.lastActivity = getTime()
-            {.cast(gcsafe).}: echo "[transport] sendSync: SUCCESS sent " &
-                $totalSent & " bytes"
-            return true
-      except Exception as e:
-        {.cast(gcsafe).}: echo "[transport] sendSync: FAILED send exception: " & e.msg
-        sendFailed = true
-
-    # If send failed due to broken connection, disconnect and retry
-    if needReconnect:
-      {.cast(gcsafe).}: echo "[transport] sendSync: disconnecting broken connection to " & $nodeId
-      t.disconnectPeer(nodeId)
-      if attempt < 2:
-        sleep(50) # Small delay before reconnect attempt
-        continue
-
-    # If send failed for other reasons, don't retry
-    if sendFailed:
-      return false
-
-  {.cast(gcsafe).}: echo "[transport] sendSync: FAILED after 3 attempts"
   return false
 
 # =============================================================================
@@ -446,10 +407,7 @@ proc sendSync*(t: MultiplexedRaftTransport, nodeId: core_types.NodeID,
 proc sendMessage*(t: MultiplexedRaftTransport, groupId: GroupID, nodeId: core_types.NodeID,
                    msg: RaftMessage, host: string, port: int): bool =
   ## Send a message to a specific peer for a specific group.
-  let conn = t.getOrCreateConnection(nodeId, host, port)
-  if conn == nil:
-    return false
-
+  ## Delegates to sendSync which handles connection management.
   # Serialize message
   var payload: string
   case msg.kind
@@ -477,14 +435,8 @@ proc sendMessage*(t: MultiplexedRaftTransport, groupId: GroupID, nodeId: core_ty
   # Encode frame
   let frame = encodeRaftFrame(groupId, payload)
 
-  # Send
-  withLock conn.sendLock:
-    try:
-      waitFor conn.socket.send(frame)
-      conn.lastActivity = getTime()
-      return true
-    except:
-      return false
+  # Send via sendSync
+  return t.sendSync(nodeId, frame, host, port)
 
 # =============================================================================
 # Message Receiving
@@ -556,26 +508,42 @@ proc readOneMessage(client: Socket, t: MultiplexedRaftTransport): bool =
   ## Returns false on error or disconnect.
   ## For non-blocking sockets, returns true if no data available (caller should retry).
   ## Uses NON-BLOCKING recv with select polling.
+  ##
+  ## NOTE: This is called from the accept loop AFTER selectRead indicated data is
+  ## available. So we use 0ms timeout for the initial selectRead (non-blocking check)
+  ## and short timeouts for recv chunks (to handle partial reads).
 
-  # Use select to wait for data with short timeout (100ms)
+  # Quick non-blocking check - data should be available since accept loop
+  # already detected it with selectRead(fds, 0)
   var fds = @[client.getFd()]
-  let ready = nativesockets.selectRead(fds, 100)       # 100ms timeout
+  let ready = nativesockets.selectRead(fds, 0)       # Non-blocking
   if ready <= 0:
     # No data available - return true so caller continues polling
     return true
+
+  # Check for socket errors (e.g., ECONNRESET after peer crash)
+  # This avoids trying to read from a broken socket, which wastes time.
+  var errVal: cint = cint(0)
+  var errLen: SockLen = sizeof(errVal).SockLen
+  if getsockopt(client.getFd(), SOL_SOCKET, SO_ERROR, addr errVal,
+      addr errLen) == 0 and errVal != 0:
+    # Socket has a pending error - connection is broken
+    return false
 
   try:
     # Read frame header (magic + groupId = 20 bytes) using non-blocking recv
     let fd = client.getFd().cint
     var headerBuf = newString(FrameHeaderSize)
     let headerRead = recvExactNonBlocking(fd, headerBuf, FrameHeaderSize,
-        1000) # 1 second timeout per chunk
+        100) # Short timeout - data should be available immediately
     if headerRead == 0:
       # Connection closed by peer
       return false
     if headerRead != FrameHeaderSize:
-      # Incomplete read (timeout)
-      return true
+      # Incomplete read - could be a slow sender or connection error.
+      # Since we already confirmed data was available via selectRead,
+      # a partial read likely means the connection is broken.
+      return false
 
     # Check magic
     let magic = uint32(headerBuf[0]) shl 24 or
@@ -593,7 +561,7 @@ proc readOneMessage(client: Socket, t: MultiplexedRaftTransport): bool =
 
     # Read length prefix (4 bytes)
     var lenBuf = newString(4)
-    let lenRead = recvExactNonBlocking(fd, lenBuf, 4, 1000)
+    let lenRead = recvExactNonBlocking(fd, lenBuf, 4, 100)
     if lenRead != 4:
       return false
 
@@ -609,18 +577,12 @@ proc readOneMessage(client: Socket, t: MultiplexedRaftTransport): bool =
     var payload = newString(payloadLen)
     if payloadLen > 0:
       let payloadRead = recvExactNonBlocking(fd, payload, payloadLen,
-          5000) # 5 second timeout for payload
+          1000) # 1 second timeout for payload
       if payloadRead != payloadLen:
         return false
 
     # Deliver to coordinator
     if t.coordinatorCb != nil:
-      # Debug: log the groupId being delivered
-      var gidHex = ""
-      for i in 12..<16:
-        gidHex.add(toHex(ulid.data[i], 2))
-      {.cast(gcsafe).}: echo "[transport] readOneMessage: delivering groupId=" &
-          gidHex & " payloadLen=" & $payloadLen
       t.coordinatorCb(groupId, cstring(payload), csize_t(payloadLen))
 
     return true
@@ -635,15 +597,9 @@ proc acceptLoop(t: MultiplexedRaftTransport) {.thread.} =
   var activeClients: seq[Socket] = @[]
   var pollCount = 0
 
-  {.cast(gcsafe).}: echo "[transport] acceptLoop: STARTED on port=" & $t.port
-
   while t.serverRunning.load():
     try:
       pollCount += 1
-      # Log poll status every 10 iterations for debugging
-      if pollCount mod 10 == 0:
-        {.cast(gcsafe).}: echo "[transport] acceptLoop: poll #" & $pollCount &
-            " activeClients=" & $activeClients.len & " port=" & $t.port
 
       # Check for new connections (with short timeout)
       var listenFds = @[t.serverSocket.getFd()]
@@ -655,8 +611,6 @@ proc acceptLoop(t: MultiplexedRaftTransport) {.thread.} =
         # Set non-blocking mode for polling
         setBlocking(client.getFd(), false)
         activeClients.add(client)
-        {.cast(gcsafe).}: echo "[transport] acceptLoop: NEW connection accepted on port=" &
-            $t.port & " totalClients=" & $activeClients.len
 
       # Poll all active clients for data
       if activeClients.len > 0:
@@ -665,13 +619,9 @@ proc acceptLoop(t: MultiplexedRaftTransport) {.thread.} =
           var fds = @[client.getFd()]
           let ready = nativesockets.selectRead(fds, 0) # No timeout - just check
           if ready > 0:
-            {.cast(gcsafe).}: echo "[transport] acceptLoop: data ready on client #" &
-                $i & " port=" & $t.port
             # Data available - try to read a message
             if not readOneMessage(client, t):
               # Connection closed or error
-              {.cast(gcsafe).}: echo "[transport] acceptLoop: client #" & $i &
-                  " disconnected/error port=" & $t.port
               toRemove.add(i)
 
         # Remove closed connections (in reverse order to preserve indices)
@@ -684,14 +634,12 @@ proc acceptLoop(t: MultiplexedRaftTransport) {.thread.} =
 
       sleep(1) # Small yield to prevent busy-waiting
 
-    except Exception as e:
-      {.cast(gcsafe).}: echo "[transport] acceptLoop: EXCEPTION on port=" &
-          $t.port & " error=" & e.msg & " pollCount=" & $pollCount
+    except Exception:
       if t.serverRunning.load():
         sleep(10)
 
-  {.cast(gcsafe).}: echo "[transport] acceptLoop: EXITED on port=" & $t.port &
-      " serverRunning=" & $t.serverRunning.load()
+  # Accept loop exited normally (server stopped)
+  discard
 
 proc startServer*(t: MultiplexedRaftTransport): bool =
   ## Start the TCP server.
@@ -752,10 +700,6 @@ proc stopServer*(t: MultiplexedRaftTransport) =
   # Close all connections
   withLock t.connectionsLock:
     for conn in t.connections.values:
-      try:
-        conn.socket.close()
-      except:
-        discard
       try:
         if conn.syncSocket != nil:
           conn.syncSocket.close()

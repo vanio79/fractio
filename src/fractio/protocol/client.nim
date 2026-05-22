@@ -1228,3 +1228,37 @@ proc joinGroup*(client: ProtocolClient,
   let r = client.send(clusterMsgs.encodeJoinGroupRequest(req))
   if r.isErr: return peErr(r.error)
   clusterMsgs.decodeJoinGroupResponse(r.value.payload)
+
+# ---------------------------------------------------------------------------
+# Rejoin Protocol convenience procs
+# ---------------------------------------------------------------------------
+
+proc findMetaLeader*(client: ProtocolClient): Result[
+    clusterMsgs.FindMetaLeaderResponse, ProtocolError] {.gcsafe, raises: [].} =
+  ## Ask a node who the current meta leader is.
+  ## Any node can answer this.
+  let r = client.send(clusterMsgs.encodeFindMetaLeaderRequest())
+  if r.isErr: return peErr(r.error)
+  clusterMsgs.decodeFindMetaLeaderResponse(r.value.payload)
+
+proc rejoinNode*(client: ProtocolClient,
+    req: clusterMsgs.RejoinNodeRequest): Result[
+        clusterMsgs.RejoinNodeResponse,
+    ProtocolError] {.gcsafe, raises: [].} =
+  ## Send a RejoinNode request to the meta leader.
+  ## The meta leader will re-add this node to all groups it was a member of
+  ## via add_srv and send JoinGroup RPCs so the node can create proper instances.
+  let r = client.send(clusterMsgs.encodeRejoinNodeRequest(req))
+  if r.isErr: return peErr(r.error)
+  clusterMsgs.decodeRejoinNodeResponse(r.value.payload)
+
+proc addServerToGroup*(client: ProtocolClient,
+    req: clusterMsgs.AddServerToGroupRequest): Result[
+        clusterMsgs.AddServerToGroupResponse,
+    ProtocolError] {.gcsafe, raises: [].} =
+  ## Send an AddServerToGroup request to the group leader.
+  ## Used by the meta leader to forward add_srv to the data group leader
+  ## when it is not the leader of that group.
+  let r = client.send(clusterMsgs.encodeAddServerToGroupRequest(req))
+  if r.isErr: return peErr(r.error)
+  clusterMsgs.decodeAddServerToGroupResponse(r.value.payload)

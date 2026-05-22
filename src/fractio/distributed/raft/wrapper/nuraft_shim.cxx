@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <deque>
 #include <functional>
 #include <fstream>
 #include <sys/stat.h>
@@ -44,7 +45,18 @@ public:
 // Key: (group_id_hex, src_node_id, dst_node_id) -> rpc_handler
 
 static std::mutex g_handlers_lock;
-static std::map<std::tuple<std::string, int32_t, int32_t>, rpc_handler> g_pending_handlers;
+static std::map<std::tuple<std::string, int32_t, int32_t>, std::deque<rpc_handler>> g_pending_handlers;
+
+static void clearPendingHandlersForGroupAndServer(const std::string& gid_hex, int32_t server_id) {
+    std::lock_guard<std::mutex> lock(g_handlers_lock);
+    for (auto it = g_pending_handlers.begin(); it != g_pending_handlers.end(); ) {
+        if (std::get<0>(it->first) == gid_hex && std::get<1>(it->first) == server_id) {
+            it = g_pending_handlers.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
 
 // =============================================================================
 // Message Serialization
@@ -237,12 +249,15 @@ public:
     ~callback_state_machine() {}
 
     ptr<buffer> commit(const ulong log_idx, buffer& data) override {
-        last_committed_idx_ = log_idx;
         if (commit_cb_) {
             const char* raw = reinterpret_cast<const char*>(data.data_begin());
             size_t len = data.size() - data.pos();
             commit_cb_(ctx_, log_idx, raw, len);
         }
+        // Update last_committed_idx_ AFTER the callback completes so that
+        // callers polling for commit advancement (e.g. proposeAndWait) don't
+        // observe the new index while the state machine is still being updated.
+        last_committed_idx_ = log_idx;
         return nullptr;
     }
 
@@ -333,7 +348,8 @@ public:
           state_file_path_(state_file_path),
           config_change_cb_(nullptr), config_change_ctx_(nullptr),
           quorum_update_cb_(nullptr), quorum_update_ctx_(nullptr),
-          raft_server_ptr_(nullptr) {
+          raft_server_ptr_(nullptr),
+          config_log_idx_hwm_(0) {
         saved_config_ = cs_new<cluster_config>();
         
         // Initialize state - load from file if path provided and file exists
@@ -348,15 +364,7 @@ public:
             saved_state_->allow_election_timer(false);
         }
         
-        std::cerr << "[NuRaft] dynamic_state_mgr constructor: my_id=" << my_id_
-                  << " servers=" << servers.size()
-                  << " catching_up=" << catching_up
-                  << " state_file=" << (state_file_path_.empty() ? "(none)" : state_file_path_)
-                  << " loaded_term=" << saved_state_->get_term()
-                  << " loaded_voted_for=" << saved_state_->get_voted_for()
-                  << std::endl;
         for (auto& kv : servers) {
-            std::cerr << "[NuRaft]   - server " << kv.first << " endpoint=" << kv.second << std::endl;
             auto sc = cs_new<srv_config>(kv.first, kv.second);
             saved_config_->get_servers().push_back(sc);
         }
@@ -374,17 +382,32 @@ public:
     }
 
     ptr<cluster_config> load_config() override {
-        std::cerr << "[NuRaft] load_config: my_id=" << my_id_
-                  << " returning config with "
-                  << saved_config_->get_servers().size() << " servers:" << std::endl;
-        for (auto& srv : saved_config_->get_servers()) {
-            std::cerr << "[NuRaft]   - server " << srv->get_id()
-                      << " endpoint=" << srv->get_endpoint() << std::endl;
-        }
         return saved_config_;
     }
 
     void save_config(const cluster_config& config) override {
+        // High water mark: ignore config changes from old log entries.
+        // When a follower receives append_entries from the leader, it replays
+        // the entire log including old config changes (e.g., when the cluster
+        // had 1 server). These stale configs would regress the follower's
+        // config and break cluster communication. Only accept configs whose
+        // log_idx is at or above the high water mark.
+        ulong new_log_idx = config.get_log_idx();
+        size_t new_servers = config.get_servers().size();
+        // Only skip stale configs (don't log — can fire frequently during replay)
+        if (new_log_idx > 0 && new_log_idx < config_log_idx_hwm_) {
+            return;
+        }
+        if (new_log_idx > 0) {
+            config_log_idx_hwm_ = new_log_idx;
+            // Persist the updated HWM so it survives restarts.
+            // Without this, a restarted node's HWM=0 allows old config
+            // entries from log replay to regress the cluster config.
+            if (!state_file_path_.empty()) {
+                save_state_to_file();
+            }
+        }
+
         ptr<buffer> buf = config.serialize();
         saved_config_ = cluster_config::deserialize(*buf);
         
@@ -398,21 +421,15 @@ public:
         }
         
         size_t num_servers = saved_config_->get_servers().size();
-        std::cerr << "[NuRaft] save_config: my_id=" << my_id_
-                  << " new_config_servers=" << num_servers
-                  << " includes_self=" << includes_self << std::endl;
+        // (my_id and num_servers already logged above with log_idx/hwm)
 
         // Notify Nim about each server in the new config
         // This is critical for follower nodes to learn about new peers
         // when the leader adds them via add_srv
         if (config_change_cb_) {
-            std::cerr << "[NuRaft] save_config: calling callback for "
-                      << num_servers << " servers" << std::endl;
             for (auto& srv : saved_config_->get_servers()) {
                 int32_t server_id = srv->get_id();
                 const std::string& endpoint = srv->get_endpoint();
-                std::cerr << "[NuRaft] save_config: server " << server_id
-                          << " endpoint=" << endpoint << std::endl;
                 // Call Nim callback to update peerInfo table
                 config_change_cb_(config_change_ctx_, server_id, endpoint.c_str());
             }
@@ -422,11 +439,7 @@ public:
         if (quorum_update_cb_ && num_servers > 0) {
             int32_t majority = (int32_t)(num_servers / 2) + 1;
             int32_t quorum_size = majority;
-            std::cerr << "[NuRaft] save_config: calling quorum update callback, "
-                      << "num_servers=" << num_servers
-                      << " majority=" << majority
-                      << " quorum_size=" << quorum_size
-                      << " (quorum_for_election=" << (quorum_size - 1) << ")" << std::endl;
+            // Quorum update callback — no logging (can fire during log replay)
             quorum_update_cb_(quorum_update_ctx_, my_id_, quorum_size);
         }
     }
@@ -434,12 +447,6 @@ public:
     void save_state(const srv_state& state) override {
         ptr<buffer> buf = state.serialize();
         saved_state_ = srv_state::deserialize(*buf);
-        std::cerr << "[NuRaft] save_state: my_id=" << my_id_
-                  << " term=" << saved_state_->get_term()
-                  << " voted_for=" << saved_state_->get_voted_for()
-                  << " catching_up=" << (saved_state_->is_catching_up() ? 1 : 0)
-                  << " election_timer_allowed=" << (saved_state_->is_election_timer_allowed() ? 1 : 0)
-                  << std::endl;
         
         // Persist state to file if path is set
         if (!state_file_path_.empty()) {
@@ -480,25 +487,26 @@ private:
     nuraft_quorum_update_cb quorum_update_cb_;
     void* quorum_update_ctx_;
     void* raft_server_ptr_;
+    ulong config_log_idx_hwm_;  // High water mark: max log_idx seen in save_config
     
     // Load srv_state from file (term, voted_for)
     // File format: [term:8B BE][voted_for:4B BE][padding:4B] = 16 bytes
     void load_state_from_file() {
         std::ifstream file(state_file_path_, std::ios::binary);
         if (!file.is_open()) {
-            std::cerr << "[NuRaft] load_state_from_file: file not found or cannot open: "
-                      << state_file_path_ << ", using default state (term=0, voted_for=-1)"
-                      << std::endl;
             saved_state_->set_term(0);
             saved_state_->set_voted_for(-1);
             return;
         }
         
-        char buf[16];
-        file.read(buf, 16);
-        if (file.gcount() != 16) {
-            std::cerr << "[NuRaft] load_state_from_file: incomplete file (read "
-                      << file.gcount() << " bytes), using default state" << std::endl;
+        // Read up to 24 bytes: term(8) + voted_for(4) + padding(4) + config_hwm(8)
+        // v1 format: 16 bytes (no HWM). v2 format: 24 bytes (with HWM).
+        char buf[24];
+        memset(buf, 0, sizeof(buf));
+        file.read(buf, sizeof(buf));
+        std::streamsize bytes_read = file.gcount();
+        
+        if (bytes_read < 12) {
             saved_state_->set_term(0);
             saved_state_->set_voted_for(-1);
             return;
@@ -519,11 +527,22 @@ private:
         saved_state_->set_term(term);
         saved_state_->set_voted_for(voted_for);
         
-        std::cerr << "[NuRaft] load_state_from_file: loaded from " << state_file_path_
-                  << " term=" << term << " voted_for=" << voted_for << std::endl;
+        // Parse config_log_idx_hwm (8 bytes big-endian, bytes 16-23)
+        // Only present in v2 format (24 bytes). If file is shorter,
+        // HWM stays at 0 (which is safe but may allow config regression
+        // until the first forward-progress save_config updates it).
+        if (bytes_read >= 24) {
+            uint64_t hwm = 0;
+            for (int i = 16; i < 24; i++) {
+                hwm = (hwm << 8) | (uint8_t)buf[i];
+            }
+            config_log_idx_hwm_ = hwm;
+        }
+        // State loaded successfully (term, voted_for, config_hwm)
     }
     
-    // Save srv_state to file (term, voted_for)
+    // Save srv_state + config_log_idx_hwm to file
+    // Format v2 (24 bytes): term(8) + voted_for(4) + padding(4) + config_hwm(8)
     void save_state_to_file() {
         // Ensure parent directory exists
         size_t last_slash = state_file_path_.find_last_of('/');
@@ -539,7 +558,8 @@ private:
             return;
         }
         
-        char buf[16];
+        char buf[24];
+        memset(buf, 0, sizeof(buf));
         
         // Write term (8 bytes big-endian)
         uint64_t term = saved_state_->get_term();
@@ -555,17 +575,21 @@ private:
             voted_for >>= 8;
         }
         
-        // Padding (4 bytes)
+        // Padding (4 bytes, bytes 12-15)
         for (int i = 12; i < 16; i++) {
             buf[i] = 0;
         }
         
-        file.write(buf, 16);
-        file.flush();
+        // Write config_log_idx_hwm (8 bytes big-endian, bytes 16-23)
+        uint64_t hwm = config_log_idx_hwm_;
+        for (int i = 23; i >= 16; i--) {
+            buf[i] = (char)(hwm & 0xFF);
+            hwm >>= 8;
+        }
         
-        std::cerr << "[NuRaft] save_state_to_file: saved to " << state_file_path_
-                  << " term=" << saved_state_->get_term()
-                  << " voted_for=" << saved_state_->get_voted_for() << std::endl;
+        file.write(buf, 24);
+        file.flush();
+        // State saved successfully (term, voted_for, config_hwm persisted)
     }
 };
 
@@ -619,7 +643,7 @@ public:
                 gid_hex += hex;
             }
             // Key: (groupId, our_id, target_id)
-            g_pending_handlers[std::make_tuple(gid_hex, server_id_, target_id_)] = when_done;
+            g_pending_handlers[std::make_tuple(gid_hex, server_id_, target_id_)].push_back(when_done);
         }
 
         // Call Nim send callback
@@ -634,7 +658,13 @@ public:
                 gid_hex += hex;
             }
             auto key = std::make_tuple(gid_hex, server_id_, target_id_);
-            g_pending_handlers.erase(key);
+            auto it = g_pending_handlers.find(key);
+            if (it != g_pending_handlers.end() && !it->second.empty()) {
+                it->second.pop_back();
+                if (it->second.empty()) {
+                    g_pending_handlers.erase(it);
+                }
+            }
             ptr<rpc_exception> err = cs_new<rpc_exception>("Send failed", req);
             ptr<resp_msg> null_resp;
             when_done(null_resp, err);
@@ -798,26 +828,6 @@ public:
             tasks_[timer_id] = task;
         }
 
-        // Log timer type for debugging (include group_id)
-        std::string type_str = "unknown";
-        if (task) {
-            int32 ttype = task->get_type();
-            if (ttype == 1) type_str = "election";  // timer_task_type::election_timer
-            else if (ttype == 2) type_str = "heartbeat";  // timer_task_type::heartbeat_timer
-        }
-        // Format group_id as hex string (last 4 bytes for brevity)
-        std::string group_id_str = "unknown";
-        if (parent_ctx_) {
-            char hex_buf[9];
-            for (int i = 12; i < 16; i++) {
-                sprintf(hex_buf + (i-12)*2, "%02x", (unsigned char)parent_ctx_->group_id_bytes[i]);
-            }
-            group_id_str = std::string(hex_buf);
-        }
-        std::cerr << "[NuRaft] schedule_timer: server_id=" << (parent_ctx_ ? parent_ctx_->server_id : -1)
-                  << " group_id=" << group_id_str
-                  << " timer_id=" << timer_id << " type=" << type_str << " delay_ms=" << milliseconds << std::endl;
-
         if (schedule_cb_) {
             schedule_cb_(timer_ctx_, timer_id, milliseconds);
         }
@@ -828,17 +838,6 @@ public:
         for (auto it = tasks_.begin(); it != tasks_.end(); ++it) {
             if (it->second == task) {
                 // Format group_id as hex string (last 4 bytes for brevity)
-                std::string group_id_str = "unknown";
-                if (parent_ctx_) {
-                    char hex_buf[9];
-                    for (int i = 12; i < 16; i++) {
-                        sprintf(hex_buf + (i-12)*2, "%02x", (unsigned char)parent_ctx_->group_id_bytes[i]);
-                    }
-                    group_id_str = std::string(hex_buf);
-                }
-                std::cerr << "[NuRaft] cancel_timer: server_id=" << (parent_ctx_ ? parent_ctx_->server_id : -1)
-                          << " group_id=" << group_id_str
-                          << " timer_id=" << it->first << std::endl;
                 if (cancel_cb_) {
                     cancel_cb_(timer_ctx_, it->first);
                 }
@@ -854,81 +853,19 @@ public:
             std::lock_guard<std::mutex> lock(tasks_lock_);
             auto it = tasks_.find(timer_id);
             if (it == tasks_.end()) {
-                // Format group_id as hex string (last 4 bytes for brevity)
-                std::string group_id_str = "unknown";
-                if (parent_ctx_) {
-                    char hex_buf[9];
-                    for (int i = 12; i < 16; i++) {
-                        sprintf(hex_buf + (i-12)*2, "%02x", (unsigned char)parent_ctx_->group_id_bytes[i]);
-                    }
-                    group_id_str = std::string(hex_buf);
-                }
-                std::cerr << "[NuRaft] invoke_timer: server_id=" << (parent_ctx_ ? parent_ctx_->server_id : -1)
-                          << " group_id=" << group_id_str
-                          << " timer_id=" << timer_id
-                          << " NOT FOUND (cancelled or expired)" << std::endl;
+                // Timer was cancelled or expired - this is normal, no need to log
                 return false;
             }
             task = it->second;
             tasks_.erase(it);
         }
         if (task) {
-            int32 ttype = task->get_type();
-            std::string type_str = "unknown";
-            if (ttype == 1) type_str = "election";
-            else if (ttype == 2) type_str = "heartbeat";
-            
-            // Format group_id as hex string (last 4 bytes for brevity)
-            std::string group_id_str = "unknown";
-            if (parent_ctx_) {
-                char hex_buf[9];
-                for (int i = 12; i < 16; i++) {
-                    sprintf(hex_buf + (i-12)*2, "%02x", (unsigned char)parent_ctx_->group_id_bytes[i]);
-                }
-                group_id_str = std::string(hex_buf);
-            }
-            
-            std::cerr << std::unitbuf;  // Force unbuffered
-            
-            // Count active timers BEFORE execution
-            size_t count_before = 0;
-            {
-                std::lock_guard<std::mutex> lock(tasks_lock_);
-                count_before = tasks_.size();
-            }
-            
-            std::cerr << "[NuRaft shim] invoke_timer START: server_id=" << (parent_ctx_ ? parent_ctx_->server_id : -1)
-                      << " group_id=" << group_id_str
-                      << " ctx_ptr=" << (void*)parent_ctx_
-                      << " timer_id=" << timer_id << " type=" << type_str 
-                      << " active_before=" << count_before << std::endl;
-            
             // Call execute() - internally checks cancelled_ flag
             task->execute();
-            
-            // Confirm that execute() was actually called
-            std::cerr << "[NuRaft shim] invoke_timer EXECUTED: server_id=" << (parent_ctx_ ? parent_ctx_->server_id : -1)
-                      << " group_id=" << group_id_str
-                      << " timer_id=" << timer_id << std::endl;
-            
-            // Note: if task was cancelled, execute() returns silently without calling exec()
-            // This would explain why HE_TIMEOUT doesn appear
-            
-            // Count active timers AFTER execution to see if new timer was scheduled
-            size_t count_after = 0;
-            {
-                std::lock_guard<std::mutex> lock(tasks_lock_);
-                count_after = tasks_.size();
-            }
-            
-            std::cerr << "[NuRaft shim] invoke_timer END: server_id=" << (parent_ctx_ ? parent_ctx_->server_id : -1)
-                      << " group_id=" << group_id_str
-                      << " ctx_ptr=" << (void*)parent_ctx_
-                      << " timer_id=" << timer_id << " type=" << type_str << " active_after=" << count_after << std::endl;
             return true;
         }
         return false;
-}
+    }
              
     void stop() {
         stopped_.store(true);
@@ -1075,6 +1012,15 @@ void nuraft_params_set_custom_election_quorum_size(void* params, int32_t size) {
             size, size > 0 ? size - 1 : 0);
 }
 
+void nuraft_params_set_auto_adjust_quorum(void* params, int32_t enable) {
+    if (!params) return;
+    auto* p = static_cast<raft_params*>(params);
+    p->auto_adjust_quorum_for_small_cluster_ = (enable != 0);
+    fprintf(stderr, "[NuRaft Shim] Set auto_adjust_quorum_for_small_cluster to %s\n",
+            enable ? "true" : "false");
+    fflush(stderr);
+}
+
 // =============================================================================
 // Limits (global settings)
 // =============================================================================
@@ -1196,6 +1142,16 @@ void nuraft_mp_context_destroy(void* ctx) {
     if (ctx) {
         auto* mp_ctx = static_cast<mp_context_t*>(ctx);
         try {
+            // Clear any pending RPC handlers for this group/server to prevent
+            // stale handlers from interfering with future tests.
+            std::string gid_hex;
+            for (int i = 0; i < 16; i++) {
+                char hex[3];
+                sprintf(hex, "%02x", (unsigned char)mp_ctx->group_id_bytes[i]);
+                gid_hex += hex;
+            }
+            clearPendingHandlersForGroupAndServer(gid_hex, mp_ctx->server_id);
+
             if (mp_ctx->client_factory) {
                 mp_ctx->client_factory->abandon_all();
             }
@@ -1258,21 +1214,11 @@ void nuraft_mp_listener_destroy(void* listener_ptr) {
 void nuraft_mp_deliver_message(void* mp_context, void* server,
                                const char* msg_data, size_t msg_len) {
     if (!mp_context || !msg_data || msg_len == 0) {
-        std::cerr << "[shim] deliver_message: early return (null or zero len)" << std::endl;
         return;
     }
 
     auto* mp_ctx = static_cast<mp_context_t*>(mp_context);
     auto* wrapper = static_cast<server_wrapper*>(server);
-
-    // Build group_id hex for logging
-    std::string gid_hex;
-    for (int i = 0; i < 16; i++) {
-        char hex[3];
-        sprintf(hex, "%02x", (unsigned char)mp_ctx->group_id_bytes[i]);
-        gid_hex += hex;
-    }
-    std::string gid_short = gid_hex.substr(24, 8);  // Last 4 bytes for brevity
 
     // Deserialize message - allocate buffer and copy data
     // IMPORTANT: buffer::alloc creates buffer with given size, and pos=0
@@ -1282,77 +1228,85 @@ void nuraft_mp_deliver_message(void* mp_context, void* server,
 
     msg_type type = get_msg_type(*msg_buf);
 
-    std::cerr << "[shim] deliver_message: server_id=" << mp_ctx->server_id
-              << " group=" << gid_short << " msg_type=" << static_cast<int>(type)
-              << " len=" << msg_len << std::endl;
+    // std::cerr << "[shim] deliver_message: server_id=" << mp_ctx->server_id
+    //           << " group=" << gid_short << " msg_type=" << static_cast<int>(type)
+    //           << " len=" << msg_len << std::endl;
 
     if (is_response_type(type)) {
-        // It's a response - match to pending handler
-        ptr<resp_msg> resp = deserialize_resp_msg(*msg_buf);
+         // It's a response - match to pending handler
+         ptr<resp_msg> resp = deserialize_resp_msg(*msg_buf);
 
-        std::cerr << "[shim] deliver_message RESPONSE: src=" << resp->get_src()
-                  << " dst=" << resp->get_dst() << " accepted=" << resp->get_accepted()
-                  << " term=" << resp->get_term() << std::endl;
+         // Build group_id hex for handler lookup key
+         std::string gid_hex_key;
+         for (int i = 0; i < 16; i++) {
+             char hex[3];
+             sprintf(hex, "%02x", (unsigned char)mp_ctx->group_id_bytes[i]);
+             gid_hex_key += hex;
+         }
 
-        // Key: (groupId_hex, our_server_id, responder_id)
-        auto key = std::make_tuple(gid_hex, mp_ctx->server_id, resp->get_src());
-
-        std::cerr << "[shim] deliver_message: lookup key=(" << gid_short << ", " << mp_ctx->server_id << ", " << resp->get_src() << ")" << std::endl;
-
-        // Dump all pending handlers for debugging
-        {
-            std::lock_guard<std::mutex> lock(g_handlers_lock);
-            std::cerr << "[shim] deliver_message: pending handlers count=" << g_pending_handlers.size() << std::endl;
-            for (const auto& entry : g_pending_handlers) {
-                const auto& k = entry.first;
-                std::string k_gid = std::get<0>(k).substr(24, 8);
-                std::cerr << "[shim]   handler: (" << k_gid << ", " << std::get<1>(k) << ", " << std::get<2>(k) << ")" << std::endl;
-            }
-        }
+         // Key: (groupId_hex, our_server_id, responder_id)
+         auto key = std::make_tuple(gid_hex_key, mp_ctx->server_id, resp->get_src());
 
         rpc_handler handler;
         {
             std::lock_guard<std::mutex> lock(g_handlers_lock);
             auto it = g_pending_handlers.find(key);
-            if (it != g_pending_handlers.end()) {
-                handler = it->second;
-                g_pending_handlers.erase(it);
-                std::cerr << "[shim] deliver_message: FOUND handler for key" << std::endl;
-            } else {
-                std::cerr << "[shim] deliver_message: NO handler found for key" << std::endl;
+            if (it != g_pending_handlers.end() && !it->second.empty()) {
+                handler = it->second.front();
+                it->second.pop_front();
+                if (it->second.empty()) {
+                    g_pending_handlers.erase(it);
+                }
             }
         }
 
         if (handler) {
-            std::cerr << "[shim] deliver_message: invoking handler" << std::endl;
             ptr<rpc_exception> no_err;
             handler(resp, no_err);
-            std::cerr << "[shim] deliver_message: handler completed" << std::endl;
         }
     } else {
         // It's a request - process and send response
         ptr<req_msg> req = deserialize_req_msg(*msg_buf);
 
-        std::cerr << "[shim] deliver_message REQUEST: src=" << req->get_src()
-                  << " dst=" << req->get_dst() << " term=" << req->get_term()
-                  << " last_log_idx=" << req->get_last_log_idx() << std::endl;
-
         raft_server* srv = wrapper ? wrapper->server.get() : nullptr;
         if (!srv) {
-            std::cerr << "[shim] deliver_message: server is null, returning" << std::endl;
             return;
         }
 
-        std::cerr << "[shim] deliver_message: calling process_req for msg_type=" 
-                  << static_cast<int>(req->get_type()) << std::endl;
+        // --- FRACTIO: longest-log-wins pre-vote gate ---
+        // NuRaft's handle_prevote_req grants pre-vote whenever
+        // `!hb_alive_`, with no log comparison. That allows a node
+        // with FEWER entries to start an election, become leader,
+        // and then crash into "peer last_log_idx too large".
+        // We gate pre-vote here (in Fractio code, not NuRaft) so
+        // that only the longest-log node can pass pre-vote.
+        ptr<resp_msg> resp;
+        if (req->get_type() == msg_type::pre_vote_request) {
+            ulong my_last_log_idx = srv->get_last_log_idx();
+            ulong req_last_log_idx = req->get_last_log_idx();
+            if (my_last_log_idx > req_last_log_idx) {
+                // We have more entries: deny pre-vote so the shorter-log
+                // node cannot become leader.
+                // next_idx == MAX with accepted==false signals a "live"
+                // peer to handle_prevote_resp (counts toward live_ counter).
+                resp = cs_new<resp_msg>(
+                    req->get_term(),
+                    msg_type::pre_vote_response,
+                    mp_ctx->server_id,
+                    req->get_src(),
+                    std::numeric_limits<ulong>::max(),
+                    false
+                );
+            }
+        }
 
-        ptr<resp_msg> resp = raft_server_access::call_process_req(srv, *req);
-
-        std::cerr << "[shim] deliver_message: process_req returned, resp=" 
-                  << (resp ? "non-null" : "null") << std::endl;
+        if (!resp) {
+            // Normal path: let NuRaft handle the request
+            resp = raft_server_access::call_process_req(srv, *req);
+        }
 
         if (resp) {
-            std::cerr << "[shim] deliver_message: got response, sending via listener" << std::endl;
+            // std::cerr << "[shim] deliver_message: got response, sending via listener" << std::endl;
             // Send response via listener's callback
             auto& listener = mp_ctx->listener;
             if (listener && listener->has_send_response_callback()) {
@@ -1360,8 +1314,8 @@ void nuraft_mp_deliver_message(void* mp_context, void* server,
                 const char* resp_data = reinterpret_cast<const char*>(resp_buf->data_begin());
                 size_t resp_len = resp_buf->size();
 
-                std::cerr << "[shim] deliver_message: response src=" << resp->get_src()
-                          << " dst=" << resp->get_dst() << " accepted=" << resp->get_accepted() << std::endl;
+                // std::cerr << "[shim] deliver_message: response src=" << resp->get_src()
+                //           << " dst=" << resp->get_dst() << " accepted=" << resp->get_accepted() << std::endl;
 
                 listener->get_send_resp_cb()(
                     listener->get_send_resp_ctx(),
@@ -1371,9 +1325,9 @@ void nuraft_mp_deliver_message(void* mp_context, void* server,
                     resp_data,
                     resp_len
                 );
-                std::cerr << "[shim] deliver_message: response sent" << std::endl;
+                // std::cerr << "[shim] deliver_message: response sent" << std::endl;
             } else {
-                std::cerr << "[shim] deliver_message: no listener or callback" << std::endl;
+                // std::cerr << "[shim] deliver_message: no listener or callback" << std::endl;
             }
         }
     }
@@ -1412,12 +1366,6 @@ void* nuraft_server_create(
     auto& smgr_sp = *static_cast<ptr<dynamic_state_mgr>*>(smgr);
     auto* rp = static_cast<raft_params*>(params);
 
-    // Log params values to trace what's being passed to raft_server
-    std::cerr << "[NuRaft shim] nuraft_server_create: params="
-              << " election_timeout_lower=" << rp->election_timeout_lower_bound_
-              << " election_timeout_upper=" << rp->election_timeout_upper_bound_
-              << " heartbeat_interval=" << rp->heart_beat_interval_ << std::endl;
-
     // Create context with custom RPC components
     context* ctx = new context(
         std::static_pointer_cast<state_mgr>(smgr_sp),
@@ -1430,12 +1378,12 @@ void* nuraft_server_create(
     );
 
     // Wire event callback
+    // Only log BecomeLeader/BecomeFollower events — these are rare and critical.
+    // Other event types (ProcessReq, AppendEntries, etc.) fire hundreds of times
+    // per second and synchronous std::cerr writes block the calling thread,
+    // preventing timely election processing.
     if (event_cb) {
         ctx->set_cb_func([event_cb, event_ctx](cb_func::Type type, cb_func::Param* param) -> cb_func::ReturnCode {
-            std::cerr << "[NuRaft cb_func] type=" << static_cast<int>(type)
-                      << " (BecomeLeader=" << static_cast<int>(cb_func::BecomeLeader)
-                      << ", BecomeFollower=" << static_cast<int>(cb_func::BecomeFollower) << ")"
-                      << " leaderId=" << param->leaderId << std::endl;
             if (type == cb_func::BecomeLeader || type == cb_func::BecomeFollower) {
                 event_cb(event_ctx, static_cast<int>(type), param->leaderId,
                          param->ctx ? *static_cast<uint64_t*>(param->ctx) : 0);
@@ -1561,19 +1509,13 @@ int nuraft_server_add_srv(void* server, int32_t srv_id, const char* endpoint) {
     auto* wrapper = static_cast<server_wrapper*>(server);
     if (!wrapper->server) return -1;
 
-    std::cerr << "[NuRaft shim] add_srv: srv_id=" << srv_id
-              << " endpoint=" << endpoint << std::endl;
-
     srv_config sc(srv_id, std::string(endpoint));
     auto result = wrapper->server->add_srv(sc);
     if (!result) {
-        std::cerr << "[NuRaft shim] add_srv: result is NULL!" << std::endl;
         return -1;
     }
 
     int rc = result->get_accepted() ? 0 : static_cast<int>(result->get_result_code());
-    std::cerr << "[NuRaft shim] add_srv: accepted=" << result->get_accepted()
-              << " result_code=" << rc << std::endl;
     return rc;
 }
 
@@ -1611,17 +1553,38 @@ void nuraft_server_update_quorum(void* server, int32_t quorum_size) {
     auto* wrapper = static_cast<server_wrapper*>(server);
     if (!wrapper->server || !wrapper->raft_ctx) return;
     
-    // Get current params and modify only the quorum size
+    // Get current params and modify quorum sizes
     ptr<raft_params> current_params = wrapper->raft_ctx->get_params();
     raft_params new_params(*current_params);  // Copy existing params (preserves hb_interval!)
     new_params.custom_election_quorum_size_ = quorum_size;
-    
-    std::cerr << "[NuRaft Shim] update_quorum: server_id=" << wrapper->server->get_id()
-              << " quorum_size=" << quorum_size
-              << " (actual quorum=" << (quorum_size > 0 ? quorum_size - 1 : 0) << ")"
-              << " hb_interval=" << new_params.heart_beat_interval_ << std::endl;
+    new_params.custom_commit_quorum_size_ = quorum_size;
     
     wrapper->server->update_params(new_params);
+}
+
+int32_t nuraft_server_get_peer_info(void* server, int32_t peer_id, nuraft_peer_info* out_info) {
+    if (!server || !out_info) return -1;
+    auto* wrapper = static_cast<server_wrapper*>(server);
+    if (!wrapper->server) return -1;
+
+    auto peer = wrapper->server->get_peer_info(peer_id);
+    if (peer.id_ < 0) {
+        out_info->exists = 0;
+        return -1;
+    }
+    out_info->exists = 1;
+    out_info->last_log_idx = peer.last_log_idx_;
+    out_info->last_succ_resp_us = peer.last_succ_resp_us_;
+    return 0;
+}
+
+int32_t nuraft_server_get_server_count(void* server) {
+    if (!server) return 0;
+    auto* wrapper = static_cast<server_wrapper*>(server);
+    if (!wrapper->server) return 0;
+    auto config = wrapper->server->get_config();
+    if (!config) return 0;
+    return static_cast<int32_t>(config->get_servers().size());
 }
 
 } // extern "C"
