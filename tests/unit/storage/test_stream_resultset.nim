@@ -4,8 +4,10 @@
 import unittest
 import std/[options, deques, strutils]
 import fractio/storage/backend
-import fractio/core/kv_interface # for consumeStream
-import fractio/di/mocks
+import fractio/core/kv_interface # for consumeStream, KVStreamResult
+import fractio/core/mock_kv # for MockKVStore (KVStore subclass with streamScan)
+import fractio/protocol/mvcc_store # for ScanChunk
+import fractio/di/mocks # for MockStreamResultSet, MockBackend, newMockKVStore (mocks version)
 
 suite "StreamResultSet Types":
   test "StreamConfig defaults":
@@ -134,7 +136,7 @@ suite "MockStreamResultSet":
 
 suite "MockKVStore Streaming":
   test "mockStreamScan creates stream from MockKVStore":
-    let store = newMockKVStore()
+    let store = mocks.newMockKVStore()
     discard store.put("prefix_a", "value_a")
     discard store.put("prefix_b", "value_b")
     discard store.put("prefix_c", "value_c")
@@ -154,7 +156,7 @@ suite "MockKVStore Streaming":
     rs.close()
 
   test "mockStreamScan respects limit":
-    let store = newMockKVStore()
+    let store = mocks.newMockKVStore()
     discard store.put("key_1", "v1")
     discard store.put("key_2", "v2")
     discard store.put("key_3", "v3")
@@ -191,3 +193,86 @@ suite "MockBackend Streaming":
 
     check count == 2
     rs.close()
+
+suite "MockKVStore streamScan (KVStore interface)":
+  test "streamScan returns all keys in range":
+    let store = mock_kv.newMockKVStore()
+    discard store.put("key_a", "val_a")
+    discard store.put("key_b", "val_b")
+    discard store.put("key_c", "val_c")
+    discard store.put("other_x", "val_x")
+
+    # Use endKey to limit the range (empty endKey = no upper bound)
+    let res = store.streamScan("key_a", "key_z", 0)
+    check res.isOk
+    var count = 0
+    while res.stream.hasNext():
+      let kv = res.stream.next()
+      if kv.isSome:
+        inc count
+    check count == 3
+    res.stream.close()
+
+  test "streamScan respects limit":
+    let store = mock_kv.newMockKVStore()
+    discard store.put("k1", "v1")
+    discard store.put("k2", "v2")
+    discard store.put("k3", "v3")
+    discard store.put("k4", "v4")
+
+    let res = store.streamScan("", "", 2)
+    check res.isOk
+    var count = 0
+    while res.stream.hasNext():
+      let kv = res.stream.next()
+      if kv.isSome:
+        inc count
+    check count == 2
+    res.stream.close()
+
+  test "streamScan with empty store returns no results":
+    let store = mock_kv.newMockKVStore()
+    let res = store.streamScan("", "", 0)
+    check res.isOk
+    check res.stream.hasNext() == false
+    res.stream.close()
+
+  test "streamScan returns sorted keys":
+    let store = mock_kv.newMockKVStore()
+    discard store.put("z_key", "val_z")
+    discard store.put("a_key", "val_a")
+    discard store.put("m_key", "val_m")
+
+    let res = store.streamScan("", "", 0)
+    check res.isOk
+    var keys: seq[string] = @[]
+    while res.stream.hasNext():
+      let kv = res.stream.next()
+      if kv.isSome:
+        keys.add(kv.get.key)
+    check keys == @["a_key", "m_key", "z_key"]
+    res.stream.close()
+
+suite "ScanChunk type":
+  test "ScanChunk holds pairs and hasMore flag":
+    let chunk = ScanChunk(
+      pairs: @[(key: "k1", value: "v1"), (key: "k2", value: "v2")],
+      hasMore: true
+    )
+    check chunk.pairs.len == 2
+    check chunk.hasMore == true
+    check chunk.pairs[0].key == "k1"
+    check chunk.pairs[1].key == "k2"
+
+  test "ScanChunk final chunk has hasMore=false":
+    let chunk = ScanChunk(
+      pairs: @[(key: "k3", value: "v3")],
+      hasMore: false
+    )
+    check chunk.pairs.len == 1
+    check chunk.hasMore == false
+
+  test "ScanChunk empty chunk signals end":
+    let chunk = ScanChunk(pairs: @[], hasMore: false)
+    check chunk.pairs.len == 0
+    check chunk.hasMore == false

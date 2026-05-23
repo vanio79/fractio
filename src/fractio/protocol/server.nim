@@ -1251,42 +1251,31 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
         return
 
     if not server.mvccStore.isNil:
-      let res = if not isZero(req.txnId):
-                  server.mvccStore.txnScanByTxnId(req.txnId, req.startKey,
-                      req.endKey, req.limit)
-                else:
-                  server.mvccStore.latestScan(req.startKey, req.endKey, req.limit)
+      let isStreaming = (req.flags and ScanFlagStreaming) != 0
+      let chunkSize = if req.chunkSize > 0: int(req.chunkSize)
+                      else: DEFAULT_SCAN_CHUNK_SIZE
+      let needGroupFilter = req.groupId != ZeroGroupID()
+      let needServerFilter = req.filter.isSome
 
-      if res.isOk:
-        let currentTs = server.mvccStore.getCurrentTimestamp()
+      # Build filter procs
+      var groupFilterProc: proc(key: string): bool {.gcsafe, raises: [].} = nil
+      if needGroupFilter:
+        groupFilterProc = proc(key: string): bool {.gcsafe, raises: [].} =
+          server.raftStore.keyRoutesToGroupIdDuringRebalance(key, req.groupId)
 
-        # Filter by group routing if groupId is provided
-        var filteredPairs: seq[tuple[key: string, value: string]] = @[]
-        let needGroupFilter = req.groupId != ZeroGroupID()
-        let needServerFilter = req.filter.isSome
+      var serverFilterProc: proc(value: string): bool {.gcsafe, raises: [].} = nil
+      if needServerFilter:
+        serverFilterProc = proc(value: string): bool {.gcsafe, raises: [].} =
+          matchesWireFilterWithDecodedValue(req.filter, value)
 
-        for p in res.value:
-          # If groupId is specified, only include keys that route to this group
-          # During rebalancing, use dual-read mode to accept keys that route to
-          # either old or new groups
-          if needGroupFilter:
-            # Use the dual-read-aware routing check
-            let routesToGroup = server.raftStore.keyRoutesToGroupIdDuringRebalance(
-              p.key, req.groupId)
-            if not routesToGroup:
-              continue # key doesn't route to this group, skip it
-          
-          # Apply server-side filter if present
-          if needServerFilter:
-            if not matchesWireFilterWithDecodedValue(req.filter, p.value):
-              continue # row doesn't match filter, skip it
+      let currentTs = server.mvccStore.getCurrentTimestamp()
 
-          filteredPairs.add(p)
-
-        # Convert filtered pairs to ScanPair with metadata
-        var scanPairs = newSeq[ScanPair](filteredPairs.len)
-        for i, p in filteredPairs:
-          # Get version for this key
+      # Use streaming path for large scans to avoid buffering everything in
+      # memory. The streaming callback sends frames incrementally.
+      proc sendChunk(chunk: ScanChunk) {.gcsafe, raises: [].} =
+        let chunkPairs = chunk.pairs
+        var scanPairs = newSeq[ScanPair](chunkPairs.len)
+        for i, p in chunkPairs:
           var ver: uint64 = 1
           withLock server.mvccStore.keyVersionsMu:
             ver = server.mvccStore.keyVersions.getOrDefault(p.key, 1'u64)
@@ -1297,43 +1286,37 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
             version: ver,
           )
 
-        # Check if streaming scan is requested
-        let isStreaming = (req.flags and ScanFlagStreaming) != 0
-        let chunkSize = if req.chunkSize > 0: int(req.chunkSize)
-                        else: DEFAULT_SCAN_CHUNK_SIZE
-
-        if isStreaming and scanPairs.len > chunkSize:
-          # Streaming scan: send multiple frames
-          var sent = 0
-          while sent < scanPairs.len:
-            let remaining = scanPairs.len - sent
-            let thisChunk = min(remaining, chunkSize)
-            let chunkPairs = scanPairs[sent ..< sent + thisChunk]
-            sent += thisChunk
-
-            let hasMore = sent < scanPairs.len
-            let respFlags = if hasMore: ScanRespFlagHasMore
-                            else: ScanRespFlagHasMore or ScanRespFlagEndOfScan
-
-            let rf = ScanResponseFrame(
-              respFlags: respFlags,
-              pairs: chunkPairs,
-              reqFlags: req.flags,
-            )
-            # Use FlagIsResponse for all frames, FlagEndOfStream for final frame
-            let frameFlags = if hasMore: FlagIsResponse
-                             else: FlagIsResponse or FlagEndOfStream
-            sendFrame(conn, encodeScanResponseFrame(rf), requestId, frameFlags)
+        if chunk.hasMore:
+          # More frames coming
+          let rf = ScanResponseFrame(
+            respFlags: ScanRespFlagHasMore,
+            pairs: scanPairs,
+            reqFlags: req.flags,
+          )
+          sendFrame(conn, encodeScanResponseFrame(rf), requestId,
+              FlagIsResponse)
         else:
-          # Single-frame scan (non-streaming or small result)
+          # Final frame
           let rf = ScanResponseFrame(
             respFlags: ScanRespFlagEndOfScan,
             pairs: scanPairs,
             reqFlags: req.flags,
           )
           sendFrame(conn, encodeScanResponseFrame(rf), requestId)
-      else:
-        sendError(conn, requestId, ErrInternal, ErrCatKV, res.error.msg)
+
+      let readTs = if not isZero(req.txnId): LATEST_READ_TIMESTAMP
+                   else: LATEST_READ_TIMESTAMP
+
+      discard server.mvccStore.snapshotStreamScan(
+        startKey = req.startKey,
+        endKey = req.endKey,
+        readTs = readTs,
+        limit = req.limit,
+        chunkSize = chunkSize,
+        callback = sendChunk,
+        groupFilter = groupFilterProc,
+        serverFilter = serverFilterProc
+      )
     else:
       sendError(conn, requestId, ErrInternal, ErrCatKV, "MVCC store not initialized")
 

@@ -9,7 +9,7 @@
 #
 # Port range: 20640-20669
 
-import std/[unittest, os, options]
+import std/[unittest, os, options, strutils]
 import fractio/protocol/raft_store
 import fractio/protocol/mvcc_store
 import fractio/protocol/txn_manager
@@ -340,3 +340,161 @@ suite "MvccTransactionStore - Conflict detection":
     # Note: In our simplified implementation, conflict is detected via commitIndex
     # The second commit should either succeed or fail depending on timing
     # For a proper test, we'd need two concurrent transactions
+
+  # ---------------------------------------------------------------------------
+  # Suite: snapshotStreamScan
+  # ---------------------------------------------------------------------------
+
+suite "MvccTransactionStore - snapshotStreamScan":
+
+  test "snapshotStreamScan returns all keys in range":
+    let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_ss01")
+    defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_ss01")
+
+    # Insert data via transaction
+    let sessionId = mvccStore.createSession()
+    discard mvccStore.beginTransaction(sessionId)
+    discard mvccStore.txnPut(sessionId, "stream_a", "val_a")
+    discard mvccStore.txnPut(sessionId, "stream_b", "val_b")
+    discard mvccStore.txnPut(sessionId, "stream_c", "val_c")
+    discard mvccStore.txnPut(sessionId, "other_x", "val_x")
+    let commitRes = mvccStore.commitTransaction(sessionId)
+    check commitRes.isOk
+
+    # Wait for Raft replication
+    os.sleep(200)
+
+    var chunksReceived = 0
+    var totalPairs = 0
+
+    let ok = mvccStore.snapshotStreamScan(
+      startKey = "stream_a",
+      endKey = "stream_z",
+      readTs = LATEST_READ_TIMESTAMP,
+      limit = 0,
+      chunkSize = 100,
+      callback = proc(chunk: ScanChunk) {.gcsafe, raises: [].} =
+      inc chunksReceived
+      totalPairs += chunk.pairs.len
+    )
+    check ok
+    check chunksReceived >= 1
+    check totalPairs == 3 # stream_a, stream_b, stream_c
+
+  test "snapshotStreamScan with group filter":
+    let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_ss02")
+    defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_ss02")
+
+    let sessionId = mvccStore.createSession()
+    discard mvccStore.beginTransaction(sessionId)
+    discard mvccStore.txnPut(sessionId, "gfilter_a", "val_a")
+    discard mvccStore.txnPut(sessionId, "gfilter_b", "val_b")
+    discard mvccStore.txnPut(sessionId, "gfilter_c", "val_c")
+    discard mvccStore.commitTransaction(sessionId)
+
+    os.sleep(200)
+
+    # Filter that only allows keys containing 'b'
+    var totalPairs = 0
+    let ok = mvccStore.snapshotStreamScan(
+      startKey = "gfilter_a",
+      endKey = "gfilter_z",
+      readTs = LATEST_READ_TIMESTAMP,
+      limit = 0,
+      chunkSize = 100,
+      callback = proc(chunk: ScanChunk) {.gcsafe, raises: [].} =
+      totalPairs += chunk.pairs.len
+    ,
+      groupFilter = proc(key: string): bool {.gcsafe, raises: [].} =
+      key.contains("b")
+    )
+    check ok
+    check totalPairs == 1 # Only gfilter_b passes the filter
+
+  test "snapshotStreamScan with limit":
+    let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_ss03")
+    defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_ss03")
+
+    let sessionId = mvccStore.createSession()
+    discard mvccStore.beginTransaction(sessionId)
+    discard mvccStore.txnPut(sessionId, "limit_a", "1")
+    discard mvccStore.txnPut(sessionId, "limit_b", "2")
+    discard mvccStore.txnPut(sessionId, "limit_c", "3")
+    discard mvccStore.txnPut(sessionId, "limit_d", "4")
+    discard mvccStore.txnPut(sessionId, "limit_e", "5")
+    discard mvccStore.commitTransaction(sessionId)
+
+    os.sleep(200)
+
+    var totalPairs = 0
+    let ok = mvccStore.snapshotStreamScan(
+      startKey = "limit_a",
+      endKey = "limit_z",
+      readTs = LATEST_READ_TIMESTAMP,
+      limit = 3,
+      chunkSize = 100,
+      callback = proc(chunk: ScanChunk) {.gcsafe, raises: [].} =
+      totalPairs += chunk.pairs.len
+    )
+    check ok
+    check totalPairs == 3
+
+  test "snapshotStreamScan with small chunk size sends multiple chunks":
+    let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_ss04")
+    defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_ss04")
+
+    let sessionId = mvccStore.createSession()
+    discard mvccStore.beginTransaction(sessionId)
+    for i in 0..<10:
+      discard mvccStore.txnPut(sessionId, "chunk_" & $i, "val_" & $i)
+    discard mvccStore.commitTransaction(sessionId)
+
+    os.sleep(200)
+
+    var chunksReceived = 0
+    var totalPairs = 0
+    var sawHasMore = false
+    var sawFinalChunk = false
+
+    let ok = mvccStore.snapshotStreamScan(
+      startKey = "chunk_",
+      endKey = "chunk_z",
+      readTs = LATEST_READ_TIMESTAMP,
+      limit = 0,
+      chunkSize = 3, # Small chunk size to force multiple chunks
+      callback = proc(chunk: ScanChunk) {.gcsafe, raises: [].} =
+        inc chunksReceived
+        totalPairs += chunk.pairs.len
+        if chunk.hasMore:
+          sawHasMore = true
+        else:
+          sawFinalChunk = true
+    )
+    check ok
+    check chunksReceived >= 4 # 10 items / 3 per chunk = 4 chunks
+    check totalPairs == 10
+    check sawHasMore
+    check sawFinalChunk
+
+  test "snapshotStreamScan with empty range":
+    let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_ss05")
+    defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_ss05")
+
+    # No data in this range
+    var chunksReceived = 0
+    var totalPairs = 0
+
+    let ok = mvccStore.snapshotStreamScan(
+      startKey = "empty_a",
+      endKey = "empty_z",
+      readTs = LATEST_READ_TIMESTAMP,
+      limit = 0,
+      chunkSize = 100,
+      callback = proc(chunk: ScanChunk) {.gcsafe, raises: [].} =
+      inc chunksReceived
+      totalPairs += chunk.pairs.len
+    )
+    check ok
+    # Empty result still sends one chunk with hasMore=false and 0 pairs
+    check chunksReceived == 1
+    check totalPairs == 0

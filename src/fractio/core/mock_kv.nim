@@ -6,6 +6,8 @@
 import std/[tables as stdtables, options, locks, atomics, algorithm]
 import ./types
 import ./kv_interface
+import ../storage/backend # for StreamConfig, StreamResultSet
+import ../di/mocks # for MockStreamResultSet
 
 type
   MockKVStore* = ref object of KVStore
@@ -194,6 +196,29 @@ method scan*(store: MockKVStore, startKey: string, endKey: string,
     kvOpOk(entries)
   finally:
     store.lock.release()
+
+method streamScan*(store: MockKVStore, startKey: string, endKey: string,
+                   limit: uint32 = 0,
+                   txnId: TransactionID = zeroTransactionID(),
+                   readTimestamp: uint64 = 0,
+                   config: StreamConfig = defaultStreamConfig()): KVStreamResult =
+  ## Streaming scan for MockKVStore.
+  ## Delegates to the synchronous scan() and wraps results in a MockStreamResultSet.
+  ## This allows the streaming SQL path to be tested with mock data.
+  let scanRes = store.scan(startKey, endKey, limit, txnId, readTimestamp)
+  if scanRes.isErr:
+    return kvStreamErr(scanRes.err)
+
+  # Convert scan results to the format expected by MockStreamResultSet
+  var data: seq[(string, string)] = @[]
+  for entry in scanRes.val:
+    data.add((entry.key, entry.value))
+
+  # Create and return a mock stream result set
+  let mockStream = newMockStreamResultSet(data, config)
+  # MockStreamResultSet doesn't need init() — it's already populated
+  discard mockStream.init(nil, startKey, endKey, int(limit))
+  kvStreamOk(mockStream)
 
 method beginTxn*(store: MockKVStore): KVOpResult[TxnBeginResult] =
   ## Begin a new transaction.

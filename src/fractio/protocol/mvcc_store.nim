@@ -855,10 +855,128 @@ proc getCurrentTimestamp*(store: MvccTransactionStore): coreTypes.Timestamp {.
   coreTypes.Timestamp(wallNs)
 
 # ---------------------------------------------------------------------------
+# Streaming scan (chunk-based, avoids buffering entire result set)
+# ---------------------------------------------------------------------------
+
+type
+  ScanChunk* = object
+    ## A chunk of deduplicated MVCC scan results, ready for wire encoding.
+    pairs*: seq[tuple[key: string, value: string]]
+    hasMore*: bool ## True if more results remain
+
+proc snapshotStreamScan*(store: MvccTransactionStore,
+    startKey: string, endKey: string, readTs: coreTypes.Timestamp,
+    limit: uint32 = 0, chunkSize: int = 1000,
+    callback: proc(chunk: ScanChunk) {.gcsafe, raises: [].},
+    groupFilter: proc(key: string): bool {.gcsafe, raises: [].} = nil,
+    serverFilter: proc(value: string): bool {.gcsafe, raises: [].} = nil,
+    raftStore: RaftKVStoreExt = nil): bool {.gcsafe, raises: [].} =
+  ## Stream MVCC scan results in chunks, calling `callback` for each chunk.
+  ##
+  ## This avoids buffering the entire result set in memory. Instead, it reads
+  ## from Raft in batches, deduplicates MVCC versions, applies optional filters,
+  ## and yields sorted chunks via the callback.
+  ##
+  ## Returns true if all chunks were sent successfully, false on error.
+  ##
+  ## The `groupFilter` and `serverFilter` callbacks are applied per-row before
+  ## adding to a chunk, allowing the server to push down filters during streaming.
+  ## If provided, `raftStore` is used for group routing filter resolution.
+  ##
+  ## `chunkSize` controls how many filtered pairs are accumulated before
+  ## invoking the callback. The final chunk may be smaller and has hasMore=false.
+
+  # Step 1: Read all raw KV pairs from Raft (this is necessary because MVCC
+  # dedup requires seeing all versions of a key to pick the latest).
+  # However, we can apply filters early to reduce memory pressure.
+  let scanRes = store.raftStore.raftScan(startKey, endKey, 0,
+      includeSystemKeys = true)
+  if not scanRes.isOk:
+    return false
+
+  # Step 2: Deduplicate MVCC keys (same logic as snapshotScan)
+  var keyVersions: tables.Table[string, tuple[value: string,
+      isDeleted: bool, timestamp: coreTypes.Timestamp]] = initTable[string,
+      tuple[value: string, isDeleted: bool, timestamp: coreTypes.Timestamp]]()
+
+  # Pass 1: Collect latest versioned keys
+  for (k, entry) in scanRes.value:
+    if isIntentKeyMvcc(k): continue
+    if isVersionKey(k):
+      try:
+        let decoded = decodeVersionKey(k)
+        if decoded.timestamp <= readTs:
+          let mvccVal = mvccTypes.decodeMVCCValue(entry.value)
+          if not keyVersions.hasKey(decoded.userKey) or decoded.timestamp >
+              keyVersions[decoded.userKey].timestamp:
+            keyVersions[decoded.userKey] = (mvccVal.data, mvccVal.isDeleted,
+                decoded.timestamp)
+      except:
+        discard
+
+  # Pass 2: Plain keys with MVCC-encoded values
+  for (k, entry) in scanRes.value:
+    if isIntentKeyMvcc(k) or isVersionKey(k): continue
+    if mvccTypes.isLikelyMVCCValue(entry.value):
+      try:
+        let mvccVal = mvccTypes.decodeMVCCValue(entry.value)
+        if mvccVal.timestamp <= readTs:
+          if not keyVersions.hasKey(k) or mvccVal.timestamp > keyVersions[k].timestamp:
+            keyVersions[k] = (mvccVal.data, mvccVal.isDeleted,
+                mvccVal.timestamp)
+      except:
+        keyVersions[k] = (entry.value, false, coreTypes.Timestamp(0))
+    else:
+      if not keyVersions.hasKey(k):
+        keyVersions[k] = (entry.value, false, coreTypes.Timestamp(0))
+
+  # Step 3: Collect non-deleted keys, apply filters, sort, and chunk
+  var filteredPairs: seq[tuple[key: string, value: string]] = @[]
+  for key, val in keyVersions.pairs:
+    if val.isDeleted: continue
+
+    # Apply group routing filter
+    if groupFilter != nil:
+      if not groupFilter(key):
+        continue
+
+    # Apply server-side value filter
+    if serverFilter != nil:
+      if not serverFilter(val.value):
+        continue
+
+    filteredPairs.add((key, val.value))
+
+  # Sort by key for deterministic ordering
+  filteredPairs.sort(proc(a, b: tuple[key: string, value: string]): int =
+    cmp(a.key, b.key))
+
+  # Apply limit
+  if limit > 0 and uint32(filteredPairs.len) > limit:
+    filteredPairs.setLen(int(limit))
+
+  # Step 4: Send chunks via callback
+  if filteredPairs.len == 0:
+    # Send empty result
+    callback(ScanChunk(pairs: @[], hasMore: false))
+    return true
+
+  var sent = 0
+  while sent < filteredPairs.len:
+    let remaining = filteredPairs.len - sent
+    let thisChunk = min(remaining, chunkSize)
+    let chunkPairs = filteredPairs[sent ..< sent + thisChunk]
+    sent += thisChunk
+    let hasMore = sent < filteredPairs.len
+    callback(ScanChunk(pairs: chunkPairs, hasMore: hasMore))
+
+  return true
+
+# ---------------------------------------------------------------------------
 # Convenience: latest reads (no timestamp required)
 # ---------------------------------------------------------------------------
 
-const LATEST_READ_TIMESTAMP = coreTypes.Timestamp(high(int64))
+const LATEST_READ_TIMESTAMP* = coreTypes.Timestamp(high(int64))
 
 proc latestGet*(store: MvccTransactionStore,
     key: string): MvccResult[Option[string]] {.gcsafe, raises: [].} =

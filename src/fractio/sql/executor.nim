@@ -1206,14 +1206,20 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
             outputRows = outputRows[0..<int(op.obLimit)]
           rowsResult(op.obColumns, outputRows)
         elif lastResult.kind == erkStreamingRows:
-          # For streaming, apply LIMIT during consumption
-          let bufferedRows = lastResult.streamIterator.consumeAllRows()
-          var outputRows = bufferedRows
+          # Data is already in PK ASC order from the scan, so no sort needed.
+          # Stream rows directly with LIMIT pushdown instead of buffering all.
+          var outputRows: seq[seq[string]] = @[]
+          let limitRows = if op.obLimit > 0: int(op.obLimit) else: -1
+          while lastResult.streamIterator.hasNextRow():
+            let rowOpt = lastResult.streamIterator.nextRow()
+            if rowOpt.isSome:
+              outputRows.add(rowOpt.get())
+              if limitRows > 0 and outputRows.len >= limitRows:
+                break
+          # Extract only requested columns if needed
           if op.obColumns.len != lastResult.streamColumns.len:
             outputRows = extractRequestedColumns(outputRows, op.obColumns,
                 op.obAllColumns)
-          if op.obLimit > 0 and outputRows.len > int(op.obLimit):
-            outputRows = outputRows[0..<int(op.obLimit)]
           rowsResult(op.obColumns, outputRows)
         else:
           errorResult("ORDER BY requires row results from previous operation")
@@ -1279,25 +1285,67 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
               outputRows = outputRows[0..<int(op.obLimit)]
             rowsResult(op.obColumns, outputRows)
         elif lastResult.kind == erkStreamingRows:
-          # Buffer all rows from streaming result, then sort in-memory
-          # For very large results, this could be memory-intensive
-          # TODO: Implement external merge sort for streaming with large datasets
-          let bufferedRows = lastResult.streamIterator.consumeAllRows()
-          if bufferedRows.len <= 1:
-            # Apply LIMIT if present
-            if op.obLimit > 0 and bufferedRows.len > int(op.obLimit):
-              rowsResult(op.obColumns, bufferedRows[0..<int(op.obLimit)])
+          # Stream rows through external merge sort to avoid buffering
+          # everything in memory. For small result sets, falls back to
+          # in-memory sort after consuming the stream.
+          const EXTERNAL_SORT_THRESHOLD = 10000
+          let hasLimit = op.obLimit > 0
+          let estimatedRows = op.obLimit.int # rough upper bound if LIMIT present
+
+          # For small expected results or when no ORDER BY specs, buffer and
+          # sort in memory. For large results, use external merge sort.
+          if hasLimit and estimatedRows < EXTERNAL_SORT_THRESHOLD:
+            # Small result set expected — buffer and sort in memory
+            let bufferedRows = lastResult.streamIterator.consumeAllRows()
+            if bufferedRows.len <= 1:
+              if op.obLimit > 0 and bufferedRows.len > int(op.obLimit):
+                rowsResult(op.obColumns, bufferedRows[0..<int(op.obLimit)])
+              else:
+                rowsResult(op.obColumns, bufferedRows)
             else:
-              rowsResult(op.obColumns, bufferedRows)
+              let sortedRows = sortRowsInMemory(bufferedRows, op.obSortSpecs,
+                  op.obAllColumns)
+              var outputRows = extractRequestedColumns(sortedRows, op.obColumns,
+                  op.obAllColumns)
+              if op.obLimit > 0 and outputRows.len > int(op.obLimit):
+                outputRows = outputRows[0..<int(op.obLimit)]
+              rowsResult(op.obColumns, outputRows)
           else:
-            let sortedRows = sortRowsInMemory(bufferedRows, op.obSortSpecs,
+            # Large result set or no limit — use external merge sort
+            # to avoid OOM on large datasets.
+            let sortIter = newStreamingSortIterator(op.obSortSpecs,
                 op.obAllColumns)
-            # Extract only the requested columns after sorting
+            if op.obLimit > 0:
+              sortIter.limit = uint32(op.obLimit)
+
+            # Feed streaming rows into the sorter in chunks
+            const FEED_CHUNK_SIZE = 1000
+            var feedChunk: seq[seq[string]] = @[]
+            while lastResult.streamIterator.hasNextRow():
+              let rowOpt = lastResult.streamIterator.nextRow()
+              if rowOpt.isSome:
+                feedChunk.add(rowOpt.get())
+                if feedChunk.len >= FEED_CHUNK_SIZE:
+                  sortIter.addRowsToIterator(feedChunk)
+                  feedChunk = @[]
+            # Flush remaining rows
+            if feedChunk.len > 0:
+              sortIter.addRowsToIterator(feedChunk)
+
+            # Finalize and read sorted rows
+            sortIter.finalizeIterator()
+            var sortedRows: seq[seq[string]] = @[]
+            while sortIter.hasNextSortedRow():
+              let rowOpt = sortIter.nextSortedRow()
+              if rowOpt.isSome:
+                sortedRows.add(rowOpt.get())
+            sortIter.closeSortIterator()
+
+            # Apply column extraction (ORDER BY may reference columns
+            # not in the output SELECT list)
             var outputRows = extractRequestedColumns(sortedRows, op.obColumns,
                 op.obAllColumns)
-            # Apply LIMIT after sorting
-            if op.obLimit > 0 and outputRows.len > int(op.obLimit):
-              outputRows = outputRows[0..<int(op.obLimit)]
+            # LIMIT already applied by StreamingSortIterator if set
             rowsResult(op.obColumns, outputRows)
         else:
           # Previous result is not rows - ORDER BY is invalid here
