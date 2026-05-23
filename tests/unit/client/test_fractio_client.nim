@@ -1100,7 +1100,7 @@ suite "Fractio Client - refreshMetadata Edge Cases":
 # =============================================================================
 
 suite "Fractio Client - getGroupsForTable Rebalancing":
-  test "getGroupsForTable returns both old and new groups during rebalancing":
+  test "getGroupsForTable returns old groups during rebalancing (dual-read for point gets)":
     let c = client.newFractioClient("localhost", 9000)
     let tid = genTableId()
     let spaceId = genSpaceID()
@@ -1124,15 +1124,14 @@ suite "Fractio Client - getGroupsForTable Rebalancing":
     )
 
     let groups = c.getGroupsForTable(tid)
-    check groups.len == 4
-    # Should contain all old and new groups
+    # During rebalancing, getGroupsForTable returns only old groups for full scans.
+    # Point gets use dual-read via keyRoutesToGroupIdDuringRebalance.
+    check groups.len == 2
     check oldGid1 in groups
     check oldGid2 in groups
-    check newGid1 in groups
-    check newGid2 in groups
     c.close()
 
-  test "getGroupsForTable deduplicates overlapping groups during rebalancing":
+  test "getGroupsForTable returns old groups during rebalancing (no dedup needed)":
     let c = client.newFractioClient("localhost", 9000)
     let tid = genTableId()
     let spaceId = genSpaceID()
@@ -1155,9 +1154,9 @@ suite "Fractio Client - getGroupsForTable Rebalancing":
     )
 
     let groups = c.getGroupsForTable(tid)
-    check groups.len == 3 # Deduplicated: sharedGid, newGid, oldGid
+    # During rebalancing, returns oldGroupIds only
+    check groups.len == 2
     check sharedGid in groups
-    check newGid in groups
     check oldGid in groups
     c.close()
 
@@ -1520,6 +1519,7 @@ suite "Fractio Client - InGroup Operations Error Handling":
 
   test "getInGroup returns error for unknown group":
     let c = client.newFractioClient("localhost", 9000)
+    c.config.maxKvRetries = 1
     c.initialized.store(true, moRelaxed)
     let groupId = genGroupID()
     # Group not in groups table
@@ -1530,6 +1530,7 @@ suite "Fractio Client - InGroup Operations Error Handling":
 
   test "putInGroup returns error for unknown group":
     let c = client.newFractioClient("localhost", 9000)
+    c.config.maxKvRetries = 1
     c.initialized.store(true, moRelaxed)
     let groupId = genGroupID()
     let result = c.putInGroup("test_key", "test_value", groupId)
@@ -1539,6 +1540,7 @@ suite "Fractio Client - InGroup Operations Error Handling":
 
   test "deleteInGroup returns error for unknown group":
     let c = client.newFractioClient("localhost", 9000)
+    c.config.maxKvRetries = 1
     c.initialized.store(true, moRelaxed)
     let groupId = genGroupID()
     let result = c.deleteInGroup("test_key", groupId)
@@ -1598,8 +1600,8 @@ suite "Fractio Client - getGroupForKey Additional Edge Cases":
     c.tables[tid] = client.TableInfo(tableId: tid, name: "test",
         spaceId: spaceId)
     c.spaces[spaceId] = client.SpaceInfo(
-      spaceId: spaceId, name: "space", groupIds: @[gid1, gid2], oldGroupIds: @[],
-          rebalancing: false
+      spaceId: spaceId, name: "space", groupIds: @[gid1, gid2], oldGroupIds: @[
+      ], rebalancing: false
     )
 
     let key = encodeTableKey(tid, "d/pk-with-special/chars:123")
