@@ -178,7 +178,7 @@ suite "getGroupsForTable":
     check group1 in groups
     check group2 in groups
 
-  test "rebalancing space returns both old and new groups":
+  test "rebalancing space returns old groups for scans (dual-read for point gets)":
     var state = initRoutingState()
     let tableId = genTableId()
     let spaceId = SpaceID(genULID())
@@ -191,9 +191,10 @@ suite "getGroupsForTable":
                    oldGroupIds = @[oldGroup], rebalancing = true)
 
     let groups = getGroupsForTable(state, tableId)
-    check groups.len == 3
-    check newGroup1 in groups
-    check newGroup2 in groups
+    # During rebalancing, getGroupsForTable returns only old groups for full scans.
+    # Old groups contain all existing data; new groups are empty until migration.
+    # Point gets use dual-read mode via keyRoutesToGroupIdDuringRebalance.
+    check groups.len == 1
     check oldGroup in groups
 
 suite "getTableIdFromKey":
