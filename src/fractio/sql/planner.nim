@@ -547,7 +547,7 @@ proc sysPkSpecToPrimaryKeySpec(sysPk: SysPrimaryKeySpec): PrimaryKeySpec =
   ## Convert a SysPrimaryKeySpec to a PrimaryKeySpec.
   PrimaryKeySpec(columns: sysPk.columns)
 
-proc getSystemTableDescriptor(tableName: string): Option[TableDescriptor] =
+proc getSystemTableDescriptor*(tableName: string): Option[TableDescriptor] =
   ## Return a table descriptor for a system table when querying from sys schema.
   ## Converts from the self-contained SystemTableInfo in SYSTEM_TABLES_REGISTRY
   ## to the planner's TableDescriptor type.

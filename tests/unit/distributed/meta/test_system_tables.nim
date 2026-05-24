@@ -5,10 +5,13 @@
 # - Key classification (isSystemKey, isMetaGroupKey, isUserTableKey)
 # - User table data row and index key encoding
 # - Well-known system table ULIDs
+# - SYSTEM_TABLES_REGISTRY completeness and consistency
+# - Lookup procs (getSystemTableInfoByName, getSystemTableInfoById)
 
-import std/[unittest, algorithm, strutils]
+import std/[unittest, algorithm, strutils, options]
 
 import fractio/distributed/meta/system_tables
+import fractio/distributed/meta/system_schemas
 import fractio/distributed/raft/group_types
 import fractio/core/types
 
@@ -205,3 +208,154 @@ suite "Constants":
 
     ulid = ULID(SYS_SPACES_TABLE_ID)
     check ulid.data[15] == SYS_SPACES_TABLE_NUM
+
+suite "System Table Registry":
+  test "registry has 10 entries":
+    check SYSTEM_TABLES_REGISTRY.len == 10
+
+  test "all registry entries have well-known ULIDs":
+    for info in SYSTEM_TABLES_REGISTRY:
+      let ulid = ULID(info.tableId)
+      # Bytes 0-14 should be zero
+      for i in 0..<15:
+        check ulid.data[i] == 0'u8
+      # Byte 15 should match tableNum
+      check ulid.data[15] == info.tableNum
+
+  test "tableNum matches well-known constant":
+    # Verify each registry entry's tableNum matches its well-known constant
+    check SYSTEM_TABLES_REGISTRY[0].tableNum == SYS_DATABASES_TABLE_NUM
+    check SYSTEM_TABLES_REGISTRY[1].tableNum == SYS_SCHEMAS_TABLE_NUM
+    check SYSTEM_TABLES_REGISTRY[2].tableNum == SYS_TABLES_TABLE_NUM
+    check SYSTEM_TABLES_REGISTRY[3].tableNum == SYS_GROUPS_TABLE_NUM
+    check SYSTEM_TABLES_REGISTRY[4].tableNum == SYS_NODES_TABLE_NUM
+    check SYSTEM_TABLES_REGISTRY[5].tableNum == SYS_SETTINGS_TABLE_NUM
+    check SYSTEM_TABLES_REGISTRY[6].tableNum == SYS_SPACES_TABLE_NUM
+    check SYSTEM_TABLES_REGISTRY[7].tableNum == SYS_NODE_METRICS_NUM
+    check SYSTEM_TABLES_REGISTRY[8].tableNum == SYS_GROUP_METRICS_NUM
+    check SYSTEM_TABLES_REGISTRY[9].tableNum == SYS_EVENTS_TABLE_NUM
+
+  test "tableId matches well-known ID constant":
+    check SYSTEM_TABLES_REGISTRY[0].tableId == SYS_DATABASES_TABLE_ID
+    check SYSTEM_TABLES_REGISTRY[1].tableId == SYS_SCHEMAS_TABLE_ID
+    check SYSTEM_TABLES_REGISTRY[2].tableId == SYS_TABLES_TABLE_ID
+    check SYSTEM_TABLES_REGISTRY[3].tableId == SYS_GROUPS_TABLE_ID
+    check SYSTEM_TABLES_REGISTRY[4].tableId == SYS_NODES_TABLE_ID
+    check SYSTEM_TABLES_REGISTRY[5].tableId == SYS_SETTINGS_TABLE_ID
+    check SYSTEM_TABLES_REGISTRY[6].tableId == SYS_SPACES_TABLE_ID
+    check SYSTEM_TABLES_REGISTRY[7].tableId == SYS_NODE_METRICS_ID
+    check SYSTEM_TABLES_REGISTRY[8].tableId == SYS_GROUP_METRICS_ID
+    check SYSTEM_TABLES_REGISTRY[9].tableId == SYS_EVENTS_TABLE_ID
+
+  test "all entries have sys schema and database":
+    for info in SYSTEM_TABLES_REGISTRY:
+      check info.schema == "sys"
+      check info.database == "sys"
+
+  test "all entries have non-empty name and description":
+    for info in SYSTEM_TABLES_REGISTRY:
+      check info.name.len > 0
+      check info.description.len > 0
+
+  test "all entries have at least one column":
+    for info in SYSTEM_TABLES_REGISTRY:
+      check info.columns.len > 0
+
+  test "all entries have at least one primary key column":
+    for info in SYSTEM_TABLES_REGISTRY:
+      check info.primaryKey.len > 0
+
+  test "all entries have non-empty pkSpec":
+    for info in SYSTEM_TABLES_REGISTRY:
+      check info.pkSpec.columns.len > 0
+
+  test "first column of each entry has _key as primary key":
+    for info in SYSTEM_TABLES_REGISTRY:
+      check info.primaryKey[0] == "_key"
+      # The first column should be _key and marked as primary key
+      check info.columns[0].name == "_key"
+      check info.columns[0].primaryKey == true
+
+  test "primary key column names match pkSpec columns":
+    for info in SYSTEM_TABLES_REGISTRY:
+      check info.primaryKey.len == info.pkSpec.columns.len
+      for i, pkName in info.primaryKey:
+        check info.pkSpec.columns[i].name == pkName
+
+  test "meta group tables (1-7) have tableNum <= MAX_META_GROUP_TABLE_NUM":
+    for info in SYSTEM_TABLES_REGISTRY:
+      if info.tableNum <= MAX_META_GROUP_TABLE_NUM:
+        check isMetaGroupTableId(info.tableId)
+
+  test "metrics tables (10+) are not meta group":
+    for info in SYSTEM_TABLES_REGISTRY:
+      if info.tableNum > MAX_META_GROUP_TABLE_NUM:
+        check not isMetaGroupTableId(info.tableId)
+
+suite "System Table Lookup":
+  test "getSystemTableInfoByName finds databases":
+    let opt = getSystemTableInfoByName("databases")
+    check opt.isSome
+    check opt.get.name == "databases"
+    check opt.get.tableNum == SYS_DATABASES_TABLE_NUM
+
+  test "getSystemTableInfoByName finds nodes":
+    let opt = getSystemTableInfoByName("nodes")
+    check opt.isSome
+    check opt.get.name == "nodes"
+    check opt.get.tableNum == SYS_NODES_TABLE_NUM
+
+  test "getSystemTableInfoByName is case insensitive":
+    let opt1 = getSystemTableInfoByName("Databases")
+    let opt2 = getSystemTableInfoByName("DATABASES")
+    let opt3 = getSystemTableInfoByName("databases")
+    check opt1.isSome
+    check opt2.isSome
+    check opt3.isSome
+    check opt1.get.name == "databases"
+    check opt2.get.name == "databases"
+    check opt3.get.name == "databases"
+
+  test "getSystemTableInfoByName returns none for unknown table":
+    let opt = getSystemTableInfoByName("nonexistent_table")
+    check opt.isNone
+
+  test "getSystemTableInfoById finds tables":
+    let opt = getSystemTableInfoById(SYS_DATABASES_TABLE_ID)
+    check opt.isSome
+    check opt.get.name == "databases"
+    check opt.get.tableNum == SYS_DATABASES_TABLE_NUM
+
+  test "getSystemTableInfoById returns none for unknown ID":
+    let unknownId = genTableId() # random ULID, not a system table
+    let opt = getSystemTableInfoById(unknownId)
+    check opt.isNone
+
+  test "lookup by name matches lookup by ID for all entries":
+    for info in SYSTEM_TABLES_REGISTRY:
+      let byName = getSystemTableInfoByName(info.name)
+      check byName.isSome
+      check byName.get.tableId == info.tableId
+
+      let byId = getSystemTableInfoById(info.tableId)
+      check byId.isSome
+      check byId.get.name == info.name
+
+suite "SysColDef Types":
+  test "SysColDef fields are accessible":
+    let col = SysColDef(name: "testCol", dataType: dtInt, maxLen: 0,
+        primaryKey: false, notNull: true)
+    check col.name == "testCol"
+    check col.dataType == dtInt
+    check col.maxLen == 0
+    check col.primaryKey == false
+    check col.notNull == true
+
+  test "SysPrimaryKeySpec columns are accessible":
+    let spec = SysPrimaryKeySpec(
+      columns: @[(name: "id", dataType: cdtInt, maxLen: 0)]
+    )
+    check spec.columns.len == 1
+    check spec.columns[0].name == "id"
+    check spec.columns[0].dataType == cdtInt
+    check spec.columns[0].maxLen == 0
