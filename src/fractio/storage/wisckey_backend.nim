@@ -225,16 +225,20 @@ method close*(backend: WiscKeyBackend) =
   if not backend.isOpen:
     return
 
-  # Destroy all live iterators before closing the database.
+  # Destroy all live iterators' C-level resources before closing the database.
   # LevelDB asserts that no iterators exist at close time.
   # Under AtomicArc, Nim GC may not eagerly collect iterator objects,
-  # so we explicitly destroy them here.
-  for iter in backend.liveIterators:
+  # so we explicitly destroy the C-level iterators here.
+  # We do NOT modify the liveIterators seq (no setLen, no reassignment)
+  # because that would trigger ARC destruction of WiscKeyIterator refs,
+  # which can cause SIGSEGV during close() due to cross-thread allocator issues.
+  # The Nim objects will be collected by ARC naturally after close().
+  for i in 0 ..< backend.liveIterators.len:
+    let iter = backend.liveIterators[i]
     if iter.iter != nil:
       c_leveldb_iter_destroy(iter.iter)
       iter.iter = nil
     iter.backendRef = nil
-  backend.liveIterators.setLen(0)
 
   if backend.db != nil:
     # Force compaction to flush memtable to SSTable
