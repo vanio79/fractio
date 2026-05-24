@@ -7,6 +7,7 @@ import ../../core/timestamp_provider
 import ../../core/transaction
 import ../../utils/logging
 import ../../storage/backend
+import ../../storage/wisckey_backend
 import ./types
 import ./engine
 
@@ -262,6 +263,7 @@ proc collectVersions*(gc: GarbageCollector,
 
     # Get iterator over all keys
     var scanIter = gc.engine.backend.newIterator()
+    defer: destroyIter(scanIter)
     discard scanIter.seekToFirst()
 
     var keysScanned = 0
@@ -330,6 +332,7 @@ proc collectVersionsForTransaction*(gc: GarbageCollector,
   try:
     # Scan all keys to find intents for this transaction
     var scanIter = gc.engine.backend.newIterator()
+    defer: destroyIter(scanIter)
     discard scanIter.seekToFirst()
 
     var versionsCollected = 0

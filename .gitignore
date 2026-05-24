@@ -117,6 +117,7 @@ src/fractio/protocol/mvcc_store.nim
 
 # Compiled Nim binaries without extension in src/
 src/fractio/distributed/raft/nuraft_coordinator
+src/fractio/distributed/raft/raft_store_callbacks
 src/fractio/protocol/mvcc_store
 src/fractio/protocol/raft_store
 src/fractio/sql/executor

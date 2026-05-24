@@ -23,6 +23,7 @@ type
     path*: string
     isOpen*: bool
     syncWrites*: bool # Whether to sync writes to disk
+    liveIterators*: seq[WiscKeyIterator] # tracked for cleanup on close
 
   WiscKeyIterator* = ref object of StorageIterator
     ## WiscKey iterator
@@ -141,6 +142,7 @@ proc newWiscKeyBackend*(config: StorageConfig): WiscKeyBackend =
   ## Create a new WiscKey backend
   new(result)
   initLock(result.mu)
+  result.liveIterators = @[]
   result.path = config.path
   result.isOpen = false
 
@@ -222,6 +224,17 @@ method close*(backend: WiscKeyBackend) =
   defer: release(backend.mu)
   if not backend.isOpen:
     return
+
+  # Destroy all live iterators before closing the database.
+  # LevelDB asserts that no iterators exist at close time.
+  # Under AtomicArc, Nim GC may not eagerly collect iterator objects,
+  # so we explicitly destroy them here.
+  for iter in backend.liveIterators:
+    if iter.iter != nil:
+      c_leveldb_iter_destroy(iter.iter)
+      iter.iter = nil
+    iter.backendRef = nil
+  backend.liveIterators.setLen(0)
 
   if backend.db != nil:
     # Force compaction to flush memtable to SSTable
@@ -371,7 +384,12 @@ method newIterator*(backend: WiscKeyBackend): StorageIterator =
     return nil
 
   let iter = c_leveldb_create_iterator(backend.db, backend.readOptions)
-  result = WiscKeyIterator(iter: iter, backendRef: backend)
+  let wkIter = WiscKeyIterator(iter: iter, backendRef: backend)
+  # Track live iterators so we can destroy them all on close()
+  acquire(backend.mu)
+  backend.liveIterators.add(wkIter)
+  release(backend.mu)
+  result = wkIter
 
 # WiscKeyIterator methods - these use the pointer directly without type checking
 # since we know the concrete type here
@@ -473,6 +491,16 @@ proc destroyIter*(iter: StorageIterator) =
     if witer.iter != nil:
       c_leveldb_iter_destroy(witer.iter)
       witer.iter = nil
+    # Remove from backend's live iterator tracking
+    if witer.backendRef != nil:
+      acquire(witer.backendRef.mu)
+      let idx = witer.backendRef.liveIterators.find(witer)
+      if idx >= 0:
+        witer.backendRef.liveIterators.del(idx)
+      release(witer.backendRef.mu)
+    # Nil out backendRef to break the reference cycle so the backend
+    # can be freed by ARC when all iterators are destroyed.
+    witer.backendRef = nil
 
 proc scan*(backend: WiscKeyBackend, startKey, endKey: string,
            limit: int = 0): seq[KeyValuePair] =

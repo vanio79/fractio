@@ -7,6 +7,7 @@ import ../../core/types as core_types
 import ../../core/timestamp_provider
 import ../../core/transaction
 import ../../storage/backend
+import ../../storage/wisckey_backend
 import ./types
 export types.MAX_TIMESTAMP
 
@@ -68,6 +69,7 @@ proc mvccGet*(engine: MVCCEngine, key: string, timestamp: Timestamp,
 
   # Use seekToLast to find newest versions first, then iterate backwards
   let iter = engine.backend.newIterator()
+  defer: destroyIter(iter)
   discard iter.seekToLast()
 
   # Iterate backwards to find newest version <= timestamp
@@ -153,6 +155,7 @@ proc mvccScan*(engine: MVCCEngine, startKey: string, endKey: string,
   var seenKeys: HashSet[string] = initHashSet[string]()
 
   let iter = engine.backend.newIterator()
+  defer: destroyIter(iter)
 
   # Start from the end key (or from last key if no endKey)
   # We need to find a starting position that's within or before our range
@@ -221,6 +224,7 @@ proc getLatestVersion*(engine: MVCCEngine, key: string): Option[MVCCValue] =
   ## Iterates backwards to find newest version first
 
   let iter = engine.backend.newIterator()
+  defer: destroyIter(iter)
   discard iter.seekToLast()
 
   while iter.valid():
@@ -294,6 +298,7 @@ proc getIntent*(engine: MVCCEngine, key: string,
 proc hasIntent*(engine: MVCCEngine, key: string): bool =
   ## Check if any intent exists for a key
   let iter = engine.backend.newIterator()
+  defer: destroyIter(iter)
   discard iter.seekToLast()
 
   while iter.valid():
@@ -315,6 +320,7 @@ proc getIntentsForKey*(engine: MVCCEngine, key: string): seq[Intent] =
   result = @[]
 
   let iter = engine.backend.newIterator()
+  defer: destroyIter(iter)
   discard iter.seekToLast()
 
   while iter.valid():
@@ -345,6 +351,7 @@ proc getAllVersions*(engine: MVCCEngine, userKey: string): seq[KeyVersion] =
   result = @[]
 
   let iter = engine.backend.newIterator()
+  defer: destroyIter(iter)
   discard iter.seekToLast()
 
   while iter.valid():
@@ -530,7 +537,7 @@ proc mvccPrefetchWorker(stream: MVCCStreamResultSet) {.thread, gcsafe, raises: [
   # Clean up iterator
   {.cast(raises: []).}:
     try:
-      iter.destroy()
+      destroyIter(iter)
     except:
       discard
 
