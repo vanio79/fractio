@@ -197,7 +197,7 @@ proc findSpaceByName*(sm: SpaceManager, name: string): Option[SpaceRecord] =
   return none(SpaceRecord)
 
 proc computeGroupPlacement(nodeIds: seq[uint32], replicas: int,
-    spaceId: SpaceID): seq[GroupRecord] {.gcsafe.} =
+    spaceId: SpaceID, tp: TimeProvider = nil): seq[GroupRecord] {.gcsafe.} =
   ## Compute group placement using ring algorithm.
   ## N nodes → N groups, each with R replicas placed in a ring.
   let nodeCount = nodeIds.len
@@ -212,8 +212,16 @@ proc computeGroupPlacement(nodeIds: seq[uint32], replicas: int,
     # This ensures each group has a unique ID that won't collide with others
     var groupId: ULID
     {.cast(gcsafe).}:
-      let t = getTime()
-      let tsNs = t.toUnix * 1_000_000_000 + t.nanosecond.int64
+      var tsNs: int64
+      if tp != nil:
+        try:
+          tsNs = tp.now()
+        except Exception:
+          let t = getTime()
+          tsNs = t.toUnix * 1_000_000_000 + t.nanosecond.int64
+      else:
+        let t = getTime()
+        tsNs = t.toUnix * 1_000_000_000 + t.nanosecond.int64
       groupId = genULID(tsNs)
 
     # Compute members using ring algorithm
@@ -236,7 +244,7 @@ proc computeGroupPlacement(nodeIds: seq[uint32], replicas: int,
 proc waitForGroupLeaders(sm: SpaceManager, groupIds: seq[GroupID],
     timeoutMs: int = DEFAULT_LEADER_WAIT_MS): bool =
   ## Wait for all specified groups to have elected leaders.
-  let deadlineMs = int(getTime().toUnix() * 1000) + timeoutMs
+  let deadlineMs = sm.nowNs() div 1_000_000 + timeoutMs
 
   while true:
     var allHaveLeaders = true
@@ -255,7 +263,7 @@ proc waitForGroupLeaders(sm: SpaceManager, groupIds: seq[GroupID],
     if allHaveLeaders:
       return true
 
-    let nowMs = int(getTime().toUnix() * 1000)
+    let nowMs = sm.nowNs() div 1_000_000
     if nowMs >= deadlineMs:
       # Log which groups are missing or have no leader
       for gid in groupIds:
@@ -353,7 +361,7 @@ proc createSpace*(sm: SpaceManager, req: CreateSpaceRequest): CreateSpaceRespons
 
     # 5. Compute group placement
     timedLog("computing group placement")
-    groupRecs = computeGroupPlacement(nodeIds, replicas, spaceId)
+    groupRecs = computeGroupPlacement(nodeIds, replicas, spaceId, sm.timeProvider)
     for gr in groupRecs:
       groupIds.add(groupIDFromULID(gr.groupId))
 
@@ -373,7 +381,7 @@ proc createSpace*(sm: SpaceManager, req: CreateSpaceRequest): CreateSpaceRespons
     for (key, value) in groupWrites:
       writeIdx += 1
       timedLog(safeFmt("writing group record $#", $writeIdx))
-      let ts = int64(times.getTime().toUnixFloat() * 1_000_000_000)
+      let ts = sm.nowNs()
       let encoded = mvccTypes.encodeMVCCValue(value, ts, false)
       timedLog(safeFmt("calling raftPut for group record $#", $writeIdx))
       let res = sm.store.raftPut(key, encoded)

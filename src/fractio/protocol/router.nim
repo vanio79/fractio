@@ -17,6 +17,7 @@
 
 import std/[tables, locks, strformat, algorithm, times]
 import ./types
+import ../distributed/sharedtimer/timeprovider
 
 # ---------------------------------------------------------------------------
 # Types
@@ -46,6 +47,7 @@ type
     leaders*: Table[uint32, LeaderInfo]   ## shardId → leader
     localNodeId*: uint32
     mu*: Lock
+    timeProvider*: TimeProvider
     ## Phase 5: optional callbacks for leader-change notifications
     onLeaderChange*: LeaderChangeCallback ## nil when not configured
     leaderTtlMs*: int64 ## entries older than this are treated as stale (0 = no TTL)
@@ -55,15 +57,25 @@ type
 # ---------------------------------------------------------------------------
 
 proc newRouterTable*(localNodeId: uint32 = 1,
-    leaderTtlMs: int64 = 0): RouterTable =
+    leaderTtlMs: int64 = 0,
+    timeProvider: TimeProvider = nil): RouterTable =
   result = RouterTable(
     shards: @[],
     leaders: initTable[uint32, LeaderInfo](),
     localNodeId: localNodeId,
     leaderTtlMs: leaderTtlMs,
     onLeaderChange: nil,
+    timeProvider: timeProvider,
   )
   initLock(result.mu)
+
+proc rtNowMs(rt: RouterTable): int64 {.inline, raises: [].} =
+  if rt.timeProvider != nil:
+    try:
+      return rt.timeProvider.now() div 1_000_000
+    except Exception:
+      discard
+  (getTime().toUnixFloat() * 1000).int64
 
 proc setLeaderChangeCallback*(rt: RouterTable,
     cb: LeaderChangeCallback) {.gcsafe, raises: [].} =
@@ -141,7 +153,7 @@ proc routeKey*(rt: RouterTable,
 
   # Phase 5: check staleness TTL
   if rt.leaderTtlMs > 0 and leader.lastSeenMs > 0:
-    let nowMs = (getTime().toUnixFloat() * 1000).int64
+    let nowMs = rtNowMs(rt)
     if (nowMs - leader.lastSeenMs) > rt.leaderTtlMs:
       return peErr(newProtocolError(peNotLeader,
         &"leader entry for shard {shard.shardId} is stale (ttl={rt.leaderTtlMs}ms)"))
@@ -233,7 +245,7 @@ proc touchLeader*(rt: RouterTable, shardId: uint32) {.gcsafe, raises: [].} =
   var entry = rt.leaders.getOrDefault(shardId,
       LeaderInfo(nodeId: 0, nodeAddr: "", lastSeenMs: 0))
   if entry.nodeId != 0:
-    entry.lastSeenMs = (getTime().toUnixFloat() * 1000).int64
+    entry.lastSeenMs = rtNowMs(rt)
     rt.leaders[shardId] = entry
 
 # ---------------------------------------------------------------------------

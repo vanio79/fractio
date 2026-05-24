@@ -142,26 +142,6 @@ type
     authenticated*: bool
     mu*: Lock
 
-proc newClientConnection*(id: uint32, sock: Socket,
-    address: string): ClientConnection =
-  result = ClientConnection(
-    id: id,
-    socket: sock,
-    address: address,
-    createdAt: (getTime().toUnixFloat() * 1000).int64,
-    lastActivityMs: (getTime().toUnixFloat() * 1000).int64,
-  )
-  initLock(result.mu)
-
-proc touchActivity*(conn: ClientConnection) {.gcsafe, raises: [].} =
-  withLock(conn.mu):
-    conn.lastActivityMs = (getTime().toUnixFloat() * 1000).int64
-
-proc isIdle*(conn: ClientConnection, timeoutSecs: int): bool {.gcsafe, raises: [].} =
-  withLock(conn.mu):
-    let nowMs = (getTime().toUnixFloat() * 1000).int64
-    result = (nowMs - conn.lastActivityMs) > int64(timeoutSecs) * 1000
-
 # ---------------------------------------------------------------------------
 # Message handler type
 # ---------------------------------------------------------------------------
@@ -425,6 +405,41 @@ type
     acceptThreadCount*: Atomic[int]
     threadsMu*: Lock
 
+proc serverNowMs*(server: ProtocolServer): int64 {.gcsafe, raises: [].} =
+  if server.sharedTimer != nil:
+    try:
+      return server.sharedTimer.now() div 1_000_000
+    except Exception:
+      discard
+  let t = getTime()
+  t.toUnix * 1000 + t.nanosecond() div 1_000_000
+
+proc newClientConnection*(id: uint32, sock: Socket,
+    address: string, server: ProtocolServer = nil): ClientConnection =
+  let nowMs = if server != nil: serverNowMs(server)
+              else: (getTime().toUnixFloat() * 1000).int64
+  result = ClientConnection(
+    id: id,
+    socket: sock,
+    address: address,
+    createdAt: nowMs,
+    lastActivityMs: nowMs,
+  )
+  initLock(result.mu)
+
+proc touchActivity*(conn: ClientConnection,
+    server: ProtocolServer = nil) {.gcsafe, raises: [].} =
+  withLock(conn.mu):
+    conn.lastActivityMs = if server != nil: serverNowMs(server)
+                          else: (getTime().toUnixFloat() * 1000).int64
+
+proc isIdle*(conn: ClientConnection, timeoutSecs: int,
+    server: ProtocolServer = nil): bool {.gcsafe, raises: [].} =
+  withLock(conn.mu):
+    let nowMs = if server != nil: serverNowMs(server)
+                else: (getTime().toUnixFloat() * 1000).int64
+    result = (nowMs - conn.lastActivityMs) > int64(timeoutSecs) * 1000
+
 # ---------------------------------------------------------------------------
 # Thread argument types — defined after ProtocolServer to avoid forward refs
 # ---------------------------------------------------------------------------
@@ -464,7 +479,7 @@ proc newProtocolServer*(config: ServerConfig): ProtocolServer =
     metrics: newServerMetrics(),
     authenticator: newAuthenticator(config.authMethod),
     nodeRegistry: reg,
-    startedAt: getTime().toUnix(),
+    startedAt: getTime().toUnix(), # TODO: use timeProvider (display only)
   )
   initLock(result.clientsMu)
   initLock(result.handlersMu)
@@ -882,7 +897,10 @@ proc handleBuiltinCore(server: ProtocolServer, conn: ClientConnection,
   let typeVal = (uint16(payload[0]) shl 8) or uint16(payload[1])
   case typeVal
   of uint16(mtPing):
-    let tsUs = uint64(getTime().toUnixFloat() * 1_000_000)
+    let tsUs = if server.sharedTimer != nil:
+      try: uint64(server.sharedTimer.now() div 1_000) except Exception:
+        uint64(getTime().toUnixFloat() * 1_000_000)
+    else: uint64(getTime().toUnixFloat() * 1_000_000)
     sendFrame(conn, encodePingResponse(tsUs), requestId)
   of uint16(mtEcho):
     let dataR = decodeEchoData(payload)
@@ -1485,7 +1503,7 @@ proc handleBuiltinAdmin(server: ProtocolServer, conn: ClientConnection,
   case typeVal
 
   of uint16(mtServerInfo):
-    let nowSec = getTime().toUnix()
+    let nowSec = getTime().toUnix() # TODO: use timeProvider (display only)
     let uptime = uint64(if nowSec > server.startedAt: nowSec -
         server.startedAt else: 0)
     let realShardCount: uint32 =
@@ -2048,7 +2066,7 @@ proc clientLoop(server: ProtocolServer,
   server.logger.logInfo(&"[{conn.address}] handshake OK (id={conn.id})")
 
   while server.running.load():
-    if conn.isIdle(server.config.idleTimeoutSecs):
+    if conn.isIdle(server.config.idleTimeoutSecs, server):
       server.logger.logInfo(&"[{conn.address}] idle timeout")
       break
 
@@ -2067,7 +2085,7 @@ proc clientLoop(server: ProtocolServer,
       break
 
     let f = frameR.value
-    conn.touchActivity()
+    conn.touchActivity(server)
 
     discard server.metrics.requestsTotal.fetchAdd(1)
     discard server.metrics.bytesIn.fetchAdd(uint64(FRAME_HEADER_SIZE +
@@ -2161,7 +2179,7 @@ proc acceptLoop(args: AcceptLoopArgs) {.thread.} =
         continue
 
       let id = server.nextClientId.fetchAdd(1)
-      let conn = newClientConnection(id, clientSock, address)
+      let conn = newClientConnection(id, clientSock, address, server)
       server.addClient(conn)
 
       # Allocate a heap-resident Thread so its lifetime is not tied to this
@@ -2547,6 +2565,9 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
 
   coord.start()
 
+  if not server.sharedTimer.isNil:
+    coord.setTimeProvider(server.sharedTimer)
+
   if isRejoining and peers.len > 0:
     # RejoinNode RPC: tell the meta leader to re-add us to the Raft config
     # so it starts sending append_entries. This is an optimization — the
@@ -2681,8 +2702,8 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
   # Both groups must have leaders so that addPeerToRaft can add servers
   # to the data group (not just the meta group) when new nodes join.
   if startAsLeader and not isRejoining and not hasExistingSpaces:
-    let waitDeadline = getTime().toUnixFloat() * 1000 + 5000.0
-    while getTime().toUnixFloat() * 1000 < waitDeadline:
+    let waitDeadline = serverNowMs(server).float + 5000.0
+    while serverNowMs(server).float < waitDeadline:
       let metaOk = coord.isLeader(META_GROUP_ID) or coord.getLeader(
           META_GROUP_ID) > 0
       let dataOk = coord.isLeader(DATA_GROUP_START_ID) or coord.getLeader(
@@ -2802,6 +2823,8 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
     )
     server.sharedTimer = timer
     server.txnMgr.setTimeProvider(timer)
+    if not server.raftCoord.isNil:
+      server.raftCoord.setTimeProvider(timer)
 
   # Start rebalance monitor thread (uses module-level globals)
   gRebalStorePtr = cast[pointer](store)
@@ -2828,7 +2851,7 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
               rebalSpaces.add(sp)
           release(rstoreRef.spacesMu)
 
-          let nowSecs = getTime().toUnix()
+          let nowSecs = getTime().toUnix()               # TODO: use timeProvider
           let myNodeId = int(rstoreRef.coordinator.nodeId)
           for sp in rebalSpaces:
             let heartbeatAge = nowSecs - sp.rebalanceHeartbeat
@@ -2853,7 +2876,7 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
 
 proc start*(server: ProtocolServer) {.raises: [].} =
   server.running.store(true)
-  server.startedAt = getTime().toUnix()
+  server.startedAt = getTime().toUnix() # TODO: use timeProvider (display only)
   # Start background SharedTimer sync thread if configured
   if not server.sharedTimer.isNil:
     try: server.sharedTimer.start()

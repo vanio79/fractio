@@ -7,6 +7,7 @@ import ./tcp_transport
 import ./config
 import ./serialization
 import ../../core/types as coretypes
+import ../../distributed/sharedtimer/timeprovider
 
 # =============================================================================
 # Health Status Types
@@ -34,6 +35,7 @@ type
     ## Health checker for monitoring nodes
     config*: NetworkConfig
     transport*: TCPTransport
+    timeProvider*: TimeProvider
 
     # Health data
     nodeHealth*: tables.Table[string, NodeHealth]
@@ -72,6 +74,15 @@ proc close*(hc: HealthChecker) =
   hc.running.store(false)
   deinitLock(hc.healthLock)
 
+proc hcNowMs(hc: HealthChecker): int64 {.inline, raises: [].} =
+  if hc.timeProvider != nil:
+    try:
+      return hc.timeProvider.now() div 1_000_000
+    except Exception:
+      discard
+  let t = times.getTime()
+  t.toUnix * 1000 + t.nanosecond() div 1_000_000
+
 # =============================================================================
 # Node Registration
 # =============================================================================
@@ -106,7 +117,7 @@ proc checkNodeHealth*(hc: HealthChecker, nodeId: NodeID, host: string,
     port: int): HealthStatus =
   ## Perform a health check on a specific node
   let key = string(nodeId)
-  let startTime = int64(times.getTime().toUnix() * 1000)
+  let startTime = hcNowMs(hc)
 
   # Create heartbeat message
   var msg: HeartbeatMsg
@@ -146,7 +157,7 @@ proc checkNodeHealth*(hc: HealthChecker, nodeId: NodeID, host: string,
 
   # Read response
   let responseOpt = readFrame(conn.socket, hc.timeoutMs)
-  let endTime = int64(times.getTime().toUnix() * 1000)
+  let endTime = hcNowMs(hc)
   let rtt = endTime - startTime
 
   withLock hc.healthLock:
@@ -203,7 +214,7 @@ proc isHealthy*(hc: HealthChecker, nodeId: NodeID): bool =
 proc markUnhealthy*(hc: HealthChecker, nodeId: NodeID, reason: string) =
   ## Manually mark a node as unhealthy
   let key = string(nodeId)
-  let now = int64(times.getTime().toUnix() * 1000)
+  let now = hcNowMs(hc)
   withLock hc.healthLock:
     if key in hc.nodeHealth:
       var health = hc.nodeHealth[key]
@@ -217,7 +228,7 @@ proc markUnhealthy*(hc: HealthChecker, nodeId: NodeID, reason: string) =
 proc markHealthy*(hc: HealthChecker, nodeId: NodeID) =
   ## Manually mark a node as healthy
   let key = string(nodeId)
-  let now = int64(times.getTime().toUnix() * 1000)
+  let now = hcNowMs(hc)
   withLock hc.healthLock:
     if key in hc.nodeHealth:
       var health = hc.nodeHealth[key]

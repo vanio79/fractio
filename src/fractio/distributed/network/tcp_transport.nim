@@ -11,6 +11,7 @@ import ./config
 import ../../core/types as coretypes
 import ../../utils/logging
 import ../../utils/socket_utils
+import ../../distributed/sharedtimer/timeprovider
 
 when defined(posix):
   import std/posix
@@ -45,6 +46,7 @@ type
     config*: NetworkConfig
     port*: int
     role*: string
+    timeProvider*: TimeProvider
     serverSocket*: Socket
     running*: Atomic[bool]
     runningLock*: Lock
@@ -58,16 +60,35 @@ type
     connThreads*: seq[ptr Thread[ConnHandlerCtx]] # raw ptr: Thread on shared heap, no ORC tracking
     connThreadsLock*: Lock
 
+proc tpNowMs(t: TCPTransport): int64 {.inline, raises: [].} =
+  if t.timeProvider != nil:
+    try:
+      return t.timeProvider.now() div 1_000_000
+    except Exception:
+      discard
+  let tt = getTime()
+  tt.toUnix * 1000 + tt.nanosecond() div 1_000_000
+
 # =============================================================================
 # Connection Management
 # =============================================================================
 
 proc newConnection*(nodeId: NodeID, socket: Socket,
-    remoteAddr: string): Connection =
+    remoteAddr: string, tp: TimeProvider = nil): Connection =
+  var nowMs: int64
+  if tp != nil:
+    try:
+      nowMs = tp.now() div 1_000_000
+    except Exception:
+      let t = getTime()
+      nowMs = t.toUnix * 1000 + t.nanosecond() div 1_000_000
+  else:
+    let t = getTime()
+    nowMs = t.toUnix * 1000 + t.nanosecond() div 1_000_000
   result = Connection(
     nodeId: nodeId,
     socket: socket,
-    lastUsed: int64(getTime().toUnix() * 1000),
+    lastUsed: nowMs,
     state: csConnected,
     remoteAddr: remoteAddr
   )
@@ -267,13 +288,7 @@ proc connectToNode*(t: TCPTransport, nodeId: NodeID, host: string,
     # would set SO_DEBUG=1 which requires root and returns EACCES on Linux).
     socket.setSockOpt(OptNoDelay, t.config.tcpNoDelay, level = IPPROTO_TCP.cint)
 
-    let conn = newConnection(nodeId, socket, remoteAddr)
-
-    withLock t.connectionsLock:
-      t.connections[string(nodeId)] = conn
-
-    info("Connected to node", fields)
-    return some(conn)
+    let conn = newConnection(nodeId, socket, remoteAddr, t.timeProvider)
 
   except CatchableError as e:
     # Close the socket to avoid leaking the file descriptor.
@@ -318,7 +333,7 @@ proc sendRaw*(t: TCPTransport, conn: Connection, payload: string): bool =
   withLock conn.sendLock:
     result = writeFrame(conn.socket, payload, t.config.tcpWriteTimeoutMs)
     if result:
-      conn.lastUsed = int64(getTime().toUnix() * 1000)
+      conn.lastUsed = tpNowMs(t)
 
 proc sendMessage*(t: TCPTransport, nodeId: NodeID, host: string, port: int,
                   payload: string): bool =
@@ -476,7 +491,7 @@ proc acceptLoopWrapper(t: TCPTransport) {.thread.} =
       client.setSockOpt(OptKeepAlive, t.config.tcpKeepAlive)
 
       let tempId = NodeID("unknown_" & clientAddr)
-      let conn = newConnection(tempId, client, clientAddr)
+      let conn = newConnection(tempId, client, clientAddr, t.timeProvider)
 
       withLock t.connectionsLock:
         t.connections[string(tempId)] = conn

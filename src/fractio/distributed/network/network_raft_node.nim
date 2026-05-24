@@ -10,6 +10,7 @@ import ./serialization
 import ../raft/types as raft_types
 import ../../core/types as coretypes
 import ../../utils/logging
+import ../../distributed/sharedtimer/timeprovider
 
 # =============================================================================
 # Network Raft Node Types
@@ -27,6 +28,7 @@ type
     running*: Atomic[bool]
     lastHeartbeat*: int64
     lastHeartbeatLock*: Lock
+    timeProvider*: TimeProvider
 
     # For tracking votes
     votesReceived*: tables.Table[int32, bool]
@@ -89,6 +91,15 @@ proc close*(node: NetworkRaftNode) =
   deinitLock(node.lastHeartbeatLock)
   deinitLock(node.electionResetLock)
 
+proc nodeNowMs(node: NetworkRaftNode): int64 {.inline, raises: [].} =
+  if node.timeProvider != nil:
+    try:
+      return node.timeProvider.now() div 1_000_000
+    except Exception:
+      discard
+  let t = getTime()
+  t.toUnix * 1000 + t.nanosecond() div 1_000_000
+
 # =============================================================================
 # Node Registry Management
 # =============================================================================
@@ -132,7 +143,7 @@ proc sendHeartbeat*(node: NetworkRaftNode)
 proc resetElectionTimer*(node: NetworkRaftNode) =
   ## Reset the election timer (called when receiving heartbeat from leader)
   withLock node.electionResetLock:
-    node.electionResetEvent = getTime().toUnix() * 1000 + getTime().nanosecond() div 1_000_000
+    node.electionResetEvent = nodeNowMs(node)
 
 proc getLastResetTime*(node: NetworkRaftNode): int64 =
   ## Get the last time the election timer was reset (in ms)
@@ -141,7 +152,7 @@ proc getLastResetTime*(node: NetworkRaftNode): int64 =
 
 proc checkElectionTimeout*(node: NetworkRaftNode): bool =
   ## Check if election timeout has occurred
-  let nowMs = getTime().toUnix() * 1000 + getTime().nanosecond() div 1_000_000
+  let nowMs = nodeNowMs(node)
   let lastReset = node.getLastResetTime()
   let elapsed = nowMs - lastReset
 
@@ -287,7 +298,7 @@ proc start*(node: NetworkRaftNode): bool =
     else:
       # Accept entries / heartbeat from leader
       n.nodeState.leaderId = toServerId(msg.leaderId)
-      n.lastHeartbeat = getTime().toUnix()
+      n.lastHeartbeat = nodeNowMs(node) div 1000 # TODO: use timeProvider
 
       # Reset election timer since we got a valid heartbeat from leader
       n.resetElectionTimer()

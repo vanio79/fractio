@@ -6,6 +6,7 @@ import ./types
 import ./tcp_transport
 import ./config
 import ../../core/types as coretypes
+import ../../distributed/sharedtimer/timeprovider
 
 # =============================================================================
 # Pool Entry
@@ -23,6 +24,7 @@ type
     ## Connection pool for a single transport type
     config*: NetworkConfig
     role*: string
+    timeProvider*: TimeProvider
 
     # Pool storage: nodeId -> list of pooled connections
     pool*: tables.Table[string, Deque[PooledConnection]]
@@ -39,13 +41,23 @@ type
     totalReused*: int64
     totalClosed*: int64
 
+proc poolTimeMs(tp: TimeProvider): int64 {.inline, raises: [].} =
+  if tp != nil:
+    try:
+      return tp.now() div 1_000_000
+    except Exception:
+      discard
+  let t = times.getTime()
+  t.toUnix * 1000 + t.nanosecond() div 1_000_000
+
 # =============================================================================
 # Connection Pool Implementation
 # =============================================================================
 
-proc newPooledConnection*(conn: Connection): PooledConnection =
+proc newPooledConnection*(conn: Connection,
+    tp: TimeProvider = nil): PooledConnection =
   ## Create a new pooled connection wrapper
-  let now = int64(times.getTime().toUnix() * 1000)
+  let now = poolTimeMs(tp)
   result = PooledConnection(
     conn: conn,
     lastUsed: now,
@@ -79,13 +91,13 @@ proc close*(pool: ConnectionPool) =
     # may still hold refs.  The table is cleaned up when the pool
     # itself is collected.
 
-# =============================================================================
-# Connection Management
-# =============================================================================
+  # =============================================================================
+  # Connection Management
+  # =============================================================================
 
 proc pruneIdleConnections*(pool: ConnectionPool, maxIdleMs: int64) =
   ## Remove connections that have been idle for too long
-  let now = int64(times.getTime().toUnix() * 1000)
+  let now = poolTimeMs(pool.timeProvider)
 
   withLock pool.poolLock:
     var keysToRemove: seq[string] = @[]
@@ -120,12 +132,12 @@ proc getOrCreateConnection*(pool: ConnectionPool, transport: TCPTransport,
         let pc = conns[i]
         if not pc.inUse and pc.conn.state == csConnected:
           pc.inUse = true
-          pc.lastUsed = int64(times.getTime().toUnix() * 1000)
+          pc.lastUsed = poolTimeMs(pool.timeProvider)
           pool.totalReused += 1
           return some(pc.conn)
 
   # Backoff: skip if we recently failed to connect to this node
-  let now2 = int64(times.getTime().toUnix() * 1000)
+  let now2 = poolTimeMs(pool.timeProvider)
   withLock pool.poolLock:
     if key in pool.lastFailure:
       let lastFail = pool.lastFailure[key]
@@ -137,11 +149,11 @@ proc getOrCreateConnection*(pool: ConnectionPool, transport: TCPTransport,
   if connOpt.isNone:
     # Record failure time for backoff
     withLock pool.poolLock:
-      pool.lastFailure[key] = int64(times.getTime().toUnix() * 1000)
+      pool.lastFailure[key] = poolTimeMs(pool.timeProvider)
     return none(Connection)
 
   let conn = connOpt.get()
-  let pc = newPooledConnection(conn)
+  let pc = newPooledConnection(conn, pool.timeProvider)
   pc.inUse = true
 
   withLock pool.poolLock:
@@ -164,7 +176,7 @@ proc returnConnection*(pool: ConnectionPool, conn: Connection) =
       for i in 0 ..< conns.len:
         if conns[i].conn == conn:
           conns[i].inUse = false
-          conns[i].lastUsed = int64(times.getTime().toUnix() * 1000)
+          conns[i].lastUsed = poolTimeMs(pool.timeProvider)
           return
 
 proc removeConnection*(pool: ConnectionPool, conn: Connection) =

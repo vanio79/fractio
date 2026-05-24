@@ -23,6 +23,7 @@ import std/logging
 import std/sequtils
 
 import fractio/core/types as core_types
+import fractio/distributed/sharedtimer/timeprovider
 import fractio/distributed/raft/c_bindings
 import fractio/distributed/raft/group_types
 import fractio/distributed/raft/multigroup_types
@@ -84,6 +85,9 @@ type
     ## Back-reference to RaftKVStoreExt (raw pointer to break circular imports)
     kvStorePtr*: pointer
 
+    ## Clock source for coordinated timestamps (nil = use local clock)
+    timeProvider*: TimeProvider
+
     ## Multiplexed transport (single TCP port for all groups)
     transport*: MultiplexedRaftTransport
 
@@ -119,6 +123,17 @@ proc c_malloc(size: csize_t): pointer {.importc: "malloc",
     header: "<stdlib.h>".}
 proc c_free(p: pointer) {.importc: "free", header: "<stdlib.h>".}
 
+var coordinatorTimeProvider*: TimeProvider = nil
+
+proc coordNowNs*(): int64 {.gcsafe, raises: [].} =
+  {.cast(gcsafe).}:
+    if coordinatorTimeProvider != nil:
+      try:
+        return coordinatorTimeProvider.now()
+      except Exception:
+        discard
+  return localTimeNs()
+
 proc allocInstance(): NuRaftGroupInstancePtr =
   result = cast[NuRaftGroupInstancePtr](c_malloc(csize_t(sizeof(
       NuRaftGroupInstance))))
@@ -127,6 +142,10 @@ proc allocInstance(): NuRaftGroupInstancePtr =
 proc freeInstance(p: NuRaftGroupInstancePtr) =
   if p != nil:
     c_free(p)
+
+proc setTimeProvider*(c: NuRaftCoordinator, tp: TimeProvider) =
+  c.timeProvider = tp
+  coordinatorTimeProvider = tp
 
 # ============================================================================
 # Module-level callbacks (same pattern as before)
@@ -443,7 +462,7 @@ proc multiplexedScheduleTimerCb(ctx: pointer, timerId: int32,
   # Schedule actual timer in Nim - when it fires, call nuraftMpInvokeTimer
   {.cast(gcsafe).}:
     withLock gTimerLock:
-      let nowNs = int64(getTime().toUnixFloat() * 1_000_000_000)
+      let nowNs = coordNowNs()
       let expireNs = nowNs + delayMs.int64 * 1_000_000
       # Use (timerId, ctx) as key to avoid collisions between groups
       gActiveTimers[(timerId: timerId, rpcCtx: ctx)] = (expireNs: expireNs)
@@ -496,7 +515,7 @@ proc timerThreadProc() {.thread, gcsafe.} =
     var expiredTimers: seq[tuple[timerId: int32, rpcCtx: pointer]] = @[]
     {.cast(gcsafe).}:
       withLock gTimerLock:
-        let nowNs = int64(getTime().toUnixFloat() * 1_000_000_000)
+        let nowNs = coordNowNs()
         # Collect all expired timers
         for key, entry in gActiveTimers:
           if entry.expireNs <= nowNs:
@@ -889,7 +908,7 @@ proc queueGroupCreation*(c: NuRaftCoordinator, groupId: GroupID,
 
 proc waitForGroupCreationQueue*(c: NuRaftCoordinator,
     timeoutMs: int = 5000): bool =
-  let startMs = getTime().toUnixFloat() * 1000
+  let startMs = coordNowNs().float / 1_000_000.0
   while true:
     var queueLen = 0
     var creatingLen = 0
@@ -900,7 +919,7 @@ proc waitForGroupCreationQueue*(c: NuRaftCoordinator,
     let pending = c.groupCreationPending.load()
     if queueLen == 0 and pending == 0 and creatingLen == 0:
       return true
-    let nowMs = getTime().toUnixFloat() * 1000
+    let nowMs = coordNowNs().float / 1_000_000.0
     if nowMs - startMs > timeoutMs.float:
       return false
     sleep(10)
@@ -1401,13 +1420,13 @@ proc proposeAndWait*(c: NuRaftCoordinator, groupId: GroupID,
     if rc == 0:
       # Wait for the state machine to advance past the current index.
       # Since logIdx may be 0 (NuRaft API quirk), we wait for SM index to increment.
-      let startTime = getTime().toUnixFloat() * 1000.0
+      let startTime = coordNowNs().float / 1_000_000.0
       while true:
         let smLastIdx = nuraftSmLastCommitIndex(inst.sm)
         # Wait for SM to advance by at least 1 (the write we just proposed)
         if smLastIdx > smIdxBefore:
           break
-        let elapsed = (getTime().toUnixFloat() * 1000.0) - startTime
+        let elapsed = (coordNowNs().float / 1_000_000.0) - startTime
         if elapsed > float(timeoutMs):
           return RaftResult(success: false, error: "Timeout waiting for commit")
         sleep(1) # 1ms poll interval
@@ -1464,13 +1483,13 @@ proc waitForWriteReady*(c: NuRaftCoordinator, groupId: GroupID,
   ## 3. A probe write to succeed (confirms readiness)
   ##
   ## Returns true if write-ready, false on timeout.
-  let startTime = getTime().toUnixFloat() * 1000.0
+  let startTime = coordNowNs().float / 1_000_000.0
 
   # Phase 1: Wait for leadership and initialization
   while true:
     if c.isWriteReady(groupId):
       break
-    let elapsed = (getTime().toUnixFloat() * 1000.0) - startTime
+    let elapsed = (coordNowNs().float / 1_000_000.0) - startTime
     if elapsed > float(timeoutMs * 2 div 3): # Give 2/3 of time for election
       return false
     sleep(5)
@@ -1479,8 +1498,8 @@ proc waitForWriteReady*(c: NuRaftCoordinator, groupId: GroupID,
   # Use an empty write batch - NuRaft must commit this to be ready
   let probeBatch = newWriteBatch()
   let probeCmd = RaftCommand(kind: ckWrite, writeBatch: probeBatch)
-  let remainingMs = max(100, timeoutMs - int((getTime().toUnixFloat() *
-      1000.0) - startTime))
+  let remainingMs = max(100, timeoutMs - int((coordNowNs().float /
+      1_000_000.0) - startTime))
 
   # Retry probe writes on NOT_LEADER - this handles the race between
   # isWriteReady returning true and NuRaft actually being ready
