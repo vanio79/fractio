@@ -43,8 +43,37 @@ src/**/test_*
 tests/**/test_*
 !tests/**/*.nim
 
-# Third-party libraries
-thirdparty/
+# Third-party libraries — build artifacts only (submodules are tracked by git)
+thirdparty/NuRaft/build/
+thirdparty/NuRaft/libnuraft.a
+thirdparty/NuRaft/libnuraft.so
+thirdparty/NuRaft/cert.pem
+thirdparty/NuRaft/key.pem
+thirdparty/NuRaft/DartConfiguration.tcl
+thirdparty/NuRaft/NuRaftConfig.cmake
+thirdparty/NuRaft/runtests.sh
+thirdparty/NuRaft/CMakeFiles/
+thirdparty/NuRaft/CTestTestfile.cmake
+thirdparty/NuRaft/Makefile
+thirdparty/NuRaft/cmake_install.cmake
+thirdparty/NuRaft/examples/CMakeFiles/
+thirdparty/NuRaft/examples/CTestTestfile.cmake
+thirdparty/NuRaft/examples/Makefile
+thirdparty/NuRaft/examples/calc_server
+thirdparty/NuRaft/examples/cmake_install.cmake
+thirdparty/NuRaft/examples/echo_server
+thirdparty/NuRaft/examples/quick_start
+thirdparty/NuRaft/tests/CMakeFiles/
+thirdparty/NuRaft/tests/CTestTestfile.cmake
+thirdparty/NuRaft/tests/Makefile
+thirdparty/NuRaft/tests/cmake_install.cmake
+thirdparty/NuRaft/tests/*_test
+thirdparty/NuRaft/tests/raft_bench
+thirdparty/NuRaft/wrapper/
+thirdparty/wisckey/build/
+thirdparty/crossbeam/
+thirdparty/fjall/
+thirdparty/lsm-tree/
 node_modules/
 
 # Generated documentation

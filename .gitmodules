@@ -1,0 +1,6 @@
+[submodule "thirdparty/NuRaft"]
+	path = thirdparty/NuRaft
+	url = https://github.com/eBay/NuRaft.git
+[submodule "thirdparty/wisckey"]
+	path = thirdparty/wisckey
+	url = https://github.com/coyorkdow/wisckey.git

@@ -28,6 +28,8 @@ import fractio/distributed/raft/group_types
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/multiplexed_bindings
 import fractio/distributed/raft/multiplexed_transport
+import fractio/distributed/raft/raft_persistent_store
+import fractio/distributed/raft/raft_store_callbacks
 import fractio/distributed/meta/system_tables
 import fractio/utils/binary
 import fractio/storage/wisckey_backend
@@ -44,6 +46,8 @@ type
     server*: NuRaftServer
     sm*: NuRaftSM
     smgr*: NuRaftSMgr
+    ## WiscKey-backed persistent store for Raft log and state
+    persistentStore*: RaftPersistentStore
     ## Per-group RPC context
     rpcContext*: MultiplexedContext
     ## Listener handle (for cleanup)
@@ -842,6 +846,8 @@ proc stop*(c: NuRaftCoordinator) =
       # This prevents stale timer callbacks from accessing destroyed memory
       cancelAllTimersForContext(cast[pointer](inst.rpcContext))
       nuraftMpContextDestroy(inst.rpcContext)
+    if not inst.persistentStore.isNil:
+      inst.persistentStore.close()
     freeInstance(inst)
 
   # Fully destroy transport
@@ -973,29 +979,28 @@ proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
                        preferredLeader != uint32(c.nodeId))
   let useCatchingUp = isJoiningNode and members.len == 1
 
-  # Create state manager with persistence
-  # State file stores term and voted_for to ensure restarted nodes
-  # maintain their term and don't trigger unnecessary elections.
-  let stateFilePath = c.dataDir & "/raft_state_" & $groupId & ".bin"
-  var cServerIds = newSeq[int32](members.len)
-  var cEndpoints = newSeq[cstring](members.len)
-  for i in 0 ..< members.len:
-    cServerIds[i] = serverIds[i]
-    cEndpoints[i] = cstring(endpoints[i])
+  # Create WiscKey-backed persistent store for this group's Raft log and state.
+  # This replaces the old per-group binary state file approach with durable
+  # WiscKey storage using /raft/<groupId>/log/<index> and /raft/<groupId>/state.
+  let persistentStore = newRaftPersistentStore(c.store, groupId)
+  inst.persistentStore = persistentStore
 
-  inst.smgr = nuraftSmgrCreateWithPersistence(
+  # Create state manager with callback-based persistence (WiscKey-backed)
+  # The callbacks bridge C++ → Nim → RaftPersistentStore → WiscKey
+  inst.smgr = createCallbackSmgr(
+    persistentStore,
     int32(c.nodeId.uint32),
-    cstring(myEndpoint),
-    int32(members.len),
-    addr cServerIds[0],
-    addr cEndpoints[0],
-    useCatchingUp,
-    cstring(stateFilePath)
+    myEndpoint,
+    serverIds,
+    endpoints,
+    useCatchingUp
   )
 
   if inst.smgr.isNil:
     error("Failed to create NuRaft SMgr", "groupId", $groupId)
     nuraftSmDestroy(inst.sm)
+    if not inst.persistentStore.isNil:
+      inst.persistentStore.close()
     cleanupOnFailure()
     freeInstance(inst)
     return false
@@ -1057,6 +1062,8 @@ proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
     nuraftParamsDestroy(params)
     nuraftSmgrDestroy(inst.smgr)
     nuraftSmDestroy(inst.sm)
+    if not inst.persistentStore.isNil:
+      inst.persistentStore.close()
     cleanupOnFailure()
     freeInstance(inst)
     return false
@@ -1119,6 +1126,8 @@ proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
       nuraftMpContextDestroy(inst.rpcContext)
     nuraftSmgrDestroy(inst.smgr)
     nuraftSmDestroy(inst.sm)
+    if not inst.persistentStore.isNil:
+      inst.persistentStore.close()
     cleanupOnFailure()
     freeInstance(inst)
     return false
@@ -1240,6 +1249,8 @@ proc removeGroup*(c: NuRaftCoordinator, groupId: GroupID) =
     nuraftSmDestroy(inst.sm)
   if not inst.smgr.isNil:
     nuraftSmgrDestroy(inst.smgr)
+  if not inst.persistentStore.isNil:
+    inst.persistentStore.close()
   freeInstance(inst)
 
 proc hasGroup*(c: NuRaftCoordinator, groupId: GroupID): bool =
@@ -1563,10 +1574,20 @@ proc addServerToGroup*(c: NuRaftCoordinator, groupId: GroupID,
     if not alreadyConnected:
       discard c.transport.connectToPeer(peerCoreId, host, port)
 
+  # IMPORTANT: Add the peer to peerInfo BEFORE calling add_srv.
+  # nuraftConfigChangeCb (called after config commit) also adds to peerInfo,
+  # but add_srv needs to replicate the config change to the new server via
+  # heartbeats/append_entries BEFORE it's committed. Without peerInfo, the
+  # send callback can't look up the peer's address if the TCP connection
+  # drops and needs to be re-established.
+  withLock c.groupsLock:
+    c.peerInfo[nodeId] = (host, port)
+
   # IMPORTANT: Use "serverId@host:port" format so NuRaft can extract the server ID
   # from the endpoint when creating RPC clients (same format as createAndStartGroup)
   let endpoint = $nodeId & "@" & host & ":" & $port
-  return nuraftServerAddSrv(inst.server, int32(nodeId), cstring(endpoint))
+  let rc = nuraftServerAddSrv(inst.server, int32(nodeId), cstring(endpoint))
+  return rc
 
 proc removeServerFromGroup*(c: NuRaftCoordinator, groupId: GroupID,
     nodeId: uint32): int32 =

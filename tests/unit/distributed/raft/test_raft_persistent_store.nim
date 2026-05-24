@@ -101,7 +101,18 @@ suite "Raft State Serialization":
     check deserialized.get().votedFor == 3
     check deserialized.get().configLogIdxHwm == 100
 
-  test "deserialize legacy v2 format (24 bytes, no magic)":
+  test "deserialize v3 format round-trips":
+    let state = RaftState(term: 42, votedFor: 3, configLogIdxHwm: 100)
+    let serialized = serializeRaftState(state)
+    check serialized.len == 26
+    let deserialized = deserializeRaftState(serialized)
+    check deserialized.isSome
+    check deserialized.get().term == 42
+    check deserialized.get().votedFor == 3
+    check deserialized.get().configLogIdxHwm == 100
+
+  test "reject data without magic header":
+    # 24 bytes with no magic — this was the old v2 format, now rejected
     var data = newString(24)
     var term: uint64 = 7
     for i in countdown(7, 0):
@@ -117,13 +128,10 @@ suite "Raft State Serialization":
     for i in countdown(23, 16):
       data[i] = char(hwm and 0xFF)
       hwm = hwm shr 8
-    let deserialized = deserializeRaftState(data)
-    check deserialized.isSome
-    check deserialized.get().term == 7
-    check deserialized.get().votedFor == 1
-    check deserialized.get().configLogIdxHwm == 50
+    check deserializeRaftState(data).isNone
 
-  test "deserialize legacy v1 format (16 bytes)":
+  test "reject short data (16 bytes, old v1 format)":
+    # 16 bytes with no magic — this was the old v1 format, now rejected
     var data = newString(16)
     var term: uint64 = 15
     for i in countdown(7, 0):
@@ -135,15 +143,18 @@ suite "Raft State Serialization":
       vf = vf shr 8
     for i in 12..<16:
       data[i] = '\0'
-    let deserialized = deserializeRaftState(data)
-    check deserialized.isSome
-    check deserialized.get().term == 15
-    check deserialized.get().votedFor == 5
-    check deserialized.get().configLogIdxHwm == 0
+    check deserializeRaftState(data).isNone
 
   test "deserialize too-short data returns none":
     let short = newString(10)
     check deserializeRaftState(short).isNone
+
+  test "deserialize data with wrong magic returns none":
+    # 26 bytes but wrong magic header
+    var data = newString(26)
+    data[0] = char(0xFF) # wrong magic
+    data[1] = char(0xFF)
+    check deserializeRaftState(data).isNone
 
   test "zero term state":
     let state = RaftState(term: 0, votedFor: -1, configLogIdxHwm: 0)

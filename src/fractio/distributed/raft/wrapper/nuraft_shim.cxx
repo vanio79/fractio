@@ -12,7 +12,6 @@
 
 #include "libnuraft/nuraft.hxx"
 #include "libnuraft/raft_server_handler.hxx"
-#include "in_memory_log_store.hxx"
 
 #include <atomic>
 #include <cstring>
@@ -27,6 +26,220 @@
 #include <sys/stat.h>
 
 using namespace nuraft;
+
+// =============================================================================
+// Callback-based Log Store (delegates all operations to Nim via C callbacks)
+// =============================================================================
+
+class callback_log_store : public log_store {
+public:
+    callback_log_store(void* ctx,
+                       nuraft_log_append_cb append_cb,
+                       nuraft_log_write_at_cb write_at_cb,
+                       nuraft_log_get_cb get_cb,
+                       nuraft_log_term_at_cb term_at_cb,
+                       nuraft_log_next_slot_cb next_slot_cb,
+                       nuraft_log_start_index_cb start_index_cb,
+                       nuraft_log_pack_cb pack_cb,
+                       nuraft_log_apply_pack_cb apply_pack_cb,
+                       nuraft_log_compact_cb compact_cb,
+                       nuraft_log_flush_cb flush_cb)
+        : ctx_(ctx),
+          append_cb_(append_cb),
+          write_at_cb_(write_at_cb),
+          get_cb_(get_cb),
+          term_at_cb_(term_at_cb),
+          next_slot_cb_(next_slot_cb),
+          start_index_cb_(start_index_cb),
+          pack_cb_(pack_cb),
+          apply_pack_cb_(apply_pack_cb),
+          compact_cb_(compact_cb),
+          flush_cb_(flush_cb) {}
+
+    ~callback_log_store() {}
+
+    ulong next_slot() const override {
+        if (next_slot_cb_) {
+            return next_slot_cb_(ctx_);
+        }
+        return 1;
+    }
+
+    ulong start_index() const override {
+        if (start_index_cb_) {
+            return start_index_cb_(ctx_);
+        }
+        return 1;
+    }
+
+    ptr<log_entry> last_entry() const override {
+        // Get the entry at next_slot() - 1
+        ulong ns = next_slot();
+        if (ns <= 1) {
+            // Empty log: return a dummy entry with term=0 and null buffer
+            return cs_new<log_entry>(0, buffer::alloc(0));
+        }
+        ulong idx = ns - 1;
+        // We need to call get_cb, but it's not const-qualified in the callback.
+        // Since log_store declares last_entry() as const, we const_cast the ctx.
+        // This is safe because the Nim callback is thread-safe.
+        if (get_cb_) {
+            uint64_t term = 0;
+            int32_t val_type = 0;
+            // Allocate a reasonable buffer for the entry data
+            size_t buf_cap = 64 * 1024;  // 64KB should be enough for any single entry
+            char* buf = new char[buf_cap];
+            size_t actual_len = get_cb_(ctx_, idx, &term, &val_type, buf, buf_cap);
+            ptr<buffer> data_buf;
+            if (actual_len > 0 && actual_len <= buf_cap) {
+                data_buf = buffer::alloc(actual_len);
+                std::memcpy(data_buf->data_begin(), buf, actual_len);
+                data_buf->pos(0);
+            } else {
+                data_buf = buffer::alloc(0);
+            }
+            delete[] buf;
+            return cs_new<log_entry>(term, data_buf, static_cast<log_val_type>(val_type));
+        }
+        return cs_new<log_entry>(0, buffer::alloc(0));
+    }
+
+    ulong append(ptr<log_entry>& entry) override {
+        if (!append_cb_ || !entry) {
+            return next_slot();
+        }
+        // Serialize entry data
+        size_t data_len = 0;
+        const char* data_ptr = nullptr;
+        if (!entry->is_buf_null()) {
+            buffer& buf = entry->get_buf();
+            data_len = buf.size() - buf.pos();
+            data_ptr = reinterpret_cast<const char*>(buf.data_begin() + buf.pos());
+        }
+        return append_cb_(ctx_, entry->get_term(), static_cast<int32_t>(entry->get_val_type()),
+                          data_ptr ? data_ptr : "", data_len);
+    }
+
+    void write_at(ulong index, ptr<log_entry>& entry) override {
+        if (!write_at_cb_ || !entry) return;
+        size_t data_len = 0;
+        const char* data_ptr = nullptr;
+        if (!entry->is_buf_null()) {
+            buffer& buf = entry->get_buf();
+            data_len = buf.size() - buf.pos();
+            data_ptr = reinterpret_cast<const char*>(buf.data_begin() + buf.pos());
+        }
+        write_at_cb_(ctx_, index, entry->get_term(), static_cast<int32_t>(entry->get_val_type()),
+                     data_ptr ? data_ptr : "", data_len);
+    }
+
+    void end_of_append_batch(ulong start, ulong cnt) override {
+        // No-op: Nim handles batching internally via WiscKey write batches
+    }
+
+    ptr<std::vector<ptr<log_entry>>> log_entries(ulong start, ulong end) override {
+        auto result = cs_new<std::vector<ptr<log_entry>>>();
+        result->reserve(end - start);
+        for (ulong idx = start; idx < end; idx++) {
+            ptr<log_entry> entry = entry_at(idx);
+            if (entry) {
+                result->push_back(entry);
+            }
+        }
+        return result;
+    }
+
+    ptr<log_entry> entry_at(ulong index) override {
+        if (!get_cb_) {
+            return cs_new<log_entry>(0, buffer::alloc(0));
+        }
+        uint64_t term = 0;
+        int32_t val_type = 0;
+        size_t buf_cap = 64 * 1024;
+        char* buf = new char[buf_cap];
+        size_t actual_len = get_cb_(ctx_, index, &term, &val_type, buf, buf_cap);
+
+        ptr<buffer> data_buf;
+        if (actual_len > 0 && actual_len <= buf_cap) {
+            data_buf = buffer::alloc(actual_len);
+            std::memcpy(data_buf->data_begin(), buf, actual_len);
+            data_buf->pos(0);
+        } else {
+            data_buf = buffer::alloc(0);
+        }
+        delete[] buf;
+        return cs_new<log_entry>(term, data_buf, static_cast<log_val_type>(val_type));
+    }
+
+    ulong term_at(ulong index) override {
+        if (term_at_cb_) {
+            return term_at_cb_(ctx_, index);
+        }
+        return 0;
+    }
+
+    ptr<buffer> pack(ulong index, int32 cnt) override {
+        if (!pack_cb_) {
+            return buffer::alloc(0);
+        }
+        // First call to get the required size
+        // Allocate a large buffer: each entry can be up to 64KB, cnt entries max
+        size_t cap = static_cast<size_t>(cnt) * 64 * 1024 + 1024;
+        char* buf = new char[cap];
+        size_t actual_len = pack_cb_(ctx_, index, cnt, buf, cap);
+
+        ptr<buffer> result;
+        if (actual_len > 0 && actual_len <= cap) {
+            result = buffer::alloc(actual_len);
+            std::memcpy(result->data_begin(), buf, actual_len);
+            result->pos(0);
+        } else {
+            result = buffer::alloc(0);
+        }
+        delete[] buf;
+        return result;
+    }
+
+    void apply_pack(ulong index, buffer& pack) override {
+        if (!apply_pack_cb_) return;
+        pack.pos(0);
+        const char* data = reinterpret_cast<const char*>(pack.data_begin() + pack.pos());
+        size_t len = pack.size() - pack.pos();
+        apply_pack_cb_(ctx_, index, data, len);
+    }
+
+    bool compact(ulong last_log_index) override {
+        if (compact_cb_) {
+            return compact_cb_(ctx_, last_log_index) == 0;
+        }
+        return true;
+    }
+
+    bool flush() override {
+        if (flush_cb_) {
+            return flush_cb_(ctx_) == 0;
+        }
+        return true;
+    }
+
+    ulong last_durable_index() override {
+        // For now, treat all written entries as durable immediately
+        return next_slot() > 0 ? next_slot() - 1 : 0;
+    }
+
+private:
+    void* ctx_;
+    nuraft_log_append_cb append_cb_;
+    nuraft_log_write_at_cb write_at_cb_;
+    nuraft_log_get_cb get_cb_;
+    nuraft_log_term_at_cb term_at_cb_;
+    nuraft_log_next_slot_cb next_slot_cb_;
+    nuraft_log_start_index_cb start_index_cb_;
+    nuraft_log_pack_cb pack_cb_;
+    nuraft_log_apply_pack_cb apply_pack_cb_;
+    nuraft_log_compact_cb compact_cb_;
+    nuraft_log_flush_cb flush_cb_;
+};
 
 // =============================================================================
 // Helper: Access NuRaft's protected process_req method
@@ -323,54 +536,106 @@ private:
 };
 
 // =============================================================================
-// State Manager (In-memory with dynamic config + persistent state)
+// Callback-based State Manager (delegates persistence to Nim via C callbacks)
 // =============================================================================
-// 
-// State persistence: srv_state (term, voted_for) is saved to a file on disk.
-// This ensures restarted nodes maintain their term and don't trigger
-// unnecessary elections when rejoining a cluster.
 //
-// File format (binary, 16 bytes):
-//   [term:8 bytes BE][voted_for:4 bytes BE][padding:4 bytes]
+// Dedicated state_mgr that uses Nim callbacks (backed by WiscKey) for all
+// persistence. No file I/O. Separated from dynamic_state_mgr which retains
+// file-based persistence for backward compatibility.
 //
-// The catching_up flag is NOT persisted - it's set fresh on each restart
-// based on whether the node is joining as a new member.
+// Handles:
+// - Raft state (term, voted_for, config_hwm) via state_save_cb / state_read_cb
+// - Cluster config via config_save_cb / config_load_cb
+// - Log store via an externally-provided callback_log_store
+// - Config change notifications to Nim (config_change_cb)
+// - Quorum updates to Nim (quorum_update_cb)
+// - High water mark to reject stale config changes during log replay
 
-class dynamic_state_mgr : public state_mgr {
+class callback_state_mgr : public state_mgr {
 public:
-    // Constructor with optional state file path for persistence
-    dynamic_state_mgr(int32 my_id, const std::string& my_endpoint,
-                      const std::vector<std::pair<int32, std::string>>& servers,
-                      bool catching_up = false,
-                      const std::string& state_file_path = "")
+    callback_state_mgr(int32 my_id, const std::string& my_endpoint,
+                       const std::vector<std::pair<int32, std::string>>& servers,
+                       bool catching_up,
+                       ptr<callback_log_store> log_store,
+                       nuraft_state_save_cb state_save_cb,
+                       nuraft_state_read_cb state_read_cb,
+                       nuraft_config_save_cb config_save_cb,
+                       nuraft_config_load_cb config_load_cb,
+                       void* cb_ctx)
         : my_id_(my_id), my_endpoint_(my_endpoint),
-          cur_log_store_(cs_new<inmem_log_store>()),
-          state_file_path_(state_file_path),
+          cur_log_store_(log_store),
+          state_save_cb_(state_save_cb),
+          state_read_cb_(state_read_cb),
+          config_save_cb_(config_save_cb),
+          config_load_cb_(config_load_cb),
+          cb_ctx_(cb_ctx),
           config_change_cb_(nullptr), config_change_ctx_(nullptr),
           quorum_update_cb_(nullptr), quorum_update_ctx_(nullptr),
           raft_server_ptr_(nullptr),
           config_log_idx_hwm_(0) {
         saved_config_ = cs_new<cluster_config>();
-        
-        // Initialize state - load from file if path provided and file exists
         saved_state_ = cs_new<srv_state>();
-        if (!state_file_path_.empty()) {
-            load_state_from_file();
+
+        // Load state from Nim callbacks
+        if (state_read_cb_) {
+            uint64_t term = 0;
+            int32_t voted_for = -1;
+            uint64_t config_hwm = 0;
+            int32_t found = state_read_cb_(cb_ctx_, &term, &voted_for, &config_hwm);
+            if (found) {
+                saved_state_->set_term(term);
+                saved_state_->set_voted_for(voted_for);
+                config_log_idx_hwm_ = config_hwm;
+            }
         }
-        
+
         // Apply catching_up flag (not persisted, set fresh each restart)
         if (catching_up) {
             saved_state_->set_catching_up(true);
             saved_state_->allow_election_timer(false);
         }
-        
+
+        // Load config from Nim callbacks
+        if (config_load_cb_) {
+            size_t cap = 64 * 1024;  // 64KB buffer for config
+            char* buf = new char[cap];
+            size_t config_len = config_load_cb_(cb_ctx_, buf, cap);
+            if (config_len > 0 && config_len <= cap) {
+                ptr<buffer> config_buf = buffer::alloc(config_len);
+                std::memcpy(config_buf->data_begin(), buf, config_len);
+                config_buf->pos(0);
+                saved_config_ = cluster_config::deserialize(*config_buf);
+            }
+            delete[] buf;
+        }
+
+        // Apply catching_up flag (not persisted, set fresh each restart)
+        if (catching_up) {
+            saved_state_->set_catching_up(true);
+            saved_state_->allow_election_timer(false);
+        }
+
+        // Load config from Nim callbacks
+        if (config_load_cb_) {
+            size_t cap = 64 * 1024;  // 64KB buffer for config
+            char* buf = new char[cap];
+            size_t config_len = config_load_cb_(cb_ctx_, buf, cap);
+            if (config_len > 0 && config_len <= cap) {
+                ptr<buffer> config_buf = buffer::alloc(config_len);
+                std::memcpy(config_buf->data_begin(), buf, config_len);
+                config_buf->pos(0);
+                saved_config_ = cluster_config::deserialize(*config_buf);
+            }
+            delete[] buf;
+        }
+
         for (auto& kv : servers) {
             auto sc = cs_new<srv_config>(kv.first, kv.second);
             saved_config_->get_servers().push_back(sc);
         }
     }
 
-    ~dynamic_state_mgr() {}
+    ~callback_state_mgr() {}
 
     void set_raft_server(void* server_ptr) {
         raft_server_ptr_ = server_ptr;
@@ -387,70 +652,54 @@ public:
 
     void save_config(const cluster_config& config) override {
         // High water mark: ignore config changes from old log entries.
-        // When a follower receives append_entries from the leader, it replays
-        // the entire log including old config changes (e.g., when the cluster
-        // had 1 server). These stale configs would regress the follower's
-        // config and break cluster communication. Only accept configs whose
-        // log_idx is at or above the high water mark.
         ulong new_log_idx = config.get_log_idx();
-        size_t new_servers = config.get_servers().size();
-        // Only skip stale configs (don't log — can fire frequently during replay)
         if (new_log_idx > 0 && new_log_idx < config_log_idx_hwm_) {
             return;
         }
         if (new_log_idx > 0) {
             config_log_idx_hwm_ = new_log_idx;
-            // Persist the updated HWM so it survives restarts.
-            // Without this, a restarted node's HWM=0 allows old config
-            // entries from log replay to regress the cluster config.
-            if (!state_file_path_.empty()) {
-                save_state_to_file();
+            // Persist updated HWM via Nim callback
+            if (state_save_cb_) {
+                state_save_cb_(cb_ctx_, saved_state_->get_term(),
+                               saved_state_->get_voted_for(), config_log_idx_hwm_);
             }
         }
 
         ptr<buffer> buf = config.serialize();
         saved_config_ = cluster_config::deserialize(*buf);
-        
-        // Check if the new config includes this server
-        bool includes_self = false;
-        for (auto& srv : saved_config_->get_servers()) {
-            if (srv->get_id() == my_id_) {
-                includes_self = true;
-                break;
-            }
+
+        // Persist the config itself via Nim callback
+        if (config_save_cb_) {
+            buf->pos(0);
+            const char* config_data = reinterpret_cast<const char*>(buf->data_begin() + buf->pos());
+            size_t config_len = buf->size() - buf->pos();
+            config_save_cb_(cb_ctx_, config_data, config_len);
         }
-        
-        size_t num_servers = saved_config_->get_servers().size();
-        // (my_id and num_servers already logged above with log_idx/hwm)
 
         // Notify Nim about each server in the new config
-        // This is critical for follower nodes to learn about new peers
-        // when the leader adds them via add_srv
         if (config_change_cb_) {
             for (auto& srv : saved_config_->get_servers()) {
                 int32_t server_id = srv->get_id();
                 const std::string& endpoint = srv->get_endpoint();
-                // Call Nim callback to update peerInfo table
                 config_change_cb_(config_change_ctx_, server_id, endpoint.c_str());
             }
         }
-        
+
         // Update quorum based on new server count
+        size_t num_servers = saved_config_->get_servers().size();
         if (quorum_update_cb_ && num_servers > 0) {
             int32_t majority = (int32_t)(num_servers / 2) + 1;
-            int32_t quorum_size = majority;
-            // Quorum update callback — no logging (can fire during log replay)
-            quorum_update_cb_(quorum_update_ctx_, my_id_, quorum_size);
+            quorum_update_cb_(quorum_update_ctx_, my_id_, majority);
         }
     }
 
     void save_state(const srv_state& state) override {
         ptr<buffer> buf = state.serialize();
         saved_state_ = srv_state::deserialize(*buf);
-        
-        // Persist state to file if path is set
-        if (!state_file_path_.empty()) {
-            save_state_to_file();
+
+        if (state_save_cb_) {
+            state_save_cb_(cb_ctx_, saved_state_->get_term(),
+                           saved_state_->get_voted_for(), config_log_idx_hwm_);
         }
     }
 
@@ -467,7 +716,8 @@ public:
     }
 
     void system_exit(const int exit_code) override {
-        std::cerr << "NuRaft system_exit called with code " << exit_code << std::endl;
+        // No stderr output in production (per project rules)
+        (void)exit_code;
     }
 
     void set_config_change_callback(void* ctx, nuraft_config_change_cb cb) {
@@ -478,119 +728,20 @@ public:
 private:
     int32 my_id_;
     std::string my_endpoint_;
-    ptr<inmem_log_store> cur_log_store_;
+    ptr<callback_log_store> cur_log_store_;
     ptr<cluster_config> saved_config_;
     ptr<srv_state> saved_state_;
-    std::string state_file_path_;  // Path for persistent state file
+    nuraft_state_save_cb state_save_cb_;
+    nuraft_state_read_cb state_read_cb_;
+    nuraft_config_save_cb config_save_cb_;
+    nuraft_config_load_cb config_load_cb_;
+    void* cb_ctx_;
     nuraft_config_change_cb config_change_cb_;
     void* config_change_ctx_;
     nuraft_quorum_update_cb quorum_update_cb_;
     void* quorum_update_ctx_;
     void* raft_server_ptr_;
-    ulong config_log_idx_hwm_;  // High water mark: max log_idx seen in save_config
-    
-    // Load srv_state from file (term, voted_for)
-    // File format: [term:8B BE][voted_for:4B BE][padding:4B] = 16 bytes
-    void load_state_from_file() {
-        std::ifstream file(state_file_path_, std::ios::binary);
-        if (!file.is_open()) {
-            saved_state_->set_term(0);
-            saved_state_->set_voted_for(-1);
-            return;
-        }
-        
-        // Read up to 24 bytes: term(8) + voted_for(4) + padding(4) + config_hwm(8)
-        // v1 format: 16 bytes (no HWM). v2 format: 24 bytes (with HWM).
-        char buf[24];
-        memset(buf, 0, sizeof(buf));
-        file.read(buf, sizeof(buf));
-        std::streamsize bytes_read = file.gcount();
-        
-        if (bytes_read < 12) {
-            saved_state_->set_term(0);
-            saved_state_->set_voted_for(-1);
-            return;
-        }
-        
-        // Parse term (8 bytes big-endian)
-        uint64_t term = 0;
-        for (int i = 0; i < 8; i++) {
-            term = (term << 8) | (uint8_t)buf[i];
-        }
-        
-        // Parse voted_for (4 bytes big-endian)
-        int32_t voted_for = 0;
-        for (int i = 8; i < 12; i++) {
-            voted_for = (voted_for << 8) | (int8_t)buf[i];
-        }
-        
-        saved_state_->set_term(term);
-        saved_state_->set_voted_for(voted_for);
-        
-        // Parse config_log_idx_hwm (8 bytes big-endian, bytes 16-23)
-        // Only present in v2 format (24 bytes). If file is shorter,
-        // HWM stays at 0 (which is safe but may allow config regression
-        // until the first forward-progress save_config updates it).
-        if (bytes_read >= 24) {
-            uint64_t hwm = 0;
-            for (int i = 16; i < 24; i++) {
-                hwm = (hwm << 8) | (uint8_t)buf[i];
-            }
-            config_log_idx_hwm_ = hwm;
-        }
-        // State loaded successfully (term, voted_for, config_hwm)
-    }
-    
-    // Save srv_state + config_log_idx_hwm to file
-    // Format v2 (24 bytes): term(8) + voted_for(4) + padding(4) + config_hwm(8)
-    void save_state_to_file() {
-        // Ensure parent directory exists
-        size_t last_slash = state_file_path_.find_last_of('/');
-        if (last_slash != std::string::npos) {
-            std::string dir = state_file_path_.substr(0, last_slash);
-            mkdir(dir.c_str(), 0755);  // Ignore error if already exists
-        }
-        
-        std::ofstream file(state_file_path_, std::ios::binary);
-        if (!file.is_open()) {
-            std::cerr << "[NuRaft] save_state_to_file: ERROR cannot open file: "
-                      << state_file_path_ << std::endl;
-            return;
-        }
-        
-        char buf[24];
-        memset(buf, 0, sizeof(buf));
-        
-        // Write term (8 bytes big-endian)
-        uint64_t term = saved_state_->get_term();
-        for (int i = 7; i >= 0; i--) {
-            buf[i] = (char)(term & 0xFF);
-            term >>= 8;
-        }
-        
-        // Write voted_for (4 bytes big-endian)
-        int32_t voted_for = saved_state_->get_voted_for();
-        for (int i = 11; i >= 8; i--) {
-            buf[i] = (char)(voted_for & 0xFF);
-            voted_for >>= 8;
-        }
-        
-        // Padding (4 bytes, bytes 12-15)
-        for (int i = 12; i < 16; i++) {
-            buf[i] = 0;
-        }
-        
-        // Write config_log_idx_hwm (8 bytes big-endian, bytes 16-23)
-        uint64_t hwm = config_log_idx_hwm_;
-        for (int i = 23; i >= 16; i--) {
-            buf[i] = (char)(hwm & 0xFF);
-            hwm >>= 8;
-        }
-        
-        file.write(buf, 24);
-        file.flush();
-        // State saved successfully (term, voted_for, config_hwm persisted)
-    }
+    ulong config_log_idx_hwm_;
 };
 
 // =============================================================================
@@ -885,16 +1036,26 @@ private:
 };
 
 // =============================================================================
+// State Manager Handle (tagged wrapper for dynamic_state_mgr or callback_state_mgr)
+// =============================================================================
+
+struct smgr_handle {
+    ptr<callback_state_mgr> smgr;
+
+    smgr_handle() : smgr(nullptr) {}
+};
+
+// =============================================================================
 // Raft Server Wrapper
 // =============================================================================
 
 struct server_wrapper {
     ptr<raft_server> server;
-    ptr<context> raft_ctx;
+    context* raft_ctx;  // Non-owning pointer for quorum updates (server owns the context)
     // Note: mp_ctx is NOT stored here - Nim owns it separately via rpcContext
     // Storing it here would cause double-free when server is destroyed
     ptr<callback_state_machine> sm;
-    ptr<dynamic_state_mgr> smgr;
+    smgr_handle* smgr;  // Tagged handle (dynamic or callback)
 };
 
 // =============================================================================
@@ -1058,63 +1219,88 @@ uint64_t nuraft_sm_last_commit_index(void* sm) {
 // State Manager
 // =============================================================================
 
-void* nuraft_smgr_create(int32_t my_server_id, const char* my_endpoint,
-                          int32_t num_servers, const int32_t* server_ids, const char** endpoints) {
+// Create state manager with callback-based persistence (WiscKey-backed).
+// The log_store and state persistence callbacks delegate to Nim's RaftPersistentStore.
+void* nuraft_smgr_create_with_callbacks(
+    int32_t my_server_id,
+    const char* my_endpoint,
+    int32_t num_servers,
+    const int32_t* server_ids,
+    const char** endpoints,
+    bool catching_up,
+    // Log store callbacks
+    void* log_store_ctx,
+    nuraft_log_append_cb log_append_cb,
+    nuraft_log_write_at_cb log_write_at_cb,
+    nuraft_log_get_cb log_get_cb,
+    nuraft_log_term_at_cb log_term_at_cb,
+    nuraft_log_next_slot_cb log_next_slot_cb,
+    nuraft_log_start_index_cb log_start_index_cb,
+    nuraft_log_pack_cb log_pack_cb,
+    nuraft_log_apply_pack_cb log_apply_pack_cb,
+    nuraft_log_compact_cb log_compact_cb,
+    nuraft_log_flush_cb log_flush_cb,
+    // State callbacks
+    void* state_cb_ctx,
+    nuraft_state_save_cb state_save_cb,
+    nuraft_state_read_cb state_read_cb,
+    nuraft_config_save_cb config_save_cb,
+    nuraft_config_load_cb config_load_cb) {
     std::vector<std::pair<int32, std::string>> servers;
     for (int i = 0; i < num_servers; i++) {
         servers.push_back({server_ids[i], std::string(endpoints[i])});
     }
-    auto smgr = cs_new<dynamic_state_mgr>(my_server_id, std::string(my_endpoint), servers, false);
-    return new ptr<dynamic_state_mgr>(smgr);
-}
 
-void* nuraft_smgr_create_with_catching_up(int32_t my_server_id, const char* my_endpoint,
-                                           int32_t num_servers, const int32_t* server_ids,
-                                           const char** endpoints, bool catching_up) {
-    std::vector<std::pair<int32, std::string>> servers;
-    for (int i = 0; i < num_servers; i++) {
-        servers.push_back({server_ids[i], std::string(endpoints[i])});
-    }
-    auto smgr = cs_new<dynamic_state_mgr>(my_server_id, std::string(my_endpoint), servers, catching_up);
-    return new ptr<dynamic_state_mgr>(smgr);
-}
+    // Create the callback-based log store
+    auto log_store = cs_new<callback_log_store>(
+        log_store_ctx,
+        log_append_cb,
+        log_write_at_cb,
+        log_get_cb,
+        log_term_at_cb,
+        log_next_slot_cb,
+        log_start_index_cb,
+        log_pack_cb,
+        log_apply_pack_cb,
+        log_compact_cb,
+        log_flush_cb
+    );
 
-void* nuraft_smgr_create_with_persistence(int32_t my_server_id, const char* my_endpoint,
-                                           int32_t num_servers, const int32_t* server_ids,
-                                           const char** endpoints, bool catching_up,
-                                           const char* state_file_path) {
-    std::vector<std::pair<int32, std::string>> servers;
-    for (int i = 0; i < num_servers; i++) {
-        servers.push_back({server_ids[i], std::string(endpoints[i])});
-    }
-    std::string path_str = state_file_path ? std::string(state_file_path) : "";
-    auto smgr = cs_new<dynamic_state_mgr>(my_server_id, std::string(my_endpoint),
-                                          servers, catching_up, path_str);
-    return new ptr<dynamic_state_mgr>(smgr);
+    // Create the callback-based state manager
+    auto smgr = cs_new<callback_state_mgr>(
+        my_server_id, std::string(my_endpoint), servers, catching_up,
+        log_store,
+        state_save_cb, state_read_cb, config_save_cb, config_load_cb,
+        state_cb_ctx
+    );
+    auto* h = new smgr_handle();
+    h->smgr = smgr;
+    return h;
 }
 
 void nuraft_smgr_destroy(void* smgr) {
     if (smgr) {
-        delete static_cast<ptr<dynamic_state_mgr>*>(smgr);
+        auto* h = static_cast<smgr_handle*>(smgr);
+        delete h;
     }
 }
 
 void nuraft_smgr_set_config_cb(void* smgr, void* ctx, nuraft_config_change_cb cb) {
     if (!smgr) return;
-    auto& sp = *static_cast<ptr<dynamic_state_mgr>*>(smgr);
-    sp->set_config_change_callback(ctx, cb);
+    auto* h = static_cast<smgr_handle*>(smgr);
+    h->smgr->set_config_change_callback(ctx, cb);
 }
 
 void nuraft_smgr_set_quorum_cb(void* smgr, void* ctx, nuraft_quorum_update_cb cb) {
     if (!smgr) return;
-    auto& sp = *static_cast<ptr<dynamic_state_mgr>*>(smgr);
-    sp->set_quorum_update_callback(ctx, cb);
+    auto* h = static_cast<smgr_handle*>(smgr);
+    h->smgr->set_quorum_update_callback(ctx, cb);
 }
 
 void nuraft_smgr_set_raft_server(void* smgr, void* server) {
     if (!smgr) return;
-    auto& sp = *static_cast<ptr<dynamic_state_mgr>*>(smgr);
-    sp->set_raft_server(server);
+    auto* h = static_cast<smgr_handle*>(smgr);
+    h->smgr->set_raft_server(server);
 }
 
 // =============================================================================
@@ -1363,12 +1549,15 @@ void* nuraft_server_create(
 
     auto* mp_ctx = static_cast<mp_context_t*>(mp_context);
     auto& sm_sp = *static_cast<ptr<callback_state_machine>*>(sm);
-    auto& smgr_sp = *static_cast<ptr<dynamic_state_mgr>*>(smgr);
+    auto* smgr_h = static_cast<smgr_handle*>(smgr);
     auto* rp = static_cast<raft_params*>(params);
+
+    // Get the base state_mgr pointer from the handle
+    ptr<state_mgr> smgr_ptr = std::static_pointer_cast<state_mgr>(smgr_h->smgr);
 
     // Create context with custom RPC components
     context* ctx = new context(
-        std::static_pointer_cast<state_mgr>(smgr_sp),
+        smgr_ptr,
         std::static_pointer_cast<state_machine>(sm_sp),
         mp_ctx->listener,
         nullptr, // logger
@@ -1396,6 +1585,11 @@ void* nuraft_server_create(
     raft_server::init_options init_opt;
     init_opt.start_server_in_constructor_ = false;
 
+    // Store context pointer before transferring ownership to raft_server.
+    // raft_server takes ownership via unique_ptr, but we need a non-owning
+    // reference for update_params (quorum updates).
+    context* ctx_raw = ctx;
+
     auto server = cs_new<raft_server>(ctx, init_opt);
     if (!server) {
         delete ctx;
@@ -1408,10 +1602,10 @@ void* nuraft_server_create(
     // Wrap
     auto* wrapper = new server_wrapper();
     wrapper->server = server;
-    wrapper->raft_ctx = nullptr; // server owns it
+    wrapper->raft_ctx = ctx_raw; // Non-owning pointer for quorum updates
     // Note: mp_ctx is owned by Nim (rpcContext), not stored here
     wrapper->sm = sm_sp;
-    wrapper->smgr = smgr_sp;
+    wrapper->smgr = smgr_h;
 
     return wrapper;
 }
@@ -1420,10 +1614,12 @@ void nuraft_server_destroy(void* server) {
     if (!server) return;
     auto* wrapper = static_cast<server_wrapper*>(server);
     wrapper->server.reset();
-    wrapper->raft_ctx.reset();
+    wrapper->raft_ctx = nullptr; // Non-owning, just clear the pointer
     // Note: mp_ctx is owned by Nim, destroyed separately via nuraftMpContextDestroy
     wrapper->sm.reset();
-    wrapper->smgr.reset();
+    // smgr is a smgr_handle* — shared_ptrs inside are released when handle is deleted
+    // via nuraftSmgrDestroy, not here. Just clear the pointer.
+    wrapper->smgr = nullptr;
     delete wrapper;
 }
 
@@ -1511,12 +1707,9 @@ int nuraft_server_add_srv(void* server, int32_t srv_id, const char* endpoint) {
 
     srv_config sc(srv_id, std::string(endpoint));
     auto result = wrapper->server->add_srv(sc);
-    if (!result) {
-        return -1;
-    }
+    if (!result) return -1;
 
-    int rc = result->get_accepted() ? 0 : static_cast<int>(result->get_result_code());
-    return rc;
+    return result->get_accepted() ? 0 : static_cast<int>(result->get_result_code());
 }
 
 int nuraft_server_remove_srv(void* server, int32_t srv_id) {
@@ -1551,14 +1744,16 @@ void nuraft_server_yield_leadership(void* server, bool immediate, int32_t succes
 void nuraft_server_update_quorum(void* server, int32_t quorum_size) {
     if (!server) return;
     auto* wrapper = static_cast<server_wrapper*>(server);
-    if (!wrapper->server || !wrapper->raft_ctx) return;
-    
+    if (!wrapper->server) return;
+
+    if (!wrapper->raft_ctx) return;
+
     // Get current params and modify quorum sizes
     ptr<raft_params> current_params = wrapper->raft_ctx->get_params();
     raft_params new_params(*current_params);  // Copy existing params (preserves hb_interval!)
     new_params.custom_election_quorum_size_ = quorum_size;
     new_params.custom_commit_quorum_size_ = quorum_size;
-    
+
     wrapper->server->update_params(new_params);
 }
 

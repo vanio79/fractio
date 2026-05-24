@@ -42,6 +42,75 @@ typedef void (*nuraft_schedule_timer_cb)(void* ctx, int32_t timer_id, int32_t de
 typedef void (*nuraft_cancel_timer_cb)(void* ctx, int32_t timer_id);
 
 // =============================================================================
+// Log Store Callback Types (called from C++ to Nim for persistent log store)
+// =============================================================================
+
+// Append a log entry. Nim stores the serialized entry and returns the index.
+// entry_data: serialized log entry [term:8][val_type:1][data_len:4][data:N]
+// entry_len: length of entry_data
+// Returns: the log index where the entry was stored
+typedef uint64_t (*nuraft_log_append_cb)(void* ctx, uint64_t term, int32_t val_type,
+                                         const char* entry_data, size_t entry_len);
+
+// Write a log entry at the given index, truncating all entries after it.
+typedef void (*nuraft_log_write_at_cb)(void* ctx, uint64_t index, uint64_t term,
+                                        int32_t val_type, const char* entry_data, size_t entry_len);
+
+// Get a log entry at the given index.
+// Nim writes the serialized entry into out_data (up to out_capacity bytes).
+// Returns: the actual size of the entry data, or 0 if not found.
+typedef size_t (*nuraft_log_get_cb)(void* ctx, uint64_t index, uint64_t* out_term,
+                                     int32_t* out_val_type, char* out_data, size_t out_capacity);
+
+// Get the term at the given index. Returns 0 if not found.
+typedef uint64_t (*nuraft_log_term_at_cb)(void* ctx, uint64_t index);
+
+// Get the next available log slot (1-based).
+typedef uint64_t (*nuraft_log_next_slot_cb)(void* ctx);
+
+// Get the start index of the log.
+typedef uint64_t (*nuraft_log_start_index_cb)(void* ctx);
+
+// Pack log entries starting at index for count entries.
+// Nim writes the packed data into out_data (up to out_capacity bytes).
+// Returns: the actual size of the packed data, or 0 on error.
+typedef size_t (*nuraft_log_pack_cb)(void* ctx, uint64_t index, int32_t count,
+                                     char* out_data, size_t out_capacity);
+
+// Apply packed log entries starting at index.
+typedef void (*nuraft_log_apply_pack_cb)(void* ctx, uint64_t index,
+                                          const char* pack_data, size_t pack_len);
+
+// Compact the log store up to and including last_log_index.
+typedef int32_t (*nuraft_log_compact_cb)(void* ctx, uint64_t last_log_index);
+
+// Flush all pending writes to durable storage.
+typedef int32_t (*nuraft_log_flush_cb)(void* ctx);
+
+// =============================================================================
+// State Manager Callback Types (called from C++ to Nim for persistent state)
+// =============================================================================
+
+// Save Raft state (term, voted_for, config_hwm) to persistent storage.
+// state_data: serialized state [term:8][voted_for:4][padding:4][config_hwm:8]
+typedef void (*nuraft_state_save_cb)(void* ctx, uint64_t term, int32_t voted_for,
+                                      uint64_t config_hwm);
+
+// Load Raft state from persistent storage.
+// Nim writes the state values into the output parameters.
+// Returns: 1 if state was found, 0 if not found.
+typedef int32_t (*nuraft_state_read_cb)(void* ctx, uint64_t* out_term, int32_t* out_voted_for,
+                                        uint64_t* out_config_hwm);
+
+// Save cluster config to persistent storage.
+typedef void (*nuraft_config_save_cb)(void* ctx, const char* config_data, size_t config_len);
+
+// Load cluster config from persistent storage.
+// Nim writes config data into out_data (up to out_capacity bytes).
+// Returns: the actual size of the config data, or 0 if not found.
+typedef size_t (*nuraft_config_load_cb)(void* ctx, char* out_data, size_t out_capacity);
+
+// =============================================================================
 // Process Request - Exposes NuRaft's internal process_req
 // =============================================================================
 
@@ -95,22 +164,34 @@ typedef int32_t (*nuraft_config_change_cb)(void* ctx, int32_t server_id, const c
 // Callback type for quorum updates (called when config changes)
 typedef void (*nuraft_quorum_update_cb)(void* ctx, int32_t server_id, int32_t quorum_size);
 
-// Create state manager (in-memory, no persistence)
-void* nuraft_smgr_create(int32_t my_server_id, const char* my_endpoint,
-                         int32_t num_servers, const int32_t* server_ids, const char** endpoints);
-
-// Create state manager with catching_up flag (in-memory, no persistence)
-void* nuraft_smgr_create_with_catching_up(int32_t my_server_id, const char* my_endpoint,
-                                          int32_t num_servers, const int32_t* server_ids,
-                                          const char** endpoints, bool catching_up);
-
-// Create state manager with persistent state file
-// state_file_path: path to file for persisting term and voted_for
-// The file is created if it doesn't exist, and updated on every save_state()
-void* nuraft_smgr_create_with_persistence(int32_t my_server_id, const char* my_endpoint,
-                                          int32_t num_servers, const int32_t* server_ids,
-                                          const char** endpoints, bool catching_up,
-                                          const char* state_file_path);
+// Create state manager with callback-based persistence (WiscKey-backed).
+// The log store and state persistence callbacks delegate to Nim's RaftPersistentStore.
+// No file I/O is used — all persistence goes through the Nim callbacks.
+void* nuraft_smgr_create_with_callbacks(
+    int32_t my_server_id,
+    const char* my_endpoint,
+    int32_t num_servers,
+    const int32_t* server_ids,
+    const char** endpoints,
+    bool catching_up,
+    // Log store callbacks
+    void* log_store_ctx,
+    nuraft_log_append_cb log_append_cb,
+    nuraft_log_write_at_cb log_write_at_cb,
+    nuraft_log_get_cb log_get_cb,
+    nuraft_log_term_at_cb log_term_at_cb,
+    nuraft_log_next_slot_cb log_next_slot_cb,
+    nuraft_log_start_index_cb log_start_index_cb,
+    nuraft_log_pack_cb log_pack_cb,
+    nuraft_log_apply_pack_cb log_apply_pack_cb,
+    nuraft_log_compact_cb log_compact_cb,
+    nuraft_log_flush_cb log_flush_cb,
+    // State callbacks
+    void* state_cb_ctx,
+    nuraft_state_save_cb state_save_cb,
+    nuraft_state_read_cb state_read_cb,
+    nuraft_config_save_cb config_save_cb,
+    nuraft_config_load_cb config_load_cb);
 
 void nuraft_smgr_destroy(void* smgr);
 void nuraft_smgr_set_config_cb(void* smgr, void* ctx, nuraft_config_change_cb cb);

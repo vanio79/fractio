@@ -27,7 +27,7 @@ type
     ## Callback-based state machine (wraps nuraft::state_machine)
 
   NuRaftSMgr* = distinct pointer
-    ## Dynamic state manager (wraps nuraft::state_mgr)
+    ## Callback-based state manager backed by WiscKey (wraps nuraft::state_mgr)
 
   NuRaftServer* = distinct pointer
     ## Reference to the underlying raft_server
@@ -73,6 +73,70 @@ type
       quorumSize: int32) {.cdecl.}
     ## Called when quorum should be updated based on new server count.
     ## quorumSize = majority + 1 = floor(N/2) + 2
+
+  # ============================================
+  # Log Store Callback Types
+  # ============================================
+
+  LogAppendCb* = proc(ctx: pointer, term: uint64, valType: int32,
+      entryData: cstring, entryLen: csize_t): uint64 {.cdecl.}
+    ## Append a log entry. Returns the log index where it was stored.
+
+  LogWriteAtCb* = proc(ctx: pointer, index: uint64, term: uint64,
+      valType: int32, entryData: cstring, entryLen: csize_t) {.cdecl.}
+    ## Write a log entry at the given index, truncating all entries after it.
+
+  LogGetCb* = proc(ctx: pointer, index: uint64, outTerm: ptr uint64,
+      outValType: ptr int32, outData: cstring,
+          outCapacity: csize_t): csize_t {.cdecl.}
+    ## Get a log entry at the given index.
+    ## Nim writes entry data into outData (up to outCapacity bytes).
+    ## Returns: actual size of entry data, or 0 if not found.
+
+  LogTermAtCb* = proc(ctx: pointer, index: uint64): uint64 {.cdecl.}
+    ## Get the term at the given index. Returns 0 if not found.
+
+  LogNextSlotCb* = proc(ctx: pointer): uint64 {.cdecl.}
+    ## Get the next available log slot (1-based).
+
+  LogStartIndexCb* = proc(ctx: pointer): uint64 {.cdecl.}
+    ## Get the start index of the log.
+
+  LogPackCb* = proc(ctx: pointer, index: uint64, count: int32,
+      outData: cstring, outCapacity: csize_t): csize_t {.cdecl.}
+    ## Pack log entries. Returns size of packed data, or 0 on error.
+
+  LogApplyPackCb* = proc(ctx: pointer, index: uint64,
+      packData: cstring, packLen: csize_t) {.cdecl.}
+    ## Apply packed log entries starting at index.
+
+  LogCompactCb* = proc(ctx: pointer, lastLogIndex: uint64): int32 {.cdecl.}
+    ## Compact the log store. Returns 0 on success.
+
+  LogFlushCb* = proc(ctx: pointer): int32 {.cdecl.}
+    ## Flush all pending writes. Returns 0 on success.
+
+  # ============================================
+  # State Manager Callback Types
+  # ============================================
+
+  StateSaveCb* = proc(ctx: pointer, term: uint64, votedFor: int32,
+      configHwm: uint64) {.cdecl.}
+    ## Save Raft state (term, voted_for, config_hwm) to persistent storage.
+
+  StateReadCb* = proc(ctx: pointer, outTerm: ptr uint64,
+      outVotedFor: ptr int32, outConfigHwm: ptr uint64): int32 {.cdecl.}
+    ## Load Raft state from persistent storage.
+    ## Returns 1 if state was found, 0 if not found.
+
+  ConfigSaveCb* = proc(ctx: pointer, configData: cstring,
+      configLen: csize_t) {.cdecl.}
+    ## Save cluster config to persistent storage.
+
+  ConfigLoadCb* = proc(ctx: pointer, outData: cstring,
+      outCapacity: csize_t): csize_t {.cdecl.}
+    ## Load cluster config from persistent storage.
+    ## Returns size of config data, or 0 if not found.
 
 # ============================================
 # NuRaft event type constants
@@ -144,26 +208,32 @@ proc nuraftSmLastCommitIndex*(
 # State Manager
 # ============================================
 
-proc nuraftSmgrCreate*(myServerId: int32, myEndpoint: cstring,
-    numServers: int32, serverIds: ptr int32,
-    endpoints: ptr cstring): NuRaftSMgr {.importc: "nuraft_smgr_create".}
-
-proc nuraftSmgrCreateWithCatchingUp*(myServerId: int32, myEndpoint: cstring,
-    numServers: int32, serverIds: ptr int32,
-    endpoints: ptr cstring, catchingUp: bool): NuRaftSMgr
-    {.importc: "nuraft_smgr_create_with_catching_up".}
-  ## Create state manager with catching_up=true to prevent auto-leader promotion
-  ## for joining nodes (single-member clusters should not become leaders).
-
-proc nuraftSmgrCreateWithPersistence*(myServerId: int32, myEndpoint: cstring,
+proc nuraftSmgrCreateWithCallbacks*(
+    myServerId: int32, myEndpoint: cstring,
     numServers: int32, serverIds: ptr int32,
     endpoints: ptr cstring, catchingUp: bool,
-    stateFilePath: cstring): NuRaftSMgr
-    {.importc: "nuraft_smgr_create_with_persistence".}
-  ## Create state manager with persistent state file.
-  ## The file stores term and voted_for, ensuring restarted nodes
-  ## maintain their term and don't trigger unnecessary elections.
-  ## stateFilePath: path to file for persisting state (e.g., "data/raft_state.bin")
+    # Log store callbacks
+    logStoreCtx: pointer,
+    logAppendCb: LogAppendCb,
+    logWriteAtCb: LogWriteAtCb,
+    logGetCb: LogGetCb,
+    logTermAtCb: LogTermAtCb,
+    logNextSlotCb: LogNextSlotCb,
+    logStartIndexCb: LogStartIndexCb,
+    logPackCb: LogPackCb,
+    logApplyPackCb: LogApplyPackCb,
+    logCompactCb: LogCompactCb,
+    logFlushCb: LogFlushCb,
+    # State callbacks
+    stateCbCtx: pointer,
+    stateSaveCb: StateSaveCb,
+    stateReadCb: StateReadCb,
+    configSaveCb: ConfigSaveCb,
+    configLoadCb: ConfigLoadCb
+): NuRaftSMgr {.importc: "nuraft_smgr_create_with_callbacks".}
+  ## Create state manager with callback-based persistence (WiscKey-backed).
+  ## No file I/O is used — all persistence goes through the Nim callbacks.
+  ## The log store callbacks delegate to Nim's RaftPersistentStore.
 
 proc nuraftSmgrDestroy*(smgr: NuRaftSMgr) {.importc: "nuraft_smgr_destroy".}
 proc nuraftSmgrSetConfigCb*(smgr: NuRaftSMgr, ctx: pointer,

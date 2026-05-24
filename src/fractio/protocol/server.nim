@@ -2247,7 +2247,11 @@ proc addPeerToRaft*(server: ProtocolServer, peerNodeId: uint32,
   if not coord.isLeader(META_GROUP_ID):
     # Still register peer info so this node knows about the new peer
     coord.peerInfo[peerNodeId] = (host: host, port: raftPort)
+    echo "[addPeerToRaft] NOT meta leader, skipping add_srv for peerNodeId=", peerNodeId
     return
+
+  echo "[addPeerToRaft] meta leader, adding peerNodeId=", peerNodeId, " host=",
+      host, " raftPort=", raftPort
 
   # Register peer info for future group creation
   coord.peerInfo[peerNodeId] = (host: host, port: raftPort)

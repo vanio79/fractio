@@ -3,8 +3,8 @@
 # Stores NuRaft log entries and state in the shared WiscKey/LevelDB backend
 # using /raft/<groupId>/log/<index> and /raft/<groupId>/state key prefixes.
 #
-# This replaces the in-memory log store (lost on crash) and per-group binary
-# state files (raft_state_<groupId>.bin) with durable WiscKey storage.
+# This replaces the in-memory log store (lost on crash) with durable WiscKey storage.
+#
 #
 # Key format:
 #   Log entries:  /raft/<groupId>/log/<index>   → serialized log entry
@@ -37,8 +37,8 @@ const
 
 type
   LogValType* = enum
-    lvtAppLog = 0        ## Regular application log entry
-    lvtClusterConfig = 1 ## Cluster configuration entry
+    lvtAppLog = 1 ## Regular application log entry (matches NuRaft log_val_type::app_log)
+    lvtClusterConfig = 2 ## Cluster configuration entry (matches NuRaft log_val_type::conf)
 
   RaftLogEntry* = object
     ## A single Raft log entry.
@@ -115,7 +115,7 @@ proc deserializeLogEntry*(data: string): Option[RaftLogEntry] =
   # Value type (1 byte)
   let valTypeByte = data[offset].ord
   offset += 1
-  if valTypeByte > 1:
+  if valTypeByte < 1 or valTypeByte > 4:
     return none(RaftLogEntry)
   let valType = LogValType(valTypeByte)
   # Data length (4 bytes big-endian)
@@ -164,50 +164,27 @@ proc serializeRaftState*(state: RaftState): string =
     hwm = hwm shr 8
 
 proc deserializeRaftState*(data: string): Option[RaftState] =
-  ## Deserialize RaftState from binary format.
-  ## Supports both old v1 (16 bytes, no magic), v2 (24 bytes, no magic),
-  ## and new v3 (26 bytes, with magic) formats.
-  if data.len < 16:
+  ## Deserialize RaftState from binary format (v3 only).
+  ## Format: [magic:2][term:8][voted_for:4][padding:4][config_hwm:8] = 26 bytes
+  ## Returns none if data is too short or magic is invalid.
+  const stateSize = 26
+  if data.len < stateSize:
     return none(RaftState)
 
-  # Check for new v3 format with magic header
-  if data.len >= 26:
-    let magic = uint16(data[0].ord) shl 8 or uint16(data[1].ord)
-    if magic == STATE_ENTRY_MAGIC:
-      # v3 format: [magic:2][term:8][voted_for:4][padding:4][config_hwm:8]
-      var term: uint64 = 0
-      for i in 0..<8:
-        term = (term shl 8) or uint64(data[2 + i].ord)
-      var votedFor: int32 = 0
-      for i in 0..<4:
-        votedFor = (votedFor shl 8) or int32(data[10 + i].ord)
-      var hwm: uint64 = 0
-      for i in 0..<8:
-        hwm = (hwm shl 8) or uint64(data[18 + i].ord)
-      return some(RaftState(term: term, votedFor: votedFor,
-          configLogIdxHwm: hwm))
+  let magic = uint16(data[0].ord) shl 8 or uint16(data[1].ord)
+  if magic != STATE_ENTRY_MAGIC:
+    return none(RaftState)
 
-  # Legacy v2 format (24 bytes, no magic): [term:8][voted_for:4][padding:4][config_hwm:8]
-  if data.len >= 24:
-    var term: uint64 = 0
-    for i in 0..<8:
-      term = (term shl 8) or uint64(data[i].ord)
-    var votedFor: int32 = 0
-    for i in 0..<4:
-      votedFor = (votedFor shl 8) or int32(data[8 + i].ord)
-    var hwm: uint64 = 0
-    for i in 0..<8:
-      hwm = (hwm shl 8) or uint64(data[16 + i].ord)
-    return some(RaftState(term: term, votedFor: votedFor, configLogIdxHwm: hwm))
-
-  # Legacy v1 format (16 bytes, no magic, no HWM): [term:8][voted_for:4][padding:4]
   var term: uint64 = 0
   for i in 0..<8:
-    term = (term shl 8) or uint64(data[i].ord)
+    term = (term shl 8) or uint64(data[2 + i].ord)
   var votedFor: int32 = 0
   for i in 0..<4:
-    votedFor = (votedFor shl 8) or int32(data[8 + i].ord)
-  some(RaftState(term: term, votedFor: votedFor, configLogIdxHwm: 0))
+    votedFor = (votedFor shl 8) or int32(data[10 + i].ord)
+  var hwm: uint64 = 0
+  for i in 0..<8:
+    hwm = (hwm shl 8) or uint64(data[18 + i].ord)
+  some(RaftState(term: term, votedFor: votedFor, configLogIdxHwm: hwm))
 
 # ============================================================================
 # RaftPersistentStore implementation
