@@ -12,8 +12,8 @@
 
 import std/[unittest, os, options, tables, algorithm, hashes, json, strutils, locks,
             sequtils]
-from fractio/core/types import genULID, genSpaceID, genTableId, ULID, SpaceID,
-    TableId, ulidToBytes, ulidFromBytes, ZeroULID
+from fractio/core/types import genULIDLocal, genSpaceIDLocal, genTableIdLocal,
+    ULID, SpaceID, TableId, ulidToBytes, ulidFromBytes, ZeroULID
 import fractio/protocol/raft_store
 import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
@@ -515,7 +515,8 @@ suite "Space rebalance — raftDeleteInGroup":
 
     # Write to group 100 directly
     let space = SpaceInfo(
-      spaceId: genSpaceIDLocal(), name: "t", replicas: 1, groupIds: @[groupIDFromInt(100)])
+      spaceId: genSpaceIDLocal(), name: "t", replicas: 1, groupIds: @[
+          groupIDFromInt(100)])
     discard store.raftPutInSpace(key, "value", space, pk)
 
     # Verify it exists

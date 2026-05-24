@@ -5,7 +5,7 @@ import std/unittest
 import std/options
 import fractio/di/mocks
 import fractio/core/types # For NodeID
-from fractio/distributed/raft/group_types import GroupID, genGroupID,
+from fractio/distributed/raft/group_types import GroupID, genGroupIDLocal,
     ZeroGroupID, `==`
 
 suite "MockRaftCoordinator":

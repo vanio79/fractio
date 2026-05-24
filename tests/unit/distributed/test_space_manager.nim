@@ -11,7 +11,7 @@
 import std/[unittest, options, tables, strutils, json]
 
 import fractio/core/types # SpaceID, genSpaceID, genULID, ULID
-from fractio/distributed/raft/group_types import GroupID, genGroupID, NodeID
+from fractio/distributed/raft/group_types import GroupID, genGroupIDLocal, NodeID
 import fractio/distributed/meta/system_tables
 import fractio/distributed/meta/system_schemas as schemas
 import fractio/protocol/messages/space as spaceMsgs

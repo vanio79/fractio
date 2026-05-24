@@ -6,7 +6,8 @@ import fractio/di/mocks
 import fractio/di/adapters as diAdapters
 import fractio/core/types
 import fractio/core/errors
-from fractio/distributed/raft/group_types import genGroupID, groupIDFromInt, GroupID
+from fractio/distributed/raft/group_types import genGroupIDLocal,
+    groupIDFromInt, GroupID
 
 suite "ExecutionResult type":
   test "erkRows result":
