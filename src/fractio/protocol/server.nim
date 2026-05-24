@@ -2518,6 +2518,7 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
       server.config.serverId)
   let mvccStore = newMvccTransactionStore(store, server.txnMgr, tsProvider)
   server.mvccStore = mvccStore
+  store.setTimestampProvider(tsProvider)
 
   # Wire callbacks and pre-create state machines before starting NuRaft
   store.bootstrapStore(@[META_GROUP_ID, DATA_GROUP_START_ID])

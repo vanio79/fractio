@@ -29,9 +29,10 @@
 #   - Intent keys:  "\x00INTENT\x00<txnId8be><userKey>"  (for mvcc intents)
 #   - 2PC records:  "\x00COORD\x00<txnId8be>"            (coordinator records)
 
-import std/[tables, locks, options, algorithm, atomics, times, strformat,
+import std/[tables, locks, options, algorithm, atomics, strformat,
     strutils, json, hashes, os]
 import fractio/core/types
+import fractio/core/timestamp_provider
 import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/c_bindings
 import fractio/distributed/raft/multigroup_types
@@ -249,6 +250,7 @@ type
     rebalRunning*: Atomic[bool]
     triggerRebal*: Atomic[bool]
     stopped*: Atomic[bool] ## Set to true when stop() is called; prevents send() on closed channel
+    tsProvider*: TimestampProvider ## cluster-wide HLC for MVCC timestamps
 
 
 
@@ -274,6 +276,16 @@ proc newRaftKVStoreExt*(coord: NuRaftCoordinator,
   initLock(result.groupMu)
   result.leaderPersistChan.open() # Initialize async channel for leader persistence
   result.nextVersion.store(1)
+
+proc nowNs*(s: RaftKVStoreExt): int64 {.gcsafe, raises: [].} =
+  if s.tsProvider != nil:
+    try: s.tsProvider.now() except Exception: localTimeNs()
+  else:
+    localTimeNs()
+
+proc setTimestampProvider*(s: RaftKVStoreExt, tp: TimestampProvider) {.
+    gcsafe, raises: [].} =
+  s.tsProvider = tp
 
 # ---------------------------------------------------------------------------
 # Route to group (helper used before forward declarations are needed)
@@ -607,11 +619,7 @@ proc sysTablePut*(store: RaftKVStoreExt, key: string, value: string): bool {.
     return false
 
   # Get timestamp - use current nanosecond time
-  var ts: int64 = 0
-  {.cast(raises: []).}:
-    ts = int64(getTime().toUnixFloat() * 1_000_000_000)
-
-  # Encode value with MVCC header
+  let ts = store.nowNs()
   let encoded = mvccTypes.encodeMVCCValue(value, ts, false)
 
   # Write via Raft for replication
@@ -628,11 +636,7 @@ proc sysTablePutBatch*(store: RaftKVStoreExt,
     return true
 
   # Get timestamp for all writes (same timestamp for atomicity)
-  var ts: int64 = 0
-  {.cast(raises: []).}:
-    ts = int64(getTime().toUnixFloat() * 1_000_000_000)
-
-  # Write all with same timestamp
+  let ts = store.nowNs()
   for (key, value) in writes:
     let encoded = mvccTypes.encodeMVCCValue(value, ts, false)
     let res = store.raftPut(key, encoded)
@@ -674,9 +678,7 @@ proc sysTablePutAndDeleteBatch*(store: RaftKVStoreExt,
     return true
 
   # Get timestamp for all puts (same timestamp for atomicity)
-  var ts: int64 = 0
-  {.cast(raises: []).}:
-    ts = int64(getTime().toUnixFloat() * 1_000_000_000)
+  let ts = store.nowNs()
 
   # Do puts first (always MVCC-encoded)
   for (key, value) in puts:
@@ -822,7 +824,7 @@ proc processLeaderPersistReq*(s: RaftKVStoreExt,
         groupRec.leader = leaderNodeId
         let groupData = encode(groupRec)
         # Encode with MVCC header for consistency
-        let ts = int64(epochTime() * 1_000_000_000)
+        let ts = s.nowNs()
         let encoded = mvccTypes.encodeMVCCValue(groupData, ts, false)
 
         # Retry loop: after a failover, we may not yet recognize ourselves
@@ -889,7 +891,7 @@ proc rebalanceLeadershipTask(s: RaftKVStoreExt) {.thread, gcsafe, raises: [].} =
       s.loadGroupMembers(waitForCatchUp = true)
 
       var toYield: seq[tuple[gid: GroupID, preferred: uint32]] = @[]
-      let now = epochTime()
+      let now = s.nowNs().float / 1_000_000_000.0
 
       withLock s.groupMu:
         for gid, preferredId in s.preferredLeaders:
@@ -957,7 +959,7 @@ proc rebalanceLeadershipTask(s: RaftKVStoreExt) {.thread, gcsafe, raises: [].} =
           # discard s.coordinator.transferLeadership(gid, toNodeID(preferredId))
 
           # Record when we attempted this yield
-          lastYieldAttempt[gid] = epochTime()
+          lastYieldAttempt[gid] = s.nowNs().float / 1_000_000_000.0
 
         # Wait briefly to see if leadership actually transfers
         # Check if we should stop during the wait
@@ -1198,7 +1200,7 @@ proc raftGet*(store: RaftKVStoreExt,
         let entry = RaftKVEntry(
           value: valOpt.get(),
           version: 1'u64,
-          timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
+          timestamp: uint64(store.nowNs()),
         )
         return rsOk[Option[RaftKVEntry]](some(entry))
 
@@ -1222,7 +1224,7 @@ proc raftPut*(store: RaftKVStoreExt, key, value: string): RSResult[
     return rsErr[RaftKVEntry](vr.error)
 
   let ver = store.nextVersion.fetchAdd(1)
-  let ts = uint64(getTime().toUnixFloat() * 1_000_000_000)
+  let ts = uint64(store.nowNs())
   rsOk[RaftKVEntry](RaftKVEntry(value: value, version: ver, timestamp: ts))
 
 proc raftDelete*(store: RaftKVStoreExt,
@@ -1243,7 +1245,7 @@ proc raftDelete*(store: RaftKVStoreExt,
         prevEntry = some(RaftKVEntry(
           value: valOpt.get(),
           version: 1'u64,
-          timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
+          timestamp: uint64(store.nowNs()),
         ))
 
   let batch = newWriteBatch()
@@ -1320,7 +1322,7 @@ proc raftPutInGroup*(store: RaftKVStoreExt, key, value: string,
   if not vr.isOk:
     return rsErr[RaftKVEntry](vr.error)
   let ver = store.nextVersion.fetchAdd(1)
-  let ts = uint64(getTime().toUnixFloat() * 1_000_000_000)
+  let ts = uint64(store.nowNs())
   rsOk[RaftKVEntry](RaftKVEntry(value: value, version: ver, timestamp: ts))
 
 proc raftDeleteInGroupExplicit*(store: RaftKVStoreExt, key: string,
@@ -1337,11 +1339,11 @@ proc raftDeleteInGroupExplicit*(store: RaftKVStoreExt, key: string,
     {.cast(raises: []).}:
       let valOpt = backend.get(key)
       if valOpt.isSome:
-        prevEntry = some(RaftKVEntry(
-          value: valOpt.get(),
-          version: 1'u64,
-          timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
-        ))
+         prevEntry = some(RaftKVEntry(
+           value: valOpt.get(),
+           version: 1'u64,
+           timestamp: uint64(store.nowNs()),
+         ))
   let batch = newWriteBatch()
   batch.delete(toBytes(key))
   let vr = proposeWrite(store, groupId, batch)
@@ -1368,7 +1370,7 @@ proc raftGetInGroup*(store: RaftKVStoreExt, key: string,
         let entry = RaftKVEntry(
           value: valOpt.get(),
           version: 1'u64,
-          timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
+          timestamp: uint64(store.nowNs()),
         )
         return rsOk[Option[RaftKVEntry]](some(entry))
     return rsOk[Option[RaftKVEntry]](none(RaftKVEntry))
@@ -1389,7 +1391,7 @@ proc raftScan*(store: RaftKVStoreExt, startKey, endKey: string,
   {.cast(raises: []).}:
     # Scan with no limit; we filter below. LevelDB iterates in sorted order.
     let raw = backend.scan(startKey, endKey)
-    let ts = uint64(getTime().toUnixFloat() * 1_000_000_000)
+    let ts = uint64(store.nowNs())
     for (k, v) in raw:
       if isIntentKey(k) or isCoordKey(k): continue
       if k.startsWith("/raft/"): continue
@@ -1616,7 +1618,7 @@ proc raftGetForTxn*(store: RaftKVStoreExt, txnId: uint64,
 
   let intentKey = encodeIntentKey(txnId, key)
   let backend = store.getBackend()
-  let ts = uint64(getTime().toUnixFloat() * 1_000_000_000)
+  let ts = uint64(store.nowNs())
 
   if backend != nil and backend.isOpen:
     {.cast(raises: []).}:
@@ -1969,8 +1971,7 @@ proc forwardPutToLeader(store: RaftKVStoreExt, groupId: GroupID,
     let writeRes = proposeWrite(store, groupId, batch)
     if writeRes.isOk:
       return rsOk[RaftKVEntry](RaftKVEntry(
-        value: value, version: 1'u64, timestamp: uint64(getTime().toUnixFloat() *
-            1_000_000_000)))
+        value: value, version: 1'u64, timestamp: uint64(store.nowNs())))
     # Local write failed - leadership may have changed
     # Check if it's a not-leader error and fall through to remote forwarding
     if writeRes.error.kind != rseNotLeader:
@@ -2013,7 +2014,7 @@ proc forwardPutToLeader(store: RaftKVStoreExt, groupId: GroupID,
     batch.put(toBytes(key), toBytes(value))
     let writeRes = proposeWrite(store, groupId, batch)
     if writeRes.isOk:
-      let ts = uint64(getTime().toUnixFloat() * 1_000_000_000)
+      let ts = uint64(store.nowNs())
       return rsOk[RaftKVEntry](RaftKVEntry(value: value, version: 1'u64,
           timestamp: ts))
     # Local write failed - not actually leader, try other group members
@@ -2156,10 +2157,10 @@ proc forwardDeleteToLeaderRemote(store: RaftKVStoreExt, groupId: GroupID,
         if resp.hasPreviousValue:
           return rsOk[Option[RaftKVEntry]](some(RaftKVEntry(
             value: resp.previousValue, version: 1'u64,
-            timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000))))
+            timestamp: uint64(store.nowNs()))))
         return rsOk[Option[RaftKVEntry]](some(RaftKVEntry(
           value: "", version: 1'u64,
-          timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000))))
+          timestamp: uint64(store.nowNs()))))
       return rsOk[Option[RaftKVEntry]](none(RaftKVEntry))
     except CatchableError as e:
       return rsErr[Option[RaftKVEntry]](newRSE(rseInternal,
@@ -2308,7 +2309,7 @@ proc raftPutInSpace*(store: RaftKVStoreExt, key, value: string,
         let vr = proposeWrite(store, rid, batch)
         if vr.isOk:
           let ver = store.nextVersion.fetchAdd(1)
-          let ts = uint64(getTime().toUnixFloat() * 1_000_000_000)
+          let ts = uint64(store.nowNs())
           return rsOk[RaftKVEntry](RaftKVEntry(value: value, version: ver,
               timestamp: ts))
         if vr.error.kind != rseNotLeader:
@@ -2336,7 +2337,7 @@ proc raftPutInSpaceBoth*(store: RaftKVStoreExt, key, value: string,
         let vr = proposeWrite(store, newRid, batch)
         if vr.isOk:
           let ver = store.nextVersion.fetchAdd(1)
-          let ts = uint64(getTime().toUnixFloat() * 1_000_000_000)
+          let ts = uint64(store.nowNs())
           newResult = rsOk[RaftKVEntry](RaftKVEntry(value: value, version: ver,
               timestamp: ts))
         elif vr.error.kind != rseNotLeader:
@@ -2393,7 +2394,7 @@ proc raftGetInSpaceFromGroup*(store: RaftKVStoreExt, key: string,
               let entry = RaftKVEntry(
                 value: rawValue,
                 version: 1'u64,
-                timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
+                timestamp: uint64(store.nowNs()),
               )
               return rsOk[Option[RaftKVEntry]](some(entry))
           else:
@@ -2401,7 +2402,7 @@ proc raftGetInSpaceFromGroup*(store: RaftKVStoreExt, key: string,
             let entry = RaftKVEntry(
               value: rawValue,
               version: 1'u64,
-              timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
+              timestamp: uint64(store.nowNs()),
             )
             return rsOk[Option[RaftKVEntry]](some(entry))
       return rsOk[Option[RaftKVEntry]](none(RaftKVEntry))
@@ -2486,7 +2487,7 @@ proc raftDeleteInSpace*(store: RaftKVStoreExt, key: string,
             prevEntry = some(RaftKVEntry(
               value: valOpt.get(),
               version: 1'u64,
-              timestamp: uint64(getTime().toUnixFloat() * 1_000_000_000),
+              timestamp: uint64(store.nowNs()),
             ))
         let batch = newWriteBatch()
         batch.delete(toBytes(key))
@@ -2622,7 +2623,7 @@ proc raftScanSpace*(store: RaftKVStoreExt, startKey, endKey: string,
         let sr = pc.kvScan(startKey, endKey, 0)
         pc.disconnect()
         if sr.isOk:
-          let ts = uint64(getTime().toUnixFloat() * 1_000_000_000)
+          let ts = uint64(store.nowNs())
           for pair in sr.val.pairs:
             let entry = RaftKVEntry(
               value: pair.value, version: 1'u64, timestamp: ts,
@@ -3067,7 +3068,7 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: SpaceID) {.raises: [
     let myNodeId = int(store.coordinator.nodeId)
 
     # Claim worker role
-    let nowSecs = getTime().toUnix()
+    let nowSecs = store.nowNs() div 1_000_000_000
     space.rebalanceWorker = myNodeId
     space.rebalanceHeartbeat = nowSecs
     if not store.updateSpaceRecord(space):
@@ -3213,7 +3214,7 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: SpaceID) {.raises: [
 
           # Update cursor and heartbeat periodically
           if keysMigrated mod 100 == 0:
-            let curNow = getTime().toUnix()
+            let curNow = store.nowNs() div 1_000_000_000
             # Re-read space to check if we're still the worker
             acquire(store.spacesMu)
             if store.spaces.hasKey(spaceId):
