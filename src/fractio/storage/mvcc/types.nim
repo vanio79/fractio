@@ -396,7 +396,7 @@ when isMainModule:
 
     test "encode and decode intent key with ULID":
       let userKey = "test_key"
-      let txnId = genTransactionID()
+      let txnId = genTransactionID(0)
 
       let encoded = makeIntentKey(userKey, txnId)
       let decoded = decodeIntentKey(encoded)
@@ -407,7 +407,7 @@ when isMainModule:
     test "encode and decode MVCC value with ULID":
       let value = "test_value"
       let timestamp: Timestamp = 9876543210
-      let txnId = genTransactionID()
+      let txnId = genTransactionID(0)
 
       let encoded = encodeMVCCValue(value, timestamp, false, txnId)
       let decoded = decodeMVCCValue(encoded)

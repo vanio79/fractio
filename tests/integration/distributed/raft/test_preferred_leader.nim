@@ -70,7 +70,7 @@ suite "RaftKVStoreExt - preferredLeaders table":
     defer: teardown(coord, path)
 
     # Seed sys.groups with a group that has preferredLeader (binary format)
-    let gid = genGroupID()
+    let gid = genGroupIDLocal()
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(gid))
     let val = GroupRecord(
       groupId: groupIDToULID(gid),
@@ -96,7 +96,7 @@ suite "RaftKVStoreExt - preferredLeaders table":
     let (coord, store) = makeStore(path)
     defer: teardown(coord, path)
 
-    let gid = genGroupID()
+    let gid = genGroupIDLocal()
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(gid))
     let val = GroupRecord(
       groupId: groupIDToULID(gid),
@@ -115,7 +115,7 @@ suite "RaftKVStoreExt - preferredLeaders table":
     let (coord, store) = makeStore(path)
     defer: teardown(coord, path)
 
-    let gid = genGroupID()
+    let gid = genGroupIDLocal()
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(gid))
     let val = GroupRecord(
       groupId: groupIDToULID(gid),
@@ -135,7 +135,7 @@ suite "RaftKVStoreExt - preferredLeaders table":
     defer: teardown(coord, path)
 
     # Insert a group with preferred leader (binary format)
-    let gid = genGroupID()
+    let gid = genGroupIDLocal()
     let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(gid))
     let val = GroupRecord(
       groupId: groupIDToULID(gid),
@@ -164,7 +164,7 @@ suite "getPreferredLeaderCallback wiring":
     defer: teardown(coord, path)
 
     # Manually populate preferredLeaders
-    let testGid = genGroupID()
+    let testGid = genGroupIDLocal()
     store.preferredLeaders[testGid] = 3'u32
 
     # The callback should have been wired by bootstrapStore -> wireApplyCallback
@@ -182,5 +182,5 @@ suite "getPreferredLeaderCallback wiring":
 
     check getPreferredLeaderCallback != nil
     let result = getPreferredLeaderCallback(
-      cast[pointer](store), genGroupID())
+      cast[pointer](store), genGroupIDLocal())
     check result.isNone

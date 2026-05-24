@@ -5,7 +5,7 @@ import hashes
 import tables
 import sets
 import times
-import ulid
+import random
 
 const
   ULID_SIZE* = 16        ## ULID binary size in bytes
@@ -44,42 +44,39 @@ proc `<`*(a, b: ULID): bool =
       return false
   false
 
-proc genULID*(): ULID {.raises: [].} =
-  ## Generate a new ULID with current timestamp
-  ## Uses the ulid library for string generation, then converts to binary
+proc genULID*(tsNs: int64): ULID {.raises: [].} =
+  ## Generate a new ULID with an explicit nanosecond timestamp.
+  ## The timestamp is converted to milliseconds and encoded in the first 48 bits
+  ## (6 bytes, big-endian). The remaining 80 bits (10 bytes) are filled with
+  ## cryptographically random data for uniqueness.
+  ## Use this in distributed contexts where the timestamp comes from SharedTimer.
+  let ms = tsNs div 1_000_000
+  # Encode timestamp in first 6 bytes (48-bit big-endian milliseconds)
+  for i in 0 ..< 6:
+    result.data[i] = uint8((ms shr ((5 - i) * 8)) and 0xFF)
+  # Fill remaining 10 bytes with random entropy
   {.cast(raises: []).}:
     try:
-      let s = ulid()
-      # Decode Crockford's base32 to binary
-      const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
-      proc charVal(c: char): int =
-        for i, ch in alphabet:
-          if ch == c: return i
-        return 0
-      # Decode 26 chars to 16 bytes (each char is 5 bits, 26*5 = 130 bits, we need 128)
-      var bits: array[130, int]
-      var bitIdx = 0
-      for i in 0 ..< 26:
-        let v = charVal(s[i])
-        for j in countdown(4, 0):
-          bits[bitIdx] = (v shr j) and 1
-          inc bitIdx
-      # Take first 128 bits for the 16 bytes
-      for i in 0 ..< 16:
-        var b = 0
-        for j in 0 ..< 8:
-          b = (b shl 1) or bits[i * 8 + j]
-        result.data[i] = uint8(b)
+      var rng = initRand()
+      for i in 6 ..< 15:
+        result.data[i] = uint8(rng.next() and 0xFF)
+      # Last byte: use lower 8 bits to avoid any correlation
+      result.data[15] = uint8(rng.next() and 0xFF)
     except CatchableError:
-      # Fall back to timestamp-based generation if ulid() fails
-      let t = getTime()
-      let ms = t.toUnix * 1000 + (t.nanosecond div 1_000_000)
-      # Encode timestamp in first 6 bytes
-      for i in 0 ..< 6:
-        result.data[i] = uint8((ms shr ((5 - i) * 8)) and 0xFF)
-      # Fill rest with pseudo-random
+      # Fallback: counter-based entropy if random fails
       for i in 6 ..< 16:
-        result.data[i] = uint8(i * 17)
+        result.data[i] = uint8((i * 17 + int(ms and 0xFF)) and 0xFF)
+
+proc localTimeNs*(): int64 {.inline, raises: [].} =
+  ## Current local wall-clock time in nanoseconds. Uses getTime() (NOT SharedTimer).
+  ## Only use in tests and non-distributed code. Production code must use TimeProvider.now().
+  let t = getTime()
+  t.toUnix * 1_000_000_000 + t.nanosecond.int64
+
+proc genULIDLocal*(): ULID {.raises: [].} =
+  ## Generate a ULID using the LOCAL clock. Only for tests and non-distributed code.
+  ## Production code must use genULID(tsNs) with a SharedTimer-sourced timestamp.
+  genULID(localTimeNs())
 
 proc ulidFromString*(s: string): ULID =
   ## Parse a 26-character ULID string to binary.
@@ -303,9 +300,9 @@ proc newValueRef*(bytes: seq[uint8]): ValueRef =
 proc newValueRef*(u: ULID): ValueRef =
   result = ValueRef(kind: dtULID, ulidValue: u)
 
-proc newRow*(id: RowID = RowID(ZeroULID())): Row =
-  Row(id: id, values: @[], createdAt: getTime().toUnix * 1000,
-       updatedAt: getTime().toUnix * 1000, version: 1)
+proc newRow*(id: RowID = RowID(ZeroULID()), createdAtMs: int64): Row =
+  ## Create a new Row with an explicit creation timestamp in milliseconds.
+  Row(id: id, values: @[], createdAt: createdAtMs, updatedAt: createdAtMs, version: 1)
 
 # TransactionID operations (ULID-based)
 proc `==`*(a, b: TransactionID): bool = ULID(a) == ULID(b)
@@ -343,24 +340,49 @@ proc `$`*(id: SpaceID): string = $ULID(id)
 proc hash*(id: SpaceID): Hash = hash($ULID(id))
 
 # Transaction ID generation - uses ULID for globally unique IDs
-proc genTransactionID*(): TransactionID =
-  TransactionID(genULID())
+proc genTransactionID*(tsNs: int64): TransactionID =
+  ## Generate TransactionID with nanosecond timestamp (from SharedTimer).
+  TransactionID(genULID(tsNs))
+
+proc genTransactionIDLocal*(): TransactionID =
+  ## Generate TransactionID using LOCAL clock. Only for tests.
+  genTransactionID(localTimeNs())
 
 # Row ID generation - uses ULID for globally unique IDs
-proc genRowID*(): RowID =
-  RowID(genULID())
+proc genRowID*(tsNs: int64): RowID =
+  ## Generate RowID with nanosecond timestamp (from SharedTimer).
+  RowID(genULID(tsNs))
+
+proc genRowIDLocal*(): RowID =
+  ## Generate RowID using LOCAL clock. Only for tests.
+  genRowID(localTimeNs())
 
 # Shard ID generation - uses ULID for globally unique IDs
-proc genShardID*(): ShardID =
-  ShardID(genULID())
+proc genShardID*(tsNs: int64): ShardID =
+  ## Generate ShardID with nanosecond timestamp (from SharedTimer).
+  ShardID(genULID(tsNs))
+
+proc genShardIDLocal*(): ShardID =
+  ## Generate ShardID using LOCAL clock. Only for tests.
+  genShardID(localTimeNs())
 
 # TableId generation - uses ULID for globally unique IDs
-proc genTableId*(): TableId =
-  TableId(genULID())
+proc genTableId*(tsNs: int64): TableId =
+  ## Generate TableId with nanosecond timestamp (from SharedTimer).
+  TableId(genULID(tsNs))
+
+proc genTableIdLocal*(): TableId =
+  ## Generate TableId using LOCAL clock. Only for tests.
+  genTableId(localTimeNs())
 
 # SpaceID generation - uses ULID for globally unique IDs
-proc genSpaceID*(): SpaceID =
-  SpaceID(genULID())
+proc genSpaceID*(tsNs: int64): SpaceID =
+  ## Generate SpaceID with nanosecond timestamp (from SharedTimer).
+  SpaceID(genULID(tsNs))
+
+proc genSpaceIDLocal*(): SpaceID =
+  ## Generate SpaceID using LOCAL clock. Only for tests.
+  genSpaceID(localTimeNs())
 
 # Convenience conversions for TransactionID
 proc transactionIDFromBytes*(data: string): TransactionID =

@@ -249,8 +249,8 @@ proc makeCluster3(): seq[TestNode] =
   var spaceGroupIds: seq[GroupID] = @[]
   for i in 0 ..< NODE_COUNT:
     spaceGroupIds.add(groupIDFromInt(SPACE_GROUP_START + uint64(i)))
-  seededSpaceUid = coreTypes.genSpaceID()
-  seededTableId = coreTypes.genTableId()
+  seededSpaceUid = coreTypes.genSpaceIDLocal()
+  seededTableId = coreTypes.genTableIdLocal()
   let spaceKey = encodeSpaceKey(seededSpaceUid)
   let spaceRec = SpaceRecord(
     spaceId: seededSpaceUid,

@@ -4,11 +4,12 @@
 # The planner resolves table names to table IDs via catalog lookups
 # and generates the appropriate key encodings for reads/writes.
 
-import std/[options, json, strutils, strformat, sequtils]
+import std/[options, json, strutils, strformat, sequtils, times]
 import ./ast
 import ./data_row
 import ../distributed/meta/system_tables
 import ../distributed/meta/system_schemas
+import ../distributed/sharedtimer/timeprovider
 import ../client/fractio_client
 import ../core/types as coreTypes
 import ../core/primary_key
@@ -625,10 +626,14 @@ proc resolveQualifiedTableRef*(client: FractioClient,
 
   resolveTable(client, dbName, scName, tableRef.table)
 
-proc genNewTableId*(): TableId =
+proc genNewTableId*(timeProvider: TimeProvider = nil): TableId =
   ## Generate a new globally unique TableId using ULID.
   ## ULID-based table IDs are globally unique and lexicographically sortable.
-  genTableId()
+  let tsNs = if timeProvider != nil: timeProvider.now()
+             else:
+               let t = getTime()
+               t.toUnix * 1_000_000_000 + t.nanosecond.int64
+  genTableId(tsNs)
 
 # ---------------------------------------------------------------------------
 # Serialization helpers

@@ -24,7 +24,7 @@ suite "MultiGroupStress":
 
     # Create many groups rapidly
     for i in 0..99:
-      let gid = genGroupID()
+      let gid = genGroupIDLocal()
       let desc = newGroupDescriptor(gid)
       discard desc.addReplica(NodeID(1))
       discard desc.addReplica(NodeID(2))
@@ -57,7 +57,7 @@ suite "MultiGroupStress":
 
     # Create 20 groups
     for i in 0..19:
-      let gid = genGroupID()
+      let gid = genGroupIDLocal()
       let desc = newGroupDescriptor(gid)
       discard desc.addReplica(NodeID(1))
       discard desc.addReplica(NodeID(2))
@@ -144,7 +144,7 @@ suite "MultiGroupStress":
 
     # Create 30 groups
     for i in 0..29:
-      let gid = genGroupID()
+      let gid = genGroupIDLocal()
       let desc = newGroupDescriptor(gid)
       discard desc.addReplica(NodeID(1))
       discard desc.addReplica(NodeID(2))
@@ -192,7 +192,7 @@ suite "MultiGroupStress":
 
     # Create groups
     for i in 0..9:
-      let gid = genGroupID()
+      let gid = genGroupIDLocal()
       let desc = newGroupDescriptor(gid)
       discard desc.addReplica(NodeID(1))
       discard desc.addReplica(NodeID(2))
@@ -253,7 +253,7 @@ suite "MultiGroupStress":
 
     # Create many groups
     for i in 0..NUM_GROUPS - 1:
-      let gid = genGroupID()
+      let gid = genGroupIDLocal()
       let desc = newGroupDescriptor(gid)
       discard desc.addReplica(NodeID(1))
       discard desc.addReplica(NodeID(2))

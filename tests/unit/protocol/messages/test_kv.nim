@@ -11,7 +11,7 @@ import fractio/distributed/raft/group_types
 suite "GetRequest/GetResponse":
 
   proc makeTxnId(): TransactionID =
-    genTransactionID()
+    genTransactionIDLocal()
 
   test "encodeGetRequest basic":
     let txnId = makeTxnId()
@@ -41,7 +41,7 @@ suite "GetRequest/GetResponse":
 
   test "encodeGetRequest with GroupRouted":
     let txnId = makeTxnId()
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     let req = GetRequest(
       flags: 0'u8,
       txnId: txnId,
@@ -71,7 +71,7 @@ suite "GetRequest/GetResponse":
 
   test "decodeGetRequest with groupId roundtrip":
     let txnId = makeTxnId()
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     let req = GetRequest(
       flags: GetFlagGroupRouted,
       txnId: txnId,
@@ -139,7 +139,7 @@ suite "GetRequest/GetResponse":
 suite "PutRequest/PutResponse":
 
   proc makeTxnId(): TransactionID =
-    genTransactionID()
+    genTransactionIDLocal()
 
   test "encodePutRequest basic":
     let txnId = makeTxnId()
@@ -186,7 +186,7 @@ suite "PutRequest/PutResponse":
 
   test "encodePutRequest with groupId":
     let txnId = makeTxnId()
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     let req = PutRequest(
       flags: 0'u8,
       txnId: txnId,
@@ -218,7 +218,7 @@ suite "PutRequest/PutResponse":
 
   test "decodePutRequest with groupId roundtrip":
     let txnId = makeTxnId()
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     let req = PutRequest(
       flags: PutFlagGroupRouted,
       txnId: txnId,
@@ -305,7 +305,7 @@ suite "PutRequest/PutResponse":
 suite "DeleteRequest/DeleteResponse":
 
   proc makeTxnId(): TransactionID =
-    genTransactionID()
+    genTransactionIDLocal()
 
   test "encodeDeleteRequest basic":
     let txnId = makeTxnId()
@@ -333,7 +333,7 @@ suite "DeleteRequest/DeleteResponse":
 
   test "encodeDeleteRequest with groupId":
     let txnId = makeTxnId()
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     let req = DeleteRequest(
       flags: DelFlagGroupRouted,
       txnId: txnId,
@@ -359,7 +359,7 @@ suite "DeleteRequest/DeleteResponse":
 
   test "decodeDeleteRequest with groupId roundtrip":
     let txnId = makeTxnId()
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     let req = DeleteRequest(
       flags: DelFlagGroupRouted,
       txnId: txnId,
@@ -433,7 +433,7 @@ suite "DeleteRequest/DeleteResponse":
 suite "BatchRequest/BatchResponse":
 
   proc makeTxnId(): TransactionID =
-    genTransactionID()
+    genTransactionIDLocal()
 
   test "encodeBatchRequest empty":
     let txnId = makeTxnId()
@@ -553,7 +553,7 @@ suite "BatchRequest/BatchResponse":
 suite "ScanRequest/ScanResponseFrame":
 
   proc makeTxnId(): TransactionID =
-    genTransactionID()
+    genTransactionIDLocal()
 
   test "encodeScanRequest basic":
     let txnId = makeTxnId()
@@ -587,7 +587,7 @@ suite "ScanRequest/ScanResponseFrame":
 
   test "encodeScanRequest with groupId":
     let txnId = makeTxnId()
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     let req = ScanRequest(
       flags: ScanFlagGroupRouted,
       txnId: txnId,
@@ -622,7 +622,7 @@ suite "ScanRequest/ScanResponseFrame":
 
   test "decodeScanRequest with groupId roundtrip":
     let txnId = makeTxnId()
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     let req = ScanRequest(
       flags: ScanFlagGroupRouted,
       txnId: txnId,

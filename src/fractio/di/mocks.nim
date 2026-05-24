@@ -1,7 +1,7 @@
 # Mock Implementations for Fractio DI Testing
 # Thread-safe mocks with call tracking and assertions
 
-import std/[options, locks, deques, strformat, strutils, sequtils]
+import std/[options, locks, deques, strformat, strutils, sequtils, times]
 import tables
 import fractio/core/types
 import fractio/core/errors
@@ -500,7 +500,9 @@ proc begin*(m: MockTransactionManager): TransactionID =
   ## Begin a new transaction
   withLock(m.lock):
     inc m.beginCallCount
-    let id = genTransactionID()
+    let t = getTime()
+    let tsNs = t.toUnix * 1_000_000_000 + t.nanosecond.int64
+    let id = genTransactionID(tsNs)
     inc m.currentTimestamp
     let txn = MockTransaction(
       id: id,
@@ -1635,8 +1637,9 @@ proc beginTxn*(pc: MockProtocolClient): TransactionID =
     if not pc.connected:
       result = zeroTransactionID()
     else:
-      # Generate a new unique transaction ID using the standard generator
-      result = genTransactionID()
+      let t = getTime()
+      let tsNs = t.toUnix * 1_000_000_000 + t.nanosecond.int64
+      result = genTransactionID(tsNs)
       pc.activeTxns.addLast(result)
 
 proc commitTxn*(pc: MockProtocolClient, txnId: TransactionID): bool =

@@ -1004,7 +1004,7 @@ suite "Generic Message Encoding":
 suite "GroupID Encoding/Decoding":
   test "writeGroupID and readGroupID":
     var w = newBinaryWriter()
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     w.writeGroupID(groupId)
     let data = w.getString()
     var r = newBinaryReader(data)
@@ -1020,7 +1020,7 @@ suite "GroupID Encoding/Decoding":
     check decoded == ZeroGroupID()
 
   test "GroupID roundtrip in header":
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     let header = newMessageHeader(
       msgType = 1'u16,
       msgId = 123'u64,

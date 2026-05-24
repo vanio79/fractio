@@ -253,7 +253,7 @@ suite "Range Cache":
   test "put multiple descriptors":
     let cache = newGroupCache(ttlNs = 60000'i64)
     for i in 1..5:
-      let gid = genGroupID()
+      let gid = genGroupIDLocal()
       let desc = newGroupDescriptor(
         gid,
         @[newReplicaDescriptor(NodeID(i), ReplicaID(i))]
@@ -265,7 +265,7 @@ suite "Range Cache":
 
   test "put replaces existing":
     let cache = newGroupCache(ttlNs = 60000'i64)
-    let gid = genGroupID()
+    let gid = genGroupIDLocal()
     let desc1 = newGroupDescriptor(
       gid,
       @[newReplicaDescriptor(NodeID(1), ReplicaID(1))]
@@ -287,7 +287,7 @@ suite "Range Cache":
 
   test "get non-existent range":
     let cache = newGroupCache()
-    let gid = genGroupID()
+    let gid = genGroupIDLocal()
     let result = cache.get(gid, 1000)
     check result.isNone
 
@@ -333,7 +333,7 @@ suite "Range Cache":
     )
     cache.put(desc, 1000)
 
-    let gid = genGroupID()
+    let gid = genGroupIDLocal()
     cache.invalidate(gid)
 
     check cache.stats().size == 1
@@ -343,7 +343,7 @@ suite "Range Cache":
     let cache = newGroupCache(ttlNs = 60000'i64)
     var gids: seq[GroupID] = @[]
     for i in 1..5:
-      let gid = genGroupID()
+      let gid = genGroupIDLocal()
       gids.add(gid)
       let desc = newGroupDescriptor(
         gid,
@@ -393,7 +393,7 @@ suite "Range Cache":
     discard cache.get(META_GROUP_ID, 3000)
     discard cache.get(META_GROUP_ID, 4000)
     discard cache.get(DATA_GROUP_START_ID, 5000)
-    let gid = genGroupID()
+    let gid = genGroupIDLocal()
     discard cache.get(gid, 6000)
 
     check cache.hitRate() == 0.6
@@ -403,7 +403,7 @@ suite "Range Cache Eviction":
   test "eviction when over limit":
     let cache = newGroupCache(ttlNs = 60000'i64, maxEntries = 3)
     for i in 1..5:
-      let gid = genGroupID()
+      let gid = genGroupIDLocal()
       let desc = newGroupDescriptor(
         gid,
         @[newReplicaDescriptor(NodeID(i), ReplicaID(i))]
@@ -416,9 +416,9 @@ suite "Range Cache Eviction":
 
   test "eviction removes oldest":
     let cache = newGroupCache(ttlNs = 60000'i64, maxEntries = 2)
-    let gid1 = genGroupID()
-    let gid2 = genGroupID()
-    let gid3 = genGroupID()
+    let gid1 = genGroupIDLocal()
+    let gid2 = genGroupIDLocal()
+    let gid3 = genGroupIDLocal()
 
     let desc1 = newGroupDescriptor(gid1, @[newReplicaDescriptor(NodeID(1),
         ReplicaID(1))])
@@ -499,7 +499,7 @@ suite "Meta2 Cache":
     let cache = newGroupCache(ttlNs = 60000'i64, maxEntries = 3)
     for i in 1..5:
       let desc = newGroupDescriptor(
-        genGroupID(),
+        genGroupIDLocal(),
         @[newReplicaDescriptor(NodeID(i), ReplicaID(i))]
       )
       cache.putMeta2(@[byte(i)], desc, i * 1000)
@@ -642,7 +642,7 @@ suite "Leaseholder Info":
     check decoded.epoch == 5
 
   test "binary serialization fixed size":
-    let info = newLeaseholderInfo(genGroupID(), NodeID(42), 999999'i64, 100)
+    let info = newLeaseholderInfo(genGroupIDLocal(), NodeID(42), 999999'i64, 100)
     let encoded = encodeLeaseholderInfo(info)
     check encoded.len == 40
 
@@ -709,7 +709,7 @@ suite "Thread Safety - Cache Operations":
   test "concurrent put operations":
     let cache = newGroupCache(ttlNs = 60000'i64, maxEntries = 100)
     for i in 1..10:
-      let gid = genGroupID()
+      let gid = genGroupIDLocal()
       let desc = newGroupDescriptor(gid, @[newReplicaDescriptor(NodeID(i),
           ReplicaID(i))])
       cache.put(desc, i * 1000)
@@ -734,7 +734,7 @@ suite "Thread Safety - Cache Operations":
     let cache = newGroupCache(ttlNs = 60000'i64)
     var gids: seq[GroupID] = @[]
     for i in 1..5:
-      let gid = genGroupID()
+      let gid = genGroupIDLocal()
       gids.add(gid)
       let desc = newGroupDescriptor(gid, @[newReplicaDescriptor(NodeID(i),
           ReplicaID(i))])

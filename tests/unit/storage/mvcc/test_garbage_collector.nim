@@ -690,7 +690,7 @@ suite "Garbage Collector - collectVersionsForKey":
     let engine = createTestEngine(mockBackend)
     let gc = newGarbageCollector(engine)
 
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     addVersion(mockBackend, "key1", Timestamp(100), "v100")
     addIntent(mockBackend, "key1", txnId, "intent", Timestamp(200))
 
@@ -751,7 +751,7 @@ suite "Garbage Collector - collectVersionsForTransaction":
     let engine = createTestEngine(mockBackend)
     let gc = newGarbageCollector(engine)
 
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let result = gc.collectVersionsForTransaction(txnId)
     check result.success == true
     check result.versionsCollected == 0
@@ -762,7 +762,7 @@ suite "Garbage Collector - collectVersionsForTransaction":
     let engine = createTestEngine(mockBackend)
     let gc = newGarbageCollector(engine)
 
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     addIntent(mockBackend, "key1", txnId, "intent1", Timestamp(100))
 
     let result = gc.collectVersionsForTransaction(txnId)
@@ -775,8 +775,8 @@ suite "Garbage Collector - collectVersionsForTransaction":
     let engine = createTestEngine(mockBackend)
     let gc = newGarbageCollector(engine)
 
-    let txnId1 = genTransactionID()
-    let txnId2 = genTransactionID()
+    let txnId1 = genTransactionIDLocal()
+    let txnId2 = genTransactionIDLocal()
     addIntent(mockBackend, "key1", txnId1, "intent1", Timestamp(100))
     addIntent(mockBackend, "key2", txnId2, "intent2", Timestamp(100))
 
@@ -910,7 +910,7 @@ suite "Garbage Collector - Edge Cases":
     let gc = newGarbageCollector(engine)
 
     addVersion(mockBackend, "key1", Timestamp(100), "v100")
-    addIntent(mockBackend, "key1", genTransactionID(), "intent", Timestamp(200))
+    addIntent(mockBackend, "key1", genTransactionIDLocal(), "intent", Timestamp(200))
     addVersion(mockBackend, "key2", Timestamp(150), "v150")
 
     let result = gc.collectVersions()

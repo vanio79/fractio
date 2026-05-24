@@ -12,7 +12,7 @@ suite "MockRaftCoordinator":
   test "newMockRaftCoordinator creates empty coordinator":
     let rc = newMockRaftCoordinator()
     check not rc.isRunning()
-    check rc.hasGroup(genGroupID()) == false
+    check rc.hasGroup(genGroupIDLocal()) == false
     check rc.startCallCount == 0
     check rc.stopCallCount == 0
 
@@ -31,39 +31,39 @@ suite "MockRaftCoordinator":
 
   test "addGroup adds a group with leader":
     let rc = newMockRaftCoordinator()
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     rc.addGroup(groupId, 1)
     check rc.hasGroup(groupId)
     check rc.getLeader(groupId) == 1
 
   test "removeGroup removes a group":
     let rc = newMockRaftCoordinator()
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     rc.addGroup(groupId, 1)
     rc.removeGroup(groupId)
     check not rc.hasGroup(groupId)
 
   test "getLeader returns -1 for unknown group":
     let rc = newMockRaftCoordinator()
-    check rc.getLeader(genGroupID()) == -1
+    check rc.getLeader(genGroupIDLocal()) == -1
 
   test "setLeader updates leader for group":
     let rc = newMockRaftCoordinator()
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     rc.addGroup(groupId, 1)
     rc.setLeader(groupId, 2)
     check rc.getLeader(groupId) == 2
 
   test "isLeader returns false for all groups":
     let rc = newMockRaftCoordinator()
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     rc.addGroup(groupId, 1)
     check rc.isLeader(groupId) == false
 
   test "reset clears all state":
     let rc = newMockRaftCoordinator()
     rc.start()
-    rc.addGroup(genGroupID(), 1)
+    rc.addGroup(genGroupIDLocal(), 1)
     rc.reset()
     check not rc.isRunning()
     check rc.startCallCount == 0
@@ -228,7 +228,7 @@ suite "MockSpaceManager":
 
   test "getSpaceInfo returns none for unknown space":
     let sm = newMockSpaceManager()
-    let info = sm.getSpaceInfo(genGroupID())
+    let info = sm.getSpaceInfo(genGroupIDLocal())
     check info.isNone()
 
   test "dropSpace removes space":
@@ -240,11 +240,11 @@ suite "MockSpaceManager":
 
   test "dropSpace returns false for unknown space":
     let sm = newMockSpaceManager()
-    check not sm.dropSpace(genGroupID())
+    check not sm.dropSpace(genGroupIDLocal())
 
   test "addSpace adds predefined space":
     let sm = newMockSpaceManager()
-    let spaceId = genGroupID()
+    let spaceId = genGroupIDLocal()
     sm.addSpace(spaceId, "predefined-space")
     check sm.listSpaces().len == 1
     # Check spaceId is in listSpaces

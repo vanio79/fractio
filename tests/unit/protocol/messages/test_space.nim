@@ -77,7 +77,7 @@ suite "CreateSpaceRequest/CreateSpaceResponse":
     check decoded.isErr
 
   test "encodeCreateSpaceResponse success empty groups":
-    let spaceId = genSpaceID()
+    let spaceId = genSpaceIDLocal()
     let resp = CreateSpaceResponse(
       success: true,
       spaceId: spaceId,
@@ -89,9 +89,9 @@ suite "CreateSpaceRequest/CreateSpaceResponse":
     check encoded.len > 2
 
   test "encodeCreateSpaceResponse success with groups":
-    let spaceId = genSpaceID()
-    let groupId1 = genULID()
-    let groupId2 = genULID()
+    let spaceId = genSpaceIDLocal()
+    let groupId1 = genULIDLocal()
+    let groupId2 = genULIDLocal()
     let resp = CreateSpaceResponse(
       success: true,
       spaceId: spaceId,
@@ -130,7 +130,7 @@ suite "CreateSpaceRequest/CreateSpaceResponse":
     check encoded.len > 2
 
   test "decodeCreateSpaceResponse roundtrip success empty":
-    let spaceId = genSpaceID()
+    let spaceId = genSpaceIDLocal()
     let resp = CreateSpaceResponse(
       success: true,
       spaceId: spaceId,
@@ -148,9 +148,9 @@ suite "CreateSpaceRequest/CreateSpaceResponse":
     check decoded.value.groupRecords.len == 0
 
   test "decodeCreateSpaceResponse roundtrip success with groups":
-    let spaceId = genSpaceID()
-    let groupId1 = genULID()
-    let groupId2 = genULID()
+    let spaceId = genSpaceIDLocal()
+    let groupId1 = genULIDLocal()
+    let groupId2 = genULIDLocal()
     let resp = CreateSpaceResponse(
       success: true,
       spaceId: spaceId,
@@ -247,7 +247,7 @@ suite "DropSpaceRequest/DropSpaceResponse":
     check decoded.isErr
 
   test "encodeDropSpaceResponse success empty groups":
-    let spaceId = genSpaceID()
+    let spaceId = genSpaceIDLocal()
     let resp = DropSpaceResponse(
       success: true,
       spaceId: spaceId,
@@ -257,10 +257,10 @@ suite "DropSpaceRequest/DropSpaceResponse":
     check encoded.len > 2
 
   test "encodeDropSpaceResponse success with groups":
-    let spaceId = genSpaceID()
-    let groupId1 = groupIDFromULID(genULID())
-    let groupId2 = groupIDFromULID(genULID())
-    let groupId3 = groupIDFromULID(genULID())
+    let spaceId = genSpaceIDLocal()
+    let groupId1 = groupIDFromULID(genULIDLocal())
+    let groupId2 = groupIDFromULID(genULIDLocal())
+    let groupId3 = groupIDFromULID(genULIDLocal())
     let resp = DropSpaceResponse(
       success: true,
       spaceId: spaceId,
@@ -290,7 +290,7 @@ suite "DropSpaceRequest/DropSpaceResponse":
     check encoded.len > 2
 
   test "decodeDropSpaceResponse roundtrip success empty":
-    let spaceId = genSpaceID()
+    let spaceId = genSpaceIDLocal()
     let resp = DropSpaceResponse(
       success: true,
       spaceId: spaceId,
@@ -304,9 +304,9 @@ suite "DropSpaceRequest/DropSpaceResponse":
     check decoded.value.deletedGroupIds.len == 0
 
   test "decodeDropSpaceResponse roundtrip success with groups":
-    let spaceId = genSpaceID()
-    let groupId1 = groupIDFromULID(genULID())
-    let groupId2 = groupIDFromULID(genULID())
+    let spaceId = genSpaceIDLocal()
+    let groupId1 = groupIDFromULID(genULIDLocal())
+    let groupId2 = groupIDFromULID(genULIDLocal())
     let resp = DropSpaceResponse(
       success: true,
       spaceId: spaceId,
@@ -358,8 +358,8 @@ suite "Space Message Integration":
     check reqDecoded.value.name == "production-space"
     check reqDecoded.value.replicas == 5'i32
 
-    let spaceId = genSpaceID()
-    let groupId = genULID()
+    let spaceId = genSpaceIDLocal()
+    let groupId = genULIDLocal()
     let resp = CreateSpaceResponse(
       success: true,
       spaceId: spaceId,
@@ -380,8 +380,8 @@ suite "Space Message Integration":
     check reqDecoded.isOk
     check reqDecoded.value.name == "old-space"
 
-    let spaceId = genSpaceID()
-    let groupId = groupIDFromULID(genULID())
+    let spaceId = genSpaceIDLocal()
+    let groupId = groupIDFromULID(genULIDLocal())
     let resp = DropSpaceResponse(
       success: true,
       spaceId: spaceId,

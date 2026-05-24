@@ -12,8 +12,8 @@ suite "RoutingState - Initialization":
 
   test "add table to routing state":
     var state = initRoutingState()
-    let tableId = genTableId()
-    let spaceId = SpaceID(genULID())
+    let tableId = genTableIdLocal()
+    let spaceId = SpaceID(genULIDLocal())
     state.addTable(tableId, "my_table", spaceId)
 
     check stdtables.len(state.tables) == 1
@@ -22,9 +22,9 @@ suite "RoutingState - Initialization":
 
   test "add space to routing state":
     var state = initRoutingState()
-    let spaceId = SpaceID(genULID())
-    let group1 = GroupID(genULID())
-    let group2 = GroupID(genULID())
+    let spaceId = SpaceID(genULIDLocal())
+    let group1 = GroupID(genULIDLocal())
+    let group2 = GroupID(genULIDLocal())
 
     state.addSpace(spaceId, "my_space", @[group1, group2])
 
@@ -35,10 +35,10 @@ suite "RoutingState - Initialization":
 
   test "add space with rebalancing":
     var state = initRoutingState()
-    let spaceId = SpaceID(genULID())
-    let group1 = GroupID(genULID())
-    let group2 = GroupID(genULID())
-    let oldGroup = GroupID(genULID())
+    let spaceId = SpaceID(genULIDLocal())
+    let group1 = GroupID(genULIDLocal())
+    let group2 = GroupID(genULIDLocal())
+    let oldGroup = GroupID(genULIDLocal())
 
     state.addSpace(spaceId, "rebalancing_space", @[group1, group2],
                    oldGroupIds = @[oldGroup], rebalancing = true)
@@ -51,7 +51,7 @@ suite "isValidSpaceId":
     check not isValidSpaceId(SpaceID(ZeroULID()))
 
   test "non-zero spaceId is valid":
-    let spaceId = SpaceID(genULID())
+    let spaceId = SpaceID(genULIDLocal())
     check isValidSpaceId(spaceId)
 
 suite "routeToGroup - Hash Routing":
@@ -60,14 +60,14 @@ suite "routeToGroup - Hash Routing":
     check result == META_GROUP_ID
 
   test "single groupId returns that group":
-    let group1 = GroupID(genULID())
+    let group1 = GroupID(genULIDLocal())
     let result = routeToGroup("pk1", @[group1])
     check result == group1
 
   test "multiple groups routes deterministically":
-    let group1 = GroupID(genULID())
-    let group2 = GroupID(genULID())
-    let group3 = GroupID(genULID())
+    let group1 = GroupID(genULIDLocal())
+    let group2 = GroupID(genULIDLocal())
+    let group3 = GroupID(genULIDLocal())
 
     # Same key should route to same group every time
     let result1 = routeToGroup("pk1", @[group1, group2, group3])
@@ -95,7 +95,7 @@ suite "getGroupForKey - Data Tables":
   test "table without space assignment falls back to DATA_GROUP_START_ID":
     var state = initRoutingState()
     # Add a table with zero spaceId
-    let tableId = genTableId()
+    let tableId = genTableIdLocal()
     state.addTable(tableId, "isolated_table", SpaceID(ZeroULID()))
 
     let key = encodeTableKey(tableId, "d/1")
@@ -104,9 +104,9 @@ suite "getGroupForKey - Data Tables":
 
   test "table with single-group space routes to that group":
     var state = initRoutingState()
-    let tableId = genTableId()
-    let spaceId = SpaceID(genULID())
-    let groupId = GroupID(genULID())
+    let tableId = genTableIdLocal()
+    let spaceId = SpaceID(genULIDLocal())
+    let groupId = GroupID(genULIDLocal())
 
     state.addTable(tableId, "single_group_table", spaceId)
     state.addSpace(spaceId, "single_group_space", @[groupId])
@@ -117,10 +117,10 @@ suite "getGroupForKey - Data Tables":
 
   test "table with multi-group space uses hash routing":
     var state = initRoutingState()
-    let tableId = genTableId()
-    let spaceId = SpaceID(genULID())
-    let group1 = GroupID(genULID())
-    let group2 = GroupID(genULID())
+    let tableId = genTableIdLocal()
+    let spaceId = SpaceID(genULIDLocal())
+    let group1 = GroupID(genULIDLocal())
+    let group2 = GroupID(genULIDLocal())
 
     state.addTable(tableId, "multi_group_table", spaceId)
     state.addSpace(spaceId, "multi_group_space", @[group1, group2])
@@ -138,9 +138,9 @@ suite "getGroupForKey - Data Tables":
 
   test "key with d/ prefix correctly extracts PK":
     var state = initRoutingState()
-    let tableId = genTableId()
-    let spaceId = SpaceID(genULID())
-    let groupId = GroupID(genULID())
+    let tableId = genTableIdLocal()
+    let spaceId = SpaceID(genULIDLocal())
+    let groupId = GroupID(genULIDLocal())
 
     state.addTable(tableId, "test_table", spaceId)
     state.addSpace(spaceId, "test_space", @[groupId])
@@ -152,7 +152,7 @@ suite "getGroupForKey - Data Tables":
 suite "getGroupsForTable":
   test "unknown table falls back to DATA_GROUP_START_ID":
     let state = initRoutingState()
-    let unknownTableId = genTableId()
+    let unknownTableId = genTableIdLocal()
     let groups = getGroupsForTable(state, unknownTableId)
     check groups == @[DATA_GROUP_START_ID]
 
@@ -165,10 +165,10 @@ suite "getGroupsForTable":
 
   test "table with space returns space groups":
     var state = initRoutingState()
-    let tableId = genTableId()
-    let spaceId = SpaceID(genULID())
-    let group1 = GroupID(genULID())
-    let group2 = GroupID(genULID())
+    let tableId = genTableIdLocal()
+    let spaceId = SpaceID(genULIDLocal())
+    let group1 = GroupID(genULIDLocal())
+    let group2 = GroupID(genULIDLocal())
 
     state.addTable(tableId, "test_table", spaceId)
     state.addSpace(spaceId, "test_space", @[group1, group2])
@@ -180,11 +180,11 @@ suite "getGroupsForTable":
 
   test "rebalancing space returns old groups for scans (dual-read for point gets)":
     var state = initRoutingState()
-    let tableId = genTableId()
-    let spaceId = SpaceID(genULID())
-    let newGroup1 = GroupID(genULID())
-    let newGroup2 = GroupID(genULID())
-    let oldGroup = GroupID(genULID())
+    let tableId = genTableIdLocal()
+    let spaceId = SpaceID(genULIDLocal())
+    let newGroup1 = GroupID(genULIDLocal())
+    let newGroup2 = GroupID(genULIDLocal())
+    let oldGroup = GroupID(genULIDLocal())
 
     state.addTable(tableId, "rebalancing_table", spaceId)
     state.addSpace(spaceId, "rebalancing_space", @[newGroup1, newGroup2],
@@ -199,7 +199,7 @@ suite "getGroupsForTable":
 
 suite "getTableIdFromKey":
   test "extract tableId from valid key":
-    let tableId = genTableId()
+    let tableId = genTableIdLocal()
     let key = encodeTableKey(tableId, "test")
     let extractedId = getTableIdFromKey(key)
     check extractedId == tableId
@@ -214,7 +214,7 @@ suite "getTableIdFromKey":
 
 suite "parseTableKey":
   test "parse valid data row key":
-    let tableId = genTableId()
+    let tableId = genTableIdLocal()
     # encodeTableKey adds "/" separator, so pass "d/my_pk" not "/d/my_pk"
     let key = encodeTableKey(tableId, "d/my_pk")
     let (extractedId, pk) = parseTableKey(key)
@@ -222,7 +222,7 @@ suite "parseTableKey":
     check pk == "my_pk"
 
   test "parse key without d/ prefix":
-    let tableId = genTableId()
+    let tableId = genTableIdLocal()
     let key = encodeTableKey(tableId, "my_pk")
     let (extractedId, pk) = parseTableKey(key)
     check extractedId == tableId
@@ -246,34 +246,34 @@ suite "Routing Validation Helpers":
 
   test "isMultiGroup":
     var state = initRoutingState()
-    let tableId1 = genTableId()
-    let spaceId = SpaceID(genULID())
+    let tableId1 = genTableIdLocal()
+    let spaceId = SpaceID(genULIDLocal())
 
     # Single group
     state.addTable(tableId1, "single_table", spaceId)
-    state.addSpace(spaceId, "single_space", @[GroupID(genULID())])
+    state.addSpace(spaceId, "single_space", @[GroupID(genULIDLocal())])
     check not isMultiGroup(state, tableId1)
 
     # Multi group
-    let tableId2 = genTableId()
-    let spaceId2 = SpaceID(genULID())
+    let tableId2 = genTableIdLocal()
+    let spaceId2 = SpaceID(genULIDLocal())
     state.addTable(tableId2, "multi_table", spaceId2)
     state.addSpace(spaceId2, "multi_space",
-                   @[GroupID(genULID()), GroupID(genULID())])
+                   @[GroupID(genULIDLocal()), GroupID(genULIDLocal())])
     check isMultiGroup(state, tableId2)
 
   test "isRebalancing":
     var state = initRoutingState()
-    let tableId1 = genTableId()
-    let spaceId = SpaceID(genULID())
+    let tableId1 = genTableIdLocal()
+    let spaceId = SpaceID(genULIDLocal())
 
     state.addTable(tableId1, "stable_table", spaceId)
-    state.addSpace(spaceId, "stable_space", @[GroupID(genULID())])
+    state.addSpace(spaceId, "stable_space", @[GroupID(genULIDLocal())])
     check not isRebalancing(state, tableId1)
 
-    let tableId2 = genTableId()
-    let spaceId2 = SpaceID(genULID())
+    let tableId2 = genTableIdLocal()
+    let spaceId2 = SpaceID(genULIDLocal())
     state.addTable(tableId2, "rebalancing_table", spaceId2)
-    state.addSpace(spaceId2, "rebalancing_space", @[GroupID(genULID())],
+    state.addSpace(spaceId2, "rebalancing_space", @[GroupID(genULIDLocal())],
                    rebalancing = true)
     check isRebalancing(state, tableId2)

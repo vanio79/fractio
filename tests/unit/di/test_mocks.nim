@@ -514,7 +514,7 @@ suite "MockSqlExecutor":
 
   test "executeInTxn tracks txnId":
     let e = newMockSqlExecutor()
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
 
     discard e.executeInTxn("UPDATE t SET x = 1", txnId)
     check e.lastTxnId == txnId

@@ -208,7 +208,7 @@ suite "MVCC Garbage Collector - Version Collection Logic":
       data: "test",
       timestamp: Timestamp(1000),
       isDeleted: false,
-      txnId: genTransactionID()
+      txnId: genTransactionIDLocal()
     )
 
     let currentTime = Timestamp(100_000_000_000) # 100 seconds later in nanoseconds
@@ -233,7 +233,7 @@ suite "MVCC Garbage Collector - Version Collection Logic":
       data: "test",
       timestamp: Timestamp(1000),
       isDeleted: false,
-      txnId: genTransactionID()
+      txnId: genTransactionIDLocal()
     )
 
     let currentTime = Timestamp(50_000_000_000) # 50 seconds later in nanoseconds
@@ -258,7 +258,7 @@ suite "MVCC Garbage Collector - Version Collection Logic":
       data: "test",
       timestamp: Timestamp(1000),
       isDeleted: false,
-      txnId: genTransactionID()
+      txnId: genTransactionIDLocal()
     )
 
     let currentTime = Timestamp(100_000_000_000)
@@ -283,7 +283,7 @@ suite "MVCC Garbage Collector - Version Collection Logic":
       data: "test",
       timestamp: Timestamp(60_000_000_000),
       isDeleted: false,
-      txnId: genTransactionID()
+      txnId: genTransactionIDLocal()
     )
 
     let currentTime = Timestamp(100_000_000_000)
@@ -309,7 +309,7 @@ suite "MVCC Garbage Collector - Version Collection Logic":
       data: "",
       timestamp: Timestamp(1000),
       isDeleted: true,
-      txnId: genTransactionID()
+      txnId: genTransactionIDLocal()
     )
 
     let currentTime = Timestamp(100_000_000_000)
@@ -435,7 +435,7 @@ suite "MVCC Garbage Collector - Edge Cases":
       data: "test",
       timestamp: Timestamp(1000),
       isDeleted: false,
-      txnId: genTransactionID()
+      txnId: genTransactionIDLocal()
     )
 
     let currentTime = Timestamp(61_000_000_000) # Exactly 60 seconds later
@@ -460,7 +460,7 @@ suite "MVCC Garbage Collector - Edge Cases":
       data: "test",
       timestamp: Timestamp(1000),
       isDeleted: false,
-      txnId: genTransactionID()
+      txnId: genTransactionIDLocal()
     )
 
     let currentTime = Timestamp(60_999_000_000) # 60.999 seconds later
@@ -485,7 +485,7 @@ suite "MVCC Garbage Collector - Edge Cases":
       data: "test",
       timestamp: Timestamp(50_000_000_000),
       isDeleted: false,
-      txnId: genTransactionID()
+      txnId: genTransactionIDLocal()
     )
 
     let currentTime = Timestamp(100_000_000_000)
@@ -510,7 +510,7 @@ suite "MVCC Garbage Collector - Edge Cases":
       data: "test",
       timestamp: Timestamp(49999),
       isDeleted: false,
-      txnId: genTransactionID()
+      txnId: genTransactionIDLocal()
     )
 
     let currentTime = Timestamp(100_000_000_000)
@@ -536,7 +536,7 @@ suite "MVCC Garbage Collector - Multiple Conditions":
       data: "test",
       timestamp: Timestamp(1000),
       isDeleted: false,
-      txnId: genTransactionID()
+      txnId: genTransactionIDLocal()
     )
 
     let currentTime = Timestamp(100_000_000_000)
@@ -561,7 +561,7 @@ suite "MVCC Garbage Collector - Multiple Conditions":
       data: "test",
       timestamp: Timestamp(60_000_000_000),
       isDeleted: false,
-      txnId: genTransactionID()
+      txnId: genTransactionIDLocal()
     )
 
     let currentTime = Timestamp(100_000_000_000)
@@ -586,7 +586,7 @@ suite "MVCC Garbage Collector - Multiple Conditions":
       data: "test",
       timestamp: Timestamp(60_000_000_000),
       isDeleted: false,
-      txnId: genTransactionID()
+      txnId: genTransactionIDLocal()
     )
 
     let currentTime = Timestamp(200_000_000_000) # 140 seconds later
@@ -611,7 +611,7 @@ suite "MVCC Garbage Collector - Multiple Conditions":
       data: "test",
       timestamp: Timestamp(1000),
       isDeleted: false,
-      txnId: genTransactionID()
+      txnId: genTransactionIDLocal()
     )
 
     let currentTime = Timestamp(60000) # 59 seconds later

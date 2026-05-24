@@ -79,7 +79,7 @@ suite "ReplicaDescriptor Binary Serialization":
 
 suite "GroupDescriptor Binary Serialization":
   test "encode minimal GroupDescriptor":
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     let desc = newGroupDescriptor(groupId)
     let encoded = encodeGroupDescriptor(desc)
     # 3 (magic) + 1 (version) + 16 (groupId) + 8 (gen) + 4 (nextRepId) +
@@ -90,7 +90,7 @@ suite "GroupDescriptor Binary Serialization":
     check encoded[2] == 'D'
 
   test "encode GroupDescriptor with replicas":
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     let desc = newGroupDescriptor(groupId)
     discard desc.addReplica(NodeID(1))
     discard desc.addReplica(NodeID(2))
@@ -100,7 +100,7 @@ suite "GroupDescriptor Binary Serialization":
     check encoded.len == 83
 
   test "decode GroupDescriptor roundtrip minimal":
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     let desc = newGroupDescriptor(groupId)
     let encoded = encodeGroupDescriptor(desc)
     let decoded = decodeGroupDescriptor(encoded)
@@ -110,7 +110,7 @@ suite "GroupDescriptor Binary Serialization":
     check decoded.nextReplicaId == desc.nextReplicaId
 
   test "decode GroupDescriptor roundtrip with replicas":
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     let desc = newGroupDescriptor(groupId)
     discard desc.addReplica(NodeID(1), rtVoter)
     discard desc.addReplica(NodeID(2), rtVoter)
@@ -135,7 +135,7 @@ suite "GroupDescriptor Binary Serialization":
     check decoded.leader == NodeID(2)
 
   test "decode GroupDescriptor with invalid leader fields":
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     let desc = newGroupDescriptor(groupId)
     # InvalidNodeID is 0
     check not desc.preferredLeader.isValid
@@ -153,7 +153,7 @@ suite "GroupDescriptor Binary Serialization":
       discard decodeGroupDescriptor(badData)
 
   test "decode rejects truncated data":
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     let desc = newGroupDescriptor(groupId)
     let encoded = encodeGroupDescriptor(desc)
     let truncated = encoded[0..20]
@@ -176,7 +176,7 @@ suite "GroupDescriptor Binary Serialization":
 
 suite "GroupDescriptor Binary - Edge Cases":
   test "large number of replicas":
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     let desc = newGroupDescriptor(groupId)
     for i in 1..100:
       discard desc.addReplica(NodeID(i))
@@ -189,7 +189,7 @@ suite "GroupDescriptor Binary - Edge Cases":
       check decoded.replicas[i].nodeId == NodeID(i + 1)
 
   test "generation and nextReplicaId preserved":
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     let desc = newGroupDescriptor(groupId)
     desc.generation = 12345
     desc.nextReplicaId = ReplicaID(50)

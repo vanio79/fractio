@@ -10,7 +10,7 @@ import fractio/core/types
 suite "BeginTxnRequest/BeginTxnResponse":
 
   proc makeTxnId(): TransactionID =
-    genTransactionID()
+    genTransactionIDLocal()
 
   test "encodeBeginTxnRequest basic":
     let req = BeginTxnRequest(
@@ -85,7 +85,7 @@ suite "BeginTxnRequest/BeginTxnResponse":
 suite "CommitTxnRequest/CommitTxnResponse":
 
   proc makeTxnId(): TransactionID =
-    genTransactionID()
+    genTransactionIDLocal()
 
   test "encodeCommitTxnRequest":
     let txnId = makeTxnId()
@@ -171,7 +171,7 @@ suite "CommitTxnRequest/CommitTxnResponse":
 suite "RollbackTxnRequest/RollbackTxnResponse":
 
   proc makeTxnId(): TransactionID =
-    genTransactionID()
+    genTransactionIDLocal()
 
   test "encodeRollbackTxnRequest":
     let txnId = makeTxnId()
@@ -228,7 +228,7 @@ suite "RollbackTxnRequest/RollbackTxnResponse":
 suite "TxnStatusRequest/TxnStatusResponse":
 
   proc makeTxnId(): TransactionID =
-    genTransactionID()
+    genTransactionIDLocal()
 
   test "encodeTxnStatusRequest":
     let txnId = makeTxnId()
@@ -347,7 +347,7 @@ suite "Transaction Constants":
 suite "Transaction Message Roundtrip Integration":
 
   proc makeTxnId(): TransactionID =
-    genTransactionID()
+    genTransactionIDLocal()
 
   test "Full transaction lifecycle encode/decode":
     let beginReq = BeginTxnRequest(flags: 0'u8, timeoutMs: 10000'u32)

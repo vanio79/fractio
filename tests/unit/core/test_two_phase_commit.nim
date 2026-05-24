@@ -32,8 +32,8 @@ suite "Two-Phase Commit - Transaction ID Generation":
   test "generate unique transaction IDs":
     # Note: generateTransactionId requires a SharedTimer which we can't easily mock
     # So we'll just test that TransactionID type works correctly
-    let txnId1 = genTransactionID()
-    let txnId2 = genTransactionID()
+    let txnId1 = genTransactionIDLocal()
+    let txnId2 = genTransactionIDLocal()
 
     # TransactionID is a distinct ULID, check it's not zero
     check txnId1 != zeroTransactionID()
@@ -41,8 +41,8 @@ suite "Two-Phase Commit - Transaction ID Generation":
     check txnId1 != txnId2
 
   test "transaction IDs are unique":
-    let txnId1 = genTransactionID()
-    let txnId2 = genTransactionID()
+    let txnId1 = genTransactionIDLocal()
+    let txnId2 = genTransactionIDLocal()
 
     check txnId1 != txnId2
 
@@ -68,7 +68,7 @@ suite "Two-Phase Commit - Request ID Generation":
 suite "Two-Phase Commit - Coordinator":
   test "create coordinator":
     var txn = MVCCTransaction(
-      id: genTransactionID(),
+      id: genTransactionIDLocal(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -93,7 +93,7 @@ suite "Two-Phase Commit - Coordinator":
 
   test "add participants to coordinator":
     var txn = MVCCTransaction(
-      id: genTransactionID(),
+      id: genTransactionIDLocal(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -121,7 +121,7 @@ suite "Two-Phase Commit - Coordinator":
 
   test "quorum calculation":
     var txn = MVCCTransaction(
-      id: genTransactionID(),
+      id: genTransactionIDLocal(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -173,7 +173,7 @@ suite "Two-Phase Commit - Participant":
     let request = TwoPCRequest(
       requestId: "req_123",
       requestType: tpcPrepare,
-      transactionId: genTransactionID(),
+      transactionId: genTransactionIDLocal(),
       coordinatorId: "coord1",
       timestamp: Timestamp(1000),
       data: "test data",
@@ -195,7 +195,7 @@ suite "Two-Phase Commit - Participant":
     let request = TwoPCRequest(
       requestId: "req_123",
       requestType: tpcCommit,
-      transactionId: genTransactionID(),
+      transactionId: genTransactionIDLocal(),
       coordinatorId: "coord1",
       timestamp: Timestamp(1000),
       data: "test data",
@@ -214,7 +214,7 @@ suite "Two-Phase Commit - Participant":
     let request = TwoPCRequest(
       requestId: "req_123",
       requestType: tpcRollback,
-      transactionId: genTransactionID(),
+      transactionId: genTransactionIDLocal(),
       coordinatorId: "coord1",
       timestamp: Timestamp(1000),
       data: "test data",
@@ -233,7 +233,7 @@ suite "Two-Phase Commit - Participant":
     let request = TwoPCRequest(
       requestId: "req_123",
       requestType: tpcHeartbeat,
-      transactionId: genTransactionID(),
+      transactionId: genTransactionIDLocal(),
       coordinatorId: "coord1",
       timestamp: Timestamp(1000),
       data: "test data",
@@ -248,7 +248,7 @@ suite "Two-Phase Commit - Participant":
 suite "Two-Phase Commit - Response Processing":
   test "process prepare responses with quorum":
     var txn = MVCCTransaction(
-      id: genTransactionID(),
+      id: genTransactionIDLocal(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -269,7 +269,7 @@ suite "Two-Phase Commit - Response Processing":
     let responses = @[
       TwoPCResponse(
         requestId: "req_1",
-        transactionId: genTransactionID(),
+        transactionId: genTransactionIDLocal(),
         participantId: "node2",
         vote: pvYes,
         state: tpcsPrepared,
@@ -277,7 +277,7 @@ suite "Two-Phase Commit - Response Processing":
       ),
       TwoPCResponse(
         requestId: "req_1",
-        transactionId: genTransactionID(),
+        transactionId: genTransactionIDLocal(),
         participantId: "node3",
         vote: pvYes,
         state: tpcsPrepared,
@@ -294,7 +294,7 @@ suite "Two-Phase Commit - Response Processing":
 
   test "process prepare responses without quorum":
     var txn = MVCCTransaction(
-      id: genTransactionID(),
+      id: genTransactionIDLocal(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -316,7 +316,7 @@ suite "Two-Phase Commit - Response Processing":
     let responses = @[
       TwoPCResponse(
         requestId: "req_1",
-        transactionId: genTransactionID(),
+        transactionId: genTransactionIDLocal(),
         participantId: "node2",
         vote: pvYes,
         state: tpcsPrepared,
@@ -324,7 +324,7 @@ suite "Two-Phase Commit - Response Processing":
       ),
       TwoPCResponse(
         requestId: "req_1",
-        transactionId: genTransactionID(),
+        transactionId: genTransactionIDLocal(),
         participantId: "node3",
         vote: pvNo,
         state: tpcsIdle,
@@ -332,7 +332,7 @@ suite "Two-Phase Commit - Response Processing":
       ),
       TwoPCResponse(
         requestId: "req_1",
-        transactionId: genTransactionID(),
+        transactionId: genTransactionIDLocal(),
         participantId: "node4",
         vote: pvNo,
         state: tpcsIdle,
@@ -350,7 +350,7 @@ suite "Two-Phase Commit - Response Processing":
 suite "Two-Phase Commit - Timeout Handling":
   test "check timeout in prepare phase":
     var txn = MVCCTransaction(
-      id: genTransactionID(),
+      id: genTransactionIDLocal(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -378,7 +378,7 @@ suite "Two-Phase Commit - Timeout Handling":
 
   test "check timeout in commit phase":
     var txn = MVCCTransaction(
-      id: genTransactionID(),
+      id: genTransactionIDLocal(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -405,7 +405,7 @@ suite "Two-Phase Commit - Timeout Handling":
 
   test "handle timeout in prepare phase":
     var txn = MVCCTransaction(
-      id: genTransactionID(),
+      id: genTransactionIDLocal(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -431,7 +431,7 @@ suite "Two-Phase Commit - Timeout Handling":
 
   test "handle timeout in commit phase":
     var txn = MVCCTransaction(
-      id: genTransactionID(),
+      id: genTransactionIDLocal(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -458,7 +458,7 @@ suite "Two-Phase Commit - Timeout Handling":
 suite "Two-Phase Commit - Recovery":
   test "recover transaction":
     var txn = MVCCTransaction(
-      id: genTransactionID(),
+      id: genTransactionIDLocal(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -473,7 +473,7 @@ suite "Two-Phase Commit - Recovery":
     )
 
     let coord = newCoordinator(txn, "node1")
-    let result = coord.recoverTransaction(genTransactionID())
+    let result = coord.recoverTransaction(genTransactionIDLocal())
 
     check result.success == true
     check coord.state == tpcsIdle
@@ -491,7 +491,7 @@ suite "Two-Phase Commit - Serialization":
     let request = TwoPCRequest(
       requestId: "req_123",
       requestType: tpcPrepare,
-      transactionId: genTransactionID(),
+      transactionId: genTransactionIDLocal(),
       coordinatorId: "coord1",
       timestamp: Timestamp(1000),
       data: "test data",
@@ -512,7 +512,7 @@ suite "Two-Phase Commit - Serialization":
   test "serialize and deserialize response":
     let response = TwoPCResponse(
       requestId: "req_123",
-      transactionId: genTransactionID(),
+      transactionId: genTransactionIDLocal(),
       participantId: "node1",
       vote: pvYes,
       state: tpcsPrepared,
@@ -547,7 +547,7 @@ suite "Two-Phase Commit - Error Handling":
 
 suite "Two-Phase Commit - Result Types":
   test "create successful result":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let result = TwoPCResult(
       success: true,
       transactionId: txnId,
@@ -565,7 +565,7 @@ suite "Two-Phase Commit - Result Types":
     check result.retryable == false
 
   test "create failed result with retry":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let result = TwoPCResult(
       success: false,
       transactionId: txnId,
@@ -580,7 +580,7 @@ suite "Two-Phase Commit - Result Types":
     check result.retryable == true
 
   test "create failed result without retry":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let result = TwoPCResult(
       success: false,
       transactionId: txnId,
@@ -597,7 +597,7 @@ suite "Two-Phase Commit - Result Types":
 suite "Two-Phase Commit - State Transitions":
   test "coordinator state transitions":
     var txn = MVCCTransaction(
-      id: genTransactionID(),
+      id: genTransactionIDLocal(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,

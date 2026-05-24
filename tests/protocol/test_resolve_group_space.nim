@@ -99,7 +99,7 @@ proc seedSpaceAndTable(store: RaftKVStoreExt, spaceIdNum: int,
     tableId: TableId, groupIds: seq[GroupID]) =
   ## Write a space record and a table record into the meta range, then
   ## reload the caches.
-  let spaceId = coreTypes.genSpaceID()
+  let spaceId = coreTypes.genSpaceIDLocal()
   let spaceKey = encodeSpaceKey(spaceId)
   let spaceRec = SpaceRecord(
     spaceId: spaceId,
@@ -158,7 +158,7 @@ suite "resolveGroupId — space-aware routing":
 
     # SYS_NODES_TABLE_ID = 5, which is in meta range (1-6), so actually META_GROUP_ID
     # Table ID > 6 but < 100 is a system table in data range
-    let key = encodeTableKey(genTableId(), "some_metric")
+    let key = encodeTableKey(genTableIdLocal(), "some_metric")
     let r = store.resolveGroupId(key)
     check r.isSome
     check r.get() == DATA_GROUP_START_ID
@@ -171,7 +171,7 @@ suite "resolveGroupId — space-aware routing":
     store.loadTableSpaces()
 
     # tableId not in any space, no space mapping exists
-    let key = encodeDataRowKey(genTableId(), "42")
+    let key = encodeDataRowKey(genTableIdLocal(), "42")
     let r = store.resolveGroupId(key)
     check r.isSome
     check r.get() == DATA_GROUP_START_ID
@@ -291,7 +291,7 @@ suite "raftPut/raftDelete via resolveGroupId for space keys":
     let (coord, store, space) = makeMultiGroupStore("/tmp/fractio_rgs_t20", 3)
     defer: teardown(coord, "/tmp/fractio_rgs_t20")
 
-    let putTableId = genTableId()
+    let putTableId = genTableIdLocal()
     seedSpaceAndTable(store, 2, putTableId, space.groupIds)
 
     let key = encodeDataRowKey(putTableId, "42")
@@ -310,7 +310,7 @@ suite "raftPut/raftDelete via resolveGroupId for space keys":
     let (coord, store, space) = makeMultiGroupStore("/tmp/fractio_rgs_t21", 3)
     defer: teardown(coord, "/tmp/fractio_rgs_t21")
 
-    let delTableId = genTableId()
+    let delTableId = genTableIdLocal()
     seedSpaceAndTable(store, 2, delTableId, space.groupIds)
 
     let key = encodeDataRowKey(delTableId, "99")

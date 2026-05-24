@@ -651,7 +651,7 @@ suite "EXPLAIN — planner with store":
       discard planStatement(stmt, client)
 
   test "EXPLAIN CREATE TABLE does not consume a table ID":
-    let id1 = genTableId()
+    let id1 = genTableIdLocal()
     let stmt = parseStatement("EXPLAIN CREATE TABLE t (id INT PRIMARY KEY)")
     let plan = planStatement(stmt, client)
     check plan.ops[0].kind == poExplain

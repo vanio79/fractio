@@ -259,7 +259,7 @@ suite "AllocationConstraint":
 suite "AllocationDecision":
 
   test "newAddReplicaDecision":
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     let decision = newAddReplicaDecision(groupId, NodeID(5), 10, "test reason")
     check decision.kind == adkAddReplica
     check decision.addTarget == NodeID(5)
@@ -268,7 +268,7 @@ suite "AllocationDecision":
     check decision.reason == "test reason"
 
   test "newRemoveReplicaDecision":
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     let decision = newRemoveReplicaDecision(groupId, NodeID(3), 5, "remove reason")
     check decision.kind == adkRemoveReplica
     check decision.removeTarget == NodeID(3)
@@ -277,7 +277,7 @@ suite "AllocationDecision":
     check decision.reason == "remove reason"
 
   test "newTransferLeaseDecision":
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     let decision = newTransferLeaseDecision(groupId, NodeID(1), NodeID(2), 3, "transfer reason")
     check decision.kind == adkTransferLease
     check decision.transferFrom == NodeID(1)
@@ -534,7 +534,7 @@ suite "Allocator":
     pool.addStore(newStoreStats(NodeID(4)))
 
     let alloc = newAllocator(pool, 3)
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     let replicas = @[
       newReplicaDescriptor(NodeID(1), ReplicaID(1), rtVoter)
     ]
@@ -552,7 +552,7 @@ suite "Allocator":
     pool.addStore(newStoreStats(NodeID(4)))
 
     let alloc = newAllocator(pool, 3)
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     let replicas = @[
       newReplicaDescriptor(NodeID(1), ReplicaID(1), rtVoter),
       newReplicaDescriptor(NodeID(2), ReplicaID(2), rtVoter),
@@ -572,7 +572,7 @@ suite "Allocator":
     pool.addStore(newStoreStats(NodeID(3)))
 
     let alloc = newAllocator(pool, 3)
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     let replicas = @[
       newReplicaDescriptor(NodeID(1), ReplicaID(1), rtVoter),
       newReplicaDescriptor(NodeID(2), ReplicaID(2), rtVoter),

@@ -27,7 +27,7 @@ suite "Table Key Encoding":
     check pk == "mydb"
 
   test "encodeTableKey user table":
-    let tableId = genTableId()
+    let tableId = genTableIdLocal()
     let key = encodeTableKey(tableId, "users/alice")
     check key.startsWith("/t/")
     check "/users/alice" in key
@@ -43,13 +43,13 @@ suite "Table Key Encoding":
 
   test "formatTableId ULID length":
     # ULIDs are always 26 characters
-    let tid = genTableId()
+    let tid = genTableIdLocal()
     let formatted = formatTableId(tid)
     check formatted.len == 26
 
 suite "Table Key Decoding":
   test "decode roundtrip":
-    let tableId = genTableId()
+    let tableId = genTableIdLocal()
     let original = encodeTableKey(tableId, "hello/world")
     let (decodedId, primaryKey) = decodeTableKey(original)
     check decodedId == tableId
@@ -74,7 +74,7 @@ suite "Lexicographic Ordering":
     # System table ULIDs have zero timestamp + zero randomness
     # User table ULIDs have non-zero timestamp (current time)
     let sysKey = encodeTableKey(SYS_DATABASES_TABLE_ID, "default")
-    let userKey = encodeTableKey(genTableId(), "data")
+    let userKey = encodeTableKey(genTableIdLocal(), "data")
     check sysKey < userKey
 
   test "system tables sort in table number order":
@@ -111,7 +111,7 @@ suite "Lexicographic Ordering":
 suite "Key Classification":
   test "isTableKey":
     check isTableKey(encodeTableKey(SYS_DATABASES_TABLE_ID, "foo"))
-    check isTableKey(encodeTableKey(genTableId(), "bar"))
+    check isTableKey(encodeTableKey(genTableIdLocal(), "bar"))
     check not isTableKey("/sys/meta1/x")
     check not isTableKey("/range/1/data/x")
     check not isTableKey("plain_key")
@@ -119,7 +119,7 @@ suite "Key Classification":
   test "isSystemKey":
     check isSystemKey(encodeTableKey(SYS_DATABASES_TABLE_ID, "default"))
     check isSystemKey(encodeTableKey(SYS_NODES_TABLE_ID, "node1"))
-    check not isSystemKey(encodeTableKey(genTableId(), "user_data"))
+    check not isSystemKey(encodeTableKey(genTableIdLocal(), "user_data"))
     check not isSystemKey("/sys/meta1/foo")
     check not isSystemKey("plain_key")
 
@@ -128,7 +128,7 @@ suite "Key Classification":
     check isMetaGroupKey(encodeTableKey(SYS_SETTINGS_TABLE_ID, "setting"))
     check isMetaGroupKey(encodeTableKey(SYS_SPACES_TABLE_ID, "space"))
     check not isMetaGroupKey(encodeTableKey(SYS_NODE_METRICS_ID, "x"))
-    check not isMetaGroupKey(encodeTableKey(genTableId(), "user"))
+    check not isMetaGroupKey(encodeTableKey(genTableIdLocal(), "user"))
 
   test "isMetaGroupKey for meta keys":
     # Note: isMetaGroupKey only works for table keys (/t/...)
@@ -140,18 +140,18 @@ suite "Key Classification":
     check isMetaGroupKey(encodeTableKey(SYS_DATABASES_TABLE_ID, "test"))
 
   test "isUserTableKey":
-    check isUserTableKey(encodeTableKey(genTableId(), "row1"))
+    check isUserTableKey(encodeTableKey(genTableIdLocal(), "row1"))
     check not isUserTableKey(encodeTableKey(SYS_DATABASES_TABLE_ID, "system"))
     check not isUserTableKey("/sys/meta1/x")
 
   test "tableIdFromKey":
-    let tid = genTableId()
+    let tid = genTableIdLocal()
     check tableIdFromKey(encodeTableKey(tid, "test")) == tid
     check tableIdFromKey(encodeTableKey(SYS_DATABASES_TABLE_ID, "db")) == SYS_DATABASES_TABLE_ID
 
 suite "User Table Key Helpers":
   test "encodeDataRowKey":
-    let tableId = genTableId()
+    let tableId = genTableIdLocal()
     let key = encodeDataRowKey(tableId, "alice")
     check key.startsWith("/t/")
     check "/d/alice" in key
@@ -160,17 +160,17 @@ suite "User Table Key Helpers":
     check pk == "d/alice"
 
   test "encodeIndexKey":
-    let tableId = genTableId()
-    let indexId = genTableId()
+    let tableId = genTableIdLocal()
+    let indexId = genTableIdLocal()
     let key = encodeIndexKey(tableId, indexId, "alice@example.com", "alice")
     check key.startsWith("/t/")
     check "/i/" in key
     check "alice@example.com" in key
 
   test "data rows sort before index entries":
-    let tableId = genTableId()
+    let tableId = genTableIdLocal()
     let dataKey = encodeDataRowKey(tableId, "alice")
-    let indexKey = encodeIndexKey(tableId, genTableId(), "alice@example.com", "alice")
+    let indexKey = encodeIndexKey(tableId, genTableIdLocal(), "alice@example.com", "alice")
     check dataKey < indexKey # "d/" < "i/"
 
 suite "GroupDescriptor.isMetaGroup":
@@ -183,7 +183,7 @@ suite "GroupDescriptor.isMetaGroup":
     check not desc.isMetaGroup
 
   test "other groups are not meta range":
-    let gid = genGroupID()
+    let gid = genGroupIDLocal()
     let desc = newGroupDescriptor(gid)
     check not desc.isMetaGroup
 
@@ -327,7 +327,7 @@ suite "System Table Lookup":
     check opt.get.tableNum == SYS_DATABASES_TABLE_NUM
 
   test "getSystemTableInfoById returns none for unknown ID":
-    let unknownId = genTableId() # random ULID, not a system table
+    let unknownId = genTableIdLocal() # random ULID, not a system table
     let opt = getSystemTableInfoById(unknownId)
     check opt.isNone
 

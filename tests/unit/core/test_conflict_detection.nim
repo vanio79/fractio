@@ -126,7 +126,7 @@ suite "Conflict Detection - Pure Tests":
     let conflict = ConflictInfo(
       conflictType: ctWriteWrite,
       key: "test_key",
-      conflictingTxnId: genTransactionID(),
+      conflictingTxnId: genTransactionIDLocal(),
       timestamp: Timestamp(1000),
       retryable: true
     )
@@ -206,7 +206,7 @@ suite "Conflict Resolution":
 
   test "resolve conflict with committed transaction":
     var txn1 = MVCCTransaction(
-      id: genTransactionID(),
+      id: genTransactionIDLocal(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -220,7 +220,7 @@ suite "Conflict Resolution":
       epoch: 0
     )
     var txn2 = MVCCTransaction(
-      id: genTransactionID(),
+      id: genTransactionIDLocal(),
       status: TXN_COMMITTED,
       startTimestamp: Timestamp(50),
       commitTimestamp: Timestamp(200),
@@ -236,7 +236,7 @@ suite "Conflict Resolution":
     let conflict = ConflictInfo(
       conflictType: ctWriteWrite,
       key: "key1",
-      conflictingTxnId: genTransactionID(),
+      conflictingTxnId: genTransactionIDLocal(),
       timestamp: Timestamp(200),
       retryable: true
     )
@@ -247,7 +247,7 @@ suite "Conflict Resolution":
 
   test "resolve conflict with aborted transaction":
     var txn1 = MVCCTransaction(
-      id: genTransactionID(),
+      id: genTransactionIDLocal(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -261,7 +261,7 @@ suite "Conflict Resolution":
       epoch: 0
     )
     var txn2 = MVCCTransaction(
-      id: genTransactionID(),
+      id: genTransactionIDLocal(),
       status: TXN_ABORTED,
       startTimestamp: Timestamp(50),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -277,7 +277,7 @@ suite "Conflict Resolution":
     let conflict = ConflictInfo(
       conflictType: ctWriteWrite,
       key: "key1",
-      conflictingTxnId: genTransactionID(),
+      conflictingTxnId: genTransactionIDLocal(),
       timestamp: Timestamp(150),
       retryable: true
     )
@@ -288,7 +288,7 @@ suite "Conflict Resolution":
 
   test "resolve conflict with priority - higher priority wins":
     var txn1 = MVCCTransaction(
-      id: genTransactionID(),
+      id: genTransactionIDLocal(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -302,7 +302,7 @@ suite "Conflict Resolution":
       epoch: 0
     )
     var txn2 = MVCCTransaction(
-      id: genTransactionID(),
+      id: genTransactionIDLocal(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(50),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -318,7 +318,7 @@ suite "Conflict Resolution":
     let conflict = ConflictInfo(
       conflictType: ctWriteWrite,
       key: "key1",
-      conflictingTxnId: genTransactionID(),
+      conflictingTxnId: genTransactionIDLocal(),
       timestamp: Timestamp(150),
       retryable: true
     )
@@ -330,7 +330,7 @@ suite "Transaction Push Mechanism - Pure Tests":
   # Tests that don't need backend/engine
   test "push transaction timestamp":
     var txn1 = MVCCTransaction(
-      id: genTransactionID(),
+      id: genTransactionIDLocal(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -344,7 +344,7 @@ suite "Transaction Push Mechanism - Pure Tests":
       epoch: 0
     )
     var txn2 = MVCCTransaction(
-      id: genTransactionID(),
+      id: genTransactionIDLocal(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(50),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -363,7 +363,7 @@ suite "Transaction Push Mechanism - Pure Tests":
 
   test "push aborted transaction":
     var txn1 = MVCCTransaction(
-      id: genTransactionID(),
+      id: genTransactionIDLocal(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -377,7 +377,7 @@ suite "Transaction Push Mechanism - Pure Tests":
       epoch: 0
     )
     var txn2 = MVCCTransaction(
-      id: genTransactionID(),
+      id: genTransactionIDLocal(),
       status: TXN_ABORTED,
       startTimestamp: Timestamp(50),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -395,7 +395,7 @@ suite "Transaction Push Mechanism - Pure Tests":
 
   test "push committed transaction":
     var txn1 = MVCCTransaction(
-      id: genTransactionID(),
+      id: genTransactionIDLocal(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -409,7 +409,7 @@ suite "Transaction Push Mechanism - Pure Tests":
       epoch: 0
     )
     var txn2 = MVCCTransaction(
-      id: genTransactionID(),
+      id: genTransactionIDLocal(),
       status: TXN_COMMITTED,
       startTimestamp: Timestamp(50),
       commitTimestamp: Timestamp(200),
@@ -427,7 +427,7 @@ suite "Transaction Push Mechanism - Pure Tests":
 
   test "can push check":
     var txn1 = MVCCTransaction(
-      id: genTransactionID(),
+      id: genTransactionIDLocal(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -441,7 +441,7 @@ suite "Transaction Push Mechanism - Pure Tests":
       epoch: 0
     )
     var txn2 = MVCCTransaction(
-      id: genTransactionID(),
+      id: genTransactionIDLocal(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(50),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -461,7 +461,7 @@ suite "Transaction Push Mechanism - Pure Tests":
 suite "Wait-Die Deadlock Prevention - Pure Tests":
   test "younger waits for older":
     var txn1 = MVCCTransaction(
-      id: genTransactionID(),
+      id: genTransactionIDLocal(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(200),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -475,7 +475,7 @@ suite "Wait-Die Deadlock Prevention - Pure Tests":
       epoch: 0
     )
     var txn2 = MVCCTransaction(
-      id: genTransactionID(),
+      id: genTransactionIDLocal(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -493,7 +493,7 @@ suite "Wait-Die Deadlock Prevention - Pure Tests":
 
   test "should abort transaction":
     var txn1 = MVCCTransaction(
-      id: genTransactionID(),
+      id: genTransactionIDLocal(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -507,7 +507,7 @@ suite "Wait-Die Deadlock Prevention - Pure Tests":
       epoch: 0
     )
     var txn2 = MVCCTransaction(
-      id: genTransactionID(),
+      id: genTransactionIDLocal(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(200),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -525,7 +525,7 @@ suite "Wait-Die Deadlock Prevention - Pure Tests":
 
   test "committed transaction doesn't cause abort":
     var txn1 = MVCCTransaction(
-      id: genTransactionID(),
+      id: genTransactionIDLocal(),
       status: TXN_PENDING,
       startTimestamp: Timestamp(100),
       commitTimestamp: INVALID_TIMESTAMP,
@@ -539,7 +539,7 @@ suite "Wait-Die Deadlock Prevention - Pure Tests":
       epoch: 0
     )
     var txn2 = MVCCTransaction(
-      id: genTransactionID(),
+      id: genTransactionIDLocal(),
       status: TXN_COMMITTED,
       startTimestamp: Timestamp(50),
       commitTimestamp: Timestamp(200),

@@ -74,7 +74,7 @@ suite "MockSqlExecutor Tests":
     check executor.executeCallCount == 1
 
   test "executeInTxn tracks transaction ID":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     discard executor.executeInTxn("SELECT * FROM users", txnId)
     check executor.executeInTxnCallCount == 1
     check executor.lastSql == "SELECT * FROM users"
@@ -87,7 +87,7 @@ suite "MockSqlExecutor Tests":
     )
     executor.setResult("UPDATE users SET name='Test'", modifiedResult)
 
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let result = executor.executeInTxn("UPDATE users SET name='Test'", txnId)
     check result.kind == erkModified
     check result.count == 1
@@ -109,7 +109,7 @@ suite "MockSqlExecutor Tests":
 
   test "reset clears all state":
     discard executor.execute("SELECT 1")
-    discard executor.executeInTxn("SELECT 2", genTransactionID())
+    discard executor.executeInTxn("SELECT 2", genTransactionIDLocal())
     executor.setForceError(true)
 
     executor.reset()
@@ -136,8 +136,8 @@ suite "MockSqlExecutor Assertion Tests":
     assertExecuteCalled(executor, 2)
 
   test "assertExecuteInTxnCalled succeeds when count matches":
-    discard executor.executeInTxn("SELECT 1", genTransactionID())
-    discard executor.executeInTxn("SELECT 2", genTransactionID())
+    discard executor.executeInTxn("SELECT 1", genTransactionIDLocal())
+    discard executor.executeInTxn("SELECT 2", genTransactionIDLocal())
     assertExecuteInTxnCalled(executor, 2)
 
   test "assertLastSql succeeds when SQL matches":
@@ -145,7 +145,7 @@ suite "MockSqlExecutor Assertion Tests":
     assertLastSql(executor, "SELECT * FROM test")
 
   test "assertLastTxnId succeeds when txnId matches":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     discard executor.executeInTxn("SELECT 1", txnId)
     assertLastTxnId(executor, txnId)
 

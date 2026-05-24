@@ -109,9 +109,9 @@ suite "Fractio Client - KVOpVoidResult":
 
 suite "Fractio Client - SpaceOpResult":
   test "SpaceOpResult structure":
-    let spaceId = genSpaceID()
+    let spaceId = genSpaceIDLocal()
     let result = client.SpaceOpResult(isOk: true, spaceId: spaceId,
-        groupCount: 2, groupIds: @[genGroupID()])
+        groupCount: 2, groupIds: @[genGroupIDLocal()])
     check result.isOk == true
     check result.err == ""
     check result.groupCount == 2
@@ -161,10 +161,10 @@ suite "Fractio Client - NodeInfo":
 
 suite "Fractio Client - GroupInfo":
   test "create GroupInfo with all fields":
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     let groupInfo = client.GroupInfo(
       groupId: groupId,
-      spaceId: genSpaceID(),
+      spaceId: genSpaceIDLocal(),
       leaderNodeId: 1,
       replicaNodeIds: @[1.uint32, 2, 3]
     )
@@ -174,8 +174,8 @@ suite "Fractio Client - GroupInfo":
 
   test "GroupInfo with empty replicas":
     let groupInfo = client.GroupInfo(
-      groupId: genGroupID(),
-      spaceId: genSpaceID(),
+      groupId: genGroupIDLocal(),
+      spaceId: genSpaceIDLocal(),
       leaderNodeId: 0,
       replicaNodeIds: @[]
     )
@@ -187,17 +187,17 @@ suite "Fractio Client - GroupInfo":
 
 suite "Fractio Client - TableInfo":
   test "create TableInfo with all fields":
-    let tid = genTableId()
+    let tid = genTableIdLocal()
     let tableInfo = client.TableInfo(
       tableId: tid,
       name: "users",
-      spaceId: genSpaceID()
+      spaceId: genSpaceIDLocal()
     )
     check tableInfo.tableId == tid
     check tableInfo.name == "users"
 
   test "TableInfo with empty name":
-    let tid = genTableId()
+    let tid = genTableIdLocal()
     let tableInfo = client.TableInfo(tableId: tid, name: "")
     check tableInfo.name == ""
 
@@ -207,10 +207,10 @@ suite "Fractio Client - TableInfo":
 
 suite "Fractio Client - SpaceInfo":
   test "create SpaceInfo with all fields":
-    let groupId1 = genGroupID()
-    let groupId2 = genGroupID()
+    let groupId1 = genGroupIDLocal()
+    let groupId2 = genGroupIDLocal()
     let spaceInfo = client.SpaceInfo(
-      spaceId: genSpaceID(),
+      spaceId: genSpaceIDLocal(),
       name: "production",
       groupIds: @[groupId1, groupId2],
       oldGroupIds: @[],
@@ -222,10 +222,10 @@ suite "Fractio Client - SpaceInfo":
     check spaceInfo.rebalancing == false
 
   test "SpaceInfo with rebalancing":
-    let oldGroupId = genGroupID()
-    let newGroupId = genGroupID()
+    let oldGroupId = genGroupIDLocal()
+    let newGroupId = genGroupIDLocal()
     let spaceInfo = client.SpaceInfo(
-      spaceId: genSpaceID(),
+      spaceId: genSpaceIDLocal(),
       name: "rebalancing_space",
       groupIds: @[newGroupId],
       oldGroupIds: @[oldGroupId],
@@ -332,18 +332,18 @@ suite "Fractio Client - Close Operation":
       status: nsAlive,
       client: nil
     )
-    let gid = genGroupID()
+    let gid = genGroupIDLocal()
     c.groups[gid] = client.GroupInfo(
       groupId: gid,
-      spaceId: genSpaceID(),
+      spaceId: genSpaceIDLocal(),
       leaderNodeId: 1,
       replicaNodeIds: @[1.uint32, 2, 3]
     )
-    let tid = genTableId()
+    let tid = genTableIdLocal()
     c.tables[tid] = client.TableInfo(
       tableId: tid,
       name: "users",
-      spaceId: genSpaceID()
+      spaceId: genSpaceIDLocal()
     )
 
     c.close()
@@ -452,7 +452,7 @@ suite "Fractio Client - Stress Tests":
   test "many GroupID generations":
     var ids: seq[GroupID] = @[]
     for i in 0..<1000:
-      let gid = genGroupID()
+      let gid = genGroupIDLocal()
       ids.add(gid)
     check ids.len == 1000
 
@@ -463,7 +463,7 @@ suite "Fractio Client - Stress Tests":
 suite "Fractio Client - getTableIdFromKey":
   test "getTableIdFromKey with valid key":
     let c = client.newFractioClient("localhost", 9000)
-    let tid = genTableId()
+    let tid = genTableIdLocal()
     let key = encodeTableKey(tid, "pk123")
     let parsedTid = c.getTableIdFromKey(key)
     check parsedTid == tid
@@ -491,7 +491,7 @@ suite "Fractio Client - getTableIdFromKey":
 
   test "getTableIdFromKey with key without /d/":
     let c = client.newFractioClient("localhost", 9000)
-    let tid = genTableId()
+    let tid = genTableIdLocal()
     let key = "/t/" & formatTableId(tid) & "/pk123"         # No /d/ prefix
     let parsedTid = c.getTableIdFromKey(key)
     check parsedTid == tid
@@ -513,7 +513,7 @@ suite "Fractio Client - getGroupsForTable":
   test "getGroupsForTable for unknown table":
     let c = client.newFractioClient("localhost", 9000)
     # Unknown table falls back to DATA_GROUP_START_ID
-    let groups = c.getGroupsForTable(genTableId())
+    let groups = c.getGroupsForTable(genTableIdLocal())
     check groups.len == 1
     check groups[0] == DATA_GROUP_START_ID
     c.close()
@@ -569,7 +569,7 @@ suite "Fractio Client - getGroupForKey":
   test "getGroupForKey for data table key without space":
     let c = client.newFractioClient("localhost", 9000)
     # Generate a valid non-system table ID (ULID format, 26 chars)
-    let tid = genTableId()
+    let tid = genTableIdLocal()
     let key = encodeTableKey(tid, "test_pk")
     let group = c.getGroupForKey(key)
     # Non-system table without space assignment falls back to DATA_GROUP_START_ID
@@ -597,7 +597,7 @@ suite "Fractio Client - getGroupForKey":
 suite "Fractio Client - Leader Connection":
   test "getGroupLeaderConnection returns none for unknown group":
     let c = client.newFractioClient("localhost", 9000)
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     let connOpt = c.getGroupLeaderConnection(groupId)
     check connOpt.isNone
     c.close()
@@ -611,18 +611,18 @@ suite "Fractio Client - Leader Connection":
 
   test "invalidateGroupLeader is safe for unknown group":
     let c = client.newFractioClient("localhost", 9000)
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     c.invalidateGroupLeader(groupId)
     # Should not crash
     c.close()
 
   test "invalidateGroupLeader clears leader connection":
     let c = client.newFractioClient("localhost", 9000)
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     # Manually add a group
     c.groups[groupId] = client.GroupInfo(
       groupId: groupId,
-      spaceId: genSpaceID(),
+      spaceId: genSpaceIDLocal(),
       leaderNodeId: 1,
       replicaNodeIds: @[1.uint32]
     )
@@ -642,13 +642,13 @@ suite "Fractio Client - TableInfo Edge Cases":
     let tableInfo = client.TableInfo(
       tableId: zeroTableId(),
       name: "empty_table",
-      spaceId: genSpaceID()
+      spaceId: genSpaceIDLocal()
     )
     check tableInfo.tableId == zeroTableId()
     check tableInfo.name == "empty_table"
 
   test "TableInfo comparison":
-    let tid = genTableId()
+    let tid = genTableIdLocal()
     let t1 = client.TableInfo(tableId: tid, name: "users")
     let t2 = client.TableInfo(tableId: tid, name: "users")
     check t1.tableId == t2.tableId
@@ -657,7 +657,7 @@ suite "Fractio Client - TableInfo Edge Cases":
 suite "Fractio Client - SpaceInfo Edge Cases":
   test "SpaceInfo with empty groupIds":
     let spaceInfo = client.SpaceInfo(
-      spaceId: genSpaceID(),
+      spaceId: genSpaceIDLocal(),
       name: "empty_space",
       groupIds: @[],
       oldGroupIds: @[],
@@ -667,9 +667,9 @@ suite "Fractio Client - SpaceInfo Edge Cases":
     check spaceInfo.oldGroupIds.len == 0
 
   test "SpaceInfo with overlapping old and new groups":
-    let gid = genGroupID()
+    let gid = genGroupIDLocal()
     let spaceInfo = client.SpaceInfo(
-      spaceId: genSpaceID(),
+      spaceId: genSpaceIDLocal(),
       name: "overlap_space",
       groupIds: @[gid],
       oldGroupIds: @[gid],
@@ -682,9 +682,9 @@ suite "Fractio Client - SpaceInfo Edge Cases":
   test "SpaceInfo with many groups":
     var groupIds: seq[GroupID] = @[]
     for i in 0..<10:
-      groupIds.add(genGroupID())
+      groupIds.add(genGroupIDLocal())
     let spaceInfo = client.SpaceInfo(
-      spaceId: genSpaceID(),
+      spaceId: genSpaceIDLocal(),
       name: "large_space",
       groupIds: groupIds,
       oldGroupIds: @[],
@@ -732,8 +732,8 @@ suite "Fractio Client - NodeInfo Edge Cases":
 suite "Fractio Client - GroupInfo Edge Cases":
   test "GroupInfo with zero leaderNodeId":
     let groupInfo = client.GroupInfo(
-      groupId: genGroupID(),
-      spaceId: genSpaceID(),
+      groupId: genGroupIDLocal(),
+      spaceId: genSpaceIDLocal(),
       leaderNodeId: 0,
       replicaNodeIds: @[]
     )
@@ -744,8 +744,8 @@ suite "Fractio Client - GroupInfo Edge Cases":
     for i in 1..10:
       replicas.add(i.uint32)
     let groupInfo = client.GroupInfo(
-      groupId: genGroupID(),
-      spaceId: genSpaceID(),
+      groupId: genGroupIDLocal(),
+      spaceId: genSpaceIDLocal(),
       leaderNodeId: 1,
       replicaNodeIds: replicas
     )
@@ -839,7 +839,7 @@ suite "Fractio Client - KV Operations Not Initialized":
 
   test "kvGet with transaction params returns error when not initialized":
     let c = client.newFractioClient("localhost", 9000)
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let result = c.kvGet("test_key", txnId = txnId, readTimestamp = 12345)
     check result.isErr == true
     check result.err == "client not initialized"
@@ -847,7 +847,7 @@ suite "Fractio Client - KV Operations Not Initialized":
 
   test "kvPut with transaction params returns error when not initialized":
     let c = client.newFractioClient("localhost", 9000)
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let result = c.kvPut("test_key", "test_value", txnId = txnId)
     check result.isErr == true
     check result.err == "client not initialized"
@@ -855,7 +855,7 @@ suite "Fractio Client - KV Operations Not Initialized":
 
   test "kvDelete with transaction params returns error when not initialized":
     let c = client.newFractioClient("localhost", 9000)
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let result = c.kvDelete("test_key", txnId = txnId)
     check result.isErr == true
     check result.err == "client not initialized"
@@ -863,7 +863,7 @@ suite "Fractio Client - KV Operations Not Initialized":
 
   test "kvScan with transaction params returns error when not initialized":
     let c = client.newFractioClient("localhost", 9000)
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let result = c.kvScan("start", "end", limit = 10, txnId = txnId,
         readTimestamp = 12345)
     check result.isErr == true
@@ -896,7 +896,7 @@ suite "Fractio Client - Transaction Operations Error Handling":
   test "commitTxn returns error when no META group connection":
     let c = client.newFractioClient("localhost", 9000)
     c.initialized.store(true, moRelaxed)
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let result = c.commitTxn(txnId)
     check result.isErr == true
     check result.err == "no connection for commitTxn"
@@ -905,7 +905,7 @@ suite "Fractio Client - Transaction Operations Error Handling":
   test "rollbackTxn returns error when no META group connection":
     let c = client.newFractioClient("localhost", 9000)
     c.initialized.store(true, moRelaxed)
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let result = c.rollbackTxn(txnId)
     check result.isErr == true
     check result.err == "no connection for rollbackTxn"
@@ -955,11 +955,11 @@ suite "Fractio Client - Space Operations Error Handling":
 suite "Fractio Client - getGroupLeaderConnection Edge Cases":
   test "getGroupLeaderConnection returns none when group has leader but node info missing":
     let c = client.newFractioClient("localhost", 9000)
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     # Add group with known leader but no node info in nodes table
     c.groups[groupId] = client.GroupInfo(
       groupId: groupId,
-      spaceId: genSpaceID(),
+      spaceId: genSpaceIDLocal(),
       leaderNodeId: 1, # Known leader
       replicaNodeIds: @[1.uint32]
     )
@@ -970,11 +970,11 @@ suite "Fractio Client - getGroupLeaderConnection Edge Cases":
 
   test "getGroupLeaderConnection returns none when leader unknown and no replicas":
     let c = client.newFractioClient("localhost", 9000)
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     # Add group with unknown leader (leaderNodeId = 0) and no replicas
     c.groups[groupId] = client.GroupInfo(
       groupId: groupId,
-      spaceId: genSpaceID(),
+      spaceId: genSpaceIDLocal(),
       leaderNodeId: 0, # Unknown leader
       replicaNodeIds: @[] # No replicas
     )
@@ -984,11 +984,11 @@ suite "Fractio Client - getGroupLeaderConnection Edge Cases":
 
   test "getGroupLeaderConnection returns none when leader unknown and replica node info missing":
     let c = client.newFractioClient("localhost", 9000)
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     # Add group with unknown leader and replicas, but no node info
     c.groups[groupId] = client.GroupInfo(
       groupId: groupId,
-      spaceId: genSpaceID(),
+      spaceId: genSpaceIDLocal(),
       leaderNodeId: 0, # Unknown leader
       replicaNodeIds: @[1.uint32, 2, 3]
     )
@@ -999,10 +999,10 @@ suite "Fractio Client - getGroupLeaderConnection Edge Cases":
 
   test "getGroupLeaderConnection handles multiple replicas all missing node info":
     let c = client.newFractioClient("localhost", 9000)
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     c.groups[groupId] = client.GroupInfo(
       groupId: groupId,
-      spaceId: genSpaceID(),
+      spaceId: genSpaceIDLocal(),
       leaderNodeId: 0,
       replicaNodeIds: @[10.uint32, 20, 30, 40, 50]
     )
@@ -1017,11 +1017,11 @@ suite "Fractio Client - getGroupLeaderConnection Edge Cases":
 suite "Fractio Client - invalidateGroupLeader Full Behavior":
   test "invalidateGroupLeader clears leaderNodeId to zero":
     let c = client.newFractioClient("localhost", 9000)
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     # Add group with known leader
     c.groups[groupId] = client.GroupInfo(
       groupId: groupId,
-      spaceId: genSpaceID(),
+      spaceId: genSpaceIDLocal(),
       leaderNodeId: 5, # Known leader
       replicaNodeIds: @[5.uint32, 6, 7]
     )
@@ -1032,11 +1032,11 @@ suite "Fractio Client - invalidateGroupLeader Full Behavior":
 
   test "invalidateGroupLeader handles group in leaderConnections":
     let c = client.newFractioClient("localhost", 9000)
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     # Just set up the group without a connection (more realistic)
     c.groups[groupId] = client.GroupInfo(
       groupId: groupId,
-      spaceId: genSpaceID(),
+      spaceId: genSpaceIDLocal(),
       leaderNodeId: 1,
       replicaNodeIds: @[1.uint32]
     )
@@ -1047,7 +1047,7 @@ suite "Fractio Client - invalidateGroupLeader Full Behavior":
 
   test "invalidateGroupLeader is safe for group not in groups table":
     let c = client.newFractioClient("localhost", 9000)
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     # Only test the case where group is not in groups table
     # No entries in leaderConnections or groups
     c.invalidateGroupLeader(groupId)
@@ -1058,10 +1058,10 @@ suite "Fractio Client - invalidateGroupLeader Full Behavior":
 
   test "invalidateGroupLeader clears leaderNodeId even when no cached connection":
     let c = client.newFractioClient("localhost", 9000)
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     c.groups[groupId] = client.GroupInfo(
       groupId: groupId,
-      spaceId: genSpaceID(),
+      spaceId: genSpaceIDLocal(),
       leaderNodeId: 10,
       replicaNodeIds: @[10.uint32]
     )
@@ -1102,12 +1102,12 @@ suite "Fractio Client - refreshMetadata Edge Cases":
 suite "Fractio Client - getGroupsForTable Rebalancing":
   test "getGroupsForTable returns old groups during rebalancing (dual-read for point gets)":
     let c = client.newFractioClient("localhost", 9000)
-    let tid = genTableId()
-    let spaceId = genSpaceID()
-    let oldGid1 = genGroupID()
-    let oldGid2 = genGroupID()
-    let newGid1 = genGroupID()
-    let newGid2 = genGroupID()
+    let tid = genTableIdLocal()
+    let spaceId = genSpaceIDLocal()
+    let oldGid1 = genGroupIDLocal()
+    let oldGid2 = genGroupIDLocal()
+    let newGid1 = genGroupIDLocal()
+    let newGid2 = genGroupIDLocal()
 
     # Set up table in rebalancing space
     c.tables[tid] = client.TableInfo(
@@ -1133,11 +1133,11 @@ suite "Fractio Client - getGroupsForTable Rebalancing":
 
   test "getGroupsForTable returns old groups during rebalancing (no dedup needed)":
     let c = client.newFractioClient("localhost", 9000)
-    let tid = genTableId()
-    let spaceId = genSpaceID()
-    let sharedGid = genGroupID()
-    let newGid = genGroupID()
-    let oldGid = genGroupID()
+    let tid = genTableIdLocal()
+    let spaceId = genSpaceIDLocal()
+    let sharedGid = genGroupIDLocal()
+    let newGid = genGroupIDLocal()
+    let oldGid = genGroupIDLocal()
 
     c.tables[tid] = client.TableInfo(
       tableId: tid,
@@ -1162,10 +1162,10 @@ suite "Fractio Client - getGroupsForTable Rebalancing":
 
   test "getGroupsForTable returns only new groups when not rebalancing":
     let c = client.newFractioClient("localhost", 9000)
-    let tid = genTableId()
-    let spaceId = genSpaceID()
-    let gid1 = genGroupID()
-    let gid2 = genGroupID()
+    let tid = genTableIdLocal()
+    let spaceId = genSpaceIDLocal()
+    let gid1 = genGroupIDLocal()
+    let gid2 = genGroupIDLocal()
 
     c.tables[tid] = client.TableInfo(
       tableId: tid,
@@ -1193,11 +1193,11 @@ suite "Fractio Client - getGroupsForTable Rebalancing":
 suite "Fractio Client - getGroupForKey Multi-Group Routing":
   test "getGroupForKey routes to correct group via hash":
     let c = client.newFractioClient("localhost", 9000)
-    let tid = genTableId()
-    let spaceId = genSpaceID()
-    let gid1 = genGroupID()
-    let gid2 = genGroupID()
-    let gid3 = genGroupID()
+    let tid = genTableIdLocal()
+    let spaceId = genSpaceIDLocal()
+    let gid1 = genGroupIDLocal()
+    let gid2 = genGroupIDLocal()
+    let gid3 = genGroupIDLocal()
 
     c.tables[tid] = client.TableInfo(
       tableId: tid,
@@ -1229,8 +1229,8 @@ suite "Fractio Client - getGroupForKey Multi-Group Routing":
 
   test "getGroupForKey with empty groupIds returns DATA_GROUP_START_ID":
     let c = client.newFractioClient("localhost", 9000)
-    let tid = genTableId()
-    let spaceId = genSpaceID()
+    let tid = genTableIdLocal()
+    let spaceId = genSpaceIDLocal()
 
     c.tables[tid] = client.TableInfo(
       tableId: tid,
@@ -1254,10 +1254,10 @@ suite "Fractio Client - getGroupForKey Multi-Group Routing":
 
   test "getGroupForKey routes consistently for same key":
     let c = client.newFractioClient("localhost", 9000)
-    let tid = genTableId()
-    let spaceId = genSpaceID()
-    let gid1 = genGroupID()
-    let gid2 = genGroupID()
+    let tid = genTableIdLocal()
+    let spaceId = genSpaceIDLocal()
+    let gid1 = genGroupIDLocal()
+    let gid2 = genGroupIDLocal()
 
     c.tables[tid] = client.TableInfo(
       tableId: tid,
@@ -1308,7 +1308,7 @@ suite "Fractio Client - SpaceOpResult Helpers":
   test "SpaceOpResult with large groupCount":
     let result = client.SpaceOpResult(
       isOk: true,
-      spaceId: genSpaceID(),
+      spaceId: genSpaceIDLocal(),
       groupCount: 100000.int32,
       groupIds: @[]
     )
@@ -1331,7 +1331,7 @@ suite "Fractio Client - Active Transaction State":
 
   test "activeTxnId can be manually set":
     let c = client.newFractioClient("localhost", 9000)
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     c.activeTxnId = txnId
     check c.activeTxnId == txnId
     c.close()
@@ -1354,7 +1354,7 @@ suite "Fractio Client - keyPrefixToGroup":
 
   test "keyPrefixToGroup can have entries added":
     let c = client.newFractioClient("localhost", 9000)
-    let gid = genGroupID()
+    let gid = genGroupIDLocal()
     c.keyPrefixToGroup["custom_prefix"] = gid
     check c.keyPrefixToGroup.len == 1
     check c.keyPrefixToGroup["custom_prefix"] == gid
@@ -1364,8 +1364,8 @@ suite "Fractio Client - keyPrefixToGroup":
     # Note: keyPrefixToGroup is NOT cleared by close() - this is expected
     # as the field is rarely used and clear() doesn't affect it
     let c = client.newFractioClient("localhost", 9000)
-    c.keyPrefixToGroup["prefix1"] = genGroupID()
-    c.keyPrefixToGroup["prefix2"] = genGroupID()
+    c.keyPrefixToGroup["prefix1"] = genGroupIDLocal()
+    c.keyPrefixToGroup["prefix2"] = genGroupIDLocal()
     c.close()
     # After close, keyPrefixToGroup still has entries (not cleared)
     # This matches the current implementation behavior
@@ -1384,9 +1384,9 @@ suite "Fractio Client - getRoutingState":
 
   test "getRoutingState includes tables":
     let c = client.newFractioClient("localhost", 9000)
-    let tid1 = genTableId()
-    let tid2 = genTableId()
-    let spaceId = genSpaceID()
+    let tid1 = genTableIdLocal()
+    let tid2 = genTableIdLocal()
+    let spaceId = genSpaceIDLocal()
 
     c.tables[tid1] = client.TableInfo(tableId: tid1, name: "users",
         spaceId: spaceId)
@@ -1402,9 +1402,9 @@ suite "Fractio Client - getRoutingState":
 
   test "getRoutingState includes spaces":
     let c = client.newFractioClient("localhost", 9000)
-    let spaceId = genSpaceID()
-    let gid1 = genGroupID()
-    let gid2 = genGroupID()
+    let spaceId = genSpaceIDLocal()
+    let gid1 = genGroupIDLocal()
+    let gid2 = genGroupIDLocal()
 
     c.spaces[spaceId] = client.SpaceInfo(
       spaceId: spaceId,
@@ -1423,9 +1423,9 @@ suite "Fractio Client - getRoutingState":
 
   test "getRoutingState includes rebalancing info":
     let c = client.newFractioClient("localhost", 9000)
-    let spaceId = genSpaceID()
-    let oldGid = genGroupID()
-    let newGid = genGroupID()
+    let spaceId = genSpaceIDLocal()
+    let oldGid = genGroupIDLocal()
+    let newGid = genGroupIDLocal()
 
     c.spaces[spaceId] = client.SpaceInfo(
       spaceId: spaceId,
@@ -1443,8 +1443,8 @@ suite "Fractio Client - getRoutingState":
 
   test "getRoutingState snapshot is independent of client":
     let c = client.newFractioClient("localhost", 9000)
-    let tid = genTableId()
-    let spaceId = genSpaceID()
+    let tid = genTableIdLocal()
+    let spaceId = genSpaceIDLocal()
 
     c.tables[tid] = client.TableInfo(tableId: tid, name: "test",
         spaceId: spaceId)
@@ -1467,7 +1467,7 @@ suite "Fractio Client - InGroup Operations Error Handling":
   test "getInGroup returns error when client not initialized":
     let c = client.newFractioClient("localhost", 9000)
     check c.initialized.load(moRelaxed) == false
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     let result = c.getInGroup("test_key", groupId)
     check result.isErr == true
     check result.err == "client not initialized"
@@ -1475,8 +1475,8 @@ suite "Fractio Client - InGroup Operations Error Handling":
 
   test "getInGroup returns error with txn params when not initialized":
     let c = client.newFractioClient("localhost", 9000)
-    let groupId = genGroupID()
-    let txnId = genTransactionID()
+    let groupId = genGroupIDLocal()
+    let txnId = genTransactionIDLocal()
     let result = c.getInGroup("test_key", groupId, txnId = txnId,
         readTimestamp = 12345)
     check result.isErr == true
@@ -1485,7 +1485,7 @@ suite "Fractio Client - InGroup Operations Error Handling":
 
   test "putInGroup returns error when client not initialized":
     let c = client.newFractioClient("localhost", 9000)
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     let result = c.putInGroup("test_key", "test_value", groupId)
     check result.isErr == true
     check result.err == "client not initialized"
@@ -1493,8 +1493,8 @@ suite "Fractio Client - InGroup Operations Error Handling":
 
   test "putInGroup returns error with txn params when not initialized":
     let c = client.newFractioClient("localhost", 9000)
-    let groupId = genGroupID()
-    let txnId = genTransactionID()
+    let groupId = genGroupIDLocal()
+    let txnId = genTransactionIDLocal()
     let result = c.putInGroup("test_key", "test_value", groupId, txnId = txnId)
     check result.isErr == true
     check result.err == "client not initialized"
@@ -1502,7 +1502,7 @@ suite "Fractio Client - InGroup Operations Error Handling":
 
   test "deleteInGroup returns error when client not initialized":
     let c = client.newFractioClient("localhost", 9000)
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     let result = c.deleteInGroup("test_key", groupId)
     check result.isErr == true
     check result.err == "client not initialized"
@@ -1510,8 +1510,8 @@ suite "Fractio Client - InGroup Operations Error Handling":
 
   test "deleteInGroup returns error with txn params when not initialized":
     let c = client.newFractioClient("localhost", 9000)
-    let groupId = genGroupID()
-    let txnId = genTransactionID()
+    let groupId = genGroupIDLocal()
+    let txnId = genTransactionIDLocal()
     let result = c.deleteInGroup("test_key", groupId, txnId = txnId)
     check result.isErr == true
     check result.err == "client not initialized"
@@ -1521,7 +1521,7 @@ suite "Fractio Client - InGroup Operations Error Handling":
     let c = client.newFractioClient("localhost", 9000)
     c.config.maxKvRetries = 1
     c.initialized.store(true, moRelaxed)
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     # Group not in groups table
     let result = c.getInGroup("test_key", groupId)
     check result.isErr == true
@@ -1532,7 +1532,7 @@ suite "Fractio Client - InGroup Operations Error Handling":
     let c = client.newFractioClient("localhost", 9000)
     c.config.maxKvRetries = 1
     c.initialized.store(true, moRelaxed)
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     let result = c.putInGroup("test_key", "test_value", groupId)
     check result.isErr == true
     check result.err == "no connection to group leader"
@@ -1542,7 +1542,7 @@ suite "Fractio Client - InGroup Operations Error Handling":
     let c = client.newFractioClient("localhost", 9000)
     c.config.maxKvRetries = 1
     c.initialized.store(true, moRelaxed)
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     let result = c.deleteInGroup("test_key", groupId)
     check result.isErr == true
     check result.err == "no connection to group leader"
@@ -1572,9 +1572,9 @@ suite "Fractio Client - getGroupForKey Additional Edge Cases":
 
   test "getGroupForKey handles key without primary key":
     let c = client.newFractioClient("localhost", 9000)
-    let tid = genTableId()
-    let spaceId = genSpaceID()
-    let gid = genGroupID()
+    let tid = genTableIdLocal()
+    let spaceId = genSpaceIDLocal()
+    let gid = genGroupIDLocal()
 
     c.tables[tid] = client.TableInfo(tableId: tid, name: "test",
         spaceId: spaceId)
@@ -1592,10 +1592,10 @@ suite "Fractio Client - getGroupForKey Additional Edge Cases":
 
   test "getGroupForKey with special characters in pk":
     let c = client.newFractioClient("localhost", 9000)
-    let tid = genTableId()
-    let spaceId = genSpaceID()
-    let gid1 = genGroupID()
-    let gid2 = genGroupID()
+    let tid = genTableIdLocal()
+    let spaceId = genSpaceIDLocal()
+    let gid1 = genGroupIDLocal()
+    let gid2 = genGroupIDLocal()
 
     c.tables[tid] = client.TableInfo(tableId: tid, name: "test",
         spaceId: spaceId)
@@ -1632,7 +1632,7 @@ suite "Fractio Client - getTableIdFromKey Additional Cases":
 
   test "getTableIdFromKey with very long key":
     let c = client.newFractioClient("localhost", 9000)
-    let tid = genTableId()
+    let tid = genTableIdLocal()
     let longPk = "pk_" & repeat('x', 1000)
     let key = encodeTableKey(tid, longPk)
     let parsedTid = c.getTableIdFromKey(key)
@@ -1709,9 +1709,9 @@ suite "Fractio Client - NodeStatus Additional":
 
 suite "Fractio Client - SpaceOpResult Internal":
   test "spaceOpOk creates success result":
-    let spaceId = genSpaceID()
-    let gid1 = genGroupID()
-    let gid2 = genGroupID()
+    let spaceId = genSpaceIDLocal()
+    let gid1 = genGroupIDLocal()
+    let gid2 = genGroupIDLocal()
     # Note: spaceOpOk/spaceOpErr are internal, test via createSpace/dropSpace behavior
     # We test the result type structure instead
     let result = client.SpaceOpResult(
@@ -1741,8 +1741,8 @@ suite "Fractio Client - SpaceOpResult Internal":
 suite "Fractio Client - GroupInfo Additional":
   test "GroupInfo with single replica":
     let groupInfo = client.GroupInfo(
-      groupId: genGroupID(),
-      spaceId: genSpaceID(),
+      groupId: genGroupIDLocal(),
+      spaceId: genSpaceIDLocal(),
       leaderNodeId: 1,
       replicaNodeIds: @[1.uint32]
     )
@@ -1751,8 +1751,8 @@ suite "Fractio Client - GroupInfo Additional":
 
   test "GroupInfo with leader not in replicas":
     let groupInfo = client.GroupInfo(
-      groupId: genGroupID(),
-      spaceId: genSpaceID(),
+      groupId: genGroupIDLocal(),
+      spaceId: genSpaceIDLocal(),
       leaderNodeId: 100, # Leader not in replica list
       replicaNodeIds: @[1.uint32, 2, 3]
     )
@@ -1761,8 +1761,8 @@ suite "Fractio Client - GroupInfo Additional":
 
   test "GroupInfo with duplicate replicas":
     let groupInfo = client.GroupInfo(
-      groupId: genGroupID(),
-      spaceId: genSpaceID(),
+      groupId: genGroupIDLocal(),
+      spaceId: genSpaceIDLocal(),
       leaderNodeId: 1,
       replicaNodeIds: @[1.uint32, 1, 1] # Duplicates allowed
     )
@@ -1776,11 +1776,11 @@ suite "Fractio Client - SpaceInfo Additional":
   test "SpaceInfo with many old groups":
     var oldGroups: seq[GroupID] = @[]
     for i in 0..<20:
-      oldGroups.add(genGroupID())
+      oldGroups.add(genGroupIDLocal())
     let spaceInfo = client.SpaceInfo(
-      spaceId: genSpaceID(),
+      spaceId: genSpaceIDLocal(),
       name: "many_old_groups",
-      groupIds: @[genGroupID()],
+      groupIds: @[genGroupIDLocal()],
       oldGroupIds: oldGroups,
       rebalancing: true
     )
@@ -1788,16 +1788,16 @@ suite "Fractio Client - SpaceInfo Additional":
 
   test "SpaceInfo with empty name":
     let spaceInfo = client.SpaceInfo(
-      spaceId: genSpaceID(),
+      spaceId: genSpaceIDLocal(),
       name: "",
-      groupIds: @[genGroupID()],
+      groupIds: @[genGroupIDLocal()],
       oldGroupIds: @[],
       rebalancing: false
     )
     check spaceInfo.name == ""
 
   test "SpaceInfo comparison":
-    let sid = genSpaceID()
+    let sid = genSpaceIDLocal()
     let s1 = client.SpaceInfo(spaceId: sid, name: "test")
     let s2 = client.SpaceInfo(spaceId: sid, name: "test")
     check s1.name == s2.name
@@ -1851,20 +1851,20 @@ suite "Fractio Client - State After Close":
 
   test "groups cleared after close":
     let c = client.newFractioClient("localhost", 9000)
-    c.groups[genGroupID()] = client.GroupInfo(groupId: genGroupID(),
-        spaceId: genSpaceID())
+    c.groups[genGroupIDLocal()] = client.GroupInfo(groupId: genGroupIDLocal(),
+        spaceId: genSpaceIDLocal())
     c.close()
     check c.groups.len == 0
 
   test "spaces cleared after close":
     let c = client.newFractioClient("localhost", 9000)
-    c.spaces[genSpaceID()] = client.SpaceInfo(spaceId: genSpaceID(), name: "test")
+    c.spaces[genSpaceIDLocal()] = client.SpaceInfo(spaceId: genSpaceIDLocal(), name: "test")
     c.close()
     check c.spaces.len == 0
 
   test "tables cleared after close":
     let c = client.newFractioClient("localhost", 9000)
-    c.tables[genTableId()] = client.TableInfo(tableId: genTableId(), name: "test")
+    c.tables[genTableIdLocal()] = client.TableInfo(tableId: genTableIdLocal(), name: "test")
     c.close()
     check c.tables.len == 0
 
@@ -1933,7 +1933,7 @@ suite "Fractio Client - KV Interface Methods":
 
   test "get method with transaction params":
     let c = client.newFractioClient("localhost", 9000)
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let result = c.get("test_key", txnId = txnId, readTimestamp = 1000)
     check result.isErr == true
     check result.err == "client not initialized"
@@ -1941,7 +1941,7 @@ suite "Fractio Client - KV Interface Methods":
 
   test "put method with transaction params":
     let c = client.newFractioClient("localhost", 9000)
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let result = c.put("test_key", "test_value", txnId = txnId)
     check result.isErr == true
     check result.err == "client not initialized"
@@ -1949,7 +1949,7 @@ suite "Fractio Client - KV Interface Methods":
 
   test "delete method with transaction params":
     let c = client.newFractioClient("localhost", 9000)
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let result = c.delete("test_key", txnId = txnId)
     check result.isErr == true
     check result.err == "client not initialized"
@@ -1957,7 +1957,7 @@ suite "Fractio Client - KV Interface Methods":
 
   test "scan method with all params":
     let c = client.newFractioClient("localhost", 9000)
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let result = c.scan("start", "end", limit = 10, txnId = txnId,
         readTimestamp = 1000)
     check result.isErr == true
@@ -1971,9 +1971,9 @@ suite "Fractio Client - KV Interface Methods":
 suite "Fractio Client - Routing State Thread Safety":
   test "concurrent getRoutingState calls":
     let c = client.newFractioClient("localhost", 9000)
-    let tid = genTableId()
+    let tid = genTableIdLocal()
     c.tables[tid] = client.TableInfo(tableId: tid, name: "test",
-        spaceId: genSpaceID())
+        spaceId: genSpaceIDLocal())
 
     var successCount: Atomic[int]
     successCount.store(0)

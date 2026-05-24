@@ -34,6 +34,7 @@ import ../distributed/raft/nuraft_coordinator
 import ../distributed/raft/group_types
 import ../distributed/meta/system_tables
 import ../distributed/meta/system_schemas
+import ../distributed/sharedtimer/timeprovider
 import ../storage/mvcc/types as mvccTypes
 import ../utils/logging
 import ../core/types
@@ -58,21 +59,35 @@ type
     store*: RaftKVStoreExt ## Raft KV store for sys table writes
     coord*: NuRaftCoordinator ## Coordinator for group management
     nodeId*: uint32 ## This node's ID
+    timeProvider*: TimeProvider ## Time source for ULID generation
     logger*: Logger ## Optional logger
 
 proc newSpaceManager*(store: RaftKVStoreExt, coord: NuRaftCoordinator,
-    nodeId: uint32, logger: Logger = nil): SpaceManager =
+    nodeId: uint32, timeProvider: TimeProvider = nil,
+    logger: Logger = nil): SpaceManager =
   ## Create a new SpaceManager.
   result = SpaceManager(
     store: store,
     coord: coord,
     nodeId: nodeId,
+    timeProvider: timeProvider,
     logger: logger
   )
 
 # ---------------------------------------------------------------------------
 # Helper procs
 # ---------------------------------------------------------------------------
+
+proc nowNs(sm: SpaceManager): int64 {.gcsafe, raises: [].} =
+  if sm.timeProvider != nil:
+    try:
+      sm.timeProvider.now()
+    except Exception:
+      let t = getTime()
+      t.toUnix * 1_000_000_000 + t.nanosecond.int64
+  else:
+    let t = getTime()
+    t.toUnix * 1_000_000_000 + t.nanosecond.int64
 
 proc safeLog(sm: SpaceManager, level: LogLevel, msg: string) {.raises: [].} =
   ## Safe logging that catches any exceptions.
@@ -197,7 +212,9 @@ proc computeGroupPlacement(nodeIds: seq[uint32], replicas: int,
     # This ensures each group has a unique ID that won't collide with others
     var groupId: ULID
     {.cast(gcsafe).}:
-      groupId = genULID()
+      let t = getTime()
+      let tsNs = t.toUnix * 1_000_000_000 + t.nanosecond.int64
+      groupId = genULID(tsNs)
 
     # Compute members using ring algorithm
     var members: seq[GroupReplicaBin] = @[]
@@ -330,7 +347,7 @@ proc createSpace*(sm: SpaceManager, req: CreateSpaceRequest): CreateSpaceRespons
 
     # 4. Generate ULID for spaceId
     timedLog("generating spaceId ULID")
-    spaceId = ({.cast(gcsafe).}: genSpaceID())
+    spaceId = ({.cast(gcsafe).}: genSpaceID(sm.nowNs()))
     timedLog(safeFmt("spaceId=$#", $spaceId))
     groupCount = nodeCount
 

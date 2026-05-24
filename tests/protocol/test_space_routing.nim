@@ -396,7 +396,7 @@ suite "Space routing — cache loading":
     defer: teardown(coord, "/tmp/fractio_sr_t30")
 
     # Write a space record into the meta range (binary format)
-    let spaceId = coreTypes.genSpaceID()
+    let spaceId = coreTypes.genSpaceIDLocal()
     let spaceKey = encodeSpaceKey(spaceId)
     let spaceRec = SpaceRecord(
       spaceId: spaceId,         # SpaceRecord.spaceId is now SpaceID
@@ -445,5 +445,5 @@ suite "Space routing — cache loading":
     store.loadSpaces()
     store.loadTableSpaces()
 
-    let spaceOpt = store.getSpaceForTable(genTableId())
+    let spaceOpt = store.getSpaceForTable(genTableIdLocal())
     check spaceOpt.isNone

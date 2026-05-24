@@ -175,7 +175,7 @@ suite "Raft State Serialization":
 suite "RaftPersistentStore - Log Operations":
   # Single shared backend for the entire suite to avoid LevelDB open/close issues
   var backend: WiscKeyBackend
-  let testDir = "/tmp/fractio_test_raft_log_" & $genULID()
+  let testDir = "/tmp/fractio_test_raft_log_" & $genULIDLocal()
 
   setup:
     if backend.isNil or not backend.isOpen:
@@ -326,7 +326,7 @@ suite "RaftPersistentStore - Log Operations":
 
 suite "RaftPersistentStore - State Operations":
   var backend: WiscKeyBackend
-  let testDir = "/tmp/fractio_test_raft_state_" & $genULID()
+  let testDir = "/tmp/fractio_test_raft_state_" & $genULIDLocal()
 
   setup:
     if backend.isNil or not backend.isOpen:

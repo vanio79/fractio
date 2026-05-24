@@ -485,6 +485,6 @@ suite "SQL Planner":
     check plan.ops[0].exInnerPlan.ops[0].kind == poCreateTable
 
   test "genTableId allocates unique IDs":
-    let id1 = genTableId()
-    let id2 = genTableId()
+    let id1 = genTableIdLocal()
+    let id2 = genTableIdLocal()
     check id1 != id2 # Each call should generate a unique ULID

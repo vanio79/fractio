@@ -82,8 +82,8 @@ suite "CreateSpace Messages":
     check decoded.isErr
 
   test "encodeCreateSpaceResponse success":
-    let spaceId = SpaceID(genULID())
-    let groupId = genULID()
+    let spaceId = SpaceID(genULIDLocal())
+    let groupId = genULIDLocal()
     let resp = CreateSpaceResponse(
       success: true,
       spaceId: spaceId,
@@ -100,7 +100,7 @@ suite "CreateSpace Messages":
     check success.value == 0x01'u8
 
   test "encodeCreateSpaceResponse success no groups":
-    let spaceId = SpaceID(genULID())
+    let spaceId = SpaceID(genULIDLocal())
     let resp = CreateSpaceResponse(
       success: true,
       spaceId: spaceId,
@@ -142,8 +142,8 @@ suite "CreateSpace Messages":
     check err.value == ""
 
   test "decodeCreateSpaceResponse success":
-    let spaceId = SpaceID(genULID())
-    let groupId = genULID()
+    let spaceId = SpaceID(genULIDLocal())
+    let groupId = genULIDLocal()
     let resp = CreateSpaceResponse(
       success: true,
       spaceId: spaceId,
@@ -151,7 +151,7 @@ suite "CreateSpace Messages":
       spaceRecord: "record1",
       groupRecords: @[
         GroupRecordData(groupId: groupId, record: "g1"),
-        GroupRecordData(groupId: genULID(), record: "g2")
+        GroupRecordData(groupId: genULIDLocal(), record: "g2")
       ]
     )
     let encoded = encodeCreateSpaceResponse(resp)
@@ -241,9 +241,9 @@ suite "DropSpace Messages":
     check decoded.isErr
 
   test "encodeDropSpaceResponse success with groups":
-    let spaceId = SpaceID(genULID())
-    let groupId1 = groupIDFromULID(genULID())
-    let groupId2 = groupIDFromULID(genULID())
+    let spaceId = SpaceID(genULIDLocal())
+    let groupId1 = groupIDFromULID(genULIDLocal())
+    let groupId2 = groupIDFromULID(genULIDLocal())
     let resp = DropSpaceResponse(
       success: true,
       spaceId: spaceId,
@@ -257,7 +257,7 @@ suite "DropSpace Messages":
     check success.value == 0x01'u8
 
   test "encodeDropSpaceResponse success no groups":
-    let spaceId = SpaceID(genULID())
+    let spaceId = SpaceID(genULIDLocal())
     let resp = DropSpaceResponse(
       success: true,
       spaceId: spaceId,
@@ -283,8 +283,8 @@ suite "DropSpace Messages":
     check err.value == "Space not found"
 
   test "decodeDropSpaceResponse success":
-    let spaceId = SpaceID(genULID())
-    let groupId = groupIDFromULID(genULID())
+    let spaceId = SpaceID(genULIDLocal())
+    let groupId = groupIDFromULID(genULIDLocal())
     let resp = DropSpaceResponse(
       success: true,
       spaceId: spaceId,
@@ -297,12 +297,12 @@ suite "DropSpace Messages":
     check decoded.value.deletedGroupIds.len == 1
 
   test "decodeDropSpaceResponse success multiple groups":
-    let spaceId = SpaceID(genULID())
+    let spaceId = SpaceID(genULIDLocal())
     let resp = DropSpaceResponse(
       success: true,
       spaceId: spaceId,
-      deletedGroupIds: @[groupIDFromULID(genULID()), groupIDFromULID(genULID()),
-          GroupID(genULID())]
+      deletedGroupIds: @[groupIDFromULID(genULIDLocal()), groupIDFromULID(genULIDLocal()),
+          GroupID(genULIDLocal())]
     )
     let encoded = encodeDropSpaceResponse(resp)
     let decoded = decodeDropSpaceResponse(encoded)
@@ -331,7 +331,7 @@ suite "DropSpace Messages":
     check decoded.isErr
 
   test "decodeDropSpaceResponse truncated groupId":
-    let spaceId = SpaceID(genULID())
+    let spaceId = SpaceID(genULIDLocal())
     let spaceBytes = spaceIDToBytes(spaceId)
     let invalid = "\x07\x09\x01" & spaceBytes &
         "\x00\x00\x00\x01" # success + spaceId + count=1, but no groupId
@@ -349,11 +349,11 @@ suite "DropSpace Messages":
 suite "GroupRecordData":
 
   test "GroupRecordData construction":
-    let groupId = genULID()
+    let groupId = genULIDLocal()
     let gr = GroupRecordData(groupId: groupId, record: "test_record")
     check gr.record == "test_record"
 
   test "GroupRecordData empty record":
-    let groupId = genULID()
+    let groupId = genULIDLocal()
     let gr = GroupRecordData(groupId: groupId, record: "")
     check gr.record == ""

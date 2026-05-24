@@ -135,15 +135,15 @@ suite "Strip MVCC Suffix":
 suite "Route to Group":
 
   test "routeToGroup single group":
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     let groupIds = @[groupId]
     let result = routeToGroup("any_key", groupIds)
     check result == groupId
 
   test "routeToGroup deterministic routing":
-    let g1 = genGroupID()
-    let g2 = genGroupID()
-    let g3 = genGroupID()
+    let g1 = genGroupIDLocal()
+    let g2 = genGroupIDLocal()
+    let g3 = genGroupIDLocal()
     let groupIds = @[g1, g2, g3]
     let r1 = routeToGroup("key1", groupIds)
     let r2 = routeToGroup("key1", groupIds)
@@ -155,8 +155,8 @@ suite "Route to Group":
     check result == META_GROUP_ID
 
   test "routeToGroup different keys different groups":
-    let g1 = genGroupID()
-    let g2 = genGroupID()
+    let g1 = genGroupIDLocal()
+    let g2 = genGroupIDLocal()
     let groupIds = @[g1, g2]
     let r1 = routeToGroup("key_a", groupIds)
     let r2 = routeToGroup("key_b_different_hash", groupIds)
@@ -253,7 +253,7 @@ suite "SpaceInfo Type":
       spaceId: SpaceID(ZeroULID()),
       name: "test_space",
       replicas: 3,
-      groupIds: @[genGroupID()],
+      groupIds: @[genGroupIDLocal()],
       oldGroupIds: @[],
       rebalancing: false,
       rebalanceWorker: 0,

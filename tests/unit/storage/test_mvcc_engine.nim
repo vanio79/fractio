@@ -259,7 +259,7 @@ suite "MVCCEngine - Basic Operations":
     check result.value.isNone
 
   test "get with own intent":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     addIntent(mockBackend, "key1", txnId, "intentValue", Timestamp(1000))
     let result = mvccEngine.mvccGet("key1", Timestamp(2000), txnId)
     check result.success == true
@@ -267,7 +267,7 @@ suite "MVCCEngine - Basic Operations":
     check result.value.get().data == "intentValue"
 
   test "get with foreign intent returns conflict":
-    let foreignTxnId = genTransactionID()
+    let foreignTxnId = genTransactionIDLocal()
     addIntent(mockBackend, "key1", foreignTxnId, "intentValue", Timestamp(1000))
     let result = mvccEngine.mvccGet("key1", Timestamp(2000))
     check result.success == false
@@ -388,7 +388,7 @@ suite "MVCCEngine - Scan Operations":
 
   test "scan skips intents":
     addVersion(mockBackend, "key1", Timestamp(500), "value500")
-    addIntent(mockBackend, "key1", genTransactionID(), "intentValue", Timestamp(600))
+    addIntent(mockBackend, "key1", genTransactionIDLocal(), "intentValue", Timestamp(600))
     let result = mvccEngine.mvccScan("key1", "key2", Timestamp(1000))
     check result.success == true
     check result.kvs.len == 1
@@ -435,7 +435,7 @@ suite "MVCCEngine - Intent Operations":
     )
 
   test "resolve intent - commit":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     addIntent(mockBackend, "key1", txnId, "intentValue", Timestamp(1000))
     let result = mvccEngine.resolveIntent("key1", txnId, commit = true,
         commitTimestamp = Timestamp(1500))
@@ -446,7 +446,7 @@ suite "MVCCEngine - Intent Operations":
     check mockBackend.exists(makeVersionKey("key1", Timestamp(1500)))
 
   test "resolve intent - abort":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     addIntent(mockBackend, "key1", txnId, "intentValue", Timestamp(1000))
     let result = mvccEngine.resolveIntent("key1", txnId, commit = false)
     check result.success == true
@@ -456,31 +456,31 @@ suite "MVCCEngine - Intent Operations":
     check mockBackend.exists(makeVersionKey("key1", Timestamp(1500))) == false
 
   test "resolve intent fails if not found":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let result = mvccEngine.resolveIntent("key1", txnId, commit = true)
     check result.success == false
     check result.error.code == mvccIntentNotFound
 
   test "cleanup intent":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     addIntent(mockBackend, "key1", txnId, "intentValue", Timestamp(1000))
     check mvccEngine.cleanupIntent("key1", txnId) == true
     check mockBackend.exists(makeIntentKey("key1", txnId)) == false
 
   test "get intent":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     addIntent(mockBackend, "key1", txnId, "intentValue", Timestamp(1000))
     let intent = mvccEngine.getIntent("key1", txnId)
     check intent.isSome
     check intent.get().data == "intentValue"
 
   test "get intent returns none if not found":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let intent = mvccEngine.getIntent("key1", txnId)
     check intent.isNone
 
   test "has intent - true":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     addIntent(mockBackend, "key1", txnId, "intentValue", Timestamp(1000))
     check mvccEngine.hasIntent("key1") == true
 
@@ -488,8 +488,8 @@ suite "MVCCEngine - Intent Operations":
     check mvccEngine.hasIntent("key1") == false
 
   test "get intents for key":
-    let txnId1 = genTransactionID()
-    let txnId2 = genTransactionID()
+    let txnId1 = genTransactionIDLocal()
+    let txnId2 = genTransactionIDLocal()
     addIntent(mockBackend, "key1", txnId1, "intent1", Timestamp(1000))
     addIntent(mockBackend, "key1", txnId2, "intent2", Timestamp(1100))
     let intents = mvccEngine.getIntentsForKey("key1")
@@ -527,7 +527,7 @@ suite "MVCCEngine - Version Operations":
 
   test "get latest version skips intents":
     addVersion(mockBackend, "key1", Timestamp(500), "value500")
-    addIntent(mockBackend, "key1", genTransactionID(), "intentValue", Timestamp(600))
+    addIntent(mockBackend, "key1", genTransactionIDLocal(), "intentValue", Timestamp(600))
     let version = mvccEngine.getLatestVersion("key1")
     check version.isSome
     check version.get().data == "value500"
@@ -652,7 +652,7 @@ suite "MVCCEngine - Edge Cases":
     check intent.get().data == ""
 
   test "resolve intent with delete flag":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     addIntent(mockBackend, "key1", txnId, "", Timestamp(1000), isDeleted = true)
     let result = mvccEngine.resolveIntent("key1", txnId, commit = true,
         commitTimestamp = Timestamp(1500))
@@ -723,7 +723,7 @@ suite "MVCCEngine - Key Encoding":
     check key.len > "userKey".len
 
   test "make intent key":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let key = makeIntentKey("userKey", txnId)
     check key.contains("userKey")
     check key.len > "userKey".len
@@ -733,7 +733,7 @@ suite "MVCCEngine - Key Encoding":
       data: "testData",
       timestamp: 1500,
       isDeleted: false,
-      txnId: genTransactionID()
+      txnId: genTransactionIDLocal()
     )
     let encoded = encodeMVCCValue(original.data, original.timestamp,
         original.isDeleted, original.txnId)
@@ -750,7 +750,7 @@ suite "MVCCEngine - Key Encoding":
     check decoded.isIntent == false
 
   test "decode intent key":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let intentKey = makeIntentKey("userKey", txnId)
     let decoded = decodeIntentKey(intentKey)
     check decoded.userKey == "userKey"
@@ -873,7 +873,7 @@ suite "MVCCEngine - Streaming Scan":
 
   test "mvccStreamScan skips intents":
     addVersion(mockBackend, "key1", Timestamp(500), "value500")
-    addIntent(mockBackend, "key1", genTransactionID(), "intentValue", Timestamp(600))
+    addIntent(mockBackend, "key1", genTransactionIDLocal(), "intentValue", Timestamp(600))
 
     let stream = mvccEngine.mvccStreamScan("key1", "key2", Timestamp(1000))
 

@@ -252,7 +252,7 @@ proc seedSysGroups(nodes: seq[TestNode], nodeNums: seq[int],
             replicaType: rtVoter))
       let groupRec = GroupRecord(
         groupId: groupIDToULID(gid),
-        spaceId: if gid == META_GROUP_ID: zeroSpaceID() else: genSpaceID(),
+        spaceId: if gid == META_GROUP_ID: zeroSpaceID() else: genSpaceIDLocal(),
         leader: uint32(nodeNums[0]),
         replicas: replicasSeq,
       )

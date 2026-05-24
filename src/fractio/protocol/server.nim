@@ -2693,6 +2693,8 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
 # Seed system tables: sys.nodes (table 5) and sys.groups (table 4)
   # Only seed when starting as fresh leader with NO existing data
   if startAsLeader and not isRejoining and not hasExistingSpaces:
+    let seedTsNs = try: server.sharedTimer.now() except Exception:
+      let t = getTime(); t.toUnix * 1_000_000_000 + t.nanosecond.int64
     # Use a single transaction for all seeding operations
     discard mvccStore.withAutoTransaction(proc(
         sessionId: uint64): MvccVoidResult =
@@ -2708,9 +2710,10 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
 
       for gid in [META_GROUP_ID, DATA_GROUP_START_ID]:
         let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid)
+        let spaceIdVal = ({.cast(gcsafe).}: genSpaceID(seedTsNs))
         let groupRec = GroupRecord(
           groupId: groupIDToULID(gid),
-          spaceId: ({.cast(gcsafe).}: genSpaceID()), # TODO: proper space ID for meta/data groups
+          spaceId: spaceIdVal, # TODO: proper space ID for meta/data groups
           preferredLeader: server.config.serverId,
           leader: server.config.serverId,
           replicas: @[GroupReplicaBin(nodeId: server.config.serverId,
@@ -2741,7 +2744,7 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
       discard mvccStore.txnPut(sessionId, scKey, encode(scRec))
 
       # Seed default space (replicas=0 means ALL, single group = META_GROUP_ID)
-      let defaultSpaceId = ({.cast(gcsafe).}: genSpaceID())
+      let defaultSpaceId = ({.cast(gcsafe).}: genSpaceID(seedTsNs))
       let spaceKey = encodeTableKey(SYS_SPACES_TABLE_ID, $defaultSpaceId)
       let spaceRec = SpaceRecord(
         spaceId: defaultSpaceId,

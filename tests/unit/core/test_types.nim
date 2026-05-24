@@ -16,24 +16,24 @@ suite "ULID Basic Operations":
     let b = ZeroULID()
     check a == b
 
-    let c = genULID()
+    let c = genULIDLocal()
     check a != c
 
   test "ULID inequality":
     let a = ZeroULID()
-    let b = genULID()
+    let b = genULIDLocal()
     check a != b
 
   test "ULID less than ordering":
     let earlier = ZeroULID()
-    let later = genULID()
+    let later = genULIDLocal()
     check earlier < later
     check not (later < earlier)
 
   test "ULID ordering with same prefix":
     # Create two ULIDs - the first should be < second (monotonically increasing)
-    let u1 = genULID()
-    let u2 = genULID()
+    let u1 = genULIDLocal()
+    let u2 = genULIDLocal()
     # They could be equal if generated in same millisecond with same randomness
     # but typically u1 < u2 due to timestamp ordering
     check u1 == u1 # Self-equality
@@ -60,14 +60,14 @@ suite "ULID String Operations":
     check u == ZeroULID()
 
   test "ulidToString roundtrip":
-    let original = genULID()
+    let original = genULIDLocal()
     let s = $original
     check s.len == 26
     let restored = ulidFromString(s)
     check restored == original
 
   test "ulidToString format":
-    let u = genULID()
+    let u = genULIDLocal()
     let s = $u
     # All chars should be valid Crockford base32
     const validChars = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
@@ -77,12 +77,12 @@ suite "ULID String Operations":
 suite "ULID Binary Operations":
 
   test "ulidToBytes produces 16 bytes":
-    let u = genULID()
+    let u = genULIDLocal()
     let bytes = ulidToBytes(u)
     check bytes.len == ULID_SIZE
 
   test "ulidFromBytes roundtrip":
-    let original = genULID()
+    let original = genULIDLocal()
     let bytes = ulidToBytes(original)
     let restored = ulidFromBytes(bytes)
     check restored == original
@@ -104,7 +104,7 @@ suite "ULID Binary Operations":
 suite "ULID Timestamp Extraction":
 
   test "ulidTimestamp returns milliseconds":
-    let u = genULID()
+    let u = genULIDLocal()
     let ts = ulidTimestamp(u)
     # Should be a reasonable Unix timestamp (milliseconds since epoch)
     check ts > 0
@@ -121,20 +121,20 @@ suite "genULID":
   test "generates unique IDs":
     var seen: HashSet[ULID] = initHashSet[ULID]()
     for i in 0 ..< 1000:
-      let u = genULID()
+      let u = genULIDLocal()
       check u notin seen
       seen.incl(u)
 
   test "generates monotonically increasing timestamps":
     var lastTs: int64 = 0
     for i in 0 ..< 100:
-      let u = genULID()
+      let u = genULIDLocal()
       let ts = ulidTimestamp(u)
       check ts >= lastTs
       lastTs = ts
 
   test "generated ULID is not zero":
-    let u = genULID()
+    let u = genULIDLocal()
     check u != ZeroULID()
 
 suite "DataType Enum":
@@ -182,7 +182,7 @@ suite "ValueRef Constructors":
     check v.bytesValue == @[1'u8, 2'u8, 3'u8]
 
   test "newValueRef ULID":
-    let u = genULID()
+    let u = genULIDLocal()
     let v = newValueRef(u)
     check v.kind == dtULID
     check v.ulidValue == u
@@ -224,48 +224,48 @@ suite "ValueRef Templates":
 suite "Row Operations":
 
   test "newRow creates empty row":
-    let row = newRow()
+    let row = newRow(createdAtMs = localTimeNs() div 1_000_000)
     check row.values.len == 0
     check row.version == 1
     check row.id == RowID(ZeroULID())
 
   test "newRow with custom ID":
-    let id = genRowID()
-    let row = newRow(id)
+    let id = genRowIDLocal()
+    let row = newRow(id, createdAtMs = localTimeNs() div 1_000_000)
     check row.id == id
 
   test "Row has timestamps":
-    let row = newRow()
+    let row = newRow(createdAtMs = localTimeNs() div 1_000_000)
     check row.createdAt > 0
     check row.updatedAt > 0
 
 suite "TransactionID Operations":
 
   test "TransactionID equality":
-    let a = genTransactionID()
-    let b = genTransactionID()
+    let a = genTransactionIDLocal()
+    let b = genTransactionIDLocal()
     check a == a
     check a != b
 
   test "TransactionID inequality":
-    let a = genTransactionID()
-    let b = genTransactionID()
+    let a = genTransactionIDLocal()
+    let b = genTransactionIDLocal()
     check a != b
     check not (a == b)
 
   test "TransactionID ordering":
     let a = zeroTransactionID()
-    let b = genTransactionID()
+    let b = genTransactionIDLocal()
     check a < b
 
   test "TransactionID string":
-    let id = genTransactionID()
+    let id = genTransactionIDLocal()
     let s = $id
     check s.len == 26
 
   test "TransactionID hash":
-    let a = genTransactionID()
-    let b = genTransactionID()
+    let a = genTransactionIDLocal()
+    let b = genTransactionIDLocal()
     check hash(a) != hash(b)
     check hash(a) == hash(a)
 
@@ -275,16 +275,16 @@ suite "TransactionID Operations":
 
   test "isZero TransactionID":
     check isZero(zeroTransactionID())
-    check not isZero(genTransactionID())
+    check not isZero(genTransactionIDLocal())
 
   test "transactionIDFromBytes":
-    let original = genTransactionID()
+    let original = genTransactionIDLocal()
     let bytes = transactionIDToBytes(original)
     let restored = transactionIDFromBytes(bytes)
     check restored == original
 
   test "transactionIDFromString":
-    let original = genTransactionID()
+    let original = genTransactionIDLocal()
     let s = $original
     let restored = transactionIDFromString(s)
     check restored == original
@@ -292,24 +292,24 @@ suite "TransactionID Operations":
 suite "RowID Operations":
 
   test "RowID equality":
-    let a = genRowID()
-    let b = genRowID()
+    let a = genRowIDLocal()
+    let b = genRowIDLocal()
     check a == a
     check a != b
 
   test "RowID ordering":
     let a = zeroRowID()
-    let b = genRowID()
+    let b = genRowIDLocal()
     check a < b
 
   test "RowID string":
-    let id = genRowID()
+    let id = genRowIDLocal()
     let s = $id
     check s.len == 26
 
   test "RowID hash":
-    let a = genRowID()
-    let b = genRowID()
+    let a = genRowIDLocal()
+    let b = genRowIDLocal()
     check hash(a) != hash(b)
 
   test "zeroRowID":
@@ -318,28 +318,28 @@ suite "RowID Operations":
 
   test "isZero RowID":
     check isZero(zeroRowID())
-    check not isZero(genRowID())
+    check not isZero(genRowIDLocal())
 
 suite "ShardID Operations":
 
   test "ShardID equality":
-    let a = genShardID()
-    let b = genShardID()
+    let a = genShardIDLocal()
+    let b = genShardIDLocal()
     check a == a
     check a != b
 
   test "ShardID ordering":
     let a = zeroShardID()
-    let b = genShardID()
+    let b = genShardIDLocal()
     check a < b
 
   test "ShardID string":
-    let id = genShardID()
+    let id = genShardIDLocal()
     let s = $id
     check s.len == 26
 
   test "ShardID hash":
-    let id = genShardID()
+    let id = genShardIDLocal()
     check hash(id) == hash(id)
 
   test "zeroShardID":
@@ -347,83 +347,83 @@ suite "ShardID Operations":
 
   test "isZero ShardID":
     check isZero(zeroShardID())
-    check not isZero(genShardID())
+    check not isZero(genShardIDLocal())
 
 suite "TableId Operations":
 
   test "TableId equality":
-    let a = genTableId()
-    let b = genTableId()
+    let a = genTableIdLocal()
+    let b = genTableIdLocal()
     check a == a
     check a != b
 
   test "TableId ordering":
     let a = zeroTableId()
-    let b = genTableId()
+    let b = genTableIdLocal()
     check a < b
 
   test "TableId string":
-    let id = genTableId()
+    let id = genTableIdLocal()
     let s = $id
     check s.len == 26
 
   test "TableId hash":
-    check hash(genTableId()) != hash(genTableId())
+    check hash(genTableIdLocal()) != hash(genTableIdLocal())
 
   test "zeroTableId":
     check zeroTableId() == zeroTableId()
 
   test "isZero TableId":
     check isZero(zeroTableId())
-    check not isZero(genTableId())
+    check not isZero(genTableIdLocal())
 
   test "tableIdFromBytes":
-    let original = genTableId()
+    let original = genTableIdLocal()
     let bytes = tableIdToBytes(original)
     let restored = tableIdFromBytes(bytes)
     check restored == original
 
   test "tableIdFromString":
-    let original = genTableId()
+    let original = genTableIdLocal()
     let restored = tableIdFromString($original)
     check restored == original
 
 suite "SpaceID Operations":
 
   test "SpaceID equality":
-    let a = genSpaceID()
-    let b = genSpaceID()
+    let a = genSpaceIDLocal()
+    let b = genSpaceIDLocal()
     check a == a
     check a != b
 
   test "SpaceID ordering":
     let a = zeroSpaceID()
-    let b = genSpaceID()
+    let b = genSpaceIDLocal()
     check a < b
 
   test "SpaceID string":
-    let id = genSpaceID()
+    let id = genSpaceIDLocal()
     let s = $id
     check s.len == 26
 
   test "SpaceID hash":
-    check hash(genSpaceID()) != hash(genSpaceID())
+    check hash(genSpaceIDLocal()) != hash(genSpaceIDLocal())
 
   test "zeroSpaceID":
     check zeroSpaceID() == zeroSpaceID()
 
   test "isZero SpaceID":
     check isZero(zeroSpaceID())
-    check not isZero(genSpaceID())
+    check not isZero(genSpaceIDLocal())
 
   test "spaceIDFromBytes":
-    let original = genSpaceID()
+    let original = genSpaceIDLocal()
     let bytes = spaceIDToBytes(original)
     let restored = spaceIDFromBytes(bytes)
     check restored == original
 
   test "spaceIDFromString":
-    let original = genSpaceID()
+    let original = genSpaceIDLocal()
     let restored = spaceIDFromString($original)
     check restored == original
 
@@ -493,34 +493,34 @@ suite "ID Generation Uniqueness":
   test "TransactionIDs are unique":
     var seen: HashSet[TransactionID] = initHashSet[TransactionID]()
     for i in 0 ..< 1000:
-      let id = genTransactionID()
+      let id = genTransactionIDLocal()
       check id notin seen
       seen.incl(id)
 
   test "RowIDs are unique":
     var seen: HashSet[RowID] = initHashSet[RowID]()
     for i in 0 ..< 1000:
-      let id = genRowID()
+      let id = genRowIDLocal()
       check id notin seen
       seen.incl(id)
 
   test "ShardIDs are unique":
     var seen: HashSet[ShardID] = initHashSet[ShardID]()
     for i in 0 ..< 1000:
-      let id = genShardID()
+      let id = genShardIDLocal()
       check id notin seen
       seen.incl(id)
 
   test "TableIds are unique":
     var seen: HashSet[TableId] = initHashSet[TableId]()
     for i in 0 ..< 1000:
-      let id = genTableId()
+      let id = genTableIdLocal()
       check id notin seen
       seen.incl(id)
 
   test "SpaceIDs are unique":
     var seen: HashSet[SpaceID] = initHashSet[SpaceID]()
     for i in 0 ..< 1000:
-      let id = genSpaceID()
+      let id = genSpaceIDLocal()
       check id notin seen
       seen.incl(id)

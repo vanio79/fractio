@@ -71,14 +71,14 @@ suite "BeginTxn Messages":
     check decoded.isErr
 
   test "encodeBeginTxnResponse":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let resp = BeginTxnResponse(txnId: TransactionID(txnId),
         readTimestamp: 123456789'u64)
     let encoded = encodeBeginTxnResponse(resp)
     check encoded.len == 26 # 2 byte type + 16 byte ULID + 8 byte timestamp
 
   test "decodeBeginTxnResponse valid":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let resp = BeginTxnResponse(txnId: TransactionID(txnId),
         readTimestamp: 987654321'u64)
     let encoded = encodeBeginTxnResponse(resp)
@@ -92,7 +92,7 @@ suite "BeginTxn Messages":
     check decoded.isErr
 
   test "decodeBeginTxnResponse truncated timestamp":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let txnBytes = ulidToBytes(txnId)
     let invalid = "\x02\x00" & txnBytes # Message type + txnId, no timestamp
     let decoded = decodeBeginTxnResponse(invalid)
@@ -109,13 +109,13 @@ suite "BeginTxn Messages":
 suite "CommitTxn Messages":
 
   test "encodeCommitTxnRequest":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = CommitTxnRequest(txnId: TransactionID(txnId))
     let encoded = encodeCommitTxnRequest(req)
     check encoded.len == 18 # 2 byte type + 16 byte ULID
 
   test "decodeCommitTxnRequest valid":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = CommitTxnRequest(txnId: TransactionID(txnId))
     let encoded = encodeCommitTxnRequest(req)
     let decoded = decodeCommitTxnRequest(encoded)
@@ -187,7 +187,7 @@ suite "CommitTxn Messages":
     check decoded.isErr
 
   test "CommitTxn request roundtrip":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = CommitTxnRequest(txnId: TransactionID(txnId))
     let encoded = encodeCommitTxnRequest(req)
     let decoded = decodeCommitTxnRequest(encoded)
@@ -206,13 +206,13 @@ suite "CommitTxn Messages":
 suite "RollbackTxn Messages":
 
   test "encodeRollbackTxnRequest":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = RollbackTxnRequest(txnId: TransactionID(txnId))
     let encoded = encodeRollbackTxnRequest(req)
     check encoded.len == 18 # 2 byte type + 16 byte ULID
 
   test "decodeRollbackTxnRequest valid":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = RollbackTxnRequest(txnId: TransactionID(txnId))
     let encoded = encodeRollbackTxnRequest(req)
     let decoded = decodeRollbackTxnRequest(encoded)
@@ -256,7 +256,7 @@ suite "RollbackTxn Messages":
     check decoded.isErr
 
   test "RollbackTxn request roundtrip":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = RollbackTxnRequest(txnId: TransactionID(txnId))
     let encoded = encodeRollbackTxnRequest(req)
     let decoded = decodeRollbackTxnRequest(encoded)
@@ -273,13 +273,13 @@ suite "RollbackTxn Messages":
 suite "TxnStatus Messages":
 
   test "encodeTxnStatusRequest":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = TxnStatusRequest(txnId: TransactionID(txnId))
     let encoded = encodeTxnStatusRequest(req)
     check encoded.len == 18 # 2 byte type + 16 byte ULID
 
   test "decodeTxnStatusRequest valid":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = TxnStatusRequest(txnId: TransactionID(txnId))
     let encoded = encodeTxnStatusRequest(req)
     let decoded = decodeTxnStatusRequest(encoded)
@@ -354,7 +354,7 @@ suite "TxnStatus Messages":
     check decoded.isErr
 
   test "TxnStatus request roundtrip":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = TxnStatusRequest(txnId: TransactionID(txnId))
     let encoded = encodeTxnStatusRequest(req)
     let decoded = decodeTxnStatusRequest(encoded)

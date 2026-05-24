@@ -177,7 +177,7 @@ suite "TxnManager - getWriteSet":
 
   test "getWriteSet returns empty seq for unknown txnId":
     let mgr = newTransactionManager()
-    let ws = mgr.getWriteSet(coreTypes.genTransactionID())
+    let ws = mgr.getWriteSet(coreTypes.genTransactionIDLocal())
     check ws.len == 0
 
   test "getWriteSet returns empty seq for txn with no writes":

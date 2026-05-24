@@ -138,7 +138,7 @@ suite "txn codec - BeginTxnRequest/Response":
     check (r.value.flags and TxnFlagSerializable) != 0
 
   test "begin response encodes and decodes":
-    let testTxnId = genTransactionID()
+    let testTxnId = genTransactionIDLocal()
     let resp = txnMsgs.BeginTxnResponse(txnId: testTxnId,
         readTimestamp: 999_999)
     let payload = txnMsgs.encodeBeginTxnResponse(resp)
@@ -158,7 +158,7 @@ suite "txn codec - BeginTxnRequest/Response":
 
 suite "txn codec - CommitTxnRequest/Response":
   test "commit request encodes and decodes":
-    let testTxnId = genTransactionID()
+    let testTxnId = genTransactionIDLocal()
     let req = txnMsgs.CommitTxnRequest(txnId: testTxnId)
     let payload = txnMsgs.encodeCommitTxnRequest(req)
     let r = txnMsgs.decodeCommitTxnRequest(payload)
@@ -205,7 +205,7 @@ suite "txn codec - CommitTxnRequest/Response":
 
 suite "txn codec - RollbackTxnRequest/Response":
   test "rollback request encodes and decodes":
-    let testTxnId = genTransactionID()
+    let testTxnId = genTransactionIDLocal()
     let req = txnMsgs.RollbackTxnRequest(txnId: testTxnId)
     let payload = txnMsgs.encodeRollbackTxnRequest(req)
     let r = txnMsgs.decodeRollbackTxnRequest(payload)
@@ -237,7 +237,7 @@ suite "txn codec - RollbackTxnRequest/Response":
 
 suite "txn codec - TxnStatusRequest/Response":
   test "status request encodes and decodes":
-    let testTxnId = genTransactionID()
+    let testTxnId = genTransactionIDLocal()
     let req = txnMsgs.TxnStatusRequest(txnId: testTxnId)
     let payload = txnMsgs.encodeTxnStatusRequest(req)
     let r = txnMsgs.decodeTxnStatusRequest(payload)
@@ -303,7 +303,7 @@ suite "txn_manager - begin/commit/rollback":
 
   test "commit unknown txn returns NotFound":
     let mgr = newTransactionManager()
-    let resp = mgr.commitTransaction(genTransactionID())
+    let resp = mgr.commitTransaction(genTransactionIDLocal())
     check resp.status == TxnCommitNotFound
 
   test "commit active txn with no write set succeeds":
@@ -336,7 +336,7 @@ suite "txn_manager - begin/commit/rollback":
 
   test "rollback unknown txn returns NotFound":
     let mgr = newTransactionManager()
-    let resp = mgr.rollbackTransaction(genTransactionID())
+    let resp = mgr.rollbackTransaction(genTransactionIDLocal())
     check resp.status == TxnRollbackNotFound
 
   test "rollback aborted txn is idempotent":
@@ -450,12 +450,12 @@ suite "txn_manager - conflict detection":
 
   test "recording write on non-existent txn returns error":
     let mgr = newTransactionManager()
-    let r = mgr.recordWrite(genTransactionID(), "k")
+    let r = mgr.recordWrite(genTransactionIDLocal(), "k")
     check r.isErr
 
   test "recording read on non-existent txn returns error":
     let mgr = newTransactionManager()
-    let r = mgr.recordRead(genTransactionID(), "k")
+    let r = mgr.recordRead(genTransactionIDLocal(), "k")
     check r.isErr
 
 suite "txn_manager - timeout":
@@ -532,7 +532,7 @@ suite "integration - BeginTxn/CommitTxn/RollbackTxn/TxnStatus":
 
   test "commit unknown txn returns NotFound":
     withServer(19904, proc(srv: ProtocolServer, cli: ProtocolClient) =
-      let r = cli.commitTxn(genTransactionID())
+      let r = cli.commitTxn(genTransactionIDLocal())
       check r.isOk
       check r.value.status == TxnCommitNotFound
     )
@@ -559,7 +559,7 @@ suite "integration - BeginTxn/CommitTxn/RollbackTxn/TxnStatus":
 
   test "rollback unknown txn returns NotFound":
     withServer(19907, proc(srv: ProtocolServer, cli: ProtocolClient) =
-      let r = cli.rollbackTxn(genTransactionID())
+      let r = cli.rollbackTxn(genTransactionIDLocal())
       check r.isOk
       check r.value.status == TxnRollbackNotFound
     )

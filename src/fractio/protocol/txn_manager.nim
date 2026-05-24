@@ -140,8 +140,9 @@ proc beginTransaction*(mgr: TransactionManager, flags: uint8 = 0,
         coreTypes.TransactionID)): TxnRecord {.gcsafe, raises: [].} =
   ## Create a new transaction and return its record.
   ## Uses ULID-based TransactionID for globally unique IDs.
+  let tsNs = try: mgr.timeProvider.now() except Exception: 0'i64
   let id = if forcedId.isSome: forcedId.get()
-           else: {.cast(gcsafe).}: coreTypes.genTransactionID()
+           else: {.cast(gcsafe).}: coreTypes.genTransactionID(tsNs)
   let readTs = mgr.allocTimestamp()
   let rec = TxnRecord(
     id: id,

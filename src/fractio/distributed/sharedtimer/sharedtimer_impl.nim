@@ -328,4 +328,4 @@ proc isSynchronized*(self: SharedTimer): bool =
 proc getTransactionID*(self: SharedTimer): TransactionID =
   ## Generate a globally unique transaction ID using ULID.
   ## The ULID provides timestamp-based ordering and global uniqueness.
-  genTransactionID()
+  genTransactionID(self.now())

@@ -130,8 +130,8 @@ suite "ColumnDefBin":
 
 suite "TableRecord":
   test "encode/decode roundtrip basic":
-    let tableId = genTableId()
-    let spaceId = genSpaceID()
+    let tableId = genTableIdLocal()
+    let spaceId = genSpaceIDLocal()
     let col = ColumnDefBin(name: "id", dataType: cdtInt, maxLen: 0'u16,
         flags: 0x01'u8)
     let rec = TableRecord(
@@ -157,8 +157,8 @@ suite "TableRecord":
     check decoded.columns[0].dataType == cdtInt
 
   test "encode/decode roundtrip multiple columns":
-    let tableId = genTableId()
-    let spaceId = genSpaceID()
+    let tableId = genTableIdLocal()
+    let spaceId = genSpaceIDLocal()
     let cols = @[
       ColumnDefBin(name: "id", dataType: cdtULID, maxLen: 0'u16,
           flags: 0x01'u8),
@@ -190,8 +190,8 @@ suite "TableRecord":
     check decoded.primaryKey[1] == "email"
 
   test "encode/decode roundtrip empty columns":
-    let tableId = genTableId()
-    let spaceId = genSpaceID()
+    let tableId = genTableIdLocal()
+    let spaceId = genSpaceIDLocal()
     let rec = TableRecord(
       tableId: tableId,
       name: "empty_table",
@@ -267,8 +267,8 @@ suite "GroupReplicaBin":
 
 suite "GroupRecord":
   test "encode/decode roundtrip basic":
-    let groupId = genULID()
-    let spaceId = genSpaceID()
+    let groupId = genULIDLocal()
+    let spaceId = genSpaceIDLocal()
     let replicas = @[
       GroupReplicaBin(nodeId: 1'u32, replicaType: rtVoter),
       GroupReplicaBin(nodeId: 2'u32, replicaType: rtVoter),
@@ -293,8 +293,8 @@ suite "GroupRecord":
     check decoded.replicas[2].replicaType == rtLearner
 
   test "encode/decode roundtrip empty replicas":
-    let groupId = genULID()
-    let spaceId = genSpaceID()
+    let groupId = genULIDLocal()
+    let spaceId = genSpaceIDLocal()
     let rec = GroupRecord(
       groupId: groupId,
       spaceId: spaceId,
@@ -377,9 +377,9 @@ suite "NodeRecord":
 
 suite "SpaceRecord":
   test "encode/decode roundtrip basic":
-    let spaceId = genSpaceID()
-    let groupIds = @[genGroupID(), genGroupID()]
-    let oldGroupIds = @[genGroupID()]
+    let spaceId = genSpaceIDLocal()
+    let groupIds = @[genGroupIDLocal(), genGroupIDLocal()]
+    let oldGroupIds = @[genGroupIDLocal()]
     let rec = SpaceRecord(
       spaceId: spaceId,
       name: "default_space",
@@ -408,13 +408,13 @@ suite "SpaceRecord":
     check decoded.createdAtNs == 1600000000'i64
 
   test "encode/decode roundtrip not rebalancing":
-    let spaceId = genSpaceID()
+    let spaceId = genSpaceIDLocal()
     let rec = SpaceRecord(
       spaceId: spaceId,
       name: "stable_space",
       replicas: 0'i32, # 0 = ALL nodes
       groupCount: 10'i32,
-      groupIds: @[genGroupID()],
+      groupIds: @[genGroupIDLocal()],
       oldGroupIds: @[],
       rebalancing: false,
       rebalanceWorker: -1'i32,
@@ -429,7 +429,7 @@ suite "SpaceRecord":
     check decoded.rebalanceCursor == ""
 
   test "encode/decode roundtrip empty groupIds":
-    let spaceId = genSpaceID()
+    let spaceId = genSpaceIDLocal()
     let rec = SpaceRecord(
       spaceId: spaceId,
       name: "empty_space",
@@ -449,7 +449,7 @@ suite "SpaceRecord":
     check decoded.oldGroupIds.len == 0
 
   test "encode/decode roundtrip negative values":
-    let spaceId = genSpaceID()
+    let spaceId = genSpaceIDLocal()
     let rec = SpaceRecord(
       spaceId: spaceId,
       name: "test",
@@ -494,7 +494,7 @@ suite "stripMVCCHeader":
     var w = initBinaryWriter()
     w.writeBytes("MVCC")
     w.writeI64(12345'i64) # timestamp
-    w.writeBytes(ulidToBytes(genULID())) # txn_id
+    w.writeBytes(ulidToBytes(genULIDLocal())) # txn_id
     w.writeU8(ord('0')) # delete flag = '0' (not deleted)
     w.writeBytes("payload_data") # raw bytes, no length prefix
     let data = w.finish()
@@ -507,7 +507,7 @@ suite "stripMVCCHeader":
     var w = initBinaryWriter()
     w.writeBytes("MVCC")
     w.writeI64(999'i64)
-    w.writeBytes(ulidToBytes(genULID()))
+    w.writeBytes(ulidToBytes(genULIDLocal()))
     w.writeU8(ord('1')) # delete flag = '1' (deleted)
     w.writeBytes("deleted_payload") # raw bytes, no length prefix
     let data = w.finish()
@@ -542,7 +542,7 @@ suite "decodeDatabaseRecordFromMVCC":
     var w = initBinaryWriter()
     w.writeBytes("MVCC")
     w.writeI64(5000'i64)
-    w.writeBytes(ulidToBytes(genULID()))
+    w.writeBytes(ulidToBytes(genULIDLocal()))
     w.writeU8(ord('0'))
     w.writeBytes(payload)
     let data = w.finish()
@@ -556,7 +556,7 @@ suite "decodeDatabaseRecordFromMVCC":
     var w = initBinaryWriter()
     w.writeBytes("MVCC")
     w.writeI64(1'i64)
-    w.writeBytes(ulidToBytes(genULID()))
+    w.writeBytes(ulidToBytes(genULIDLocal()))
     w.writeU8(ord('1')) # deleted
     w.writeString("any_payload")
     let data = w.finish()
@@ -581,7 +581,7 @@ suite "decodeSchemaRecordFromMVCC":
     var w = initBinaryWriter()
     w.writeBytes("MVCC")
     w.writeI64(3000'i64)
-    w.writeBytes(ulidToBytes(genULID()))
+    w.writeBytes(ulidToBytes(genULIDLocal()))
     w.writeU8(ord('0'))
     w.writeBytes(payload)
     let data = w.finish()
@@ -595,7 +595,7 @@ suite "decodeSchemaRecordFromMVCC":
     var w = initBinaryWriter()
     w.writeBytes("MVCC")
     w.writeI64(1'i64)
-    w.writeBytes(ulidToBytes(genULID()))
+    w.writeBytes(ulidToBytes(genULIDLocal()))
     w.writeU8(ord('1'))
     w.writeString("any")
     let data = w.finish()
@@ -606,8 +606,8 @@ suite "decodeSchemaRecordFromMVCC":
 
 suite "decodeTableRecordFromMVCC":
   test "decodes valid MVCC data":
-    let tableId = genTableId()
-    let spaceId = genSpaceID()
+    let tableId = genTableIdLocal()
+    let spaceId = genSpaceIDLocal()
     let rec = TableRecord(
       tableId: tableId,
       name: "test_table",
@@ -622,7 +622,7 @@ suite "decodeTableRecordFromMVCC":
     var w = initBinaryWriter()
     w.writeBytes("MVCC")
     w.writeI64(4000'i64)
-    w.writeBytes(ulidToBytes(genULID()))
+    w.writeBytes(ulidToBytes(genULIDLocal()))
     w.writeU8(ord('0'))
     w.writeBytes(payload)
     let data = w.finish()
@@ -636,7 +636,7 @@ suite "decodeTableRecordFromMVCC":
     var w = initBinaryWriter()
     w.writeBytes("MVCC")
     w.writeI64(1'i64)
-    w.writeBytes(ulidToBytes(genULID()))
+    w.writeBytes(ulidToBytes(genULIDLocal()))
     w.writeU8(ord('1'))
     w.writeString("payload")
     let data = w.finish()
@@ -649,7 +649,7 @@ suite "decodeTableRecordFromMVCC":
     var w = initBinaryWriter()
     w.writeBytes("MVCC")
     w.writeI64(1'i64)
-    w.writeBytes(ulidToBytes(genULID()))
+    w.writeBytes(ulidToBytes(genULIDLocal()))
     w.writeU8(ord('0'))
     w.writeBytes("abc") # Exactly 3 bytes (< 4 byte threshold)
     let data = w.finish()
@@ -663,7 +663,7 @@ suite "decodeTableRecordFromMVCC":
     var w = initBinaryWriter()
     w.writeBytes("MVCC")
     w.writeI64(1'i64)
-    w.writeBytes(ulidToBytes(genULID()))
+    w.writeBytes(ulidToBytes(genULIDLocal()))
     w.writeU8(ord('0'))
     w.writeU32(100'u32) # 4 bytes, passes threshold
     let data = w.finish()
@@ -673,8 +673,8 @@ suite "decodeTableRecordFromMVCC":
 
 suite "decodeGroupRecordFromMVCC":
   test "decodes valid MVCC data":
-    let groupId = genULID()
-    let spaceId = genSpaceID()
+    let groupId = genULIDLocal()
+    let spaceId = genSpaceIDLocal()
     let rec = GroupRecord(
       groupId: groupId,
       spaceId: spaceId,
@@ -686,7 +686,7 @@ suite "decodeGroupRecordFromMVCC":
     var w = initBinaryWriter()
     w.writeBytes("MVCC")
     w.writeI64(5000'i64)
-    w.writeBytes(ulidToBytes(genULID()))
+    w.writeBytes(ulidToBytes(genULIDLocal()))
     w.writeU8(ord('0'))
     w.writeBytes(payload)
     let data = w.finish()
@@ -700,7 +700,7 @@ suite "decodeGroupRecordFromMVCC":
     var w = initBinaryWriter()
     w.writeBytes("MVCC")
     w.writeI64(1'i64)
-    w.writeBytes(ulidToBytes(genULID()))
+    w.writeBytes(ulidToBytes(genULIDLocal()))
     w.writeU8(ord('1'))
     w.writeString("any")
     let data = w.finish()
@@ -712,7 +712,7 @@ suite "decodeGroupRecordFromMVCC":
     var w = initBinaryWriter()
     w.writeBytes("MVCC")
     w.writeI64(1'i64)
-    w.writeBytes(ulidToBytes(genULID()))
+    w.writeBytes(ulidToBytes(genULIDLocal()))
     w.writeU8(ord('0'))
     w.writeString("abc") # Too short (< 8 bytes)
     let data = w.finish()
@@ -734,7 +734,7 @@ suite "decodeNodeRecordFromMVCC":
     var w = initBinaryWriter()
     w.writeBytes("MVCC")
     w.writeI64(6000'i64)
-    w.writeBytes(ulidToBytes(genULID()))
+    w.writeBytes(ulidToBytes(genULIDLocal()))
     w.writeU8(ord('0'))
     w.writeBytes(payload)
     let data = w.finish()
@@ -748,7 +748,7 @@ suite "decodeNodeRecordFromMVCC":
     var w = initBinaryWriter()
     w.writeBytes("MVCC")
     w.writeI64(1'i64)
-    w.writeBytes(ulidToBytes(genULID()))
+    w.writeBytes(ulidToBytes(genULIDLocal()))
     w.writeU8(ord('1'))
     w.writeString("any")
     let data = w.finish()
@@ -760,7 +760,7 @@ suite "decodeNodeRecordFromMVCC":
     var w = initBinaryWriter()
     w.writeBytes("MVCC")
     w.writeI64(1'i64)
-    w.writeBytes(ulidToBytes(genULID()))
+    w.writeBytes(ulidToBytes(genULIDLocal()))
     w.writeU8(ord('0'))
     w.writeString("short") # Too short (< 10 bytes)
     let data = w.finish()
@@ -771,13 +771,13 @@ suite "decodeNodeRecordFromMVCC":
 
 suite "decodeSpaceRecordFromMVCC":
   test "decodes valid MVCC data":
-    let spaceId = genSpaceID()
+    let spaceId = genSpaceIDLocal()
     let rec = SpaceRecord(
       spaceId: spaceId,
       name: "test_space",
       replicas: 3'i32,
       groupCount: 5'i32,
-      groupIds: @[genGroupID()],
+      groupIds: @[genGroupIDLocal()],
       oldGroupIds: @[],
       rebalancing: false,
       rebalanceWorker: 0'i32,
@@ -789,7 +789,7 @@ suite "decodeSpaceRecordFromMVCC":
     var w = initBinaryWriter()
     w.writeBytes("MVCC")
     w.writeI64(8000'i64)
-    w.writeBytes(ulidToBytes(genULID()))
+    w.writeBytes(ulidToBytes(genULIDLocal()))
     w.writeU8(ord('0'))
     w.writeBytes(payload)
     let data = w.finish()
@@ -803,7 +803,7 @@ suite "decodeSpaceRecordFromMVCC":
     var w = initBinaryWriter()
     w.writeBytes("MVCC")
     w.writeI64(1'i64)
-    w.writeBytes(ulidToBytes(genULID()))
+    w.writeBytes(ulidToBytes(genULIDLocal()))
     w.writeU8(ord('1'))
     w.writeString("any")
     let data = w.finish()
@@ -838,8 +838,8 @@ suite "toJson SchemaRecord":
 
 suite "toJson TableRecord":
   test "converts to JSON with columns":
-    let tableId = genTableId()
-    let spaceId = genSpaceID()
+    let tableId = genTableIdLocal()
+    let spaceId = genSpaceIDLocal()
     let rec = TableRecord(
       tableId: tableId,
       name: "users",
@@ -866,8 +866,8 @@ suite "toJson TableRecord":
     check json["columns"][1]["type"].getStr() == "TEXT"
 
   test "converts all data types correctly":
-    let tableId = genTableId()
-    let spaceId = genSpaceID()
+    let tableId = genTableIdLocal()
+    let spaceId = genSpaceIDLocal()
     let rec = TableRecord(
       tableId: tableId,
       name: "test",
@@ -905,8 +905,8 @@ suite "toJson TableRecord":
 
 suite "toJson GroupRecord":
   test "converts to JSON with replicas":
-    let groupId = genULID()
-    let spaceId = genSpaceID()
+    let groupId = genULIDLocal()
+    let spaceId = genSpaceIDLocal()
     let rec = GroupRecord(
       groupId: groupId,
       spaceId: spaceId,
@@ -958,9 +958,9 @@ suite "toJson SettingRecord":
 
 suite "toJson SpaceRecord":
   test "converts to JSON with all fields":
-    let spaceId = genSpaceID()
-    let groupIds = @[genGroupID(), genGroupID()]
-    let oldGroupIds = @[genGroupID()]
+    let spaceId = genSpaceIDLocal()
+    let groupIds = @[genGroupIDLocal(), genGroupIDLocal()]
+    let oldGroupIds = @[genGroupIDLocal()]
     let rec = SpaceRecord(
       spaceId: spaceId,
       name: "my_space",

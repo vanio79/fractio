@@ -204,8 +204,7 @@ proc newTwoPCConfig*(): TwoPCConfig =
 proc generateTransactionId*(tsProvider: TimestampProvider): TransactionID =
   ## Generate a unique transaction ID using ULID
   ## The timestamp provider is used for the timestamp component
-  discard tsProvider.now() # Ensure timestamp provider is active
-  result = genTransactionID()
+  result = genTransactionID(tsProvider.now())
 
 proc generateRequestId*(): string =
   ## Generate a unique request ID

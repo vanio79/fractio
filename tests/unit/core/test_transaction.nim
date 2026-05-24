@@ -22,46 +22,46 @@ suite "TransactionID Generation":
   test "genTransactionID creates unique IDs":
     var seen: HashSet[TransactionID] = initHashSet[TransactionID]()
     for i in 0 ..< 100:
-      let id = genTransactionID()
+      let id = genTransactionIDLocal()
       check id notin seen
       seen.incl(id)
 
   test "TransactionID equality":
-    let a = genTransactionID()
-    let b = genTransactionID()
+    let a = genTransactionIDLocal()
+    let b = genTransactionIDLocal()
     check a == a
     check a != b
 
   test "TransactionID ordering":
     let zero = zeroTransactionID()
-    let id = genTransactionID()
+    let id = genTransactionIDLocal()
     check zero < id
 
   test "TransactionID string representation":
-    let id = genTransactionID()
+    let id = genTransactionIDLocal()
     let s = $id
     check s.len == 26
 
   test "TransactionID hash consistency":
-    let a = genTransactionID()
+    let a = genTransactionIDLocal()
     check hash(a) == hash(a)
 
   test "TransactionID bytes roundtrip":
-    let original = genTransactionID()
+    let original = genTransactionIDLocal()
     let bytes = transactionIDToBytes(original)
     check bytes.len == 16
     let restored = transactionIDFromBytes(bytes)
     check restored == original
 
   test "TransactionID string roundtrip":
-    let original = genTransactionID()
+    let original = genTransactionIDLocal()
     let s = $original
     let restored = transactionIDFromString(s)
     check restored == original
 
   test "isZero check":
     check isZero(zeroTransactionID())
-    check not isZero(genTransactionID())
+    check not isZero(genTransactionIDLocal())
 
 suite "MVCCTransaction Creation and Initialization":
   test "basic transaction creation with timestamp provider":
@@ -132,7 +132,7 @@ suite "MVCCTransaction Creation and Initialization":
     check txn.lockedKeys == 0
 
   test "manual transaction construction":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let txn = MVCCTransaction(
       id: txnId,
       status: TXN_PENDING,
@@ -156,7 +156,7 @@ suite "MVCCTransaction Creation and Initialization":
 
 suite "MVCCTransaction Status Changes":
   test "pending to committed transition":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     var txn = MVCCTransaction(
       id: txnId,
       status: TXN_PENDING,
@@ -187,7 +187,7 @@ suite "MVCCTransaction Status Changes":
     check txn.commitTimestamp == Timestamp(200)
 
   test "pending to aborted transition":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     var txn = MVCCTransaction(
       id: txnId,
       status: TXN_PENDING,
@@ -211,7 +211,7 @@ suite "MVCCTransaction Status Changes":
     check txn.isActive() == false
 
   test "pending to prepared transition":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     var txn = MVCCTransaction(
       id: txnId,
       status: TXN_PENDING,
@@ -235,7 +235,7 @@ suite "MVCCTransaction Status Changes":
     check txn.isActive() == true
 
   test "all status state checks":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     var txn = MVCCTransaction(
       id: txnId,
       status: TXN_PENDING,
@@ -273,7 +273,7 @@ suite "MVCCTransaction Status Changes":
 
 suite "MVCCTransaction ReadSet Operations":
   test "add single read entry":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     var txn = MVCCTransaction(
       id: txnId,
       status: TXN_PENDING,
@@ -297,7 +297,7 @@ suite "MVCCTransaction ReadSet Operations":
     check txn.readSet.timestamps[0] == Timestamp(50)
 
   test "add multiple read entries":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     var txn = MVCCTransaction(
       id: txnId,
       status: TXN_PENDING,
@@ -324,7 +324,7 @@ suite "MVCCTransaction ReadSet Operations":
     check txn.getReadTimestamp("key3") == Timestamp(90)
 
   test "getReadTimestamp for nonexistent key":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     var txn = MVCCTransaction(
       id: txnId,
       status: TXN_PENDING,
@@ -345,7 +345,7 @@ suite "MVCCTransaction ReadSet Operations":
     check txn.getReadTimestamp("nonexistent") == INVALID_TIMESTAMP
 
   test "clear read set":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     var txn = MVCCTransaction(
       id: txnId,
       status: TXN_PENDING,
@@ -373,7 +373,7 @@ suite "MVCCTransaction ReadSet Operations":
     check txn.readSet.timestamps.len == 0
 
   test "hasRead check":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     var txn = MVCCTransaction(
       id: txnId,
       status: TXN_PENDING,
@@ -399,7 +399,7 @@ suite "MVCCTransaction ReadSet Operations":
     check txn.hasRead("key3") == false
 
   test "getReadCount":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     var txn = MVCCTransaction(
       id: txnId,
       status: TXN_PENDING,
@@ -426,7 +426,7 @@ suite "MVCCTransaction ReadSet Operations":
 
 suite "MVCCTransaction WriteSet Operations":
   test "add single write entry":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     var txn = MVCCTransaction(
       id: txnId,
       status: TXN_PENDING,
@@ -450,7 +450,7 @@ suite "MVCCTransaction WriteSet Operations":
     check txn.writeSet.entries[0].isDelete == false
 
   test "add write entry as delete":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     var txn = MVCCTransaction(
       id: txnId,
       status: TXN_PENDING,
@@ -477,7 +477,7 @@ suite "MVCCTransaction WriteSet Operations":
     check txn.writeSet.entries[1].isDelete == true
 
   test "add multiple write entries":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     var txn = MVCCTransaction(
       id: txnId,
       status: TXN_PENDING,
@@ -501,7 +501,7 @@ suite "MVCCTransaction WriteSet Operations":
     check txn.getWriteCount() == 3
 
   test "hasWrite check":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     var txn = MVCCTransaction(
       id: txnId,
       status: TXN_PENDING,
@@ -527,7 +527,7 @@ suite "MVCCTransaction WriteSet Operations":
     check txn.hasWrite("key3") == false
 
   test "getWriteCount":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     var txn = MVCCTransaction(
       id: txnId,
       status: TXN_PENDING,
@@ -553,7 +553,7 @@ suite "MVCCTransaction WriteSet Operations":
 
 suite "MVCCTransaction Epoch and Retry":
   test "initial epoch is zero":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let txn = MVCCTransaction(
       id: txnId,
       status: TXN_PENDING,
@@ -572,7 +572,7 @@ suite "MVCCTransaction Epoch and Retry":
     check txn.epoch == 0
 
   test "incrementEpoch increases epoch":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     var txn = MVCCTransaction(
       id: txnId,
       status: TXN_PENDING,
@@ -600,7 +600,7 @@ suite "MVCCTransaction Epoch and Retry":
     check txn.epoch == 3
 
   test "canRetry with default max retries":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     var txn = MVCCTransaction(
       id: txnId,
       status: TXN_PENDING,
@@ -626,7 +626,7 @@ suite "MVCCTransaction Epoch and Retry":
     check txn.canRetry(DEFAULT_MAX_RETRIES) == false
 
   test "canRetry with custom max retries":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     var txn = MVCCTransaction(
       id: txnId,
       status: TXN_PENDING,
@@ -651,7 +651,7 @@ suite "MVCCTransaction Epoch and Retry":
     check txn.canRetry(5) == false
 
   test "resetForRetry clears state and increments epoch":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     var txn = MVCCTransaction(
       id: txnId,
       status: TXN_ABORTED,
@@ -685,7 +685,7 @@ suite "MVCCTransaction Epoch and Retry":
 
 suite "MVCCTransaction Deadline Checking":
   test "checkDeadline before deadline":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     var txn = MVCCTransaction(
       id: txnId,
       status: TXN_PENDING,
@@ -705,7 +705,7 @@ suite "MVCCTransaction Deadline Checking":
     check txn.isExpired(Timestamp(500)) == false
 
   test "checkDeadline at deadline boundary":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     var txn = MVCCTransaction(
       id: txnId,
       status: TXN_PENDING,
@@ -724,7 +724,7 @@ suite "MVCCTransaction Deadline Checking":
     check txn.checkDeadline(Timestamp(1000)) == false
 
   test "checkDeadline after deadline":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     var txn = MVCCTransaction(
       id: txnId,
       status: TXN_PENDING,
@@ -745,7 +745,7 @@ suite "MVCCTransaction Deadline Checking":
     check txn.isExpired(Timestamp(1500)) == true
 
   test "checkDeadline with no deadline set":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     var txn = MVCCTransaction(
       id: txnId,
       status: TXN_PENDING,
@@ -869,7 +869,7 @@ suite "TransactionCommitError Constructors":
 
 suite "Core Transaction Type (types.nim)":
   test "Transaction creation":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let txn = Transaction(
       id: txnId,
       timestamp: 1000'i64,
@@ -884,7 +884,7 @@ suite "Core Transaction Type (types.nim)":
     check txn.readSnapshot == 500
 
   test "Transaction mutatedTables tracking":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     var txn = Transaction(
       id: txnId,
       timestamp: 1000'i64,
@@ -906,7 +906,7 @@ suite "Core Transaction Type (types.nim)":
     check "table3" in txn.mutatedTables
 
   test "Transaction readSnapshot handling":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let txn = Transaction(
       id: txnId,
       timestamp: 1000'i64,
@@ -919,7 +919,7 @@ suite "Core Transaction Type (types.nim)":
     check txn.readSnapshot < txn.timestamp
 
   test "Transaction status transitions":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     var txn = Transaction(
       id: txnId,
       timestamp: 1000'i64,

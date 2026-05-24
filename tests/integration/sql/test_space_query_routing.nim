@@ -157,7 +157,7 @@ proc createMultiGroupTestStore(testDir: string,
         value: encode(spaceGroupRec)))
   discard store.sysTablePutBatch(sysTableWrites)
 
-  let testSpaceId = genSpaceID() # Generate proper SpaceID for test space
+  let testSpaceId = genSpaceIDLocal() # Generate proper SpaceID for test space
   let spaceKey = encodeSpaceKey(testSpaceId)
   let spaceRec = SpaceRecord(
     spaceId: testSpaceId, # SpaceRecord.spaceId is now SpaceID
@@ -268,7 +268,7 @@ suite "SQL Executor — space-routed INSERT":
     cleanupTestDir(testDir)
     (client, server, store, spaceGroupIds,
         testSpaceId) = createMultiGroupTestStore(testDir, 3)
-    seedSpaceTable(client, store, genTableId(), "items", testSpaceId)
+    seedSpaceTable(client, store, genTableIdLocal(), "items", testSpaceId)
 
   teardown:
     client.close()
@@ -320,7 +320,7 @@ suite "SQL Executor — space-routed SELECT":
     cleanupTestDir(testDir)
     (client, server, store, spaceGroupIds,
         testSpaceId) = createMultiGroupTestStore(testDir, 3)
-    seedSpaceTable(client, store, genTableId(), "items", testSpaceId)
+    seedSpaceTable(client, store, genTableIdLocal(), "items", testSpaceId)
     # Insert 10 rows distributed across groups
     for i in 1 .. 10:
       discard exec(client,
@@ -368,7 +368,7 @@ suite "SQL Executor — space-routed SELECT":
 
   test "SELECT from empty space-routed table":
     # Create a second table in the same space, don't insert data
-    seedSpaceTable(client, store, genTableId(), "empty_items", testSpaceId)
+    seedSpaceTable(client, store, genTableIdLocal(), "empty_items", testSpaceId)
     let res = exec(client, "SELECT * FROM empty_items")
     check res.kind == erkRows
     check res.rows.len == 0
@@ -395,7 +395,7 @@ suite "SQL Executor — space-routed UPDATE":
     cleanupTestDir(testDir)
     (client, server, store, spaceGroupIds,
         testSpaceId) = createMultiGroupTestStore(testDir, 3)
-    seedSpaceTable(client, store, genTableId(), "items", testSpaceId)
+    seedSpaceTable(client, store, genTableIdLocal(), "items", testSpaceId)
     for i in 1 .. 5:
       discard exec(client,
           "INSERT INTO items (id, val) VALUES (" & $i & ", 'orig')")
@@ -455,7 +455,7 @@ suite "SQL Executor — space-routed DELETE":
     cleanupTestDir(testDir)
     (client, server, store, spaceGroupIds,
         testSpaceId) = createMultiGroupTestStore(testDir, 3)
-    seedSpaceTable(client, store, genTableId(), "items", testSpaceId)
+    seedSpaceTable(client, store, genTableIdLocal(), "items", testSpaceId)
     for i in 1 .. 5:
       discard exec(client,
           "INSERT INTO items (id, val) VALUES (" & $i & ", 'v" & $i & "')")
@@ -514,7 +514,7 @@ suite "SQL Executor — space routing full round-trip":
     cleanupTestDir(testDir)
     (client, server, store, spaceGroupIds,
         testSpaceId) = createMultiGroupTestStore(testDir, 4)
-    seedSpaceTableThreeCol(client, store, genTableId(), "products", testSpaceId)
+    seedSpaceTableThreeCol(client, store, genTableIdLocal(), "products", testSpaceId)
 
   teardown:
     client.close()
@@ -633,7 +633,7 @@ suite "SQL Executor — space routing backward compat":
         "INSERT INTO plain (id, val) VALUES (1, 'plain1')")
 
     # Space-routed table
-    seedSpaceTable(client, store, genTableId(), "spaced", testSpaceId)
+    seedSpaceTable(client, store, genTableIdLocal(), "spaced", testSpaceId)
     discard exec(client,
         "INSERT INTO spaced (id, val) VALUES (1, 'spaced1')")
 

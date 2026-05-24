@@ -114,7 +114,7 @@ proc withServer(port: int, body: proc(srv: ProtocolServer,
 
 suite "kv codec - GetRequest round-trip":
   test "basic get request encodes and decodes":
-    let testTxnId = genTransactionID()
+    let testTxnId = genTransactionIDLocal()
     let req = GetRequest(flags: 0x03, txnId: testTxnId, readTimestamp: 100,
                          key: "hello")
     let payload = encodeGetRequest(req)
@@ -196,7 +196,7 @@ suite "kv codec - PutRequest round-trip":
     check got.value == "v"
 
   test "put request with CAS flag and expected version":
-    let testTxnId = genTransactionID()
+    let testTxnId = genTransactionIDLocal()
     let req = PutRequest(flags: PutFlagCAS, txnId: testTxnId,
                          expectedVersion: 42, key: "cas_key", value: "new")
     let payload = encodePutRequest(req)
@@ -258,7 +258,7 @@ suite "kv codec - DeleteRequest round-trip":
     check r.value.key == "del_key"
 
   test "delete request return previous":
-    let testTxnId = genTransactionID()
+    let testTxnId = genTransactionIDLocal()
     let req = DeleteRequest(flags: DelFlagReturnPrev, txnId: testTxnId, key: "x")
     let payload = encodeDeleteRequest(req)
     let r = decodeDeleteRequest(payload)
@@ -320,7 +320,7 @@ suite "kv codec - BatchRequest round-trip":
     opDelBuf.writeBytes("dkey")
     opDel.data = opDelBuf
 
-    let testTxnId = genTransactionID()
+    let testTxnId = genTransactionIDLocal()
     let req = BatchRequest(flags: BatchFlagAllOrNothing, txnId: testTxnId,
                            operations: @[opGet, opPut, opDel])
     let payload = encodeBatchRequest(req)

@@ -131,9 +131,9 @@ proc newMVCCTransaction*(tsProvider: TimestampProvider,
     priority: int32 = DEFAULT_PRIORITY): MVCCTransaction =
   ## Begin a new MVCC transaction
   new(result)
-  result.id = genTransactionID()
-  result.status = TXN_PENDING
   result.startTimestamp = tsProvider.acquireStartTimestamp()
+  result.id = genTransactionID(result.startTimestamp)
+  result.status = TXN_PENDING
   result.commitTimestamp = INVALID_TIMESTAMP
   result.priority = priority
   result.maxTimestamp = MAX_TIMESTAMP
@@ -148,9 +148,9 @@ proc newMVCCTransaction*(tsProvider: TimestampProvider,
     options: TransactionOptions): MVCCTransaction =
   ## Begin a new MVCC transaction with options
   new(result)
-  result.id = genTransactionID()
-  result.status = TXN_PENDING
   result.startTimestamp = tsProvider.acquireStartTimestamp()
+  result.id = genTransactionID(result.startTimestamp)
+  result.status = TXN_PENDING
   result.commitTimestamp = INVALID_TIMESTAMP
   result.priority = options.priority
   result.maxTimestamp = MAX_TIMESTAMP
@@ -309,7 +309,7 @@ when isMainModule:
   suite "MVCCTransaction":
     test "transaction creation":
       # Test basic transaction creation
-      let txnId = genTransactionID()
+      let txnId = genTransactionID(0)
       let txn = MVCCTransaction(
         id: txnId,
         status: TXN_PENDING,
@@ -325,7 +325,7 @@ when isMainModule:
 
     test "add write entry":
       var txn = MVCCTransaction(
-        id: genTransactionID(),
+        id: genTransactionID(0),
         status: TXN_PENDING,
         startTimestamp: Timestamp(100),
         priority: DEFAULT_PRIORITY,
@@ -343,7 +343,7 @@ when isMainModule:
 
     test "add read entry":
       var txn = MVCCTransaction(
-        id: genTransactionID(),
+        id: genTransactionID(0),
         status: TXN_PENDING,
         startTimestamp: Timestamp(100),
         priority: DEFAULT_PRIORITY,

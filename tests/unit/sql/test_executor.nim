@@ -53,7 +53,7 @@ proc newMockFractioClient(): MockFractioClient =
   initLock(result.lock)
   result.data = stdtables.initTable[string, string]()
   result.txnState = stdtables.initTable[TransactionID, MockTxnState]()
-  result.nextTxnId = TransactionID(genULID())
+  result.nextTxnId = TransactionID(genULIDLocal())
   result.nextReadTs = 1
 
 proc toFractioClient(m: MockFractioClient): FractioClient =
@@ -73,7 +73,7 @@ proc mockBeginTxn(m: MockFractioClient): KVOpResult[tuple[txnId: TransactionID,
     txn.writes = stdtables.initTable[string, string]()
     txn.deleted = stdtables.initTable[string, bool]()
     m.txnState[m.nextTxnId] = txn
-    m.nextTxnId = TransactionID(genULID())
+    m.nextTxnId = TransactionID(genULIDLocal())
     inc m.nextReadTs
     kvOpOk((txnId: txn.txnId, readTimestamp: txn.readTimestamp))
   finally:
@@ -193,13 +193,13 @@ proc mockCreateSpace(m: MockFractioClient, name: string,
     replicas: int32): SpaceOpResult =
   m.lock.acquire()
   try:
-    let spaceId = SpaceID(genULID())
+    let spaceId = SpaceID(genULIDLocal())
     let spaceRec = SpaceRecord(
       spaceId: spaceId,
       name: name,
       replicas: replicas,
       groupCount: 1,
-      groupIds: @[groupIDFromULID(genULID())]
+      groupIds: @[groupIDFromULID(genULIDLocal())]
     )
     let encoded = encode(spaceRec)
     let key = encodeTableKey(SYS_SPACES_TABLE_ID, name)
@@ -1449,13 +1449,13 @@ suite "ExecutorPlanOp Formatting":
 
   test "formatPlanOp poInsert":
     let op = PlanOp(kind: poInsert, insTableName: "users",
-        insTableId: genTableId(), insRows: @["row1", "row2"])
+        insTableId: genTableIdLocal(), insRows: @["row1", "row2"])
     let text = formatPlanOp(op)
     check text.contains("Insert")
     check text.contains("users")
 
   test "formatPlanOp poPointGet":
-    let op = PlanOp(kind: poPointGet, pgTableId: genTableId(), pgKey: "pk123",
+    let op = PlanOp(kind: poPointGet, pgTableId: genTableIdLocal(), pgKey: "pk123",
         pgColumns: @["id", "name"])
     let text = formatPlanOp(op)
     check text.contains("PointGet")
@@ -1465,7 +1465,7 @@ suite "ExecutorPlanOp Formatting":
     let filter = Expr(kind: exBinOp, binOp: boEq,
       binLeft: Expr(kind: exColumn, colName: "id"),
       binRight: Expr(kind: exLiteral, litValue: newValueRef(1'i64)))
-    let op = PlanOp(kind: poScan, scTableId: genTableId(), scColumns: @["id"],
+    let op = PlanOp(kind: poScan, scTableId: genTableIdLocal(), scColumns: @["id"],
                     scFilter: some(filter), scLimit: 10)
     let text = formatPlanOp(op)
     check text.contains("Scan")
@@ -1473,7 +1473,7 @@ suite "ExecutorPlanOp Formatting":
     check text.contains("limit=10")
 
   test "formatPlanOp poScan without filter":
-    let op = PlanOp(kind: poScan, scTableId: genTableId(), scColumns: @["id"],
+    let op = PlanOp(kind: poScan, scTableId: genTableIdLocal(), scColumns: @["id"],
                     scFilter: none(Expr), scLimit: 0)
     let text = formatPlanOp(op)
     check text.contains("Scan")
@@ -1484,7 +1484,7 @@ suite "ExecutorPlanOp Formatting":
     let filter = Expr(kind: exBinOp, binOp: boGt,
       binLeft: Expr(kind: exColumn, colName: "age"),
       binRight: Expr(kind: exLiteral, litValue: newValueRef(18'i64)))
-    let op = PlanOp(kind: poUpdate, upTableName: "users", upTableId: genTableId(),
+    let op = PlanOp(kind: poUpdate, upTableName: "users", upTableId: genTableIdLocal(),
                     upFilter: some(filter), upSets: @[(col: "name",
                         val: Expr(kind: exLiteral, litValue: newValueRef("updated")))])
     let text = formatPlanOp(op)
@@ -1495,7 +1495,7 @@ suite "ExecutorPlanOp Formatting":
     let filter = Expr(kind: exBinOp, binOp: boLt,
       binLeft: Expr(kind: exColumn, colName: "id"),
       binRight: Expr(kind: exLiteral, litValue: newValueRef(5'i64)))
-    let op = PlanOp(kind: poDelete, delTableName: "users", delTableId: genTableId(),
+    let op = PlanOp(kind: poDelete, delTableName: "users", delTableId: genTableIdLocal(),
                     delFilter: some(filter))
     let text = formatPlanOp(op)
     check text.contains("Delete")
@@ -1840,7 +1840,7 @@ suite "ExecutorContext with MockKVStore":
 
   test "newExecutorContextWithKV with custom settings":
     let mockKV = newMockKVStore()
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let ctx = newExecutorContextWithKV(mockKV, nil, "mydb", "myschema",
                                         txnId, readTimestamp = 100)
     check ctx.database == "mydb"
@@ -1899,7 +1899,7 @@ suite "Executor Transaction Operations with MockKVStore":
     discard executeWithTxn(beginPlan, ctx)
 
     # Write some data (will be discarded)
-    let tableId = genTableId()
+    let tableId = genTableIdLocal()
     let writePlan = newPlan()
     writePlan.add(PlanOp(kind: poInsert, insTableId: tableId,
                          insRows: @["test_row"], insPkValues: @["pk1"]))
@@ -2021,11 +2021,11 @@ suite "Executor DDL Operations with MockKVStore":
     let ctx = newExecutorContextWithKV(mockKV)
 
     let tableRec = TableRecord(
-      tableId: genTableId(),
+      tableId: genTableIdLocal(),
       name: "users",
       database: "default",
       schema: "public",
-      spaceId: genSpaceID(),
+      spaceId: genSpaceIDLocal(),
       columns: @[ColumnDefBin(name: "id", dataType: cdtInt,
                                flags: uint8(cfPrimaryKey.ord))],
       primaryKey: @["id"]
@@ -2097,11 +2097,11 @@ suite "Executor SHOW Operations with MockKVStore":
 
     # Create a table
     let tableRec = TableRecord(
-      tableId: genTableId(),
+      tableId: genTableIdLocal(),
       name: "users",
       database: "default",
       schema: "public",
-      spaceId: genSpaceID(),
+      spaceId: genSpaceIDLocal(),
       columns: @[ColumnDefBin(name: "id", dataType: cdtInt,
                                flags: uint8(cfPrimaryKey.ord))],
       primaryKey: @["id"]
@@ -2206,11 +2206,11 @@ suite "Executor DDL Forbidden in Transaction":
 
     # Try CREATE TABLE
     let tableRec = TableRecord(
-      tableId: genTableId(),
+      tableId: genTableIdLocal(),
       name: "users",
       database: "default",
       schema: "public",
-      spaceId: genSpaceID(),
+      spaceId: genSpaceIDLocal(),
       columns: @[ColumnDefBin(name: "id", dataType: cdtInt,
                                flags: uint8(cfPrimaryKey.ord))],
       primaryKey: @["id"]
@@ -2299,11 +2299,11 @@ suite "Executor DROP Operations with MockKVStore":
 
     # Create table first
     let tableRec = TableRecord(
-      tableId: genTableId(),
+      tableId: genTableIdLocal(),
       name: "users",
       database: "default",
       schema: "public",
-      spaceId: genSpaceID(),
+      spaceId: genSpaceIDLocal(),
       columns: @[ColumnDefBin(name: "id", dataType: cdtInt,
                                flags: uint8(cfPrimaryKey.ord))],
       primaryKey: @["id"]
@@ -2369,7 +2369,7 @@ suite "Executor DML Operations with MockKVStore":
     row["id"] = DataRowValue(kind: drvkInt, intVal: 123)
     row["name"] = DataRowValue(kind: drvkString, strVal: "Alice")
 
-    let tableId = genTableId()
+    let tableId = genTableIdLocal()
     let pkSpec = PrimaryKeySpec(columns: @[("id", cdtInt, 0)])
     let pkValue = bytesToString(encodeInt64BE(123'i64))
 
@@ -2407,7 +2407,7 @@ suite "Executor DML Operations with MockKVStore":
     beginPlan.add(PlanOp(kind: poBeginTxn, btReadOnly: false))
     discard executeWithTxn(beginPlan, ctx)
 
-    let tableId = genTableId()
+    let tableId = genTableIdLocal()
     let pkSpec = PrimaryKeySpec(columns: @[("id", cdtInt, 0)])
 
     var rows: seq[string] = @[]
@@ -2450,7 +2450,7 @@ suite "Executor DML Operations with MockKVStore":
     let plan = newPlan()
     plan.add(PlanOp(
       kind: poInsert,
-      insTableId: genTableId(),
+      insTableId: genTableIdLocal(),
       insTableName: "users",
       insColumns: @["name"],
       insPkColumn: "id",
@@ -2473,7 +2473,7 @@ suite "Executor DML Operations with MockKVStore":
     discard executeWithTxn(beginPlan, ctx)
 
     # Insert a row first
-    let tableId = genTableId()
+    let tableId = genTableIdLocal()
     var row = newDataRow()
     row["id"] = DataRowValue(kind: drvkInt, intVal: 42)
     row["name"] = DataRowValue(kind: drvkString, strVal: "Bob")
@@ -2517,7 +2517,7 @@ suite "Executor DML Operations with MockKVStore":
     beginPlan.add(PlanOp(kind: poBeginTxn, btReadOnly: false))
     discard executeWithTxn(beginPlan, ctx)
 
-    let tableId = genTableId()
+    let tableId = genTableIdLocal()
     let pkValue = bytesToString(encodeInt64BE(999'i64))
 
     let plan = newPlan()
@@ -2544,7 +2544,7 @@ suite "Executor DML Operations with MockKVStore":
     discard executeWithTxn(beginPlan, ctx)
 
     # Insert multiple rows
-    let tableId = genTableId()
+    let tableId = genTableIdLocal()
     let pkSpec = PrimaryKeySpec(columns: @[("id", cdtInt, 0)])
 
     for i in 1..5:
@@ -2594,7 +2594,7 @@ suite "Executor DML Operations with MockKVStore":
     discard executeWithTxn(beginPlan, ctx)
 
     # Insert multiple rows
-    let tableId = genTableId()
+    let tableId = genTableIdLocal()
     let pkSpec = PrimaryKeySpec(columns: @[("id", cdtInt, 0)])
 
     for i in 1..10:
@@ -2643,7 +2643,7 @@ suite "Executor DML Operations with MockKVStore":
     discard executeWithTxn(beginPlan, ctx)
 
     # Insert rows
-    let tableId = genTableId()
+    let tableId = genTableIdLocal()
     let pkSpec = PrimaryKeySpec(columns: @[("id", cdtInt, 0)])
 
     for i in 1..3:
@@ -2690,7 +2690,7 @@ suite "Executor DML Operations with MockKVStore":
     discard executeWithTxn(beginPlan, ctx)
 
     # Insert rows
-    let tableId = genTableId()
+    let tableId = genTableIdLocal()
     let pkSpec = PrimaryKeySpec(columns: @[("id", cdtInt, 0)])
 
     for i in 1..5:
@@ -2732,12 +2732,12 @@ suite "Executor SHOW SPACES with MockKVStore":
 
     # Create a space record
     let spaceRec = SpaceRecord(
-      spaceId: genSpaceID(),
+      spaceId: genSpaceIDLocal(),
       name: "myspace",
       replicas: 3,
       groupCount: 5,
-      groupIds: @[genGroupID(), genGroupID(), genGroupID(), genGroupID(),
-          genGroupID()]
+      groupIds: @[genGroupIDLocal(), genGroupIDLocal(), genGroupIDLocal(), genGroupIDLocal(),
+          genGroupIDLocal()]
     )
     let key = encodeTableKey(SYS_SPACES_TABLE_ID, "myspace")
     discard mockKV.put(key, encode(spaceRec), txnId = zeroTransactionID())
@@ -2856,7 +2856,7 @@ suite "Executor ORDER BY with MockKVStore":
     discard executeWithTxn(beginPlan, ctx)
 
     # Insert rows in reverse order
-    let tableId = genTableId()
+    let tableId = genTableIdLocal()
     let pkSpec = PrimaryKeySpec(columns: @[("id", cdtInt, 0)])
 
     for i in countdown(5, 1):
@@ -2923,7 +2923,7 @@ suite "Executor ORDER BY with MockKVStore":
     discard executeWithTxn(beginPlan, ctx)
 
     # Insert rows in ascending order
-    let tableId = genTableId()
+    let tableId = genTableIdLocal()
     let pkSpec = PrimaryKeySpec(columns: @[("id", cdtInt, 0)])
 
     for i in 1..5:
@@ -2990,7 +2990,7 @@ suite "Executor ORDER BY with MockKVStore":
     discard executeWithTxn(beginPlan, ctx)
 
     # Insert rows with varying age and name
-    let tableId = genTableId()
+    let tableId = genTableIdLocal()
     let pkSpec = PrimaryKeySpec(columns: @[("id", cdtInt, 0)])
 
     # Data: (id, name, age): (1, "Bob", 25), (2, "Alice", 30), (3, "Carol", 25), (4, "Dave", 30)
@@ -3070,7 +3070,7 @@ suite "Executor ORDER BY with MockKVStore":
     discard executeWithTxn(beginPlan, ctx)
 
     # Insert a row
-    let tableId = genTableId()
+    let tableId = genTableIdLocal()
     let pkSpec = PrimaryKeySpec(columns: @[("id", cdtInt, 0)])
 
     var row = newDataRow()
@@ -3132,7 +3132,7 @@ suite "Executor ORDER BY with MockKVStore":
     beginPlan.add(PlanOp(kind: poBeginTxn, btReadOnly: false))
     discard executeWithTxn(beginPlan, ctx)
 
-    let tableId = genTableId()
+    let tableId = genTableIdLocal()
     let pkSpec = PrimaryKeySpec(columns: @[("id", cdtInt, 0)])
     let pkValue = bytesToString(encodeInt64BE(42'i64))
 
@@ -3198,7 +3198,7 @@ suite "System Table Identification":
     check isSystemTableId(sysDatabasesId)
 
     # Check that regular table IDs are not detected as system tables
-    let regularTableId = genTableId()
+    let regularTableId = genTableIdLocal()
     check not isSystemTableId(regularTableId)
 
   test "isSystemTableId rejects tables outside 1-99 range":
@@ -3240,9 +3240,9 @@ suite "System Table Record Decoding":
     check decoded[5] == "alive" # status
 
   test "decodeSystemTableRecord for SpaceRecord":
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     let spaceRec = SpaceRecord(
-      spaceId: SpaceID(genULID()),
+      spaceId: SpaceID(genULIDLocal()),
       name: "test-space",
       replicas: 3,
       groupCount: 1,
@@ -3300,8 +3300,8 @@ suite "System Table Record Decoding":
 
   test "decodeSystemTableRecord for GroupRecord":
     let groupRec = GroupRecord(
-      groupId: genULID(),
-      spaceId: SpaceID(genULID()),
+      groupId: genULIDLocal(),
+      spaceId: SpaceID(genULIDLocal()),
       preferredLeader: 1,
       leader: 2,
       replicas: @[
@@ -3383,7 +3383,7 @@ suite "System Table Key Encoding":
       remainingFilter: none(Expr)
     )
 
-    let regularTableId = genTableId()
+    let regularTableId = genTableIdLocal()
     let (startKey, endKey) = makeScanKeysFromRange(regularTableId, rangeInfo)
 
     # Regular table keys SHOULD have d/ prefix

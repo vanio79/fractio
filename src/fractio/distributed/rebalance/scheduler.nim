@@ -12,9 +12,9 @@ import std/atomics
 import std/sequtils
 import std/algorithm
 import std/times
-
 import fractio/distributed/raft/group_types
 import fractio/distributed/rebalance/allocator
+import fractio/distributed/sharedtimer/timeprovider
 import fractio/core/types
 
 # ============================================================================
@@ -72,7 +72,7 @@ proc newRebalanceOp*(decision: AllocationDecision,
                      nowNs: int64): RebalanceOp =
   ## Create a new rebalance operation with ULID ID
   new(result)
-  result.id = genTransactionID()
+  result.id = genTransactionID(nowNs)
   result.decision = decision
   result.state = rosPending
   result.createdAtNs = nowNs

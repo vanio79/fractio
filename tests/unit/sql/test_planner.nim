@@ -393,7 +393,7 @@ suite "Planner formatExpr":
     check formatExpr(e) == "?" # dtBytes falls through to else
 
   test "format literal with dtULID falls through":
-    let v = newValueRef(genULID())
+    let v = newValueRef(genULIDLocal())
     let e = Expr(kind: exLiteral, litValue: v)
     check formatExpr(e) == "?" # dtULID falls through to else
 
@@ -667,7 +667,7 @@ suite "Planner dataRowValueToPkValue":
 
 suite "Planner formatPlanOp DML":
   test "format Insert":
-    let tid = genTableId()
+    let tid = genTableIdLocal()
     let op = PlanOp(kind: poInsert, insTableName: "users", insTableId: tid,
         insRows: @["r1", "r2"])
     let s = formatPlanOp(op)
@@ -676,7 +676,7 @@ suite "Planner formatPlanOp DML":
     check "rows=2" in s
 
   test "format PointGet":
-    let tid = genTableId()
+    let tid = genTableIdLocal()
     let op = PlanOp(kind: poPointGet, pgTableId: tid, pgKey: "abc",
         pgColumns: @["id", "name"])
     let s = formatPlanOp(op)
@@ -685,14 +685,14 @@ suite "Planner formatPlanOp DML":
     check "id" in s
 
   test "format Scan without filter":
-    let tid = genTableId()
+    let tid = genTableIdLocal()
     let op = PlanOp(kind: poScan, scTableId: tid, scColumns: @["id"], scLimit: 0)
     let s = formatPlanOp(op)
     check "Scan" in s
     check "id" in s
 
   test "format Scan with filter":
-    let tid = genTableId()
+    let tid = genTableIdLocal()
     let filter = Expr(kind: exBinOp, binOp: boEq,
       binLeft: Expr(kind: exColumn, colName: "status"),
       binRight: Expr(kind: exLiteral, litValue: newValueRef("active")))
@@ -705,7 +705,7 @@ suite "Planner formatPlanOp DML":
     check "limit=10" in s
 
   test "format Update without filter":
-    let tid = genTableId()
+    let tid = genTableIdLocal()
     let op = PlanOp(kind: poUpdate, upTableName: "users", upTableId: tid,
                     upSets: @[("name", Expr(kind: exLiteral,
                         litValue: newValueRef("test")))])
@@ -715,7 +715,7 @@ suite "Planner formatPlanOp DML":
     check "1 cols" in s
 
   test "format Update with filter":
-    let tid = genTableId()
+    let tid = genTableIdLocal()
     let filter = Expr(kind: exBinOp, binOp: boGt,
       binLeft: Expr(kind: exColumn, colName: "age"),
       binRight: Expr(kind: exLiteral, litValue: newValueRef(18'i64)))
@@ -728,14 +728,14 @@ suite "Planner formatPlanOp DML":
     check "age" in s
 
   test "format Delete without filter":
-    let tid = genTableId()
+    let tid = genTableIdLocal()
     let op = PlanOp(kind: poDelete, delTableName: "logs", delTableId: tid)
     let s = formatPlanOp(op)
     check "Delete" in s
     check "logs" in s
 
   test "format Delete with filter":
-    let tid = genTableId()
+    let tid = genTableIdLocal()
     let filter = Expr(kind: exBinOp, binOp: boLt,
       binLeft: Expr(kind: exColumn, colName: "created"),
       binRight: Expr(kind: exLiteral, litValue: newValueRef(100'i64)))

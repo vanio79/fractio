@@ -149,7 +149,7 @@ suite "Key Encoding Helpers":
     check isVersionKey(key) == false
 
   test "isIntentKeyMvcc true":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let txnBytes = transactionIDToBytes(txnId)
     var key = "user_key\x00\x01"
     key.add(txnBytes)

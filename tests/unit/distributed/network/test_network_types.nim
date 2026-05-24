@@ -126,7 +126,7 @@ suite "MessageHeader":
   test "newMessageHeader":
     let source = NodeID("node-1")
     let target = NodeID("node-2")
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     let header = newMessageHeader(uint16(rmtAppendEntries), 123'u64, source,
         target, 5'u64, groupId)
 

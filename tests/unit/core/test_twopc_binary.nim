@@ -8,7 +8,7 @@ import fractio/utils/binary
 
 suite "TwoPCRequest Binary Serialization":
   test "encode minimal TwoPCRequest":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let req = TwoPCRequest(
       requestId: "req_001",
       requestType: tpcPrepare,
@@ -26,7 +26,7 @@ suite "TwoPCRequest Binary Serialization":
     check encoded[2] == 'R'
 
   test "encode TwoPCRequest with data and endpoints":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let req = TwoPCRequest(
       requestId: "req_002",
       requestType: tpcCommit,
@@ -40,7 +40,7 @@ suite "TwoPCRequest Binary Serialization":
     check encoded.len > 30
 
   test "decode TwoPCRequest roundtrip":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let req = TwoPCRequest(
       requestId: "req_003",
       requestType: tpcRollback,
@@ -65,7 +65,7 @@ suite "TwoPCRequest Binary Serialization":
       let req = TwoPCRequest(
         requestId: "req_rt",
         requestType: rt,
-        transactionId: genTransactionID(),
+        transactionId: genTransactionIDLocal(),
         coordinatorId: "coord",
         timestamp: Timestamp(0),
         data: "",
@@ -97,7 +97,7 @@ suite "TwoPCRequest Binary Serialization":
 
 suite "TwoPCResponse Binary Serialization":
   test "encode minimal TwoPCResponse":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let resp = TwoPCResponse(
       requestId: "req_001",
       transactionId: txnId,
@@ -113,7 +113,7 @@ suite "TwoPCResponse Binary Serialization":
     check encoded[2] == 'S'
 
   test "encode TwoPCResponse with error":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let resp = TwoPCResponse(
       requestId: "req_002",
       transactionId: txnId,
@@ -126,7 +126,7 @@ suite "TwoPCResponse Binary Serialization":
     check encoded.len > 20
 
   test "decode TwoPCResponse roundtrip":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let resp = TwoPCResponse(
       requestId: "req_003",
       transactionId: txnId,
@@ -148,7 +148,7 @@ suite "TwoPCResponse Binary Serialization":
     for v in [pvYes, pvNo, pvAbstain]:
       let resp = TwoPCResponse(
         requestId: "req_vote",
-        transactionId: genTransactionID(),
+        transactionId: genTransactionIDLocal(),
         participantId: "part",
         vote: v,
         state: tpcsPrepared,
@@ -163,7 +163,7 @@ suite "TwoPCResponse Binary Serialization":
               tpcsCommitted, tpcsAborting, tpcsAborted, tpcsRecovering]:
       let resp = TwoPCResponse(
         requestId: "req_state",
-        transactionId: genTransactionID(),
+        transactionId: genTransactionIDLocal(),
         participantId: "part",
         vote: pvYes,
         state: s,
@@ -198,7 +198,7 @@ suite "TwoPC Binary Serialization - Edge Cases":
     let req = TwoPCRequest(
       requestId: "req_large",
       requestType: tpcCommit,
-      transactionId: genTransactionID(),
+      transactionId: genTransactionIDLocal(),
       coordinatorId: "coord",
       timestamp: Timestamp(0),
       data: largeData,
@@ -216,7 +216,7 @@ suite "TwoPC Binary Serialization - Edge Cases":
     let req = TwoPCRequest(
       requestId: "req_many",
       requestType: tpcPrepare,
-      transactionId: genTransactionID(),
+      transactionId: genTransactionIDLocal(),
       coordinatorId: "coord",
       timestamp: Timestamp(0),
       data: "",
@@ -232,7 +232,7 @@ suite "TwoPC Binary Serialization - Edge Cases":
     let req = TwoPCRequest(
       requestId: "req_special",
       requestType: tpcCommit,
-      transactionId: genTransactionID(),
+      transactionId: genTransactionIDLocal(),
       coordinatorId: "coord with \"quotes\" and \\backslash\\",
       timestamp: Timestamp(0),
       data: "data\nwith\nnewlines\tand\ttabs",

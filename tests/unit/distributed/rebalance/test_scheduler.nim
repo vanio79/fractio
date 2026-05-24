@@ -19,7 +19,7 @@ suite "RebalanceOpState":
 suite "RebalanceOp":
 
   test "newRebalanceOp":
-    let decision = newAddReplicaDecision(genGroupID(), NodeID(1), 10, "test")
+    let decision = newAddReplicaDecision(genGroupIDLocal(), NodeID(1), 10, "test")
     let op = newRebalanceOp(decision, 1000'i64)
     check op.id != zeroTransactionID()
     check op.decision.kind == adkAddReplica
@@ -32,7 +32,7 @@ suite "RebalanceOp":
     check op.lastError == ""
 
   test "markInProgress":
-    let decision = newAddReplicaDecision(genGroupID(), NodeID(1), 10, "test")
+    let decision = newAddReplicaDecision(genGroupIDLocal(), NodeID(1), 10, "test")
     let op = newRebalanceOp(decision, 1000'i64)
     op.markInProgress(2000'i64)
     check op.state == rosInProgress
@@ -40,7 +40,7 @@ suite "RebalanceOp":
     check op.attempts == 1
 
   test "markCompleted":
-    let decision = newAddReplicaDecision(genGroupID(), NodeID(1), 10, "test")
+    let decision = newAddReplicaDecision(genGroupIDLocal(), NodeID(1), 10, "test")
     let op = newRebalanceOp(decision, 1000'i64)
     op.markInProgress(2000'i64)
     op.markCompleted(3000'i64)
@@ -48,7 +48,7 @@ suite "RebalanceOp":
     check op.completedAtNs == 3000'i64
 
   test "markFailed":
-    let decision = newAddReplicaDecision(genGroupID(), NodeID(1), 10, "test")
+    let decision = newAddReplicaDecision(genGroupIDLocal(), NodeID(1), 10, "test")
     let op = newRebalanceOp(decision, 1000'i64)
     op.markInProgress(2000'i64)
     op.markFailed(3000'i64, "test error")
@@ -57,32 +57,32 @@ suite "RebalanceOp":
     check op.lastError == "test error"
 
   test "markCancelled":
-    let decision = newAddReplicaDecision(genGroupID(), NodeID(1), 10, "test")
+    let decision = newAddReplicaDecision(genGroupIDLocal(), NodeID(1), 10, "test")
     let op = newRebalanceOp(decision, 1000'i64)
     op.markCancelled(2000'i64)
     check op.state == rosCancelled
     check op.completedAtNs == 2000'i64
 
   test "ageNs":
-    let decision = newAddReplicaDecision(genGroupID(), NodeID(1), 10, "test")
+    let decision = newAddReplicaDecision(genGroupIDLocal(), NodeID(1), 10, "test")
     let op = newRebalanceOp(decision, 1000'i64)
     check op.ageNs(5000'i64) == 4000'i64
 
   test "durationNs completed":
-    let decision = newAddReplicaDecision(genGroupID(), NodeID(1), 10, "test")
+    let decision = newAddReplicaDecision(genGroupIDLocal(), NodeID(1), 10, "test")
     let op = newRebalanceOp(decision, 1000'i64)
     op.markInProgress(2000'i64)
     op.markCompleted(5000'i64)
     check op.durationNs(10000'i64) == 3000'i64
 
   test "durationNs in progress":
-    let decision = newAddReplicaDecision(genGroupID(), NodeID(1), 10, "test")
+    let decision = newAddReplicaDecision(genGroupIDLocal(), NodeID(1), 10, "test")
     let op = newRebalanceOp(decision, 1000'i64)
     op.markInProgress(2000'i64)
     check op.durationNs(5000'i64) == 3000'i64
 
   test "durationNs not started":
-    let decision = newAddReplicaDecision(genGroupID(), NodeID(1), 10, "test")
+    let decision = newAddReplicaDecision(genGroupIDLocal(), NodeID(1), 10, "test")
     let op = newRebalanceOp(decision, 1000'i64)
     check op.durationNs(5000'i64) == 0
 
@@ -97,7 +97,7 @@ suite "RebalanceQueue":
 
   test "enqueue":
     let queue = newRebalanceQueue()
-    let decision = newAddReplicaDecision(genGroupID(), NodeID(1), 10, "test")
+    let decision = newAddReplicaDecision(genGroupIDLocal(), NodeID(1), 10, "test")
     let op = queue.enqueue(decision, 1000'i64)
     check queue.pending.len == 1
     check op.decision.kind == adkAddReplica
@@ -106,8 +106,8 @@ suite "RebalanceQueue":
 
   test "enqueue sorts by priority":
     let queue = newRebalanceQueue()
-    let lowPriority = newAddReplicaDecision(genGroupID(), NodeID(1), 5, "low")
-    let highPriority = newAddReplicaDecision(genGroupID(), NodeID(2), 10, "high")
+    let lowPriority = newAddReplicaDecision(genGroupIDLocal(), NodeID(1), 5, "low")
+    let highPriority = newAddReplicaDecision(genGroupIDLocal(), NodeID(2), 10, "high")
 
     discard queue.enqueue(lowPriority, 1000'i64)
     discard queue.enqueue(highPriority, 1000'i64)
@@ -126,7 +126,7 @@ suite "RebalanceQueue":
 
   test "dequeue removes from pending":
     let queue = newRebalanceQueue()
-    let decision = newAddReplicaDecision(genGroupID(), NodeID(1), 10, "test")
+    let decision = newAddReplicaDecision(genGroupIDLocal(), NodeID(1), 10, "test")
     discard queue.enqueue(decision, 1000'i64)
 
     let op = queue.dequeue()
@@ -136,7 +136,7 @@ suite "RebalanceQueue":
 
   test "startOp":
     let queue = newRebalanceQueue()
-    let decision = newAddReplicaDecision(genGroupID(), NodeID(1), 10, "test")
+    let decision = newAddReplicaDecision(genGroupIDLocal(), NodeID(1), 10, "test")
     discard queue.enqueue(decision, 1000'i64)
 
     # First dequeue to remove from pending
@@ -149,7 +149,7 @@ suite "RebalanceQueue":
 
   test "completeOp":
     let queue = newRebalanceQueue()
-    let decision = newAddReplicaDecision(genGroupID(), NodeID(1), 10, "test")
+    let decision = newAddReplicaDecision(genGroupIDLocal(), NodeID(1), 10, "test")
     discard queue.enqueue(decision, 1000'i64)
 
     let op = queue.dequeue()
@@ -164,7 +164,7 @@ suite "RebalanceQueue":
 
   test "failOp":
     let queue = newRebalanceQueue()
-    let decision = newAddReplicaDecision(genGroupID(), NodeID(1), 10, "test")
+    let decision = newAddReplicaDecision(genGroupIDLocal(), NodeID(1), 10, "test")
     discard queue.enqueue(decision, 1000'i64)
 
     let op = queue.dequeue()
@@ -180,7 +180,7 @@ suite "RebalanceQueue":
 
   test "cancelOp from pending":
     let queue = newRebalanceQueue()
-    let decision = newAddReplicaDecision(genGroupID(), NodeID(1), 10, "test")
+    let decision = newAddReplicaDecision(genGroupIDLocal(), NodeID(1), 10, "test")
     let op = queue.enqueue(decision, 1000'i64)
 
     queue.cancelOp(op, 2000'i64)
@@ -192,7 +192,7 @@ suite "RebalanceQueue":
 
   test "cancelOp from inProgress":
     let queue = newRebalanceQueue()
-    let decision = newAddReplicaDecision(genGroupID(), NodeID(1), 10, "test")
+    let decision = newAddReplicaDecision(genGroupIDLocal(), NodeID(1), 10, "test")
     discard queue.enqueue(decision, 1000'i64)
 
     # Proper flow: dequeue removes from pending, then startOp adds to inProgress
@@ -208,7 +208,7 @@ suite "RebalanceQueue":
 
   test "cancelOp not found":
     let queue = newRebalanceQueue()
-    let decision = newAddReplicaDecision(genGroupID(), NodeID(1), 10, "test")
+    let decision = newAddReplicaDecision(genGroupIDLocal(), NodeID(1), 10, "test")
     # Create op but don't enqueue it
     let op = newRebalanceOp(decision, 1000'i64)
 
@@ -222,7 +222,7 @@ suite "RebalanceQueue":
     let queue = newRebalanceQueue()
     check queue.pendingCount() == 0
 
-    discard queue.enqueue(newAddReplicaDecision(genGroupID(), NodeID(1), 10,
+    discard queue.enqueue(newAddReplicaDecision(genGroupIDLocal(), NodeID(1), 10,
         "test"), 1000'i64)
     check queue.pendingCount() == 1
     queue.destroy()
@@ -231,7 +231,7 @@ suite "RebalanceQueue":
     let queue = newRebalanceQueue()
     check queue.inProgressCount() == 0
 
-    discard queue.enqueue(newAddReplicaDecision(genGroupID(), NodeID(1), 10,
+    discard queue.enqueue(newAddReplicaDecision(genGroupIDLocal(), NodeID(1), 10,
         "test"), 1000'i64)
     let op = queue.dequeue()
     check op.isSome
@@ -243,7 +243,7 @@ suite "RebalanceQueue":
     let queue = newRebalanceQueue()
     check queue.totalCount() == 0
 
-    discard queue.enqueue(newAddReplicaDecision(genGroupID(), NodeID(1), 10,
+    discard queue.enqueue(newAddReplicaDecision(genGroupIDLocal(), NodeID(1), 10,
         "test"), 1000'i64)
     check queue.totalCount() == 1
 
@@ -261,7 +261,7 @@ suite "RebalanceQueue":
     check stats.inProgress == 0
     check stats.completed == 0
 
-    discard queue.enqueue(newAddReplicaDecision(genGroupID(), NodeID(1), 10,
+    discard queue.enqueue(newAddReplicaDecision(genGroupIDLocal(), NodeID(1), 10,
         "test"), 1000'i64)
     let dequeued = queue.dequeue()
     check dequeued.isSome
@@ -302,7 +302,7 @@ suite "RebalanceScheduler":
     let alloc = newAllocator(pool)
     let scheduler = newRebalanceScheduler(alloc, dummyCallback)
 
-    let decision = newAddReplicaDecision(genGroupID(), NodeID(1), 10, "test")
+    let decision = newAddReplicaDecision(genGroupIDLocal(), NodeID(1), 10, "test")
     let result = scheduler.addDecision(decision, 1000'i64)
 
     check result.isSome
@@ -319,12 +319,12 @@ suite "RebalanceScheduler":
     scheduler.maxPending = 1
 
     # Add first decision
-    let decision1 = newAddReplicaDecision(genGroupID(), NodeID(1), 10, "test")
+    let decision1 = newAddReplicaDecision(genGroupIDLocal(), NodeID(1), 10, "test")
     let result1 = scheduler.addDecision(decision1, 1000'i64)
     check result1.isSome
 
     # Try to add second - should fail
-    let decision2 = newAddReplicaDecision(genGroupID(), NodeID(2), 10, "test2")
+    let decision2 = newAddReplicaDecision(genGroupIDLocal(), NodeID(2), 10, "test2")
     let result2 = scheduler.addDecision(decision2, 1000'i64)
     check result2.isNone
 
@@ -338,8 +338,8 @@ suite "RebalanceScheduler":
     let scheduler = newRebalanceScheduler(alloc, dummyCallback)
 
     let decisions = @[
-      newAddReplicaDecision(genGroupID(), NodeID(1), 10, "test1"),
-      newAddReplicaDecision(genGroupID(), NodeID(2), 5, "test2")
+      newAddReplicaDecision(genGroupIDLocal(), NodeID(1), 10, "test1"),
+      newAddReplicaDecision(genGroupIDLocal(), NodeID(2), 5, "test2")
     ]
     let ops = scheduler.addDecisions(decisions, 1000'i64)
 
@@ -357,9 +357,9 @@ suite "RebalanceScheduler":
     scheduler.maxPending = 2
 
     let decisions = @[
-      newAddReplicaDecision(genGroupID(), NodeID(1), 10, "test1"),
-      newAddReplicaDecision(genGroupID(), NodeID(2), 5, "test2"),
-      newAddReplicaDecision(genGroupID(), NodeID(3), 3, "test3")
+      newAddReplicaDecision(genGroupIDLocal(), NodeID(1), 10, "test1"),
+      newAddReplicaDecision(genGroupIDLocal(), NodeID(2), 5, "test2"),
+      newAddReplicaDecision(genGroupIDLocal(), NodeID(3), 3, "test3")
     ]
     let ops = scheduler.addDecisions(decisions, 1000'i64)
 
@@ -378,9 +378,9 @@ suite "RebalanceScheduler":
     let alloc = newAllocator(pool)
     let scheduler = newRebalanceScheduler(alloc, successCallback)
 
-    discard scheduler.addDecision(newAddReplicaDecision(genGroupID(), NodeID(1),
+    discard scheduler.addDecision(newAddReplicaDecision(genGroupIDLocal(), NodeID(1),
         10, "test"), 1000'i64)
-    discard scheduler.addDecision(newAddReplicaDecision(genGroupID(), NodeID(2),
+    discard scheduler.addDecision(newAddReplicaDecision(genGroupIDLocal(), NodeID(2),
         5, "test2"), 1000'i64)
 
     let processed = scheduler.processBatch(2000'i64)
@@ -399,7 +399,7 @@ suite "RebalanceScheduler":
     let alloc = newAllocator(pool)
     let scheduler = newRebalanceScheduler(alloc, failCallback)
 
-    discard scheduler.addDecision(newAddReplicaDecision(genGroupID(), NodeID(1),
+    discard scheduler.addDecision(newAddReplicaDecision(genGroupIDLocal(), NodeID(1),
         10, "test"), 1000'i64)
 
     let processed = scheduler.processBatch(2000'i64)
@@ -432,7 +432,7 @@ suite "RebalanceScheduler":
     scheduler.batchSize = 2
 
     for i in 1..5:
-      discard scheduler.addDecision(newAddReplicaDecision(genGroupID(), NodeID(
+      discard scheduler.addDecision(newAddReplicaDecision(genGroupIDLocal(), NodeID(
           i.uint32), 10, "test"), 1000'i64)
 
     let processed = scheduler.processBatch(2000'i64)
@@ -453,7 +453,7 @@ suite "RebalanceScheduler":
     let alloc = newAllocator(pool, 3)
     let scheduler = newRebalanceScheduler(alloc, successCallback)
 
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     let replicas = @[newReplicaDescriptor(NodeID(1), ReplicaID(1), rtVoter)]
 
     let ops = scheduler.checkGroupForRebalance(groupId, replicas, NodeID(1), 1000'i64)
@@ -469,7 +469,7 @@ suite "RebalanceScheduler":
     let alloc = newAllocator(pool)
     let scheduler = newRebalanceScheduler(alloc, successCallback)
 
-    discard scheduler.addDecision(newAddReplicaDecision(genGroupID(), NodeID(1),
+    discard scheduler.addDecision(newAddReplicaDecision(genGroupIDLocal(), NodeID(1),
         10, "test"), 1000'i64)
     discard scheduler.processBatch(2000'i64)
 
@@ -494,9 +494,9 @@ suite "Rebalance Prioritization":
     let scheduler = newRebalanceScheduler(alloc, dummyCallback)
 
     var decisions = @[
-      newAddReplicaDecision(genGroupID(), NodeID(1), 5, "low"),
-      newAddReplicaDecision(genGroupID(), NodeID(2), 10, "high"),
-      newAddReplicaDecision(genGroupID(), NodeID(3), 7, "medium")
+      newAddReplicaDecision(genGroupIDLocal(), NodeID(1), 5, "low"),
+      newAddReplicaDecision(genGroupIDLocal(), NodeID(2), 10, "high"),
+      newAddReplicaDecision(genGroupIDLocal(), NodeID(3), 7, "medium")
     ]
 
     scheduler.prioritizeByLoad(decisions)
@@ -515,8 +515,8 @@ suite "Rebalance Prioritization":
     let scheduler = newRebalanceScheduler(alloc, dummyCallback)
 
     var decisions = @[
-      newAddReplicaDecision(genGroupID(), NodeID(1), 3, "low"),
-      newAddReplicaDecision(genGroupID(), NodeID(2), 10, "high")
+      newAddReplicaDecision(genGroupIDLocal(), NodeID(1), 3, "low"),
+      newAddReplicaDecision(genGroupIDLocal(), NodeID(2), 10, "high")
     ]
 
     scheduler.prioritizeByAge(decisions)
@@ -534,9 +534,9 @@ suite "Rebalance Prioritization":
     let scheduler = newRebalanceScheduler(alloc, dummyCallback)
 
     let decisions = @[
-      newAddReplicaDecision(genGroupID(), NodeID(1), 10, "high"),
-      newAddReplicaDecision(genGroupID(), NodeID(2), 5, "medium"),
-      newAddReplicaDecision(genGroupID(), NodeID(3), 2, "low")
+      newAddReplicaDecision(genGroupIDLocal(), NodeID(1), 10, "high"),
+      newAddReplicaDecision(genGroupIDLocal(), NodeID(2), 5, "medium"),
+      newAddReplicaDecision(genGroupIDLocal(), NodeID(3), 2, "low")
     ]
 
     let filtered = scheduler.filterHighPriority(decisions)
@@ -553,9 +553,9 @@ suite "Rebalance Prioritization":
     let scheduler = newRebalanceScheduler(alloc, dummyCallback)
 
     let decisions = @[
-      newAddReplicaDecision(genGroupID(), NodeID(1), 10, "high"),
-      newAddReplicaDecision(genGroupID(), NodeID(2), 5, "medium"),
-      newAddReplicaDecision(genGroupID(), NodeID(3), 2, "low")
+      newAddReplicaDecision(genGroupIDLocal(), NodeID(1), 10, "high"),
+      newAddReplicaDecision(genGroupIDLocal(), NodeID(2), 5, "medium"),
+      newAddReplicaDecision(genGroupIDLocal(), NodeID(3), 2, "low")
     ]
 
     let filtered = scheduler.filterLowPriority(decisions)
@@ -577,22 +577,22 @@ suite "RebalanceConstraints":
 
   test "canRebalance true":
     let c = defaultRebalanceConstraints()
-    check c.canRebalance(genGroupID())
+    check c.canRebalance(genGroupIDLocal())
 
   test "canRebalance false for forbidden":
-    let groupId = genGroupID()
+    let groupId = genGroupIDLocal()
     let c = defaultRebalanceConstraints().withForbiddenGroups(@[groupId])
     check not c.canRebalance(groupId)
 
   test "canRebalance true for non-forbidden":
-    let groupId1 = genGroupID()
-    let groupId2 = genGroupID()
+    let groupId1 = genGroupIDLocal()
+    let groupId2 = genGroupIDLocal()
     let c = defaultRebalanceConstraints().withForbiddenGroups(@[groupId1])
     check c.canRebalance(groupId2)
 
   test "withForbiddenGroups":
-    let group1 = genGroupID()
-    let group2 = genGroupID()
+    let group1 = genGroupIDLocal()
+    let group2 = genGroupIDLocal()
     let c = defaultRebalanceConstraints().withForbiddenGroups(@[group1, group2])
     check c.forbiddenGroups.len == 2
     check group1 in c.forbiddenGroups

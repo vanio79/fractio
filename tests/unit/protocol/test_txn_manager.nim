@@ -41,7 +41,7 @@ suite "beginTransaction":
 
   test "beginTransaction with forcedId":
     let mgr = newTransactionManager()
-    let forcedId = genTransactionID()
+    let forcedId = genTransactionIDLocal()
     let rec = mgr.beginTransaction(0'u8, 0'u32, some(forcedId))
     check rec.id == forcedId
 
@@ -75,7 +75,7 @@ suite "recordRead":
 
   test "recordRead non-existent txn":
     let mgr = newTransactionManager()
-    let fakeId = genTransactionID()
+    let fakeId = genTransactionIDLocal()
     let result = mgr.recordRead(fakeId, "key1")
     check result.isErr
 
@@ -102,7 +102,7 @@ suite "recordWrite":
 
   test "recordWrite non-existent txn":
     let mgr = newTransactionManager()
-    let fakeId = genTransactionID()
+    let fakeId = genTransactionIDLocal()
     let result = mgr.recordWrite(fakeId, "key1")
     check result.isErr
 
@@ -153,7 +153,7 @@ suite "commitTransaction":
 
   test "commitTransaction non-existent txn":
     let mgr = newTransactionManager()
-    let fakeId = genTransactionID()
+    let fakeId = genTransactionIDLocal()
     let resp = mgr.commitTransaction(fakeId)
     check resp.status == TxnCommitNotFound
 
@@ -190,7 +190,7 @@ suite "rollbackTransaction":
 
   test "rollbackTransaction non-existent txn":
     let mgr = newTransactionManager()
-    let fakeId = genTransactionID()
+    let fakeId = genTransactionIDLocal()
     let resp = mgr.rollbackTransaction(fakeId)
     check resp.status == TxnRollbackNotFound
 
@@ -227,7 +227,7 @@ suite "getTransactionStatus":
 
   test "getTransactionStatus non-existent":
     let mgr = newTransactionManager()
-    let fakeId = genTransactionID()
+    let fakeId = genTransactionIDLocal()
     let resp = mgr.getTransactionStatus(fakeId)
     check resp.status == TxnStatusNotFound
 
@@ -251,7 +251,7 @@ suite "getWriteSet":
 
   test "getWriteSet non-existent txn":
     let mgr = newTransactionManager()
-    let fakeId = genTransactionID()
+    let fakeId = genTransactionIDLocal()
     let ws = mgr.getWriteSet(fakeId)
     check ws.len == 0
 

@@ -809,11 +809,11 @@ suite "PrimaryKeySpec from TableRecord":
 
   test "primaryKeySpecFromTable single PK column":
     let rec = TableRecord(
-      tableId: genTableId(),
+      tableId: genTableIdLocal(),
       name: "users",
       schema: "public",
       database: "testdb",
-      spaceId: genSpaceID(),
+      spaceId: genSpaceIDLocal(),
       columns: @[
         ColumnDefBin(name: "id", dataType: cdtInt, maxLen: 0,
             flags: uint8(1 shl int(cfPrimaryKey) or 1 shl int(cfNotNull))),
@@ -829,11 +829,11 @@ suite "PrimaryKeySpec from TableRecord":
 
   test "primaryKeySpecFromTable composite PK":
     let rec = TableRecord(
-      tableId: genTableId(),
+      tableId: genTableIdLocal(),
       name: "orders",
       schema: "public",
       database: "testdb",
-      spaceId: genSpaceID(),
+      spaceId: genSpaceIDLocal(),
       columns: @[
         ColumnDefBin(name: "user_id", dataType: cdtInt, maxLen: 0,
             flags: uint8(1 shl int(cfPrimaryKey) or 1 shl int(cfNotNull))),
@@ -850,11 +850,11 @@ suite "PrimaryKeySpec from TableRecord":
 
   test "primaryKeySpecFromTable with string PK":
     let rec = TableRecord(
-      tableId: genTableId(),
+      tableId: genTableIdLocal(),
       name: "countries",
       schema: "public",
       database: "testdb",
-      spaceId: genSpaceID(),
+      spaceId: genSpaceIDLocal(),
       columns: @[
         ColumnDefBin(name: "code", dataType: cdtString, maxLen: 4,
             flags: uint8(1 shl int(cfPrimaryKey) or 1 shl int(cfNotNull))),
@@ -869,11 +869,11 @@ suite "PrimaryKeySpec from TableRecord":
 
   test "primaryKeySpecFromTable missing PK column raises error":
     let rec = TableRecord(
-      tableId: genTableId(),
+      tableId: genTableIdLocal(),
       name: "bad_table",
       schema: "public",
       database: "testdb",
-      spaceId: genSpaceID(),
+      spaceId: genSpaceIDLocal(),
       columns: @[
         ColumnDefBin(name: "id", dataType: cdtInt, maxLen: 0, flags: 0)
       ],

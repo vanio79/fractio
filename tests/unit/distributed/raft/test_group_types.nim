@@ -43,13 +43,13 @@ suite "NodeID":
 
 suite "GroupID":
   test "string representation is 26-char ULID":
-    let id = genGroupID()
+    let id = genGroupIDLocal()
     let str = $id
     check str.len == 26
     check str.allCharsInSet(Digits + {'A'..'Z'})
 
   test "parse from ULID string":
-    let id = genGroupID()
+    let id = genGroupIDLocal()
     let parsed = parseGroupID($id)
     check parsed == id
 
@@ -69,8 +69,8 @@ suite "GroupID":
     check META_GROUP_ID <= DATA_GROUP_START_ID
 
   test "generation produces unique IDs":
-    let id1 = genGroupID()
-    let id2 = genGroupID()
+    let id1 = genGroupIDLocal()
+    let id2 = genGroupIDLocal()
     # ULIDs are unique
     check id1 != id2
     # Both are valid ULIDs
@@ -207,7 +207,7 @@ suite "GroupDescriptor":
     check desc.isInitialized()
 
   test "binary round-trip":
-    let gid = genGroupID()
+    let gid = genGroupIDLocal()
     let desc = newGroupDescriptor(gid)
     discard desc.addReplica(NodeID(1))
     discard desc.addReplica(NodeID(2))
@@ -222,37 +222,37 @@ suite "GroupDescriptor":
 
 suite "Key Encoding":
   test "group prefix":
-    let gid = genGroupID()
+    let gid = genGroupIDLocal()
     let prefix = encodeGroupPrefix(gid)
     check prefix.startsWith("/range/")
     check prefix.endsWith("/")
 
   test "data key":
-    let gid = genGroupID()
+    let gid = genGroupIDLocal()
     let key = encodeDataKey(gid, @[byte 0x01, 0x02])
     check key.startsWith("/range/")
     check key.contains("/data/")
 
   test "log key":
-    let gid = genGroupID()
+    let gid = genGroupIDLocal()
     let key = encodeLogKey(gid, 789'u64)
     check key.startsWith("/raft/")
     check key.endsWith("/log/789")
 
   test "state key":
-    let gid = genGroupID()
+    let gid = genGroupIDLocal()
     let key = encodeStateKey(gid)
     check key.startsWith("/raft/")
     check key.endsWith("/state")
 
   test "snapshot key":
-    let gid = genGroupID()
+    let gid = genGroupIDLocal()
     let key = encodeSnapshotKey(gid)
     check key.startsWith("/raft/")
     check key.endsWith("/snapshot")
 
   test "parse log index":
-    let gid = genGroupID()
+    let gid = genGroupIDLocal()
     let key = encodeLogKey(gid, 789'u64)
     let index = parseLogIndex(key)
     check index == 789'u64
@@ -341,34 +341,34 @@ suite "GroupID Extended":
       check b == 0'u8
 
   test "groupIDFromULID and groupIDToULID":
-    let ulid = genULID()
+    let ulid = genULIDLocal()
     let gid = groupIDFromULID(ulid)
     let recovered = groupIDToULID(gid)
     check recovered == ulid
 
   test "groupIDToBytes and groupIDFromBytes":
-    let gid = genGroupID()
+    let gid = genGroupIDLocal()
     let bytes = groupIDToBytes(gid)
     check bytes.len == 16
     let recovered = groupIDFromBytes(bytes)
     check recovered == gid
 
   test "GroupID hash consistency":
-    let id1 = genGroupID()
+    let id1 = genGroupIDLocal()
     let id2 = id1
     check hash(id1) == hash(id2)
 
   test "GroupID in HashSet":
     var set = initHashSet[GroupID]()
-    let id = genGroupID()
+    let id = genGroupIDLocal()
     set.incl(id)
     check id in set
     set.excl(id)
     check id notin set
 
   test "GroupID ordering time-based":
-    let id1 = genGroupID()
-    let id2 = genGroupID()
+    let id1 = genGroupIDLocal()
+    let id2 = genGroupIDLocal()
     check (id1 < id2) or (id2 < id1) or (id1 == id2)
 
 suite "ReplicaID Extended":
@@ -446,19 +446,19 @@ suite "ReplicaDescriptor Extended":
 
 suite "GroupDescriptor Extended":
   test "addReplica duplicate node returns existing":
-    let desc = newGroupDescriptor(genGroupID())
+    let desc = newGroupDescriptor(genGroupIDLocal())
     let rep1 = desc.addReplica(NodeID(1))
     let rep2 = desc.addReplica(NodeID(1))
     check rep1 == rep2
     check desc.replicas.len == 1
 
   test "removeReplica non-existent returns false":
-    let desc = newGroupDescriptor(genGroupID())
+    let desc = newGroupDescriptor(genGroupIDLocal())
     discard desc.addReplica(NodeID(1))
     check not desc.removeReplica(ReplicaID(99))
 
   test "removeReplica removes correct replica":
-    let desc = newGroupDescriptor(genGroupID())
+    let desc = newGroupDescriptor(genGroupIDLocal())
     discard desc.addReplica(NodeID(1))
     discard desc.addReplica(NodeID(2))
     discard desc.addReplica(NodeID(3))
@@ -468,28 +468,28 @@ suite "GroupDescriptor Extended":
     check desc.replicas[1].nodeId == NodeID(3)
 
   test "quorum size edge cases":
-    let desc1 = newGroupDescriptor(genGroupID())
+    let desc1 = newGroupDescriptor(genGroupIDLocal())
     discard desc1.addReplica(NodeID(1))
     check desc1.quorumSize() == 1
 
-    let desc2 = newGroupDescriptor(genGroupID())
+    let desc2 = newGroupDescriptor(genGroupIDLocal())
     discard desc2.addReplica(NodeID(1))
     discard desc2.addReplica(NodeID(2))
     check desc2.quorumSize() == 2
 
-    let desc5 = newGroupDescriptor(genGroupID())
+    let desc5 = newGroupDescriptor(genGroupIDLocal())
     for i in 1..5:
       discard desc5.addReplica(NodeID(int32(i)))
     check desc5.quorumSize() == 3
 
   test "quorum size only non-voters":
-    let desc = newGroupDescriptor(genGroupID())
+    let desc = newGroupDescriptor(genGroupIDLocal())
     discard desc.addReplica(NodeID(1), rtNonVoter)
     discard desc.addReplica(NodeID(2), rtNonVoter)
     check desc.quorumSize() == 1
 
   test "isInitialized with replicas":
-    let gid = genGroupID()
+    let gid = genGroupIDLocal()
     let desc = newGroupDescriptor(gid)
     check not desc.isInitialized()
     discard desc.addReplica(NodeID(1))
@@ -500,23 +500,23 @@ suite "GroupDescriptor Extended":
     metaDesc.groupId.ULID.data[15] = 1'u8
     check metaDesc.isMetaGroup()
 
-    let dataDesc = newGroupDescriptor(genGroupID())
+    let dataDesc = newGroupDescriptor(genGroupIDLocal())
     check not dataDesc.isMetaGroup()
 
   test "preferredLeader field":
-    let desc = newGroupDescriptor(genGroupID())
+    let desc = newGroupDescriptor(genGroupIDLocal())
     check desc.preferredLeader == NodeID(0)
     desc.preferredLeader = NodeID(5)
     check desc.preferredLeader == NodeID(5)
 
   test "leader field":
-    let desc = newGroupDescriptor(genGroupID())
+    let desc = newGroupDescriptor(genGroupIDLocal())
     check desc.leader == NodeID(0)
     desc.leader = NodeID(3)
     check desc.leader == NodeID(3)
 
   test "binary encode verify magic":
-    let desc = newGroupDescriptor(genGroupID())
+    let desc = newGroupDescriptor(genGroupIDLocal())
     discard desc.addReplica(NodeID(1))
     let encoded = encodeGroupDescriptor(desc)
     check encoded[0] == char(GROUP_DESC_MAGIC[0])
@@ -535,13 +535,13 @@ suite "GroupDescriptor Extended":
       discard decodeGroupDescriptor(small)
 
   test "binary decode invalid version":
-    var encoded = encodeGroupDescriptor(newGroupDescriptor(genGroupID()))
+    var encoded = encodeGroupDescriptor(newGroupDescriptor(genGroupIDLocal()))
     encoded[3] = char(0xFF)
     expect ValueError:
       discard decodeGroupDescriptor(encoded)
 
   test "binary roundtrip with all fields":
-    let desc = newGroupDescriptor(genGroupID())
+    let desc = newGroupDescriptor(genGroupIDLocal())
     discard desc.addReplica(NodeID(1))
     discard desc.addReplica(NodeID(2), rtNonVoter)
     desc.preferredLeader = NodeID(5)
@@ -558,7 +558,7 @@ suite "GroupDescriptor Extended":
     check decoded.replicas.len == desc.replicas.len
 
   test "string representation":
-    let desc = newGroupDescriptor(genGroupID())
+    let desc = newGroupDescriptor(genGroupIDLocal())
     discard desc.addReplica(NodeID(1))
     let str = $desc
     check str.contains("GroupDescriptor")
@@ -566,12 +566,12 @@ suite "GroupDescriptor Extended":
 
 suite "Key Encoding Extended":
   test "encodeDataKey with empty bytes":
-    let gid = genGroupID()
+    let gid = genGroupIDLocal()
     let key = encodeDataKey(gid, @[])
     check key.contains("/data/")
 
   test "encodeDataKey with large bytes":
-    let gid = genGroupID()
+    let gid = genGroupIDLocal()
     var largeBytes = newSeq[byte](1000)
     for i in 0..<largeBytes.len:
       largeBytes[i] = byte(i mod 256)
@@ -579,17 +579,17 @@ suite "Key Encoding Extended":
     check key.len > 1000
 
   test "encodeLogKey with zero index":
-    let gid = genGroupID()
+    let gid = genGroupIDLocal()
     let key = encodeLogKey(gid, 0'u64)
     check key.endsWith("/log/0")
 
   test "encodeLogKey with max index":
-    let gid = genGroupID()
+    let gid = genGroupIDLocal()
     let key = encodeLogKey(gid, uint64.high)
     check key.contains("/log/")
 
   test "parseLogIndex various formats":
-    let gid = genGroupID()
+    let gid = genGroupIDLocal()
     for idx in [0'u64, 1'u64, 100'u64, uint64.high]:
       let key = encodeLogKey(gid, idx)
       let parsed = parseLogIndex(key)
@@ -605,14 +605,14 @@ suite "Key Encoding Extended":
 
 suite "GroupDescriptor Operations":
   test "many replicas":
-    let desc = newGroupDescriptor(genGroupID())
+    let desc = newGroupDescriptor(genGroupIDLocal())
     for i in 1..100:
       discard desc.addReplica(NodeID(int32(i)))
     check desc.replicas.len == 100
     check desc.quorumSize() == 51
 
   test "alternate voter/non-voter":
-    let desc = newGroupDescriptor(genGroupID())
+    let desc = newGroupDescriptor(genGroupIDLocal())
     for i in 1..10:
       let rt = if i mod 2 == 0: rtNonVoter else: rtVoter
       discard desc.addReplica(NodeID(int32(i)), rt)
@@ -622,7 +622,7 @@ suite "GroupDescriptor Operations":
     check nonVoters.len == 5
 
   test "remove all replicas":
-    let desc = newGroupDescriptor(genGroupID())
+    let desc = newGroupDescriptor(genGroupIDLocal())
     for i in 1..5:
       discard desc.addReplica(NodeID(int32(i)))
     for i in 1..5:
@@ -630,7 +630,7 @@ suite "GroupDescriptor Operations":
     check desc.replicas.len == 0
 
   test "generation increments correctly":
-    let desc = newGroupDescriptor(genGroupID())
+    let desc = newGroupDescriptor(genGroupIDLocal())
     check desc.generation == 1
     discard desc.addReplica(NodeID(1))
     check desc.generation == 2

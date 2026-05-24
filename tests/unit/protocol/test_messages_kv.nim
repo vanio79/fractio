@@ -12,7 +12,7 @@ import fractio/sql/data_row # for DataRow type in filter evaluation tests
 suite "Get Request Messages":
 
   test "encodeGetRequest basic":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = GetRequest(
       flags: 0x00'u8,
       txnId: TransactionID(txnId),
@@ -27,7 +27,7 @@ suite "Get Request Messages":
     check mt.value == uint16(mtGet)
 
   test "encodeGetRequest with IncludeTimestamp flag":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = GetRequest(
       flags: GetFlagIncludeTimestamp,
       txnId: TransactionID(txnId),
@@ -42,7 +42,7 @@ suite "Get Request Messages":
     check flags.value == GetFlagIncludeTimestamp
 
   test "encodeGetRequest with IncludeVersion flag":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = GetRequest(
       flags: GetFlagIncludeVersion,
       txnId: TransactionID(txnId),
@@ -57,7 +57,7 @@ suite "Get Request Messages":
     check flags.value == GetFlagIncludeVersion
 
   test "encodeGetRequest with GroupRouted flag":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let groupId = groupIDFromInt(1)
     let req = GetRequest(
       flags: 0x00'u8,
@@ -73,7 +73,7 @@ suite "Get Request Messages":
     check (flags.value and GetFlagGroupRouted) != 0'u8
 
   test "encodeGetRequest combined flags":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = GetRequest(
       flags: GetFlagIncludeTimestamp or GetFlagIncludeVersion,
       txnId: TransactionID(txnId),
@@ -88,7 +88,7 @@ suite "Get Request Messages":
     check flags.value == (GetFlagIncludeTimestamp or GetFlagIncludeVersion)
 
   test "encodeGetRequest empty key":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = GetRequest(
       flags: 0x00'u8,
       txnId: TransactionID(txnId),
@@ -102,7 +102,7 @@ suite "Get Request Messages":
     check decoded.value.key == ""
 
   test "encodeGetRequest binary key":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = GetRequest(
       flags: 0x00'u8,
       txnId: TransactionID(txnId),
@@ -116,7 +116,7 @@ suite "Get Request Messages":
     check decoded.value.key == "\x00\x01\x02\xff"
 
   test "decodeGetRequest valid":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = GetRequest(
       flags: 0x00'u8,
       txnId: TransactionID(txnId),
@@ -131,7 +131,7 @@ suite "Get Request Messages":
     check decoded.value.readTimestamp == 12345'u64
 
   test "decodeGetRequest with groupId":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let groupId = groupIDFromInt(42)
     let req = GetRequest(
       flags: 0x00'u8,
@@ -156,7 +156,7 @@ suite "Get Request Messages":
     check decoded.isErr
 
   test "decodeGetRequest truncated key":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let txnBytes = ulidToBytes(txnId)
     let invalid = "\x01\x00\x00" & txnBytes &
         "\x00\x00\x00\x00\x00\x00\x00\x00" # no key length
@@ -164,7 +164,7 @@ suite "Get Request Messages":
     check decoded.isErr
 
   test "encodeGetRequest with filter":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let filterExpr = WireFilterExpr(
       kind: wekBinOp,
       binOpKind: wboEq,
@@ -185,7 +185,7 @@ suite "Get Request Messages":
     check (flagsR.value and GetFlagHasFilter) != 0'u8
 
   test "decodeGetRequest with filter roundtrip":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let filterExpr = WireFilterExpr(
       kind: wekBinOp,
       binOpKind: wboEq,
@@ -213,7 +213,7 @@ suite "Get Request Messages":
     check decodedFilter.binRight.litStringVal == "active"
 
   test "decodeGetRequest with filter and groupId":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let groupId = groupIDFromInt(5)
     let filterExpr = WireFilterExpr(
       kind: wekBinOp,
@@ -395,7 +395,7 @@ suite "Get Response Messages":
 suite "Put Request Messages":
 
   test "encodePutRequest basic":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = PutRequest(
       flags: 0x00'u8,
       txnId: TransactionID(txnId),
@@ -410,7 +410,7 @@ suite "Put Request Messages":
     check mt.value == uint16(mtPut)
 
   test "encodePutRequest with ReturnPrev flag":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = PutRequest(
       flags: PutFlagReturnPrev,
       txnId: TransactionID(txnId),
@@ -426,7 +426,7 @@ suite "Put Request Messages":
     check (flags.value and PutFlagReturnPrev) != 0'u8
 
   test "encodePutRequest with SyncWrite flag":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = PutRequest(
       flags: PutFlagSyncWrite,
       txnId: TransactionID(txnId),
@@ -442,7 +442,7 @@ suite "Put Request Messages":
     check (flags.value and PutFlagSyncWrite) != 0'u8
 
   test "encodePutRequest with CAS flag":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = PutRequest(
       flags: PutFlagCAS,
       txnId: TransactionID(txnId),
@@ -461,7 +461,7 @@ suite "Put Request Messages":
     check ev.value == 5'u64
 
   test "encodePutRequest with groupId":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let groupId = groupIDFromInt(7)
     let req = PutRequest(
       flags: 0x00'u8,
@@ -478,7 +478,7 @@ suite "Put Request Messages":
     check (flags.value and PutFlagGroupRouted) != 0'u8
 
   test "encodePutRequest combined flags":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = PutRequest(
       flags: PutFlagReturnPrev or PutFlagSyncWrite or PutFlagCAS,
       txnId: TransactionID(txnId),
@@ -494,7 +494,7 @@ suite "Put Request Messages":
     check flags.value == (PutFlagReturnPrev or PutFlagSyncWrite or PutFlagCAS)
 
   test "encodePutRequest empty key and value":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = PutRequest(
       flags: 0x00'u8,
       txnId: TransactionID(txnId),
@@ -510,7 +510,7 @@ suite "Put Request Messages":
     check decoded.value.value == ""
 
   test "decodePutRequest valid":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = PutRequest(
       flags: 0x00'u8,
       txnId: TransactionID(txnId),
@@ -526,7 +526,7 @@ suite "Put Request Messages":
     check decoded.value.value == "decode_value"
 
   test "decodePutRequest with groupId":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let groupId = groupIDFromInt(99)
     let req = PutRequest(
       flags: 0x00'u8,
@@ -547,7 +547,7 @@ suite "Put Request Messages":
     check decoded.isErr
 
   test "encodeRawPutRequest":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = PutRequest(
       flags: 0x00'u8,
       txnId: TransactionID(txnId),
@@ -676,7 +676,7 @@ suite "Put Response Messages":
 suite "Delete Request Messages":
 
   test "encodeDeleteRequest basic":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = DeleteRequest(
       flags: 0x00'u8,
       txnId: TransactionID(txnId),
@@ -689,7 +689,7 @@ suite "Delete Request Messages":
     check mt.value == uint16(mtDelete)
 
   test "encodeDeleteRequest with ReturnPrev flag":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = DeleteRequest(
       flags: DelFlagReturnPrev,
       txnId: TransactionID(txnId),
@@ -703,7 +703,7 @@ suite "Delete Request Messages":
     check (flags.value and DelFlagReturnPrev) != 0'u8
 
   test "encodeDeleteRequest with SyncWrite flag":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = DeleteRequest(
       flags: DelFlagSyncWrite,
       txnId: TransactionID(txnId),
@@ -717,7 +717,7 @@ suite "Delete Request Messages":
     check (flags.value and DelFlagSyncWrite) != 0'u8
 
   test "encodeDeleteRequest with OnlyIfExists flag":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = DeleteRequest(
       flags: DelFlagOnlyIfExists,
       txnId: TransactionID(txnId),
@@ -731,7 +731,7 @@ suite "Delete Request Messages":
     check (flags.value and DelFlagOnlyIfExists) != 0'u8
 
   test "encodeDeleteRequest with groupId":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let groupId = groupIDFromInt(11)
     let req = DeleteRequest(
       flags: 0x00'u8,
@@ -746,7 +746,7 @@ suite "Delete Request Messages":
     check (flags.value and DelFlagGroupRouted) != 0'u8
 
   test "decodeDeleteRequest valid":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = DeleteRequest(
       flags: 0x00'u8,
       txnId: TransactionID(txnId),
@@ -759,7 +759,7 @@ suite "Delete Request Messages":
     check decoded.value.key == "valid_del"
 
   test "decodeDeleteRequest with groupId":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let groupId = groupIDFromInt(22)
     let req = DeleteRequest(
       flags: 0x00'u8,
@@ -859,7 +859,7 @@ suite "Delete Response Messages":
 suite "Batch Messages":
 
   test "encodeBatchRequest empty":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = BatchRequest(
       flags: 0x00'u8,
       txnId: TransactionID(txnId),
@@ -871,7 +871,7 @@ suite "Batch Messages":
     check decoded.value.operations.len == 0
 
   test "encodeBatchRequest single Get":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = BatchRequest(
       flags: BatchFlagAllOrNothing,
       txnId: TransactionID(txnId),
@@ -885,7 +885,7 @@ suite "Batch Messages":
     check decoded.value.operations[0].data == "key_data"
 
   test "encodeBatchRequest single Put":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = BatchRequest(
       flags: 0x00'u8,
       txnId: TransactionID(txnId),
@@ -899,7 +899,7 @@ suite "Batch Messages":
     check decoded.value.operations[0].data == "put_data"
 
   test "encodeBatchRequest single Delete":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = BatchRequest(
       flags: 0x00'u8,
       txnId: TransactionID(txnId),
@@ -914,7 +914,7 @@ suite "Batch Messages":
     check decoded.value.operations[0].data == "del_data"
 
   test "encodeBatchRequest multiple operations":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = BatchRequest(
       flags: BatchFlagContinueOnErr,
       txnId: TransactionID(txnId),
@@ -931,7 +931,7 @@ suite "Batch Messages":
     check decoded.value.flags == BatchFlagContinueOnErr
 
   test "decodeBatchRequest valid":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = BatchRequest(
       flags: BatchFlagAllOrNothing,
       txnId: TransactionID(txnId),
@@ -947,7 +947,7 @@ suite "Batch Messages":
     check decoded.value.operations.len == 2
 
   test "decodeBatchRequest empty":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = BatchRequest(
       flags: 0x00'u8,
       txnId: TransactionID(txnId),
@@ -1042,7 +1042,7 @@ suite "Batch Messages":
 suite "Scan Request Messages":
 
   test "encodeScanRequest basic":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = ScanRequest(
       flags: 0x00'u8,
       txnId: TransactionID(txnId),
@@ -1058,7 +1058,7 @@ suite "Scan Request Messages":
     check mt.value == uint16(mtScan)
 
   test "encodeScanRequest with flags":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = ScanRequest(
       flags: ScanFlagIncludeTimestamp or ScanFlagIncludeVersion,
       txnId: TransactionID(txnId),
@@ -1075,7 +1075,7 @@ suite "Scan Request Messages":
     check flags.value == (ScanFlagIncludeTimestamp or ScanFlagIncludeVersion)
 
   test "encodeScanRequest KeysOnly":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = ScanRequest(
       flags: ScanFlagKeysOnly,
       txnId: TransactionID(txnId),
@@ -1092,7 +1092,7 @@ suite "Scan Request Messages":
     check (flags.value and ScanFlagKeysOnly) != 0'u8
 
   test "encodeScanRequest Reverse":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = ScanRequest(
       flags: ScanFlagReverse,
       txnId: TransactionID(txnId),
@@ -1109,7 +1109,7 @@ suite "Scan Request Messages":
     check (flags.value and ScanFlagReverse) != 0'u8
 
   test "encodeScanRequest with groupId":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let groupId = groupIDFromInt(33)
     let req = ScanRequest(
       flags: ScanFlagGroupRouted,
@@ -1126,7 +1126,7 @@ suite "Scan Request Messages":
     check decoded.value.groupId == groupId
 
   test "encodeScanRequest with range":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = ScanRequest(
       flags: 0x00'u8,
       txnId: TransactionID(txnId),
@@ -1144,7 +1144,7 @@ suite "Scan Request Messages":
     check decoded.value.limit == 1000'u32
 
   test "decodeScanRequest valid":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = ScanRequest(
       flags: ScanFlagKeysOnly,
       txnId: TransactionID(txnId),
@@ -1162,7 +1162,7 @@ suite "Scan Request Messages":
     check decoded.value.limit == 200'u32
 
   test "decodeScanRequest with groupId":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let groupId = groupIDFromInt(44)
     let req = ScanRequest(
       flags: ScanFlagGroupRouted,
@@ -1716,7 +1716,7 @@ suite "WireFilterExpr encode/decode":
 suite "ScanRequest with filter":
 
   test "ScanRequest without filter":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let req = ScanRequest(
       flags: ScanFlagStreaming,
       txnId: TransactionID(txnId),
@@ -1735,7 +1735,7 @@ suite "ScanRequest with filter":
     check decoded.filter.isNone
 
   test "ScanRequest with filter":
-    let txnId = genULID()
+    let txnId = genULIDLocal()
     let filterExpr = WireFilterExpr(
       kind: wekBinOp,
       binOpKind: wboEq,

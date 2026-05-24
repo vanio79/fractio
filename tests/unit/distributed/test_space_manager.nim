@@ -66,9 +66,9 @@ suite "Node Record Encoding/Decoding":
 
 suite "Group Record Encoding/Decoding":
   test "encode/decode group record":
-    let spaceId = genSpaceID()
+    let spaceId = genSpaceIDLocal()
     let rec = GroupRecord(
-      groupId: genULID(),
+      groupId: genULIDLocal(),
       spaceId: spaceId,
       preferredLeader: 1,
       leader: 0,
@@ -91,8 +91,8 @@ suite "Group Record Encoding/Decoding":
 
   test "group record with zero leader":
     let rec = GroupRecord(
-      groupId: genULID(),
-      spaceId: genSpaceID(),
+      groupId: genULIDLocal(),
+      spaceId: genSpaceIDLocal(),
       preferredLeader: 5,
       leader: 0,
       replicas: @[GroupReplicaBin(nodeId: 5,
@@ -106,8 +106,8 @@ suite "Group Record Encoding/Decoding":
 
   test "group record with assigned leader":
     let rec = GroupRecord(
-      groupId: genULID(),
-      spaceId: genSpaceID(),
+      groupId: genULIDLocal(),
+      spaceId: genSpaceIDLocal(),
       preferredLeader: 1,
       leader: 2,
       replicas: @[
@@ -122,8 +122,8 @@ suite "Group Record Encoding/Decoding":
 
   test "group record with many replicas":
     let rec = GroupRecord(
-      groupId: genULID(),
-      spaceId: genSpaceID(),
+      groupId: genULIDLocal(),
+      spaceId: genSpaceIDLocal(),
       preferredLeader: 1,
       leader: 1,
       replicas: @[
@@ -141,8 +141,8 @@ suite "Group Record Encoding/Decoding":
 
 suite "Space Record Encoding/Decoding":
   test "encode/decode space record":
-    let spaceId = genSpaceID()
-    let groupIds = @[genGroupID(), genGroupID(), genGroupID()]
+    let spaceId = genSpaceIDLocal()
+    let groupIds = @[genGroupIDLocal(), genGroupIDLocal(), genGroupIDLocal()]
     let rec = SpaceRecord(
       spaceId: spaceId,
       name: "test_space",
@@ -164,14 +164,14 @@ suite "Space Record Encoding/Decoding":
     check decoded.rebalancing == false
 
   test "space record with rebalancing":
-    let spaceId = genSpaceID()
+    let spaceId = genSpaceIDLocal()
     let rec = SpaceRecord(
       spaceId: spaceId,
       name: "rebalancing_space",
       replicas: 3,
       groupCount: 5,
-      groupIds: @[genGroupID(), genGroupID()],
-      oldGroupIds: @[genGroupID(), genGroupID(), genGroupID()],
+      groupIds: @[genGroupIDLocal(), genGroupIDLocal()],
+      oldGroupIds: @[genGroupIDLocal(), genGroupIDLocal(), genGroupIDLocal()],
       rebalancing: true,
       rebalanceWorker: 2,
       rebalanceHeartbeat: 12345,
@@ -188,7 +188,7 @@ suite "Space Record Encoding/Decoding":
     check decoded.oldGroupIds.len == 3
 
   test "space record with empty groupIds":
-    let spaceId = genSpaceID()
+    let spaceId = genSpaceIDLocal()
     let rec = SpaceRecord(
       spaceId: spaceId,
       name: "empty_space",
@@ -252,15 +252,15 @@ suite "CreateSpaceRequest/Response":
     check decoded.val.replicas == 100
 
   test "encode/decode create space response - success":
-    let spaceId = genSpaceID()
+    let spaceId = genSpaceIDLocal()
     let resp = spaceMsgs.CreateSpaceResponse(
       success: true,
       spaceId: spaceId,
       groupCount: 3,
       spaceRecord: "encoded_record",
       groupRecords: @[
-        spaceMsgs.GroupRecordData(groupId: genULID(), record: "group1"),
-        spaceMsgs.GroupRecordData(groupId: genULID(), record: "group2")
+        spaceMsgs.GroupRecordData(groupId: genULIDLocal(), record: "group1"),
+        spaceMsgs.GroupRecordData(groupId: genULIDLocal(), record: "group2")
       ]
     )
     let encoded = spaceMsgs.encodeCreateSpaceResponse(resp)
@@ -285,7 +285,7 @@ suite "CreateSpaceRequest/Response":
     check decoded.val.error == "not the leader"
 
   test "encode/decode create space response - empty groupRecords":
-    let spaceId = genSpaceID()
+    let spaceId = genSpaceIDLocal()
     let resp = spaceMsgs.CreateSpaceResponse(
       success: true,
       spaceId: spaceId,
@@ -317,8 +317,8 @@ suite "DropSpaceRequest/Response":
     check decoded.val.name == ""
 
   test "encode/decode drop space response - success":
-    let spaceId = genSpaceID()
-    let deletedIds = @[genGroupID(), genGroupID(), genGroupID()]
+    let spaceId = genSpaceIDLocal()
+    let deletedIds = @[genGroupIDLocal(), genGroupIDLocal(), genGroupIDLocal()]
     let resp = spaceMsgs.DropSpaceResponse(
       success: true,
       spaceId: spaceId,
@@ -345,7 +345,7 @@ suite "DropSpaceRequest/Response":
     check decoded.val.error == "space not found"
 
   test "encode/decode drop space response - empty deletedGroupIds":
-    let spaceId = genSpaceID()
+    let spaceId = genSpaceIDLocal()
     let resp = spaceMsgs.DropSpaceResponse(
       success: true,
       spaceId: spaceId,
@@ -372,13 +372,13 @@ suite "System Table Constants":
 
 suite "Space Key Encoding":
   test "encodeSpaceKey produces valid key":
-    let spaceId = genSpaceID()
+    let spaceId = genSpaceIDLocal()
     let key = encodeSpaceKey(spaceId)
     check key.startsWith("/t/")
     check key.contains($spaceId)
 
   test "space key uses SYS_SPACES_TABLE_ID":
-    let spaceId = genSpaceID()
+    let spaceId = genSpaceIDLocal()
     let key = encodeSpaceKey(spaceId)
     let (tableId, _) = decodeTableKey(key)
     check tableId == SYS_SPACES_TABLE_ID
@@ -458,8 +458,8 @@ suite "JSON Serialization":
 
   test "GroupRecord toJson":
     let rec = GroupRecord(
-      groupId: genULID(),
-      spaceId: genSpaceID(),
+      groupId: genULIDLocal(),
+      spaceId: genSpaceIDLocal(),
       preferredLeader: 1,
       leader: 0,
       replicas: @[GroupReplicaBin(nodeId: 1,
@@ -471,11 +471,11 @@ suite "JSON Serialization":
 
   test "SpaceRecord toJson":
     let rec = SpaceRecord(
-      spaceId: genSpaceID(),
+      spaceId: genSpaceIDLocal(),
       name: "test",
       replicas: 3,
       groupCount: 1,
-      groupIds: @[genGroupID()],
+      groupIds: @[genGroupIDLocal()],
       oldGroupIds: @[],
       rebalancing: false,
       createdAtNs: nowNs()

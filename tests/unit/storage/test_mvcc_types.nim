@@ -100,7 +100,7 @@ suite "MVCC Types - MVCCKey":
 
 suite "MVCC Types - MVCCValue":
   test "create MVCCValue with all fields":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let value = MVCCValue(
       data: "test_data",
       timestamp: Timestamp(1500),
@@ -123,7 +123,7 @@ suite "MVCC Types - MVCCValue":
     check value.data == ""
 
   test "MVCCValue string representation":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let value = MVCCValue(data: "data", timestamp: 999, isDeleted: true, txnId: txnId)
     let strRep = $value
     check "data" in strRep
@@ -291,7 +291,7 @@ suite "MVCC Types - KeyVersions":
 
 suite "MVCC Types - Intent":
   test "create Intent":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let intent = Intent(
       key: "intent_key",
       txnId: txnId,
@@ -308,7 +308,7 @@ suite "MVCC Types - Intent":
   test "Intent with delete flag":
     let intent = Intent(
       key: "key",
-      txnId: genTransactionID(),
+      txnId: genTransactionIDLocal(),
       timestamp: 100,
       value: "",
       isDeleted: true
@@ -422,7 +422,7 @@ suite "MVCC Key Encoding - decodeMVCCKey":
     check decoded.isIntent == false
 
   test "decode intent key":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let intentKey = makeIntentKey("user_key", txnId)
     let decoded = decodeMVCCKey(intentKey)
     check decoded.userKey == "user_key"
@@ -469,7 +469,7 @@ suite "MVCC Value Encoding - encodeMVCCValue":
     check decoded.isDeleted == true
 
   test "encode value with transaction ID":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let encoded = encodeMVCCValue("data", Timestamp(1000), false, txnId)
     let decoded = decodeMVCCValue(encoded)
     check decoded.txnId == txnId
@@ -524,7 +524,7 @@ suite "MVCC Value Encoding - decodeMVCCValue":
     check caught == true
 
   test "decode roundtrip":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     for data in ["", "a", "test", "日本語", "x".repeat(1000)]:
       for ts in [0'i64, 100, 1000, high(int64)]:
         for deleted in [false, true]:
@@ -566,7 +566,7 @@ suite "MVCC Value Encoding - decodeMVCCValueFast":
     check decoded.data == ""
 
   test "decodeMVCCValueFast extracts all fields":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let encoded = encodeMVCCValue("data", Timestamp(1234567890), true, txnId)
     let decoded = decodeMVCCValueFast(encoded)
     check decoded.data == "data"
@@ -576,31 +576,31 @@ suite "MVCC Value Encoding - decodeMVCCValueFast":
 
 suite "Intent Key Encoding - encodeIntentKey":
   test "encode intent key":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let encoded = encodeIntentKey("user_key", txnId)
     check encoded.startsWith("user_key")
     check encoded.len == "user_key".len + 18
 
   test "encode intent key preserves user key":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let userKey = "test_intent_key"
     let encoded = encodeIntentKey(userKey, txnId)
     check encoded[0..userKey.len-1] == userKey
 
   test "encode intent key with empty user key":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let encoded = encodeIntentKey("", txnId)
     check encoded.len == 18
 
   test "encode intent key with special characters":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let userKey = "key\x00with\xFFspecial"
     let encoded = encodeIntentKey(userKey, txnId)
     check encoded.startsWith(userKey)
 
 suite "Intent Key Encoding - decodeIntentKey":
   test "decode intent key":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let encoded = encodeIntentKey("user_key", txnId)
     let decoded = decodeIntentKey(encoded)
     check decoded.userKey == "user_key"
@@ -624,7 +624,7 @@ suite "Intent Key Encoding - decodeIntentKey":
     check caught == true
 
   test "decode intent key roundtrip":
-    for txnId in [genTransactionID(), genTransactionID(), genTransactionID()]:
+    for txnId in [genTransactionIDLocal(), genTransactionIDLocal(), genTransactionIDLocal()]:
       for userKey in ["key", "test_key", "日本語", ""]:
         let encoded = encodeIntentKey(userKey, txnId)
         let decoded = decodeIntentKey(encoded)
@@ -661,12 +661,12 @@ suite "MVCC Helper Functions - makeVersionKey":
 
 suite "MVCC Helper Functions - makeIntentKey":
   test "makeIntentKey creates intent key":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let intentKey = makeIntentKey("user_key", txnId)
     check intentKey.startsWith("user_key")
 
   test "makeIntentKey is same as encodeIntentKey":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let key1 = makeIntentKey("test", txnId)
     let key2 = encodeIntentKey("test", txnId)
     check key1 == key2
@@ -693,14 +693,14 @@ suite "MVCC Error Constructors - keyNotFound":
 
 suite "MVCC Error Constructors - intentConflict":
   test "intentConflict creates correct error":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let err = intentConflict("conflict_key", txnId)
     check err.code == mvccIntentConflict
     check "conflict_key" in err.msg
     check $txnId in err.msg
 
   test "intentConflict with empty key":
-    let txnId = genTransactionID()
+    let txnId = genTransactionIDLocal()
     let err = intentConflict("", txnId)
     check err.code == mvccIntentConflict
 
@@ -751,7 +751,7 @@ suite "MVCC Types - Edge Cases":
 
   test "intent key vs version key differentiation":
     let versionKey = encodeMVCCKey("key", Timestamp(100), false)
-    let intentKey = encodeIntentKey("key", genTransactionID())
+    let intentKey = encodeIntentKey("key", genTransactionIDLocal())
 
     let versionDecoded = decodeMVCCKey(versionKey)
     let intentDecoded = decodeMVCCKey(intentKey)
@@ -851,7 +851,7 @@ suite "MVCC Types - Stress Tests":
   test "many transaction IDs":
     var txnIds: seq[TransactionID] = @[]
     for i in 0..<1000:
-      txnIds.add(genTransactionID())
+      txnIds.add(genTransactionIDLocal())
 
     for txnId in txnIds:
       let encoded = encodeIntentKey("key", txnId)

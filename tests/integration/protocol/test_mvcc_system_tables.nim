@@ -95,7 +95,7 @@ suite "MVCC System Tables - Basic Operations":
     let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_st01")
     defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_st01")
 
-    let tableId = genTableId()
+    let tableId = genTableIdLocal()
     let key = tableKey(tableId)
     let value = """{"name": "users", "columns": 3}"""
 
@@ -118,7 +118,7 @@ suite "MVCC System Tables - Basic Operations":
     let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_st02")
     defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_st02")
 
-    let tableId = genTableId()
+    let tableId = genTableIdLocal()
     let sessionId = mvccStore.createSession()
     discard mvccStore.beginTransaction(sessionId)
 
@@ -153,7 +153,7 @@ suite "MVCC System Tables - Basic Operations":
     let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_st03")
     defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_st03")
 
-    let tableId = genTableId()
+    let tableId = genTableIdLocal()
     let sessionId = mvccStore.createSession()
     discard mvccStore.beginTransaction(sessionId)
 
@@ -173,7 +173,7 @@ suite "MVCC System Tables - Basic Operations":
     let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_st04")
     defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_st04")
 
-    let tableId = genTableId()
+    let tableId = genTableIdLocal()
     let key = tableKey(tableId)
 
     # Initial write
@@ -205,7 +205,7 @@ suite "MVCC System Tables - Isolation":
     let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_iso01")
     defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_iso01")
 
-    let tableId = genTableId()
+    let tableId = genTableIdLocal()
     let key = tableKey(tableId)
 
     # Initial write
@@ -242,7 +242,7 @@ suite "MVCC System Tables - Isolation":
     let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_iso02")
     defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_iso02")
 
-    let tableId = genTableId()
+    let tableId = genTableIdLocal()
     let key = tableKey(tableId)
 
     # Initial write
@@ -280,7 +280,7 @@ suite "MVCC System Tables - Index Operations":
     let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_idx01")
     defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_idx01")
 
-    let tableId = genTableId()
+    let tableId = genTableIdLocal()
     let sessionId = mvccStore.createSession()
     discard mvccStore.beginTransaction(sessionId)
 
@@ -307,7 +307,7 @@ suite "MVCC System Tables - Index Operations":
     let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_idx02")
     defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_idx02")
 
-    let tableId = genTableId()
+    let tableId = genTableIdLocal()
     let idxKey = indexKey(tableId, "temp_idx")
 
     # Create index
@@ -343,7 +343,7 @@ suite "MVCC System Tables - Persistence":
   test "data survives restart":
     let storagePath = "/tmp/fractio_mvcc_persist01"
     cleanDir(storagePath)
-    let tableId = genTableId() # Use same tableId across both instances
+    let tableId = genTableIdLocal() # Use same tableId across both instances
     let key = tableKey(tableId)
     let value = """{"name": "persistent_table"}"""
 

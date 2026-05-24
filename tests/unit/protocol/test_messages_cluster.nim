@@ -383,7 +383,7 @@ suite "DrainNode Messages":
 suite "CreateGroup Messages":
 
   test "encodeCreateGroupRequest":
-    let groupIdBytes = ulidToBytes(genULID())
+    let groupIdBytes = ulidToBytes(genULIDLocal())
     let req = CreateGroupRequest(
       groupId: groupIdBytes,
       preferredLeaderId: 1'u16,
@@ -396,7 +396,7 @@ suite "CreateGroup Messages":
     check mt.value == uint16(mtCreateGroup)
 
   test "encodeCreateGroupRequest multiple members":
-    let groupIdBytes = ulidToBytes(genULID())
+    let groupIdBytes = ulidToBytes(genULIDLocal())
     let req = CreateGroupRequest(
       groupId: groupIdBytes,
       preferredLeaderId: 1'u16,
@@ -415,7 +415,7 @@ suite "CreateGroup Messages":
     check decoded.value.members.len == 3
 
   test "encodeCreateGroupRequest empty members":
-    let groupIdBytes = ulidToBytes(genULID())
+    let groupIdBytes = ulidToBytes(genULIDLocal())
     let req = CreateGroupRequest(
       groupId: groupIdBytes,
       preferredLeaderId: 1'u16,
@@ -427,7 +427,7 @@ suite "CreateGroup Messages":
     check decoded.value.members.len == 0
 
   test "decodeCreateGroupRequest valid":
-    let groupIdBytes = ulidToBytes(genULID())
+    let groupIdBytes = ulidToBytes(genULIDLocal())
     let req = CreateGroupRequest(
       groupId: groupIdBytes,
       preferredLeaderId: 2'u16,
@@ -447,7 +447,7 @@ suite "CreateGroup Messages":
     check decoded.isErr
 
   test "encodeCreateGroupResponse success":
-    let groupIdBytes = ulidToBytes(genULID())
+    let groupIdBytes = ulidToBytes(genULIDLocal())
     let resp = CreateGroupResponse(success: true, groupId: groupIdBytes, error: "")
     let encoded = encodeCreateGroupResponse(resp)
     var pos = 0
@@ -465,7 +465,7 @@ suite "CreateGroup Messages":
     check success.value == 0x00'u8
 
   test "decodeCreateGroupResponse success":
-    let groupIdBytes = ulidToBytes(genULID())
+    let groupIdBytes = ulidToBytes(genULIDLocal())
     let resp = CreateGroupResponse(success: true, groupId: groupIdBytes, error: "")
     let encoded = encodeCreateGroupResponse(resp)
     let decoded = decodeCreateGroupResponse(encoded)
@@ -490,7 +490,7 @@ suite "CreateGroup Messages":
 suite "JoinGroup Messages":
 
   test "encodeJoinGroupRequest":
-    let groupIdBytes = ulidToBytes(genULID())
+    let groupIdBytes = ulidToBytes(genULIDLocal())
     let req = JoinGroupRequest(
       groupId: groupIdBytes,
       creatorNodeId: 1'u16,
@@ -505,7 +505,7 @@ suite "JoinGroup Messages":
     check mt.value == uint16(mtJoinGroup)
 
   test "encodeJoinGroupRequest no members":
-    let groupIdBytes = ulidToBytes(genULID())
+    let groupIdBytes = ulidToBytes(genULIDLocal())
     let req = JoinGroupRequest(
       groupId: groupIdBytes,
       creatorNodeId: 1'u16,
@@ -519,7 +519,7 @@ suite "JoinGroup Messages":
     check decoded.value.members.len == 0
 
   test "decodeJoinGroupRequest valid":
-    let groupIdBytes = ulidToBytes(genULID())
+    let groupIdBytes = ulidToBytes(genULIDLocal())
     let req = JoinGroupRequest(
       groupId: groupIdBytes,
       creatorNodeId: 5'u16,
@@ -541,7 +541,7 @@ suite "JoinGroup Messages":
     check decoded.isErr
 
   test "encodeJoinGroupResponse success":
-    let groupIdBytes = ulidToBytes(genULID())
+    let groupIdBytes = ulidToBytes(genULIDLocal())
     let resp = JoinGroupResponse(success: true, groupId: groupIdBytes, error: "")
     let encoded = encodeJoinGroupResponse(resp)
     var pos = 0
@@ -559,7 +559,7 @@ suite "JoinGroup Messages":
     check success.value == 0x00'u8
 
   test "decodeJoinGroupResponse success":
-    let groupIdBytes = ulidToBytes(genULID())
+    let groupIdBytes = ulidToBytes(genULIDLocal())
     let resp = JoinGroupResponse(success: true, groupId: groupIdBytes, error: "")
     let encoded = encodeJoinGroupResponse(resp)
     let decoded = decodeJoinGroupResponse(encoded)

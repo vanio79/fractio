@@ -303,7 +303,7 @@ suite "Rebalance Scheduler":
 
     # Add multiple decisions
     for i in 1..5:
-      let gid = genGroupID()
+      let gid = genGroupIDLocal()
       let decision = newAddReplicaDecision(gid, NodeID(2), 10, "test")
       discard scheduler.addDecision(decision, 1000)
 

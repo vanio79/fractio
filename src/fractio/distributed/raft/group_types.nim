@@ -144,14 +144,18 @@ proc `<=`*(a, b: GroupID): bool =
   ## Less than or equal comparison
   a.ULID == b.ULID or a.ULID < b.ULID
 
-proc genGroupID*(): GroupID =
-  ## Generate a new unique GroupID using ULID
-  GroupID(genULID())
+proc genGroupID*(tsNs: int64): GroupID =
+  ## Generate a new unique GroupID using ULID with nanosecond timestamp (from SharedTimer).
+  GroupID(genULID(tsNs))
+
+proc genGroupIDLocal*(): GroupID =
+  ## Generate GroupID using LOCAL clock. Only for tests.
+  GroupID(genULIDLocal())
 
 proc groupIDFromInt*(n: int64 | uint64): GroupID =
   ## Create a deterministic GroupID from an integer.
   ## This embeds the integer in the ULID bytes for testing purposes.
-  ## NOT for production use - use genGroupID() instead.
+  ## NOT for production use - use genGroupID(tsNs) instead.
   var ulid: ULID
   # Embed the integer in the last 8 bytes, first 8 bytes are zero
   let val = uint64(n)

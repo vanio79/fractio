@@ -141,7 +141,7 @@ suite "Range Cache":
 
   test "get non-existent range":
     let cache = newGroupCache()
-    let gid = genGroupID()
+    let gid = genGroupIDLocal()
     let result = cache.get(gid, 1000)
     check result.isNone
 
@@ -183,7 +183,7 @@ suite "Range Cache":
     let cache = newGroupCache(ttlNs = 60000'i64)
     var gids: seq[GroupID] = @[]
     for i in 1..5:
-      let gid = genGroupID()
+      let gid = genGroupIDLocal()
       gids.add(gid)
       let desc = newGroupDescriptor(
         gid,
@@ -213,7 +213,7 @@ suite "Range Cache":
 
     # 2 misses
     discard cache.get(DATA_GROUP_START_ID, 5000)
-    let gid = genGroupID()
+    let gid = genGroupIDLocal()
     discard cache.get(gid, 6000)
 
     check cache.hitRate() == 0.6 # 3/5
@@ -310,7 +310,7 @@ suite "Leaseholder Info":
     check decoded.epoch == 5
 
   test "binary serialization fixed size":
-    let info = newLeaseholderInfo(genGroupID(), NodeID(42), 999999'i64, 100)
+    let info = newLeaseholderInfo(genGroupIDLocal(), NodeID(42), 999999'i64, 100)
     let encoded = encodeLeaseholderInfo(info)
     # Fixed size: 3 (magic) + 1 (version) + 16 (groupId) + 4 (leaseholder) + 8 (expiration) + 8 (epoch) = 40
     check encoded.len == 40
