@@ -2736,12 +2736,14 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
       # Seed default database and public schema
       let dbKey = encodeTableKey(SYS_DATABASES_TABLE_ID, "default")
       let dbRec = DatabaseRecord(name: "default",
-          createdAtNs: system_schemas.nowNs())
+          createdAtNs: system_schemas.nowNs(
+              if server.sharedTimer.isNil: nil else: server.sharedTimer))
       discard mvccStore.txnPut(sessionId, dbKey, encode(dbRec))
 
       let scKey = encodeTableKey(SYS_SCHEMAS_TABLE_ID, "default.public")
       let scRec = SchemaRecord(name: "public", database: "default",
-        createdAtNs: system_schemas.nowNs())
+        createdAtNs: system_schemas.nowNs(
+            if server.sharedTimer.isNil: nil else: server.sharedTimer))
       discard mvccStore.txnPut(sessionId, scKey, encode(scRec))
 
       # Seed default space (replicas=0 means ALL, single group = META_GROUP_ID)
@@ -2758,7 +2760,8 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
         rebalanceWorker: 0,
         rebalanceHeartbeat: 0,
         rebalanceCursor: "",
-        createdAtNs: system_schemas.nowNs()
+        createdAtNs: system_schemas.nowNs(
+            if server.sharedTimer.isNil: nil else: server.sharedTimer)
       )
       discard mvccStore.txnPut(sessionId, spaceKey, encode(spaceRec))
 

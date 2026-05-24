@@ -7,7 +7,7 @@
 #   - Conflict detection on commit
 #   - Automatic rollback on abort
 
-import std/[tables, locks, options, atomics, strutils, algorithm, times, sets]
+import std/[tables, locks, options, atomics, strutils, algorithm, sets]
 import ../core/types as coreTypes
 import ../core/transaction as coreTxn
 import ../core/timestamp_provider
@@ -180,10 +180,13 @@ proc newMvccTransactionStore*(raftStore: RaftKVStoreExt,
 
 proc createSession*(store: MvccTransactionStore): uint64 {.gcsafe, raises: [].} =
   result = store.nextSessionId.fetchAdd(1)
+  let createdAt = if store.tsProvider != nil:
+                    try: store.tsProvider.now() except Exception: coreTypes.localTimeNs()
+                  else: coreTypes.localTimeNs()
   let state = SessionTxnState(
     txn: nil,
     intents: initTable[string, coreTxn.WriteEntry](),
-    createdAtNs: getTime().toUnixFloat().int64 * 1_000_000_000,
+    createdAtNs: createdAt,
   )
   withLock store.sessionsMu:
     store.sessions[result] = state
@@ -849,9 +852,9 @@ proc getCurrentTimestamp*(store: MvccTransactionStore): coreTypes.Timestamp {.
   let wallNs: uint64 =
     if not store.txnManager.timeProvider.isNil:
       try: uint64(store.txnManager.timeProvider.now())
-      except Exception: uint64(getTime().toUnixFloat() * 1_000_000_000)
+      except Exception: uint64(coreTypes.localTimeNs())
     else:
-      uint64(getTime().toUnixFloat() * 1_000_000_000)
+      uint64(coreTypes.localTimeNs())
   coreTypes.Timestamp(wallNs)
 
 # ---------------------------------------------------------------------------

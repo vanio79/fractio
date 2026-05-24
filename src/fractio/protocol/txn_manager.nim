@@ -21,7 +21,7 @@
 #     coordinator to durably commit / rollback write-intents through Raft
 #     consensus.  When nil (Phase 3 compat), pure in-memory behaviour is kept.
 
-import std/[tables as stdtables, sets, locks, times, atomics, strformat, options]
+import std/[tables as stdtables, sets, locks, atomics, strformat, options]
 import ./types
 import ./messages/txn as txnMsgs
 import fractio/core/types as coreTypes
@@ -73,9 +73,7 @@ proc newTransactionManager*(): TransactionManager =
     raftCoordPtr: nil,
   )
   initLock(result.mu)
-  # Seed timestamp from wall clock (ns)
-  let nowNs = uint64(getTime().toUnixFloat() * 1_000_000_000)
-  result.nextTimestamp.store(nowNs)
+  result.nextTimestamp.store(uint64(localTimeNs()))
 
 proc setTimeProvider*(mgr: TransactionManager,
     provider: tp.TimeProvider) {.gcsafe, raises: [].} =
@@ -105,9 +103,9 @@ proc allocTimestamp(mgr: TransactionManager): uint64 {.gcsafe, raises: [].} =
   let wallNs: uint64 =
     if not mgr.timeProvider.isNil:
       try: uint64(mgr.timeProvider.now())
-      except Exception: uint64(getTime().toUnixFloat() * 1_000_000_000)
+      except Exception: uint64(localTimeNs())
     else:
-      uint64(getTime().toUnixFloat() * 1_000_000_000)
+      uint64(localTimeNs())
 
   var cur = mgr.nextTimestamp.load()
   while true:
@@ -116,15 +114,20 @@ proc allocTimestamp(mgr: TransactionManager): uint64 {.gcsafe, raises: [].} =
       return next
     # CAS failed — cur was updated by another thread; loop
 
-proc nowMs(): int64 {.gcsafe, raises: [].} =
-  int64(getTime().toUnixFloat() * 1000)
+proc nowMs(mgr: TransactionManager): int64 {.gcsafe, raises: [].} =
+  if not mgr.timeProvider.isNil:
+    try: mgr.timeProvider.now() div 1_000_000
+    except Exception: localTimeNs() div 1_000_000
+  else:
+    localTimeNs() div 1_000_000
 
 proc effectiveTimeout(rec: TxnRecord): uint32 {.inline.} =
   if rec.timeoutMs == 0: DEFAULT_TXN_TIMEOUT_MS else: rec.timeoutMs
 
-proc isExpired(rec: TxnRecord): bool {.gcsafe, raises: [].} =
+proc isExpired(rec: TxnRecord, mgr: TransactionManager): bool {.gcsafe,
+    raises: [].} =
   rec.state == TxnStatusActive and
-  (nowMs() - rec.createdAtMs) > int64(rec.effectiveTimeout)
+  (mgr.nowMs() - rec.createdAtMs) > int64(rec.effectiveTimeout)
 
 proc isZeroTxnId(id: coreTypes.TransactionID): bool {.inline.} =
   ## Check if a TransactionID is the zero/invalid value
@@ -152,7 +155,7 @@ proc beginTransaction*(mgr: TransactionManager, flags: uint8 = 0,
     writeSet: initHashSet[string](),
     readSet: initHashSet[string](),
     state: TxnStatusActive,
-    createdAtMs: nowMs(),
+    createdAtMs: mgr.nowMs(),
     timeoutMs: timeoutMs,
   )
   acquire(mgr.mu)
@@ -171,7 +174,7 @@ proc recordRead*(mgr: TransactionManager, txnId: coreTypes.TransactionID,
   if rec.state != TxnStatusActive:
     return pErr(newProtocolError(peInternal,
       &"txn {txnId} is not active (state={rec.state})"))
-  if isExpired(rec):
+  if isExpired(rec, mgr):
     rec.state = TxnStatusAborted
     mgr.txns[txnId] = rec
     return pErr(newProtocolError(peTimeout, &"txn {txnId} expired"))
@@ -190,7 +193,7 @@ proc recordWrite*(mgr: TransactionManager, txnId: coreTypes.TransactionID,
   if rec.state != TxnStatusActive:
     return pErr(newProtocolError(peInternal,
       &"txn {txnId} is not active (state={rec.state})"))
-  if isExpired(rec):
+  if isExpired(rec, mgr):
     rec.state = TxnStatusAborted
     mgr.txns[txnId] = rec
     return pErr(newProtocolError(peTimeout, &"txn {txnId} expired"))
@@ -218,7 +221,7 @@ proc commitTransaction*(mgr: TransactionManager,
       return CommitTxnResponse(status: TxnCommitConflict, commitTimestamp: 0)
 
   # Timeout check
-  if isExpired(rec):
+  if isExpired(rec, mgr):
     rec.state = TxnStatusAborted
     mgr.txns[txnId] = rec
     return CommitTxnResponse(status: TxnCommitTimeout, commitTimestamp: 0)
@@ -281,7 +284,7 @@ proc getTransactionStatus*(mgr: TransactionManager,
     return TxnStatusResponse(status: TxnStatusNotFound, commitTimestamp: 0)
 
   # Lazily mark expired active txns as aborted on status query
-  if isExpired(rec):
+  if isExpired(rec, mgr):
     rec.state = TxnStatusAborted
     mgr.txns[txnId] = rec
 
@@ -294,7 +297,7 @@ proc expireTimedOutTxns*(mgr: TransactionManager) {.gcsafe, raises: [].} =
   acquire(mgr.mu)
   defer: release(mgr.mu)
   for txnId, rec in mgr.txns.mpairs:
-    if rec.state == TxnStatusActive and isExpired(rec):
+    if rec.state == TxnStatusActive and isExpired(rec, mgr):
       rec.state = TxnStatusAborted
 
 proc getWriteSet*(mgr: TransactionManager,

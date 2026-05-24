@@ -10,11 +10,12 @@
 import std/atomics
 import std/locks
 import std/tables
-import std/times
 import std/options
 import std/sets
 
 import fractio/distributed/raft/group_types
+import fractio/distributed/sharedtimer/timeprovider
+from fractio/core/types import localTimeNs
 import fractio/utils/logging
 
 # ============================================================================
@@ -79,6 +80,9 @@ type
     running*: Atomic[bool]
     lastHeartbeatSent*: Atomic[int64]
 
+    # Cluster time source
+    timeProvider*: TimeProvider
+
   LivenessMessage* = object
     ## Message exchanged between stores for liveness
     nodeId*: NodeID
@@ -99,7 +103,8 @@ type
 
 proc newStoreLiveness*(nodeId: NodeID,
                         heartbeatIntervalNs = DEFAULT_HEARTBEAT_INTERVAL_NS,
-                        supportExpirationNs = DEFAULT_SUPPORT_EXPIRATION_NS): StoreLiveness =
+                        supportExpirationNs = DEFAULT_SUPPORT_EXPIRATION_NS,
+                        timeProvider: TimeProvider = nil): StoreLiveness =
   ## Create a new store liveness manager
   new(result)
   result.nodeId = nodeId
@@ -112,6 +117,15 @@ proc newStoreLiveness*(nodeId: NodeID,
   initLock(result.supportingLock)
   result.running.store(false)
   result.lastHeartbeatSent.store(0)
+  result.timeProvider = timeProvider
+
+proc nowNs(sl: StoreLiveness): int64 {.inline.} =
+  ## Get current nanoseconds using timeProvider when available, falls back to localTimeNs.
+  if not sl.timeProvider.isNil:
+    try: sl.timeProvider.now()
+    except Exception: localTimeNs()
+  else:
+    localTimeNs()
 
 proc close*(sl: StoreLiveness) =
   ## Clean up resources
@@ -134,7 +148,7 @@ proc processHeartbeat*(sl: StoreLiveness,
     state.epoch = msg.epoch
 
     # Update supported until based on our configuration
-    let now = getTime().toUnix * 1_000_000_000
+    let now = sl.nowNs()
     state.supportedUntil = now + sl.supportExpirationNs
 
     sl.stores[msg.nodeId] = state
@@ -148,13 +162,13 @@ proc processHeartbeat*(sl: StoreLiveness,
   result = LivenessMessage(
     nodeId: sl.nodeId,
     epoch: sl.epoch.load(),
-    timestamp: getTime().toUnix * 1_000_000_000,
+    timestamp: sl.nowNs(),
     messageType: lmtHeartbeatResponse
   )
 
 proc recordHeartbeat*(sl: StoreLiveness, nodeId: NodeID, epoch: uint64) =
   ## Record a heartbeat from another store
-  let now = getTime().toUnix * 1_000_000_000
+  let now = sl.nowNs()
 
   withLock sl.storesLock:
     var state = sl.stores.getOrDefault(nodeId)
@@ -202,7 +216,7 @@ proc getSupportedStores*(sl: StoreLiveness): HashSet[NodeID] =
 
 proc isAlive*(sl: StoreLiveness, nodeId: NodeID): bool =
   ## Check if a store is considered alive
-  let now = getTime().toUnix * 1_000_000_000
+  let now = sl.nowNs()
 
   withLock sl.storesLock:
     if sl.stores.hasKey(nodeId):
@@ -219,7 +233,7 @@ proc getLivenessState*(sl: StoreLiveness, nodeId: NodeID): Option[
 
 proc getSupportState*(sl: StoreLiveness, nodeId: NodeID): SupportState =
   ## Get the support state for a store
-  let now = getTime().toUnix * 1_000_000_000
+  let now = sl.nowNs()
 
   withLock sl.storesLock:
     if not sl.stores.hasKey(nodeId):
@@ -232,7 +246,7 @@ proc getSupportState*(sl: StoreLiveness, nodeId: NodeID): SupportState =
 
 proc timeUntilExpiration*(sl: StoreLiveness, nodeId: NodeID): int64 =
   ## Get time until liveness expires for a store (nanoseconds)
-  let now = getTime().toUnix * 1_000_000_000
+  let now = sl.nowNs()
 
   withLock sl.storesLock:
     if sl.stores.hasKey(nodeId):
@@ -278,14 +292,14 @@ proc createHeartbeat*(sl: StoreLiveness): LivenessMessage =
   result = LivenessMessage(
     nodeId: sl.nodeId,
     epoch: sl.epoch.load(),
-    timestamp: getTime().toUnix * 1_000_000_000,
+    timestamp: sl.nowNs(),
     messageType: lmtHeartbeat
   )
   sl.lastHeartbeatSent.store(result.timestamp)
 
 proc shouldSendHeartbeat*(sl: StoreLiveness): bool =
   ## Check if we should send a heartbeat
-  let now = getTime().toUnix * 1_000_000_000
+  let now = sl.nowNs()
   let lastSent = sl.lastHeartbeatSent.load()
   result = (now - lastSent) >= sl.heartbeatIntervalNs
 
@@ -312,7 +326,7 @@ proc getEpoch*(sl: StoreLiveness): uint64 =
 
 proc registerStore*(sl: StoreLiveness, nodeId: NodeID, epoch: uint64 = 0) =
   ## Register a new store
-  let now = getTime().toUnix * 1_000_000_000
+  let now = sl.nowNs()
 
   withLock sl.storesLock:
     var state = LivenessState(
@@ -345,8 +359,8 @@ proc unregisterStore*(sl: StoreLiveness, nodeId: NodeID) =
 
 proc getAliveStores*(sl: StoreLiveness): seq[NodeID] =
   ## Get all stores that are currently alive
+  let now = sl.nowNs()
   withLock sl.storesLock:
-    let now = getTime().toUnix * 1_000_000_000
     for nodeId, state in sl.stores:
       if now < state.supportedUntil:
         result.add(nodeId)
@@ -354,12 +368,14 @@ proc getAliveStores*(sl: StoreLiveness): seq[NodeID] =
 proc getStats*(sl: StoreLiveness): tuple[total: int, alive: int,
     supporting: int] =
   ## Get liveness statistics
-  withLock sl.storesLock:
-    result.total = sl.stores.len
-    let now = getTime().toUnix * 1_000_000_000
-    for state in sl.stores.values:
-      if now < state.supportedUntil:
-        inc result.alive
+  let now = sl.nowNs()
+  acquire(sl.storesLock)
+  result.total = sl.stores.len
+  for state in sl.stores.values:
+    if now < state.supportedUntil:
+      inc result.alive
+  release(sl.storesLock)
 
-  withLock sl.supportingLock:
-    result.supporting = sl.supporting.len
+  acquire(sl.supportingLock)
+  result.supporting = sl.supporting.len
+  release(sl.supportingLock)

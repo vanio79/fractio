@@ -9,6 +9,7 @@
 import std/[times, strutils, json]
 import fractio/utils/binary
 import fractio/core/types
+import fractio/distributed/sharedtimer/timeprovider
 import fractio/distributed/raft/group_types
 
 # =============================================================================
@@ -386,11 +387,20 @@ proc decodeSettingRecord*(data: string): SettingRecord =
 # =============================================================================
 
 proc nowNs*(): int64 =
-  ## Get current time as Unix nanoseconds
+  ## Get current time as Unix nanoseconds (local clock fallback)
   let t = getTime()
   let secs = t.toUnix()
   let nanos = t.nanosecond()
   result = secs * 1_000_000_000'i64 + nanos
+
+proc nowNs*(tp: TimeProvider): int64 =
+  ## Get current time as Unix nanoseconds using TimeProvider when available,
+  ## falls back to local clock when nil.
+  if not tp.isNil:
+    try: tp.now()
+    except Exception: localTimeNs()
+  else:
+    localTimeNs()
 
 # =============================================================================
 # Conversion helpers: Binary -> JSON (for dashboard API)

@@ -16,6 +16,7 @@ import ./expr_eval # Pure expression evaluation functions
 import ../distributed/meta/system_tables
 import ../distributed/meta/system_schemas
 import ../distributed/raft/group_types
+import ../distributed/sharedtimer/timeprovider
 import ../client/fractio_client
 import ../core/types as coreTypes
 import ../core/kv_interface # KVStore interface for mockable testing
@@ -86,6 +87,7 @@ type
     database*: string
     schema*: string
     tempDir*: string ## Base directory for temporary files (sort, etc.)
+    timeProvider*: TimeProvider ## Cluster time source (nil = local clock)
 
   KVEntry* = object
     key*: string
@@ -532,7 +534,7 @@ proc execCreateDatabase(op: PlanOp, ctx: ExecutorContext): ExecResult =
   let pubRec = SchemaRecord(
     name: "public",
     database: op.cdbName,
-    createdAtNs: nowNs()
+    createdAtNs: system_schemas.nowNs(ctx.timeProvider)
   )
   let pubPutRes = ctx.kv.put(pubKey, encode(pubRec),
       txnId = internalTxnId)

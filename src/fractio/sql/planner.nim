@@ -811,12 +811,12 @@ proc exprToWireFilterExpr*(e: Expr): WireFilterExpr =
 # Statement planners
 # ---------------------------------------------------------------------------
 
-proc planCreateDatabase(stmt: Stmt): Plan =
+proc planCreateDatabase(stmt: Stmt, timeProvider: TimeProvider = nil): Plan =
   let plan = newPlan()
   # Use binary encoding for DatabaseRecord
   let rec = DatabaseRecord(
     name: stmt.cdbName,
-    createdAtNs: nowNs()
+    createdAtNs: nowNs(timeProvider)
   )
   plan.add(PlanOp(kind: poCreateDatabase,
     cdbName: stmt.cdbName,
@@ -834,13 +834,14 @@ proc planDropDatabase(stmt: Stmt): Plan =
   ))
   plan
 
-proc planCreateSchema(stmt: Stmt, database: string): Plan =
+proc planCreateSchema(stmt: Stmt, database: string,
+    timeProvider: TimeProvider = nil): Plan =
   let plan = newPlan()
   # Use binary encoding for SchemaRecord
   let rec = SchemaRecord(
     name: stmt.csName,
     database: database,
-    createdAtNs: nowNs()
+    createdAtNs: nowNs(timeProvider)
   )
   plan.add(PlanOp(kind: poCreateSchema,
     csName: stmt.csName,
@@ -1181,7 +1182,7 @@ proc planDelete(stmt: Stmt, client: FractioClient,
 # Space planners
 # ---------------------------------------------------------------------------
 
-proc planCreateSpace(stmt: Stmt): Plan =
+proc planCreateSpace(stmt: Stmt, timeProvider: TimeProvider = nil): Plan =
   let plan = newPlan()
   # Use binary encoding for SpaceRecord
   # spaceId will be assigned at execution time - use placeholder
@@ -1194,7 +1195,7 @@ proc planCreateSpace(stmt: Stmt): Plan =
     groupIds: @[],
     oldGroupIds: @[],
     rebalancing: false,
-    createdAtNs: nowNs()
+    createdAtNs: nowNs(timeProvider)
   )
   plan.add(PlanOp(kind: poCreateSpace,
     cspName: stmt.csSpaceName,
@@ -1322,12 +1323,13 @@ proc formatPlan*(plan: Plan): string =
 
 proc planStatement*(stmt: Stmt, client: FractioClient,
     database: string = "default",
-    schema: string = "public"): Plan =
+    schema: string = "public",
+    timeProvider: TimeProvider = nil): Plan =
   ## Translate a Stmt AST into a Plan (sequence of KV operations).
   case stmt.kind
-  of stmtCreateDatabase: planCreateDatabase(stmt)
+  of stmtCreateDatabase: planCreateDatabase(stmt, timeProvider)
   of stmtDropDatabase: planDropDatabase(stmt)
-  of stmtCreateSchema: planCreateSchema(stmt, database)
+  of stmtCreateSchema: planCreateSchema(stmt, database, timeProvider)
   of stmtDropSchema: planDropSchema(stmt, database)
   of stmtCreateTable: planCreateTable(stmt, client, database, schema)
   of stmtDropTable:
@@ -1364,7 +1366,7 @@ proc planStatement*(stmt: Stmt, client: FractioClient,
         0: stmt.showTablesSchema else: schema
     plan.add(PlanOp(kind: poShowTables, stDatabase: db, stSchema: sc))
     plan
-  of stmtCreateSpace: planCreateSpace(stmt)
+  of stmtCreateSpace: planCreateSpace(stmt, timeProvider)
   of stmtDropSpace: planDropSpace(stmt)
   of stmtShowSpaces:
     let plan = newPlan()
@@ -1391,7 +1393,7 @@ proc planStatement*(stmt: Stmt, client: FractioClient,
     plan.add(PlanOp(kind: poRollbackTxn))
     plan
   of stmtExplain:
-    let innerPlan = planStatement(stmt.explainStmt, client, database, schema)
+    let innerPlan = planStatement(stmt.explainStmt, client, database, schema, timeProvider)
     let plan = newPlan()
     plan.add(PlanOp(kind: poExplain, exInnerPlan: innerPlan))
     plan

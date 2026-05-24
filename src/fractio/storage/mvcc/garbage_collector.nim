@@ -1,13 +1,14 @@
 # MVCC Garbage Collector - Cleanup of old MVCC versions
 # Removes old versions of keys that are no longer needed for transaction visibility
 
-import std/[times, atomics, locks, tables, sets, sequtils, options]
+import std/[atomics, locks, tables, sets, sequtils, options]
 import ../../core/types
 import ../../core/timestamp_provider
 import ../../core/transaction
 import ../../utils/logging
 import ../../storage/backend
 import ../../storage/wisckey_backend
+import ../../distributed/sharedtimer/timeprovider
 import ./types
 import ./engine
 
@@ -46,6 +47,7 @@ type
       ## Logger for GC operations
     lock*: Lock
       ## Lock for thread-safe statistics updates
+    timeProvider*: TimeProvider ## Cluster time source (nil = local clock)
 
   GCResult* = object
     ## Result of a GC operation
@@ -89,7 +91,8 @@ proc newGCPolicy*(minTimestamp: Timestamp,
 
 proc newGarbageCollector*(engine: MVCCEngine,
     policy: GCPolicy = newGCPolicy(),
-    logger: Logger = nil): GarbageCollector =
+    logger: Logger = nil,
+    timeProvider: TimeProvider = nil): GarbageCollector =
   ## Create a new garbage collector
   new(result)
   result.engine = engine
@@ -104,7 +107,16 @@ proc newGarbageCollector*(engine: MVCCEngine,
     runCount: 0
   )
   result.logger = if logger != nil: logger else: newLogger("mvcc_gc")
+  result.timeProvider = timeProvider
   initLock(result.lock)
+
+proc gcNowNs(gc: GarbageCollector): int64 {.inline.} =
+  ## Get current nanoseconds using timeProvider when available, falls back to localTimeNs.
+  if not gc.timeProvider.isNil:
+    try: gc.timeProvider.now()
+    except Exception: localTimeNs()
+  else:
+    localTimeNs()
 
 proc isRunning*(gc: GarbageCollector): bool =
   ## Check if GC is running
@@ -123,7 +135,7 @@ proc updateStats*(gc: GarbageCollector, keysScanned: int,
   gc.stats.keysScanned += keysScanned
   gc.stats.versionsCollected += versionsCollected
   gc.stats.bytesCollected += bytesCollected
-  gc.stats.lastRunTime = Timestamp(epochTime().int64 * 1_000_000)
+  gc.stats.lastRunTime = Timestamp(gc.gcNowNs() div 1_000)
   gc.stats.totalRunTimeMs += runTimeMs
   gc.stats.runCount += 1
   release(gc.lock)
@@ -166,7 +178,7 @@ proc collectVersionsForKey*(gc: GarbageCollector,
       return
 
     result.keysScanned = 1
-    let currentTime = Timestamp(epochTime().int64 * 1_000_000)
+    let currentTime = Timestamp(gc.gcNowNs())
 
     # Determine which versions to keep
     var versionsToKeep: seq[KeyVersion] = @[]
@@ -250,7 +262,7 @@ proc collectVersions*(gc: GarbageCollector,
     error: ""
   )
 
-  let startTime = epochTime().int64
+  let startTime = gc.gcNowNs() div 1_000_000
 
   try:
     # Update policy min timestamp if provided
@@ -299,7 +311,7 @@ proc collectVersions*(gc: GarbageCollector,
     result.bytesCollected = bytesCollected
     result.success = true
 
-    let runTimeMs = epochTime().int64 - startTime
+    let runTimeMs = (gc.gcNowNs() div 1_000_000) - startTime
     gc.updateStats(keysScanned, versionsCollected, bytesCollected, runTimeMs)
 
     gc.logger.info("Garbage collection completed",
