@@ -1291,17 +1291,15 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
     if srv.isNil:
       sendJson(Http503, %* {"error": "server not ready"})
       return fut
-    # Return list of system tables with metadata
-    let sysTablesInfo = %* [
-      {"id": 1, "name": "sys.databases", "description": "Database catalog", "rowCount": -1},
-      {"id": 2, "name": "sys.schemas", "description": "Schema catalog", "rowCount": -1},
-      {"id": 3, "name": "sys.tables", "description": "Table descriptors", "rowCount": -1},
-      {"id": 4, "name": "sys.groups", "description": "Raft group metadata", "rowCount": -1},
-      {"id": 5, "name": "sys.nodes", "description": "Cluster node registry", "rowCount": -1},
-      {"id": 6, "name": "sys.settings", "description": "Cluster config", "rowCount": -1},
-      {"id": 7, "name": "sys.spaces", "description": "Space catalog", "rowCount": -1}
-    ]
-    sendJson(Http200, sysTablesInfo)
+    # Return list of system tables with metadata (from registry)
+    var sysTablesArr = newJArray()
+    {.cast(gcsafe).}:
+      for info in SYSTEM_TABLES_REGISTRY:
+        if info.tableNum <= MAX_META_GROUP_TABLE_NUM:
+          sysTablesArr.add(%* {"id": int(info.tableNum),
+            "name": info.schema & "." & info.name,
+            "description": info.description, "rowCount": -1})
+    sendJson(Http200, sysTablesArr)
     return fut
 
   # ---- REST: System table by ID ----
@@ -1312,14 +1310,20 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
       return fut
     # Parse table ID from path
     let idStr = path[len("/api/sql/system-table/")..path.len-1]
-    let tableId = try: parseInt(idStr) except: -1
-    if tableId < 1 or tableId > 7:
+    let tableNum = try: parseInt(idStr) except: -1
+    if tableNum < 1 or tableNum > int(MAX_META_GROUP_TABLE_NUM):
       sendJson(Http400, %* {"error": "invalid table ID"})
       return fut
-    # Map ID to table name
-    let tableNames = ["sys.databases", "sys.schemas", "sys.tables", "sys.groups", 
-                      "sys.nodes", "sys.settings", "sys.spaces"]
-    let tableName = tableNames[tableId - 1]
+    # Look up table info from registry
+    var tableName = ""
+    {.cast(gcsafe).}:
+      for info in SYSTEM_TABLES_REGISTRY:
+        if int(info.tableNum) == tableNum:
+          tableName = info.schema & "." & info.name
+          break
+    if tableName.len == 0:
+      sendJson(Http400, %* {"error": "table not found"})
+      return fut
     # Query the table
     var columns: seq[string] = @[]
     var rowsData: seq[JsonNode] = @[]
@@ -1354,7 +1358,7 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
         sendJson(Http400, %* {"error": res.error})
         return fut
     sendJson(Http200, %* {
-      "tableId": tableId,
+      "tableId": idStr,
       "tableName": tableName,
       "columns": columns,
       "rows": rowsData

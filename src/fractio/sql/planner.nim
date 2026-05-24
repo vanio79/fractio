@@ -531,163 +531,43 @@ proc columnDataTypeToDataType(cdt: ColumnDataType): DataType =
 # System table descriptors for sys schema queries
 # ---------------------------------------------------------------------------
 
+proc sysColDefToColDef(sysCol: SysColDef): ColDef =
+  ## Convert a SysColDef (self-contained system table column def) to a planner ColDef.
+  ColDef(
+    name: sysCol.name,
+    dataType: sysCol.dataType,
+    maxLen: sysCol.maxLen,
+    notNull: sysCol.notNull,
+    primaryKey: sysCol.primaryKey,
+    unique: false,
+    defaultExpr: none(Expr)
+  )
+
+proc sysPkSpecToPrimaryKeySpec(sysPk: SysPrimaryKeySpec): PrimaryKeySpec =
+  ## Convert a SysPrimaryKeySpec to a PrimaryKeySpec.
+  PrimaryKeySpec(columns: sysPk.columns)
+
 proc getSystemTableDescriptor(tableName: string): Option[TableDescriptor] =
   ## Return a table descriptor for a system table when querying from sys schema.
-  ## System tables have well-known IDs and fixed schemas.
-  let name = tableName.toLowerAscii()
-
-  # All system tables have a single primary key column named "_key"
-  let pkCol = ColDef(name: "_key", dataType: dtString, maxLen: 64,
-      primaryKey: true, notNull: true)
-  let pkSpec = PrimaryKeySpec(columns: @[(name: "_key", dataType: cdtString, maxLen: 64)])
-
-  if name == "databases":
-    return some(TableDescriptor(
-      tableId: SYS_DATABASES_TABLE_ID,
-      name: "databases",
-      schema: "sys",
-      database: "sys",
-      columns: @[pkCol, ColDef(name: "name", dataType: dtString), ColDef(
-          name: "createdAt", dataType: dtDateTime)],
-      primaryKey: @["_key"],
-      pkSpec: pkSpec,
-      spaceId: zeroSpaceID()
-    ))
-
-  if name == "schemas":
-    return some(TableDescriptor(
-      tableId: SYS_SCHEMAS_TABLE_ID,
-      name: "schemas",
-      schema: "sys",
-      database: "sys",
-      columns: @[pkCol, ColDef(name: "name", dataType: dtString), ColDef(
-          name: "database", dataType: dtString), ColDef(name: "createdAt",
-          dataType: dtDateTime)],
-      primaryKey: @["_key"],
-      pkSpec: pkSpec,
-      spaceId: zeroSpaceID()
-    ))
-
-  if name == "tables":
-    return some(TableDescriptor(
-      tableId: SYS_TABLES_TABLE_ID,
-      name: "tables",
-      schema: "sys",
-      database: "sys",
-      columns: @[pkCol, ColDef(name: "tableId", dataType: dtULID), ColDef(
-          name: "name", dataType: dtString), ColDef(name: "schema",
-          dataType: dtString), ColDef(name: "database", dataType: dtString),
-          ColDef(name: "spaceId", dataType: dtULID), ColDef(name: "primaryKey",
-          dataType: dtString), ColDef(name: "columns", dataType: dtBytes)],
-      primaryKey: @["_key"],
-      pkSpec: pkSpec,
-      spaceId: zeroSpaceID()
-    ))
-
-  if name == "groups":
-    return some(TableDescriptor(
-      tableId: SYS_GROUPS_TABLE_ID,
-      name: "groups",
-      schema: "sys",
-      database: "sys",
-      columns: @[pkCol, ColDef(name: "groupId", dataType: dtULID), ColDef(
-          name: "spaceId", dataType: dtULID), ColDef(name: "preferredLeader",
-          dataType: dtInt), ColDef(name: "leader", dataType: dtInt), ColDef(
-          name: "replicas", dataType: dtBytes)],
-      primaryKey: @["_key"],
-      pkSpec: pkSpec,
-      spaceId: zeroSpaceID()
-    ))
-
-  if name == "nodes":
-    return some(TableDescriptor(
-      tableId: SYS_NODES_TABLE_ID,
-      name: "nodes",
-      schema: "sys",
-      database: "sys",
-      columns: @[pkCol, ColDef(name: "nodeId", dataType: dtInt), ColDef(
-          name: "host", dataType: dtString), ColDef(name: "raftPort",
-          dataType: dtInt), ColDef(name: "clientPort", dataType: dtInt), ColDef(
-          name: "webPort", dataType: dtInt), ColDef(name: "status",
-          dataType: dtInt)],
-      primaryKey: @["_key"],
-      pkSpec: pkSpec,
-      spaceId: zeroSpaceID()
-    ))
-
-  if name == "settings":
-    return some(TableDescriptor(
-      tableId: SYS_SETTINGS_TABLE_ID,
-      name: "settings",
-      schema: "sys",
-      database: "sys",
-      columns: @[pkCol, ColDef(name: "value", dataType: dtString)],
-      primaryKey: @["_key"],
-      pkSpec: pkSpec,
-      spaceId: zeroSpaceID()
-    ))
-
-  if name == "spaces":
-    return some(TableDescriptor(
-      tableId: SYS_SPACES_TABLE_ID,
-      name: "spaces",
-      schema: "sys",
-      database: "sys",
-      columns: @[pkCol, ColDef(name: "spaceId", dataType: dtULID), ColDef(
-          name: "name", dataType: dtString), ColDef(name: "replicas",
-          dataType: dtInt), ColDef(name: "groupCount", dataType: dtInt), ColDef(
-          name: "groupIds", dataType: dtBytes), ColDef(name: "oldGroupIds",
-          dataType: dtBytes), ColDef(name: "rebalancing", dataType: dtBool),
-          ColDef(name: "createdAt", dataType: dtDateTime)],
-      primaryKey: @["_key"],
-      pkSpec: pkSpec,
-      spaceId: zeroSpaceID()
-    ))
-
-  if name == "node_metrics":
-    return some(TableDescriptor(
-      tableId: SYS_NODE_METRICS_ID,
-      name: "node_metrics",
-      schema: "sys",
-      database: "sys",
-      columns: @[pkCol, ColDef(name: "nodeId", dataType: dtInt), ColDef(
-          name: "cpuPercent", dataType: dtFloat), ColDef(name: "memUsedBytes",
-          dataType: dtInt), ColDef(name: "diskUsedBytes", dataType: dtInt)],
-      primaryKey: @["_key"],
-      pkSpec: pkSpec,
-      spaceId: zeroSpaceID()
-    ))
-
-  if name == "group_metrics":
-    return some(TableDescriptor(
-      tableId: SYS_GROUP_METRICS_ID,
-      name: "group_metrics",
-      schema: "sys",
-      database: "sys",
-      columns: @[pkCol, ColDef(name: "groupId", dataType: dtULID), ColDef(
-          name: "keyCount", dataType: dtInt), ColDef(name: "sizeBytes",
-          dataType: dtInt), ColDef(name: "readQps", dataType: dtFloat), ColDef(
-          name: "writeQps", dataType: dtFloat)],
-      primaryKey: @["_key"],
-      pkSpec: pkSpec,
-      spaceId: zeroSpaceID()
-    ))
-
-  if name == "events":
-    return some(TableDescriptor(
-      tableId: SYS_EVENTS_TABLE_ID,
-      name: "events",
-      schema: "sys",
-      database: "sys",
-      columns: @[pkCol, ColDef(name: "timestamp", dataType: dtDateTime), ColDef(
-          name: "eventType", dataType: dtString), ColDef(name: "nodeId",
-          dataType: dtInt), ColDef(name: "message", dataType: dtString)],
-      primaryKey: @["_key"],
-      pkSpec: pkSpec,
-      spaceId: zeroSpaceID()
-    ))
-
-  none(TableDescriptor)
+  ## Converts from the self-contained SystemTableInfo in SYSTEM_TABLES_REGISTRY
+  ## to the planner's TableDescriptor type.
+  let infoOpt = getSystemTableInfoByName(tableName)
+  if infoOpt.isNone:
+    return none(TableDescriptor)
+  let info = infoOpt.get()
+  var columns: seq[ColDef] = @[]
+  for sysCol in info.columns:
+    columns.add(sysColDefToColDef(sysCol))
+  some(TableDescriptor(
+    tableId: info.tableId,
+    name: info.name,
+    schema: info.schema,
+    database: info.database,
+    columns: columns,
+    primaryKey: info.primaryKey,
+    pkSpec: sysPkSpecToPrimaryKeySpec(info.pkSpec),
+    spaceId: zeroSpaceID()
+  ))
 
 proc resolveTable*(client: FractioClient,
     database, schema, tableName: string): Option[TableDescriptor] =

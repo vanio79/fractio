@@ -12,8 +12,9 @@
 #   Tier 2 (Standard RF=3): metrics/events tables 10+, user tables
 #   Tier 3 (Node-local): /sys/liveness/*, /raft/*, not replicated
 
-import std/strutils
+import std/[strutils, options]
 import fractio/core/types
+import fractio/distributed/meta/system_schemas
 import fractio/distributed/raft/group_types
 
 # ============================================================================
@@ -101,6 +102,253 @@ const
 
   MAX_META_GROUP_TABLE_NUM* = 7'u8
     ## Tables 1-7 live in the meta range (Range 1)
+
+# ============================================================================
+# System Table Registry
+# ============================================================================
+#
+# Single source of truth for all system table metadata. Every system table
+# is defined here with its ID, name, columns, and description. This registry
+# is used by the planner, executor, dashboard, and bootstrap code so that
+# system tables can be treated like normal user tables — queried via SQL,
+# listed in SHOW TABLES, and introspected from sys.tables.
+#
+# When a new system table is added:
+#   1. Add a SYS_*_TABLE_NUM and SYS_*_TABLE_ID constant above
+#   2. Add an entry to SYSTEM_TABLES_REGISTRY below
+#   3. Add a decodeSystemTableRecord case in executor.nim
+#   4. Add a binary record type in system_schemas.nim if needed
+
+type
+  SysColDef* = object
+    ## Column definition for system table registry.
+    ## Self-contained (no dependency on planner types).
+    name*: string
+    dataType*: DataType ## Uses core/types.DataType (dtInt, dtString, etc.)
+    maxLen*: int ## 0 = unspecified, use default
+    primaryKey*: bool
+    notNull*: bool
+
+  SysPrimaryKeySpec* = object
+    ## Primary key spec for system tables (simplified).
+    columns*: seq[tuple[name: string, dataType: ColumnDataType, maxLen: int]]
+
+  SystemTableInfo* = object
+    ## Complete metadata for a system table.
+    ## Used as the single source of truth for system table definitions.
+    tableNum*: uint8 ## Well-known system table number (1-99)
+    tableId*: TableId ## Well-known TableId (ULID with tableNum in last byte)
+    name*: string ## Unqualified table name (e.g. "databases")
+    schema*: string ## Schema name (always "sys" for system tables)
+    database*: string ## Database name (always "sys" for system tables)
+    description*: string ## Human-readable description
+    columns*: seq[SysColDef] ## Column definitions
+    primaryKey*: seq[string] ## Primary key column names
+    pkSpec*: SysPrimaryKeySpec ## Primary key spec for binary encoding
+
+let
+  SYSTEM_TABLES_REGISTRY* = [
+    SystemTableInfo(
+      tableNum: SYS_DATABASES_TABLE_NUM,
+      tableId: SYS_DATABASES_TABLE_ID,
+      name: "databases",
+      schema: "sys",
+      database: "sys",
+      description: "Database catalog",
+      columns: @[
+        SysColDef(name: "_key", dataType: dtString, maxLen: 64,
+            primaryKey: true, notNull: true),
+        SysColDef(name: "name", dataType: dtString),
+        SysColDef(name: "createdAt", dataType: dtDateTime)
+    ],
+    primaryKey: @["_key"],
+    pkSpec: SysPrimaryKeySpec(columns: @[(name: "_key", dataType: cdtString, maxLen: 64)])
+  ),
+    SystemTableInfo(
+      tableNum: SYS_SCHEMAS_TABLE_NUM,
+      tableId: SYS_SCHEMAS_TABLE_ID,
+      name: "schemas",
+      schema: "sys",
+      database: "sys",
+      description: "Schema catalog",
+      columns: @[
+        SysColDef(name: "_key", dataType: dtString, maxLen: 64,
+            primaryKey: true, notNull: true),
+        SysColDef(name: "name", dataType: dtString),
+        SysColDef(name: "database", dataType: dtString),
+        SysColDef(name: "createdAt", dataType: dtDateTime)
+    ],
+    primaryKey: @["_key"],
+    pkSpec: SysPrimaryKeySpec(columns: @[(name: "_key", dataType: cdtString, maxLen: 64)])
+  ),
+    SystemTableInfo(
+      tableNum: SYS_TABLES_TABLE_NUM,
+      tableId: SYS_TABLES_TABLE_ID,
+      name: "tables",
+      schema: "sys",
+      database: "sys",
+      description: "Table descriptors",
+      columns: @[
+        SysColDef(name: "_key", dataType: dtString, maxLen: 64,
+            primaryKey: true, notNull: true),
+        SysColDef(name: "tableId", dataType: dtULID),
+        SysColDef(name: "name", dataType: dtString),
+        SysColDef(name: "schema", dataType: dtString),
+        SysColDef(name: "database", dataType: dtString),
+        SysColDef(name: "spaceId", dataType: dtULID),
+        SysColDef(name: "primaryKey", dataType: dtString),
+        SysColDef(name: "columns", dataType: dtBytes)
+    ],
+    primaryKey: @["_key"],
+    pkSpec: SysPrimaryKeySpec(columns: @[(name: "_key", dataType: cdtString, maxLen: 64)])
+  ),
+    SystemTableInfo(
+      tableNum: SYS_GROUPS_TABLE_NUM,
+      tableId: SYS_GROUPS_TABLE_ID,
+      name: "groups",
+      schema: "sys",
+      database: "sys",
+      description: "Raft group metadata",
+      columns: @[
+        SysColDef(name: "_key", dataType: dtString, maxLen: 64,
+            primaryKey: true, notNull: true),
+        SysColDef(name: "groupId", dataType: dtULID),
+        SysColDef(name: "spaceId", dataType: dtULID),
+        SysColDef(name: "preferredLeader", dataType: dtInt),
+        SysColDef(name: "leader", dataType: dtInt),
+        SysColDef(name: "replicas", dataType: dtBytes)
+    ],
+    primaryKey: @["_key"],
+    pkSpec: SysPrimaryKeySpec(columns: @[(name: "_key", dataType: cdtString, maxLen: 64)])
+  ),
+    SystemTableInfo(
+      tableNum: SYS_NODES_TABLE_NUM,
+      tableId: SYS_NODES_TABLE_ID,
+      name: "nodes",
+      schema: "sys",
+      database: "sys",
+      description: "Cluster node registry",
+      columns: @[
+        SysColDef(name: "_key", dataType: dtString, maxLen: 64,
+            primaryKey: true, notNull: true),
+        SysColDef(name: "nodeId", dataType: dtInt),
+        SysColDef(name: "host", dataType: dtString),
+        SysColDef(name: "raftPort", dataType: dtInt),
+        SysColDef(name: "clientPort", dataType: dtInt),
+        SysColDef(name: "webPort", dataType: dtInt),
+        SysColDef(name: "status", dataType: dtInt)
+    ],
+    primaryKey: @["_key"],
+    pkSpec: SysPrimaryKeySpec(columns: @[(name: "_key", dataType: cdtString, maxLen: 64)])
+  ),
+    SystemTableInfo(
+      tableNum: SYS_SETTINGS_TABLE_NUM,
+      tableId: SYS_SETTINGS_TABLE_ID,
+      name: "settings",
+      schema: "sys",
+      database: "sys",
+      description: "Cluster configuration",
+      columns: @[
+        SysColDef(name: "_key", dataType: dtString, maxLen: 64,
+            primaryKey: true, notNull: true),
+        SysColDef(name: "value", dataType: dtString)
+    ],
+    primaryKey: @["_key"],
+    pkSpec: SysPrimaryKeySpec(columns: @[(name: "_key", dataType: cdtString, maxLen: 64)])
+  ),
+    SystemTableInfo(
+      tableNum: SYS_SPACES_TABLE_NUM,
+      tableId: SYS_SPACES_TABLE_ID,
+      name: "spaces",
+      schema: "sys",
+      database: "sys",
+      description: "Space catalog",
+      columns: @[
+        SysColDef(name: "_key", dataType: dtString, maxLen: 64,
+            primaryKey: true, notNull: true),
+        SysColDef(name: "spaceId", dataType: dtULID),
+        SysColDef(name: "name", dataType: dtString),
+        SysColDef(name: "replicas", dataType: dtInt),
+        SysColDef(name: "groupCount", dataType: dtInt),
+        SysColDef(name: "groupIds", dataType: dtBytes),
+        SysColDef(name: "oldGroupIds", dataType: dtBytes),
+        SysColDef(name: "rebalancing", dataType: dtBool),
+        SysColDef(name: "createdAt", dataType: dtDateTime)
+    ],
+    primaryKey: @["_key"],
+    pkSpec: SysPrimaryKeySpec(columns: @[(name: "_key", dataType: cdtString, maxLen: 64)])
+  ),
+    SystemTableInfo(
+      tableNum: SYS_NODE_METRICS_NUM,
+      tableId: SYS_NODE_METRICS_ID,
+      name: "node_metrics",
+      schema: "sys",
+      database: "sys",
+      description: "Per-node performance metrics",
+      columns: @[
+        SysColDef(name: "_key", dataType: dtString, maxLen: 64,
+            primaryKey: true, notNull: true),
+        SysColDef(name: "nodeId", dataType: dtInt),
+        SysColDef(name: "cpuPercent", dataType: dtFloat),
+        SysColDef(name: "memUsedBytes", dataType: dtInt),
+        SysColDef(name: "diskUsedBytes", dataType: dtInt)
+    ],
+    primaryKey: @["_key"],
+    pkSpec: SysPrimaryKeySpec(columns: @[(name: "_key", dataType: cdtString, maxLen: 64)])
+  ),
+    SystemTableInfo(
+      tableNum: SYS_GROUP_METRICS_NUM,
+      tableId: SYS_GROUP_METRICS_ID,
+      name: "group_metrics",
+      schema: "sys",
+      database: "sys",
+      description: "Per-group performance metrics",
+      columns: @[
+        SysColDef(name: "_key", dataType: dtString, maxLen: 64,
+            primaryKey: true, notNull: true),
+        SysColDef(name: "groupId", dataType: dtULID),
+        SysColDef(name: "keyCount", dataType: dtInt),
+        SysColDef(name: "sizeBytes", dataType: dtInt),
+        SysColDef(name: "readQps", dataType: dtFloat),
+        SysColDef(name: "writeQps", dataType: dtFloat)
+    ],
+    primaryKey: @["_key"],
+    pkSpec: SysPrimaryKeySpec(columns: @[(name: "_key", dataType: cdtString, maxLen: 64)])
+  ),
+    SystemTableInfo(
+      tableNum: SYS_EVENTS_TABLE_NUM,
+      tableId: SYS_EVENTS_TABLE_ID,
+      name: "events",
+      schema: "sys",
+      database: "sys",
+      description: "Cluster event log",
+      columns: @[
+        SysColDef(name: "_key", dataType: dtString, maxLen: 64,
+            primaryKey: true, notNull: true),
+        SysColDef(name: "timestamp", dataType: dtDateTime),
+        SysColDef(name: "eventType", dataType: dtString),
+        SysColDef(name: "nodeId", dataType: dtInt),
+        SysColDef(name: "message", dataType: dtString)
+    ],
+    primaryKey: @["_key"],
+    pkSpec: SysPrimaryKeySpec(columns: @[(name: "_key", dataType: cdtString, maxLen: 64)])
+  )
+  ]
+
+proc getSystemTableInfoByName*(name: string): Option[SystemTableInfo] =
+  ## Look up a SystemTableInfo by its unqualified table name (e.g. "databases").
+  let lowerName = name.toLowerAscii()
+  for info in SYSTEM_TABLES_REGISTRY:
+    if info.name == lowerName:
+      return some(info)
+  none(SystemTableInfo)
+
+proc getSystemTableInfoById*(tableId: TableId): Option[SystemTableInfo] =
+  ## Look up a SystemTableInfo by its well-known TableId.
+  for info in SYSTEM_TABLES_REGISTRY:
+    if info.tableId == tableId:
+      return some(info)
+  none(SystemTableInfo)
 
 # ============================================================================
 # Key encoding constants

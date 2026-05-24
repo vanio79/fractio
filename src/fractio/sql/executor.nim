@@ -871,13 +871,11 @@ proc execShowTablesTxn(op: PlanOp, ctx: ExecutorContext): ExecResult =
 
   # sys schema contains implicit/virtual system tables that are always present
   if op.stDatabase == "default" and op.stSchema == "sys":
-    resultRows.add(@["databases"])
-    resultRows.add(@["schemas"])
-    resultRows.add(@["tables"])
-    resultRows.add(@["groups"])
-    resultRows.add(@["nodes"])
-    resultRows.add(@["settings"])
-    resultRows.add(@["spaces"])
+    for info in SYSTEM_TABLES_REGISTRY:
+      # Only include meta-group tables (1-7) in SHOW TABLES
+      # metrics/events tables (10+) are tier 2 and less commonly listed
+      if info.tableNum <= MAX_META_GROUP_TABLE_NUM:
+        resultRows.add(@[info.name])
 
   for entry in res.val:
     let (rec, isDeleted) = decodeTableRecordFromMVCC(entry.value)
