@@ -404,6 +404,16 @@ proc serverNowMs*(server: ProtocolServer): int64 {.gcsafe, raises: [].} =
   let t = getTime()
   t.toUnix * 1000 + t.nanosecond() div 1_000_000
 
+proc serverNowSec*(server: ProtocolServer): int64 {.gcsafe, raises: [].} =
+  ## Get current time in seconds. Uses sharedTimer when available,
+  ## falls back to local clock. For display-only timestamps.
+  if server.sharedTimer != nil:
+    try:
+      return server.sharedTimer.now() div 1_000_000_000
+    except Exception:
+      discard
+  getTime().toUnix()
+
 proc newClientConnection*(id: uint32, sock: Socket,
     address: string, server: ProtocolServer = nil): ClientConnection =
   let nowMs = if server != nil: serverNowMs(server)
@@ -464,7 +474,7 @@ proc newProtocolServer*(config: ServerConfig): ProtocolServer =
     metrics: newServerMetrics(),
     authenticator: newAuthenticator(config.authMethod),
     nodeRegistry: reg,
-    startedAt: getTime().toUnix(), # TODO: use timeProvider (display only)
+    startedAt: getTime().toUnix(), # Set before sharedTimer is available; updated in start()
   )
   initLock(result.clientsMu)
   initLock(result.handlersMu)
@@ -1488,7 +1498,7 @@ proc handleBuiltinAdmin(server: ProtocolServer, conn: ClientConnection,
   case typeVal
 
   of uint16(mtServerInfo):
-    let nowSec = getTime().toUnix() # TODO: use timeProvider (display only)
+    let nowSec = serverNowSec(server)
     let uptime = uint64(if nowSec > server.startedAt: nowSec -
         server.startedAt else: 0)
     let realShardCount: uint32 =
@@ -2828,7 +2838,7 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
 
 proc start*(server: ProtocolServer) {.raises: [].} =
   server.running.store(true)
-  server.startedAt = getTime().toUnix() # TODO: use timeProvider (display only)
+  server.startedAt = serverNowSec(server)
   # Start background SharedTimer sync thread if configured
   if not server.sharedTimer.isNil:
     try: server.sharedTimer.start()

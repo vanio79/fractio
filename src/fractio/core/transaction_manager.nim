@@ -1,6 +1,7 @@
 # Transaction Manager - Commit/Abort logic for MVCC transactions
 
 import std/[atomics, locks, sets, options]
+import std/os
 import ./transaction
 import ./timestamp_provider
 import ./types as core_types
@@ -213,18 +214,30 @@ proc waitForTransaction*(manager: TransactionManager,
   ## Wait for another transaction to commit/abort
   ## Returns true if transaction was committed, false if aborted/timeout
 
-  # Simple implementation - just check a few times
-  # In production, would use condition variables
-  for i in 0..100:
+  let startTime = manager.timestampProvider.now()
+  let deadline = startTime + timeoutNs
+  var pollIntervalNs: int64 = 100_000 # Start with 100us
+
+  while true:
     # Check if intent still exists
     let intents = manager.mvccEngine.getIntentsForKey(key)
 
     if intents.len == 0:
-      # No more intents - we're done
+      # No more intents - transaction completed
       return true
 
-    # Simple spin wait
-    # TODO: Implement proper waiting with condition variables
+    # Check timeout
+    let now = manager.timestampProvider.now()
+    if now >= deadline:
+      return false
+
+    # Wait with adaptive polling: start fast, slow down over time
+    # Convert nanoseconds to milliseconds for os.sleep (minimum 1ms)
+    let sleepMs = max(1, int(pollIntervalNs div 1_000_000))
+    os.sleep(sleepMs)
+
+    # Exponential backoff: 100us → 200us → 400us → ... → max 10ms
+    pollIntervalNs = min(pollIntervalNs * 2, 10_000_000)
 
   return false
 
@@ -267,10 +280,9 @@ proc commitWithRetry*(manager: TransactionManager,
 
     # Check if error is retryable
     if result.error.retryable and currentTxn.canRetry(maxRetries):
-      # Backoff before retry
+      # Backoff before retry: exponential with jitter
       let backoffMs = calculateBackoff(retries)
-      # TODO: Implement actual sleep/backoff
-      discard backoffMs
+      os.sleep(int(backoffMs))
 
       # Create new transaction for retry
       let newTs = manager.timestampProvider.acquireStartTimestamp()

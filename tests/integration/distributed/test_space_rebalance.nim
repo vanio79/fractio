@@ -20,7 +20,7 @@ import fractio/protocol/txn_manager
 import fractio/protocol/mvcc_store
 import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
-import fractio/distributed/raft/group_types 
+import fractio/distributed/raft/group_types
 import fractio/distributed/meta/system_tables
 import fractio/distributed/meta/system_schemas
 import fractio/distributed/sharedtimer/mock
@@ -371,6 +371,16 @@ proc waitForSpaceLeaders(nodes: seq[TestNode]) =
           continue
 
         if gid == META_GROUP_ID or gid == DATA_GROUP_START_ID: continue
+
+        # Check if any node still has this group (it may have been removed
+        # during cutover between the sys.groups scan and this check)
+        var anyNodeHasGroup = false
+        for node in nodes:
+          if node.coord.hasGroup(gid):
+            anyNodeHasGroup = true
+            break
+        if not anyNodeHasGroup:
+          continue # Group was removed, skip
 
         # First, wait for the group to be created on at least one node
         var groupCreated = false

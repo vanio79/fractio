@@ -298,7 +298,7 @@ proc start*(node: NetworkRaftNode): bool =
     else:
       # Accept entries / heartbeat from leader
       n.nodeState.leaderId = toServerId(msg.leaderId)
-      n.lastHeartbeat = nodeNowMs(node) div 1000 # TODO: use timeProvider
+      n.lastHeartbeat = nodeNowMs(node) div 1000
 
       # Reset election timer since we got a valid heartbeat from leader
       n.resetElectionTimer()

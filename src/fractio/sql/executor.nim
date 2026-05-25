@@ -750,6 +750,7 @@ proc execCreateTable(op: PlanOp, ctx: ExecutorContext): ExecResult =
 
 proc execDropTable(op: PlanOp, ctx: ExecutorContext): ExecResult =
   ## Execute DROP TABLE with internal MVCC transaction for consistency.
+  ## Deletes the table metadata and all associated data rows and index entries.
   let key = encodeTableKey(SYS_TABLES_TABLE_ID,
       op.dtDatabase & "." & op.dtSchema & "." & op.dtName)
 
@@ -768,7 +769,41 @@ proc execDropTable(op: PlanOp, ctx: ExecutorContext): ExecResult =
       return okResult("table does not exist (IF EXISTS)")
     return errorResult(&"table '{op.dtName}' does not exist")
 
-  # TODO: also delete all data rows for the table
+  # Extract tableId from the table metadata to delete data rows
+  let tableValue = existing.val.get()
+  var tableId: TableId = zeroTableId()
+  try:
+    let rec = decodeTableRecord(tableValue)
+    tableId = rec.tableId
+  except:
+    discard # If we can't decode, skip data row cleanup
+
+  # Delete all data rows for this table: /t/<tableId>/d/* through /t/<tableId>/e/
+  if tableId != zeroTableId():
+    let dataStart = encodeTableKey(tableId, "d/")
+    let dataEnd = makeDataRowScanEndKey(tableId)
+    let dataScan = ctx.kv.scan(dataStart, dataEnd, 0,
+        txnId = internalTxnId, readTimestamp = internalReadTimestamp)
+    if dataScan.isOk:
+      for entry in dataScan.val:
+        let delRes = ctx.kv.delete(entry.key, txnId = internalTxnId)
+        if delRes.isErr:
+          discard ctx.kv.rollbackTxn(internalTxnId)
+          return errorResult(&"failed to delete data row: {delRes.err}")
+
+    # Delete all secondary index entries for this table: /t/<tableId>/i/*
+    let idxStart = encodeTableKey(tableId, "i/")
+    let idxEnd = encodeTableKey(tableId, "j/")         # "j" > "i"
+    let idxScan = ctx.kv.scan(idxStart, idxEnd, 0,
+        txnId = internalTxnId, readTimestamp = internalReadTimestamp)
+    if idxScan.isOk:
+      for entry in idxScan.val:
+        let delRes = ctx.kv.delete(entry.key, txnId = internalTxnId)
+        if delRes.isErr:
+          discard ctx.kv.rollbackTxn(internalTxnId)
+          return errorResult(&"failed to delete index entry: {delRes.err}")
+
+  # Delete the table metadata
   let delRes = ctx.kv.delete(key, txnId = internalTxnId)
   if delRes.isErr:
     discard ctx.kv.rollbackTxn(internalTxnId)

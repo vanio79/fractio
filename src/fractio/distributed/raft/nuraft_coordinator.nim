@@ -60,6 +60,11 @@ type
     ## Set to true after listener is set up - before that, buffer messages
     ## Uses atomic for thread-safe access from transport accept thread
     ready*: Atomic[bool]
+    ## Reference count: incremented by acquireGroupInstance, decremented by
+    ## releaseGroupInstance. removeGroup decrements and only frees when 0.
+    ## Prevents use-after-free when a group is removed while another thread
+    ## holds a pointer to the instance.
+    refCount*: Atomic[int32]
 
   NuRaftGroupInstancePtr* = ptr NuRaftGroupInstance
 
@@ -138,10 +143,51 @@ proc allocInstance(): NuRaftGroupInstancePtr =
   result = cast[NuRaftGroupInstancePtr](c_malloc(csize_t(sizeof(
       NuRaftGroupInstance))))
   zeroMem(result, sizeof(NuRaftGroupInstance))
+  result.refCount.store(1'i32, moRelaxed) # Group table holds one reference
 
 proc freeInstance(p: NuRaftGroupInstancePtr) =
   if p != nil:
     c_free(p)
+
+# Forward declarations needed for releaseGroupInstance
+proc unregisterValidContext(ctx: pointer)
+proc cancelAllTimersForContext(ctx: pointer)
+
+proc acquireGroupInstance*(inst: NuRaftGroupInstancePtr) =
+  ## Increment the reference count on a group instance.
+  ## Must be called while the instance is still in the groups table
+  ## (i.e., while groupsLock is held).
+  if inst != nil:
+    discard inst.refCount.fetchAdd(1'i32, moAcquireRelease)
+
+proc releaseGroupInstance(inst: NuRaftGroupInstancePtr) {.raises: [], gcsafe.} =
+  ## Decrement the reference count on a group instance.
+  ## If the count reaches 0, destroy and free the instance.
+  ## NOTE: nuraftServerShutdown must have been called already (by removeGroup)
+  ## before the last reference is released. This proc only destroys the
+  ## C++ objects and frees the C memory.
+  if inst == nil:
+    return
+  let prev = inst.refCount.fetchSub(1'i32, moAcquireRelease)
+  if prev == 1:
+    # Last reference dropped — safe to destroy C++ objects and free memory
+    {.cast(raises: []).}:
+      {.cast(gcsafe).}:
+        if not inst.server.isNil:
+          nuraftServerDestroy(inst.server)
+        if not inst.listener.isNil:
+          nuraftMpListenerDestroy(inst.listener)
+        if not inst.rpcContext.isNil:
+          unregisterValidContext(cast[pointer](inst.rpcContext))
+          cancelAllTimersForContext(cast[pointer](inst.rpcContext))
+          nuraftMpContextDestroy(inst.rpcContext)
+        if not inst.sm.isNil:
+          nuraftSmDestroy(inst.sm)
+        if not inst.smgr.isNil:
+          nuraftSmgrDestroy(inst.smgr)
+        if not inst.persistentStore.isNil:
+          inst.persistentStore.close()
+    freeInstance(inst)
 
 proc setTimeProvider*(c: NuRaftCoordinator, tp: TimeProvider) =
   c.timeProvider = tp
@@ -585,9 +631,13 @@ proc deliverBufferedMessages(c: NuRaftCoordinator,
           var inst: NuRaftGroupInstancePtr
           withLock c.groupsLock:
             inst = c.groups.getOrDefault(groupId, nil)
-          if inst != nil and not inst.server.isNil and
-              not inst.rpcContext.isNil:
-            deliverMessage(inst.rpcContext, inst.server, data)
+            if inst != nil:
+              acquireGroupInstance(inst)
+          if inst != nil:
+            if not inst.stopped and not inst.server.isNil and
+                not inst.rpcContext.isNil:
+              deliverMessage(inst.rpcContext, inst.server, data)
+            releaseGroupInstance(inst)
         c.pendingMessages.del(groupId)
 
 proc clearPendingMessages(c: NuRaftCoordinator) {.gcsafe, raises: [].} =
@@ -611,18 +661,21 @@ proc deliverMessageToGroup(c: NuRaftCoordinator, groupId: GroupID,
   withLock c.groupsLock:
     inst = c.groups.getOrDefault(groupId, nil)
     if inst != nil:
+      acquireGroupInstance(inst)
       if inst.ready.load(moRelaxed) and not inst.rpcContext.isNil and
-          not inst.server.isNil:
+          not inst.server.isNil and not inst.stopped:
         # Instance is fully ready - deliver message directly
         discard
       else:
-        # Instance exists but not fully ready yet
+        # Instance exists but not fully ready yet (or shutting down)
         shouldBuffer = true
     else:
       # Instance doesn't exist yet - buffer the message
       shouldBuffer = true
 
   if shouldBuffer:
+    if inst != nil:
+      releaseGroupInstance(inst)
     bufferMessage(c, groupId, msgData, msgLen)
   elif inst != nil:
     # Deliver message using the new API
@@ -631,6 +684,7 @@ proc deliverMessageToGroup(c: NuRaftCoordinator, groupId: GroupID,
     if msgLen > 0:
       copyMem(addr binaryMsg[0], msgData, msgLen.int)
     deliverMessage(inst.rpcContext, inst.server, binaryMsg)
+    releaseGroupInstance(inst)
 
 proc deliverMessageWrapper(coordPtr: pointer, groupId: GroupID,
     msgData: cstring, msgLen: csize_t) {.gcsafe, cdecl.} =
@@ -841,33 +895,22 @@ proc stop*(c: NuRaftCoordinator) =
     # Now stop the server - this closes all connections and stops the accept loop
     c.transport.stopServer()
 
-  # Collect instances to destroy while holding lock, then release lock before destroying
+  # Collect instances to release while holding lock, then release lock before releasing
   # This prevents deadlock where destruction waits for threads that need the lock
-  var instancesToDestroy: seq[NuRaftGroupInstancePtr] = @[]
+  var instancesToRelease: seq[NuRaftGroupInstancePtr] = @[]
   withLock c.groupsLock:
     for gid, inst in c.groups:
-      instancesToDestroy.add(inst)
+      instancesToRelease.add(inst)
     c.groups.clear()
 
-  # Now destroy without holding the lock
-  for inst in instancesToDestroy:
+  # Now shutdown and release without holding the lock
+  # Since we cleared c.groups, each instance lost the table's reference.
+  # We call nuraftServerShutdown first, then release (which may destroy if
+  # no other thread holds a ref).
+  for inst in instancesToRelease:
     if not inst.server.isNil:
       nuraftServerShutdown(inst.server)
-      nuraftServerDestroy(inst.server)
-    # Note: SM and SMgr are owned by the context when using nuraftServerCreateWithContext
-    # so we don't destroy them separately here
-    if not inst.listener.isNil:
-      nuraftMpListenerDestroy(inst.listener)
-    if not inst.rpcContext.isNil:
-      # Unregister context to prevent timer callbacks on destroyed memory
-      unregisterValidContext(cast[pointer](inst.rpcContext))
-      # Cancel all timers for this context before destroying it
-      # This prevents stale timer callbacks from accessing destroyed memory
-      cancelAllTimersForContext(cast[pointer](inst.rpcContext))
-      nuraftMpContextDestroy(inst.rpcContext)
-    if not inst.persistentStore.isNil:
-      inst.persistentStore.close()
-    freeInstance(inst)
+    releaseGroupInstance(inst)
 
   # Fully destroy transport
   if c.transport != nil:
@@ -975,7 +1018,9 @@ proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
   withLock c.groupsLock:
     c.groups[groupId] = inst
 
-  # Helper to clean up on failure
+  # Helper to clean up on failure: removes from table (ref count not affected)
+  # The caller is responsible for destroying C++ objects and calling
+  # releaseGroupInstance(inst) or freeInstance(inst) after this.
   template cleanupOnFailure() =
     withLock c.groupsLock:
       c.groups.del(groupId)
@@ -1253,24 +1298,23 @@ proc removeGroup*(c: NuRaftCoordinator, groupId: GroupID) =
     if not c.groups.hasKey(groupId): return
     inst = c.groups[groupId]
     c.groups.del(groupId)
+    # Mark stopped so callbacks and readers know this group is shutting down
+    inst.stopped = true
 
-  inst.stopped = true
+  # Phase 1: Immediately shut down the Raft server.
+  # This stops the server from accepting new requests and initiates
+  # graceful shutdown of the Raft protocol for this group.
+  # The C++ objects remain alive (not destroyed) so any thread holding
+  # a reference via acquireGroupInstance can still safely check inst.stopped
+  # and return early without accessing freed memory.
   if not inst.server.isNil:
     nuraftServerShutdown(inst.server)
-    nuraftServerDestroy(inst.server)
-  if not inst.listener.isNil:
-    nuraftMpListenerDestroy(inst.listener)
-  if not inst.rpcContext.isNil:
-    unregisterValidContext(cast[pointer](inst.rpcContext))
-    cancelAllTimersForContext(cast[pointer](inst.rpcContext))
-    nuraftMpContextDestroy(inst.rpcContext)
-  if not inst.sm.isNil:
-    nuraftSmDestroy(inst.sm)
-  if not inst.smgr.isNil:
-    nuraftSmgrDestroy(inst.smgr)
-  if not inst.persistentStore.isNil:
-    inst.persistentStore.close()
-  freeInstance(inst)
+
+  # Phase 2: Release the table's reference.
+  # If no other thread holds a ref, the instance will be destroyed
+  # immediately. Otherwise, destruction is deferred until the last
+  # holder calls releaseGroupInstance.
+  releaseGroupInstance(inst)
 
 proc hasGroup*(c: NuRaftCoordinator, groupId: GroupID): bool =
   withLock c.groupsLock:
@@ -1292,8 +1336,13 @@ proc isLeader*(c: NuRaftCoordinator, groupId: GroupID): bool {.raises: [].} =
   var inst: NuRaftGroupInstancePtr = nil
   withLock c.groupsLock:
     inst = c.groups.getOrDefault(groupId, nil)
-  if inst != nil and inst.server != nil:
-    result = nuraftServerIsLeader(inst.server)
+    if inst != nil:
+      acquireGroupInstance(inst)
+  if inst != nil:
+    defer: releaseGroupInstance(inst)
+    if inst.stopped: return false
+    if inst.server != nil:
+      result = nuraftServerIsLeader(inst.server)
 
 proc isWriteReady*(c: NuRaftCoordinator, groupId: GroupID): bool {.raises: [].} =
   ## Check if a group is ready to accept writes.
@@ -1302,16 +1351,26 @@ proc isWriteReady*(c: NuRaftCoordinator, groupId: GroupID): bool {.raises: [].} 
   var inst: NuRaftGroupInstancePtr = nil
   withLock c.groupsLock:
     inst = c.groups.getOrDefault(groupId, nil)
-  if inst != nil and inst.server != nil:
-    result = nuraftServerIsLeader(inst.server) and nuraftServerIsInitialized(inst.server)
+    if inst != nil:
+      acquireGroupInstance(inst)
+  if inst != nil:
+    defer: releaseGroupInstance(inst)
+    if inst.stopped: return false
+    if inst.server != nil:
+      result = nuraftServerIsLeader(inst.server) and nuraftServerIsInitialized(inst.server)
 
 proc getLeader*(c: NuRaftCoordinator, groupId: GroupID): int32 =
   # CRITICAL: Release groupsLock BEFORE calling NuRaft C functions (see isLeader).
   var inst: NuRaftGroupInstancePtr = nil
   withLock c.groupsLock:
     inst = c.groups.getOrDefault(groupId, nil)
-  if inst != nil and inst.server != nil:
-    result = nuraftServerGetLeader(inst.server)
+    if inst != nil:
+      acquireGroupInstance(inst)
+  if inst != nil:
+    defer: releaseGroupInstance(inst)
+    if inst.stopped: return -1
+    if inst.server != nil:
+      result = nuraftServerGetLeader(inst.server)
   if result == 0:
     result = -1
 
@@ -1321,15 +1380,18 @@ proc getGroupCount*(c: NuRaftCoordinator): int =
 
 proc getLeaderCount*(c: NuRaftCoordinator): int =
   # CRITICAL: Release groupsLock BEFORE calling NuRaft C functions (see isLeader).
-  # We collect all server pointers under the lock, then check leadership outside.
-  var servers: seq[NuRaftServer] = @[]
+  # We collect all instance pointers under the lock, then check leadership outside.
+  var instances: seq[NuRaftGroupInstancePtr] = @[]
   withLock c.groupsLock:
     for inst in c.groups.values:
-      if inst.server != nil:
-        servers.add(inst.server)
-  for srv in servers:
-    if nuraftServerIsLeader(srv):
-      inc result
+      acquireGroupInstance(inst)
+      instances.add(inst)
+  # Check leadership outside the lock
+  for inst in instances:
+    if not inst.stopped and inst.server != nil:
+      if nuraftServerIsLeader(inst.server):
+        inc result
+    releaseGroupInstance(inst)
 
 proc getGroupServerCount*(c: NuRaftCoordinator, groupId: GroupID): int32 =
   ## Get the number of servers in the cluster config for a specific group.
@@ -1338,12 +1400,17 @@ proc getGroupServerCount*(c: NuRaftCoordinator, groupId: GroupID): int32 =
   var inst: NuRaftGroupInstancePtr = nil
   withLock c.groupsLock:
     inst = c.groups.getOrDefault(groupId, nil)
-  if inst != nil and inst.server != nil:
-    return nuraftServerGetServerCount(inst.server)
+    if inst != nil:
+      acquireGroupInstance(inst)
+  if inst != nil:
+    defer: releaseGroupInstance(inst)
+    if inst.stopped: return -1
+    if inst.server != nil:
+      return nuraftServerGetServerCount(inst.server)
   return -1
 
 proc isPeerAlive*(c: NuRaftCoordinator, groupId: GroupID,
-    peerId: uint32): bool =
+    peerId: uint32): bool {.gcsafe.} =
   ## Check if a peer node is alive by querying its last successful response time.
   ## Uses the META group's server as the reference. Returns true if the peer
   ## has responded within the last 10 seconds, or if peer info is unavailable
@@ -1353,7 +1420,12 @@ proc isPeerAlive*(c: NuRaftCoordinator, groupId: GroupID,
   var inst: NuRaftGroupInstancePtr = nil
   withLock c.groupsLock:
     inst = c.groups.getOrDefault(META_GROUP_ID, nil)
-  if inst == nil or inst.server == nil:
+    if inst != nil:
+      acquireGroupInstance(inst)
+  if inst == nil:
+    return true # Can't check, assume alive
+  defer: releaseGroupInstance(inst)
+  if inst.stopped or inst.server == nil:
     return true # Can't check, assume alive
   var info: NuRaftPeerInfo
   let rc = nuraftServerGetPeerInfo(inst.server, int32(peerId), addr info)
@@ -1379,8 +1451,14 @@ proc proposeAndWait*(c: NuRaftCoordinator, groupId: GroupID,
           error: "Group not found: " & $groupId)
     {.cast(raises: []).}:
       inst = c.groups[groupId]
+    acquireGroupInstance(inst)
 
-  if inst.server == nil:
+  # Ensure release on all exit paths
+  defer: releaseGroupInstance(inst)
+
+  if inst.stopped:
+    return RaftResult(success: false, error: "Group is shutting down")
+  if inst.server.isNil or inst.sm.isNil:
     return RaftResult(success: false, error: "Server not initialized")
 
   # Check if we're the leader
@@ -1422,6 +1500,9 @@ proc proposeAndWait*(c: NuRaftCoordinator, groupId: GroupID,
       # Since logIdx may be 0 (NuRaft API quirk), we wait for SM index to increment.
       let startTime = coordNowNs().float / 1_000_000.0
       while true:
+        if inst.stopped:
+          return RaftResult(success: false,
+              error: "Group shutting down during commit wait")
         let smLastIdx = nuraftSmLastCommitIndex(inst.sm)
         # Wait for SM to advance by at least 1 (the write we just proposed)
         if smLastIdx > smIdxBefore:
@@ -1462,9 +1543,10 @@ proc proposeParallel*(c: NuRaftCoordinator,
         command: proposals[i].command,
         resultPtr: addr result[i],
       )
-      createThread(threads[i], proc(a: ThreadArg) {.thread, gcsafe.} =
-        let coord = cast[NuRaftCoordinator](a.coord)
-        a.resultPtr[] = coord.proposeAndWait(a.groupId, a.command)
+      createThread(threads[i], proc(a: ThreadArg) {.thread.} =
+        {.cast(gcsafe).}:
+          let coord = cast[NuRaftCoordinator](a.coord)
+          a.resultPtr[] = coord.proposeAndWait(a.groupId, a.command)
       , arg)
 
     for i in 0 ..< n:
@@ -1525,8 +1607,12 @@ proc setPriority*(c: NuRaftCoordinator, groupId: GroupID,
   var inst: NuRaftGroupInstancePtr
   withLock c.groupsLock:
     inst = c.groups.getOrDefault(groupId, nil)
+    if inst != nil:
+      acquireGroupInstance(inst)
 
-  if inst == nil or inst.server == nil: return false
+  if inst == nil: return false
+  defer: releaseGroupInstance(inst)
+  if inst.stopped or inst.server == nil: return false
 
   let rc = nuraftServerSetPriority(inst.server, int32(targetNodeId.uint32), priority)
   if rc != 0:
@@ -1540,8 +1626,12 @@ proc transferLeadership*(c: NuRaftCoordinator, groupId: GroupID,
   var inst: NuRaftGroupInstancePtr
   withLock c.groupsLock:
     inst = c.groups.getOrDefault(groupId, nil)
+    if inst != nil:
+      acquireGroupInstance(inst)
 
-  if inst == nil or inst.server == nil: return false
+  if inst == nil: return false
+  defer: releaseGroupInstance(inst)
+  if inst.stopped or inst.server == nil: return false
 
   # NuRaft leadership transfer strategy:
   # 1. Use priority system to bias election toward target
@@ -1579,8 +1669,10 @@ proc addServerToGroup*(c: NuRaftCoordinator, groupId: GroupID,
   withLock c.groupsLock:
     if not c.groups.hasKey(groupId): return -1
     inst = c.groups[groupId]
+    acquireGroupInstance(inst)
 
-  if inst.server == nil: return -1
+  defer: releaseGroupInstance(inst)
+  if inst.stopped or inst.server == nil: return -1
 
   # Proactively establish TCP connection to the new peer.
   # This ensures the connection exists before the leader needs to send
@@ -1614,8 +1706,10 @@ proc removeServerFromGroup*(c: NuRaftCoordinator, groupId: GroupID,
   withLock c.groupsLock:
     if not c.groups.hasKey(groupId): return -1
     inst = c.groups[groupId]
+    acquireGroupInstance(inst)
 
-  if inst.server == nil: return -1
+  defer: releaseGroupInstance(inst)
+  if inst.stopped or inst.server == nil: return -1
   return nuraftServerRemoveSrv(inst.server, int32(nodeId))
 
 # ============================================================================
