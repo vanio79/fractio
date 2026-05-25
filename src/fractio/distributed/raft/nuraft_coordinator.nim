@@ -22,7 +22,7 @@ import std/algorithm
 import std/logging
 import std/sequtils
 
-import fractio/core/types as core_types
+import fractio/core/types as core_types except NodeID
 import fractio/distributed/sharedtimer/timeprovider
 import fractio/distributed/raft/c_bindings
 import fractio/distributed/raft/group_types

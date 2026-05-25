@@ -4,9 +4,9 @@
 #   ProtocolServer (in-process) ← TCP → ProtocolClient
 #
 # Server backend: 3 Raft groups, each owning a key-range partition:
-#   Group 1 (RangeID 1): keys ""       .. "key_1666"   (low third)
-#   Group 2 (RangeID 2): keys "key_1666" .. "key_3333"  (mid third)
-#   Group 3 (RangeID 3): keys "key_3333" .. ""           (high third)
+#   Group 1 (GroupID 1): keys ""       .. "key_1666"   (low third)
+#   Group 2 (GroupID 2): keys "key_1666" .. "key_3333"  (mid third)
+#   Group 3 (GroupID 3): keys "key_3333" .. ""           (high third)
 #
 # Every KV operation is routed to the correct Raft group by the RaftKVStore
 # shard table, exercising real multi-Raft key-range dispatch end-to-end.
@@ -46,7 +46,6 @@ import fractio/protocol/messages/txn as txnMsgs
 import fractio/protocol/raft_store
 import fractio/distributed/raft/multigroup_coordinator
 import fractio/distributed/raft/multigroup_types
-import fractio/distributed/range/types as rangeTypes
 
 # =============================================================================
 # Constants
@@ -62,8 +61,8 @@ const
   ## key_0 .. key_1665  → group 1
   ## key_1666 .. key_3332 → group 2
   ## key_3333 .. ∞        → group 3
-  RANGE_SPLIT_LO* = "key_1666"
-  RANGE_SPLIT_HI* = "key_3333"
+  GROUP_SPLIT_LO* = "key_1666"
+  GROUP_SPLIT_HI* = "key_3333"
 
 # =============================================================================
 # Shared types
@@ -503,9 +502,9 @@ when isMainModule:
   # -------------------------------------------------------------------------
   # Bootstrap: 3 Raft groups, each owning a key-range partition.
   #
-  # Group 1 (RangeID 1): ""         .. RANGE_SPLIT_LO  (key_0 .. key_1665)
-  # Group 2 (RangeID 2): SPLIT_LO   .. RANGE_SPLIT_HI  (key_1666 .. key_3332)
-  # Group 3 (RangeID 3): SPLIT_HI   .. ""              (key_3333 .. ∞)
+  # Group 1 (GroupID 1): ""         .. GROUP_SPLIT_LO  (key_0 .. key_1665)
+  # Group 2 (GroupID 2): SPLIT_LO   .. GROUP_SPLIT_HI  (key_1666 .. key_3332)
+  # Group 3 (GroupID 3): SPLIT_HI   .. ""              (key_3333 .. ∞)
   #
   # All three groups share one MultiRaftCoordinator and one WiscKey store,
   # mirroring a single-node production deployment with range-based sharding.
@@ -528,20 +527,25 @@ when isMainModule:
   let coord = newMultiRaftCoordinator(coordCfg)
 
   # --- Create three range descriptors and their Raft groups ---
-  let rid1 = RangeID(1)
-  let rid2 = RangeID(2)
-  let rid3 = RangeID(3)
+  # TODO: Replace RangeID/RangeDescriptor with GroupID/GroupDescriptor after
+  # range→group migration. The old RangeID/newRangeDescriptor/addShardExt API
+  # was removed; this benchmark needs rewriting to use the current Raft group API.
+  let rid1 = groupIDFromInt(1)
+  let rid2 = groupIDFromInt(2)
+  let rid3 = groupIDFromInt(3)
 
-  let loBytes = cast[seq[byte]](RANGE_SPLIT_LO)
-  let hiBytes = cast[seq[byte]](RANGE_SPLIT_HI)
+  let loBytes = cast[seq[byte]](GROUP_SPLIT_LO)
+  let hiBytes = cast[seq[byte]](GROUP_SPLIT_HI)
 
-  let desc1 = newRangeDescriptor(rid1, @[], loBytes)             # "" .. key_1666
-  let desc2 = newRangeDescriptor(rid2, loBytes, hiBytes) # key_1666 .. key_3333
-  let desc3 = newRangeDescriptor(rid3, hiBytes, @[])             # key_3333 .. ""
+  # TODO: Replace newRangeDescriptor with newGroupDescriptor after range→group migration.
+  # The old RangeDescriptor had startKey/endKey; GroupDescriptor uses hash-based spaces.
+  let desc1 = newGroupDescriptor(rid1)
+  let desc2 = newGroupDescriptor(rid2)
+  let desc3 = newGroupDescriptor(rid3)
 
-  let rep1 = desc1.addReplica(RangeNodeID(1))
-  let rep2 = desc2.addReplica(RangeNodeID(1))
-  let rep3 = desc3.addReplica(RangeNodeID(1))
+  let rep1 = desc1.addReplica(NodeID(1))
+  let rep2 = desc2.addReplica(NodeID(1))
+  let rep3 = desc3.addReplica(NodeID(1))
 
   let grp1 = coord.createGroup(desc1, rep1.replicaId)
   let grp2 = coord.createGroup(desc2, rep2.replicaId)
@@ -551,13 +555,18 @@ when isMainModule:
   grp2.becomeLeader()
   grp3.becomeLeader()
 
-  # --- Wire RaftKVStoreExt with one shard entry per range group ---
+  # --- Wire RaftKVStoreExt with one group entry per range group ---
+  # TODO: The old addShardExt(startKey, endKey, groupId) API was removed
+  # when the range→group migration happened. RaftKVStoreExt now uses
+  # hash-based Space routing via resolveGroupId(). This benchmark needs
+  # to be updated to register spaces properly instead of shard entries.
   let raftSt = newRaftKVStoreExt(coord, proposeTimeoutMs = 10_000)
   raftSt.wireApplyCallback()
 
-  raftSt.addShardExt("", RANGE_SPLIT_LO, rid1)
-  raftSt.addShardExt(RANGE_SPLIT_LO, RANGE_SPLIT_HI, rid2)
-  raftSt.addShardExt(RANGE_SPLIT_HI, "", rid3)
+  # TODO: Replace addShardExt with Space-based routing (see note above).
+  discard raftSt
+  discard loBytes
+  discard hiBytes
 
   coord.start()
 

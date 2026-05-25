@@ -15,7 +15,7 @@ from std/times import Time, getTime
 # Use explicit module aliases to avoid NodeID ambiguity:
 # - core_types.NodeID is distinct string (used here for transport identity)
 # - group_types.NodeID is distinct uint32 (used in Raft group configuration)
-import fractio/core/types as core_types
+import fractio/core/types as core_types except NodeID
 import fractio/distributed/network/types as network_types
 import fractio/distributed/network/serialization
 import fractio/distributed/raft/group_types

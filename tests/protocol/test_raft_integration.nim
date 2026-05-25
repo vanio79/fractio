@@ -21,11 +21,11 @@ import fractio/protocol/messages/txn as txnMsgs
 import fractio/protocol/messages/admin as adminMsgs
 import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
-import fractio/distributed/raft/group_types as rangeTypes
+import fractio/distributed/raft/group_types
 import fractio/distributed/meta/system_tables
 import fractio/distributed/sharedtimer/mock
 import fractio/core/timestamp_provider
-import fractio/core/types as coreTypes
+import fractio/core/types as coreTypes except NodeID
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -44,7 +44,7 @@ proc cleanDir(path: string) =
 proc makeRaftServer(port: int, storagePath: string): ProtocolServer =
   ## Spin up a ProtocolServer with Raft-backed KV store.
   cleanDir(storagePath)
-  let nodeId = rangeTypes.NodeID(1)
+  let nodeId = NodeID(1)
   let raftPort = nextBasePort()
   let members = @[(nodeId: 1'u32, host: "127.0.0.1", port: raftPort)]
   let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(

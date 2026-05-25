@@ -22,7 +22,7 @@ import fractio/protocol/mvcc_store
 import fractio/protocol/txn_manager
 import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
-import fractio/distributed/raft/group_types as rangeTypes
+import fractio/distributed/raft/group_types 
 import fractio/distributed/sharedtimer/mock
 import fractio/distributed/sharedtimer/types as timerTypes
 import fractio/core/timestamp_provider

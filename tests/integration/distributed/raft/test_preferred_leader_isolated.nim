@@ -2,7 +2,7 @@
 import std/[unittest, os, atomics, tables]
 
 import fractio/distributed/raft/nuraft_coordinator
-import fractio/distributed/raft/group_types as rangeTypes
+import fractio/distributed/raft/group_types 
 import fractio/distributed/meta/system_tables
 import fractio/distributed/meta/system_schemas
 import fractio/protocol/raft_store
@@ -18,7 +18,7 @@ suite "Preferred leader isolated test":
     for node in cluster.nodes:
       node.store.loadGroupMembers()
 
-    let testGid = rangeTypes.groupIDFromInt(101)
+    let testGid = groupIDFromInt(101)
     let metaLeader = cluster.waitForLeader(META_GROUP_ID)
     doAssert metaLeader >= 0
 

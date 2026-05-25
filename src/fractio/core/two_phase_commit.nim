@@ -1,5 +1,5 @@
 # Two-Phase Commit (2PC) for Distributed Transactions
-# Provides atomic commit across multiple nodes/ranges using the 2PC protocol
+# Provides atomic commit across multiple nodes/groups using the 2PC protocol
 # Integrated with Raft for consensus and durability
 
 import std/[options, tables, sets, sequtils, times, strutils,

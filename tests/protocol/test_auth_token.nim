@@ -21,7 +21,7 @@ import fractio/protocol/mvcc_store
 import fractio/protocol/raft_store
 import fractio/protocol/txn_manager
 import fractio/distributed/raft/nuraft_coordinator
-import fractio/distributed/raft/group_types as rangeTypes
+import fractio/distributed/raft/group_types 
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/meta/system_tables
 import fractio/distributed/sharedtimer/mock
@@ -53,7 +53,7 @@ proc startTokenServer(port: int): ProtocolServer =
   try: removeDir(storagePath) except CatchableError: discard
   createDir(storagePath)
 
-  let nodeId = rangeTypes.NodeID(1)
+  let nodeId = NodeID(1)
   let raftPort = nextRaftPort()
   let members = @[(nodeId: 1'u32, host: "127.0.0.1", port: raftPort)]
 

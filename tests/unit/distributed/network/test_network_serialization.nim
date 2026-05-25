@@ -6,7 +6,7 @@ import endians
 import strutils
 import fractio/distributed/network/types as network_types
 import fractio/distributed/network/serialization
-import fractio/core/types as core_types
+import fractio/core/types as core_types except NodeID
 import fractio/distributed/raft/group_types as group_types
 
 suite "CRC32 Checksum - Extended":

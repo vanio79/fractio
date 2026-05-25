@@ -65,11 +65,11 @@ suite "LogEntry":
     let entry = newLogEntry(1'u64, 1'u64, RaftCommand(
       kind: ckSplit,
       splitKey: @[byte 0x05],
-      newRangeId: DATA_GROUP_START_ID
+      newGroupId: DATA_GROUP_START_ID
     ))
     check entry.command.kind == ckSplit
     check entry.command.splitKey == @[byte 0x05]
-    check entry.command.newRangeId == DATA_GROUP_START_ID
+    check entry.command.newGroupId == DATA_GROUP_START_ID
 
 suite "RaftGroup":
   test "create group":

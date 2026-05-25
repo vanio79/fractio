@@ -14,7 +14,7 @@ import std/[unittest, os, times, options, tables]
 
 import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
-import fractio/distributed/raft/group_types as rangeTypes
+import fractio/distributed/raft/group_types 
 import fractio/distributed/meta/system_tables
 import fractio/protocol/raft_store
 
@@ -88,7 +88,7 @@ proc makeCluster(): (seq[NodeSetup], GroupID) =
   var nodes: seq[NodeSetup] = @[]
   for i in 0 ..< 3:
     let nodeNum = i + 1
-    let nodeId = rangeTypes.NodeID(uint32(nodeNum))
+    let nodeId = NodeID(uint32(nodeNum))
     let storagePath = TMP_DIR & $nodeNum
     cleanDir(storagePath)
 

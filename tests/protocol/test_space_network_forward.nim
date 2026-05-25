@@ -14,8 +14,8 @@
 import std/[unittest, os, options, tables]
 
 import fractio/distributed/raft/nuraft_coordinator
-import fractio/distributed/raft/group_types as rangeTypes
-import fractio/core/types as coreTypes
+import fractio/distributed/raft/group_types
+import fractio/core/types as coreTypes except NodeID
 import fractio/distributed/meta/system_tables
 import fractio/distributed/meta/system_schemas
 import fractio/protocol/raft_store
@@ -68,7 +68,7 @@ proc makeCluster3(): seq[TestNode] =
 
   # Phase 1: Create all coordinators first (without starting)
   for nodeNum in 1 .. NODE_COUNT:
-    let nodeId = rangeTypes.NodeID(uint32(nodeNum))
+    let nodeId = NodeID(uint32(nodeNum))
     let port = 26000 + (nodeNum - 1) * 100
     let storagePath = TMP_DIR & $nodeNum
     cleanDir(storagePath)

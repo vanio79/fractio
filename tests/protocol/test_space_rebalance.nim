@@ -17,7 +17,7 @@ from fractio/core/types import genULIDLocal, genSpaceIDLocal, genTableIdLocal,
 import fractio/protocol/raft_store
 import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
-import fractio/distributed/raft/group_types as rangeTypes
+import fractio/distributed/raft/group_types 
 import fractio/distributed/meta/system_tables
 import fractio/distributed/meta/system_schemas
 import fractio/storage/wisckey_backend

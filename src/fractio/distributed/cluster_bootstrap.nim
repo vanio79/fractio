@@ -7,7 +7,7 @@ import ./network/network_raft_node
 import ./network/client_handler
 import ./network/raft_transport
 import ./raft/types as raft_types
-import ./raft/group_types as rangeTypes
+import ./raft/group_types
 import ./meta/system_tables
 import ../utils/logging
 
@@ -37,8 +37,8 @@ type
     clientHandler*: ClientHandler
     running*: Atomic[bool]
 
-  SimpleRange* = object
-    ## Simplified range info for cluster management
+  SimpleGroup* = object
+    ## Simplified group info for cluster management
     groupId*: int32
     startKey*: string
     endKey*: string
@@ -48,7 +48,7 @@ type
     ## A running cluster
     config*: ClusterConfig
     nodes*: seq[ClusterNode]
-    ranges*: seq[SimpleRange]
+    groups*: seq[SimpleGroup]
     running*: Atomic[bool]
 
 # =============================================================================
@@ -226,13 +226,13 @@ proc stopCluster*(cluster: Cluster) =
     info("Cluster stopped", fields)
 
 # =============================================================================
-# Range Creation
+# Group Creation
 # =============================================================================
 
-proc createRange*(cluster: Cluster, startKey, endKey: string,
-                  numReplicas: int = 3): SimpleRange =
-  ## Create a new range with specified replicas
-  ## Returns the range info
+proc createGroup*(cluster: Cluster, startKey, endKey: string,
+                  numReplicas: int = 3): SimpleGroup =
+  ## Create a new group with specified replicas
+  ## Returns the group info
 
   if numReplicas > cluster.nodes.len:
     var fields = initTable[string, string]()
@@ -241,8 +241,8 @@ proc createRange*(cluster: Cluster, startKey, endKey: string,
     error("Not enough nodes for replication", fields)
     return
 
-  result = SimpleRange(
-    groupId: int32(cluster.ranges.len + 1),
+  result = SimpleGroup(
+    groupId: int32(cluster.groups.len + 1),
     startKey: startKey,
     endKey: endKey
   )
@@ -251,16 +251,16 @@ proc createRange*(cluster: Cluster, startKey, endKey: string,
   for i in 0..<numReplicas:
     result.replicaNodes.add(cluster.nodes[i].config.serverId)
 
-  cluster.ranges.add(result)
+  cluster.groups.add(result)
 
   var fields = initTable[string, string]()
   fields["groupId"] = $result.groupId
   fields["replicas"] = $numReplicas
-  info("Range created", fields)
+  info("Group created", fields)
 
-proc createDefaultRange*(cluster: Cluster): SimpleRange =
-  ## Create the default first range spanning all keys
-  result = createRange(cluster, "", "\xFF\xFF\xFF\xFF", min(3,
+proc createDefaultGroup*(cluster: Cluster): SimpleGroup =
+  ## Create the default first group spanning all keys
+  result = createGroup(cluster, "", "\xFF\xFF\xFF\xFF", min(3,
       cluster.nodes.len))
 
 # =============================================================================
@@ -275,12 +275,12 @@ type
     leaders*: int
     followers*: int
     candidates*: int
-    rangeCount*: int
+    groupCount*: int
 
 proc getStatus*(cluster: Cluster): ClusterStatus =
   ## Get cluster status
   result.nodeCount = cluster.nodes.len
-  result.rangeCount = cluster.ranges.len
+  result.groupCount = cluster.groups.len
 
   for node in cluster.nodes:
     if node.running.load():
@@ -367,7 +367,7 @@ proc waitForReplication*(cluster: Cluster, timeoutMs: int = 10000): bool =
     sleep(100)
 
 # =============================================================================
-# Meta Range Bootstrap
+# Meta Group Bootstrap
 # =============================================================================
 
 proc createMetaGroupDescriptor*(cluster: Cluster): GroupDescriptor =
@@ -388,7 +388,7 @@ proc createDataGroupDescriptor*(cluster: Cluster,
 
 proc buildInitialCatalog*(nodeConfigs: seq[NodeConfig]): seq[
     tuple[key, value: string]] =
-  ## Build the initial system catalog entries written to the meta range
+  ## Build the initial system catalog entries written to the meta group
   ## during first bootstrap. Returns a list of (key, value) pairs.
   ##
   ## Creates:

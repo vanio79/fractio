@@ -24,7 +24,7 @@
 import std/[os, locks, tables, options]
 
 import fractio/distributed/raft/nuraft_coordinator
-import fractio/distributed/raft/group_types as rangeTypes
+import fractio/distributed/raft/group_types 
 import fractio/distributed/meta/system_tables
 import fractio/distributed/meta/system_schemas
 import fractio/protocol/raft_store
@@ -145,7 +145,7 @@ proc newTestNode(
 
   # Create coordinator
   let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
-    nodeId: rangeTypes.NodeID(nodeId),
+    nodeId: NodeID(nodeId),
     port: port,
     host: host,
     dataDir: storagePath,

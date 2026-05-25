@@ -52,25 +52,25 @@ suite "5-Node Cluster Integration Tests":
     # Cleanup
     cleanupClusterData(config)
 
-  test "Create range in cluster":
+  test "Create group in cluster":
     let port = uniqueBasePort()
     let config = defaultThreeNodeConfig(basePort = port)
     let cluster = bootstrapCluster(config)
 
     check cluster != nil
 
-    # Create a range
-    let rangeInfo = createRange(cluster, "a", "z", 3)
-    check rangeInfo.groupId == 1
-    check rangeInfo.startKey == "a"
-    check rangeInfo.endKey == "z"
-    check rangeInfo.replicaNodes.len == 3
+    # Create a group
+    let groupInfo = createGroup(cluster, "a", "z", 3)
+    check groupInfo.groupId == 1
+    check groupInfo.startKey == "a"
+    check groupInfo.endKey == "z"
+    check groupInfo.replicaNodes.len == 3
 
-    # Create default range
-    let defaultRange = createDefaultRange(cluster)
-    check defaultRange.groupId == 2
+    # Create default group
+    let defaultGroup = createDefaultGroup(cluster)
+    check defaultGroup.groupId == 2
 
-    check cluster.ranges.len == 2
+    check cluster.groups.len == 2
 
     stopCluster(cluster)
     cleanupClusterData(config)
@@ -88,7 +88,7 @@ suite "5-Node Cluster Integration Tests":
     let status = getStatus(cluster)
     check status.nodeCount == 3
     check status.runningNodes == 3
-    check status.rangeCount == 0
+    check status.groupCount == 0
 
     stopCluster(cluster)
     cleanupClusterData(config)
@@ -124,15 +124,15 @@ suite "5-Node Cluster Integration Tests":
 
     check cluster != nil
 
-    # Create range with 5 replicas
-    let range5 = createRange(cluster, "a", "m", 5)
-    check range5.replicaNodes.len == 5
+    # Create group with 5 replicas
+    let group5 = createGroup(cluster, "a", "m", 5)
+    check group5.replicaNodes.len == 5
 
-    # Create range with 3 replicas
-    let range3 = createRange(cluster, "m", "z", 3)
-    check range3.replicaNodes.len == 3
+    # Create group with 3 replicas
+    let group3 = createGroup(cluster, "m", "z", 3)
+    check group3.replicaNodes.len == 3
 
-    check cluster.ranges.len == 2
+    check cluster.groups.len == 2
 
     stopCluster(cluster)
     cleanupClusterData(config)

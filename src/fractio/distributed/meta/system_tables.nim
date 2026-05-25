@@ -8,7 +8,7 @@
 # - User tables use genTableId() for globally unique, sortable IDs
 #
 # Replication tiers:
-#   Tier 1 (Meta Range): system tables 1-7, replicated on ALL nodes
+#   Tier 1 (Meta Group): system tables 1-7, replicated on ALL nodes
 #   Tier 2 (Standard RF=3): metrics/events tables 10+, user tables
 #   Tier 3 (Node-local): /sys/liveness/*, /raft/*, not replicated
 
@@ -65,7 +65,7 @@ let
     ## Value: JSON {id, schemaId, name, columns, indices, createdAt}
 
   SYS_GROUPS_TABLE_ID* = TableId(systemTableULID(SYS_GROUPS_TABLE_NUM))
-    ## Authoritative range map: /t/<SYS_GROUPS_TABLE_ID>/<groupId>
+    ## Authoritative group map: /t/<SYS_GROUPS_TABLE_ID>/<groupId>
     ## Value: JSON-encoded GroupDescriptor
 
   SYS_NODES_TABLE_ID* = TableId(systemTableULID(SYS_NODES_TABLE_NUM))
@@ -85,7 +85,7 @@ let
     ## Value: numeric string
 
   SYS_GROUP_METRICS_ID* = TableId(systemTableULID(SYS_GROUP_METRICS_NUM))
-    ## Per-range stats: /t/<SYS_GROUP_METRICS_ID>/<groupId>/<metricName>
+    ## Per-group stats: /t/<SYS_GROUP_METRICS_ID>/<groupId>/<metricName>
     ## Value: numeric string
 
   SYS_EVENTS_TABLE_ID* = TableId(systemTableULID(SYS_EVENTS_TABLE_NUM))
@@ -101,7 +101,7 @@ const
     ## System tables use numbers 1-99
 
   MAX_META_GROUP_TABLE_NUM* = 7'u8
-    ## Tables 1-7 live in the meta range (Range 1)
+    ## Tables 1-7 live in the meta group (Group 1)
 
 # ============================================================================
 # System Table Registry
@@ -407,16 +407,16 @@ proc dataGroupStartULID(): ULID =
   result.data[15] = 2'u8
 
 var META_GROUP_ID* = GroupID(metaGroupULID())
-  ## The meta range is always Range 1, replicated on every node
+  ## The meta group is always Group 1, replicated on every node
   ## Uses a well-known ULID (00000000000000000000000001)
 
 var DATA_GROUP_START_ID* = GroupID(dataGroupStartULID())
-  ## First data range ID - ULID with last byte = 2
+  ## First data group ID - ULID with last byte = 2
 
-# Pre-computed boundary key: one past the last meta range table
+# Pre-computed boundary key: one past the last meta group table
 # System table 8 would be 00000000000000000000000008
 let META_GROUP_END_KEY* = TABLE_KEY_PREFIX & "00000000000000000000000008/"
-  ## Exclusive upper bound for meta range table keys
+  ## Exclusive upper bound for meta group table keys
 
 # ============================================================================
 # Key Encoding / Decoding
@@ -467,8 +467,8 @@ proc isSystemTableId*(tableId: TableId): bool =
   result = tableNum >= 1'u8 and tableNum <= MAX_SYSTEM_TABLE_NUM
 
 proc isMetaGroupTableId*(tableId: TableId): bool =
-  ## Check if a TableId belongs to the meta range (tables 1-7).
-  ## These keys are replicated on ALL nodes via Range 1.
+  ## Check if a TableId belongs to the meta group (tables 1-7).
+  ## These keys are replicated on ALL nodes via Group 1.
   var ulid = ULID(tableId)
   for i in 0..<15:
     if ulid.data[i] != 0'u8:
@@ -493,8 +493,8 @@ proc isSystemKey*(key: string): bool =
     result = false
 
 proc isMetaGroupKey*(key: string): bool =
-  ## Check if a key belongs to the meta range (system tables 1-7).
-  ## These keys are replicated on ALL nodes via Range 1.
+  ## Check if a key belongs to the meta group (system tables 1-7).
+  ## These keys are replicated on ALL nodes via Group 1.
   if not key.startsWith(TABLE_KEY_PREFIX):
     return false
   try:

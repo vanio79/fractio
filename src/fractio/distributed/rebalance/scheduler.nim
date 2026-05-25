@@ -15,7 +15,7 @@ import std/times
 import fractio/distributed/raft/group_types
 import fractio/distributed/rebalance/allocator
 import fractio/distributed/sharedtimer/timeprovider
-import fractio/core/types
+import fractio/core/types except NodeID
 
 # ============================================================================
 # Constants
@@ -335,7 +335,7 @@ proc checkGroupForRebalance*(scheduler: RebalanceScheduler,
                               replicas: seq[ReplicaDescriptor],
                               leaseholder: group_types.NodeID,
                               nowNs: int64): seq[RebalanceOp] =
-  ## Check a range for rebalancing and add decisions to queue
+  ## Check a group for rebalancing and add decisions to queue
 
   let decisions = scheduler.allocator.shouldRebalance(groupId, replicas, leaseholder)
   result = scheduler.addDecisions(decisions, nowNs)
@@ -397,9 +397,9 @@ type
     maxConcurrentTransfers*: int
       ## Maximum concurrent lease transfers
     minIntervalNs*: int64
-      ## Minimum interval between operations on same range
+      ## Minimum interval between operations on same group
     forbiddenGroups*: seq[GroupID]
-      ## Ranges that cannot be rebalanced
+      ## Groups that cannot be rebalanced
 
 proc defaultRebalanceConstraints*(): RebalanceConstraints =
   ## Create default rebalance constraints
@@ -412,11 +412,11 @@ proc defaultRebalanceConstraints*(): RebalanceConstraints =
 
 proc canRebalance*(constraints: RebalanceConstraints,
                    groupId: GroupID): bool =
-  ## Check if a range can be rebalanced
+  ## Check if a group can be rebalanced
   result = groupId notin constraints.forbiddenGroups
 
 proc withForbiddenGroups*(c: RebalanceConstraints,
-                          ranges: seq[GroupID]): RebalanceConstraints =
-  ## Set forbidden ranges
+                           groups: seq[GroupID]): RebalanceConstraints =
+  ## Set forbidden groups
   result = c
-  result.forbiddenGroups = ranges
+  result.forbiddenGroups = groups

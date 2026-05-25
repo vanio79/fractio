@@ -19,7 +19,7 @@ import std/[unittest, os, times, atomics, options]
 import fractio/protocol/raft_store
 import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
-import fractio/distributed/raft/group_types as rangeTypes
+import fractio/distributed/raft/group_types 
 import fractio/distributed/meta/system_tables
 
 # ---------------------------------------------------------------------------

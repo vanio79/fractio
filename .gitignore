@@ -133,3 +133,4 @@ src/fractio/web/static/app_debug.js
 # Integration test binaries
 tests/integration/web/start_test_cluster
 tests/integration/web/test_rest_api
+scheduler/

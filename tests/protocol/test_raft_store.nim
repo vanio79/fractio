@@ -11,7 +11,7 @@ import fractio/protocol/raft_txn
 import fractio/protocol/txn_manager
 import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
-import fractio/distributed/raft/group_types as rangeTypes
+import fractio/distributed/raft/group_types 
 import fractio/distributed/meta/system_tables
 import fractio/distributed/sharedtimer/timeprovider as tp
 import fractio/distributed/sharedtimer/mock

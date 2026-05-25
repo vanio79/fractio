@@ -20,7 +20,7 @@ import fractio/protocol/txn_manager
 import fractio/protocol/mvcc_store
 import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
-import fractio/distributed/raft/group_types as rangeTypes
+import fractio/distributed/raft/group_types 
 import fractio/distributed/meta/system_tables
 import fractio/distributed/meta/system_schemas
 import fractio/distributed/sharedtimer/mock
@@ -110,7 +110,7 @@ proc cleanDir(p: string) =
 proc makeNode(nodeNum: int, port: int,
     members: seq[tuple[nodeId: uint32, host: string,
         port: int]]): TestNode =
-  let nodeId = rangeTypes.NodeID(uint32(nodeNum))
+  let nodeId = NodeID(uint32(nodeNum))
   let cPort = nextClientPort
   nextClientPort += 1
 
@@ -162,7 +162,7 @@ proc makeNode(nodeNum: int, port: int,
   # Create MVCC store for DDL operations
   let txnMgr = newTransactionManager()
   let mockTimer = MockTimeProvider(currentTime: timerTypes.Timestamp(1_000_000_000))
-  let tsProvider = newTimestampProvider(mockTimer, rangeTypes.NodeID(uint32(
+  let tsProvider = newTimestampProvider(mockTimer, NodeID(uint32(
       nodeNum)).uint16)
   let mvccStore = newMvccTransactionStore(store, txnMgr, tsProvider)
 

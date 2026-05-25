@@ -11,7 +11,7 @@ import fractio/protocol/raft_store
 import fractio/protocol/mvcc_store
 import fractio/protocol/txn_manager
 import fractio/distributed/raft/nuraft_coordinator
-import fractio/distributed/raft/group_types as rangeTypes
+import fractio/distributed/raft/group_types 
 import fractio/distributed/meta/system_tables
 import fractio/distributed/meta/system_schemas
 import fractio/distributed/sharedtimer/mock
@@ -51,7 +51,7 @@ proc makeTestEnv(suiteName: string): tuple[
   let testDir = "/tmp/fractio_sql_txn_" & suiteName & "_" & randomId
   cleanDir(testDir)
 
-  let nodeId = rangeTypes.NodeID(1)
+  let nodeId = NodeID(1)
   let raftPort = nextBasePort()
   let clientPort = nextBasePort()
   let members = @[(nodeId: 1'u32, host: "127.0.0.1", port: raftPort)]

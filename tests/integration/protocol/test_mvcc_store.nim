@@ -14,12 +14,12 @@ import fractio/protocol/raft_store
 import fractio/protocol/mvcc_store
 import fractio/protocol/txn_manager
 import fractio/distributed/raft/nuraft_coordinator
-import fractio/distributed/raft/group_types as rangeTypes
+import fractio/distributed/raft/group_types
 import fractio/distributed/meta/system_tables
 import fractio/distributed/sharedtimer/mock
 import fractio/distributed/sharedtimer/types as timerTypes
 import fractio/core/timestamp_provider
-import fractio/core/types as coreTypes
+import fractio/core/types as coreTypes except NodeID
 import fractio/core/transaction as coreTxn
 import fractio/storage/mvcc/types as mvccTypes
 import fractio/storage/wisckey_backend
@@ -42,7 +42,7 @@ proc makeMvccStore(storagePath: string): tuple[
     coord: NuRaftCoordinator, raftStore: RaftKVStoreExt,
     mvccStore: MvccTransactionStore, txnMgr: TransactionManager] =
   cleanDir(storagePath)
-  let nodeId = rangeTypes.NodeID(1)
+  let nodeId = NodeID(1)
   let port = nextBasePort()
   let members = @[(nodeId: 1'u32, host: "127.0.0.1", port: port)]
 

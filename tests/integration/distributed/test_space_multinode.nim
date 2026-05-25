@@ -22,8 +22,8 @@ import fractio/client/fractio_client
 import fractio/client/sql_client
 
 import fractio/distributed/raft/nuraft_coordinator
-import fractio/distributed/raft/group_types as rangeTypes
-import fractio/core/types as coreTypes
+import fractio/distributed/raft/group_types
+import fractio/core/types as coreTypes except NodeID
 import fractio/distributed/meta/system_tables
 import fractio/distributed/meta/system_schemas
 import fractio/protocol/raft_store
@@ -80,7 +80,7 @@ proc cleanDir(p: string) =
 proc makeNode(nodeNum: int, port: int,
     members: seq[tuple[nodeId: uint32, host: string,
         port: int]]): TestNode =
-  let nodeId = rangeTypes.NodeID(uint32(nodeNum))
+  let nodeId = NodeID(uint32(nodeNum))
   let cPort = nextClientPort
   nextClientPort += 1
 

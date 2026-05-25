@@ -7,7 +7,6 @@ import std/[unittest, random, times, options, atomics]
 
 import fractio/distributed/raft/group_types
 import fractio/distributed/raft/multigroup_types
-import fractio/distributed/meta/types
 import fractio/distributed/meta/system_tables
 
 type CrashConsistencyStats* = object of RootObj
@@ -148,7 +147,7 @@ suite "CrashConsistency":
     check group5.hasQuorum(2) == false
     group5.close()
 
-  test "range descriptor creation":
+  test "group descriptor creation":
     let desc = newGroupDescriptor(
       META_GROUP_ID
     )

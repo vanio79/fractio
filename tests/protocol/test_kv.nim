@@ -17,13 +17,13 @@ import fractio/protocol/mvcc_store
 import fractio/protocol/txn_manager
 import fractio/protocol/raft_store
 import fractio/distributed/raft/nuraft_coordinator
-import fractio/distributed/raft/group_types as rangeTypes
+import fractio/distributed/raft/group_types
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/meta/system_tables
 import fractio/distributed/sharedtimer/mock
 import fractio/distributed/sharedtimer/types as timerTypes
 import fractio/core/timestamp_provider
-import fractio/core/types as coreTypes
+import fractio/core/types as coreTypes except NodeID
 
 # ---------------------------------------------------------------------------
 # Helpers (mirrors test_core.nim conventions)
@@ -47,7 +47,7 @@ proc startTestServer(port: int): ProtocolServer =
   try: removeDir(storagePath) except CatchableError: discard
   createDir(storagePath)
 
-  let nodeId = rangeTypes.NodeID(1)
+  let nodeId = NodeID(1)
   let raftPort = nextRaftPort()
   let members = @[(nodeId: 1'u32, host: "127.0.0.1", port: raftPort)]
 

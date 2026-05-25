@@ -7,8 +7,8 @@
 import std/[unittest, os, options, tables]
 import fractio/protocol/raft_store
 import fractio/distributed/raft/nuraft_coordinator
-import fractio/distributed/raft/group_types as rangeTypes
-import fractio/core/types as coreTypes
+import fractio/distributed/raft/group_types
+import fractio/core/types as coreTypes except NodeID
 import fractio/distributed/meta/system_tables
 import fractio/distributed/meta/system_schemas
 import fractio/storage/wisckey_backend
@@ -37,7 +37,7 @@ proc makeMultiGroupStore(storagePath: string, groupCount: int): tuple[
   ## Create a store with `groupCount` Raft groups (ranges 10..10+N-1).
   ## Returns a SpaceInfo whose groupIds point to those groups.
   cleanDir(storagePath)
-  let nodeId = rangeTypes.NodeID(1)
+  let nodeId = NodeID(1)
   let port = nextBasePort()
   let members = @[(nodeId: 1'u32, host: "127.0.0.1", port: port)]
 

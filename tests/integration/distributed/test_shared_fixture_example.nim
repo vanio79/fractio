@@ -12,7 +12,7 @@ import std/options
 import ../../test_config
 import ../../test_cluster_helper
 import fractio/distributed/meta/system_tables
-import fractio/distributed/raft/group_types as rangeTypes
+import fractio/distributed/raft/group_types 
 
 # Create a shared fixture with a unique port offset
 var fixture = newSharedClusterFixture(defaultTestClusterConfig())

@@ -28,12 +28,12 @@ import fractio/protocol/messages/kv
 import fractio/protocol/messages/txn as txnMsgs
 import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
-import fractio/distributed/raft/group_types as rangeTypes
+import fractio/distributed/raft/group_types
 import fractio/distributed/meta/system_tables
 import fractio/distributed/sharedtimer/mock
 import fractio/distributed/sharedtimer/types as timerTypes
 import fractio/core/timestamp_provider
-import fractio/core/types as coreTypes
+import fractio/core/types as coreTypes except NodeID
 import fractio/storage/wisckey_backend
 
 # ---------------------------------------------------------------------------
@@ -53,7 +53,7 @@ proc nextBasePort(): int =
 proc makeStore(storagePath: string): tuple[
     coord: NuRaftCoordinator, store: RaftKVStoreExt, rid: GroupID] =
   cleanDir(storagePath)
-  let nodeId = rangeTypes.NodeID(1)
+  let nodeId = NodeID(1)
   let port = nextBasePort()
   let members = @[(nodeId: 1'u32, host: "127.0.0.1", port: port)]
 
@@ -99,7 +99,7 @@ proc smGetVal(store: RaftKVStoreExt, rid: GroupID, key: string): string =
   ""
 
 proc makeRaftServer(port: int, storagePath: string): ProtocolServer =
-  let nodeId = rangeTypes.NodeID(1)
+  let nodeId = NodeID(1)
   let raftPort = nextBasePort()
   let members = @[(nodeId: 1'u32, host: "127.0.0.1", port: raftPort)]
 

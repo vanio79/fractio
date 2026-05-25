@@ -1,21 +1,20 @@
-# Integration Tests for Multi-Group Raft Range Recovery
+# Integration Tests for Multi-Group Raft Group Recovery
 # 
-# These tests verify range recovery and log replay after failures.
+# These tests verify group recovery and log replay after failures.
 
 import std/[unittest, random, times, options, atomics]
 
 import fractio/distributed/raft/group_types
 import fractio/distributed/raft/multigroup_types
-import fractio/distributed/meta/types
 import fractio/distributed/meta/system_tables
 
-type RangeRecoveryStats* = object of RootObj
-  rangesTested: int64
+type GroupRecoveryStats* = object of RootObj
+  groupsTested: int64
   successfulRecoveries: int64
   logReplayFailures: int64
   inconsistentStates: int64
 
-suite "RangeRecovery":
+suite "GroupRecovery":
   let rng = initRand(456)
 
   test "create groups for recovery testing":
@@ -43,9 +42,9 @@ suite "RangeRecovery":
     for g in groups:
       g.close()
 
-  test "simulate range failure and recovery":
-    var stats = RangeRecoveryStats(
-      rangesTested: 0,
+  test "simulate group failure and recovery":
+    var stats = GroupRecoveryStats(
+      groupsTested: 0,
       successfulRecoveries: 0,
       logReplayFailures: 0,
       inconsistentStates: 0
@@ -66,7 +65,7 @@ suite "RangeRecovery":
       desc
     )
 
-    stats.rangesTested.inc
+    stats.groupsTested.inc
 
     # Simulate operations and leader election
     group.becomeLeader()
@@ -85,12 +84,12 @@ suite "RangeRecovery":
 
     group.close()
 
-    check stats.rangesTested == 1
+    check stats.groupsTested == 1
     check stats.successfulRecoveries == 1
 
   test "log replay after crash simulation":
-    var stats = RangeRecoveryStats(
-      rangesTested: 0,
+    var stats = GroupRecoveryStats(
+      groupsTested: 0,
       successfulRecoveries: 0,
       logReplayFailures: 0,
       inconsistentStates: 0
@@ -114,7 +113,7 @@ suite "RangeRecovery":
         desc
       )
       groups.add(group)
-      stats.rangesTested.inc
+      stats.groupsTested.inc
 
       # Elect leader
       group.becomeLeader()
@@ -124,7 +123,7 @@ suite "RangeRecovery":
       if g.isLeader():
         stats.successfulRecoveries.inc
 
-    check stats.rangesTested == 4
+    check stats.groupsTested == 4
     check stats.successfulRecoveries == 4
 
     # Simulate crash and recovery for some groups
@@ -142,7 +141,7 @@ suite "RangeRecovery":
     for g in groups:
       g.close()
 
-  test "range metadata consistency":
+  test "group metadata consistency":
     let desc = newGroupDescriptor(
       META_GROUP_ID
     )
@@ -159,7 +158,7 @@ suite "RangeRecovery":
     check desc.groupId == META_GROUP_ID
     check desc.isInitialized()
 
-  test "multiple range recovery scenarios":
+  test "multiple group recovery scenarios":
     var recoveryCounts = 0
     var groups: seq[RaftGroup]
 
@@ -203,8 +202,8 @@ suite "RangeRecovery":
       g.close()
 
   test "recovery stats tracking":
-    var stats = RangeRecoveryStats(
-      rangesTested: 0,
+    var stats = GroupRecoveryStats(
+      groupsTested: 0,
       successfulRecoveries: 0,
       logReplayFailures: 0,
       inconsistentStates: 0
@@ -212,7 +211,7 @@ suite "RangeRecovery":
 
     # Simulate various recovery scenarios
     for i in 0..9:
-      stats.rangesTested.inc
+      stats.groupsTested.inc
 
       let desc = newGroupDescriptor(
         groupIDFromInt(i)
@@ -234,13 +233,13 @@ suite "RangeRecovery":
 
       group.close()
 
-    check stats.rangesTested == 10
+    check stats.groupsTested == 10
     check stats.successfulRecoveries == 10
     check stats.logReplayFailures == 0
     check stats.inconsistentStates == 0
 
   test "concurrent recovery simulation":
-    # Simulate multiple ranges recovering concurrently
+    # Simulate multiple groups recovering concurrently
     var groups: seq[RaftGroup]
 
     for i in 0..7:

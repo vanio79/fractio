@@ -52,9 +52,9 @@ type
       writeBatch*: WriteBatch
     of ckSplit:
       splitKey*: seq[byte]
-      newRangeId*: GroupID
+      newGroupId*: GroupID
     of ckMerge:
-      otherRangeId*: GroupID
+      otherGroupId*: GroupID
     of ckChangeReplicas:
       changeType*: ReplicaChangeType
       replica*: ReplicaDescriptor

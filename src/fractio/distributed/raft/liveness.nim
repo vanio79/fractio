@@ -43,7 +43,7 @@ type
     ## Mode of store liveness operation
     slmFollower  # Not participating in liveness (passive)
     slmCandidate # Trying to become liveness leader
-    slmLeader    # Liveness leader for a range
+    slmLeader    # Liveness leader for a group
 
   SupportState* = enum
     ## Support state for a store
@@ -274,7 +274,7 @@ proc hasQuorumSupport*(sl: StoreLiveness, nodes: seq[NodeID]): bool =
   result = supported >= quorumSize
 
 proc canAcquireLease*(sl: StoreLiveness, voters: seq[ReplicaDescriptor]): bool =
-  ## Check if we can acquire a lease for a range.
+  ## Check if we can acquire a lease for a group.
   ## We need support from a quorum of voters.
   var voterNodes: seq[NodeID]
   for rep in voters:

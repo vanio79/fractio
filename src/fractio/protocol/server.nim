@@ -35,14 +35,13 @@ import ./txn_manager
 import ./raft_store
 import ./mvcc_store
 import ./cluster_state_binary
-import ../core/types
+import ../core/types except NodeID
 import ../utils/logging
 import ../utils/socket_utils
 import ../distributed/sharedtimer
 import ../distributed/raft/nuraft_coordinator
 import ../distributed/raft/multigroup_types
 import ../distributed/raft/group_types
-import ../distributed/raft/group_types as rangeTypes
 import ../distributed/sharedtimer/udptransport as udpXport
 import ../distributed/meta/system_tables
 import ../distributed/meta/system_schemas
@@ -2468,7 +2467,7 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
   ## startAsLeader: when true and no peers, this is a fresh single-node cluster.
   ## When false (joining mode), groups are created later via addPeerToRaft.
 
-  let nodeId = rangeTypes.NodeID(uint32(server.config.serverId))
+  let nodeId = NodeID(uint32(server.config.serverId))
   let raftDir = server.config.dataDir / "raft"
 
   createDir(raftDir)

@@ -31,12 +31,12 @@
 
 import std/[tables, locks, options, algorithm, atomics, strformat,
     strutils, json, hashes, os]
-import fractio/core/types
+import fractio/core/types except NodeID
 import fractio/core/timestamp_provider
 import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/c_bindings
 import fractio/distributed/raft/multigroup_types
-import fractio/distributed/raft/group_types as rangeTypes
+import fractio/distributed/raft/group_types
 import fractio/distributed/raft/state_machine
 import fractio/distributed/meta/system_tables
 import fractio/distributed/meta/system_schemas
@@ -49,8 +49,8 @@ import fractio/protocol/messages/kv
 import fractio/protocol/messages/cluster as clusterMsgs
 import ../utils/logging
 
-# Import NodeID from group_types since that's what the coordinator uses
-proc toNodeID*(id: uint32): rangeTypes.NodeID {.inline.} = rangeTypes.NodeID(id)
+# NodeID comes from core/types; group_types' NodeID is excluded to avoid ambiguity
+proc toNodeID*(id: uint32): NodeID {.inline.} = NodeID(id)
 
 # ---------------------------------------------------------------------------
 # ULID derivation helper for deterministic group IDs
@@ -979,13 +979,13 @@ proc wireApplyCallback*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
 
     nuraft_coordinator.getPreferredLeaderCallback = proc(
         storePtr: pointer,
-        groupId: GroupID): Option[rangeTypes.NodeID] {.gcsafe, raises: [].} =
+        groupId: GroupID): Option[NodeID] {.gcsafe, raises: [].} =
       let s = cast[RaftKVStoreExt](storePtr)
       let pl = s.preferredLeaders.getOrDefault(groupId, 0'u32)
       if pl > 0:
-        result = some(rangeTypes.NodeID(pl))
+        result = some(NodeID(pl))
       else:
-        result = none(rangeTypes.NodeID)
+        result = none(NodeID)
 
     nuraft_coordinator.onGroupMetadataApplied = proc(
         storePtr: pointer,
@@ -1043,7 +1043,7 @@ proc wireApplyCallback*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
     # --- Leader tracking and persistence ---
     nuraft_coordinator.onLeaderChanged = proc(
         storePtr: pointer, groupId: GroupID,
-        leaderNodeId: rangeTypes.NodeID) {.gcsafe, raises: [].} =
+        leaderNodeId: NodeID) {.gcsafe, raises: [].} =
       ## Called when a node wins an election. Updates the in-memory
       ## groupLeaders table and queues async persistence to sys.groups.
       ## IMPORTANT: This callback runs from the Raft thread. We cannot

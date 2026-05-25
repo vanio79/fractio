@@ -6,7 +6,6 @@ import std/[unittest, random, times, options, atomics]
 
 import fractio/distributed/raft/group_types
 import fractio/distributed/raft/multigroup_types
-import fractio/distributed/meta/types
 import fractio/distributed/meta/system_tables
 
 type NodeRecoveryStats* = object of RootObj
@@ -18,10 +17,10 @@ type NodeRecoveryStats* = object of RootObj
 suite "NodeRecovery":
   let rng = initRand(789)
 
-  test "create node with multiple ranges":
+  test "create node with multiple groups":
     var groups: seq[RaftGroup]
 
-    # Simulate a node with 10 ranges
+    # Simulate a node with 10 groups
     for i in 0..9:
       let desc = newGroupDescriptor(
         groupIDFromInt(i)
@@ -52,7 +51,7 @@ suite "NodeRecovery":
       leaderFailures: 0
     )
 
-    # Create a group (simulating one range on a node)
+    # Create a group (simulating one group on a node)
     let desc = newGroupDescriptor(
       META_GROUP_ID
     )

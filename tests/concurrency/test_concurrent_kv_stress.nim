@@ -25,7 +25,7 @@ import fractio/protocol/messages/kv
 import fractio/protocol/messages/txn as txnMsgs
 import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
-import fractio/distributed/raft/group_types as rangeTypes
+import fractio/distributed/raft/group_types 
 import fractio/distributed/meta/system_tables
 
 # ---------------------------------------------------------------------------
