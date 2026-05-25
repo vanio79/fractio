@@ -252,6 +252,20 @@ type
     groupId*: GroupID
     leaderNodeId*: uint32
 
+  IntentScavengerStats* = object
+    ## Statistics for the intent scavenger background task.
+    intentsScanned*: int          ## Total intent keys scanned
+    orphanIntentsCleaned*: int    ## Orphaned intents removed
+    protocolIntentsScanned*: int  ## Protocol-layer (\x00INTENT\x00) intents scanned
+    mvccIntentsScanned*: int      ## MVCC-layer (\x00\x01 suffix) intents scanned
+    scanCount*: int              ## Number of scavenger sweeps completed
+    lastScanTimeNs*: int64        ## Timestamp of last completed scan
+
+  ActiveTxnChecker* = proc(txnId: TransactionID): bool {.
+      gcsafe, raises: [].}
+    ## Callback to check if a transaction is still active.
+    ## Set by the server after creating MvccTransactionStore.
+
   RaftKVStoreExt* = ref object of RaftKVStore
     stateMachines*: tables.Table[GroupID, KVStateMachine] ## lightweight index tracking only
     smMu*: Lock                              ## guards stateMachines table
@@ -274,6 +288,10 @@ type
     migrationWakeChan*: Channel[int]          ## Wake signal for instant shutdown / trigger
     stopped*: Atomic[bool] ## Set to true when stop() is called; prevents send() on closed channel
     tsProvider*: TimestampProvider ## cluster-wide HLC for MVCC timestamps
+    gcThread*: Thread[RaftKVStoreExt]        ## Background GC + intent scavenger thread
+    gcRunning*: Atomic[bool]                ## Flag to stop GC thread
+    scavengerStats*: IntentScavengerStats   ## Scavenger statistics (updated under groupMu)
+    activeTxnChecker*: ActiveTxnChecker     ## Callback to check if a txn is still active
 
 
 
@@ -294,6 +312,7 @@ proc newRaftKVStoreExt*(coord: NuRaftCoordinator,
   result.rebalRunning.store(false)
   result.triggerRebal.store(false)
   result.migrationRunning.store(false)
+  result.gcRunning.store(false)
   result.stopped.store(false)
   initLock(result.smMu)
   initLock(result.spacesMu)
@@ -301,6 +320,7 @@ proc newRaftKVStoreExt*(coord: NuRaftCoordinator,
   result.leaderPersistChan.open() # Initialize async channel for leader persistence
   result.migrationWakeChan.open() # Initialize wake channel for migration thread
   result.nextVersion.store(1)
+  result.activeTxnChecker = nil
 
 proc nowNs*(s: RaftKVStoreExt): int64 {.gcsafe, raises: [].} =
   if s.tsProvider != nil:
@@ -981,6 +1001,7 @@ proc processLeaderPersistReq*(s: RaftKVStoreExt,
 
 proc runRebalanceMigration*(store: RaftKVStoreExt,
     spaceId: SpaceID) {.raises: [].}  # forward declaration
+proc gcAndScavengeTask(s: RaftKVStoreExt) {.thread, gcsafe, raises: [].}  # forward declaration
 
 proc migrationMonitorTask(s: RaftKVStoreExt) {.thread, gcsafe, raises: [].} =
   ## Background thread that monitors spaces for pending rebalance migrations.
@@ -1273,6 +1294,7 @@ proc wireApplyCallback*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
   store.coordinator.kvStorePtr = cast[pointer](store)
   store.rebalRunning.store(true)
   store.migrationRunning.store(true)
+  store.gcRunning.store(true)
   try:
     createThread(store.rebalThread, rebalanceLeadershipTask, store)
   except CatchableError:
@@ -1281,6 +1303,204 @@ proc wireApplyCallback*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
     createThread(store.migrationThread, migrationMonitorTask, store)
   except CatchableError:
     store.migrationRunning.store(false)
+  try:
+    createThread(store.gcThread, gcAndScavengeTask, store)
+  except CatchableError:
+    store.gcRunning.store(false)
+
+proc setActiveTxnChecker*(store: RaftKVStoreExt,
+    checker: ActiveTxnChecker) {.gcsafe, raises: [].} =
+  ## Set the callback used to check if a transaction is still active.
+  ## The server wires this to MvccTransactionStore.hasActiveTransaction
+  ## after creating the MvccTransactionStore.
+  store.activeTxnChecker = checker
+
+# ---------------------------------------------------------------------------
+# Intent scavenger — cleanup orphaned intents from crashed/abandoned txns
+# ---------------------------------------------------------------------------
+# Intent key formats in storage:
+#   Protocol-layer: "\x00INTENT\x00" + txnId (8 bytes BE) + userKey
+#   MVCC-layer:     <userKey> + "\x00\x01" + txnId (16 bytes ULID)
+#
+# Orphaned intents happen when:
+#   1. Client disconnects before commit/rollback
+#   2. Server crashes mid-transaction
+#   3. Transaction times out but intent keys are not cleaned from storage
+#
+# Safety: We only remove intents whose transaction is older than
+# INTENT_SCAVENGE_AGE_NS to avoid removing intents for active transactions.
+
+const INTENT_SCAVENGE_AGE_NS* = 60_000_000_000'i64 ## 60 seconds (2x DEFAULT_TXN_TIMEOUT_MS)
+const GC_SCAN_INTERVAL_MS* = 30_000 ## Run GC + scavenger every 30 seconds
+
+proc scavengeOrphanedIntents*(store: RaftKVStoreExt): IntentScavengerStats {.
+    gcsafe, raises: [].} =
+  ## Scan all keys in the backend for orphaned intent keys and remove them.
+  ## An intent is orphaned if:
+  ##   1. Its transaction is not found in any active session, AND
+  ##   2. The intent is older than INTENT_SCAVENGE_AGE_NS
+  ##
+  ## This handles both protocol-layer intents ("\x00INTENT\x00" prefix)
+  ## and MVCC-layer intents ("\x00\x01" suffix with 16-byte ULID).
+  ##
+  ## Returns statistics about what was scanned and cleaned.
+  result = IntentScavengerStats()
+
+  let backend = store.getBackend()
+  if backend == nil or not backend.isOpen:
+    return
+
+  let nowNs = store.nowNs()
+  let cutoffNs = nowNs - INTENT_SCAVENGE_AGE_NS
+
+  var keysToDelete: seq[string] = @[]
+
+  {.cast(raises: []).}:
+    try:
+      var scanIter = backend.newIterator()
+      defer: destroyIter(scanIter)
+      discard scanIter.seekToFirst()
+
+      while scanIter.valid():
+        let key = scanIter.key()
+
+        # --- Protocol-layer intents: "\x00INTENT\x00<8-byte txnId><userKey>" ---
+        if isIntentKey(key):
+          result.protocolIntentsScanned += 1
+          result.intentsScanned += 1
+
+          # Read the MVCC-encoded value to get the timestamp
+          let valOpt = backend.get(key)
+          if valOpt.isSome:
+            let val = valOpt.get()
+            var intentTs: int64 = 0
+            if mvccTypes.isLikelyMVCCValue(val):
+              try:
+                let mvccVal = mvccTypes.decodeMVCCValueFast(val)
+                intentTs = mvccVal.timestamp
+              except:
+                discard
+
+            # Only clean if intent is old enough
+            if intentTs > 0 and intentTs < cutoffNs:
+              # Protocol-layer intents use 8-byte txnId which doesn't
+              # directly map to a ULID TransactionID. We don't have a
+              # reliable way to check if the transaction is active, so
+              # we rely on the age threshold alone. If the intent is
+              # older than INTENT_SCAVENGE_AGE_NS (60s = 2x the 30s
+              # default txn timeout), it's safe to remove.
+              keysToDelete.add(key)
+
+        # --- MVCC-layer intents: <userKey> + "\x00\x01" + 16-byte ULID txnId ---
+        elif key.len >= 18:
+          let suffixPos = key.len - 18
+          if key[suffixPos] == '\x00' and key[suffixPos + 1] == '\x01':
+            result.mvccIntentsScanned += 1
+            result.intentsScanned += 1
+
+            # Extract 16-byte ULID from end of key
+            let txnUlidBytes = key[suffixPos + 2 ..< key.len]
+            var txnId: TransactionID
+            try:
+              txnId = TransactionID(
+                ulidFromBytes(txnUlidBytes))
+            except:
+              discard scanIter.next()
+              continue
+
+            # Read the value to get the timestamp
+            let valOpt = backend.get(key)
+            if valOpt.isSome:
+              let val = valOpt.get()
+              var intentTs: int64 = 0
+              if mvccTypes.isLikelyMVCCValue(val):
+                try:
+                  let mvccVal = mvccTypes.decodeMVCCValueFast(val)
+                  intentTs = mvccVal.timestamp
+                except:
+                  discard
+
+              # Only clean if intent is old enough AND not for an active txn
+              if intentTs > 0 and intentTs < cutoffNs:
+                # Check if the transaction is still active via the callback
+                var isActive = false
+                if store.activeTxnChecker != nil:
+                  try:
+                    isActive = store.activeTxnChecker(txnId)
+                  except:
+                    discard
+
+                if not isActive:
+                  keysToDelete.add(key)
+
+        discard scanIter.next()
+    except:
+      discard
+
+  # Delete orphaned intents (batch for efficiency)
+  if keysToDelete.len > 0:
+    {.cast(raises: []).}:
+      try:
+        discard backend.writeBatchNoSync(@[], keysToDelete)
+        result.orphanIntentsCleaned = keysToDelete.len
+      except:
+        discard
+
+  result.scanCount = 1
+  result.lastScanTimeNs = nowNs
+
+proc getScavengerStats*(store: RaftKVStoreExt): IntentScavengerStats {.
+    gcsafe, raises: [].} =
+  ## Get the current intent scavenger statistics.
+  withLock store.groupMu:
+    result = store.scavengerStats
+
+proc gcAndScavengeTask(s: RaftKVStoreExt) {.thread, gcsafe, raises: [].} =
+  ## Background thread that periodically:
+  ##   1. Scavenges orphaned intent keys from the backend
+  ##   2. (Future: runs MVCC version garbage collection)
+  ##
+  ## Uses a simple sleep loop with gcRunning flag for clean shutdown.
+  while s.gcRunning.load():
+    # Sleep for the scan interval in 100ms increments for responsive shutdown
+    let startMs = getTime().toUnixFloat() * 1000.0
+    while s.gcRunning.load():
+      let elapsed = int((getTime().toUnixFloat() * 1000.0) - startMs)
+      if elapsed >= GC_SCAN_INTERVAL_MS:
+        break
+      sleep(100)
+
+    if not s.gcRunning.load():
+      break
+
+    # Check if coordinator is still running
+    if s.coordinator.isNil or not s.coordinator.running.load():
+      break
+
+    # Run intent scavenger
+    {.cast(gcsafe).}:
+      {.cast(raises: []).}:
+        try:
+          let stats = s.scavengeOrphanedIntents()
+          withLock s.groupMu:
+            s.scavengerStats.intentsScanned += stats.intentsScanned
+            s.scavengerStats.orphanIntentsCleaned += stats.orphanIntentsCleaned
+            s.scavengerStats.protocolIntentsScanned += stats.protocolIntentsScanned
+            s.scavengerStats.mvccIntentsScanned += stats.mvccIntentsScanned
+            s.scavengerStats.scanCount += stats.scanCount
+            s.scavengerStats.lastScanTimeNs = stats.lastScanTimeNs
+
+          if stats.orphanIntentsCleaned > 0:
+            {.cast(gcsafe).}:
+              {.cast(raises: []).}:
+                info("GC: cleaned orphaned intents", {
+                  "cleaned": $stats.orphanIntentsCleaned,
+                  "scanned": $stats.intentsScanned,
+                  "protocolIntents": $stats.protocolIntentsScanned,
+                  "mvccIntents": $stats.mvccIntentsScanned
+                }.toTable)
+        except:
+          discard
 
 proc bootstrapStore*(store: RaftKVStoreExt,
     groupIds: seq[GroupID]) {.gcsafe, raises: [].} =
@@ -1291,11 +1511,22 @@ proc bootstrapStore*(store: RaftKVStoreExt,
   store.wireApplyCallback()
 
 proc stop*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
-  ## Stop the rebalancing and migration threads and clean up resources.
+  ## Stop the rebalancing, migration, and GC threads and clean up resources.
   ## Must be called before coordinator.stop() to ensure clean shutdown.
   # Set stopped flag FIRST to prevent onLeaderChanged callbacks from
   # sending to leaderPersistChan after we start shutting down.
   store.stopped.store(true)
+
+  # Stop GC + intent scavenger thread first (lightweight, no wake channel needed)
+  if store.gcRunning.load():
+    store.gcRunning.store(false)
+    # Wait for GC thread to finish (with timeout)
+    for _ in 0 ..< 30: # 3 seconds max
+      try:
+        joinThread(store.gcThread)
+        break
+      except:
+        sleep(100)
 
   if store.migrationRunning.load():
     store.migrationRunning.store(false)

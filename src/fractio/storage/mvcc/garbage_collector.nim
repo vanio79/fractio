@@ -203,8 +203,9 @@ proc collectVersionsForKey*(gc: GarbageCollector,
         collectedCount += 1
         collectedBytes += mvccKey.len + version.value.data.len
 
-        # Also collect intent if exists
-        let intentKey = encodeMVCCKey(userKey, version.value.timestamp, true)
+        # Also collect intent if exists for this version's transaction.
+        # Intent key format: <userKey>\x00\x01<16-byte ULID txnId>
+        let intentKey = makeIntentKey(userKey, version.value.txnId)
         if backend.exists(intentKey):
           discard deleteKey(backend, intentKey)
           collectedBytes += intentKey.len
@@ -223,8 +224,8 @@ proc collectVersionsForKey*(gc: GarbageCollector,
             collectedCount += 1
             collectedBytes += mvccKey.len + oldVersion.value.data.len
 
-            # Collect intent if exists
-            let intentKey = encodeMVCCKey(userKey, oldVersion.value.timestamp, true)
+            # Collect intent if exists for this version's transaction
+            let intentKey = makeIntentKey(userKey, oldVersion.value.txnId)
             if backend.exists(intentKey):
               discard deleteKey(backend, intentKey)
               collectedBytes += intentKey.len
@@ -515,14 +516,14 @@ when isMainModule:
 
       let version = MVCCValue(
         data: "test",
-        timestamp: Timestamp(1000),
+        timestamp: Timestamp(1_000_000_000),             # 1 second in ns
         isDeleted: false,
-        txnId: TransactionID(1)
+        txnId: zeroTransactionID()
       )
 
-      let currentTime = Timestamp(100000) # 100 seconds later
+      let currentTime = Timestamp(120_000_000_000) # 120 seconds in ns
 
-      # Version is 99 seconds old, which is > 60 seconds max age
+      # Version is ~119 seconds old, which is > 60 seconds max age
       check gc.shouldCollectVersion("key1", version, currentTime) == true
 
     test "should not collect recent version":
@@ -540,24 +541,24 @@ when isMainModule:
 
       let version = MVCCValue(
         data: "test",
-        timestamp: Timestamp(1000),
+        timestamp: Timestamp(1_000_000_000),             # 1 second in ns
         isDeleted: false,
-        txnId: TransactionID(1)
+        txnId: zeroTransactionID()
       )
 
-      let currentTime = Timestamp(50000) # 50 seconds later
+      let currentTime = Timestamp(10_000_000_000) # 10 seconds in ns
 
-      # Version is 49 seconds old, which is < 60 seconds max age
+      # Version is ~9 seconds old, which is < 60 seconds max age
       check gc.shouldCollectVersion("key1", version, currentTime) == false
 
     test "should collect version before min timestamp":
       let gc = GarbageCollector(
         policy: GCPolicy(
-          minTimestamp: Timestamp(50000),
-          maxVersionsPerKey: 10,
-          maxAgeMs: 60000,
-          collectIntervalMs: 60000
-        ),
+          minTimestamp: Timestamp(50_000_000_000), # 50 seconds in ns
+        maxVersionsPerKey: 10,
+        maxAgeMs: 60000,
+        collectIntervalMs: 60000
+      ),
         running: Atomic[bool](),
         stats: GCStats(),
         logger: nil
@@ -565,14 +566,14 @@ when isMainModule:
 
       let version = MVCCValue(
         data: "test",
-        timestamp: Timestamp(1000),
+        timestamp: Timestamp(1_000_000_000),             # 1 second in ns
         isDeleted: false,
-        txnId: TransactionID(1)
+        txnId: zeroTransactionID()
       )
 
-      let currentTime = Timestamp(100000)
+      let currentTime = Timestamp(100_000_000_000) # 100 seconds in ns
 
-      # Version timestamp (1000) < min timestamp (50000)
+      # Version timestamp (1s) < min timestamp (50s)
       check gc.shouldCollectVersion("key1", version, currentTime) == true
 
     test "GC stats comparison":
