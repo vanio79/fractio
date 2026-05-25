@@ -33,6 +33,7 @@ import ./client
 import ./messages/space as spaceMsgs
 import ./txn_manager
 import ./raft_store
+import ./sys_table_txn
 import ./mvcc_store
 import ./cluster_state_binary
 import ../core/types except NodeID
@@ -2431,29 +2432,42 @@ proc addPeerToRaft*(server: ProtocolServer, peerNodeId: uint32,
           webPort: uint16(webPort),
           status: nsAlive
         )
-        discard raftStore.sysTablePut(nodeKey, encode(nodeRec))
 
+        # Use MicroTransaction for atomic node join:
+        # write node record + update group replicas in a single Raft proposal
         try:
+          let txn = raftStore.beginSysTxn()
+          txn.put(nodeKey, encode(nodeRec))
+
           for groupId in [META_GROUP_ID, DATA_GROUP_START_ID]:
             let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupId)
             let valOpt = backend.get(groupKey)
             if valOpt.isSome:
               let (payload, isDeleted) = stripMVCCHeader(valOpt.get)
-              if isDeleted or payload.len == 0:
-                continue
-              let currentRec = decodeGroupRecord(payload)
-              var alreadyExists = false
-              for rep in currentRec.replicas:
-                if rep.nodeId == peerNodeId:
-                  alreadyExists = true
-                  break
-              if not alreadyExists:
-                var updatedRec = currentRec
-                updatedRec.replicas.add(GroupReplicaBin(
-                  nodeId: peerNodeId,
-                  replicaType: rtVoter
-                ))
-                discard raftStore.sysTablePut(groupKey, encode(updatedRec))
+              if not isDeleted and payload.len > 0:
+                let currentRec = decodeGroupRecord(payload)
+                var alreadyExists = false
+                for rep in currentRec.replicas:
+                  if rep.nodeId == peerNodeId:
+                    alreadyExists = true
+                    break
+                if not alreadyExists:
+                  var updatedRec = currentRec
+                  updatedRec.replicas.add(GroupReplicaBin(
+                    nodeId: peerNodeId,
+                    replicaType: rtVoter
+                  ))
+                  txn.put(groupKey, encode(updatedRec))
+
+          let result = txn.commit()
+          if not result.isOk:
+            try:
+              {.cast(gcsafe).}:
+                var fields = initTable[string, string]()
+                fields["error"] = $result.error
+                error("Failed to commit node join transaction", fields)
+            except CatchableError:
+              discard
         except CatchableError:
           discard
 

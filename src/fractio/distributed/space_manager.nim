@@ -27,6 +27,7 @@
 
 import std/[tables, options, os, times, sequtils, strutils]
 import ../protocol/raft_store
+import ../protocol/sys_table_txn
 import ../protocol/messages/space
 import ../protocol/messages/cluster as clusterMsgs
 import ../protocol/client
@@ -368,29 +369,21 @@ proc createSpace*(sm: SpaceManager, req: CreateSpaceRequest): CreateSpaceRespons
     timedLog(safeFmt("Creating space '$#' with $# groups, replicas=$#",
         req.name, $groupCount, $replicas))
 
-    # 6. Write group records to sys.groups via Raft
+    # 6. Write group records to sys.groups via MicroTransaction (atomic)
     var groupWrites: seq[tuple[key: string, value: string]] = @[]
     for gr in groupRecs:
       let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gr.groupId)
       let value = encode(gr)
       groupWrites.add((key: key, value: value))
 
-    # Write each group record with MVCC encoding
-    timedLog(safeFmt("writing $# group records", $groupWrites.len))
-    var writeIdx = 0
-    for (key, value) in groupWrites:
-      writeIdx += 1
-      timedLog(safeFmt("writing group record $#", $writeIdx))
-      let ts = sm.nowNs()
-      let encoded = mvccTypes.encodeMVCCValue(value, ts, false)
-      timedLog(safeFmt("calling raftPut for group record $#", $writeIdx))
-      let res = sm.store.raftPut(key, encoded)
-      timedLog(safeFmt("raftPut returned for group record $#", $writeIdx))
-      if not res.isOk:
-        return CreateSpaceResponse(
-          success: false,
-          error: safeFmt("failed to write group record to Raft: $#", $res.error)
-        )
+    # Write all group records atomically via MicroTransaction
+    timedLog(safeFmt("writing $# group records atomically", $groupWrites.len))
+    let groupResult = sm.store.sysTxnPutBatch(groupWrites)
+    if not groupResult.isOk:
+      return CreateSpaceResponse(
+        success: false,
+        error: safeFmt("failed to write group records to Raft: $#", $groupResult.error)
+      )
     timedLog("group records written")
 
 # 7. Send directed CreateGroup/JoinGroup RPCs to create Raft groups
@@ -541,8 +534,8 @@ proc createSpace*(sm: SpaceManager, req: CreateSpaceRequest): CreateSpaceRespons
     let spaceKey = encodeTableKey(SYS_SPACES_TABLE_ID, $spaceId)
     let spaceValue = encode(spaceRec)
 
-    if not sm.store.sysTablePut(spaceKey, spaceValue):
-      sm.logError("createSpace: sysTablePut failed")
+    if not sm.store.sysTablePutV2(spaceKey, spaceValue):
+      sm.logError("createSpace: sysTablePutV2 failed")
       return CreateSpaceResponse(
         success: false,
         error: "failed to write space record to Raft"
@@ -614,23 +607,20 @@ proc dropSpace*(sm: SpaceManager, req: DropSpaceRequest): DropSpaceResponse {.gc
 
     # 4. Mark space record as deleted
     let spaceKey = encodeTableKey(SYS_SPACES_TABLE_ID, $spaceId)
-    if not sm.store.sysTableDeleteBatch(@[spaceKey]):
-      return DropSpaceResponse(
-        success: false,
-        error: "failed to delete space record"
-      )
-
-    # 5. Mark all group records as deleted
+    # 4+5. Delete space record and all group records atomically via MicroTransaction
     var groupKeys: seq[string] = @[]
     for gid in space.groupIds:
       groupKeys.add(encodeTableKey(SYS_GROUPS_TABLE_ID, $gid))
 
-    if groupKeys.len > 0:
-      if not sm.store.sysTableDeleteBatch(groupKeys):
-        sm.logError(safeFmt("Failed to delete some group records for space $#", $spaceId))
-        # Continue anyway - space record is deleted
+    let allKeys = concat(@[spaceKey], groupKeys)
+    let delResult = sm.store.sysTxnDeleteBatch(allKeys)
+    if not delResult.isOk:
+      return DropSpaceResponse(
+        success: false,
+        error: safeFmt("failed to delete space/group records: $#", $delResult.error)
+      )
 
-    sm.logInfo(safeFmt("Deleted space '$#' and $# groups", req.name,
+    sm.logInfo(safeFmt("Deleted space '$#' and $# groups atomically", req.name,
         $space.groupIds.len))
 
     # 6. Build response - GroupIDs are used directly

@@ -84,7 +84,7 @@ type
     msg*: string
     leaderHint*: uint32 ## nodeId of the known leader (for rseNotLeader)
 
-proc newRSE(kind: RaftStoreErrorKind, msg: string,
+proc newRSE*(kind: RaftStoreErrorKind, msg: string,
     hint: uint32 = 0): RaftStoreError =
   RaftStoreError(kind: kind, msg: msg, leaderHint: hint)
 
@@ -562,7 +562,7 @@ proc loadGroupMembers*(store: RaftKVStoreExt,
 # ---------------------------------------------------------------------------
 
 # Helper: string → seq[byte] (zero-copy via cast)
-proc toBytes(s: string): seq[byte] {.inline.} =
+proc toBytes*(s: string): seq[byte] {.inline.} =
   when nimvm:
     result = newSeq[byte](s.len)
     for i in 0 ..< s.len:
@@ -574,7 +574,7 @@ proc toBytes(s: string): seq[byte] {.inline.} =
       result = cast[seq[byte]](s)
 
 # Helper: seq[byte] → string (zero-copy via cast)
-proc fromBytes(b: seq[byte]): string {.inline.} =
+proc fromBytes*(b: seq[byte]): string {.inline.} =
   when nimvm:
     result = newString(b.len)
     for i in 0 ..< b.len:
@@ -596,10 +596,24 @@ proc loadSpaces*(store: RaftKVStoreExt) {.gcsafe, raises: [].}
 proc loadTableSpaces*(store: RaftKVStoreExt) {.gcsafe, raises: [].}
 proc proposeWrite(store: RaftKVStoreExt, groupId: GroupID,
     batch: WriteBatch): RSVoidResult {.gcsafe, raises: [].}
+proc proposeSysBatch*(store: RaftKVStoreExt, batch: WriteBatch): RSVoidResult {.
+    gcsafe, raises: [].}
 proc updateSpaceCache*(store: RaftKVStoreExt, spaceKey: string,
     jsonStr: string) {.gcsafe, raises: [].}
 proc updateTableSpaceCache*(store: RaftKVStoreExt, tableKey: string,
     jsonStr: string) {.gcsafe, raises: [].}
+
+# ---------------------------------------------------------------------------
+# Public batch proposal for MicroTransaction (sys_table_txn.nim)
+# ---------------------------------------------------------------------------
+
+proc proposeSysBatch*(store: RaftKVStoreExt, batch: WriteBatch): RSVoidResult {.
+    gcsafe, raises: [].} =
+  ## Propose a WriteBatch on the meta group (group 1) for system table
+  ## mutations.  This is the public entry point used by MicroTransaction.
+  ## All system tables live on the meta group, so this always targets
+  ## META_GROUP_ID.
+  store.proposeWrite(META_GROUP_ID, batch)
 
 # ---------------------------------------------------------------------------
 # System table write helpers with MVCC encoding
