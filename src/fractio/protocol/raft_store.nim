@@ -616,98 +616,184 @@ proc proposeSysBatch*(store: RaftKVStoreExt, batch: WriteBatch): RSVoidResult {.
   store.proposeWrite(META_GROUP_ID, batch)
 
 # ---------------------------------------------------------------------------
-# System table write helpers with MVCC encoding
+# MicroTransaction — Atomic System Table Updates
 # ---------------------------------------------------------------------------
-# ALL sys table writes use MVCC encoding for consistency. This ensures:
-# 1. Consistent decoding in load* functions
-# 2. Timestamp tracking for all metadata changes
-# 3. Future support for point-in-time queries on sys tables
+# A MicroTransaction bundles puts and deletes into a single Raft WriteBatch
+# that is committed atomically. All puts share the same MVCC timestamp.
+# On failure, none of the mutations are applied (unlike the old
+# sysTablePutBatch which committed keys one-by-one with no rollback).
+#
+# Usage:
+#   let txn = store.beginSysTxn()
+#   txn.put(encodeTableKey(SYS_NODES_TABLE_ID, "1"), encode(nodeRec))
+#   txn.putSysRow(SYS_GROUPS_TABLE_ID, $groupId, encode(groupRec))
+#   txn.deleteSysRow(SYS_SPACES_TABLE_ID, oldSpaceKey)
+#   let result = txn.commit()
+#   if not result.isOk:
+#     # Handle error — none of the writes were applied
 
-proc sysTablePut*(store: RaftKVStoreExt, key: string, value: string): bool {.
+type
+  SysTxnOpKind* = enum
+    stokPut    ## Insert or update a system table row
+    stokDelete ## Delete a system table row
+
+  SysTxnOp* = object
+    ## A single operation within a MicroTransaction.
+    case kind*: SysTxnOpKind
+    of stokPut:
+      key*: string       ## Full key (e.g., /t/<tableId>/<primaryKey>)
+      value*: string     ## Raw value (will be MVCC-encoded on commit)
+    of stokDelete:
+      deleteKey*: string ## Full key to delete
+
+  SysTxnResult* = object
+    ## Result of a MicroTransaction commit.
+    case isOk*: bool
+    of true:
+      opsCommitted*: int  ## Number of operations committed
+      timestampNs*: int64 ## Shared MVCC timestamp of the commit
+    of false:
+      error*: RaftStoreError
+
+  MicroTransaction* = ref object
+    ## A transactional bundle of system table mutations.
+    ## All operations are committed atomically via a single Raft proposal.
+    store*: RaftKVStoreExt ## The RaftKVStoreExt that owns this transaction
+    ops*: seq[SysTxnOp]    ## Pending operations
+    committed*: bool       ## True after commit() has been called
+
+proc beginSysTxn*(store: RaftKVStoreExt): MicroTransaction {.gcsafe, raises: [].} =
+  ## Begin a new MicroTransaction for system table updates.
+  new(result)
+  result.store = store
+  result.ops = @[]
+  result.committed = false
+
+proc put*(txn: MicroTransaction, key, value: string) {.gcsafe, raises: [].} =
+  ## Add a put operation to the transaction.
+  if txn.committed:
+    return
+  txn.ops.add(SysTxnOp(kind: stokPut, key: key, value: value))
+
+proc delete*(txn: MicroTransaction, key: string) {.gcsafe, raises: [].} =
+  ## Add a delete operation to the transaction.
+  if txn.committed:
+    return
+  txn.ops.add(SysTxnOp(kind: stokDelete, deleteKey: key))
+
+proc putSysRow*(txn: MicroTransaction, tableId: TableId, primaryKey: string,
+    value: string) {.gcsafe, raises: [].} =
+  ## Add a put for a system table row using the standard key encoding.
+  txn.put(encodeTableKey(tableId, primaryKey), value)
+
+proc deleteSysRow*(txn: MicroTransaction, tableId: TableId,
+    primaryKey: string) {.gcsafe, raises: [].} =
+  ## Add a delete for a system table row using the standard key encoding.
+  txn.delete(encodeTableKey(tableId, primaryKey))
+
+proc commit*(txn: MicroTransaction): SysTxnResult {.gcsafe, raises: [].} =
+  ## Commit all pending operations as a single Raft proposal.
+  if txn.committed:
+    return SysTxnResult(isOk: false,
+      error: newRSE(rseInternal, "MicroTransaction already committed"))
+
+  if txn.ops.len == 0:
+    txn.committed = true
+    return SysTxnResult(isOk: true, opsCommitted: 0,
+      timestampNs: txn.store.nowNs())
+
+  let ts = txn.store.nowNs()
+  let batch = newWriteBatch()
+  for op in txn.ops:
+    case op.kind
+    of stokPut:
+      let encoded = mvccTypes.encodeMVCCValue(op.value, ts, false)
+      batch.put(toBytes(op.key), toBytes(encoded))
+    of stokDelete:
+      batch.delete(toBytes(op.deleteKey))
+
+  let vr = txn.store.proposeSysBatch(batch)
+  txn.committed = true
+
+  if not vr.isOk:
+    return SysTxnResult(isOk: false, error: vr.error)
+
+  return SysTxnResult(isOk: true, opsCommitted: txn.ops.len,
+    timestampNs: ts)
+
+# ---------------------------------------------------------------------------
+# Convenience: One-shot operations
+# ---------------------------------------------------------------------------
+
+proc sysTxnPut*(store: RaftKVStoreExt, key, value: string): SysTxnResult {.
     gcsafe, raises: [].} =
-  ## Write to a sys table with MVCC encoding.
-  ## ALWAYS encodes the value with MVCC header for consistency.
+  let txn = store.beginSysTxn()
+  txn.put(key, value)
+  txn.commit()
+
+proc sysTxnPutBatch*(store: RaftKVStoreExt,
+    writes: openArray[tuple[key: string, value: string]]): SysTxnResult {.
+    gcsafe, raises: [].} =
+  let txn = store.beginSysTxn()
+  for (key, value) in writes:
+    txn.put(key, value)
+  txn.commit()
+
+proc sysTxnDelete*(store: RaftKVStoreExt, key: string): SysTxnResult {.
+    gcsafe, raises: [].} =
+  let txn = store.beginSysTxn()
+  txn.delete(key)
+  txn.commit()
+
+proc sysTxnDeleteBatch*(store: RaftKVStoreExt,
+    keys: openArray[string]): SysTxnResult {.gcsafe, raises: [].} =
+  let txn = store.beginSysTxn()
+  for key in keys:
+    txn.delete(key)
+  txn.commit()
+
+proc sysTxnPutAndDelete*(store: RaftKVStoreExt,
+    puts: openArray[tuple[key: string, value: string]],
+    deletes: openArray[string]): SysTxnResult {.gcsafe, raises: [].} =
+  let txn = store.beginSysTxn()
+  for (key, value) in puts:
+    txn.put(key, value)
+  for key in deletes:
+    txn.delete(key)
+  txn.commit()
+
+# ---------------------------------------------------------------------------
+# System table write helpers (bool-returning wrappers for convenience)
+# ---------------------------------------------------------------------------
+
+proc sysTablePut*(store: RaftKVStoreExt, key, value: string): bool {.
+    gcsafe, raises: [].} =
+  ## Write to a sys table atomically via MicroTransaction.
   ## Returns true on success, false on failure.
-  let backend = store.getBackend()
-  if backend == nil or not backend.isOpen:
-    return false
-
-  # Get timestamp - use current nanosecond time
-  let ts = store.nowNs()
-  let encoded = mvccTypes.encodeMVCCValue(value, ts, false)
-
-  # Write via Raft for replication
-  let res = store.raftPut(key, encoded)
-  return res.isOk
+  store.sysTxnPut(key, value).isOk
 
 proc sysTablePutBatch*(store: RaftKVStoreExt,
     writes: openArray[tuple[key: string, value: string]]): bool {.
     gcsafe, raises: [].} =
-  ## Write multiple sys table entries atomically with MVCC encoding.
-  ## All entries get the same timestamp for atomicity.
-  ## Returns true on success, false on failure.
-  if writes.len == 0:
-    return true
-
-  # Get timestamp for all writes (same timestamp for atomicity)
-  let ts = store.nowNs()
-  for (key, value) in writes:
-    let encoded = mvccTypes.encodeMVCCValue(value, ts, false)
-    let res = store.raftPut(key, encoded)
-    if not res.isOk:
-      return false
-
-  return true
+  ## Write multiple sys table entries atomically via MicroTransaction.
+  ## All entries share the same timestamp and commit as a single Raft entry.
+  store.sysTxnPutBatch(writes).isOk
 
 proc sysTableDelete*(store: RaftKVStoreExt, key: string): bool {.
     gcsafe, raises: [].} =
-  ## Delete from a sys table through Raft.
-  ## For internal operations, we use actual delete (not MVCC tombstone).
-  ## Returns true on success, false on failure.
-  let res = store.raftDelete(key)
-  return res.isOk
+  ## Delete from a sys table atomically via MicroTransaction.
+  store.sysTxnDelete(key).isOk
 
 proc sysTableDeleteBatch*(store: RaftKVStoreExt,
     keys: openArray[string]): bool {.gcsafe, raises: [].} =
-  ## Delete multiple sys table entries through Raft.
-  ## For internal operations, we use actual delete (not MVCC tombstones).
-  ## Returns true on success, false on failure.
-  if keys.len == 0:
-    return true
-
-  for key in keys:
-    let res = store.raftDelete(key)
-    if not res.isOk:
-      return false
-
-  return true
+  ## Delete multiple sys table entries atomically via MicroTransaction.
+  store.sysTxnDeleteBatch(keys).isOk
 
 proc sysTablePutAndDeleteBatch*(store: RaftKVStoreExt,
     puts: openArray[tuple[key: string, value: string]],
     deletes: openArray[string]): bool {.gcsafe, raises: [].} =
-  ## Write and delete sys table entries atomically through Raft.
-  ## For internal operations, we use actual delete (not MVCC tombstones).
-  ## Returns true on success, false on failure.
-  if puts.len == 0 and deletes.len == 0:
-    return true
-
-  # Get timestamp for all puts (same timestamp for atomicity)
-  let ts = store.nowNs()
-
-  # Do puts first (always MVCC-encoded)
-  for (key, value) in puts:
-    let encoded = mvccTypes.encodeMVCCValue(value, ts, false)
-    let res = store.raftPut(key, encoded)
-    if not res.isOk:
-      return false
-
-  # Then deletes
-  for key in deletes:
-    let res = store.raftDelete(key)
-    if not res.isOk:
-      return false
-
-  return true
+  ## Write and delete sys table entries atomically via MicroTransaction.
+  store.sysTxnPutAndDelete(puts, deletes).isOk
 
 # ---------------------------------------------------------------------------
 # Follower apply callback (called by coordinator on committed entries)

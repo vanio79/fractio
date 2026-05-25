@@ -33,7 +33,6 @@ import ./client
 import ./messages/space as spaceMsgs
 import ./txn_manager
 import ./raft_store
-import ./sys_table_txn
 import ./mvcc_store
 import ./cluster_state_binary
 import ../core/types except NodeID

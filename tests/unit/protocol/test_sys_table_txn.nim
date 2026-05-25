@@ -18,7 +18,6 @@ import std/[unittest, strutils]
 import fractio/distributed/raft/group_types
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/meta/system_tables
-import fractio/protocol/sys_table_txn
 import fractio/protocol/raft_store
 
 suite "SysTxnOp":

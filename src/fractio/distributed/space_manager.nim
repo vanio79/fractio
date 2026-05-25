@@ -27,7 +27,6 @@
 
 import std/[tables, options, os, times, sequtils, strutils]
 import ../protocol/raft_store
-import ../protocol/sys_table_txn
 import ../protocol/messages/space
 import ../protocol/messages/cluster as clusterMsgs
 import ../protocol/client
@@ -534,8 +533,8 @@ proc createSpace*(sm: SpaceManager, req: CreateSpaceRequest): CreateSpaceRespons
     let spaceKey = encodeTableKey(SYS_SPACES_TABLE_ID, $spaceId)
     let spaceValue = encode(spaceRec)
 
-    if not sm.store.sysTablePutV2(spaceKey, spaceValue):
-      sm.logError("createSpace: sysTablePutV2 failed")
+    if not sm.store.sysTablePut(spaceKey, spaceValue):
+      sm.logError("createSpace: sysTablePut failed")
       return CreateSpaceResponse(
         success: false,
         error: "failed to write space record to Raft"
