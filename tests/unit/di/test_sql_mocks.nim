@@ -6,7 +6,7 @@ import fractio/di/interfaces
 import fractio/di/mocks
 import fractio/core/errors
 from fractio/core/types import TransactionID, zeroTransactionID,
-    genTransactionID, `==`
+    genTransactionIDLocal, `==`
 
 suite "MockSqlExecutor Tests":
 
