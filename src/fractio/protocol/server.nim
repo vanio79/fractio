@@ -1507,14 +1507,14 @@ proc handleBuiltinAdmin(server: ProtocolServer, conn: ClientConnection,
     let uptime = uint64(if nowSec > server.startedAt: nowSec -
         server.startedAt else: 0)
     let realShardCount: uint32 =
-      if not server.raftStore.isNil: uint32(server.raftStore.shardCount())
+      if not server.raftStore.isNil: uint32(server.raftStore.groupCount())
       else: 1'u32
     let resp = adminMsgs.ServerInfoResponse(
       nodeId: server.config.serverId,
       version: server.config.serverVersion,
       uptimeSecs: uptime,
       role: adminMsgs.RoleLeader,
-      shardCount: realShardCount,
+      groupCount: realShardCount,
       clientCount: uint32(server.clientCount()),
     )
     sendFrame(conn, adminMsgs.encodeServerInfoResponse(resp), requestId)

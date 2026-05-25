@@ -253,7 +253,7 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
         META_GROUP_ID): "Leader" else: "Follower"
     let uptime = formatUptime(uint64(getTime().toUnix() - srv.startedAt))
     let clients = $srv.clientCount()
-    let shards = if not srv.raftStore.isNil: $srv.raftStore.shardCount() else: "0"
+    let groups = if not srv.raftStore.isNil: $srv.raftStore.groupCount() else: "0"
     let version = srv.config.serverVersion
     let clusterName = srv.config.clusterName
 
@@ -1067,7 +1067,7 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
     let nodeId = srv.config.serverId.int
     # Determine role based on Raft leadership
     var role = "unknown"
-    var shardCount = 0
+    var groupCount = 0
     var clientCount = 0
     var running = false
     {.cast(gcsafe).}:
@@ -1077,7 +1077,7 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
         else:
           role = "follower"
       if srv.raftStore != nil:
-        shardCount = srv.raftStore.shardCount()
+        groupCount = srv.raftStore.groupCount()
       clientCount = srv.clientCount()
       running = srv.running.load()
     let version = srv.config.serverVersion
@@ -1087,7 +1087,7 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
       "version": version,
       "uptimeSecs": uptimeSecs,
       "role": role,
-      "shardCount": shardCount,
+      "groupCount": groupCount,
       "clientCount": clientCount,
       "clusterName": clusterName,
       "host": srv.config.host,

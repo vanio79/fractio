@@ -31,7 +31,7 @@ suite "ServerInfo Messages":
       version: "1.0.0",
       uptimeSecs: 3600'u64,
       role: RoleLeader,
-      shardCount: 10'u32,
+      groupCount: 10'u32,
       clientCount: 5'u32
     )
     let encoded = encodeServerInfoResponse(resp)
@@ -47,7 +47,7 @@ suite "ServerInfo Messages":
       version: "1.0.0",
       uptimeSecs: 7200'u64,
       role: RoleFollower,
-      shardCount: 10'u32,
+      groupCount: 10'u32,
       clientCount: 3'u32
     )
     let encoded = encodeServerInfoResponse(resp)
@@ -61,7 +61,7 @@ suite "ServerInfo Messages":
       version: "1.0.0",
       uptimeSecs: 100'u64,
       role: RoleCandidate,
-      shardCount: 0'u32,
+      groupCount: 0'u32,
       clientCount: 0'u32
     )
     let encoded = encodeServerInfoResponse(resp)
@@ -75,7 +75,7 @@ suite "ServerInfo Messages":
       version: "test",
       uptimeSecs: 0'u64,
       role: RoleUnknown,
-      shardCount: 0'u32,
+      groupCount: 0'u32,
       clientCount: 0'u32
     )
     let encoded = encodeServerInfoResponse(resp)
@@ -89,7 +89,7 @@ suite "ServerInfo Messages":
       version: "2.0.1",
       uptimeSecs: 86400'u64,
       role: RoleLeader,
-      shardCount: 100'u32,
+      groupCount: 100'u32,
       clientCount: 50'u32
     )
     let encoded = encodeServerInfoResponse(resp)
@@ -99,7 +99,7 @@ suite "ServerInfo Messages":
     check decoded.value.version == "2.0.1"
     check decoded.value.uptimeSecs == 86400'u64
     check decoded.value.role == RoleLeader
-    check decoded.value.shardCount == 100'u32
+    check decoded.value.groupCount == 100'u32
     check decoded.value.clientCount == 50'u32
 
   test "decodeServerInfoResponse truncated nodeId":
@@ -124,7 +124,7 @@ suite "ServerInfo Messages":
         version: "1.0",
         uptimeSecs: 1000'u64,
         role: role,
-        shardCount: 5'u32,
+        groupCount: 5'u32,
         clientCount: 2'u32
       )
       let encoded = encodeServerInfoResponse(resp)

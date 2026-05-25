@@ -19,8 +19,8 @@
     <div class='stat-value'>{{ clients }}</div>
   </div>
   <div class='stat-card'>
-    <div class='stat-label'>Shards</div>
-    <div class='stat-value'>{{ shards }}</div>
+    <div class='stat-label'>Groups</div>
+    <div class='stat-value'>{{ groups }}</div>
   </div>
   <div class='stat-card'>
     <div class='stat-label'>Version</div>

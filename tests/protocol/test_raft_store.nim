@@ -9,7 +9,6 @@ import std/[unittest, os, times, sets, options, locks, tables]
 import fractio/protocol/raft_store
 import fractio/protocol/raft_txn
 import fractio/protocol/txn_manager
-import fractio/protocol/router
 import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
 import fractio/distributed/raft/group_types as rangeTypes
@@ -326,7 +325,7 @@ suite "RaftTxnCoordinator - single-shard commit":
     ws.incl("sc_key1")
     ws.incl("sc_key2")
 
-    let ok = raftCoord.commitSingleShard(txnId, ws, 1234'u64)
+    let ok = raftCoord.commitSingleGroup(txnId, ws, 1234'u64)
     check ok
     check store.raftGet("sc_key1").value.get().value == "val1"
     check store.raftGet("sc_key2").value.get().value == "val2"
@@ -345,7 +344,7 @@ suite "RaftTxnCoordinator - single-shard commit":
     ws.incl("rb_key1")
     ws.incl("rb_key2")
 
-    let ok = raftCoord.rollbackSingleShard(txnId, ws)
+    let ok = raftCoord.rollbackSingleGroup(txnId, ws)
     check ok
     check store.raftGet("rb_key1").value.isNone
     check store.raftGet("rb_key2").value.isNone
@@ -426,48 +425,6 @@ suite "RaftTxnCoordinator - cross-shard 2PC":
 
     check store.raftReadCoordRecord(txnId).isNone
     check store.raftGet("recommit_key").value.get().value == "rcv"
-
-# ---------------------------------------------------------------------------
-# Suite: RouterTable Phase 5 additions
-# ---------------------------------------------------------------------------
-
-suite "RouterTable - Phase 5 leader-change callback":
-  test "setLeaderChangeCallback fires on updateLeader":
-    let rt = newRouterTable(localNodeId = 1)
-    rt.bootstrapSingleShard(shardId = 1, raftGroupId = 1)
-
-    var callbackFired = false
-    var capturedShardId: uint32 = 0
-
-    rt.setLeaderChangeCallback(proc(shardId: uint32,
-        leader: LeaderInfo) {.gcsafe, raises: [].} =
-      callbackFired = true
-      capturedShardId = shardId
-    )
-
-    let newLeader = LeaderInfo(nodeId: 2, nodeAddr: "10.0.0.2:9000",
-        lastSeenMs: 1)
-    rt.updateLeader(1, newLeader)
-
-    check callbackFired
-    check capturedShardId == 1
-
-  test "notLeaderRedirect updates routing table":
-    let rt = newRouterTable(localNodeId = 1)
-    rt.bootstrapSingleShard(shardId = 1, raftGroupId = 1)
-    let hint = LeaderInfo(nodeId: 3, nodeAddr: "10.0.0.3:9000", lastSeenMs: 42)
-    rt.notLeaderRedirect(1, hint)
-    let r = rt.routeKey("any_key")
-    check r.isOk
-    check r.val.nodeId == 3
-
-  test "touchLeader refreshes TTL":
-    let rt = newRouterTable(localNodeId = 1, leaderTtlMs = 60_000)
-    rt.bootstrapSingleShard(shardId = 1, raftGroupId = 1)
-    rt.touchLeader(1)
-    let r = rt.routeKey("k")
-    check r.isOk
-    check r.val.nodeId == 1
 
 # ---------------------------------------------------------------------------
 # Suite: txn_manager TimeProvider wiring

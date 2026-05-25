@@ -561,7 +561,7 @@ proc cmdClusterInfo(c: ProtocolClient, fmt: OutputFormat) =
       "version": resp.version,
       "uptimeSecs": resp.uptimeSecs,
       "role": roleStr(resp.role),
-      "shardCount": resp.shardCount,
+      "groupCount": resp.groupCount,
       "clientCount": resp.clientCount,
     })
     return
@@ -569,7 +569,7 @@ proc cmdClusterInfo(c: ProtocolClient, fmt: OutputFormat) =
   echo &"version:      {resp.version}"
   echo &"uptime_secs:  {resp.uptimeSecs}"
   echo &"role:         {roleStr(resp.role)}"
-  echo &"shard_count:  {resp.shardCount}"
+  echo &"group_count:  {resp.groupCount}"
   echo &"client_count: {resp.clientCount}"
 
 # ---------------------------------------------------------------------------

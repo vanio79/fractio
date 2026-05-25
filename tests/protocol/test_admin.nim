@@ -127,7 +127,7 @@ suite "admin codec - ServerInfo":
       version: "1.2.3",
       uptimeSecs: 3600,
       role: adminMsgs.RoleLeader,
-      shardCount: 4,
+      groupCount: 4,
       clientCount: 7,
     )
     let payload = adminMsgs.encodeServerInfoResponse(resp)
@@ -137,7 +137,7 @@ suite "admin codec - ServerInfo":
     check r.value.version == "1.2.3"
     check r.value.uptimeSecs == 3600
     check r.value.role == adminMsgs.RoleLeader
-    check r.value.shardCount == 4
+    check r.value.groupCount == 4
     check r.value.clientCount == 7
 
   test "ServerInfoResponse RoleFollower":
@@ -146,7 +146,7 @@ suite "admin codec - ServerInfo":
       version: "2.0.0",
       uptimeSecs: 0,
       role: adminMsgs.RoleFollower,
-      shardCount: 1,
+      groupCount: 1,
       clientCount: 0,
     )
     let payload = adminMsgs.encodeServerInfoResponse(resp)
@@ -160,7 +160,7 @@ suite "admin codec - ServerInfo":
       version: "",
       uptimeSecs: 1,
       role: adminMsgs.RoleUnknown,
-      shardCount: 0,
+      groupCount: 0,
       clientCount: 0,
     )
     let payload = adminMsgs.encodeServerInfoResponse(resp)
@@ -345,11 +345,11 @@ suite "admin e2e - ServerInfo":
       check r.isOk
       check r.value.clientCount >= 1
 
-  test "serverInfo shardCount is 2 with meta and data groups":
+  test "serverInfo groupCount is 2 with meta and data groups":
     withAdminServer(20003) do (srv: ProtocolServer, cli: ProtocolClient):
       let r = cli.serverInfo()
       check r.isOk
-      check r.value.shardCount == 2 # META_GROUP_ID + DATA_GROUP_START_ID
+      check r.value.groupCount == 2 # META_GROUP_ID + DATA_GROUP_START_ID
 
   test "serverInfo custom version string":
     var cfg = defaultServerConfig()

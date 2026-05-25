@@ -180,7 +180,6 @@ type
     name*: string
     dataType*: DataType
     constraints*: Constraint
-    isShardKey*: bool
 
   RowID* = distinct ULID
     ## Row identifier - ULID for globally unique, sortable row IDs
@@ -222,29 +221,12 @@ type
   TransactionStatus* = enum
     tsActive, tsCommitted, tsAborted
 
-  ShardID* = distinct ULID
-    ## Shard identifier - ULID for globally unique, sortable shard IDs
-
   TableId* = distinct ULID
     ## Table identifier - ULID for globally unique table IDs
     ## Enables distributed table creation without ID conflicts
 
   SpaceID* = distinct ULID
     ## Space identifier - ULID for globally unique space IDs
-
-  Shard* = ref object
-    id*: ShardID
-    rangeStart*: uint64
-    rangeEnd*: uint64
-    replicas*: seq[ReplicaInfo]
-    primaryReplica*: int
-    table*: string
-
-  ReplicaInfo* = object
-    nodeId*: string
-    address*: string
-    port*: uint16
-    lastSeen*: int64
 
   NodeID* = distinct string
 
@@ -318,13 +300,6 @@ proc `<`*(a, b: RowID): bool = ULID(a) < ULID(b)
 proc `$`*(id: RowID): string = $ULID(id)
 proc hash*(id: RowID): Hash = hash($ULID(id))
 
-# ShardID operations (ULID-based)
-proc `==`*(a, b: ShardID): bool = ULID(a) == ULID(b)
-proc `!=`*(a, b: ShardID): bool = not (a == b)
-proc `<`*(a, b: ShardID): bool = ULID(a) < ULID(b)
-proc `$`*(id: ShardID): string = $ULID(id)
-proc hash*(id: ShardID): Hash = hash($ULID(id))
-
 # TableId operations (ULID-based)
 proc `==`*(a, b: TableId): bool = ULID(a) == ULID(b)
 proc `!=`*(a, b: TableId): bool = not (a == b)
@@ -356,15 +331,6 @@ proc genRowID*(tsNs: int64): RowID =
 proc genRowIDLocal*(): RowID =
   ## Generate RowID using LOCAL clock. Only for tests.
   genRowID(localTimeNs())
-
-# Shard ID generation - uses ULID for globally unique IDs
-proc genShardID*(tsNs: int64): ShardID =
-  ## Generate ShardID with nanosecond timestamp (from SharedTimer).
-  ShardID(genULID(tsNs))
-
-proc genShardIDLocal*(): ShardID =
-  ## Generate ShardID using LOCAL clock. Only for tests.
-  genShardID(localTimeNs())
 
 # TableId generation - uses ULID for globally unique IDs
 proc genTableId*(tsNs: int64): TableId =
@@ -418,14 +384,12 @@ proc spaceIDToBytes*(id: SpaceID): string =
 # These are template-based to avoid compile-time evaluation issues
 template zeroTransactionID*(): TransactionID = TransactionID(ZeroULID())
 template zeroRowID*(): RowID = RowID(ZeroULID())
-template zeroShardID*(): ShardID = ShardID(ZeroULID())
 template zeroTableId*(): TableId = TableId(ZeroULID())
 template zeroSpaceID*(): SpaceID = SpaceID(ZeroULID())
 
 # isZero checks for comparing against zero IDs
 template isZero*(id: TransactionID): bool = id == zeroTransactionID()
 template isZero*(id: RowID): bool = id == zeroRowID()
-template isZero*(id: ShardID): bool = id == zeroShardID()
 template isZero*(id: TableId): bool = id == zeroTableId()
 template isZero*(id: SpaceID): bool = id == zeroSpaceID()
 

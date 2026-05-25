@@ -92,7 +92,7 @@ proc newRaftTxnCoordinator*(store: RaftKVStoreExt,
 # Single-shard commit: resolve all write-set intents directly
 # ---------------------------------------------------------------------------
 
-proc commitSingleShard*(coord: RaftTxnCoordinator, txnId: uint64,
+proc commitSingleGroup*(coord: RaftTxnCoordinator, txnId: uint64,
     writeSet: HashSet[string],
     commitTs: uint64): bool {.gcsafe, raises: [].} =
   ## Commit a single-shard transaction by resolving all write-intents.
@@ -119,7 +119,7 @@ proc commitSingleShard*(coord: RaftTxnCoordinator, txnId: uint64,
       return false
   true
 
-proc rollbackSingleShard*(coord: RaftTxnCoordinator, txnId: uint64,
+proc rollbackSingleGroup*(coord: RaftTxnCoordinator, txnId: uint64,
     writeSet: HashSet[string]): bool {.gcsafe, raises: [].} =
   ## Rollback a single-shard transaction by deleting all write-intents.
   for key in writeSet:

@@ -12,7 +12,7 @@
 #
 # ServerInfo Request:   [MessageType:2]
 # ServerInfo Response:  [MessageType:2][nodeId:2][version:1+N][uptime:8]
-#                       [role:1][shardCount:4][clientCount:4]
+#                       [role:1][groupCount:4][clientCount:4]
 #
 # Metrics Request:      [MessageType:2][flags:1]
 # Metrics Response:     [MessageType:2][requestsTotal:8][requestsOK:8]
@@ -58,7 +58,7 @@ const
 #
 # Request:  no fields beyond MessageType
 # Response: nodeId (2), version string (uint8-len prefixed), uptimeSecs (8),
-#           role (1), shardCount (4), clientCount (4)
+#           role (1), groupCount (4), clientCount (4)
 # ---------------------------------------------------------------------------
 
 type
@@ -70,7 +70,7 @@ type
     version*: string ## e.g. "1.0.0"
     uptimeSecs*: uint64
     role*: uint8     ## Role* constant
-    shardCount*: uint32
+    groupCount*: uint32
     clientCount*: uint32
 
 proc encodeServerInfoRequest*(): string =
@@ -92,7 +92,7 @@ proc encodeServerInfoResponse*(resp: ServerInfoResponse): string =
   buf.writeBytes8(resp.version)
   buf.writeUint64BE(resp.uptimeSecs)
   buf.writeUint8(resp.role)
-  buf.writeUint32BE(resp.shardCount)
+  buf.writeUint32BE(resp.groupCount)
   buf.writeUint32BE(resp.clientCount)
   buf
 
@@ -119,7 +119,7 @@ proc decodeServerInfoResponse*(payload: string): Result[ServerInfoResponse,
 
   let scR = readUint32BE(payload, pos)
   if scR.isErr: return peErr(scR.error)
-  resp.shardCount = scR.value
+  resp.groupCount = scR.value
 
   let ccR = readUint32BE(payload, pos)
   if ccR.isErr: return peErr(ccR.error)

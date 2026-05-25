@@ -1402,7 +1402,7 @@ proc raftScan*(store: RaftKVStoreExt, startKey, endKey: string,
 
   rsOk[seq[(string, RaftKVEntry)]](pairs)
 
-proc shardCount*(store: RaftKVStoreExt): int {.gcsafe, raises: [].} =
+proc groupCount*(store: RaftKVStoreExt): int {.gcsafe, raises: [].} =
   ## Returns the number of registered state machines (groups).
   acquire(store.smMu)
   defer: release(store.smMu)

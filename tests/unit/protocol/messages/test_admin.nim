@@ -32,7 +32,7 @@ suite "ServerInfoRequest/ServerInfoResponse":
       version: "1.0.0",
       uptimeSecs: 3600'u64,
       role: RoleLeader,
-      shardCount: 10'u32,
+      groupCount: 10'u32,
       clientCount: 5'u32
     )
     let encoded = encodeServerInfoResponse(resp)
@@ -44,7 +44,7 @@ suite "ServerInfoRequest/ServerInfoResponse":
       version: "2.0.0",
       uptimeSecs: 100'u64,
       role: RoleLeader,
-      shardCount: 1'u32,
+      groupCount: 1'u32,
       clientCount: 1'u32
     )
     let encodedLeader = encodeServerInfoResponse(respLeader)
@@ -55,7 +55,7 @@ suite "ServerInfoRequest/ServerInfoResponse":
       version: "2.0.0",
       uptimeSecs: 100'u64,
       role: RoleFollower,
-      shardCount: 1'u32,
+      groupCount: 1'u32,
       clientCount: 0'u32
     )
     let encodedFollower = encodeServerInfoResponse(respFollower)
@@ -67,7 +67,7 @@ suite "ServerInfoRequest/ServerInfoResponse":
       version: "3.5.2",
       uptimeSecs: 7200'u64,
       role: RoleFollower,
-      shardCount: 25'u32,
+      groupCount: 25'u32,
       clientCount: 100'u32
     )
     let encoded = encodeServerInfoResponse(resp)
@@ -77,7 +77,7 @@ suite "ServerInfoRequest/ServerInfoResponse":
     check decoded.value.version == resp.version
     check decoded.value.uptimeSecs == resp.uptimeSecs
     check decoded.value.role == resp.role
-    check decoded.value.shardCount == resp.shardCount
+    check decoded.value.groupCount == resp.groupCount
     check decoded.value.clientCount == resp.clientCount
 
   test "decodeServerInfoResponse empty version":
@@ -86,7 +86,7 @@ suite "ServerInfoRequest/ServerInfoResponse":
       version: "",
       uptimeSecs: 0'u64,
       role: RoleUnknown,
-      shardCount: 0'u32,
+      groupCount: 0'u32,
       clientCount: 0'u32
     )
     let encoded = encodeServerInfoResponse(resp)
@@ -325,7 +325,7 @@ suite "Admin Message Roundtrip Integration":
       version: "test-version",
       uptimeSecs: 12345'u64,
       role: RoleLeader,
-      shardCount: 50'u32,
+      groupCount: 50'u32,
       clientCount: 75'u32
     )
     let respEncoded = encodeServerInfoResponse(resp)

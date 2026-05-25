@@ -178,7 +178,7 @@ suite "REST API — Core Endpoints (3-node cluster)":
     check info.hasKey("version")
     check info.hasKey("uptimeSecs")
     check info.hasKey("role")
-    check info.hasKey("shardCount")
+    check info.hasKey("groupCount")
     check info.hasKey("clientCount")
     check info.hasKey("clusterName")
     check info["nodeId"].getInt >= 1

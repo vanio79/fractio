@@ -320,35 +320,6 @@ suite "RowID Operations":
     check isZero(zeroRowID())
     check not isZero(genRowIDLocal())
 
-suite "ShardID Operations":
-
-  test "ShardID equality":
-    let a = genShardIDLocal()
-    let b = genShardIDLocal()
-    check a == a
-    check a != b
-
-  test "ShardID ordering":
-    let a = zeroShardID()
-    let b = genShardIDLocal()
-    check a < b
-
-  test "ShardID string":
-    let id = genShardIDLocal()
-    let s = $id
-    check s.len == 26
-
-  test "ShardID hash":
-    let id = genShardIDLocal()
-    check hash(id) == hash(id)
-
-  test "zeroShardID":
-    check zeroShardID() == zeroShardID()
-
-  test "isZero ShardID":
-    check isZero(zeroShardID())
-    check not isZero(genShardIDLocal())
-
 suite "TableId Operations":
 
   test "TableId equality":
@@ -465,13 +436,11 @@ suite "ColumnDef":
     let col = ColumnDef(
       name: "id",
       dataType: dtInt,
-      constraints: Constraint(primaryKey: true),
-      isShardKey: false
+      constraints: Constraint(primaryKey: true)
     )
     check col.name == "id"
     check col.dataType == dtInt
     check col.constraints.primaryKey
-    check not col.isShardKey
 
 suite "TransactionStatus":
 
@@ -501,13 +470,6 @@ suite "ID Generation Uniqueness":
     var seen: HashSet[RowID] = initHashSet[RowID]()
     for i in 0 ..< 1000:
       let id = genRowIDLocal()
-      check id notin seen
-      seen.incl(id)
-
-  test "ShardIDs are unique":
-    var seen: HashSet[ShardID] = initHashSet[ShardID]()
-    for i in 0 ..< 1000:
-      let id = genShardIDLocal()
       check id notin seen
       seen.incl(id)
 

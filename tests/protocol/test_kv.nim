@@ -2,7 +2,6 @@
 #
 # Covers:
 #   - messages/kv: codec round-trips for Get/Put/Delete/Batch/Scan
-#   - router: RouterTable routing logic
 #   - server/client: end-to-end Get, Put, Delete, Batch, Scan over TCP
 #
 # Port allocation: each test suite group uses a distinct port in 19800-19899
@@ -13,7 +12,6 @@ import fractio/protocol/types
 import fractio/protocol/codec
 import fractio/protocol/server
 import fractio/protocol/client
-import fractio/protocol/router
 import fractio/protocol/messages/kv
 import fractio/protocol/mvcc_store
 import fractio/protocol/txn_manager
@@ -445,100 +443,6 @@ suite "kv codec - ScanRequest round-trip":
     let r = decodeScanResponseFrame(payload, 0)
     check r.isOk
     check (r.value.respFlags and ScanRespFlagHasMore) != 0
-
-# ---------------------------------------------------------------------------
-# Suite: Router
-# ---------------------------------------------------------------------------
-
-suite "router - routing table":
-  test "empty router returns error":
-    let rt = newRouterTable(1)
-    let r = rt.routeKey("anything")
-    check r.isErr
-    check r.error.kind == peNotLeader
-
-  test "single shard routes all keys to local node":
-    let rt = newRouterTable(localNodeId = 1)
-    rt.bootstrapSingleShard(shardId = 1, raftGroupId = 1,
-                            leaderAddr = "127.0.0.1:9000")
-    for key in ["", "a", "hello", "zzzzz", "\x00", "\xFF"]:
-      let r = rt.routeKey(key)
-      check r.isOk
-      check r.value.nodeId == 1
-
-  test "isLocalLeader returns true for local shard":
-    let rt = newRouterTable(localNodeId = 1)
-    rt.bootstrapSingleShard(shardId = 1, raftGroupId = 1)
-    check rt.isLocalLeader("anykey") == true
-
-  test "isLocalLeader returns false for empty router":
-    let rt = newRouterTable(localNodeId = 1)
-    check rt.isLocalLeader("anykey") == false
-
-  test "shardCount returns correct value":
-    let rt = newRouterTable(1)
-    check rt.shardCount() == 0
-    rt.bootstrapSingleShard()
-    check rt.shardCount() == 1
-
-  test "updateRoute adds a new shard":
-    let rt = newRouterTable(localNodeId = 2)
-    let shard = ShardRange(startKey: "a", endKey: "m",
-                           shardId: 10, raftGroupId: 10)
-    let leader = LeaderInfo(nodeId: 2, nodeAddr: "host:1234", lastSeenMs: 0)
-    rt.updateRoute(shard, leader)
-    check rt.shardCount() == 1
-    let r = rt.routeKey("b")
-    check r.isOk
-    check r.value.nodeId == 2
-
-  test "updateRoute replaces existing shard":
-    let rt = newRouterTable(localNodeId = 1)
-    rt.bootstrapSingleShard(shardId = 1, raftGroupId = 1)
-    # Replace with new leader
-    let shard = ShardRange(startKey: "", endKey: "",
-                           shardId: 1, raftGroupId: 1)
-    let leader = LeaderInfo(nodeId: 3, nodeAddr: "new-leader:9000")
-    rt.updateRoute(shard, leader)
-    let r = rt.routeKey("key")
-    check r.isOk
-    check r.value.nodeId == 3
-
-  test "updateLeader updates leader without touching shard range":
-    let rt = newRouterTable(localNodeId = 1)
-    rt.bootstrapSingleShard(shardId = 5, raftGroupId = 5)
-    rt.updateLeader(5, LeaderInfo(nodeId: 7, nodeAddr: "host2:9001"))
-    let r = rt.routeKey("k")
-    check r.isOk
-    check r.value.nodeId == 7
-
-  test "routeKeys returns pairs for all keys":
-    let rt = newRouterTable(localNodeId = 1)
-    rt.bootstrapSingleShard()
-    let r = rt.routeKeys(@["a", "b", "c"])
-    check r.isOk
-    check r.value.len == 3
-
-  test "two non-overlapping shards route correctly":
-    let rt = newRouterTable(localNodeId = 1)
-    let shard1 = ShardRange(startKey: "", endKey: "m",
-                            shardId: 1, raftGroupId: 1)
-    let leader1 = LeaderInfo(nodeId: 1, nodeAddr: "n1:9000")
-    rt.updateRoute(shard1, leader1)
-    let shard2 = ShardRange(startKey: "m", endKey: "",
-                            shardId: 2, raftGroupId: 2)
-    let leader2 = LeaderInfo(nodeId: 2, nodeAddr: "n2:9000")
-    rt.updateRoute(shard2, leader2)
-    check rt.shardCount() == 2
-    let r1 = rt.routeKey("apple")
-    check r1.isOk
-    check r1.value.nodeId == 1
-    let r2 = rt.routeKey("mango")
-    check r2.isOk
-    check r2.value.nodeId == 2
-    let r3 = rt.routeKey("zebra")
-    check r3.isOk
-    check r3.value.nodeId == 2
 
 # ---------------------------------------------------------------------------
 # Suite: End-to-end KV via server + client
