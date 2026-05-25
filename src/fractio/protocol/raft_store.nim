@@ -30,7 +30,7 @@
 #   - 2PC records:  "\x00COORD\x00<txnId8be>"            (coordinator records)
 
 import std/[tables, locks, options, algorithm, atomics, strformat,
-    strutils, json, hashes, os]
+    strutils, json, hashes, os, times]
 import fractio/core/types except NodeID
 import fractio/core/timestamp_provider
 import fractio/distributed/raft/nuraft_coordinator
@@ -271,6 +271,7 @@ type
     triggerRebal*: Atomic[bool]
     migrationThread*: Thread[RaftKVStoreExt]  ## Data migration monitor thread
     migrationRunning*: Atomic[bool]           ## Flag to stop migration thread
+    migrationWakeChan*: Channel[int]          ## Wake signal for instant shutdown / trigger
     stopped*: Atomic[bool] ## Set to true when stop() is called; prevents send() on closed channel
     tsProvider*: TimestampProvider ## cluster-wide HLC for MVCC timestamps
 
@@ -298,6 +299,7 @@ proc newRaftKVStoreExt*(coord: NuRaftCoordinator,
   initLock(result.spacesMu)
   initLock(result.groupMu)
   result.leaderPersistChan.open() # Initialize async channel for leader persistence
+  result.migrationWakeChan.open() # Initialize wake channel for migration thread
   result.nextVersion.store(1)
 
 proc nowNs*(s: RaftKVStoreExt): int64 {.gcsafe, raises: [].} =
@@ -984,10 +986,28 @@ proc migrationMonitorTask(s: RaftKVStoreExt) {.thread, gcsafe, raises: [].} =
   ## Background thread that monitors spaces for pending rebalance migrations.
   ## When a space needs rebalancing (workerState != wsIdle), this thread claims
   ## the worker role and calls runRebalanceMigration.
-  const checkIntervalSecs = 10
+  ##
+  ## Uses migrationWakeChan for responsive sleep: on each 10-second cycle,
+  ## the thread polls the channel in 100ms increments so it can be woken
+  ## instantly by a shutdown signal or a rebalance trigger.
+  const checkIntervalMs = 10_000  # 10 seconds between full checks
   const staleHeartbeatNs = 30_000_000_000'i64  # 30 seconds in nanoseconds
   while s.migrationRunning.load():
-    sleep(checkIntervalSecs * 1000)
+    # Responsive sleep: poll wake channel every 100ms
+    let startMs = getTime().toUnixFloat() * 1000.0
+    while s.migrationRunning.load():
+      let elapsed = int((getTime().toUnixFloat() * 1000.0) - startMs)
+      if elapsed >= checkIntervalMs:
+        break
+      # Check wake channel for early-exit signals (shutdown, trigger)
+      let wakeOpt = s.migrationWakeChan.tryRecv()
+      if wakeOpt.dataAvailable:
+        # Received wake signal — if it's a shutdown, exit immediately
+        if not s.migrationRunning.load():
+          break
+        # Otherwise it's a trigger — run the check now
+        break
+      sleep(100)
     if not s.migrationRunning.load(): break
     # Check if coordinator is still running
     if s.coordinator.isNil or not s.coordinator.running.load():
@@ -1279,6 +1299,8 @@ proc stop*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
 
   if store.migrationRunning.load():
     store.migrationRunning.store(false)
+    # Wake the migration thread instantly via channel (avoids 10s sleep delay)
+    try: store.migrationWakeChan.send(0) except CatchableError: discard
     # Wait for migration thread to finish (with timeout)
     for _ in 0 ..< 30: # 3 seconds max
       try:
@@ -1317,6 +1339,12 @@ proc stop*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
 
   withLock store.smMu:
     store.stateMachines.clear()
+
+proc triggerMigrationCheck*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
+  ## Wake the migration monitor thread from its sleep so it checks for
+  ## pending rebalancing immediately. Safe to call from any thread.
+  if store.migrationRunning.load():
+    try: store.migrationWakeChan.send(1) except CatchableError: discard
 
 proc closeChannels*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
   ## Drain and finalize the leader persistence channel.
