@@ -1194,7 +1194,17 @@ proc planCreateSpace(stmt: Stmt, timeProvider: TimeProvider = nil): Plan =
     groupCount: 0,
     groupIds: @[],
     oldGroupIds: @[],
-    rebalancing: false,
+    workerState: uint8(wsrIdle),
+    workerNodeId: 0,
+    workerHeartbeat: 0,
+    checkpoint: MigrationCheckpointRecord(
+      completedTables: @[],
+      currentTable: zeroTableId(),
+      currentCursor: "",
+      keysMigrated: 0,
+      startedAtNs: 0,
+      lastProgressNs: 0,
+    ),
     createdAtNs: nowNs(timeProvider)
   )
   plan.add(PlanOp(kind: poCreateSpace,

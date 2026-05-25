@@ -235,19 +235,10 @@ type
   NodeRegistry* = ref object
     nodes*: stdtables.Table[uint16, ClusterNodeEntry]
     mu*: Lock
-    ## Rebalance operation counters (atomic for lock-free reads)
-    rebalancePending*: Atomic[uint32]
-    rebalanceInProgress*: Atomic[uint32]
-    rebalanceCompleted*: Atomic[uint32]
-    rebalanceFailed*: Atomic[uint32]
 
 proc newNodeRegistry*(): NodeRegistry =
   result = NodeRegistry(nodes: stdtables.initTable[uint16, ClusterNodeEntry]())
   initLock(result.mu)
-  result.rebalancePending.store(0)
-  result.rebalanceInProgress.store(0)
-  result.rebalanceCompleted.store(0)
-  result.rebalanceFailed.store(0)
 
 proc addNode*(reg: NodeRegistry, entry: ClusterNodeEntry) {.gcsafe, raises: [].} =
   acquire(reg.mu)
@@ -454,11 +445,6 @@ var threadStore {.global.}: seq[ref Thread[ClientLoopArgs]] = @[]
 var acceptThreadStore {.global.}: seq[ref Thread[AcceptLoopArgs]] = @[]
 var threadStoreMu {.global.}: Lock
 initLock(threadStoreMu)
-
-# Global rebalance monitor thread
-var gRebalThread {.global.}: ref Thread[int] = nil
-var gRebalRunning {.global.}: Atomic[bool]
-var gRebalStorePtr {.global.}: pointer = nil
 
 # ---------------------------------------------------------------------------
 
@@ -1624,15 +1610,6 @@ proc handleBuiltinCluster(server: ProtocolServer, conn: ClientConnection,
     let resp = clusterMsgs.ListNodesResponse(nodes: nodes)
     sendFrame(conn, clusterMsgs.encodeListNodesResponse(resp), requestId)
 
-  of uint16(mtRebalanceStatus):
-    let resp = clusterMsgs.RebalanceStatusResponse(
-      pending: server.nodeRegistry.rebalancePending.load(),
-      inProgress: server.nodeRegistry.rebalanceInProgress.load(),
-      completed: server.nodeRegistry.rebalanceCompleted.load(),
-      failed: server.nodeRegistry.rebalanceFailed.load(),
-    )
-    sendFrame(conn, clusterMsgs.encodeRebalanceStatusResponse(resp), requestId)
-
   of uint16(mtDrainNode):
     let reqR = clusterMsgs.decodeDrainNodeRequest(payload)
     if reqR.isErr:
@@ -2789,10 +2766,17 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
         groupCount: 1,
         groupIds: @[META_GROUP_ID],
         oldGroupIds: @[],
-        rebalancing: false,
-        rebalanceWorker: 0,
-        rebalanceHeartbeat: 0,
-        rebalanceCursor: "",
+        workerState: uint8(wsrIdle),
+        workerNodeId: 0,
+        workerHeartbeat: 0,
+        checkpoint: MigrationCheckpointRecord(
+          completedTables: @[],
+          currentTable: zeroTableId(),
+          currentCursor: "",
+          keysMigrated: 0,
+          startedAtNs: 0,
+          lastProgressNs: 0,
+        ),
         createdAtNs: system_schemas.nowNs(
             if server.sharedTimer.isNil: nil else: server.sharedTimer)
       )
@@ -2837,50 +2821,6 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
     server.txnMgr.setTimeProvider(timer)
     if not server.raftCoord.isNil:
       server.raftCoord.setTimeProvider(timer)
-
-  # Start rebalance monitor thread (uses module-level globals)
-  gRebalStorePtr = cast[pointer](store)
-  gRebalRunning.store(true)
-
-  proc rebalanceMonitorThread(_: int) {.thread, gcsafe.} =
-    {.cast(gcsafe).}:
-      let rstoreRef = cast[RaftKVStoreExt](gRebalStorePtr)
-      const checkIntervalSecs = 10
-      const staleHeartbeatSecs = 30
-      while gRebalRunning.load():
-        sleep(checkIntervalSecs * 1000)
-        if not gRebalRunning.load(): break
-        # Check if coordinator is still running
-        if rstoreRef.coordinator.isNil or
-            not rstoreRef.coordinator.running.load():
-          break
-        try:
-          rstoreRef.loadSpaces()
-          acquire(rstoreRef.spacesMu)
-          var rebalSpaces: seq[SpaceInfo] = @[]
-          for sid, sp in rstoreRef.spaces:
-            if sp.rebalancing:
-              rebalSpaces.add(sp)
-          release(rstoreRef.spacesMu)
-
-          let nowSecs = getTime().toUnix()               # TODO: use timeProvider
-          let myNodeId = int(rstoreRef.coordinator.nodeId)
-          for sp in rebalSpaces:
-            let heartbeatAge = nowSecs - sp.rebalanceHeartbeat
-            if sp.rebalanceWorker == myNodeId:
-              # We are the worker — continue migration
-              rstoreRef.runRebalanceMigration(sp.spaceId)
-            elif sp.rebalanceWorker == 0 or heartbeatAge > staleHeartbeatSecs:
-              # No worker or stale heartbeat — claim and run
-              rstoreRef.runRebalanceMigration(sp.spaceId)
-        except:
-          discard
-
-  try:
-    gRebalThread = new Thread[int]
-    createThread(gRebalThread[], rebalanceMonitorThread, 0)
-  except CatchableError:
-    discard
 
   # Persist cluster membership for restart recovery
   if peers.len > 0:
@@ -2965,14 +2905,6 @@ proc stop*(server: ProtocolServer) {.raises: [].} =
     try: server.raftStore.closeChannels()
     except Exception as e: server.logger.logError(
         "RaftStore closeChannels failed: " & e.msg)
-
-  gRebalRunning.store(false)
-  if gRebalThread != nil:
-    try:
-      joinThread(gRebalThread[])
-    except:
-      discard
-    gRebalThread = nil
 
   withLock threadStoreMu:
     threadStore = @[]

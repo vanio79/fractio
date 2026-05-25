@@ -255,15 +255,22 @@ suite "SpaceInfo Type":
       replicas: 3,
       groupIds: @[genGroupIDLocal()],
       oldGroupIds: @[],
-      rebalancing: false,
-      rebalanceWorker: 0,
-      rebalanceHeartbeat: 0,
-      rebalanceCursor: ""
+      workerState: wsIdle,
+      workerNodeId: 0,
+      workerHeartbeat: 0,
+      checkpoint: MigrationCheckpoint(
+        completedTables: @[],
+        currentTable: zeroTableId(),
+        currentCursor: "",
+        keysMigrated: 0,
+        startedAtNs: 0,
+        lastProgressNs: 0,
+      )
     )
     check info.name == "test_space"
     check info.replicas == 3
     check info.groupIds.len == 1
-    check info.rebalancing == false
+    check info.workerState == wsIdle
 
 suite "NodeInfo Type":
 

@@ -351,7 +351,7 @@ proc fetchSpacesTable(client: FractioClient, conn: ProtocolClient,
         name: spaceRec.name,
         groupIds: spaceRec.groupIds,
         oldGroupIds: spaceRec.oldGroupIds,
-        rebalancing: spaceRec.rebalancing
+        rebalancing: spaceRec.workerState != uint8(wsrIdle)
       )
 
   return okFetch()
@@ -1653,7 +1653,7 @@ proc createSpace*(client: FractioClient, name: string,
         name: spaceRec.name,
         groupIds: spaceRec.groupIds,
         oldGroupIds: spaceRec.oldGroupIds,
-        rebalancing: spaceRec.rebalancing
+        rebalancing: spaceRec.workerState != uint8(wsrIdle)
       )
 
       # Parse and cache all group records

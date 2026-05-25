@@ -17,7 +17,7 @@ from fractio/core/types import genULIDLocal, genSpaceIDLocal, genTableIdLocal,
 import fractio/protocol/raft_store
 import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
-import fractio/distributed/raft/group_types 
+import fractio/distributed/raft/group_types
 import fractio/distributed/meta/system_tables
 import fractio/distributed/meta/system_schemas
 import fractio/storage/wisckey_backend
@@ -100,10 +100,10 @@ suite "Space rebalance — SpaceInfo fields":
       replicas: 2,
       groupIds: @[groupIDFromInt(100), groupIDFromInt(101)],
     )
-    check space.rebalancing == false
-    check space.rebalanceWorker == 0
-    check space.rebalanceHeartbeat == 0
-    check space.rebalanceCursor == ""
+    check space.workerState == wsIdle
+    check space.workerNodeId == 0
+    check space.workerHeartbeat == 0
+    check space.checkpoint.currentCursor == ""
     check space.oldGroupIds.len == 0
 
   test "SpaceInfo with all rebalance fields set":
@@ -114,15 +114,22 @@ suite "Space rebalance — SpaceInfo fields":
       groupIds: @[groupIDFromInt(110), groupIDFromInt(111), groupIDFromInt(
           112)],
       oldGroupIds: @[groupIDFromInt(100), groupIDFromInt(101)],
-      rebalancing: true,
-      rebalanceWorker: 3,
-      rebalanceHeartbeat: 1741700000'i64,
-      rebalanceCursor: "/t/0000000100/d/m",
+      workerState: wsMigrating,
+      workerNodeId: 3,
+      workerHeartbeat: 1741700000'i64,
+      checkpoint: MigrationCheckpoint(
+        completedTables: @[],
+        currentTable: zeroTableId(),
+        currentCursor: "/t/0000000100/d/m",
+        keysMigrated: 42,
+        startedAtNs: 1741700000_000000'i64,
+        lastProgressNs: 1741700050_000000'i64,
+      ),
     )
-    check space.rebalancing == true
-    check space.rebalanceWorker == 3
-    check space.rebalanceHeartbeat == 1741700000'i64
-    check space.rebalanceCursor == "/t/0000000100/d/m"
+    check space.workerState != wsIdle
+    check space.workerNodeId == 3
+    check space.workerHeartbeat == 1741700000'i64
+    check space.checkpoint.currentCursor == "/t/0000000100/d/m"
     check space.oldGroupIds.len == 2
     check space.groupIds.len == 3
 
@@ -146,10 +153,17 @@ suite "Space rebalance — loadSpaces parses rebalance fields":
       groupIds: @[groupIDFromInt(110), groupIDFromInt(111), groupIDFromInt(
           112)],
       oldGroupIds: @[groupIDFromInt(100), groupIDFromInt(101)],
-      rebalancing: true,
-      rebalanceWorker: 3,
-      rebalanceHeartbeat: 1741700000'i64,
-      rebalanceCursor: "/t/0000000100/d/key42",
+      workerState: uint8(wsrMigrating),
+      workerNodeId: 3,
+      workerHeartbeat: 1741700000'i64,
+      checkpoint: MigrationCheckpointRecord(
+        completedTables: @[],
+        currentTable: zeroTableId(),
+        currentCursor: "/t/0000000100/d/key42",
+        keysMigrated: 0,
+        startedAtNs: 0,
+        lastProgressNs: 0,
+      ),
     )
     discard store.sysTablePut(spaceKey, spaceRec.encode())
     # Wait for Raft commit to apply
@@ -163,16 +177,16 @@ suite "Space rebalance — loadSpaces parses rebalance fields":
     check sp.name == "rebaltest"
     check sp.groupIds.len == 3
     check sp.oldGroupIds.len == 2
-    check sp.rebalancing == true
-    check sp.rebalanceWorker == 3
-    check sp.rebalanceHeartbeat == 1741700000'i64
-    check sp.rebalanceCursor == "/t/0000000100/d/key42"
+    check sp.workerState != wsIdle
+    check sp.workerNodeId == 3
+    check sp.workerHeartbeat == 1741700000'i64
+    check sp.checkpoint.currentCursor == "/t/0000000100/d/key42"
 
-  test "loadSpaces with missing rebalance fields uses defaults":
+  test "loadSpaces with default fields uses idle state":
     let (coord, store) = makeStore("/tmp/fractio_sr_rebal_t02", @[])
     defer: teardown(coord, "/tmp/fractio_sr_rebal_t02")
 
-    # Write a space record WITHOUT rebalance fields (backward compat)
+    # Write a space record with default rebalance fields (idle state)
     let spaceId = genSpaceIDLocal()
     let spaceKey = encodeSpaceKey(spaceId)
     let spaceRec = SpaceRecord(
@@ -181,6 +195,18 @@ suite "Space rebalance — loadSpaces parses rebalance fields":
       replicas: 1,
       groupCount: 1,
       groupIds: @[groupIDFromInt(100)],
+      oldGroupIds: @[],
+      workerState: uint8(wsrIdle),
+      workerNodeId: 0,
+      workerHeartbeat: 0,
+      checkpoint: MigrationCheckpointRecord(
+        completedTables: @[],
+        currentTable: zeroTableId(),
+        currentCursor: "",
+        keysMigrated: 0,
+        startedAtNs: 0,
+        lastProgressNs: 0,
+      ),
     )
     discard store.sysTablePut(spaceKey, spaceRec.encode())
     # Wait for Raft commit to apply
@@ -191,10 +217,10 @@ suite "Space rebalance — loadSpaces parses rebalance fields":
     let sp = store.spaces[spaceId]
     release(store.spacesMu)
 
-    check sp.rebalancing == false
-    check sp.rebalanceWorker == 0
-    check sp.rebalanceHeartbeat == 0
-    check sp.rebalanceCursor == ""
+    check sp.workerState == wsIdle
+    check sp.workerNodeId == 0
+    check sp.workerHeartbeat == 0
+    check sp.checkpoint.currentCursor == ""
     check sp.oldGroupIds.len == 0
 
 # ---------------------------------------------------------------------------
@@ -214,10 +240,17 @@ suite "Space rebalance — updateSpaceRecord":
       groupIds: @[groupIDFromInt(110), groupIDFromInt(111), groupIDFromInt(
           112)],
       oldGroupIds: @[groupIDFromInt(100), groupIDFromInt(101)],
-      rebalancing: true,
-      rebalanceWorker: 1,
-      rebalanceHeartbeat: 9999'i64,
-      rebalanceCursor: "/t/0000000100/d/abc",
+      workerState: wsMigrating,
+      workerNodeId: 1,
+      workerHeartbeat: 9999'i64,
+      checkpoint: MigrationCheckpoint(
+        completedTables: @[],
+        currentTable: zeroTableId(),
+        currentCursor: "/t/0000000100/d/abc",
+        keysMigrated: 123,
+        startedAtNs: 9999000000'i64,
+        lastProgressNs: 9999500000'i64,
+      ),
     )
     discard store.updateSpaceRecord(space)
     # Wait for Raft commit to apply
@@ -232,10 +265,11 @@ suite "Space rebalance — updateSpaceRecord":
     check loaded.replicas == 2
     check loaded.groupIds.len == 3
     check loaded.oldGroupIds.len == 2
-    check loaded.rebalancing == true
-    check loaded.rebalanceWorker == 1
-    check loaded.rebalanceHeartbeat == 9999'i64
-    check loaded.rebalanceCursor == "/t/0000000100/d/abc"
+    check loaded.workerState != wsIdle
+    check loaded.workerNodeId == 1
+    check loaded.workerHeartbeat == 9999'i64
+    check loaded.checkpoint.currentCursor == "/t/0000000100/d/abc"
+    check loaded.checkpoint.keysMigrated == 123
 
   test "updateSpaceRecord clears rebalance state":
     let (coord, store) = makeStore("/tmp/fractio_sr_rebal_t06", @[])
@@ -249,10 +283,17 @@ suite "Space rebalance — updateSpaceRecord":
       replicas: 1,
       groupIds: @[groupIDFromInt(110)],
       oldGroupIds: @[groupIDFromInt(100)],
-      rebalancing: true,
-      rebalanceWorker: 2,
-      rebalanceHeartbeat: 5000,
-      rebalanceCursor: "/some/key",
+      workerState: wsMigrating,
+      workerNodeId: 2,
+      workerHeartbeat: 5000,
+      checkpoint: MigrationCheckpoint(
+        completedTables: @[],
+        currentTable: zeroTableId(),
+        currentCursor: "/some/key",
+        keysMigrated: 50,
+        startedAtNs: 5000000000'i64,
+        lastProgressNs: 5001000000'i64,
+      ),
     )
     discard store.updateSpaceRecord(space)
     # Wait for Raft commit to apply
@@ -260,10 +301,17 @@ suite "Space rebalance — updateSpaceRecord":
 
     # Now clear rebalance state
     space.oldGroupIds = @[]
-    space.rebalancing = false
-    space.rebalanceWorker = 0
-    space.rebalanceHeartbeat = 0
-    space.rebalanceCursor = ""
+    space.workerState = wsIdle
+    space.workerNodeId = 0
+    space.workerHeartbeat = 0
+    space.checkpoint = MigrationCheckpoint(
+      completedTables: @[],
+      currentTable: zeroTableId(),
+      currentCursor: "",
+      keysMigrated: 0,
+      startedAtNs: 0,
+      lastProgressNs: 0,
+    )
     discard store.updateSpaceRecord(space)
     # Wait for Raft commit to apply
     os.sleep(200)
@@ -273,10 +321,10 @@ suite "Space rebalance — updateSpaceRecord":
     let loaded = store.spaces[spaceId]
     release(store.spacesMu)
 
-    check loaded.rebalancing == false
-    check loaded.rebalanceWorker == 0
+    check loaded.workerState == wsIdle
+    check loaded.workerNodeId == 0
     check loaded.oldGroupIds.len == 0
-    check loaded.rebalanceCursor == ""
+    check loaded.checkpoint.currentCursor == ""
 
 # ---------------------------------------------------------------------------
 # Suite: dual-read routing during rebalance
@@ -318,7 +366,7 @@ suite "Space rebalance — dual-read routing":
       spaceId: genSpaceIDLocal(), name: "t", replicas: 1,
       groupIds: newGroupIds,
       oldGroupIds: oldGroupIds,
-      rebalancing: true,
+      workerState: wsMigrating,
     )
 
     # Read using new routing — key was written under old routing,
@@ -349,7 +397,7 @@ suite "Space rebalance — dual-read routing":
       spaceId: genSpaceIDLocal(), name: "t", replicas: 1,
       groupIds: newGroupIds,
       oldGroupIds: oldGroupIds,
-      rebalancing: true,
+      workerState: wsMigrating,
     )
     let gr = store.raftGetInSpace(key, rebalSpace, pk)
     check gr.isOk
@@ -366,7 +414,7 @@ suite "Space rebalance — dual-read routing":
       groupIds: @[groupIDFromInt(110), groupIDFromInt(111), groupIDFromInt(
           112)],
       oldGroupIds: @[groupIDFromInt(100), groupIDFromInt(101)],
-      rebalancing: true,
+      workerState: wsMigrating,
     )
     let gr = store.raftGetInSpace(
       encodeDataRowKey(genTableIdLocal(), "nonexistent"), rebalSpace, "nonexistent")
@@ -403,7 +451,7 @@ suite "Space rebalance — dual-read routing":
     let newSpace = SpaceInfo(
       spaceId: genSpaceIDLocal(), name: "t", replicas: 1,
       groupIds: newGroupIds,
-      rebalancing: false, # not rebalancing
+      workerState: wsIdle, # not rebalancing
     )
     let gr = store.raftGetInSpace(key, newSpace, testPk)
     check gr.isOk
@@ -447,7 +495,7 @@ suite "Space rebalance — dual-scan routing":
       spaceId: genSpaceIDLocal(), name: "t", replicas: 1,
       groupIds: newGroupIds,
       oldGroupIds: oldGroupIds,
-      rebalancing: true,
+      workerState: wsMigrating,
     )
     let startKey = encodeDataRowKey(testTableId, "")
     let endKey = encodeDataRowKey(testTableId, "\xFF")
@@ -486,7 +534,7 @@ suite "Space rebalance — dual-scan routing":
       spaceId: genSpaceIDLocal(), name: "t", replicas: 1,
       groupIds: newGroupIds,
       oldGroupIds: oldGroupIds,
-      rebalancing: true,
+      workerState: wsMigrating,
     )
     let sr = store.raftScanSpace(
         encodeDataRowKey(testTableId, ""),

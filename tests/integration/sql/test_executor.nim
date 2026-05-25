@@ -121,7 +121,17 @@ proc createTestEnv(suiteName: string): tuple[client: FractioClient,
     groupCount: 2,
     groupIds: @[META_GROUP_ID, DATA_GROUP_START_ID],
     oldGroupIds: @[],
-    rebalancing: false,
+    workerState: uint8(wsrIdle),
+    workerNodeId: 0,
+    workerHeartbeat: 0,
+    checkpoint: MigrationCheckpointRecord(
+      completedTables: @[],
+      currentTable: zeroTableId(),
+      currentCursor: "",
+      keysMigrated: 0,
+      startedAtNs: 0,
+      lastProgressNs: 0,
+    ),
     createdAtNs: 0
   )
   # Seed default database

@@ -387,24 +387,39 @@ suite "SpaceRecord":
       groupCount: 2'i32,
       groupIds: groupIds,
       oldGroupIds: oldGroupIds,
-      rebalancing: true,
-      rebalanceWorker: 5'i32,
-      rebalanceHeartbeat: 1700000000'i64,
-      rebalanceCursor: "key_123",
+      workerState: uint8(wsrMigrating),
+      workerNodeId: 5'i32,
+      workerHeartbeat: 1700000000'i64,
+      checkpoint: MigrationCheckpointRecord(
+        completedTables: @[genTableIdLocal()],
+        currentTable: genTableIdLocal(),
+        currentCursor: "key_123",
+        keysMigrated: 100'i64,
+        startedAtNs: 1600000000'i64,
+        lastProgressNs: 1699999999'i64,
+      ),
       createdAtNs: 1600000000'i64
     )
     let encoded = encode(rec)
     let decoded = decodeSpaceRecord(encoded)
+    let migratedTableId = rec.checkpoint.completedTables[0]
+    let curTableId = rec.checkpoint.currentTable
     check decoded.spaceId == spaceId
     check decoded.name == "default_space"
     check decoded.replicas == 3'i32
     check decoded.groupCount == 2'i32
     check decoded.groupIds.len == 2
     check decoded.oldGroupIds.len == 1
-    check decoded.rebalancing == true
-    check decoded.rebalanceWorker == 5'i32
-    check decoded.rebalanceHeartbeat == 1700000000'i64
-    check decoded.rebalanceCursor == "key_123"
+    check decoded.workerState == uint8(wsrMigrating)
+    check decoded.workerNodeId == 5'i32
+    check decoded.workerHeartbeat == 1700000000'i64
+    check decoded.checkpoint.completedTables.len == 1
+    check decoded.checkpoint.completedTables[0] == migratedTableId
+    check decoded.checkpoint.currentTable == curTableId
+    check decoded.checkpoint.currentCursor == "key_123"
+    check decoded.checkpoint.keysMigrated == 100'i64
+    check decoded.checkpoint.startedAtNs == 1600000000'i64
+    check decoded.checkpoint.lastProgressNs == 1699999999'i64
     check decoded.createdAtNs == 1600000000'i64
 
   test "encode/decode roundtrip not rebalancing":
@@ -416,17 +431,24 @@ suite "SpaceRecord":
       groupCount: 10'i32,
       groupIds: @[genGroupIDLocal()],
       oldGroupIds: @[],
-      rebalancing: false,
-      rebalanceWorker: -1'i32,
-      rebalanceHeartbeat: 0'i64,
-      rebalanceCursor: "",
+      workerState: uint8(wsrIdle),
+      workerNodeId: -1'i32,
+      workerHeartbeat: 0'i64,
+      checkpoint: MigrationCheckpointRecord(
+        completedTables: @[],
+        currentTable: zeroTableId(),
+        currentCursor: "",
+        keysMigrated: 0'i64,
+        startedAtNs: 0'i64,
+        lastProgressNs: 0'i64,
+      ),
       createdAtNs: 0'i64
     )
     let encoded = encode(rec)
     let decoded = decodeSpaceRecord(encoded)
-    check decoded.rebalancing == false
+    check decoded.workerState == uint8(wsrIdle)
     check decoded.oldGroupIds.len == 0
-    check decoded.rebalanceCursor == ""
+    check decoded.checkpoint.currentCursor == ""
 
   test "encode/decode roundtrip empty groupIds":
     let spaceId = genSpaceIDLocal()
@@ -437,10 +459,17 @@ suite "SpaceRecord":
       groupCount: 0'i32,
       groupIds: @[],
       oldGroupIds: @[],
-      rebalancing: false,
-      rebalanceWorker: 0'i32,
-      rebalanceHeartbeat: 0'i64,
-      rebalanceCursor: "",
+      workerState: uint8(wsrIdle),
+      workerNodeId: 0'i32,
+      workerHeartbeat: 0'i64,
+      checkpoint: MigrationCheckpointRecord(
+        completedTables: @[],
+        currentTable: zeroTableId(),
+        currentCursor: "",
+        keysMigrated: 0'i64,
+        startedAtNs: 0'i64,
+        lastProgressNs: 0'i64,
+      ),
       createdAtNs: 100'i64
     )
     let encoded = encode(rec)
@@ -457,17 +486,24 @@ suite "SpaceRecord":
       groupCount: -5'i32,
       groupIds: @[],
       oldGroupIds: @[],
-      rebalancing: false,
-      rebalanceWorker: -100'i32,
-      rebalanceHeartbeat: -999999'i64,
-      rebalanceCursor: "",
+      workerState: uint8(wsrIdle),
+      workerNodeId: -100'i32,
+      workerHeartbeat: -999999'i64,
+      checkpoint: MigrationCheckpointRecord(
+        completedTables: @[],
+        currentTable: zeroTableId(),
+        currentCursor: "",
+        keysMigrated: 0'i64,
+        startedAtNs: 0'i64,
+        lastProgressNs: 0'i64,
+      ),
       createdAtNs: -1'i64
     )
     let encoded = encode(rec)
     let decoded = decodeSpaceRecord(encoded)
     check decoded.replicas == -1'i32
     check decoded.groupCount == -5'i32
-    check decoded.rebalanceWorker == -100'i32
+    check decoded.workerNodeId == -100'i32
 
 suite "SettingRecord":
   test "encode/decode roundtrip basic":
@@ -779,10 +815,17 @@ suite "decodeSpaceRecordFromMVCC":
       groupCount: 5'i32,
       groupIds: @[genGroupIDLocal()],
       oldGroupIds: @[],
-      rebalancing: false,
-      rebalanceWorker: 0'i32,
-      rebalanceHeartbeat: 0'i64,
-      rebalanceCursor: "",
+      workerState: uint8(wsrIdle),
+      workerNodeId: 0'i32,
+      workerHeartbeat: 0'i64,
+      checkpoint: MigrationCheckpointRecord(
+        completedTables: @[],
+        currentTable: zeroTableId(),
+        currentCursor: "",
+        keysMigrated: 0'i64,
+        startedAtNs: 0'i64,
+        lastProgressNs: 0'i64,
+      ),
       createdAtNs: 7000'i64
     )
     let payload = encode(rec)
@@ -968,10 +1011,17 @@ suite "toJson SpaceRecord":
       groupCount: 2'i32,
       groupIds: groupIds,
       oldGroupIds: oldGroupIds,
-      rebalancing: true,
-      rebalanceWorker: 5'i32,
-      rebalanceHeartbeat: 1700000000'i64,
-      rebalanceCursor: "cursor_key"
+      workerState: uint8(wsrMigrating),
+      workerNodeId: 5'i32,
+      workerHeartbeat: 1700000000'i64,
+      checkpoint: MigrationCheckpointRecord(
+        completedTables: @[genTableIdLocal()],
+        currentTable: genTableIdLocal(),
+        currentCursor: "cursor_key",
+        keysMigrated: 500'i64,
+        startedAtNs: 1600000000'i64,
+        lastProgressNs: 1699999999'i64,
+      )
     )
     let json = toJson(rec)
     check json.hasKey("spaceId")
@@ -980,7 +1030,11 @@ suite "toJson SpaceRecord":
     check json["groupCount"].getInt() == 2
     check json["groupIds"].len == 2
     check json["oldGroupIds"].len == 1
-    check json["rebalancing"].getBool() == true
-    check json["rebalanceWorker"].getInt() == 5
-    check json["rebalanceHeartbeat"].getInt() == 1700000000
-    check json["rebalanceCursor"].getStr() == "cursor_key"
+    check json["workerState"].getInt() == int(uint8(wsrMigrating))
+    check json["workerNodeId"].getInt() == 5
+    check json["workerHeartbeat"].getInt() == 1700000000
+    check json.hasKey("checkpoint")
+    check json["checkpoint"].hasKey("completedTables")
+    check json["checkpoint"].hasKey("currentTable")
+    check json["checkpoint"]["currentCursor"].getStr() == "cursor_key"
+    check json["checkpoint"]["keysMigrated"].getInt() == 500

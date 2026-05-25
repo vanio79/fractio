@@ -302,10 +302,6 @@ suite "NodeRegistry":
     let reg = newNodeRegistry()
     check reg != nil
     check reg.nodes.len == 0
-    check reg.rebalancePending.load() == 0
-    check reg.rebalanceInProgress.load() == 0
-    check reg.rebalanceCompleted.load() == 0
-    check reg.rebalanceFailed.load() == 0
 
   test "addNode":
     let reg = newNodeRegistry()

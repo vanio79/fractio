@@ -219,7 +219,9 @@ proc decodeSystemTableRecord*(tableId: TableId, rawValue: string, columns: seq[
       of "groupcount": result[i] = $rec.groupCount
       of "groupids": result[i] = rec.groupIds.mapIt($it).join(",")
       of "oldgroupids": result[i] = rec.oldGroupIds.mapIt($it).join(",")
-      of "rebalancing": result[i] = $rec.rebalancing
+      of "rebalancing": result[i] = $(rec.workerState != uint8(wsrIdle))
+      of "workerstate": result[i] = $rec.workerState
+      of "workernodeid": result[i] = $rec.workerNodeId
       of "createdat": result[i] = $rec.createdAtNs
       else: result[i] = ""
 

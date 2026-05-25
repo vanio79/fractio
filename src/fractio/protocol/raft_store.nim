@@ -214,16 +214,36 @@ proc newRaftKVStore*(coord: NuRaftCoordinator,
 # This is safe for single-node because there is only one writer.
 
 type
+  WorkerState* = enum
+    wsIdle            ## No rebalancing activity
+    wsClaimed         ## A worker has claimed the space but hasn't started yet
+    wsMigrating        ## Data migration is in progress
+    wsCuttingOver     ## Migration complete, old groups being removed
+    wsCompleted       ## Rebalancing finished (transient, clears to Idle)
+    wsFailed          ## Migration failed, will be retried
+
+  MigrationCheckpoint* = object
+    ## Tracks per-table migration progress for resumable rebalancing.
+    ## Replaces the raw `rebalanceCursor: string` which was broken for
+    ## multi-table spaces (cursor pointed to a key in table N but the
+    ## outer loop restarted from table 0).
+    completedTables*: seq[TableId]  ## Tables fully migrated
+    currentTable*: TableId          ## Table currently being migrated
+    currentCursor*: string          ## Last key migrated within currentTable
+    keysMigrated*: int64            ## Total keys migrated so far
+    startedAtNs*: int64             ## When migration started (nanoseconds)
+    lastProgressNs*: int64          ## Last checkpoint write (nanoseconds)
+
   SpaceInfo* = object
     spaceId*: SpaceID
     name*: string
     replicas*: int             ## 0 = ALL nodes
     groupIds*: seq[GroupID]
     oldGroupIds*: seq[GroupID] ## previous groups during rebalance
-    rebalancing*: bool         ## true while migration is in progress
-    rebalanceWorker*: int      ## nodeId of the migrating worker
-    rebalanceHeartbeat*: int64 ## unix epoch seconds of last worker heartbeat
-    rebalanceCursor*: string   ## last key migrated (resume point)
+    workerState*: WorkerState  ## rebalancing state machine
+    workerNodeId*: int         ## nodeId of the migrating worker (0 = unclaimed)
+    workerHeartbeat*: int64    ## unix epoch nanoseconds of last worker heartbeat
+    checkpoint*: MigrationCheckpoint  ## resumable migration progress
 
   NodeInfo* = tuple[host: string, clientPort: int]
 
@@ -249,6 +269,8 @@ type
     rebalThread*: Thread[RaftKVStoreExt]
     rebalRunning*: Atomic[bool]
     triggerRebal*: Atomic[bool]
+    migrationThread*: Thread[RaftKVStoreExt]  ## Data migration monitor thread
+    migrationRunning*: Atomic[bool]           ## Flag to stop migration thread
     stopped*: Atomic[bool] ## Set to true when stop() is called; prevents send() on closed channel
     tsProvider*: TimestampProvider ## cluster-wide HLC for MVCC timestamps
 
@@ -270,6 +292,7 @@ proc newRaftKVStoreExt*(coord: NuRaftCoordinator,
   )
   result.rebalRunning.store(false)
   result.triggerRebal.store(false)
+  result.migrationRunning.store(false)
   result.stopped.store(false)
   initLock(result.smMu)
   initLock(result.spacesMu)
@@ -394,7 +417,7 @@ proc keyRoutesToGroupIdDuringRebalance*(store: RaftKVStoreExt, key: string,
                 let space = store.spaces[spaceId]
                 newGroupIds = space.groupIds
                 oldGroupIds = space.oldGroupIds
-                rebalancing = space.rebalancing
+                rebalancing = space.workerState != wsIdle
                 hasSpace = true
 
           if hasSpace and newGroupIds.len > 0:
@@ -947,6 +970,52 @@ proc processLeaderPersistReq*(s: RaftKVStoreExt,
   except Exception:
     discard
 
+# ---------------------------------------------------------------------------
+# Data migration monitor thread
+# ---------------------------------------------------------------------------
+# Polls for spaces in rebalancing state and runs data migration.
+# Previously a global thread in server.nim with gRebalThread/gRebalRunning/
+# gRebalStorePtr; now owned by RaftKVStoreExt for testability and clean shutdown.
+
+proc runRebalanceMigration*(store: RaftKVStoreExt,
+    spaceId: SpaceID) {.raises: [].}  # forward declaration
+
+proc migrationMonitorTask(s: RaftKVStoreExt) {.thread, gcsafe, raises: [].} =
+  ## Background thread that monitors spaces for pending rebalance migrations.
+  ## When a space needs rebalancing (workerState != wsIdle), this thread claims
+  ## the worker role and calls runRebalanceMigration.
+  const checkIntervalSecs = 10
+  const staleHeartbeatNs = 30_000_000_000'i64  # 30 seconds in nanoseconds
+  while s.migrationRunning.load():
+    sleep(checkIntervalSecs * 1000)
+    if not s.migrationRunning.load(): break
+    # Check if coordinator is still running
+    if s.coordinator.isNil or not s.coordinator.running.load():
+      break
+    {.cast(gcsafe).}:
+      {.cast(raises: []).}:
+        try:
+          s.loadSpaces()
+          acquire(s.spacesMu)
+          var rebalSpaces: seq[SpaceInfo] = @[]
+          for sid, sp in s.spaces:
+            if sp.workerState != wsIdle:
+              rebalSpaces.add(sp)
+          release(s.spacesMu)
+
+          let nowNs = s.nowNs()
+          let myNodeId = int(s.coordinator.nodeId)
+          for sp in rebalSpaces:
+            let heartbeatAge = nowNs - sp.workerHeartbeat
+            if sp.workerNodeId == myNodeId:
+              # We are the worker — continue migration
+              s.runRebalanceMigration(sp.spaceId)
+            elif sp.workerNodeId == 0 or heartbeatAge > staleHeartbeatNs:
+              # No worker or stale heartbeat — claim and run
+              s.runRebalanceMigration(sp.spaceId)
+        except:
+          discard
+
 proc rebalanceLeadershipTask(s: RaftKVStoreExt) {.thread, gcsafe, raises: [].} =
   ## Monitoring thread that yields leadership if this node is the current leader
   ## but not the preferred leader for a group. Also processes async leader
@@ -1162,7 +1231,7 @@ proc wireApplyCallback*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
         var isRebalancingOldGroup = false
         withLock s.spacesMu:
           for spaceId, space in s.spaces:
-            if space.rebalancing and groupId in space.oldGroupIds:
+            if space.workerState != wsIdle and groupId in space.oldGroupIds:
               isRebalancingOldGroup = true
               break
 
@@ -1183,10 +1252,15 @@ proc wireApplyCallback*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
 
   store.coordinator.kvStorePtr = cast[pointer](store)
   store.rebalRunning.store(true)
+  store.migrationRunning.store(true)
   try:
     createThread(store.rebalThread, rebalanceLeadershipTask, store)
   except CatchableError:
     store.rebalRunning.store(false)
+  try:
+    createThread(store.migrationThread, migrationMonitorTask, store)
+  except CatchableError:
+    store.migrationRunning.store(false)
 
 proc bootstrapStore*(store: RaftKVStoreExt,
     groupIds: seq[GroupID]) {.gcsafe, raises: [].} =
@@ -1197,11 +1271,21 @@ proc bootstrapStore*(store: RaftKVStoreExt,
   store.wireApplyCallback()
 
 proc stop*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
-  ## Stop the rebalancing thread and clean up resources.
+  ## Stop the rebalancing and migration threads and clean up resources.
   ## Must be called before coordinator.stop() to ensure clean shutdown.
   # Set stopped flag FIRST to prevent onLeaderChanged callbacks from
   # sending to leaderPersistChan after we start shutting down.
   store.stopped.store(true)
+
+  if store.migrationRunning.load():
+    store.migrationRunning.store(false)
+    # Wait for migration thread to finish (with timeout)
+    for _ in 0 ..< 30: # 3 seconds max
+      try:
+        joinThread(store.migrationThread)
+        break
+      except:
+        sleep(100)
 
   if store.rebalRunning.load():
     store.rebalRunning.store(false)
@@ -1393,7 +1477,7 @@ proc validateKeyRouting(store: RaftKVStoreExt, key: string,
         let expected = routeToGroup(pk, space.groupIds)
         if expected != groupId:
           # During rebalancing, also check if the key routes to an old group
-          if space.rebalancing and space.oldGroupIds.len > 0:
+          if space.workerState != wsIdle and space.oldGroupIds.len > 0:
             let oldExpected = routeToGroup(pk, space.oldGroupIds)
             if oldExpected == groupId:
               # Key routes to an old group during rebalancing - this is valid
@@ -1817,10 +1901,17 @@ proc parseSpaceInfoFromBinary*(data: string): Option[SpaceInfo] {.gcsafe,
         replicas: spaceRec.replicas,
         groupIds: spaceRec.groupIds,
         oldGroupIds: spaceRec.oldGroupIds,
-        rebalancing: spaceRec.rebalancing,
-        rebalanceWorker: spaceRec.rebalanceWorker,
-        rebalanceHeartbeat: spaceRec.rebalanceHeartbeat,
-        rebalanceCursor: spaceRec.rebalanceCursor,
+        workerState: WorkerState(spaceRec.workerState),
+        workerNodeId: int(spaceRec.workerNodeId),
+        workerHeartbeat: spaceRec.workerHeartbeat,
+        checkpoint: MigrationCheckpoint(
+          completedTables: spaceRec.checkpoint.completedTables,
+          currentTable: spaceRec.checkpoint.currentTable,
+          currentCursor: spaceRec.checkpoint.currentCursor,
+          keysMigrated: spaceRec.checkpoint.keysMigrated,
+          startedAtNs: spaceRec.checkpoint.startedAtNs,
+          lastProgressNs: spaceRec.checkpoint.lastProgressNs,
+        ),
       )
       # Accept any spaceId, including zeroSpaceID() for test purposes
       return some(info)
@@ -2448,7 +2539,7 @@ proc raftPutInSpaceBoth*(store: RaftKVStoreExt, key, value: string,
         newResult = store.forwardPutToLeader(newRid, key, value)
 
   # If rebalancing, also write to the old group (best-effort)
-  if space.rebalancing and space.oldGroupIds.len > 0:
+  if space.workerState != wsIdle and space.oldGroupIds.len > 0:
     let oldRid = routeToGroup(primaryKey, space.oldGroupIds)
     if oldRid != newRid:
       {.cast(raises: []).}:
@@ -2527,7 +2618,7 @@ proc raftGetInSpace*(store: RaftKVStoreExt, key: string,
   var lastError: Option[RaftStoreError]
 
   # During rebalancing, try old group first (it has the data)
-  if space.rebalancing and space.oldGroupIds.len > 0:
+  if space.workerState != wsIdle and space.oldGroupIds.len > 0:
     let oldRid = routeToGroup(primaryKey, space.oldGroupIds)
     if oldRid != newRid:
       let oldRes = store.raftGetInSpaceFromGroup(key, oldRid)
@@ -2602,7 +2693,7 @@ proc raftDeleteInSpace*(store: RaftKVStoreExt, key: string,
         newResult = store.forwardDeleteToLeader(newRid, key)
 
   # If rebalancing, also delete from the old group (best-effort)
-  if space.rebalancing and space.oldGroupIds.len > 0:
+  if space.workerState != wsIdle and space.oldGroupIds.len > 0:
     let oldRid = routeToGroup(primaryKey, space.oldGroupIds)
     if oldRid != newRid:
       {.cast(raises: []).}:
@@ -2649,7 +2740,7 @@ proc raftScanSpace*(store: RaftKVStoreExt, startKey, endKey: string,
 
   # Collect all group IDs to scan (old + new during rebalancing)
   var allGidsToScan = space.groupIds
-  if space.rebalancing:
+  if space.workerState != wsIdle:
     for ogid in space.oldGroupIds:
       if ogid notin allGidsToScan:
         allGidsToScan.add(ogid)
@@ -2676,7 +2767,7 @@ proc raftScanSpace*(store: RaftKVStoreExt, startKey, endKey: string,
               let routedGid = routeToGroup(pk, space.groupIds)
               # Include if it routes to new groups OR (during rebalancing) old groups
               var matches = (routedGid == gid)
-              if not matches and space.rebalancing:
+              if not matches and space.workerState != wsIdle:
                 let oldRoutedGid = routeToGroup(pk,
                     space.oldGroupIds)
                 matches = (oldRoutedGid == gid)
@@ -2769,10 +2860,17 @@ proc updateSpaceRecord*(store: RaftKVStoreExt, space: SpaceInfo): bool {.gcsafe,
     groupCount: int32(space.groupIds.len),
     groupIds: space.groupIds,
     oldGroupIds: space.oldGroupIds,
-    rebalancing: space.rebalancing,
-    rebalanceWorker: int32(space.rebalanceWorker),
-    rebalanceHeartbeat: space.rebalanceHeartbeat,
-    rebalanceCursor: space.rebalanceCursor,
+    workerState: uint8(space.workerState),
+    workerNodeId: int32(space.workerNodeId),
+    workerHeartbeat: space.workerHeartbeat,
+    checkpoint: MigrationCheckpointRecord(
+      completedTables: space.checkpoint.completedTables,
+      currentTable: space.checkpoint.currentTable,
+      currentCursor: space.checkpoint.currentCursor,
+      keysMigrated: space.checkpoint.keysMigrated,
+      startedAtNs: space.checkpoint.startedAtNs,
+      lastProgressNs: space.checkpoint.lastProgressNs,
+    ),
     createdAtNs: 0'i64, # Not tracked in SpaceInfo
   )
   let encoded = encode(spaceRec)
@@ -2874,14 +2972,14 @@ proc rebalanceSpaces*(store: RaftKVStoreExt) {.raises: [].} =
     for spaceId, (info, ts) in latestSpaces.pairs:
       try:
         let currentGroupCount = info.groupIds.len
-        let isRebalancing = info.rebalancing
+        let isRebalancing = info.workerState != wsIdle
         let replicas = info.replicas
 
         # Also check in-memory cache for rebalancing state
         # (may have been set by a previous call but not yet persisted)
         var inMemoryRebalancing = false
         acquire(store.spacesMu)
-        if store.spaces.hasKey(spaceId) and store.spaces[spaceId].rebalancing:
+        if store.spaces.hasKey(spaceId) and store.spaces[spaceId].workerState != wsIdle:
           inMemoryRebalancing = true
         release(store.spacesMu)
 
@@ -3124,10 +3222,17 @@ proc rebalanceSpaces*(store: RaftKVStoreExt) {.raises: [].} =
           replicas: info.replicas,
           groupIds: newGroupIds,
           oldGroupIds: oldGroupIds,
-          rebalancing: true,
-          rebalanceWorker: 0,
-          rebalanceHeartbeat: 0,
-          rebalanceCursor: "",
+          workerState: wsClaimed,
+          workerNodeId: 0,
+          workerHeartbeat: 0,
+          checkpoint: MigrationCheckpoint(
+            completedTables: @[],
+            currentTable: zeroTableId(),
+            currentCursor: "",
+            keysMigrated: 0,
+            startedAtNs: 0,
+            lastProgressNs: 0,
+          ),
         )
         if not store.updateSpaceRecord(space):
           {.cast(raises: []).}:
@@ -3154,6 +3259,13 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: SpaceID) {.raises: [
   ##   2. At end, remove old group definitions (data is accessible via new groups)
   ##
   ## During migration, raftGetInSpace handles dual-read from both old and new groups.
+  ##
+  ## State machine:
+  ##   wsClaimed → wsMigrating → wsCuttingOver → wsCompleted → (clears to wsIdle)
+  ##
+  ## The checkpoint tracks per-table progress so that resumption after a crash
+  ## correctly skips already-completed tables and resumes from the right cursor
+  ## within the current table.
   {.cast(raises: []).}:
     # Read current space state
     acquire(store.spacesMu)
@@ -3163,14 +3275,23 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: SpaceID) {.raises: [
       space = store.spaces[spaceId]
       found = true
     release(store.spacesMu)
-    if not found or not space.rebalancing: return
+    # Only proceed if space is in a state that requires migration work
+    if not found: return
+    case space.workerState
+    of wsIdle, wsCompleted: return
+    of wsFailed: return  # Will be retried by monitor after heartbeat timeout
+    of wsClaimed, wsMigrating, wsCuttingOver: discard  # proceed
 
     let myNodeId = int(store.coordinator.nodeId)
+    let nowNs = store.nowNs()
 
-    # Claim worker role
-    let nowSecs = store.nowNs() div 1_000_000_000
-    space.rebalanceWorker = myNodeId
-    space.rebalanceHeartbeat = nowSecs
+    # Claim or re-claim worker role and transition to wsMigrating
+    space.workerState = wsMigrating
+    space.workerNodeId = myNodeId
+    space.workerHeartbeat = nowNs
+    # Set startedAtNs if this is a fresh claim (not a resume)
+    if space.checkpoint.startedAtNs == 0:
+      space.checkpoint.startedAtNs = nowNs
     if not store.updateSpaceRecord(space):
       # Cannot claim worker role - not the leader or Raft issue
       {.cast(raises: []).}:
@@ -3217,6 +3338,11 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: SpaceID) {.raises: [
             tableIds.add(tableRec.tableId)
         except: discard
 
+    # Build a set of already-completed tables from the checkpoint for O(1) lookup
+    var completedSet = tables.initTable[TableId, bool]()
+    for tid in space.checkpoint.completedTables:
+      completedSet[tid] = true
+
     # Debug: log migration start state
     {.cast(raises: []).}:
       {.cast(gcsafe).}:
@@ -3225,25 +3351,35 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: SpaceID) {.raises: [
           "oldGroupIds": $oldGroupIds,
           "newGroupIds": $newGroupIds,
           "tableIds": $tableIds.len,
-          "rebalancing": $space.rebalancing
+          "workerState": $space.workerState,
+          "completedTables": $space.checkpoint.completedTables.len
         }.toTable)
 
-    var keysMigrated = 0
-    var lastHeartbeat = nowSecs
+    var keysMigrated = space.checkpoint.keysMigrated
     let backend = store.getBackend()
     if backend == nil or not backend.isOpen: return
 
-    # Migrate each table
+    # Migrate each table, skipping already-completed ones
     for tableId in tableIds:
+      if not store.coordinator.running.load(): return
+
+      # Skip tables that were already completed (resume support)
+      if completedSet.hasKey(tableId):
+        continue
+
       let startKey = encodeTableKey(tableId, "d/")
       let endKey = encodeTableKey(tableId, "e")           # just past "d/" range
 
+      # If we're resuming and this is the current table from the checkpoint,
+      # start from the checkpoint cursor instead of the beginning
+      var scanStart = startKey
+      if space.checkpoint.currentTable == tableId and
+          space.checkpoint.currentCursor != "":
+        scanStart = space.checkpoint.currentCursor
+
       # Scan from backend (all groups share one backend)
       var entries: seq[KeyValuePair] = @[]
-      entries = backend.scan(
-        if space.rebalanceCursor != "": space.rebalanceCursor
-        else: startKey,
-        endKey)
+      entries = backend.scan(scanStart, endKey)
 
       # Debug: log scan results
       {.cast(raises: []).}:
@@ -3255,6 +3391,10 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: SpaceID) {.raises: [
             "entriesFound": $entries.len,
             "tableIds": $tableIds.len
           }.toTable)
+
+      # Update checkpoint to mark this table as current
+      space.checkpoint.currentTable = tableId
+      space.checkpoint.currentCursor = ""
 
       for (k, v) in entries:
         if not store.coordinator.running.load(): return
@@ -3300,7 +3440,10 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: SpaceID) {.raises: [
               writeResult = store.forwardPutToLeader(newRid, k, v)
               inc retries
             if not writeResult.isOk:
-              # Migration failed - cannot proceed
+              # Migration failed - mark as failed and return
+              space.workerState = wsFailed
+              space.checkpoint.lastProgressNs = store.nowNs()
+              discard store.updateSpaceRecord(space)
               debug("runRebalanceMigration: forwardPutToLeader failed",
                 {"spaceId": $spaceId, "key": $k, "newGroup": $newRid,
                  "error": $writeResult.error}.toTable)
@@ -3312,33 +3455,45 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: SpaceID) {.raises: [
 
           inc keysMigrated
 
-          # Update cursor and heartbeat periodically
+          # Update checkpoint and heartbeat periodically
           if keysMigrated mod 100 == 0:
-            let curNow = store.nowNs() div 1_000_000_000
+            let curNow = store.nowNs()
             # Re-read space to check if we're still the worker
             acquire(store.spacesMu)
             if store.spaces.hasKey(spaceId):
               let curSpace = store.spaces[spaceId]
-              if curSpace.rebalanceWorker != myNodeId:
+              if curSpace.workerNodeId != myNodeId:
                 release(store.spacesMu)
                 return # Another node took over
             release(store.spacesMu)
 
-            space.rebalanceCursor = k
-            space.rebalanceHeartbeat = curNow
+            space.checkpoint.currentCursor = k
+            space.checkpoint.keysMigrated = keysMigrated
+            space.checkpoint.lastProgressNs = curNow
+            space.workerHeartbeat = curNow
             if not store.updateSpaceRecord(space):
               {.cast(raises: []).}:
                 {.cast(gcsafe).}:
-                  warn("runRebalanceMigration: failed to update cursor/heartbeat",
+                  warn("runRebalanceMigration: failed to update checkpoint/heartbeat",
                     {"spaceId": $spaceId}.toTable)
             # Note: Don't call loadSpaces() here - it would read stale data
-            lastHeartbeat = curNow
         except:
           continue
+
+      # Mark this table as completed in the checkpoint
+      space.checkpoint.completedTables.add(tableId)
+      space.checkpoint.currentCursor = ""
+      space.checkpoint.keysMigrated = keysMigrated
+      space.checkpoint.lastProgressNs = store.nowNs()
+      discard store.updateSpaceRecord(space)
 
     # Phase 3: Cutover — migration complete
     # All writes are already committed (proposeWrite and forwardPutToLeader
     # are synchronous - they wait for Raft commit before returning).
+    space.workerState = wsCuttingOver
+    space.checkpoint.lastProgressNs = store.nowNs()
+    discard store.updateSpaceRecord(space)
+
     debug("runRebalanceMigration: starting cutover", {"spaceId": $spaceId,
         "oldGroupIds": $oldGroupIds, "newGroupIds": $newGroupIds,
         "keysMigrated": $keysMigrated}.toTable)
@@ -3353,12 +3508,19 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: SpaceID) {.raises: [
       if coord.hasGroup(oldGid):
         coord.removeGroup(oldGid)
 
-    # Clear rebalance state
+    # Clear rebalance state — transition to wsCompleted then wsIdle
     space.oldGroupIds = @[]
-    space.rebalancing = false
-    space.rebalanceWorker = 0
-    space.rebalanceHeartbeat = 0
-    space.rebalanceCursor = ""
+    space.workerState = wsIdle
+    space.workerNodeId = 0
+    space.workerHeartbeat = 0
+    space.checkpoint = MigrationCheckpoint(
+      completedTables: @[],
+      currentTable: zeroTableId(),
+      currentCursor: "",
+      keysMigrated: 0,
+      startedAtNs: 0,
+      lastProgressNs: 0,
+    )
     if not store.updateSpaceRecord(space):
       # Raft write failed - cannot clear rebalance state
       {.cast(raises: []).}:
@@ -3370,7 +3532,7 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: SpaceID) {.raises: [
     {.cast(raises: []).}:
       {.cast(gcsafe).}:
         debug("runRebalanceMigration: state cleared", {"spaceId": $spaceId,
-            "rebalancing": $space.rebalancing,
+            "workerState": $space.workerState,
             "oldGroupIds": $space.oldGroupIds}.toTable)
     # Wait for Raft to commit the final state
     sleep(100)

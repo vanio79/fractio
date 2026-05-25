@@ -293,6 +293,33 @@ proc decodeNodeRecordFromMVCC*(data: string): tuple[record: NodeRecord,
   result.isDeleted = false
 
 # =============================================================================
+# Worker state and migration checkpoint (for Space Record)
+# =============================================================================
+
+type
+  WorkerStateRecord* = enum
+    ## Wire-format enum for rebalancing worker state.
+    ## Stored as uint8 in binary encoding.
+    wsrIdle = 0 ## No rebalancing activity
+    wsrClaimed = 1 ## Worker claimed, migration not yet started
+    wsrMigrating = 2 ## Data migration in progress
+    wsrCuttingOver = 3 ## Migration complete, old groups being removed
+    wsrCompleted = 4 ## Rebalancing finished (transient, clears to Idle)
+    wsrFailed = 5 ## Migration failed, will be retried
+
+  MigrationCheckpointRecord* = object
+    ## Wire-format for per-table migration progress tracking.
+    ## Replaces the raw rebalanceCursor string which was broken for
+    ## multi-table spaces (cursor pointed to a key in table N but the
+    ## outer loop restarted from table 0).
+    completedTables*: seq[TableId] ## Tables fully migrated
+    currentTable*: TableId ## Table currently being migrated
+    currentCursor*: string ## Last key migrated within currentTable
+    keysMigrated*: int64 ## Total keys migrated so far
+    startedAtNs*: int64 ## When migration started (nanoseconds)
+    lastProgressNs*: int64 ## Last checkpoint write (nanoseconds)
+
+# =============================================================================
 # Space Record (sys.spaces)
 # =============================================================================
 
@@ -306,10 +333,10 @@ type
     groupCount*: int32
     groupIds*: seq[GroupID]
     oldGroupIds*: seq[GroupID] # Used during rebalancing
-    rebalancing*: bool
-    rebalanceWorker*: int32 # nodeId of the migrating worker
-    rebalanceHeartbeat*: int64 # unix epoch seconds of last worker heartbeat
-    rebalanceCursor*: string # last key migrated (resume point)
+    workerState*: uint8 # WorkerStateRecord as uint8
+    workerNodeId*: int32 # nodeId of the migrating worker (0 = unclaimed)
+    workerHeartbeat*: int64 # unix epoch nanoseconds of last worker heartbeat
+    checkpoint*: MigrationCheckpointRecord
     createdAtNs*: int64
 
 proc encode*(rec: SpaceRecord): string =
@@ -326,15 +353,19 @@ proc encode*(rec: SpaceRecord): string =
   w.writeU32(uint32(rec.oldGroupIds.len))
   for gid in rec.oldGroupIds:
     w.writeBytes(groupIDToBytes(gid))
-  # flags
-  var flags: uint8 = 0
-  if rec.rebalancing:
-    flags = flags or 0x01
-  w.writeU8(flags)
-  # rebalance tracking
-  w.writeI32(rec.rebalanceWorker)
-  w.writeI64(rec.rebalanceHeartbeat)
-  w.writeString(rec.rebalanceCursor)
+  # worker state
+  w.writeU8(rec.workerState)
+  w.writeI32(rec.workerNodeId)
+  w.writeI64(rec.workerHeartbeat)
+  # checkpoint
+  w.writeU32(uint32(rec.checkpoint.completedTables.len))
+  for tid in rec.checkpoint.completedTables:
+    w.writeBytes(tableIdToBytes(tid))
+  w.writeBytes(tableIdToBytes(rec.checkpoint.currentTable))
+  w.writeString(rec.checkpoint.currentCursor)
+  w.writeI64(rec.checkpoint.keysMigrated)
+  w.writeI64(rec.checkpoint.startedAtNs)
+  w.writeI64(rec.checkpoint.lastProgressNs)
   w.writeI64(rec.createdAtNs)
   w.finish()
 
@@ -354,13 +385,20 @@ proc decodeSpaceRecord*(data: string): SpaceRecord =
   result.oldGroupIds = newSeq[GroupID](oldGidCount)
   for i in 0..<oldGidCount:
     result.oldGroupIds[i] = groupIDFromBytes(r.readFixedString(ULID_SIZE))
-  # flags
-  let flags = r.readU8()
-  result.rebalancing = (flags and 0x01) != 0
-  # rebalance tracking
-  result.rebalanceWorker = r.readI32()
-  result.rebalanceHeartbeat = r.readI64()
-  result.rebalanceCursor = r.readString()
+  # worker state
+  result.workerState = r.readU8()
+  result.workerNodeId = r.readI32()
+  result.workerHeartbeat = r.readI64()
+  # checkpoint
+  let completedCount = int(r.readU32())
+  result.checkpoint.completedTables = newSeq[TableId](completedCount)
+  for i in 0..<completedCount:
+    result.checkpoint.completedTables[i] = tableIdFromBytes(r.readFixedString(ULID_SIZE))
+  result.checkpoint.currentTable = tableIdFromBytes(r.readFixedString(ULID_SIZE))
+  result.checkpoint.currentCursor = r.readString()
+  result.checkpoint.keysMigrated = r.readI64()
+  result.checkpoint.startedAtNs = r.readI64()
+  result.checkpoint.lastProgressNs = r.readI64()
   result.createdAtNs = r.readI64()
 
 # =============================================================================
@@ -495,6 +533,9 @@ proc toJson*(rec: SpaceRecord): JsonNode =
   var oldGroupIds = newJArray()
   for gid in rec.oldGroupIds:
     oldGroupIds.add(%($gid))
+  var completedTables = newJArray()
+  for tid in rec.checkpoint.completedTables:
+    completedTables.add(%($tid))
   result = %*{
     "spaceId": $(rec.spaceId),
     "name": rec.name,
@@ -502,10 +543,17 @@ proc toJson*(rec: SpaceRecord): JsonNode =
     "groupCount": rec.groupCount,
     "groupIds": groupIds,
     "oldGroupIds": oldGroupIds,
-    "rebalancing": rec.rebalancing,
-    "rebalanceWorker": rec.rebalanceWorker,
-    "rebalanceHeartbeat": rec.rebalanceHeartbeat,
-    "rebalanceCursor": rec.rebalanceCursor
+    "workerState": rec.workerState,
+    "workerNodeId": rec.workerNodeId,
+    "workerHeartbeat": rec.workerHeartbeat,
+    "checkpoint": %*{
+      "completedTables": completedTables,
+      "currentTable": $(rec.checkpoint.currentTable),
+      "currentCursor": rec.checkpoint.currentCursor,
+      "keysMigrated": rec.checkpoint.keysMigrated,
+      "startedAtNs": rec.checkpoint.startedAtNs,
+      "lastProgressNs": rec.checkpoint.lastProgressNs
+    }
   }
 
 # =============================================================================

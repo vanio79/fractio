@@ -1455,8 +1455,8 @@ suite "ExecutorPlanOp Formatting":
     check text.contains("users")
 
   test "formatPlanOp poPointGet":
-    let op = PlanOp(kind: poPointGet, pgTableId: genTableIdLocal(), pgKey: "pk123",
-        pgColumns: @["id", "name"])
+    let op = PlanOp(kind: poPointGet, pgTableId: genTableIdLocal(),
+        pgKey: "pk123", pgColumns: @["id", "name"])
     let text = formatPlanOp(op)
     check text.contains("PointGet")
     check text.contains("pk123")
@@ -2736,8 +2736,8 @@ suite "Executor SHOW SPACES with MockKVStore":
       name: "myspace",
       replicas: 3,
       groupCount: 5,
-      groupIds: @[genGroupIDLocal(), genGroupIDLocal(), genGroupIDLocal(), genGroupIDLocal(),
-          genGroupIDLocal()]
+      groupIds: @[genGroupIDLocal(), genGroupIDLocal(), genGroupIDLocal(),
+          genGroupIDLocal(), genGroupIDLocal()]
     )
     let key = encodeTableKey(SYS_SPACES_TABLE_ID, "myspace")
     discard mockKV.put(key, encode(spaceRec), txnId = zeroTransactionID())
@@ -3248,10 +3248,17 @@ suite "System Table Record Decoding":
       groupCount: 1,
       groupIds: @[groupId],
       oldGroupIds: @[],
-      rebalancing: false,
-      rebalanceWorker: 0,
-      rebalanceHeartbeat: 0,
-      rebalanceCursor: "",
+      workerState: uint8(wsrIdle),
+      workerNodeId: 0,
+      workerHeartbeat: 0,
+      checkpoint: MigrationCheckpointRecord(
+        completedTables: @[],
+        currentTable: zeroTableId(),
+        currentCursor: "",
+        keysMigrated: 0,
+        startedAtNs: 0,
+        lastProgressNs: 0,
+      ),
       createdAtNs: 1234567890
     )
     let encoded = encode(spaceRec)

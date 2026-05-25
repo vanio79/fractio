@@ -22,7 +22,7 @@ import fractio/protocol/mvcc_store
 import fractio/protocol/txn_manager
 import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
-import fractio/distributed/raft/group_types 
+import fractio/distributed/raft/group_types
 import fractio/distributed/sharedtimer/mock
 import fractio/distributed/sharedtimer/types as timerTypes
 import fractio/core/timestamp_provider
@@ -166,10 +166,17 @@ proc createMultiGroupTestStore(testDir: string,
     groupCount: int32(groupCount),
     groupIds: groupIds,   # seq[GroupID] directly
     oldGroupIds: @[],
-    rebalancing: false,
-    rebalanceWorker: 0,
-    rebalanceHeartbeat: 0,
-    rebalanceCursor: "",
+    workerState: uint8(wsrIdle),
+    workerNodeId: 0,
+    workerHeartbeat: 0,
+    checkpoint: MigrationCheckpointRecord(
+      completedTables: @[],
+      currentTable: zeroTableId(),
+      currentCursor: "",
+      keysMigrated: 0,
+      startedAtNs: 0,
+      lastProgressNs: 0,
+    ),
     createdAtNs: 0
   )
   discard store.sysTablePut(spaceKey, encode(spaceRec))

@@ -527,7 +527,17 @@ proc createSpace*(sm: SpaceManager, req: CreateSpaceRequest): CreateSpaceRespons
       groupCount: int32(groupCount),
       groupIds: groupIds,
       oldGroupIds: @[],
-      rebalancing: false,
+      workerState: uint8(wsrIdle),
+      workerNodeId: 0,
+      workerHeartbeat: 0,
+      checkpoint: MigrationCheckpointRecord(
+        completedTables: @[],
+        currentTable: zeroTableId(),
+        currentCursor: "",
+        keysMigrated: 0,
+        startedAtNs: 0,
+        lastProgressNs: 0,
+      ),
       createdAtNs: nowNs()
     )
     let spaceKey = encodeTableKey(SYS_SPACES_TABLE_ID, $spaceId)

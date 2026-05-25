@@ -150,7 +150,17 @@ suite "Space Record Encoding/Decoding":
       groupCount: 3,
       groupIds: groupIds,
       oldGroupIds: @[],
-      rebalancing: false,
+      workerState: uint8(wsrIdle),
+      workerNodeId: 0,
+      workerHeartbeat: 0,
+      checkpoint: MigrationCheckpointRecord(
+        completedTables: @[],
+        currentTable: zeroTableId(),
+        currentCursor: "",
+        keysMigrated: 0,
+        startedAtNs: 0,
+        lastProgressNs: 0,
+      ),
       createdAtNs: nowNs()
     )
     let encoded = encode(rec)
@@ -161,7 +171,7 @@ suite "Space Record Encoding/Decoding":
     check decoded.replicas == 3
     check decoded.groupCount == 3
     check decoded.groupIds.len == 3
-    check decoded.rebalancing == false
+    check decoded.workerState == uint8(wsrIdle)
 
   test "space record with rebalancing":
     let spaceId = genSpaceIDLocal()
@@ -172,19 +182,27 @@ suite "Space Record Encoding/Decoding":
       groupCount: 5,
       groupIds: @[genGroupIDLocal(), genGroupIDLocal()],
       oldGroupIds: @[genGroupIDLocal(), genGroupIDLocal(), genGroupIDLocal()],
-      rebalancing: true,
-      rebalanceWorker: 2,
-      rebalanceHeartbeat: 12345,
-      rebalanceCursor: "key123",
+      workerState: uint8(wsrMigrating),
+      workerNodeId: 2,
+      workerHeartbeat: 12345,
+      checkpoint: MigrationCheckpointRecord(
+        completedTables: @[],
+        currentTable: zeroTableId(),
+        currentCursor: "key123",
+        keysMigrated: 500,
+        startedAtNs: 12345000000'i64,
+        lastProgressNs: 12346000000'i64,
+      ),
       createdAtNs: nowNs()
     )
     let encoded = encode(rec)
     let decoded = decodeSpaceRecord(encoded)
 
-    check decoded.rebalancing == true
-    check decoded.rebalanceWorker == 2
-    check decoded.rebalanceHeartbeat == 12345
-    check decoded.rebalanceCursor == "key123"
+    check decoded.workerState == uint8(wsrMigrating)
+    check decoded.workerNodeId == 2
+    check decoded.workerHeartbeat == 12345
+    check decoded.checkpoint.currentCursor == "key123"
+    check decoded.checkpoint.keysMigrated == 500
     check decoded.oldGroupIds.len == 3
 
   test "space record with empty groupIds":
@@ -196,7 +214,17 @@ suite "Space Record Encoding/Decoding":
       groupCount: 0,
       groupIds: @[],
       oldGroupIds: @[],
-      rebalancing: false,
+      workerState: uint8(wsrIdle),
+      workerNodeId: 0,
+      workerHeartbeat: 0,
+      checkpoint: MigrationCheckpointRecord(
+        completedTables: @[],
+        currentTable: zeroTableId(),
+        currentCursor: "",
+        keysMigrated: 0,
+        startedAtNs: 0,
+        lastProgressNs: 0,
+      ),
       createdAtNs: nowNs()
     )
     let encoded = encode(rec)
@@ -477,10 +505,20 @@ suite "JSON Serialization":
       groupCount: 1,
       groupIds: @[genGroupIDLocal()],
       oldGroupIds: @[],
-      rebalancing: false,
+      workerState: uint8(wsrIdle),
+      workerNodeId: 0,
+      workerHeartbeat: 0,
+      checkpoint: MigrationCheckpointRecord(
+        completedTables: @[],
+        currentTable: zeroTableId(),
+        currentCursor: "",
+        keysMigrated: 0,
+        startedAtNs: 0,
+        lastProgressNs: 0,
+      ),
       createdAtNs: nowNs()
     )
     let json = toJson(rec)
     check json{"name"}.getStr == "test"
     check json{"replicas"}.getInt == 3
-    check json{"rebalancing"}.getBool == false
+    check json{"workerState"}.getInt == 0

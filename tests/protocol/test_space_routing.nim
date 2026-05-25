@@ -405,10 +405,17 @@ suite "Space routing — cache loading":
       groupCount: 2,
       groupIds: space.groupIds, # seq[GroupID] directly
       oldGroupIds: @[],
-      rebalancing: false,
-      rebalanceWorker: 0,
-      rebalanceHeartbeat: 0,
-      rebalanceCursor: "",
+      workerState: uint8(wsrIdle),
+      workerNodeId: 0,
+      workerHeartbeat: 0,
+      checkpoint: MigrationCheckpointRecord(
+        completedTables: @[],
+        currentTable: zeroTableId(),
+        currentCursor: "",
+        keysMigrated: 0,
+        startedAtNs: 0,
+        lastProgressNs: 0,
+      ),
       createdAtNs: 0
     )
     discard store.raftPut(spaceKey, encode(spaceRec))

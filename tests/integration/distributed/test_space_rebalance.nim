@@ -875,7 +875,7 @@ suite "Space rebalance integration — rebalanceSpaces":
     let sp1 = leaderStore.spaces[spaceId]
     release(leaderStore.spacesMu)
     check sp1.groupIds.len == 2
-    check sp1.rebalancing == false
+    check sp1.workerState == wsIdle
 
     # Add a 3rd node
     let t2 = nowMs()
@@ -903,7 +903,7 @@ suite "Space rebalance integration — rebalanceSpaces":
     acquire(leaderStore.spacesMu)
     let sp2 = leaderStore.spaces[spaceId]
     release(leaderStore.spacesMu)
-    check sp2.rebalancing == true
+    check sp2.workerState != wsIdle
     check sp2.groupIds.len == 3 # 3 nodes -> 3 new groups
     check sp2.oldGroupIds.len == 2 # original 2 groups
 
@@ -948,7 +948,7 @@ suite "Space rebalance integration — rebalanceSpaces":
     acquire(leaderStore.spacesMu)
     let sp = leaderStore.spaces[spaceId]
     release(leaderStore.spacesMu)
-    check sp.rebalancing == false
+    check sp.workerState == wsIdle
 
 # ---------------------------------------------------------------------------
 # Suite: reads work during rebalance (dual-read mode)
@@ -1069,7 +1069,7 @@ suite "Space rebalance integration — full migration":
     acquire(migrateLeaderStore.spacesMu)
     var sp = migrateLeaderStore.spaces[spaceId]
     release(migrateLeaderStore.spacesMu)
-    check sp.rebalancing == true
+    check sp.workerState != wsIdle
 
     # Run migration
     migrateLeaderStore.runRebalanceMigration(spaceId)
@@ -1080,16 +1080,16 @@ suite "Space rebalance integration — full migration":
     acquire(migrateLeaderStore.spacesMu)
     sp = migrateLeaderStore.spaces[spaceId]
     release(migrateLeaderStore.spacesMu)
-    check sp.rebalancing == false
+    check sp.workerState == wsIdle
     check sp.oldGroupIds.len == 0
-    check sp.rebalanceWorker == 0
+    check sp.workerNodeId == 0
 
     # Reload from backend to verify persistence
     migrateLeaderStore.loadSpaces()
     acquire(migrateLeaderStore.spacesMu)
     sp = migrateLeaderStore.spaces[spaceId]
     release(migrateLeaderStore.spacesMu)
-    check sp.rebalancing == false
+    check sp.workerState == wsIdle
     check sp.oldGroupIds.len == 0
 
     # Wait for leaders on all new space groups and refresh client metadata
@@ -1230,7 +1230,7 @@ suite "Space rebalance integration — crash safety":
     acquire(leaderStore.spacesMu)
     let sp = leaderStore.spaces[spaceId]
     release(leaderStore.spacesMu)
-    check sp.rebalancing == true
+    check sp.workerState != wsIdle
     check sp.oldGroupIds.len > 0
     check sp.groupIds.len == 3
 
