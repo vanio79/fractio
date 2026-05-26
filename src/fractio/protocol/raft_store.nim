@@ -149,7 +149,7 @@ proc isIntentKey*(k: string): bool {.inline.} =
 proc isCoordKey*(k: string): bool {.inline.} =
   k.len > COORD_PREFIX.len and k[0 ..< COORD_PREFIX.len] == COORD_PREFIX
 
-proc isVersionKey*(k: string): bool {.inline.} =
+proc isVersionKey(k: string): bool {.inline.} =
   ## Check if a key is an MVCC version key.
   ## Version key format: <userKey>\x00\x00<8 bytes timestamp>
   ## Total suffix length = 10 (2-byte separator + 8-byte timestamp)
@@ -157,7 +157,7 @@ proc isVersionKey*(k: string): bool {.inline.} =
   let sepPos = k.len - 10
   result = k[sepPos .. sepPos+1] == mvccTypes.VERSION_SEPARATOR
 
-proc isIntentKeyMvcc*(k: string): bool {.inline.} =
+proc isIntentKeyMvcc(k: string): bool {.inline.} =
   ## Check if a key is an MVCC intent key.
   ## Intent key format: <userKey>\x00\x01<16 bytes ULID txnId>
   ## Total suffix length = 18 (2-byte suffix + 16-byte ULID)

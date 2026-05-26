@@ -7,6 +7,7 @@ import fractio/core/types
 import fractio/distributed/raft/group_types
 import fractio/distributed/meta/system_tables
 import fractio/storage/mvcc/types as mvccTypes
+import fractio/protocol/mvcc_store as mvccStore
 
 suite "Intent Key Encoding":
 
@@ -331,7 +332,7 @@ suite "Intent Scavenger Constants":
   test "GC_SCAN_INTERVAL_MS value":
     check GC_SCAN_INTERVAL_MS == 30_000
 
-suite "MVCC Version Key Detection":
+suite "MVCC Version Key Detection (mvcc_store)":
 
   test "isVersionKey true - basic version key":
     var key = "user_key"
@@ -339,7 +340,7 @@ suite "MVCC Version Key Detection":
     key.add('\x00')
     for i in 0..<8:
       key.add(chr(i))
-    check isVersionKey(key) == true
+    check mvccStore.isVersionKey(key) == true
 
   test "isVersionKey true - table key with version suffix":
     var key = "/t/0000000005/1"
@@ -347,13 +348,13 @@ suite "MVCC Version Key Detection":
     key.add('\x00')
     for i in 0..<8:
       key.add(chr(i))
-    check isVersionKey(key) == true
+    check mvccStore.isVersionKey(key) == true
 
   test "isVersionKey false - regular key":
-    check isVersionKey("user_key") == false
+    check mvccStore.isVersionKey("user_key") == false
 
   test "isVersionKey false - too short":
-    check isVersionKey("abc") == false
+    check mvccStore.isVersionKey("abc") == false
 
   test "isVersionKey false - intent key (\\x00\\x01 suffix)":
     var key = "user_key"
@@ -361,7 +362,7 @@ suite "MVCC Version Key Detection":
     key.add('\x01')
     for i in 0..<16:
       key.add(chr(i))
-    check isVersionKey(key) == false
+    check mvccStore.isVersionKey(key) == false
 
   test "isVersionKey false - exactly 9 bytes":
     var key = "x"
@@ -370,7 +371,7 @@ suite "MVCC Version Key Detection":
     for i in 0..<6:
       key.add(chr(i))
     check key.len == 9
-    check isVersionKey(key) == false
+    check mvccStore.isVersionKey(key) == false
 
   test "isVersionKey true - minimum valid length (10 bytes)":
     var key = ""
@@ -379,9 +380,9 @@ suite "MVCC Version Key Detection":
     for i in 0..<8:
       key.add(chr(i))
     check key.len == 10
-    check isVersionKey(key) == true
+    check mvccStore.isVersionKey(key) == true
 
-suite "MVCC Intent Key Detection":
+suite "MVCC Intent Key Detection (mvcc_store)":
 
   test "isIntentKeyMvcc true - basic intent key":
     var key = "user_key"
@@ -389,7 +390,7 @@ suite "MVCC Intent Key Detection":
     key.add('\x01')
     for i in 0..<16:
       key.add(chr(i))
-    check isIntentKeyMvcc(key) == true
+    check mvccStore.isIntentKeyMvcc(key) == true
 
   test "isIntentKeyMvcc true - table key with intent suffix":
     var key = "/t/0000000005/1"
@@ -397,13 +398,13 @@ suite "MVCC Intent Key Detection":
     key.add('\x01')
     for i in 0..<16:
       key.add(chr(i))
-    check isIntentKeyMvcc(key) == true
+    check mvccStore.isIntentKeyMvcc(key) == true
 
   test "isIntentKeyMvcc false - regular key":
-    check isIntentKeyMvcc("user_key") == false
+    check mvccStore.isIntentKeyMvcc("user_key") == false
 
   test "isIntentKeyMvcc false - too short":
-    check isIntentKeyMvcc("abc") == false
+    check mvccStore.isIntentKeyMvcc("abc") == false
 
   test "isIntentKeyMvcc false - version key (\\x00\\x00 suffix)":
     var key = "user_key"
@@ -411,10 +412,7 @@ suite "MVCC Intent Key Detection":
     key.add('\x00')
     for i in 0..<8:
       key.add(chr(i))
-    # This is 10+8=18 bytes but \x00\x00 is version, not intent
-    # Actually key.len = 8 + 2 + 8 = 18, but the suffix at pos [0,1] from end-18
-    # is the first two chars of "user_key", not \x00\x01
-    check isIntentKeyMvcc(key) == false
+    check mvccStore.isIntentKeyMvcc(key) == false
 
   test "isIntentKeyMvcc false - exactly 17 bytes":
     var key = "x"
@@ -423,7 +421,7 @@ suite "MVCC Intent Key Detection":
     for i in 0..<14:
       key.add(chr(i))
     check key.len == 17
-    check isIntentKeyMvcc(key) == false
+    check mvccStore.isIntentKeyMvcc(key) == false
 
   test "isIntentKeyMvcc true - minimum valid length (18 bytes)":
     var key = ""
@@ -432,15 +430,15 @@ suite "MVCC Intent Key Detection":
     for i in 0..<16:
       key.add(chr(i))
     check key.len == 18
-    check isIntentKeyMvcc(key) == true
+    check mvccStore.isIntentKeyMvcc(key) == true
 
   test "isIntentKeyMvcc does not match protocol intent keys":
     # Protocol intent keys use \x00INTENT\x00 prefix, not MVCC suffix
     let protoKey = encodeIntentKey(1'u64, "key")
-    check isIntentKeyMvcc(protoKey) == false
+    check mvccStore.isIntentKeyMvcc(protoKey) == false
 
 suite "MVCC Key Filtering Consistency":
-  # Verify that raft_store's isVersionKey/isIntentKeyMvcc agree with mvcc_store's versions
+  # Verify that mvcc_store's isVersionKey/isIntentKeyMvcc match constants from mvccTypes
 
   test "VERSION_SEPARATOR constant matches":
     check mvccTypes.VERSION_SEPARATOR == "\x00\x00"
@@ -455,7 +453,7 @@ suite "MVCC Key Filtering Consistency":
       key.add(chr(i))
     let sepPos = key.len - 10
     check key[sepPos .. sepPos+1] == mvccTypes.VERSION_SEPARATOR
-    check isVersionKey(key) == true
+    check mvccStore.isVersionKey(key) == true
 
   test "isIntentKeyMvcc matches manual check with INTENT_SUFFIX":
     var key = "/t/0000000005/1"
@@ -464,4 +462,4 @@ suite "MVCC Key Filtering Consistency":
       key.add(chr(i))
     let sepPos = key.len - 18
     check key[sepPos .. sepPos+1] == mvccTypes.INTENT_SUFFIX
-    check isIntentKeyMvcc(key) == true
+    check mvccStore.isIntentKeyMvcc(key) == true
