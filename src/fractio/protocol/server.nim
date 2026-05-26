@@ -49,6 +49,7 @@ import ../distributed/space_manager
 import ../core/timestamp_provider
 import ../storage/backend
 import ../storage/mvcc/types as mvccValueTypes
+import ./active_txn_registry
 
 # ---------------------------------------------------------------------------
 # Safe logging helper — swallows any logger exception so callers can be raises:[]
@@ -397,6 +398,7 @@ type
     nodeRegistry*: NodeRegistry   ## Phase 8: in-memory cluster node registry
     raftCoord*: NuRaftCoordinator ## lifecycle owner; nil until setupRaftNode
     spaceManager*: SpaceManager   ## Space management (CREATE/DROP SPACE)
+    activeTxnRegistry*: ActiveTxnRegistry ## Fast liveness tracking for conflict resolution
     # Per-server thread storage
     clientThreadCount*: Atomic[int]
     acceptThreadCount*: Atomic[int]
@@ -482,6 +484,7 @@ proc newProtocolServer*(config: ServerConfig): ProtocolServer =
     metrics: newServerMetrics(),
     authenticator: newAuthenticator(config.authMethod),
     nodeRegistry: reg,
+    activeTxnRegistry: newActiveTxnRegistry(),
     startedAt: getTime().toUnix(), # Set before sharedTimer is available; updated in start()
   )
   initLock(result.clientsMu)
@@ -1058,6 +1061,9 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
         let res = server.mvccStore.txnPutWithResultByTxnId(req.txnId, req.key, req.value,
                     req.flags, req.expectedVersion)
         if res.isOk:
+          # Touch the transaction in the active registry (inline atomic store, ~1ns)
+          if not server.activeTxnRegistry.isNil:
+            server.activeTxnRegistry.touch(req.txnId)
           let pr = res.value
           var resp = PutResponse(
             status: pr.status,
@@ -1137,6 +1143,9 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
         let res = server.mvccStore.txnDeleteWithResultByTxnId(req.txnId,
             req.key, req.flags)
         if res.isOk:
+          # Touch the transaction in the active registry (inline atomic store, ~1ns)
+          if not server.activeTxnRegistry.isNil:
+            server.activeTxnRegistry.touch(req.txnId)
           let dr = res.value
           var resp = DeleteResponse(
             status: if dr.found: DelStatusDeleted else: DelStatusNotFound,
@@ -1390,6 +1399,10 @@ proc handleBuiltinTxn(server: ProtocolServer, conn: ClientConnection,
         discard server.txnMgr.beginTransaction(req.flags, timeout,
                                               forcedId = some(txnId))
 
+        # Register in the active txn registry for liveness tracking
+        if not server.activeTxnRegistry.isNil:
+          server.activeTxnRegistry.register(txnId, sessionId)
+
         let resp = txnMsgs.BeginTxnResponse(
           txnId: txnId,
           readTimestamp: uint64(server.mvccStore.getCurrentTimestamp()),
@@ -1426,18 +1439,28 @@ proc handleBuiltinTxn(server: ProtocolServer, conn: ClientConnection,
       return
 
     if not server.mvccStore.isNil:
+      # Mark as committing in the registry (prevents stale cleaner from aborting)
+      if not server.activeTxnRegistry.isNil:
+        server.activeTxnRegistry.setCommitting(txnId)
+
       let res = server.mvccStore.commitTransactionByTxnId(txnId)
       # Also update txnMgr state for this txnId
       let txnMgrResp = server.txnMgr.commitTransaction(txnId)
 
       if res.isOk:
         discard server.metrics.committedTxns.fetchAdd(1)
+        # Remove from registry after successful commit
+        if not server.activeTxnRegistry.isNil:
+          server.activeTxnRegistry.unregister(txnId)
         sendFrame(conn, txnMsgs.encodeCommitTxnResponse(
           txnMsgs.CommitTxnResponse(
             status: txnMsgs.TxnCommitOK,
             commitTimestamp: uint64(res.value))), requestId)
         server.mvccStore.closeSessionByTxnId(txnId)
       else:
+        # Remove from registry after failed commit
+        if not server.activeTxnRegistry.isNil:
+          server.activeTxnRegistry.unregister(txnId)
         # Use txnMgr response for idempotency check
         if txnMgrResp.status == txnMsgs.TxnCommitOK:
           discard server.metrics.committedTxns.fetchAdd(1)
@@ -1471,10 +1494,15 @@ proc handleBuiltinTxn(server: ProtocolServer, conn: ClientConnection,
     let txnId = reqR.value.txnId
 
     if not server.mvccStore.isNil:
+      # Mark as aborted in registry and queue intent cleanup
+      if not server.activeTxnRegistry.isNil:
+        server.activeTxnRegistry.setAborted(txnId)
       let res = server.mvccStore.rollbackTransactionByTxnId(txnId)
       discard server.txnMgr.rollbackTransaction(txnId)
       if res.isOk:
         server.mvccStore.closeSessionByTxnId(txnId)
+        if not server.activeTxnRegistry.isNil:
+          server.activeTxnRegistry.unregister(txnId)
         sendFrame(conn, txnMsgs.encodeRollbackTxnResponse(
           txnMsgs.RollbackTxnResponse(status: txnMsgs.TxnRollbackOK)), requestId)
       else:
@@ -1498,6 +1526,28 @@ proc handleBuiltinTxn(server: ProtocolServer, conn: ClientConnection,
       return
     let resp = server.txnMgr.getTransactionStatus(reqR.value.txnId)
     sendFrame(conn, txnMsgs.encodeTxnStatusResponse(resp), requestId)
+
+  of uint16(mtTxnKeepalive):
+    let reqR = txnMsgs.decodeTxnKeepaliveRequest(payload)
+    if reqR.isErr:
+      sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
+      return
+    let txnId = reqR.value.txnId
+    if not server.activeTxnRegistry.isNil:
+      if server.activeTxnRegistry.hasTransaction(txnId):
+        server.activeTxnRegistry.touchAsync(txnId)
+        sendFrame(conn, txnMsgs.encodeTxnKeepaliveResponse(
+          txnMsgs.TxnKeepaliveResponse(status: txnMsgs.TxnKeepaliveOK)),
+          requestId)
+      else:
+        sendFrame(conn, txnMsgs.encodeTxnKeepaliveResponse(
+          txnMsgs.TxnKeepaliveResponse(status: txnMsgs.TxnKeepaliveNotFound)),
+          requestId)
+    else:
+      # No registry — always return OK (legacy behavior)
+      sendFrame(conn, txnMsgs.encodeTxnKeepaliveResponse(
+        txnMsgs.TxnKeepaliveResponse(status: txnMsgs.TxnKeepaliveOK)),
+        requestId)
 
   else:
     sendError(conn, requestId, ErrProtocol, ErrCatTransaction,
@@ -2565,6 +2615,11 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
   server.mvccStore = mvccStore
   store.setTimestampProvider(tsProvider)
 
+  # Wire the active txn registry into the MVCC store (for addIntentKey)
+  if not server.activeTxnRegistry.isNil:
+    server.activeTxnRegistry.setBackendPtr(cast[pointer](coord.store))
+    mvccStore.setActiveTxnRegistryPtr(cast[pointer](server.activeTxnRegistry))
+
   # Wire the active transaction checker so the intent scavenger can
   # check if a transaction is still in-flight before removing its intents.
   store.setActiveTxnChecker(proc(txnId: TransactionID): bool {.gcsafe, raises: [].} =
@@ -2884,6 +2939,9 @@ proc start*(server: ProtocolServer) {.raises: [].} =
   if not server.sharedTimer.isNil:
     try: server.sharedTimer.start()
     except Exception as e: server.logger.logError("SharedTimer start failed: " & e.msg)
+  # Start the active txn registry cleaner thread
+  if not server.activeTxnRegistry.isNil:
+    server.activeTxnRegistry.start()
   try:
     server.acceptSock = newSocket()
     server.acceptSock.setLingerZero()
@@ -2921,6 +2979,10 @@ proc stop*(server: ProtocolServer) {.raises: [].} =
   if not server.sharedTimer.isNil:
     try: server.sharedTimer.stop()
     except Exception as e: server.logger.logError("SharedTimer stop failed: " & e.msg)
+
+  # Stop the active txn registry cleaner thread
+  if not server.activeTxnRegistry.isNil:
+    server.activeTxnRegistry.stop()
 
   withLock server.clientsMu:
     for id, conn in server.clients:

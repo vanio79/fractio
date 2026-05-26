@@ -7,13 +7,14 @@
 #   - Conflict detection on commit
 #   - Automatic rollback on abort
 
-import std/[tables, locks, options, atomics, strutils, algorithm, sets]
+import std/[tables, locks, options, atomics, algorithm, sets]
 import ../core/types as coreTypes
 import ../core/transaction as coreTxn
 import ../core/timestamp_provider
 import ../storage/mvcc/types as mvccTypes
 import ./raft_store
 import ./txn_manager
+import ./active_txn_registry
 import ./messages/kv
 import ../distributed/sharedtimer/timeprovider as tp
 import ../utils/logging
@@ -107,6 +108,8 @@ type
     keyVersionsMu*: Lock
     # Reverse mapping: TransactionID -> sessionId for wire protocol lookups
     txnToSession*: tables.Table[coreTypes.TransactionID, uint64]
+    # Active transaction registry pointer (void ptr to avoid circular import)
+    activeTxnRegistryPtr*: pointer
 
 # ---------------------------------------------------------------------------
 # Key encoding helpers
@@ -141,6 +144,32 @@ proc isIntentKeyMvcc*(key: string): bool =
   let sepPos = key.len - 18
   result = key[sepPos .. sepPos+1] == mvccTypes.INTENT_SUFFIX
 
+proc extractTxnIdFromIntentKey*(key: string): Option[coreTypes.TransactionID] =
+  ## Extract the TransactionID from an MVCC intent key.
+  ## Intent key format: <userKey>\x00\x01<16-byte ULID txnId>
+  ## Returns none if the key is not a valid intent key.
+  if key.len < 18: return none(coreTypes.TransactionID)
+  let sepPos = key.len - 18
+  if key[sepPos .. sepPos+1] != mvccTypes.INTENT_SUFFIX:
+    return none(coreTypes.TransactionID)
+  # The last 16 bytes are the ULID transaction ID
+  let txnBytes = key[key.len - 16 .. key.len - 1]
+  if txnBytes.len != 16: return none(coreTypes.TransactionID)
+  try:
+    some(coreTypes.transactionIDFromBytes(txnBytes))
+  except CatchableError:
+    none(coreTypes.TransactionID)
+
+proc extractUserKeyFromIntentKey*(key: string): Option[string] =
+  ## Extract the user key from an MVCC intent key.
+  ## Intent key format: <userKey>\x00\x01<16-byte ULID txnId>
+  ## Returns none if the key is not a valid intent key.
+  if key.len < 18: return none(string)
+  let sepPos = key.len - 18
+  if key[sepPos .. sepPos+1] != mvccTypes.INTENT_SUFFIX:
+    return none(string)
+  some(key[0 ..< sepPos])
+
 proc decodeVersionKey(encoded: string): tuple[userKey: string,
     timestamp: Timestamp] =
   # Version key format: <userKey>\x00\x00<8 bytes timestamp>
@@ -168,6 +197,7 @@ proc newMvccTransactionStore*(raftStore: RaftKVStoreExt,
     sessions: initTable[uint64, SessionTxnState](),
     keyVersions: initTable[string, uint64](),
     txnToSession: initTable[coreTypes.TransactionID, uint64](),
+    activeTxnRegistryPtr: nil,
     logger: newLogger("protocol.mvcc_store"),
   )
   initLock(result.sessionsMu)
@@ -374,6 +404,97 @@ type
   TransactionBody* = proc(sessionId: uint64): MvccVoidResult {.gcsafe, raises: [].}
   TransactionBodyWithResult*[T] = proc(sessionId: uint64): MvccResult[
       T] {.gcsafe, raises: [].}
+
+proc setActiveTxnRegistryPtr*(store: MvccTransactionStore,
+    ptrVal: pointer) {.gcsafe, raises: [].} =
+  ## Set the ActiveTxnRegistry pointer. Uses void pointer to avoid circular
+  ## import. The server is responsible for casting this pointer back.
+  acquire(store.sessionsMu)
+  store.activeTxnRegistryPtr = ptrVal
+  release(store.sessionsMu)
+
+proc recordIntentKey(store: MvccTransactionStore,
+    txnId: coreTypes.TransactionID, intentKey: string) {.gcsafe, raises: [].} =
+  ## Notify the ActiveTxnRegistry that a new intent key was written.
+  if store.activeTxnRegistryPtr != nil:
+    {.cast(raises: []).}:
+      try:
+        let registry = cast[ActiveTxnRegistry](store.activeTxnRegistryPtr)
+        registry.addIntentKey(txnId, intentKey)
+      except:
+        discard
+
+proc resolveStaleIntentsForUserKey*(store: MvccTransactionStore,
+    userKey: string): int {.gcsafe, raises: [].} =
+  ## Scan for intent keys belonging to stale (dead) transactions on a user key.
+  ## For each stale intent found, force-rollback the owning transaction via the
+  ## ActiveTxnRegistry (which also queues intent key deletion in the background
+  ## cleaner thread). Returns the number of stale transactions force-rolled back.
+  ##
+  ## This is called inline by txnPut/txnDelete to proactively clean up dead
+  ## transactions' intents before writing a new intent, preventing stale
+  ## intents from blocking or polluting reads.
+  ##
+  ## Thread safety: each forceRollback is atomic; the scan itself is lock-free.
+  ## The background cleaner handles actual intent key deletion asynchronously.
+  var staleCount = 0
+  if store.activeTxnRegistryPtr == nil:
+    return 0
+  let registry = cast[ActiveTxnRegistry](store.activeTxnRegistryPtr)
+
+  # Scan for intent keys for this user key.
+  # Intent key format: <userKey>\x00\x01<16-byte ULID>
+  # We scan from userKey + INTENT_SUFFIX to userKey + next prefix byte.
+  let scanStart = userKey & mvccTypes.INTENT_SUFFIX
+  # Use a scan range that covers all intents for this user key.
+  # The intent suffix starts with \x00\x01, and we want all keys where
+  # the user key matches exactly. We scan a range starting at the intent
+  # prefix and ending just before the version prefix (\x00\x00 sorts before
+  # \x00\x01 in byte order, but intent keys have \x00\x01 so they sort
+  # after version keys for the same user key).
+  # A simple approach: scan from userKey to userKey\x00\x02 (exclusive).
+  let scanEnd = userKey & "\x00\x02"
+
+  let scanRes = store.raftStore.raftScan(scanStart, scanEnd, 100'u32,
+      includeSystemKeys = true)
+  if not scanRes.isOk:
+    return 0
+
+  for (k, _) in scanRes.value:
+    if not isIntentKeyMvcc(k):
+      continue
+    let blockingTxnIdOpt = extractTxnIdFromIntentKey(k)
+    if blockingTxnIdOpt.isNone:
+      continue
+    let blockingTxnId = blockingTxnIdOpt.get()
+
+    # Check if the blocking transaction is stale
+    if registry.isStale(blockingTxnId):
+      # Force-rollback the stale transaction. This marks it as aborted
+      # in the registry and queues intent key deletion in the background
+      # cleaner. The actual deletion happens asynchronously.
+      discard registry.forceRollback(blockingTxnId)
+      inc staleCount
+
+  return staleCount
+
+proc forceRollbackStaleTransaction*(store: MvccTransactionStore,
+    txnId: coreTypes.TransactionID): bool {.gcsafe, raises: [].} =
+  ## Check if a transaction is stale (>5s without activity) and force-rollback
+  ## it if so. Returns true if the transaction was force-rolled back.
+  ##
+  ## This is the server-level API for explicit conflict resolution.
+  ## When a client operation encounters a conflict with transaction `txnId`,
+  ## it calls this to check liveness and force-rollback if stale.
+  ##
+  ## Thread safety: delegates to ActiveTxnRegistry.forceRollback which is
+  ## atomic and lock-free for the isStale check.
+  if store.activeTxnRegistryPtr == nil:
+    return false
+  let registry = cast[ActiveTxnRegistry](store.activeTxnRegistryPtr)
+  if registry.isStale(txnId):
+    return registry.forceRollback(txnId)
+  return false
 
 # ---------------------------------------------------------------------------
 # Session wrapper
@@ -587,6 +708,12 @@ proc txnPut*(store: MvccTransactionStore, sessionId: uint64,
       return mvccVErr(MvccStoreError(
         kind: mseTransactionNotActive, msg: "Failed to record write"))
 
+    # Proactively resolve stale intents on this key before writing our own.
+    # This ensures dead transactions' intents don't accumulate and slow down
+    # future reads/scans on this key. The background cleaner will handle
+    # the actual key deletion asynchronously.
+    discard store.resolveStaleIntentsForUserKey(key)
+
     let intentKey = encodeIntentKey(key, state.txn.id)
     let intentValue = mvccTypes.encodeMVCCValue(value, state.txn.startTimestamp,
         false, state.txn.id)
@@ -599,6 +726,10 @@ proc txnPut*(store: MvccTransactionStore, sessionId: uint64,
 
     state.intents[key] = coreTxn.WriteEntry(key: key, value: value,
         isDelete: false)
+
+    # Record the intent key in the active txn registry for targeted cleanup
+    store.recordIntentKey(state.txn.id, intentKey)
+
     return mvccVOk()
 
 proc txnDelete*(store: MvccTransactionStore, sessionId: uint64,
@@ -622,6 +753,9 @@ proc txnDelete*(store: MvccTransactionStore, sessionId: uint64,
       return mvccVErr(MvccStoreError(
         kind: mseTransactionNotActive, msg: "Failed to record write"))
 
+    # Proactively resolve stale intents on this key before writing our own.
+    discard store.resolveStaleIntentsForUserKey(key)
+
     let intentKey = encodeIntentKey(key, state.txn.id)
     let intentValue = mvccTypes.encodeMVCCValue("", state.txn.startTimestamp,
         true, state.txn.id)
@@ -633,6 +767,10 @@ proc txnDelete*(store: MvccTransactionStore, sessionId: uint64,
         putRes.error.msg))
 
     state.intents[key] = coreTxn.WriteEntry(key: key, value: "", isDelete: true)
+
+    # Record the intent key in the active txn registry for targeted cleanup
+    store.recordIntentKey(state.txn.id, intentKey)
+
     return mvccVOk()
 
 proc txnScan*(store: MvccTransactionStore, sessionId: uint64,

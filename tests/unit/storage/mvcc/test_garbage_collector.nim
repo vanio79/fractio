@@ -994,3 +994,118 @@ suite "Garbage Collector - Integration":
     let stats = gc.getStats()
     check stats.runCount == 5
     deinitLock(gc.lock)
+
+# =============================================================================
+# GC Intent Key Bug Fix Tests
+# =============================================================================
+# The GC's collectVersionsForKey was using encodeMVCCKey(userKey, timestamp,
+# isIntent=true) which produces <userKey>\x00\x01<8-byte timestamp>, but actual
+# intent keys use <userKey>\x00\x01<16-byte ULID txnId> (from makeIntentKey).
+# Fixed by using makeIntentKey(userKey, version.value.txnId) instead.
+# =============================================================================
+
+suite "GC Intent Key Format - Bug Fix Verification":
+  test "makeIntentKey produces correct format":
+    ## Verify that makeIntentKey produces <userKey>\x00\x01<16-byte ULID>
+    let txnId = genTransactionIDLocal()
+    let intentKey = makeIntentKey("test_key", txnId)
+    # intentKey should end with \x00\x01 + 16-byte ULID
+    check intentKey.len == "test_key".len + 2 + 16 # userKey + suffix(2) + ULID(16)
+    # Check the \x00\x01 suffix is at the right position
+    let suffixPos = intentKey.len - 18
+    check intentKey[suffixPos] == '\x00'
+    check intentKey[suffixPos + 1] == '\x01'
+
+  test "encodeIntentKey matches makeIntentKey":
+    ## encodeIntentKey and makeIntentKey should produce identical results
+    let txnId = genTransactionIDLocal()
+    let fromEncode = encodeIntentKey("my_key", txnId)
+    let fromMake = makeIntentKey("my_key", txnId)
+    check fromEncode == fromMake
+
+  test "encodeMVCCKey with isIntent=true produces DIFFERENT format than makeIntentKey":
+    ## This is the core of the bug: encodeMVCCKey(..., isIntent=true) produces
+    ## <userKey>\x00\x01<8-byte timestamp> which is NOT a valid intent key.
+    ## Actual intent keys use <userKey>\x00\x01<16-byte ULID txnId>.
+    let txnId = genTransactionIDLocal()
+    let timestamp = Timestamp(12345)
+    let wrongIntentKey = encodeMVCCKey("my_key", timestamp, true)
+    let correctIntentKey = makeIntentKey("my_key", txnId)
+    # They should be DIFFERENT lengths (8 bytes vs 16 bytes for the ID part)
+    check wrongIntentKey.len == "my_key".len + 2 + 8 # userKey + \x00\x01 + 8-byte ts
+    check correctIntentKey.len == "my_key".len + 2 + 16 # userKey + \x00\x01 + 16-byte ULID
+    check wrongIntentKey != correctIntentKey
+
+  test "GC collects intent along with version using makeIntentKey":
+    ## When GC collects a version, it should also clean up the associated intent.
+    ## The intent key must match the actual intent key format.
+    let mockBackend = newMockGCBackend()
+    let engine = createTestEngine(mockBackend)
+    let gc = newGarbageCollector(engine, newGCPolicy(minTimestamp = Timestamp(0)))
+
+    let txnId = genTransactionIDLocal()
+    let oldTs = Timestamp(1_000_000_000) # 1 second in ns (very old)
+    let newTs = Timestamp(10_000_000_000) # 10 seconds in ns (newer)
+
+    # Add old version with its intent
+    addVersion(mockBackend, "key1", oldTs, "old_value", txnId = txnId)
+    addIntent(mockBackend, "key1", txnId, "intent_value", oldTs)
+    # Add newer version (this will be kept)
+    addVersion(mockBackend, "key1", newTs, "new_value")
+
+    # Verify both version and intent exist
+    let intentKey = makeIntentKey("key1", txnId)
+    check mockBackend.exists(intentKey)
+
+    # Run GC on this key
+    let result = gc.collectVersionsForKey("key1")
+    check result.success == true
+    check result.versionsCollected >= 1
+
+    # The old intent should have been cleaned up
+    check not mockBackend.exists(intentKey)
+    deinitLock(gc.lock)
+
+  test "GC does not crash when intent doesn't exist":
+    ## If the intent was already cleaned up (e.g. by intent resolution),
+    ## GC should not crash when trying to clean it.
+    let mockBackend = newMockGCBackend()
+    let engine = createTestEngine(mockBackend)
+    let gc = newGarbageCollector(engine, newGCPolicy(minTimestamp = Timestamp(0)))
+
+    let txnId = genTransactionIDLocal()
+    let oldTs = Timestamp(1_000_000_000)
+    let newTs = Timestamp(10_000_000_000)
+
+    # Add old version WITHOUT intent (intent was already resolved)
+    addVersion(mockBackend, "key1", oldTs, "old_value", txnId = txnId)
+    # Add newer version
+    addVersion(mockBackend, "key1", newTs, "new_value")
+
+    # Run GC - should not crash even though intent doesn't exist
+    let result = gc.collectVersionsForKey("key1")
+    check result.success == true
+    check result.versionsCollected >= 1
+    deinitLock(gc.lock)
+
+  test "GC with maxVersionsPerKey also uses makeIntentKey":
+    ## When GC collects versions beyond maxVersionsPerKey, it also cleans
+    ## up associated intents. This path uses the same makeIntentKey fix.
+    let mockBackend = newMockGCBackend()
+    let engine = createTestEngine(mockBackend)
+    let gc = newGarbageCollector(engine, newGCPolicy(
+      minTimestamp = Timestamp(0), maxVersionsPerKey = 3))
+
+    let txnId = genTransactionIDLocal()
+    # Add 5 versions with intents for each
+    for i in 0..<5:
+      let ts = Timestamp((i + 1) * 1_000_000_000)
+      let tid = genTransactionIDLocal()
+      addVersion(mockBackend, "key1", ts, "v" & $i, txnId = tid)
+      addIntent(mockBackend, "key1", tid, "intent" & $i, ts)
+
+    let result = gc.collectVersionsForKey("key1")
+    check result.success == true
+    # Should keep only 3 versions (the latest ones)
+    check result.versionsCollected >= 2
+    deinitLock(gc.lock)

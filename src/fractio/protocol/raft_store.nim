@@ -1333,8 +1333,11 @@ proc setActiveTxnChecker*(store: RaftKVStoreExt,
 const INTENT_SCAVENGE_AGE_NS* = 60_000_000_000'i64 ## 60 seconds (2x DEFAULT_TXN_TIMEOUT_MS)
 const GC_SCAN_INTERVAL_MS* = 30_000 ## Run GC + scavenger every 30 seconds
 
-proc scavengeOrphanedIntents*(store: RaftKVStoreExt): IntentScavengerStats {.
-    gcsafe, raises: [].} =
+proc scavengeBackendIntents*(backend: StorageBackend, activeTxnChecker: ActiveTxnChecker,
+    nowNs: int64): IntentScavengerStats {.gcsafe, raises: [].} =
+  ## Core intent scavenger logic that works on any StorageBackend.
+  ## This is extracted from scavengeOrphanedIntents for testability.
+  ##
   ## Scan all keys in the backend for orphaned intent keys and remove them.
   ## An intent is orphaned if:
   ##   1. Its transaction is not found in any active session, AND
@@ -1346,11 +1349,12 @@ proc scavengeOrphanedIntents*(store: RaftKVStoreExt): IntentScavengerStats {.
   ## Returns statistics about what was scanned and cleaned.
   result = IntentScavengerStats()
 
-  let backend = store.getBackend()
-  if backend == nil or not backend.isOpen:
+  var backendOpen = false
+  {.cast(raises: []).}:
+    backendOpen = backend != nil and backend.isOpen
+  if not backendOpen:
     return
 
-  let nowNs = store.nowNs()
   let cutoffNs = nowNs - INTENT_SCAVENGE_AGE_NS
 
   var keysToDelete: seq[string] = @[]
@@ -1424,9 +1428,9 @@ proc scavengeOrphanedIntents*(store: RaftKVStoreExt): IntentScavengerStats {.
               if intentTs > 0 and intentTs < cutoffNs:
                 # Check if the transaction is still active via the callback
                 var isActive = false
-                if store.activeTxnChecker != nil:
+                if activeTxnChecker != nil:
                   try:
-                    isActive = store.activeTxnChecker(txnId)
+                    isActive = activeTxnChecker(txnId)
                   except:
                     discard
 
@@ -1448,6 +1452,14 @@ proc scavengeOrphanedIntents*(store: RaftKVStoreExt): IntentScavengerStats {.
 
   result.scanCount = 1
   result.lastScanTimeNs = nowNs
+
+proc scavengeOrphanedIntents*(store: RaftKVStoreExt): IntentScavengerStats {.
+    gcsafe, raises: [].} =
+  ## Scan all keys in the backend for orphaned intent keys and remove them.
+  ## Delegates to scavengeBackendIntents with the store's backend, checker, and time.
+  let backend = store.getBackend()
+  let nowNs = store.nowNs()
+  result = scavengeBackendIntents(backend, store.activeTxnChecker, nowNs)
 
 proc getScavengerStats*(store: RaftKVStoreExt): IntentScavengerStats {.
     gcsafe, raises: [].} =
@@ -3616,7 +3628,8 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: SpaceID) {.raises: [
 
     var keysMigrated = space.checkpoint.keysMigrated
     let backend = store.getBackend()
-    if backend == nil or not backend.isOpen: return
+    if backend == nil or not backend.isOpen:
+      return
 
     # Migrate each table, skipping already-completed ones
     for tableId in tableIds:

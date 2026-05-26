@@ -408,3 +408,67 @@ suite "Transaction Constants":
 
   test "TxnFlagSerializable value":
     check TxnFlagSerializable == 0x02'u8
+
+# ---------------------------------------------------------------------------
+# TxnKeepalive Messages (0x0204)
+# ---------------------------------------------------------------------------
+
+suite "TxnKeepalive Messages":
+
+  test "encodeTxnKeepaliveRequest basic":
+    let txnId = genTransactionIDLocal()
+    let req = TxnKeepaliveRequest(txnId: txnId)
+    let encoded = encodeTxnKeepaliveRequest(req)
+    check encoded.len == 18 # 2 byte type + 16 byte ULID
+    var pos = 0
+    let mt = readUint16BE(encoded, pos)
+    check mt.isOk
+    check mt.value == uint16(mtTxnKeepalive)
+
+  test "decodeTxnKeepaliveRequest round-trip":
+    let txnId = genTransactionIDLocal()
+    let req = TxnKeepaliveRequest(txnId: txnId)
+    let encoded = encodeTxnKeepaliveRequest(req)
+    let decoded = decodeTxnKeepaliveRequest(encoded)
+    check decoded.isOk
+    check decoded.value.txnId == txnId
+
+  test "decodeTxnKeepaliveRequest truncated payload":
+    let bad = "\x02\x04" & "short"
+    let decoded = decodeTxnKeepaliveRequest(bad)
+    check decoded.isErr
+
+  test "encodeTxnKeepaliveResponse OK":
+    let resp = TxnKeepaliveResponse(status: TxnKeepaliveOK)
+    let encoded = encodeTxnKeepaliveResponse(resp)
+    check encoded.len == 3 # 2 byte type + 1 byte status
+    var pos = 0
+    let mt = readUint16BE(encoded, pos)
+    check mt.isOk
+    check mt.value == uint16(mtTxnKeepalive)
+    let statusR = readUint8(encoded, pos)
+    check statusR.isOk
+    check statusR.value == TxnKeepaliveOK
+
+  test "encodeTxnKeepaliveResponse NotFound":
+    let resp = TxnKeepaliveResponse(status: TxnKeepaliveNotFound)
+    let encoded = encodeTxnKeepaliveResponse(resp)
+    let decoded = decodeTxnKeepaliveResponse(encoded)
+    check decoded.isOk
+    check decoded.value.status == TxnKeepaliveNotFound
+
+  test "decodeTxnKeepaliveResponse round-trip":
+    let resp = TxnKeepaliveResponse(status: TxnKeepaliveOK)
+    let encoded = encodeTxnKeepaliveResponse(resp)
+    let decoded = decodeTxnKeepaliveResponse(encoded)
+    check decoded.isOk
+    check decoded.value.status == TxnKeepaliveOK
+
+  test "TxnKeepaliveOK constant":
+    check TxnKeepaliveOK == 0x00'u8
+
+  test "TxnKeepaliveNotFound constant":
+    check TxnKeepaliveNotFound == 0x01'u8
+
+  test "mtTxnKeepalive message type value":
+    check uint16(mtTxnKeepalive) == 0x0204

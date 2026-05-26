@@ -106,6 +106,63 @@ proc decodeBeginTxnResponse*(payload: string): Result[BeginTxnResponse,
   peOk(resp)
 
 # ---------------------------------------------------------------------------
+# TxnKeepalive  (0x0204)
+#
+# Sent by the client to confirm that a transaction is still alive.
+# The client should send this every 1 second if the transaction has not
+# performed any KV operations in the last second.
+#
+# Request:
+#   TxnId   (16 bytes ULID)
+#
+# Response:
+#   Status  (1 byte): 0x00 = OK, 0x01 = Not Found
+# ---------------------------------------------------------------------------
+
+const
+  TxnKeepaliveOK* = 0x00'u8
+  TxnKeepaliveNotFound* = 0x01'u8
+
+type
+  TxnKeepaliveRequest* = object
+    txnId*: TransactionID
+
+  TxnKeepaliveResponse* = object
+    status*: uint8
+
+proc encodeTxnKeepaliveRequest*(req: TxnKeepaliveRequest): string =
+  var buf = ""
+  buf.writeUint16BE(uint16(mtTxnKeepalive))
+  buf.add(transactionIDToBytes(req.txnId))
+  buf
+
+proc decodeTxnKeepaliveRequest*(payload: string): Result[TxnKeepaliveRequest,
+    ProtocolError] =
+  var pos = 2
+  if pos + 16 > payload.len:
+    return peErr(newProtocolError(peBoundsOverflow,
+        "TxnKeepaliveRequest: txnId truncated"))
+  let txnBytes = payload[pos ..< pos + 16]
+  peOk(TxnKeepaliveRequest(txnId: transactionIDFromBytes(txnBytes)))
+
+proc encodeTxnKeepaliveResponse*(resp: TxnKeepaliveResponse): string =
+  var buf = ""
+  buf.writeUint16BE(uint16(mtTxnKeepalive))
+  buf.writeUint8(resp.status)
+  buf
+
+proc decodeTxnKeepaliveResponse*(payload: string): Result[TxnKeepaliveResponse,
+    ProtocolError] =
+  var pos = 2
+  var resp: TxnKeepaliveResponse
+
+  let statusR = readUint8(payload, pos)
+  if statusR.isErr: return peErr(statusR.error)
+  resp.status = statusR.value
+
+  peOk(resp)
+
+# ---------------------------------------------------------------------------
 # CommitTxn  (0x0201)
 #
 # Request:

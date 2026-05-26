@@ -278,3 +278,54 @@ suite "NodeInfo Type":
     let info: raft_store.NodeInfo = (host: "localhost", clientPort: 8080)
     check info.host == "localhost"
     check info.clientPort == 8080
+
+suite "ActiveTxnChecker Type":
+  test "ActiveTxnChecker is a proc type":
+    ## ActiveTxnChecker is defined as proc(txnId: TransactionID): bool
+    var checkerCalls = 0
+    let checker: ActiveTxnChecker = proc(txnId: TransactionID): bool {.gcsafe,
+        raises: [].} =
+      inc checkerCalls
+      false
+    # Can call the checker
+    let result = checker(zeroTransactionID())
+    check result == false
+    check checkerCalls == 1
+
+  test "ActiveTxnChecker returns true for active txn":
+    let activeTxn = genTransactionIDLocal()
+    let checker: ActiveTxnChecker = proc(txnId: TransactionID): bool {.gcsafe,
+        raises: [].} =
+      txnId == activeTxn
+    check checker(activeTxn) == true
+    check checker(zeroTransactionID()) == false
+
+suite "IntentScavengerStats Type":
+  test "IntentScavengerStats default values":
+    let stats = IntentScavengerStats()
+    check stats.intentsScanned == 0
+    check stats.orphanIntentsCleaned == 0
+    check stats.protocolIntentsScanned == 0
+    check stats.mvccIntentsScanned == 0
+    check stats.scanCount == 0
+    check stats.lastScanTimeNs == 0
+
+  test "IntentScavengerStats field updates":
+    var stats = IntentScavengerStats()
+    stats.intentsScanned = 100
+    stats.orphanIntentsCleaned = 25
+    stats.protocolIntentsScanned = 40
+    stats.mvccIntentsScanned = 60
+    stats.scanCount = 3
+    stats.lastScanTimeNs = 1234567890'i64
+    check stats.intentsScanned == 100
+    check stats.orphanIntentsCleaned == 25
+    check stats.protocolIntentsScanned + stats.mvccIntentsScanned == 100
+    check stats.scanCount == 3
+
+suite "Intent Scavenger Constants":
+  test "INTENT_SCAVENGE_AGE_NS value":
+    check INTENT_SCAVENGE_AGE_NS == 60_000_000_000'i64
+
+  test "GC_SCAN_INTERVAL_MS value":
+    check GC_SCAN_INTERVAL_MS == 30_000

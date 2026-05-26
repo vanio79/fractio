@@ -123,7 +123,7 @@ method close*(backend: StorageBackend) {.base.} =
   ## Close the storage backend and release resources
   discard
 
-method isOpen*(backend: StorageBackend): bool {.base.} =
+method isOpen*(backend: StorageBackend): bool {.base, gcsafe.} =
   ## Check if the storage backend is open
   result = false
 

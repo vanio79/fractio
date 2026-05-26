@@ -6,7 +6,7 @@
 #   - dataGroupLeaderNodeId atomic field
 #   - onLeaderChanged skips meta and data groups
 
-import std/[unittest, os, options, strutils, tables, atomics]
+import std/[unittest, os, options, strutils, tables, atomics, times]
 import fractio/core/types except NodeID
 import fractio/distributed/raft/group_types
 import fractio/distributed/raft/nuraft_coordinator
@@ -22,6 +22,36 @@ import fractio/storage/mvcc/types as mvccTypes
 proc cleanDir(path: string) =
   try: removeDir(path) except CatchableError: discard
   try: createDir(path) except CatchableError: discard
+
+proc drainLeaderPersistChan(store: RaftKVStoreExt) =
+  ## Drain all pending messages from the leaderPersistChan.
+  ## Called after setup to clear stale messages from initial leader elections.
+  while true:
+    let reqOpt = store.leaderPersistChan.tryRecv()
+    if not reqOpt.dataAvailable:
+      break
+    # Process or discard the message
+    discard
+
+proc processLeaderPersistForGroup(store: RaftKVStoreExt,
+    targetGroupId: GroupID, timeoutMs: int = 2000) =
+  ## Process leader persistence requests from the channel until one matching
+  ## targetGroupId is found and processed, or timeout elapses.
+  ## This handles the race where the background rebalance thread may consume
+  ## messages before us, or stale messages from earlier elections are present.
+  let start = getTime().toUnixFloat() * 1000
+  while true:
+    let reqOpt = store.leaderPersistChan.tryRecv()
+    if reqOpt.dataAvailable:
+      # Always process the message (even if it's for a different group)
+      store.processLeaderPersistReq(reqOpt.msg)
+      if reqOpt.msg.groupId == targetGroupId:
+        return # Found and processed the target
+    else:
+      let elapsed = int(getTime().toUnixFloat() * 1000 - start)
+      if elapsed >= timeoutMs:
+        return # Timeout — give up
+      sleep(10)
 
 var testBasePort {.global.} = 23500
 
@@ -180,6 +210,13 @@ suite "onLeaderChanged callback":
 
   setup:
     (coord, store) = makeStore(testDir)
+    # Drain stale leader persistence messages from initial elections.
+    # The coordinator fires onLeaderChanged for META_GROUP and DATA_GROUP
+    # during startup, which queue messages in the channel. If we don't drain
+    # them, they can be consumed by tryRecv() instead of the test's message.
+    drainLeaderPersistChan(store)
+    # Give the background thread time to settle after draining
+    sleep(100)
 
   teardown:
     coord.stop()
@@ -205,15 +242,15 @@ suite "onLeaderChanged callback":
     let wr = store.raftPut(key, encode(val))
     check wr.isOk
 
+    # Drain any messages that arrived between setup and now
+    drainLeaderPersistChan(store)
+
     # Simulate the onLeaderChanged callback (node 20 won election for group 100)
     let storePtr = cast[pointer](store)
     nuraft_coordinator.onLeaderChanged(storePtr, gid, NodeID(20))
 
-    # Process the queued persistence request synchronously (background thread would
-    # do this normally, but for testing we process directly)
-    let reqOpt = store.leaderPersistChan.tryRecv()
-    if reqOpt.dataAvailable:
-      store.processLeaderPersistReq(reqOpt.msg)
+    # Process the queued persistence request for our target group
+    processLeaderPersistForGroup(store, gid)
 
     # Read back the sys.groups record and verify the leader field
     let gr = store.raftGet(key)
@@ -243,14 +280,15 @@ suite "onLeaderChanged callback":
     )
     discard store.raftPut(key, encode(val))
 
+    # Drain any messages that arrived between setup and now
+    drainLeaderPersistChan(store)
+
     # Node 30 wins election
     let storePtr = cast[pointer](store)
     nuraft_coordinator.onLeaderChanged(storePtr, gid, NodeID(30))
 
-    # Process the queued persistence request synchronously
-    let reqOpt = store.leaderPersistChan.tryRecv()
-    if reqOpt.dataAvailable:
-      store.processLeaderPersistReq(reqOpt.msg)
+    # Process the queued persistence request for our target group
+    processLeaderPersistForGroup(store, gid)
 
     let gr = store.raftGet(key)
     check gr.isOk
@@ -274,14 +312,15 @@ suite "onLeaderChanged callback":
     )
     discard store.raftPut(key, encode(val))
 
+    # Drain any messages that arrived between setup and now
+    drainLeaderPersistChan(store)
+
     # Fire callback for META_GROUP_ID
     let storePtr = cast[pointer](store)
     nuraft_coordinator.onLeaderChanged(storePtr, META_GROUP_ID, NodeID(10))
 
-    # Process the queued persistence request synchronously
-    let reqOpt = store.leaderPersistChan.tryRecv()
-    if reqOpt.dataAvailable:
-      store.processLeaderPersistReq(reqOpt.msg)
+    # Process the queued persistence request for META_GROUP_ID
+    processLeaderPersistForGroup(store, META_GROUP_ID)
 
     # Leader SHOULD be updated (clients need to route to meta leader)
     let gr = store.raftGet(key)

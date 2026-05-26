@@ -75,6 +75,7 @@ type
     mtCommitTxn = 0x0201
     mtRollbackTxn = 0x0202
     mtTxnStatus = 0x0203
+    mtTxnKeepalive = 0x0204
 
     # Admin / Metrics (0x0700-0x07FF)
     mtServerInfo = 0x0700

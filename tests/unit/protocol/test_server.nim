@@ -552,3 +552,133 @@ suite "MessageHandler Type":
     let srv = newProtocolServer(cfg)
     srv.registerHandler(mtPing, validHandler)
     check srv.handlers.len == 1
+
+# ---------------------------------------------------------------------------
+# Session 7: Client-disconnect rollback + connection tracking fixes
+# ---------------------------------------------------------------------------
+
+suite "ClientConnection - mvccSessionId":
+  test "newClientConnection initializes mvccSessionId to 0":
+    let sock = newSocket()
+    let conn = newClientConnection(1, sock, "127.0.0.1:12345")
+    check conn.mvccSessionId == 0
+    sock.close()
+
+  test "mvccSessionId is settable":
+    let sock = newSocket()
+    let conn = newClientConnection(1, sock, "127.0.0.1:12345")
+    check conn.mvccSessionId == 0
+    conn.mvccSessionId = 42
+    check conn.mvccSessionId == 42
+    conn.mvccSessionId = 0
+    check conn.mvccSessionId == 0
+    sock.close()
+
+  test "mvccSessionId stores uint64 values":
+    let sock = newSocket()
+    let conn = newClientConnection(1, sock, "127.0.0.1:12345")
+    conn.mvccSessionId = 0xFFFFFFFFFFFFFFFF'u64
+    check conn.mvccSessionId == 0xFFFFFFFFFFFFFFFF'u64
+    conn.mvccSessionId = 0
+    sock.close()
+
+suite "ClientConnection - deinitLock":
+  test "lock can be initialized and deinitialized":
+    let sock = newSocket()
+    let conn = newClientConnection(1, sock, "127.0.0.1:12345")
+    # The lock was initialized by newClientConnection
+    # Deinit should not crash
+    try:
+      deinitLock(conn.mu)
+    except CatchableError:
+      discard
+    sock.close()
+
+  test "touchActivity still works after init":
+    let sock = newSocket()
+    let conn = newClientConnection(1, sock, "127.0.0.1:12345")
+    let before = conn.lastActivityMs
+    sleep(10)
+    conn.touchActivity()
+    let after = conn.lastActivityMs
+    check after >= before
+    deinitLock(conn.mu)
+    sock.close()
+
+suite "ServerMetrics - Connection Counters":
+  test "connectionsAccepted starts at 0":
+    let m = newServerMetrics()
+    check m.connectionsAccepted.load() == 0
+
+  test "connectionsRejected starts at 0":
+    let m = newServerMetrics()
+    check m.connectionsRejected.load() == 0
+
+  test "connectionsAccepted increments atomically":
+    let m = newServerMetrics()
+    discard m.connectionsAccepted.fetchAdd(1)
+    check m.connectionsAccepted.load() == 1
+    discard m.connectionsAccepted.fetchAdd(5)
+    check m.connectionsAccepted.load() == 6
+
+  test "connectionsRejected increments atomically":
+    let m = newServerMetrics()
+    discard m.connectionsRejected.fetchAdd(1)
+    check m.connectionsRejected.load() == 1
+    discard m.connectionsRejected.fetchAdd(3)
+    check m.connectionsRejected.load() == 4
+
+  test "reset clears connection counters":
+    let m = newServerMetrics()
+    discard m.connectionsAccepted.fetchAdd(10)
+    discard m.connectionsRejected.fetchAdd(5)
+    m.reset()
+    check m.connectionsAccepted.load() == 0
+    check m.connectionsRejected.load() == 0
+
+  test "snapshot does not include connection counters":
+    ## snapshot() returns MetricsResponse which doesn't have connection fields
+    ## Connection counters are only accessible via direct load()
+    let m = newServerMetrics()
+    discard m.connectionsAccepted.fetchAdd(100)
+    discard m.connectionsRejected.fetchAdd(50)
+    let snap = m.snapshot()
+    # snapshot should still work without crashing
+    check snap.requestsTotal == 0
+
+suite "ClientConnection - Lock Safety":
+  test "lock protects lastActivityMs":
+    let sock = newSocket()
+    let conn = newClientConnection(1, sock, "127.0.0.1:12345")
+    # Simulate what clientLoop defer block does
+    conn.mvccSessionId = 100
+    # The defer block in clientLoop does:
+    #   1. closeSession if mvccSessionId != 0
+    #   2. deinitLock(conn.mu)
+    #   3. conn.socket.close()
+    #   4. removeClient
+    conn.mvccSessionId = 0
+    try:
+      deinitLock(conn.mu)
+    except CatchableError:
+      discard
+    sock.close()
+
+  test "multiple connections have independent mvccSessionIds":
+    let sock1 = newSocket()
+    let sock2 = newSocket()
+    let conn1 = newClientConnection(1, sock1, "addr1")
+    let conn2 = newClientConnection(2, sock2, "addr2")
+    conn1.mvccSessionId = 10
+    conn2.mvccSessionId = 20
+    check conn1.mvccSessionId == 10
+    check conn2.mvccSessionId == 20
+    conn1.mvccSessionId = 0
+    conn2.mvccSessionId = 0
+    try:
+      deinitLock(conn1.mu)
+      deinitLock(conn2.mu)
+    except CatchableError:
+      discard
+    sock1.close()
+    sock2.close()

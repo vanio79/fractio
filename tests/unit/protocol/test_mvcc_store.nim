@@ -182,3 +182,38 @@ suite "Error Kind Enumeration":
     check mseConflictDetected != mseIntentNotFound
     check mseIntentNotFound != mseStorageError
     check mseStorageError != mseTimeout
+
+suite "extractTxnIdFromIntentKey":
+
+  test "extracts txnId from valid intent key":
+    let txnId = genTransactionIDLocal()
+    let txnBytes = transactionIDToBytes(txnId)
+    var intentKey = "my_key\x00\x01"
+    intentKey.add(txnBytes)
+    let result = extractTxnIdFromIntentKey(intentKey)
+    check result.isSome
+    check result.get() == txnId
+
+  test "returns none for version key":
+    var key = "user_key\x00\x00"
+    key.add("\x00\x00\x00\x00\x00\x00\x00\x01")
+    check extractTxnIdFromIntentKey(key).isNone
+
+  test "returns none for short key":
+    check extractTxnIdFromIntentKey("short").isNone
+
+suite "extractUserKeyFromIntentKey":
+
+  test "extracts user key from valid intent key":
+    let txnId = genTransactionIDLocal()
+    let txnBytes = transactionIDToBytes(txnId)
+    var intentKey = "test_key\x00\x01"
+    intentKey.add(txnBytes)
+    let result = extractUserKeyFromIntentKey(intentKey)
+    check result.isSome
+    check result.get() == "test_key"
+
+  test "returns none for version key":
+    var key = "user_key\x00\x00"
+    key.add("\x00\x00\x00\x00\x00\x00\x00\x01")
+    check extractUserKeyFromIntentKey(key).isNone
