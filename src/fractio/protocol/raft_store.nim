@@ -1848,12 +1848,15 @@ proc raftGetInGroup*(store: RaftKVStoreExt, key: string,
 
 proc raftScan*(store: RaftKVStoreExt, startKey, endKey: string,
     limit: uint32,
-    includeSystemKeys: bool = false): RSResult[seq[(string,
+    includeSystemKeys: bool = false,
+    includeMvccKeys: bool = false): RSResult[seq[(string,
         RaftKVEntry)]] {.gcsafe, raises: [].} =
   ## Scan keys in [startKey, endKey) up to `limit` results.
   ## Uses WiscKey backend.scan() directly — results are already sorted by key.
-  ## Filters out protocol intent keys, coordinator keys, MVCC version keys,
-  ## MVCC intent keys, and Raft internal keys.
+  ## Filters out protocol intent keys, coordinator keys, and Raft internal keys.
+  ## By default, also filters out MVCC version keys and MVCC intent keys.
+  ## Set includeMvccKeys=true to include MVCC keys (needed by mvcc_store
+  ## internals that handle their own filtering).
   ## By default, system table keys (/t/0000000001/... through /t/0000000099/...)
   ## are excluded from results. Set includeSystemKeys=true to include them.
   var pairs: seq[(string, RaftKVEntry)] = @[]
@@ -1867,7 +1870,7 @@ proc raftScan*(store: RaftKVStoreExt, startKey, endKey: string,
     let ts = uint64(store.nowNs())
     for (k, v) in raw:
       if isIntentKey(k) or isCoordKey(k): continue
-      if isVersionKey(k) or isIntentKeyMvcc(k): continue
+      if not includeMvccKeys and (isVersionKey(k) or isIntentKeyMvcc(k)): continue
       if k.startsWith("/raft/"): continue
       if not includeSystemKeys and isSystemKey(k): continue
       pairs.add((k, RaftKVEntry(value: v, version: 1'u64, timestamp: ts)))

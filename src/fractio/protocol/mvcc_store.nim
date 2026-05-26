@@ -456,7 +456,7 @@ proc resolveStaleIntentsForUserKey*(store: MvccTransactionStore,
   let scanEnd = userKey & "\x00\x02"
 
   let scanRes = store.raftStore.raftScan(scanStart, scanEnd, 100'u32,
-      includeSystemKeys = true)
+      includeSystemKeys = true, includeMvccKeys = true)
   if not scanRes.isOk:
     return 0
 
@@ -662,7 +662,7 @@ proc txnGet*(store: MvccTransactionStore, sessionId: uint64,
   let scanEnd = key & "\x00\x01"
 
   let scanRes = store.raftStore.raftScan(scanStart, scanEnd, 1000'u32,
-      includeSystemKeys = true)
+      includeSystemKeys = true, includeMvccKeys = true)
   if not scanRes.isOk:
     return mvccErr[Option[string]](MvccStoreError(
       kind: mseStorageError, msg: "Scan failed"))
@@ -795,7 +795,7 @@ proc txnScan*(store: MvccTransactionStore, sessionId: uint64,
     localIntents = state.intents
 
   let scanRes = store.raftStore.raftScan(startKey, endKey, limit,
-      includeSystemKeys = true)
+      includeSystemKeys = true, includeMvccKeys = true)
   if not scanRes.isOk:
     return mvccErr[seq[tuple[key: string, value: string]]](MvccStoreError(
       kind: mseStorageError, msg: "Scan failed"))
@@ -886,7 +886,7 @@ proc snapshotGet*(store: MvccTransactionStore,
   # Also scan for versioned keys
   let versionPrefix = key & mvccTypes.VERSION_SEPARATOR
   let scanRes = store.raftStore.raftScan(versionPrefix, key & "\x00\x01",
-      100'u32, includeSystemKeys = true)
+      100'u32, includeSystemKeys = true, includeMvccKeys = true)
 
   if not scanRes.isOk:
     if nonMvccValue.isSome: return mvccOk(nonMvccValue)
@@ -926,7 +926,7 @@ proc snapshotScan*(store: MvccTransactionStore,
   ## have multiple versions per user key. We apply the limit after deduplication.
 
   let scanRes = store.raftStore.raftScan(startKey, endKey, 0, # no limit at storage level
-    includeSystemKeys = true)
+    includeSystemKeys = true, includeMvccKeys = true)
   if not scanRes.isOk:
     return mvccErr[seq[tuple[key: string, value: string]]](MvccStoreError(
       kind: mseStorageError, msg: "Scan failed"))
@@ -1031,7 +1031,7 @@ proc snapshotStreamScan*(store: MvccTransactionStore,
   # dedup requires seeing all versions of a key to pick the latest).
   # However, we can apply filters early to reduce memory pressure.
   let scanRes = store.raftStore.raftScan(startKey, endKey, 0,
-      includeSystemKeys = true)
+      includeSystemKeys = true, includeMvccKeys = true)
   if not scanRes.isOk:
     return false
 
@@ -1174,7 +1174,7 @@ proc latestGetWithMeta*(store: MvccTransactionStore,
   # Also scan for versioned keys
   let versionPrefix = key & mvccTypes.VERSION_SEPARATOR
   let scanRes = store.raftStore.raftScan(versionPrefix, key & "\x00\x01",
-      100'u32, includeSystemKeys = true)
+      100'u32, includeSystemKeys = true, includeMvccKeys = true)
 
   if scanRes.isOk:
     for (k, entry) in scanRes.value:
