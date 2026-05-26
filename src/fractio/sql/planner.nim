@@ -872,6 +872,22 @@ proc planCreateTable(stmt: Stmt, client: FractioClient,
       "": stmt.ctTableRef.schema else: schema
   let tableName = stmt.ctTableRef.table
 
+  # Auto-resolve space name: if the database part matches a known space name,
+  # automatically assign the table to that space. This allows
+  # "CREATE TABLE myspace.public.users (...)" to work without "IN SPACE myspace".
+  var spaceName = stmt.ctSpaceName
+  if spaceName.isNone and dbName != "" and client != nil:
+    # Look up the database name in sys.spaces to see if it's a space name
+    let spaceKey = encodeTableKey(SYS_SPACES_TABLE_ID, "")
+    let spaceEnd = makeScanEndKey(SYS_SPACES_TABLE_ID)
+    let spaceScan = client.kvScan(spaceKey, spaceEnd, 0)
+    if spaceScan.isOk:
+      for entry in spaceScan.val:
+        let rec = decodeSpaceRecord(entry.value)
+        if rec.name == dbName:
+          spaceName = some(dbName)
+          break
+
   # Build column definitions in binary format
   var columns: seq[ColumnDefBin]
   for col in stmt.ctColumns:
@@ -916,7 +932,7 @@ proc planCreateTable(stmt: Stmt, client: FractioClient,
     ctValue: encode(rec),
     ctSchema: scName,
     ctDatabase: dbName,
-    ctSpaceName: stmt.ctSpaceName,
+    ctSpaceName: spaceName,
   ))
   plan
 

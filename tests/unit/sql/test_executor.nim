@@ -2353,6 +2353,63 @@ suite "Executor DROP Operations with MockKVStore":
     check result.kind == erkError
     check "does not exist" in result.error
 
+  test "executeWithTxn DROP TABLE with data rows uses auto-transaction":
+    ## Verify that execDropTable deletes data rows using auto-transactions
+    ## (txnId=zero) rather than the internal META transaction. This is
+    ## critical for cross-group scenarios where the data rows live on
+    ## different Raft groups than the system table metadata.
+    let mockKV = newMockKVStore()
+    let ctx = newExecutorContextWithKV(mockKV)
+
+    # Create table first
+    let tableId = genTableIdLocal()
+    let tableRec = TableRecord(
+      tableId: tableId,
+      name: "orders",
+      database: "default",
+      schema: "public",
+      spaceId: genSpaceIDLocal(),
+      columns: @[ColumnDefBin(name: "id", dataType: cdtInt,
+                               flags: uint8(cfPrimaryKey.ord))],
+      primaryKey: @["id"]
+    )
+    var createTablePlan = newPlan()
+    createTablePlan.add(PlanOp(kind: poCreateTable, ctDatabase: "default",
+                               ctSchema: "public", ctName: "orders",
+                               ctValue: encode(tableRec)))
+    discard executeWithTxn(createTablePlan, ctx)
+
+    # Insert some data rows directly into the mock store
+    let dataKey1 = encodeTableKey(tableId, "d/" & bytesToString(encodeInt64BE(1'i64)))
+    let dataKey2 = encodeTableKey(tableId, "d/" & bytesToString(encodeInt64BE(2'i64)))
+    mockKV.setData(dataKey1, "row1_data")
+    mockKV.setData(dataKey2, "row2_data")
+
+    # Insert an index entry directly into the mock store
+    let idxKey = encodeTableKey(tableId, "i/idx_name\x00val1")
+    mockKV.setData(idxKey, "idx_data")
+
+    # Verify data exists before drop
+    check mockKV.hasKey(dataKey1)
+    check mockKV.hasKey(dataKey2)
+    check mockKV.hasKey(idxKey)
+
+    # Drop the table
+    let plan = newPlan()
+    plan.add(PlanOp(kind: poDropTable, dtDatabase: "default",
+                    dtSchema: "public", dtName: "orders", dtIfExists: false))
+
+    let result = executeWithTxn(plan, ctx)
+    check result.kind == erkOk
+    check "DROP TABLE" in result.okMessage
+
+    # Verify ALL data was deleted: table metadata, data rows, and index entries
+    let tableKey = encodeTableKey(SYS_TABLES_TABLE_ID, "default.public.orders")
+    check not mockKV.hasKey(tableKey)
+    check not mockKV.hasKey(dataKey1)
+    check not mockKV.hasKey(dataKey2)
+    check not mockKV.hasKey(idxKey)
+
 suite "Executor DML Operations with MockKVStore":
 
   test "executeWithTxn INSERT row":

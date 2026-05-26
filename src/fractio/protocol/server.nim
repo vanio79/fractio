@@ -620,11 +620,17 @@ proc getLeaderRedirect(server: ProtocolServer,
   ## If this node doesn't have the group (not a member), falls back to
   ## looking up the group's replicas from sys.groups and redirecting to
   ## the first replica, which can forward the request to the actual leader.
+  ##
+  ## IMPORTANT: If the Raft-reported leader is THIS node, we must NOT
+  ## redirect to ourselves (infinite loop). This can happen when the
+  ## local NuRaft instance has stale leader state after a leadership
+  ## change. In that case, we fall through to the sys.groups fallback.
   if server.raftCoord == nil or not server.raftCoord.running.load():
     return LeaderRedirect(leaderId: 0)
 
   let leaderId = server.raftCoord.getLeader(groupId)
-  if leaderId > 0:
+  let myNodeId = uint32(server.config.serverId)
+  if leaderId > 0 and uint32(leaderId) != myNodeId:
     let nodeId = uint32(leaderId)
 
     # Look up the leader's host and client port from multiple sources
@@ -2807,7 +2813,7 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
         break
       sleep(100)
 
-# Seed system tables: sys.nodes (table 5) and sys.groups (table 4)
+  # Seed system tables: sys.nodes (table 5) and sys.groups (table 4)
   # Only seed when starting as fresh leader with NO existing data
   if startAsLeader and not isRejoining and not hasExistingSpaces:
     let seedTsNs = try: server.sharedTimer.now() except Exception:

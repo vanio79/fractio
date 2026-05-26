@@ -751,10 +751,16 @@ proc execCreateTable(op: PlanOp, ctx: ExecutorContext): ExecResult =
 proc execDropTable(op: PlanOp, ctx: ExecutorContext): ExecResult =
   ## Execute DROP TABLE with internal MVCC transaction for consistency.
   ## Deletes the table metadata and all associated data rows and index entries.
+  ##
+  ## Data rows and index entries may be distributed across multiple Raft groups
+  ## in a multi-group space. Cross-group transactions are not supported (each
+  ## group has its own MVCC session). Therefore, data row and index deletions
+  ## use auto-transactions (per-key commit), while system table metadata
+  ## operations use a single META-group transaction.
   let key = encodeTableKey(SYS_TABLES_TABLE_ID,
       op.dtDatabase & "." & op.dtSchema & "." & op.dtName)
 
-  # Create internal transaction
+  # Create internal transaction for system table operations (META group only)
   let txnRes = ctx.kv.beginTxn()
   if txnRes.isErr:
     return errorResult(&"failed to start internal transaction: {txnRes.err}")
@@ -778,32 +784,34 @@ proc execDropTable(op: PlanOp, ctx: ExecutorContext): ExecResult =
   except:
     discard # If we can't decode, skip data row cleanup
 
-  # Delete all data rows for this table: /t/<tableId>/d/* through /t/<tableId>/e/
+  # Delete all data rows for this table using auto-transactions.
+  # Data rows may be on different Raft groups; cross-group transactions
+  # are not supported, so each delete auto-commits independently.
   if tableId != zeroTableId():
     let dataStart = encodeTableKey(tableId, "d/")
     let dataEnd = makeDataRowScanEndKey(tableId)
-    let dataScan = ctx.kv.scan(dataStart, dataEnd, 0,
-        txnId = internalTxnId, readTimestamp = internalReadTimestamp)
+    # Scan without a transaction to see all rows across all groups
+    let dataScan = ctx.kv.scan(dataStart, dataEnd, 0)
     if dataScan.isOk:
       for entry in dataScan.val:
-        let delRes = ctx.kv.delete(entry.key, txnId = internalTxnId)
+        # Auto-delete (txnId = zero) — each key auto-commmits on its group
+        let delRes = ctx.kv.delete(entry.key)
         if delRes.isErr:
           discard ctx.kv.rollbackTxn(internalTxnId)
           return errorResult(&"failed to delete data row: {delRes.err}")
 
-    # Delete all secondary index entries for this table: /t/<tableId>/i/*
+    # Delete all secondary index entries using auto-transactions
     let idxStart = encodeTableKey(tableId, "i/")
-    let idxEnd = encodeTableKey(tableId, "j/")         # "j" > "i"
-    let idxScan = ctx.kv.scan(idxStart, idxEnd, 0,
-        txnId = internalTxnId, readTimestamp = internalReadTimestamp)
+    let idxEnd = encodeTableKey(tableId, "j")         # "j" > "i"
+    let idxScan = ctx.kv.scan(idxStart, idxEnd, 0)
     if idxScan.isOk:
       for entry in idxScan.val:
-        let delRes = ctx.kv.delete(entry.key, txnId = internalTxnId)
+        let delRes = ctx.kv.delete(entry.key)
         if delRes.isErr:
           discard ctx.kv.rollbackTxn(internalTxnId)
           return errorResult(&"failed to delete index entry: {delRes.err}")
 
-  # Delete the table metadata
+  # Delete the table metadata (META group — within the transaction)
   let delRes = ctx.kv.delete(key, txnId = internalTxnId)
   if delRes.isErr:
     discard ctx.kv.rollbackTxn(internalTxnId)

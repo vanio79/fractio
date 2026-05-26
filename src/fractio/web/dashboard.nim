@@ -43,12 +43,12 @@ proc getClient(): FractioClient =
     let host = if srv.config.host == "0.0.0.0": "127.0.0.1" else: srv.config.host
     var cfg = newFractioClientConfig(host, srv.config.port)
     # Dashboard client: balance between responsiveness and reliability.
-    # With fast election timeouts (300-600ms), a 1-second timeout per retry
-    # allows enough time for a leader election to complete. 3 retries gives
-    # up to 3 seconds total blocking time, which is acceptable for HTTP.
-    cfg.maxKvRetries = 3
-    cfg.connectionTimeoutMs = 500
-    cfg.requestTimeoutMs = 1000
+    # Connection timeout of 2s allows TCP handshake to remote nodes.
+    # Request timeout of 3s allows for leader election (300-600ms) + retry.
+    # 10 retries gives enough room for NOT_LEADER redirects and connection retries.
+    cfg.maxKvRetries = 10
+    cfg.connectionTimeoutMs = 2000
+    cfg.requestTimeoutMs = 3000
     gClient = newFractioClient(cfg)
     discard gClient.initialize()
     gClientLastRefresh = epochTime()

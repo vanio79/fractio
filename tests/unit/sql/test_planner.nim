@@ -1030,6 +1030,54 @@ suite "Planner planCreateTable":
     let plan = planStatement(stmt, nil)
     check plan.ops[0].kind == poCreateTable
 
+suite "Planner planCreateTable auto-resolve space name":
+  test "nil client with database name does not crash":
+    # When client is nil, auto-resolution is skipped gracefully
+    let stmt = Stmt(
+      kind: stmtCreateTable,
+      ctTableRef: TableRef(database: "myspace", table: "users"),
+      ctIfNotExists: false,
+      ctColumns: @[ColDef(name: "id", dataType: dtInt, primaryKey: true)],
+      ctPrimaryKey: @[],
+      ctReplicas: none(int),
+      ctSpaceName: none(string)
+    )
+    let plan = planStatement(stmt, nil, database = "myspace", schema = "public")
+    check plan.ops.len == 1
+    check plan.ops[0].kind == poCreateTable
+    # With nil client, space name is not auto-resolved
+    check plan.ops[0].ctSpaceName.isNone
+
+  test "nil client without database name does not crash":
+    let stmt = Stmt(
+      kind: stmtCreateTable,
+      ctTableRef: TableRef(table: "users"),
+      ctIfNotExists: false,
+      ctColumns: @[ColDef(name: "id", dataType: dtInt, primaryKey: true)],
+      ctPrimaryKey: @[],
+      ctReplicas: none(int),
+      ctSpaceName: none(string)
+    )
+    let plan = planStatement(stmt, nil, database = "", schema = "public")
+    check plan.ops.len == 1
+    check plan.ops[0].ctSpaceName.isNone
+
+  test "explicit IN SPACE overrides auto-resolution":
+    # When ctSpaceName is already set, auto-resolution is skipped
+    let stmt = Stmt(
+      kind: stmtCreateTable,
+      ctTableRef: TableRef(database: "myspace", table: "users"),
+      ctIfNotExists: false,
+      ctColumns: @[ColDef(name: "id", dataType: dtInt, primaryKey: true)],
+      ctPrimaryKey: @[],
+      ctReplicas: none(int),
+      ctSpaceName: some("other_space")
+    )
+    let plan = planStatement(stmt, nil, database = "myspace", schema = "public")
+    check plan.ops.len == 1
+    check plan.ops[0].ctSpaceName.isSome
+    check plan.ops[0].ctSpaceName.get == "other_space"
+
 suite "Planner planDropTable":
   test "planDropTable creates correct plan":
     let stmt = Stmt(
