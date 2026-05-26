@@ -928,9 +928,16 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
       # If the query failed with a connection/leader error, reset the client
       # and retry once. This handles stale cached connections after a failover.
       # The retry is limited to ONE attempt to avoid blocking the event loop.
+      # IMPORTANT: Do NOT retry DDL statements (CREATE/DROP/ALTER) — they are
+      # not idempotent and the first attempt may have succeeded even though we
+      # got a "short header" error reading the response. Retrying would create
+      # duplicate spaces/tables/etc.
       if execResult.kind == erkError:
         let errLower = execResult.error.toLowerAscii()
-        if errLower.contains("no connection") or
+        let isDdl = sql.toLowerAscii().startsWith("create ") or
+                    sql.toLowerAscii().startsWith("drop ") or
+                    sql.toLowerAscii().startsWith("alter ")
+        let isRetryable = errLower.contains("no connection") or
            errLower.contains("not leader") or
            errLower.contains("not the leader") or
            errLower.contains("send incomplete") or
@@ -938,7 +945,8 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
            errLower.contains("connection refused") or
            errLower.contains("too many retries") or
            errLower.contains("failed to initialize client") or
-           errLower.contains("short header"):
+           errLower.contains("short header")
+        if isRetryable and not isDdl:
           {.cast(gcsafe).}:
             resetClient()
             execResult = getClient().query(sql, db, sc)

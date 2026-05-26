@@ -149,6 +149,22 @@ proc isIntentKey*(k: string): bool {.inline.} =
 proc isCoordKey*(k: string): bool {.inline.} =
   k.len > COORD_PREFIX.len and k[0 ..< COORD_PREFIX.len] == COORD_PREFIX
 
+proc isVersionKey*(k: string): bool {.inline.} =
+  ## Check if a key is an MVCC version key.
+  ## Version key format: <userKey>\x00\x00<8 bytes timestamp>
+  ## Total suffix length = 10 (2-byte separator + 8-byte timestamp)
+  if k.len < 10: return false
+  let sepPos = k.len - 10
+  result = k[sepPos .. sepPos+1] == mvccTypes.VERSION_SEPARATOR
+
+proc isIntentKeyMvcc*(k: string): bool {.inline.} =
+  ## Check if a key is an MVCC intent key.
+  ## Intent key format: <userKey>\x00\x01<16 bytes ULID txnId>
+  ## Total suffix length = 18 (2-byte suffix + 16-byte ULID)
+  if k.len < 18: return false
+  let sepPos = k.len - 18
+  result = k[sepPos .. sepPos+1] == mvccTypes.INTENT_SUFFIX
+
 proc decodeIntentTxnId*(k: string): uint64 {.inline.} =
   ## Extract the txnId from an intent key.
   let off = INTENT_PREFIX.len
@@ -1836,6 +1852,8 @@ proc raftScan*(store: RaftKVStoreExt, startKey, endKey: string,
         RaftKVEntry)]] {.gcsafe, raises: [].} =
   ## Scan keys in [startKey, endKey) up to `limit` results.
   ## Uses WiscKey backend.scan() directly — results are already sorted by key.
+  ## Filters out protocol intent keys, coordinator keys, MVCC version keys,
+  ## MVCC intent keys, and Raft internal keys.
   ## By default, system table keys (/t/0000000001/... through /t/0000000099/...)
   ## are excluded from results. Set includeSystemKeys=true to include them.
   var pairs: seq[(string, RaftKVEntry)] = @[]
@@ -1849,6 +1867,7 @@ proc raftScan*(store: RaftKVStoreExt, startKey, endKey: string,
     let ts = uint64(store.nowNs())
     for (k, v) in raw:
       if isIntentKey(k) or isCoordKey(k): continue
+      if isVersionKey(k) or isIntentKeyMvcc(k): continue
       if k.startsWith("/raft/"): continue
       if not includeSystemKeys and isSystemKey(k): continue
       pairs.add((k, RaftKVEntry(value: v, version: 1'u64, timestamp: ts)))
@@ -1864,8 +1883,8 @@ proc groupCount*(store: RaftKVStoreExt): int {.gcsafe, raises: [].} =
   store.stateMachines.len
 
 proc raftLen*(store: RaftKVStoreExt): int {.gcsafe, raises: [].} =
-  ## Count all user keys (excluding intents, coord records, and Raft
-  ## internal keys like /raft/*/log/* and /raft/*/state) via backend scan.
+  ## Count all user keys (excluding intents, coord records, MVCC version/intent
+  ## keys, and Raft internal keys like /raft/*/log/* and /raft/*/state) via backend scan.
   var total = 0
   let backend = store.getBackend()
   if backend == nil or not backend.isOpen:
@@ -1874,6 +1893,7 @@ proc raftLen*(store: RaftKVStoreExt): int {.gcsafe, raises: [].} =
     let raw = backend.scan("", "")
     for (k, _) in raw:
       if isIntentKey(k) or isCoordKey(k): continue
+      if isVersionKey(k) or isIntentKeyMvcc(k): continue
       if k.startsWith("/raft/"): continue
       inc total
   total

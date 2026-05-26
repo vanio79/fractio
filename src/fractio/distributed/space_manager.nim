@@ -345,7 +345,8 @@ proc createSpace*(sm: SpaceManager, req: CreateSpaceRequest): CreateSpaceRespons
     let nodeIds = nodes.mapIt(it.nodeId)
     let nodeCount = nodeIds.len
     replicas = if req.replicas <= 0: nodeCount else: min(req.replicas.int, nodeCount)
-    timedLog(safeFmt("nodeCount=$# replicas=$#", $nodeCount, $replicas))
+    sm.logInfo(safeFmt("createSpace: nodes=$# nodeIds=$# nodeCount=$# replicas=$#",
+        $nodes.len, $nodeIds, $nodeCount, $replicas))
 
     if replicas > nodeCount:
       return CreateSpaceResponse(
