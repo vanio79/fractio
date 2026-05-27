@@ -1061,10 +1061,20 @@ proc planSelect(stmt: Stmt, client: FractioClient,
       limit = uint32(limExpr.litValue.intValue)
 
   # Detect ORDER BY PK optimization
-  # When ORDER BY matches PK ordering, we can skip or simplify sorting
+  # When ORDER BY matches PK ordering, we can skip or simplify sorting.
+  # However, for multi-group spaces, the k-way merge produces rows grouped
+  # by groupId rather than in global PK order, so the PK optimization is
+  # invalid and we must use a full sort instead.
   var pkOptimization = oboNone
   if stmt.selOrderBy.len > 0:
     pkOptimization = detectOrderByPkOptimization(stmt.selOrderBy, pkColumns)
+    # Multi-group spaces shard data across groups. The k-way merge compares
+    # storage keys as strings (including groupId prefix), which doesn't produce
+    # globally sorted PK order. Downgrade to full sort for multi-group tables.
+    if pkOptimization != oboNone:
+      let groups = client.getGroupsForTable(desc.tableId)
+      if groups.len > 1:
+        pkOptimization = oboNone
 
   # Convert ORDER BY items to SortSpecs and determine sort columns
   # Skip this if we have PK optimization (no extra columns needed)
