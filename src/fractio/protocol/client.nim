@@ -532,6 +532,12 @@ proc closeConn*(client: ProtocolClient, reason: string = "") {.gcsafe, raises: [
 
 # Forward declaration for streaming scan result type
 type
+  KeyExtractor* = proc(key: string): string {.closure, gcsafe, raises: [].}
+    ## Extracts the comparable portion of a storage key for k-way merge.
+    ## For data row keys, this strips the groupId prefix so that rows from
+    ## different groups are compared by primary key value, not by groupId.
+    ## For non-data keys, returns the full key unchanged.
+
   StreamWithKey* = object
     ## A stream paired with its current peek key for k-way merge.
     stream*: StreamingScanClient
@@ -569,6 +575,12 @@ type
       ## All group streams with their current peek state
     mergeInitialized*: bool
       ## Whether the initial peek has been done for all streams
+    keyExtractor*: KeyExtractor
+      ## Extracts the comparable key portion for k-way merge ordering.
+      ## When nil, full storage key string comparison is used (correct for
+      ## single-group and system table scans). For multi-group data table
+      ## scans, set to primaryKeyFromDataRowKey to compare by PK value
+      ## across groups instead of by groupId prefix.
 
 proc kvGet*(client: ProtocolClient, key: string,
     flags: uint8 = 0, txnId: TransactionID = zeroTransactionID(),
@@ -720,13 +732,18 @@ proc newStreamingScanClient*(client: ProtocolClient): StreamingScanClient =
   result.mergeInitialized = false
 
 proc newKWayMergeScanClient*(streams: seq[StreamingScanClient],
-    limit: uint32 = 0): StreamingScanClient =
+    limit: uint32 = 0,
+    keyExtractor: KeyExtractor = nil): StreamingScanClient =
   ## Create a streaming scan client that merges multiple group streams
   ## using k-way merge. All streams must already be started (have their
   ## first frame loaded). Results are returned in globally sorted key order.
   ##
   ## streams: all group streams (already started, one per group)
   ## limit: total limit across all groups (0 = no limit)
+  ## keyExtractor: extracts the comparable key portion for merge ordering.
+  ##   When nil, full storage key string comparison is used. For multi-group
+  ##   data table scans, pass primaryKeyFromDataRowKey to compare by PK value
+  ##   instead of by groupId prefix.
   new(result)
   result.client = nil
   result.streamId = if streams.len > 0: streams[0].streamId else: 0
@@ -740,6 +757,7 @@ proc newKWayMergeScanClient*(streams: seq[StreamingScanClient],
   result.scanLimit = limit
   result.kWayMergeMode = true
   result.mergeInitialized = false
+  result.keyExtractor = keyExtractor
   # Initialize merge streams - peek state will be filled on first nextPair() call
   for stream in streams:
     result.mergeStreams.add(StreamWithKey(
@@ -906,17 +924,20 @@ proc nextPair*(ss: StreamingScanClient): Option[kvMsgs.ScanPair] {.gcsafe,
       ss.mergeInitialized = true
 
     # Find the stream with the smallest peek key
+    # Use keyExtractor if available to compare by PK across groups
     var bestIdx = -1
-    var bestKey = ""
+    var bestCompareKey = ""
     for i in 0 ..< ss.mergeStreams.len:
       let swk = addr(ss.mergeStreams[i])
       if swk.exhausted:
         continue
       if swk.peekPair.isNone:
         continue
-      if bestIdx < 0 or swk.peekKey < bestKey:
+      let compareKey = if ss.keyExtractor != nil:
+        ss.keyExtractor(swk.peekKey) else: swk.peekKey
+      if bestIdx < 0 or compareKey < bestCompareKey:
         bestIdx = i
-        bestKey = swk.peekKey
+        bestCompareKey = compareKey
 
     if bestIdx < 0:
       ss.exhausted = true

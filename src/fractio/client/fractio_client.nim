@@ -1133,7 +1133,13 @@ method scan*(client: FractioClient, startKey: string, endKey: string,
     entries.add((key: key, value: value))
 
   # Sort by key for consistent ordering
-  entries.sort(proc(a, b: tuple[key, value: string]): int = cmp(a.key, b.key))
+  # For data table keys, compare by PK to produce globally sorted output
+  # across groups (full storage key comparison groups by groupId prefix).
+  if isDataTable:
+    entries.sort(proc(a, b: tuple[key, value: string]): int =
+      cmp(primaryKeyFromDataRowKey(a.key), primaryKeyFromDataRowKey(b.key)))
+  else:
+    entries.sort(proc(a, b: tuple[key, value: string]): int = cmp(a.key, b.key))
 
   # Apply limit if specified
   if limit > 0 and entries.len > int(limit):
@@ -1241,7 +1247,15 @@ ProtocolError] =
     return peOk(groupStreams[0])
 
   # K-way merge: merge all group streams by key order
-  let mergeClient = newKWayMergeScanClient(groupStreams, limit)
+  # For data table scans, use PK-based comparison to produce globally sorted
+  # output. Without the extractor, the k-way merge compares full storage keys
+  # (including groupId), which groups rows by groupId instead of by PK value.
+  let extractor: KeyExtractor = if isDataTable:
+    proc(key: string): string {.closure, gcsafe, raises: [].} =
+      primaryKeyFromDataRowKey(key)
+  else:
+    nil
+  let mergeClient = newKWayMergeScanClient(groupStreams, limit, extractor)
   return peOk(mergeClient)
 
 method beginTxn*(client: FractioClient): KVOpResult[TxnBeginResult] =

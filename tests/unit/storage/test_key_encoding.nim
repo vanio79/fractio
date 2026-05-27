@@ -74,18 +74,61 @@ suite "Data Row Key Encoding with Group ID":
 
     check decodedTableId == tableId
     check decodedGroupId == groupId
-    check decodedPk == pk
-
-  test "decodeDataRowKey with empty pk":
-    let tableId = makeTableId()
-    let groupId = makeGroupId(3)
-
-    let key = encodeDataRowKey(tableId, groupId, "")
-    let (decodedTableId, decodedGroupId, decodedPk) = decodeDataRowKey(key)
-
-    check decodedTableId == tableId
-    check decodedGroupId == groupId
     check decodedPk == ""
+
+suite "primaryKeyFromDataRowKey — PK extraction for k-way merge":
+
+  test "extracts PK from data row key":
+    let tableId = makeTableId()
+    let groupId = makeGroupId(1)
+    let pk = "hello"
+    let key = encodeDataRowKey(tableId, groupId, pk)
+    let extracted = primaryKeyFromDataRowKey(key)
+    check extracted == pk
+
+  test "extracts PK from data row key with different group":
+    let tableId = makeTableId()
+    let groupId1 = makeGroupId(1)
+    let groupId2 = makeGroupId(2)
+    let pk = "world"
+    let key1 = encodeDataRowKey(tableId, groupId1, pk)
+    let key2 = encodeDataRowKey(tableId, groupId2, pk)
+    # Same PK from different groups should extract the same PK portion
+    check primaryKeyFromDataRowKey(key1) == primaryKeyFromDataRowKey(key2)
+
+  test "full key ordering differs from PK ordering across groups":
+    # When two rows have different PKs in different groups, the full key
+    # comparison includes groupId which can flip the ordering.
+    let tableId = makeTableId()
+    let groupA = makeGroupId(1)
+    let groupB = makeGroupId(2)
+    let pkA = "z" # Large PK in group A
+    let pkB = "a" # Small PK in group B
+    let keyA = encodeDataRowKey(tableId, groupA, pkA)
+    let keyB = encodeDataRowKey(tableId, groupB, pkB)
+    # PK extraction preserves the correct ordering: pkA > pkB
+    check primaryKeyFromDataRowKey(keyA) > primaryKeyFromDataRowKey(keyB)
+
+  test "returns full key for non-data-row key":
+    let key = "/t/" & $makeTableId() & "/x/some_index_key"
+    check primaryKeyFromDataRowKey(key) == key
+
+  test "returns full key for system table key":
+    let sysKey = encodeTableKey(SYS_DATABASES_TABLE_ID, "_key1")
+    check primaryKeyFromDataRowKey(sysKey) == sysKey
+
+  test "extracts empty PK from key with empty pk":
+    let tableId = makeTableId()
+    let groupId = makeGroupId(1)
+    let key = encodeDataRowKey(tableId, groupId, "")
+    check primaryKeyFromDataRowKey(key) == ""
+
+  test "extracts binary PK with null bytes":
+    let tableId = makeTableId()
+    let groupId = makeGroupId(7)
+    let pk = "\x01" & "\x00" & "\x00" & "\x00" & "hello"
+    let key = encodeDataRowKey(tableId, groupId, pk)
+    check primaryKeyFromDataRowKey(key) == pk
 
   test "decodeDataRowKey with binary pk containing null bytes":
     let tableId = makeTableId()

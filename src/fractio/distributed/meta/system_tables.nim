@@ -648,6 +648,28 @@ proc decodeDataRowKey*(key: string): tuple[tableId: TableId,
   let pk = afterDataPrefix[GROUP_ID_WIDTH + 1 .. ^1]
   result = (tableId: tableId, groupId: groupId, primaryKey: pk)
 
+proc primaryKeyFromDataRowKey*(key: string): string =
+  ## Extract the primary key portion from a stored data row key.
+  ## This strips the /t/<tableId>/d/<groupId>/ prefix, returning only
+  ## the binary-encoded primary key bytes. Used by the k-way merge to
+  ## compare keys across groups by PK order rather than by groupId.
+  ##
+  ## Key format: /t/<26 tableId>/d/<26 groupId>/<pk>
+  ## PK starts at offset: TABLE_KEY_PREFIX.len + TABLE_ID_WIDTH + 1 + DATA_ROW_PREFIX.len + GROUP_ID_WIDTH + 1
+  ##
+  ## Returns the full key unchanged if it's not a data row key
+  ## (for non-data-table scans like system tables).
+  const PK_OFFSET = TABLE_KEY_PREFIX.len + TABLE_ID_WIDTH + 1 +
+                     DATA_ROW_PREFIX.len + GROUP_ID_WIDTH + 1
+  if key.len >= PK_OFFSET and key.startsWith(TABLE_KEY_PREFIX):
+    # Check if the prefix after tableId is "/d/" (data row separator + data prefix)
+    # Position: TABLE_KEY_PREFIX.len + TABLE_ID_WIDTH is the "/" before "d/"
+    let sepStart = TABLE_KEY_PREFIX.len + TABLE_ID_WIDTH
+    if key.len > sepStart + 2 and key[sepStart .. sepStart + 2] == "/d/":
+      return key[PK_OFFSET .. ^1]
+  # Not a data row key — return full key for default string comparison
+  key
+
 proc isDataRowKey*(key: string): bool =
   ## Check if a key is a data row key (has /d/ prefix after tableId).
   ## Returns false for system table keys, index keys, and non-table keys.
