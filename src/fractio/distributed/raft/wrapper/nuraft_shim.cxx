@@ -187,6 +187,7 @@ public:
         // If cnt is negative, zero, or absurdly large, return empty buffer.
         // Each entry is at most 64KB, so the max reasonable buffer is ~6.4MB.
         if (cnt <= 0 || cnt > 10000) {
+            fprintf(stderr, "[NuRaft Shim] pack() rejected unreasonable cnt=%d at index=%lu, returning empty buffer\n", cnt, (unsigned long)index);
             return buffer::alloc(0);
         }
         size_t cap = static_cast<size_t>(cnt) * 64 * 1024 + 1024;

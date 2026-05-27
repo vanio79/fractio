@@ -891,8 +891,18 @@ proc readOneFrame(sock: Socket,
         ProtocolError] {.gcsafe, raises: [].} =
   ## Read one frame from the socket using non-blocking recv with timeout.
   ## timeoutMs: how long to wait for data (default 500ms, short to allow periodic idle checks)
+  ##
+  ## Error kinds:
+  ##   peInvalidFrame - EOF (0 bytes) or timeout (partial read). Check the
+  ##                    message string: "eof" means the peer closed the connection,
+  ##                    "short header" means a timeout with no data.
+  ##   peChecksumMismatch - CRC mismatch
+  ##   peFrameTooLarge - payload exceeds maxBytes
   var hdrBuf = newString(FRAME_HEADER_SIZE)
   let hn = srvRecvExact(sock, hdrBuf, FRAME_HEADER_SIZE, timeoutMs)
+  if hn == 0:
+    # EOF: peer closed the connection cleanly (recv returned 0)
+    return peErr(newProtocolError(peInvalidFrame, "eof"))
   if hn != FRAME_HEADER_SIZE:
     return peErr(newProtocolError(peInvalidFrame,
       &"short header: got {hn}, need {FRAME_HEADER_SIZE}"))
@@ -909,6 +919,8 @@ proc readOneFrame(sock: Socket,
   var payload = newString(int(hdr.payloadLen))
   if hdr.payloadLen > 0:
     let pn = srvRecvExact(sock, payload, int(hdr.payloadLen), timeoutMs)
+    if pn == 0:
+      return peErr(newProtocolError(peInvalidFrame, "eof"))
     if pn != int(hdr.payloadLen):
       return peErr(newProtocolError(peInvalidFrame,
         &"short payload: got {pn}, need {hdr.payloadLen}"))
@@ -2186,7 +2198,11 @@ proc clientLoop(server: ProtocolServer,
     let frameR = readOneFrame(conn.socket, server.config.maxFrameBytes, 500)
     if frameR.isErr:
       let e = frameR.error
-      # On timeout, just loop back and check idle status again
+      # On timeout, just loop back and check idle status again.
+      # On EOF (peer closed connection), break out of the loop.
+      if e.kind == peInvalidFrame and "eof" in $e:
+        # Peer closed the connection — exit the loop
+        break
       if e.kind == peInvalidFrame and "short header" in $e:
         # Timeout - no data received within 500ms
         # Loop back to check running flag and idle timeout
