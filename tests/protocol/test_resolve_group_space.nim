@@ -171,7 +171,7 @@ suite "resolveGroupId — space-aware routing":
     store.loadTableSpaces()
 
     # tableId not in any space, no space mapping exists
-    let key = encodeDataRowKey(genTableIdLocal(), "42")
+    let key = encodeDataRowScanBound(genTableIdLocal(), "42")
     let r = store.resolveGroupId(key)
     check r.isSome
     check r.get() == DATA_GROUP_START_ID
@@ -183,7 +183,7 @@ suite "resolveGroupId — space-aware routing":
     seedSpaceAndTable(store, 2, testTableId, space.groupIds)
 
     let pk = "42"
-    let key = encodeDataRowKey(testTableId, pk)
+    let key = encodeDataRowScanBound(testTableId, pk)
     let r = store.resolveGroupId(key)
     check r.isSome
 
@@ -201,7 +201,7 @@ suite "resolveGroupId — space-aware routing":
     # Hash 50 keys, check that routing works
     for i in 0 ..< 50:
       let pk = "key_" & $i
-      let key = encodeDataRowKey(testTableId, pk)
+      let key = encodeDataRowScanBound(testTableId, pk)
       let r = store.resolveGroupId(key)
       check r.isSome
       let gid = r.get()
@@ -294,7 +294,7 @@ suite "raftPut/raftDelete via resolveGroupId for space keys":
     let putTableId = genTableIdLocal()
     seedSpaceAndTable(store, 2, putTableId, space.groupIds)
 
-    let key = encodeDataRowKey(putTableId, "42")
+    let key = encodeDataRowScanBound(putTableId, "42")
     let val = """{"id":42,"name":"test"}"""
     let wr = store.raftPut(key, val)
     check wr.isOk
@@ -313,7 +313,7 @@ suite "raftPut/raftDelete via resolveGroupId for space keys":
     let delTableId = genTableIdLocal()
     seedSpaceAndTable(store, 2, delTableId, space.groupIds)
 
-    let key = encodeDataRowKey(delTableId, "99")
+    let key = encodeDataRowScanBound(delTableId, "99")
     let val = """{"id":99}"""
     discard store.raftPut(key, val)
 

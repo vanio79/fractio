@@ -532,13 +532,18 @@ proc closeConn*(client: ProtocolClient, reason: string = "") {.gcsafe, raises: [
 
 # Forward declaration for streaming scan result type
 type
-  # Callback type for multi-group scan - starts next group's stream
-  NextGroupCallback* = proc(): Result[StreamingScanClient,
-      ProtocolError] {.closure, gcsafe, raises: [].}
+  StreamWithKey* = object
+    ## A stream paired with its current peek key for k-way merge.
+    stream*: StreamingScanClient
+    peekKey*: string
+    peekPair*: Option[kvMsgs.ScanPair]
+    exhausted*: bool
 
   StreamingScanClient* = ref object
     ## Client-side streaming scan state - reads multiple frames from server.
-    ## Supports both single-group (direct) and multi-group (aggregated) modes.
+    ## Supports two modes:
+    ##   1. Single-group: direct streaming from one group
+    ##   2. K-way merge: opens all group streams and merges by key order
 
     # Single-group mode fields
     client*: ProtocolClient
@@ -551,17 +556,19 @@ type
     totalReceived*: int
     error*: Option[ProtocolError]
 
-    # Multi-group mode fields (when multiGroupMode is true)
-    multiGroupMode*: bool
-      ## True when aggregating across multiple Raft groups
-    currentGroupStream*: StreamingScanClient
-      ## Current group's stream (nil when between groups)
-    nextGroupCallback*: NextGroupCallback
-      ## Callback to start next group's stream
+    # K-way merge mode fields
     pairsSent*: int
-      ## Count of pairs returned (for limit enforcement in multi-group mode)
+      ## Count of pairs returned (for limit enforcement)
     scanLimit*: uint32
       ## Original limit for multi-group scan (0 = no limit)
+
+    # K-way merge mode fields (when kWayMergeMode is true)
+    kWayMergeMode*: bool
+      ## True when merging multiple group streams by key order
+    mergeStreams*: seq[StreamWithKey]
+      ## All group streams with their current peek state
+    mergeInitialized*: bool
+      ## Whether the initial peek has been done for all streams
 
 proc kvGet*(client: ProtocolClient, key: string,
     flags: uint8 = 0, txnId: TransactionID = zeroTransactionID(),
@@ -706,33 +713,41 @@ proc newStreamingScanClient*(client: ProtocolClient): StreamingScanClient =
   result.framePos = 0
   result.totalReceived = 0
   result.error = none(ProtocolError)
-  result.multiGroupMode = false
-  result.currentGroupStream = nil
-  result.nextGroupCallback = nil
   result.pairsSent = 0
   result.scanLimit = 0
+  result.kWayMergeMode = false
+  result.mergeStreams = @[]
+  result.mergeInitialized = false
 
-proc newMultiGroupStreamingScanClient*(firstStream: StreamingScanClient,
-    nextGroupCallback: NextGroupCallback,
+proc newKWayMergeScanClient*(streams: seq[StreamingScanClient],
     limit: uint32 = 0): StreamingScanClient =
-  ## Create a new streaming scan client for multi-group mode.
-  ## firstStream: the initial group's streaming scan (already started)
-  ## nextGroupCallback: callback to start the next group's stream when current exhausted
+  ## Create a streaming scan client that merges multiple group streams
+  ## using k-way merge. All streams must already be started (have their
+  ## first frame loaded). Results are returned in globally sorted key order.
+  ##
+  ## streams: all group streams (already started, one per group)
   ## limit: total limit across all groups (0 = no limit)
   new(result)
-  result.client = nil # Not used in multi-group mode
-  result.streamId = firstStream.streamId # Use first stream's ID for tracking
-  result.hasMore = false # Not used in multi-group mode
-  result.exhausted = false
+  result.client = nil
+  result.streamId = if streams.len > 0: streams[0].streamId else: 0
+  result.hasMore = false
+  result.exhausted = streams.len == 0
   result.currentFrame = ScanResponseFrame()
   result.framePos = 0
   result.totalReceived = 0
   result.error = none(ProtocolError)
-  result.multiGroupMode = true
-  result.currentGroupStream = firstStream
-  result.nextGroupCallback = nextGroupCallback
   result.pairsSent = 0
   result.scanLimit = limit
+  result.kWayMergeMode = true
+  result.mergeInitialized = false
+  # Initialize merge streams - peek state will be filled on first nextPair() call
+  for stream in streams:
+    result.mergeStreams.add(StreamWithKey(
+      stream: stream,
+      peekKey: "",
+      peekPair: none(kvMsgs.ScanPair),
+      exhausted: false
+    ))
 
 proc startStreamScan*(ss: StreamingScanClient, startKey: string = "",
     endKey: string = "", limit: uint32 = 0,
@@ -747,8 +762,8 @@ proc startStreamScan*(ss: StreamingScanClient, startKey: string = "",
   ## Returns the first frame of results.
   ## chunkSize: number of items per frame (0 = DEFAULT_SCAN_CHUNK_SIZE)
   ## filter: optional server-side filter for reducing network traffic
-  ## Note: Only valid for single-group mode (multiGroupMode must be false).
-  if ss.multiGroupMode:
+  ## Note: Only valid for single-group mode (not k-way merge mode).
+  if ss.kWayMergeMode:
     return peErr(newProtocolError(peInternal,
         "startStreamScan not valid for multi-group mode"))
   if not ss.client.connected.load():
@@ -850,19 +865,21 @@ proc nextFrame*(ss: StreamingScanClient): Result[ScanResponseFrame,
 # Forward declaration for closeStream (needed by nextPair)
 proc closeStream*(ss: StreamingScanClient) {.gcsafe, raises: [].}
 
+# Forward declarations (needed for k-way merge which calls hasNext)
+proc hasNext*(ss: StreamingScanClient): bool {.gcsafe, raises: [].}
+
 proc nextPair*(ss: StreamingScanClient): Option[kvMsgs.ScanPair] {.gcsafe,
     raises: [].} =
   ## Get the next individual KV pair from the stream.
   ## Returns some(pair) if available, none() if exhausted.
-  ## Automatically fetches next frame when current frame is exhausted.
-  ## In multi-group mode, automatically switches to next group when current exhausted.
   ##
-  ## Important: For single-group mode, we check currentFrame.pairs BEFORE checking
-  ## exhausted, because a stream can be marked exhausted but still have pairs
-  ## in currentFrame that need to be consumed.
+  ## Three modes:
+  ##   1. Single-group: reads from one server stream
+  ##   2. Multi-group sequential: iterates groups one at a time (legacy)
+  ##   3. K-way merge: merges all group streams by key order
 
-  # Multi-group mode: delegate to current group stream with limit tracking
-  if ss.multiGroupMode:
+  # K-way merge mode: find the smallest key across all streams
+  if ss.kWayMergeMode:
     if ss.exhausted:
       return none(kvMsgs.ScanPair)
 
@@ -871,62 +888,66 @@ proc nextPair*(ss: StreamingScanClient): Option[kvMsgs.ScanPair] {.gcsafe,
       ss.exhausted = true
       return none(kvMsgs.ScanPair)
 
-    # If no current stream, try to start one via callback
-    if ss.currentGroupStream == nil:
-      if ss.nextGroupCallback == nil:
-        ss.exhausted = true
-        return none(kvMsgs.ScanPair)
-      let nextStreamR = ss.nextGroupCallback()
-      if nextStreamR.isErr:
-        ss.error = some(nextStreamR.error)
-        ss.exhausted = true
-        return none(kvMsgs.ScanPair)
-      ss.currentGroupStream = nextStreamR.value
+    # Lazy initialization: peek the first pair from each stream on first call
+    if not ss.mergeInitialized:
+      for i in 0 ..< ss.mergeStreams.len:
+        if ss.mergeStreams[i].exhausted:
+          continue
+        let stream = ss.mergeStreams[i].stream
+        if stream.hasNext():
+          let pairOpt = stream.nextPair()
+          if pairOpt.isSome:
+            ss.mergeStreams[i].peekPair = pairOpt
+            ss.mergeStreams[i].peekKey = pairOpt.get().key
+          else:
+            ss.mergeStreams[i].exhausted = true
+        else:
+          ss.mergeStreams[i].exhausted = true
+      ss.mergeInitialized = true
 
-    # Get next pair from current group stream
-    let pairOpt = ss.currentGroupStream.nextPair()
-    if pairOpt.isSome:
-      inc ss.totalReceived
-      inc ss.pairsSent
-      return pairOpt
+    # Find the stream with the smallest peek key
+    var bestIdx = -1
+    var bestKey = ""
+    for i in 0 ..< ss.mergeStreams.len:
+      let swk = addr(ss.mergeStreams[i])
+      if swk.exhausted:
+        continue
+      if swk.peekPair.isNone:
+        continue
+      if bestIdx < 0 or swk.peekKey < bestKey:
+        bestIdx = i
+        bestKey = swk.peekKey
 
-    # Current group stream exhausted - try next group
-    ss.currentGroupStream.closeStream()
-    if ss.nextGroupCallback == nil:
+    if bestIdx < 0:
       ss.exhausted = true
       return none(kvMsgs.ScanPair)
 
-    # Check if current stream had an error
-    if ss.currentGroupStream.error.isSome:
-      ss.error = ss.currentGroupStream.error
-      ss.exhausted = true
-      return none(kvMsgs.ScanPair)
+    # Return the best pair and advance that stream
+    let result = ss.mergeStreams[bestIdx].peekPair
+    ss.mergeStreams[bestIdx].peekPair = none(kvMsgs.ScanPair)
+    ss.mergeStreams[bestIdx].peekKey = ""
 
-    # Try next group
-    var attempts = 0
-    while ss.nextGroupCallback != nil and attempts < 100:
-      let nextStreamR = ss.nextGroupCallback()
-      if nextStreamR.isErr:
-        ss.error = some(nextStreamR.error)
-        ss.exhausted = true
-        return none(kvMsgs.ScanPair)
+    # Advance the chosen stream: peek next pair
+    let stream = ss.mergeStreams[bestIdx].stream
+    if stream.hasNext():
+      let nextPairOpt = stream.nextPair()
+      if nextPairOpt.isSome:
+        ss.mergeStreams[bestIdx].peekPair = nextPairOpt
+        ss.mergeStreams[bestIdx].peekKey = nextPairOpt.get().key
+      else:
+        ss.mergeStreams[bestIdx].exhausted = true
+    else:
+      ss.mergeStreams[bestIdx].exhausted = true
 
-      ss.currentGroupStream = nextStreamR.value
-      inc attempts
+    # Check for errors in any stream
+    for swk in ss.mergeStreams:
+      if swk.stream.error.isSome:
+        ss.error = swk.stream.error
+        # Don't mark exhausted - allow caller to check error separately
 
-      # Get first pair from new stream
-      let newPairOpt = ss.currentGroupStream.nextPair()
-      if newPairOpt.isSome:
-        inc ss.totalReceived
-        inc ss.pairsSent
-        return newPairOpt
-
-      # This group also empty, close and continue
-      ss.currentGroupStream.closeStream()
-
-    # All groups exhausted
-    ss.exhausted = true
-    return none(kvMsgs.ScanPair)
+    inc ss.totalReceived
+    inc ss.pairsSent
+    return result
 
   # Single-group mode - check currentFrame.pairs FIRST before exhausted
   # A stream can be marked exhausted (EndOfScan flag) but still have pairs
@@ -957,29 +978,40 @@ proc nextPair*(ss: StreamingScanClient): Option[kvMsgs.ScanPair] {.gcsafe,
 
 proc hasNext*(ss: StreamingScanClient): bool {.gcsafe, raises: [].} =
   ## Check if more pairs are available without consuming them.
-  ## For single-group mode, we can still return pairs from currentFrame even if exhausted.
-  ## For multi-group mode, exhausted means no more groups to try.
+  ##
+  ## Two modes:
+  ##   1. Single-group: check current frame and server has_more
+  ##   2. K-way merge: check if any stream has a peeked pair
 
-  # Multi-group mode
-  if ss.multiGroupMode:
+  # K-way merge mode
+  if ss.kWayMergeMode:
     if ss.exhausted:
       return false
-    # Check limit
     if ss.scanLimit > 0 and ss.pairsSent >= int(ss.scanLimit):
       return false
-
-    # If no current stream but have callback, we can potentially get more
-    if ss.currentGroupStream == nil:
-      let hasCallback = ss.nextGroupCallback != nil
-      return hasCallback
-
-    # Check if current stream has pairs
-    if ss.currentGroupStream.hasNext():
-      return true
-
-    # Current stream exhausted - check if we have more groups
-    let hasMoreGroups = ss.nextGroupCallback != nil
-    return hasMoreGroups
+    # Lazy initialization: on first call, peek the first pair from each stream.
+    # This must happen here (not just in nextPair) because callers check
+    # hasNext() before calling nextPair().
+    if not ss.mergeInitialized:
+      for i in 0 ..< ss.mergeStreams.len:
+        if ss.mergeStreams[i].exhausted:
+          continue
+        let stream = ss.mergeStreams[i].stream
+        if stream.hasNext():
+          let pairOpt = stream.nextPair()
+          if pairOpt.isSome:
+            ss.mergeStreams[i].peekPair = pairOpt
+            ss.mergeStreams[i].peekKey = pairOpt.get().key
+          else:
+            ss.mergeStreams[i].exhausted = true
+        else:
+          ss.mergeStreams[i].exhausted = true
+      ss.mergeInitialized = true
+    # Check if any stream has a peeked pair
+    for swk in ss.mergeStreams:
+      if not swk.exhausted and swk.peekPair.isSome:
+        return true
+    return false
 
   # Single-group mode - check for pairs in current frame first
   # We can return pairs from currentFrame even if stream is exhausted
@@ -993,16 +1025,17 @@ proc hasNext*(ss: StreamingScanClient): bool {.gcsafe, raises: [].} =
 
 proc closeStream*(ss: StreamingScanClient) {.gcsafe, raises: [].} =
   ## Close the streaming scan and mark it exhausted.
-  ## Breaks reference cycles by clearing the nextGroupCallback closure.
   ss.exhausted = true
   ss.hasMore = false
-  # In multi-group mode, close current group stream and clear callback to break cycles
-  if ss.multiGroupMode:
-    if ss.currentGroupStream != nil:
-      ss.currentGroupStream.closeStream()
-      ss.currentGroupStream = nil
-    # Clear the callback to break the closure cycle (prevents ORC crash on cleanup)
-    ss.nextGroupCallback = nil
+  # In k-way merge mode, close all group streams
+  if ss.kWayMergeMode:
+    for swk in mitems(ss.mergeStreams):
+      if swk.stream != nil:
+        swk.stream.closeStream()
+        swk.stream = nil
+      swk.peekPair = none(kvMsgs.ScanPair)
+      swk.exhausted = true
+    ss.mergeStreams = @[]
 
 proc getError*(ss: StreamingScanClient): Option[ProtocolError] {.gcsafe,
     raises: [].} =

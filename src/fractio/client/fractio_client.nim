@@ -793,10 +793,16 @@ method get*(client: FractioClient, key: string,
            readTimestamp: uint64 = 0): KVOpResult[Option[string]] =
   ## Get a value by key, routing to the correct group leader.
   ## Implements KVStore interface.
+  ##
+  ## Data row keys in scan-bound format (without groupId) are automatically
+  ## converted to stored key format (with groupId).
   if not client.initialized.load(moRelaxed):
     return kvOpErr[Option[string]]("client not initialized")
 
   let groupId = client.getGroupForKey(key)
+
+  # Add groupId to data row keys (scan-bound format → stored key format)
+  let rewrittenKey = addGroupIdToKey(key, groupId)
 
   let maxRetries = client.getMaxRetries()
   const baseBackoffMs = 50
@@ -812,7 +818,7 @@ method get*(client: FractioClient, key: string,
       return kvOpErr[Option[string]]("no connection to group leader")
 
     let conn = connOpt.get()
-    let res = conn.kvGetInGroup(key, groupId, txnId = txnId,
+    let res = conn.kvGetInGroup(rewrittenKey, groupId, txnId = txnId,
         readTimestamp = readTimestamp)
 
     if res.isOk:
@@ -908,10 +914,16 @@ method put*(client: FractioClient, key: string, value: string,
            txnId: TransactionID = zeroTransactionID()): KVOpVoidResult =
   ## Put a key-value pair, routing to the correct group leader.
   ## Implements KVStore interface.
+  ##
+  ## Data row keys in scan-bound format (without groupId) are automatically
+  ## converted to stored key format (with groupId).
   if not client.initialized.load(moRelaxed):
     return kvVoidErr("client not initialized")
 
   let groupId = client.getGroupForKey(key)
+
+  # Add groupId to data row keys (scan-bound format → stored key format)
+  let rewrittenKey = addGroupIdToKey(key, groupId)
 
   # Track group participation for distributed transaction resolution
   if txnId != zeroTransactionID():
@@ -935,7 +947,7 @@ method put*(client: FractioClient, key: string, value: string,
       return kvVoidErr("no connection to group leader")
 
     let conn = connOpt.get()
-    let res = conn.kvPutInGroup(key, value, groupId, txnId = txnId)
+    let res = conn.kvPutInGroup(rewrittenKey, value, groupId, txnId = txnId)
 
     if res.isOk and res.value.status == kvMsgs.PutStatusOK:
       return kvVoidOk()
@@ -979,10 +991,16 @@ method delete*(client: FractioClient, key: string,
               txnId: TransactionID = zeroTransactionID()): KVOpVoidResult =
   ## Delete a key, routing to the correct group leader.
   ## Implements KVStore interface.
+  ##
+  ## Data row keys in scan-bound format (without groupId) are automatically
+  ## converted to stored key format (with groupId).
   if not client.initialized.load(moRelaxed):
     return kvVoidErr("client not initialized")
 
   let groupId = client.getGroupForKey(key)
+
+  # Add groupId to data row keys (scan-bound format → stored key format)
+  let rewrittenKey = addGroupIdToKey(key, groupId)
 
   # Track group participation for distributed transaction resolution
   if txnId != zeroTransactionID():
@@ -1004,7 +1022,7 @@ method delete*(client: FractioClient, key: string,
       return kvVoidErr("no connection to group leader")
 
     let conn = connOpt.get()
-    let res = conn.kvDeleteInGroup(key, groupId, txnId = txnId)
+    let res = conn.kvDeleteInGroup(rewrittenKey, groupId, txnId = txnId)
 
     if res.isOk and res.value.status in {kvMsgs.DelStatusDeleted,
         kvMsgs.DelStatusNotFound}:
@@ -1042,6 +1060,10 @@ method scan*(client: FractioClient, startKey: string, endKey: string,
   ## Scan a key range across ALL groups in the space.
   ## For multi-group spaces, data is sharded across groups by primary key hash,
   ## so we must scan ALL groups and merge results.
+  ##
+  ## When the scan is for a data table, per-group scan bounds are computed
+  ## using narrowScanBoundsToGroup() so the server only reads that group's
+  ## key range instead of the entire table.
   ## Implements KVStore interface.
   if not client.initialized.load(moRelaxed):
     return kvOpErr[seq[tuple[key, value: string]]]("client not initialized")
@@ -1050,10 +1072,20 @@ method scan*(client: FractioClient, startKey: string, endKey: string,
   let tableId = client.getTableIdFromKey(startKey)
   let groupIds = client.getGroupsForTable(tableId)
 
+  # Use per-group scan bounds to reduce I/O: each group only reads
+  # its own key range instead of scanning the entire table.
+  let isDataTable = isUserTableId(tableId) and isDataRowKey(startKey)
+
   # Collect results from all groups, deduplicating by key
   var resultMap = stdtables.initTable[string, string]()
 
   for groupId in groupIds:
+    # Compute per-group scan bounds for data tables
+    let (groupStart, groupEnd) = if isDataTable:
+      narrowScanBoundsToGroup(startKey, endKey, tableId, groupId)
+    else:
+      (startKey, endKey)
+
     for attempt in 0 ..< 3:
       let connOpt = client.getGroupLeaderConnection(groupId)
       if connOpt.isNone:
@@ -1068,8 +1100,8 @@ method scan*(client: FractioClient, startKey: string, endKey: string,
         break
 
       let conn = connOpt.get()
-      # Pass groupId for server-side routing filter
-      let res = conn.kvScan(startKey, endKey, 0, txnId = txnId,
+      # Use per-group scan bounds for efficient reads.
+      let res = conn.kvScan(groupStart, groupEnd, 0, txnId = txnId,
                             readTimestamp = readTimestamp,
                             groupId = groupId)
 
@@ -1109,104 +1141,6 @@ method scan*(client: FractioClient, startKey: string, endKey: string,
 
   return kvOpOk(entries)
 
-# =============================================================================
-# Multi-Group Streaming Scan Helpers
-# =============================================================================
-
-type
-  MultiGroupScanContext* = ref object
-    ## Context for multi-group streaming scan, passed via callback closure.
-    ## This holds the state needed to iterate through groups sequentially.
-    fractioClient*: FractioClient
-    groupIds*: seq[GroupID]
-    currentGroupIndex*: int
-    startKey*: string
-    endKey*: string
-    txnId*: TransactionID
-    readTimestamp*: uint64
-    chunkSize*: uint32
-    filter*: Option[kvMsgs.WireFilterExpr] ## Server-side filter for reducing network traffic
-
-proc startNextGroupStream(ctx: MultiGroupScanContext): Result[
-    StreamingScanClient, ProtocolError] =
-  ## Start streaming scan for the next group in the sequence.
-  ## Returns the StreamingScanClient for that group, or error if no more groups.
-  if ctx.currentGroupIndex >= ctx.groupIds.len:
-    return peErr(newProtocolError(peInternal, "no more groups to scan"))
-
-  let groupId = ctx.groupIds[ctx.currentGroupIndex]
-  inc ctx.currentGroupIndex
-
-  var connOpt: Option[ProtocolClient] = none(ProtocolClient)
-  try:
-    connOpt = ctx.fractioClient.getGroupLeaderConnection(groupId)
-  except KeyError:
-    discard
-
-  if connOpt.isNone:
-    # Try to refresh metadata and retry once
-    discard ctx.fractioClient.refreshMetadata()
-    try:
-      connOpt = ctx.fractioClient.getGroupLeaderConnection(groupId)
-    except KeyError:
-      return peErr(newProtocolError(peInternal,
-          "group not found in metadata for group " & $groupId))
-    if connOpt.isNone:
-      return peErr(newProtocolError(peInternal,
-          "no connection to group leader for group " & $groupId))
-    let conn = connOpt.get()
-    return conn.kvStreamScan(ctx.startKey, ctx.endKey, 0,
-        ctx.chunkSize, 0, ctx.txnId, ctx.readTimestamp, groupId, ctx.filter)
-
-  let conn = connOpt.get()
-  let streamRes = conn.kvStreamScan(ctx.startKey, ctx.endKey, 0,
-      ctx.chunkSize, 0, ctx.txnId, ctx.readTimestamp, groupId, ctx.filter)
-
-  if streamRes.isErr:
-    # Check if it's a not-leader error and retry
-    if streamRes.error.kind == peNotLeader:
-      if streamRes.error.leaderRedirect.leaderId != 0:
-        ctx.fractioClient.updateLeaderFromRedirect(groupId,
-            streamRes.error.leaderRedirect)
-      else:
-        discard ctx.fractioClient.refreshMetadata()
-      try:
-        connOpt = ctx.fractioClient.getGroupLeaderConnection(groupId)
-      except KeyError:
-        discard
-      if connOpt.isSome:
-        let conn2 = connOpt.get()
-        let streamRes2 = conn2.kvStreamScan(ctx.startKey, ctx.endKey, 0,
-            ctx.chunkSize, 0, ctx.txnId, ctx.readTimestamp, groupId, ctx.filter)
-        if streamRes2.isOk:
-          return streamRes2
-    return peErr(streamRes.error)
-
-  return streamRes
-
-proc createNextGroupCallback(ctx: MultiGroupScanContext): NextGroupCallback =
-  ## Create a closure callback for starting the next group's stream.
-  ## The callback captures the context and advances through groups.
-  result = proc(): Result[StreamingScanClient, ProtocolError] {.closure, gcsafe,
-      raises: [].} =
-    try:
-      startNextGroupStream(ctx)
-    except Exception as e:
-      peErr(newProtocolError(peInternal, "exception in multi-group callback: " & e.msg))
-
-proc consumeMultiGroupStream(ss: StreamingScanClient): seq[kvMsgs.ScanPair] =
-  ## Consume all pairs from a multi-group stream.
-  ## Warning: For large result sets, this defeats the purpose of streaming.
-  var pairs: seq[kvMsgs.ScanPair] = @[]
-  while ss.hasNext():
-    let pairOpt = ss.nextPair()
-    if pairOpt.isSome:
-      pairs.add(pairOpt.get())
-  ss.closeStream()
-  # Sort by key for consistent ordering
-  pairs.sort(proc(a, b: kvMsgs.ScanPair): int = cmp(a.key, b.key))
-  pairs
-
 method streamScan*(client: FractioClient, startKey: string, endKey: string,
                   limit: uint32 = 0,
                   txnId: TransactionID = zeroTransactionID(),
@@ -1217,9 +1151,8 @@ method streamScan*(client: FractioClient, startKey: string, endKey: string,
 ProtocolError] =
   ## Streaming scan across ALL groups in the space.
   ## For multi-group spaces, data is sharded across groups by primary key hash.
-  ## This method creates a streaming client that fetches results from one group
-  ## at a time, merging results in key order.
-  ## For multi-group scans, the client iterates through groups sequentially.
+  ## This method creates a streaming client that merges results from all groups
+  ## in key order using k-way merge.
   ## filter: optional server-side filter for reducing network traffic
   if not client.initialized.load(moRelaxed):
     return peErr(newProtocolError(peInternal, "client not initialized"))
@@ -1228,47 +1161,88 @@ ProtocolError] =
   let tableId = client.getTableIdFromKey(startKey)
   let groupIds = client.getGroupsForTable(tableId)
 
-  # For single group, use direct streaming
+  # Use per-group scan bounds to reduce I/O: each group only reads
+  # its own key range instead of scanning the entire table.
+  let isDataTable = isUserTableId(tableId) and isDataRowKey(startKey)
+
+  # For single group, use direct streaming.
   if groupIds.len == 1:
     let groupId = groupIds[0]
+    let (groupStart, groupEnd) = if isDataTable:
+      narrowScanBoundsToGroup(startKey, endKey, tableId, groupId)
+    else:
+      (startKey, endKey)
+
     let connOpt = client.getGroupLeaderConnection(groupId)
     if connOpt.isNone:
       return peErr(newProtocolError(peInternal,
           "no connection to group leader"))
     let conn = connOpt.get()
-    return conn.kvStreamScan(startKey, endKey, limit, 0, 0, txnId,
+    return conn.kvStreamScan(groupStart, groupEnd, limit, 0, 0, txnId,
         readTimestamp, groupId, filter)
 
-  # For multi-group, create a multi-group streaming scan client
-  # that iterates through groups sequentially
+  # For multi-group, use k-way merge: open all group streams simultaneously
+  # and merge results by key order. This produces globally sorted output
+  # without needing a post-hoc sort.
   let chunkSize = 100'u32 # Default chunk size for streaming
+  var groupStreams: seq[StreamingScanClient] = @[]
+  var errors: seq[string] = @[]
 
-  # Create context for multi-group scan
-  let ctx = new(MultiGroupScanContext)
-  ctx.fractioClient = client
-  ctx.groupIds = groupIds
-  ctx.currentGroupIndex = 0
-  ctx.startKey = startKey
-  ctx.endKey = endKey
-  ctx.txnId = txnId
-  ctx.readTimestamp = readTimestamp
-  ctx.chunkSize = chunkSize
-  ctx.filter = filter
+  for groupId in groupIds:
+    # Compute per-group scan bounds for efficient reads
+    let (groupStart, groupEnd) = if isDataTable:
+      narrowScanBoundsToGroup(startKey, endKey, tableId, groupId)
+    else:
+      (startKey, endKey)
 
-  # Start the first group's stream
-  let firstStreamR = startNextGroupStream(ctx)
-  if firstStreamR.isErr:
-    return peErr(firstStreamR.error)
+    var connOpt: Option[ProtocolClient] = none(ProtocolClient)
+    try:
+      connOpt = client.getGroupLeaderConnection(groupId)
+    except KeyError:
+      discard
 
-  let firstStream = firstStreamR.value
+    if connOpt.isNone:
+      # Skip this group if we can't connect
+      continue
 
-  # Create the callback for subsequent groups
-  let callback = createNextGroupCallback(ctx)
+    let conn = connOpt.get()
+    let streamRes = conn.kvStreamScan(groupStart, groupEnd, 0,
+        chunkSize, 0, txnId, readTimestamp, groupId, filter)
+    if streamRes.isOk:
+      groupStreams.add(streamRes.value)
+    elif streamRes.error.kind == peNotLeader:
+      # Try to update leader and retry once
+      if streamRes.error.leaderRedirect.leaderId != 0:
+        client.updateLeaderFromRedirect(groupId, streamRes.error.leaderRedirect)
+      else:
+        discard client.refreshMetadata()
+      try:
+        let connOpt2 = client.getGroupLeaderConnection(groupId)
+        if connOpt2.isSome:
+          let conn2 = connOpt2.get()
+          let streamRes2 = conn2.kvStreamScan(groupStart, groupEnd, 0,
+              chunkSize, 0, txnId, readTimestamp, groupId, filter)
+          if streamRes2.isOk:
+            groupStreams.add(streamRes2.value)
+      except KeyError:
+        discard
+    else:
+      errors.add($groupId & ": " & streamRes.error.msg)
 
-  # Create multi-group streaming client
-  let multiGroupClient = newMultiGroupStreamingScanClient(firstStream, callback, limit)
+  if groupStreams.len == 0:
+    if errors.len > 0:
+      return peErr(newProtocolError(peInternal,
+          "failed to connect to any group: " & errors.join("; ")))
+    return peErr(newProtocolError(peInternal,
+        "no groups available for scan"))
 
-  return peOk(multiGroupClient)
+  if groupStreams.len == 1:
+    # Single group stream — return directly
+    return peOk(groupStreams[0])
+
+  # K-way merge: merge all group streams by key order
+  let mergeClient = newKWayMergeScanClient(groupStreams, limit)
+  return peOk(mergeClient)
 
 method beginTxn*(client: FractioClient): KVOpResult[TxnBeginResult] =
   ## Begin a new transaction by contacting the meta group leader.

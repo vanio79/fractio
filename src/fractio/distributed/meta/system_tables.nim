@@ -530,23 +530,215 @@ proc systemTableNumFromId*(tableId: TableId): uint8 =
 # ============================================================================
 # User table key helpers (data rows and secondary index entries)
 # ============================================================================
+#
+# Key format (all data rows include the group ID):
+#   Data row:  /t/<tableId>/d/<groupId>/<primaryKey>
+#   Index:     /t/<tableId>/i/<groupId>/<indexId>/<indexKey>/<primaryKey>
+#
+# The group ID in the key enables per-group range scans:
+#   - Scan bounds for group G: /t/<tableId>/d/<groupId>/  ..  /t/<tableId>/d/<groupId>{
+#   - Table-wide end key: /t/<tableId>/e/  (covers all groups)
+#
+# Scan bound keys (start/end of ranges) omit the groupId since they span
+# all groups. Use encodeDataRowScanBound() for these delimiters.
 
-proc encodeDataRowKey*(tableId: TableId, primaryKey: string): string =
-  ## Encode a data row key: /t/<tableId>/d/<primaryKey>
-  encodeTableKey(tableId, "d/" & primaryKey)
+const
+  DATA_ROW_PREFIX* = "d/"
+    ## Prefix for data row keys within a table key
+  INDEX_PREFIX* = "i/"
+    ## Prefix for index keys within a table key
+  GROUP_ID_WIDTH* = 26
+    ## Width of GroupID ULID string in key (26 characters, same as TableId)
+
+proc encodeDataRowKey*(tableId: TableId, groupId: GroupID,
+                       primaryKey: string): string =
+  ## Encode a data row key: /t/<tableId>/d/<groupId>/<primaryKey>
+  ##
+  ## The groupId enables per-group range scans in the KV store.
+  ## Each group's data is stored in a contiguous key range, so a scan
+  ## for a specific group only reads that group's keys.
+  encodeTableKey(tableId, DATA_ROW_PREFIX & $groupId & "/" & primaryKey)
+
+proc encodeDataRowScanBound*(tableId: TableId, primaryKey: string): string =
+  ## Encode a data row scan bound key WITHOUT group ID.
+  ## Format: /t/<tableId>/d/<primaryKey>
+  ##
+  ## Used only for scan range delimiters (start/end keys) where the groupId
+  ## is not included because these bounds span all groups. For actual data
+  ## storage keys, use encodeDataRowKey(tableId, groupId, primaryKey).
+  ##
+  ## For per-group scan bounds, use makeGroupDataRowScanBounds() or
+  ## narrowScanBoundsToGroup() instead.
+  encodeTableKey(tableId, DATA_ROW_PREFIX & primaryKey)
+
+proc makeGroupDataRowScanBounds*(tableId: TableId,
+                                 groupId: GroupID): tuple[
+                                     startKey: string, endKey: string] =
+  ## Create scan bounds (start, end) for all data rows of a specific group.
+  ##
+  ## Start key: /t/<tableId>/d/<groupId>/
+  ## End key:   /t/<tableId>/d/<groupId>0
+  ##
+  ## The "0" character is lexicographically before any ULID character
+  ## (which uses Crockford base32: 0-9, A-Z excluding I, L, O, U).
+  ## Wait — '0' is actually a valid ULID character. We need a character
+  ## that sorts AFTER all valid ULID characters. The highest ULID char is
+  ## 'Z'. So we append '\xFF' or use a character beyond 'Z'.
+  ## Actually, the ULID alphabet is "0123456789ABCDEFGHJKMNPQRSTVWXYZ".
+  ## The highest character is 'Z'. Any character after 'Z' in ASCII works.
+  ## We use '~' (0x7E) which sorts after 'Z' and is safe in LevelDB keys.
+  ##
+  ## Actually, the simplest approach: append a character that sorts after
+  ## all 26-char ULID strings. Since ULID uses Crockford base32 (chars
+  ## 0-9, A-Z excluding I/L/O/U), the max char is 'Z'. We append a
+  ## single character that sorts after 'Z' — we use '{' (0x7B).
+  ##
+  ## But even simpler: the end key just needs to be one past the last
+  ## possible key with this groupId prefix. We use the groupId string
+  ## plus '{' which sorts after 'Z':
+  ##   End: /t/<tableId>/d/<groupId>{  (exclusive bound)
+  ##
+  ## Since all primary keys start after the "/" following groupId, and
+  ## no primary key can contain '{', this correctly bounds the range.
+  let startKey = encodeTableKey(tableId, DATA_ROW_PREFIX & $groupId & "/")
+  let endKey = encodeTableKey(tableId, DATA_ROW_PREFIX & $groupId & "{")
+  result = (startKey: startKey, endKey: endKey)
 
 proc makeDataRowScanEndKey*(tableId: TableId): string =
-  ## Create an end key for scanning all data rows of a table.
+  ## Create an end key for scanning all data rows of a table (across all groups).
   ## Returns "/t/<tableId>/e/" where "e" > "d" (data prefix).
-  ## This scans all keys matching /t/<tableId>/d/... (data rows).
+  ## This scans all keys matching /t/<tableId>/d/... (data rows from all groups).
   encodeTableKey(tableId, "e/")
 
-proc encodeIndexKey*(tableId: TableId, indexId: TableId,
+proc decodeDataRowKey*(key: string): tuple[tableId: TableId,
+    groupId: GroupID, primaryKey: string] =
+  ## Decode a data row key with group ID back to its components.
+  ##
+  ## Key format: /t/<tableId>/d/<groupId>/<primaryKey>
+  ## Where <groupId> is a 26-character ULID string.
+  ##
+  ## Raises ValueError if the key does not contain a valid group ID.
+  if not key.startsWith(TABLE_KEY_PREFIX):
+    raise newException(ValueError, "Not a table key: " & key)
+
+  let afterPrefix = key[TABLE_KEY_PREFIX.len .. ^1]
+  if afterPrefix.len < TABLE_ID_WIDTH + 1:
+    raise newException(ValueError, "Data row key too short: " & key)
+
+  let tableIdStr = afterPrefix[0 ..< TABLE_ID_WIDTH]
+  let tableId = tableIdFromString(tableIdStr)
+
+  # Skip the "/" after tableId
+  let rest = afterPrefix[TABLE_ID_WIDTH + 1 .. ^1]
+
+  # Check if this starts with "d/" (data row prefix)
+  if not rest.startsWith(DATA_ROW_PREFIX):
+    raise newException(ValueError, "Not a data row key: " & key)
+
+  let afterDataPrefix = rest[DATA_ROW_PREFIX.len .. ^1]
+
+  # Parse the group ID (26-char ULID string followed by "/")
+  if afterDataPrefix.len < GROUP_ID_WIDTH + 1 or
+     afterDataPrefix[GROUP_ID_WIDTH] != '/':
+    raise newException(ValueError,
+        "Data row key missing group ID: " & key)
+
+  let groupIdStr = afterDataPrefix[0 ..< GROUP_ID_WIDTH]
+  let groupId = parseGroupID(groupIdStr)
+  let pk = afterDataPrefix[GROUP_ID_WIDTH + 1 .. ^1]
+  result = (tableId: tableId, groupId: groupId, primaryKey: pk)
+
+proc isDataRowKey*(key: string): bool =
+  ## Check if a key is a data row key (has /d/ prefix after tableId).
+  ## Returns false for system table keys, index keys, and non-table keys.
+  if not key.startsWith(TABLE_KEY_PREFIX):
+    return false
+  try:
+    let (_, primaryKey) = decodeTableKey(key)
+    result = primaryKey.startsWith(DATA_ROW_PREFIX)
+  except ValueError:
+    return false
+
+proc extractGroupIdFromDataRowKey*(key: string): GroupID =
+  ## Extract the GroupID from a data row key.
+  ## All data row keys must contain a group ID (format: /t/<tableId>/d/<groupId>/<pk>).
+  ## Returns ZeroGroupID() for non-data-row keys.
+  ## Raises ValueError for data row keys with invalid format.
+  if not isDataRowKey(key):
+    return ZeroGroupID()
+  let (_, groupId, _) = decodeDataRowKey(key)
+  groupId
+
+proc narrowScanBoundsToGroup*(startKey, endKey: string,
+    tableId: TableId, groupId: GroupID): tuple[startKey: string,
+        endKey: string] =
+  ## Narrow table-wide scan bounds to a specific group's key range.
+  ##
+  ## Given a start/end key range for a table, intersect it with the group's
+  ## data row prefix range. This enables per-group range scans that avoid
+  ## reading data from other groups.
+  ##
+  ## For data row keys (starting with /t/<tableId>/d/), the intersection is:
+  ##   group_start = max(startKey, /t/<tableId>/d/<groupId>/)
+  ##   group_end   = min(endKey, /t/<tableId>/d/<groupId>{)
+  ##
+  ## For non-data-row keys (system tables, etc.), returns the original range
+  ## unchanged since group routing doesn't apply to those keys.
+  let (groupStart, groupEnd) = makeGroupDataRowScanBounds(tableId, groupId)
+
+  # Intersect: max of starts, min of ends
+  if startKey.len > 0 and startKey > groupStart:
+    result.startKey = startKey
+  else:
+    result.startKey = groupStart
+
+  if endKey.len > 0 and endKey < groupEnd:
+    result.endKey = endKey
+  else:
+    result.endKey = groupEnd
+
+proc encodeIndexKey*(tableId: TableId, groupId: GroupID, indexId: TableId,
                      indexKey: string, primaryKey: string): string =
   ## Encode a secondary index entry key:
-  ## /t/<tableId>/i/<indexId>/<indexKey>/<primaryKey>
-  encodeTableKey(tableId, "i/" & formatTableId(indexId) & "/" &
-                 indexKey & "/" & primaryKey)
+  ## /t/<tableId>/i/<groupId>/<indexId>/<indexKey>/<primaryKey>
+  ##
+  ## The groupId enables per-group index scans.
+  encodeTableKey(tableId, INDEX_PREFIX & $groupId & "/" &
+                 formatTableId(indexId) & "/" & indexKey & "/" & primaryKey)
+
+proc addGroupIdToKey*(key: string, groupId: GroupID): string =
+  ## Add a group ID to a data row scan-bound key.
+  ##
+  ## Transforms /t/<tableId>/d/<pk> → /t/<tableId>/d/<groupId>/<pk>.
+  ## This is used by the client layer to convert planner-generated scan-bound
+  ## keys (without groupId) into the canonical stored key format (with groupId).
+  ##
+  ## If the key already has a groupId (i.e., it's in stored format), returns
+  ## it unchanged. If the key is not a data row key, returns it unchanged.
+  if not isDataRowKey(key):
+    return key
+
+  try:
+    let (tableId, existingGroupId, pk) = decodeDataRowKey(key)
+    # Key already has groupId — return as-is
+    if existingGroupId != ZeroGroupID():
+      return key
+    # This shouldn't happen since decodeDataRowKey now raises on missing groupId,
+    # but handle it gracefully by re-encoding
+    return encodeDataRowKey(tableId, groupId, pk)
+  except ValueError:
+    # Not a decodable data row key — might be a scan-bound key without groupId.
+    # Parse manually to extract the table ID and primary key.
+    try:
+      let (tableId, primaryKey) = decodeTableKey(key)
+      # primaryKey is "d/<pk>" for a scan-bound key without groupId
+      let barePk = if primaryKey.startsWith(DATA_ROW_PREFIX):
+                     primaryKey[DATA_ROW_PREFIX.len .. ^1]
+                   else:
+                     primaryKey
+      return encodeDataRowKey(tableId, groupId, barePk)
+    except ValueError:
+      return key
 
 proc encodeSpaceKey*(spaceId: SpaceID): string =
   ## Encode a space catalog key: /t/<SYS_SPACES_TABLE_ID>/<spaceId>

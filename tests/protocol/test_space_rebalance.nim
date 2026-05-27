@@ -13,7 +13,7 @@
 import std/[unittest, os, options, tables, algorithm, hashes, json, strutils, locks,
             sequtils]
 from fractio/core/types import genULIDLocal, genSpaceIDLocal, genTableIdLocal,
-    ULID, SpaceID, TableId, ulidToBytes, ulidFromBytes, ZeroULID
+    ULID, SpaceID, TableId, ulidToBytes, ulidFromBytes, ZeroULID, zeroTableId
 import fractio/protocol/raft_store
 import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/multigroup_types
@@ -352,7 +352,7 @@ suite "Space rebalance — dual-read routing":
         break
     check testPk.len > 0
 
-    let key = encodeDataRowKey(genTableIdLocal(), testPk)
+    let key = encodeDataRowScanBound(genTableIdLocal(), testPk)
     let value = """{"id":"test","val":"fallback"}"""
 
     # Write data using OLD group routing (simulate pre-rebalance data)
@@ -385,7 +385,7 @@ suite "Space rebalance — dual-read routing":
         groupIDFromInt(112)]
     let oldGroupIds = @[groupIDFromInt(100), groupIDFromInt(101)]
     let pk = "new_data_key"
-    let key = encodeDataRowKey(genTableIdLocal(), pk)
+    let key = encodeDataRowScanBound(genTableIdLocal(), pk)
 
     # Write using new group routing
     let newSpace = SpaceInfo(
@@ -417,7 +417,7 @@ suite "Space rebalance — dual-read routing":
       workerState: wsMigrating,
     )
     let gr = store.raftGetInSpace(
-      encodeDataRowKey(genTableIdLocal(), "nonexistent"), rebalSpace, "nonexistent")
+      encodeDataRowScanBound(genTableIdLocal(), "nonexistent"), rebalSpace, "nonexistent")
     check gr.isOk
     check gr.value.isNone
 
@@ -439,7 +439,7 @@ suite "Space rebalance — dual-read routing":
         break
     check testPk.len > 0
 
-    let key = encodeDataRowKey(genTableIdLocal(), testPk)
+    let key = encodeDataRowScanBound(genTableIdLocal(), testPk)
     # Write using old group routing
     let oldSpace = SpaceInfo(
       spaceId: genSpaceIDLocal(), name: "t", replicas: 1, groupIds: oldGroupIds)
@@ -479,7 +479,7 @@ suite "Space rebalance — dual-scan routing":
       spaceId: genSpaceIDLocal(), name: "t", replicas: 1, groupIds: oldGroupIds)
     for i in 0 ..< 10:
       let pk = "old_" & $i
-      let key = encodeDataRowKey(testTableId, pk)
+      let key = encodeDataRowScanBound(testTableId, pk)
       discard store.raftPutInSpace(key, $ %*{"src": "old", "id": i}, oldSpace, pk)
 
     # Write some data using new routing
@@ -487,7 +487,7 @@ suite "Space rebalance — dual-scan routing":
       spaceId: genSpaceIDLocal(), name: "t", replicas: 1, groupIds: newGroupIds)
     for i in 10 ..< 15:
       let pk = "new_" & $i
-      let key = encodeDataRowKey(testTableId, pk)
+      let key = encodeDataRowScanBound(testTableId, pk)
       discard store.raftPutInSpace(key, $ %*{"src": "new", "id": i}, newSpace, pk)
 
     # Scan during rebalance — should see all 15 rows
@@ -497,8 +497,8 @@ suite "Space rebalance — dual-scan routing":
       oldGroupIds: oldGroupIds,
       workerState: wsMigrating,
     )
-    let startKey = encodeDataRowKey(testTableId, "")
-    let endKey = encodeDataRowKey(testTableId, "\xFF")
+    let startKey = encodeDataRowScanBound(testTableId, "")
+    let endKey = encodeDataRowScanBound(testTableId, "\xFF")
     let sr = store.raftScanSpace(startKey, endKey, rebalSpace, 0,
         includeSystemKeys = true)
     check sr.isOk
@@ -521,7 +521,7 @@ suite "Space rebalance — dual-scan routing":
 
     # Write the same key using both old and new routing
     let pk = "shared_key"
-    let key = encodeDataRowKey(testTableId, pk)
+    let key = encodeDataRowScanBound(testTableId, pk)
     let oldSpace = SpaceInfo(
       spaceId: genSpaceIDLocal(), name: "t", replicas: 1, groupIds: oldGroupIds)
     discard store.raftPutInSpace(key, "old_value", oldSpace, pk)
@@ -537,8 +537,8 @@ suite "Space rebalance — dual-scan routing":
       workerState: wsMigrating,
     )
     let sr = store.raftScanSpace(
-        encodeDataRowKey(testTableId, ""),
-        encodeDataRowKey(testTableId, "\xFF"),
+        encodeDataRowScanBound(testTableId, ""),
+        encodeDataRowScanBound(testTableId, "\xFF"),
         rebalSpace, 0, includeSystemKeys = true)
     check sr.isOk
     # Should be deduplicated to exactly 1 row (shared backend = same key)
@@ -559,7 +559,7 @@ suite "Space rebalance — raftDeleteInGroup":
     defer: teardown(coord, "/tmp/fractio_sr_rebal_t30")
 
     let pk = "del_target"
-    let key = encodeDataRowKey(genTableIdLocal(), pk)
+    let key = encodeDataRowScanBound(genTableIdLocal(), pk)
 
     # Write to group 100 directly
     let space = SpaceInfo(

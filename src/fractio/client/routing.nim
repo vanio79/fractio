@@ -86,10 +86,11 @@ proc getGroupForKey*(state: RoutingState, key: string): GroupID =
   ## Determine which group owns a given key using routing state.
   ## Pure function - fully testable with RoutingState.
   ##
-  ## Returns META_GROUP_ID if the group cannot be determined.
+  ## For data row keys with embedded groupId, extracts the groupId directly.
+  ## For scan-bound keys without groupId (e.g. /t/<tableId>/d/<pk>), uses
+  ## hash routing on the primary key.
   ##
-  ## During rebalancing, routes reads to oldGroupIds since data has not yet
-  ## migrated to the new groups. Writes continue to new groups.
+  ## Returns META_GROUP_ID if the group cannot be determined.
 
   # System tables (tableId 1-7) are in the meta group
   if key.startsWith(TABLE_KEY_PREFIX):
@@ -115,8 +116,11 @@ proc getGroupForKey*(state: RoutingState, key: string): GroupID =
                 spaceInfo.groupIds
 
               if activeGroupIds.len > 0:
-                # Extract the primary key portion for hashing
-                # Key format: /t/<tableId>/<pk> or /t/<tableId>/d/<pk>
+                # All stored data row keys include the group ID:
+                #   /t/<tableId>/d/<groupId>/<pk>
+                # Scan-bound keys (start/end of ranges) may omit it:
+                #   /t/<tableId>/d/<pk>
+                #   /t/<tableId>/d/
                 let afterTableId = afterPrefix[TABLE_ID_WIDTH .. ^1]
                 var pk = afterTableId
 
@@ -128,7 +132,27 @@ proc getGroupForKey*(state: RoutingState, key: string): GroupID =
                 if pk.startsWith("d/"):
                   pk = pk[2 .. ^1]
 
-                # Hash-based routing for multi-group spaces
+                  # Check for embedded groupId (26-char ULID + "/")
+                  if pk.len >= 27 and pk[26] == '/':
+                    # Key has embedded groupId — extract and route directly
+                    try:
+                      let embeddedGroupId = parseGroupID(pk[0 ..< 26])
+                      # Verify the embedded group is in the active groups
+                      for gid in activeGroupIds:
+                        if gid == embeddedGroupId:
+                          return embeddedGroupId
+                      # During rebalancing, check old groups too
+                      if spaceInfo.rebalancing:
+                        for gid in spaceInfo.oldGroupIds:
+                          if gid == embeddedGroupId:
+                            return embeddedGroupId
+                    except ValueError:
+                      discard
+                    # Embedded groupId not in any active group — fall through
+                    # to hash routing using the bare pk
+                    pk = pk[27 .. ^1] # Skip groupId + "/" for hashing
+
+                # Hash-based routing for scan-bound keys without groupId
                 return routeToGroup(pk, activeGroupIds)
 
           # Fall back to default data group for tables without space assignment

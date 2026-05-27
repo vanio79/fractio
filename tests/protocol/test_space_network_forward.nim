@@ -1,8 +1,8 @@
-# Integration tests for space-routed writes on a multi-node cluster.
+# Integration tests for space-routed operations on a multi-node cluster.
 #
 # Verifies that raftPut/raftDelete via resolveGroupId route to the correct
-# leader node directly (no forwarding needed) and that the routing is
-# consistent with raftPutInSpace/raftGetInSpace which use the bare PK.
+# leader node directly (no forwarding needed) and that non-leader nodes
+# return NOT_LEADER for space-routed keys (client must retry on leader).
 #
 # 3-node cluster with NuRaft ASIO networking. Space with 3 groups, each
 # potentially led by a different node. Tests exercise writes from the node
@@ -336,7 +336,7 @@ suite "Multi-node — resolveGroupId consistency with raftPutInSpace":
     # For 50 keys, verify resolveGroupId matches routeToGroup(barePK)
     for i in 0 ..< 50:
       let pk = "key_" & $i
-      let key = encodeDataRowKey(seededTableId, pk)
+      let key = encodeDataRowScanBound(seededTableId, pk)
       let resolved = nodes[0].store.resolveGroupId(key)
       let expected = routeToGroup(pk, space.groupIds)
       check resolved.isSome
@@ -355,7 +355,7 @@ suite "Multi-node — resolveGroupId consistency with raftPutInSpace":
       if leaderIdx < 0: continue
 
       let pk = findKeyForNode(nodes, groupIdx, space)
-      let key = encodeDataRowKey(seededTableId, pk)
+      let key = encodeDataRowScanBound(seededTableId, pk)
       let val = """{"groupIdx":""" & $groupIdx & "}"
 
       # raftPut on the leader node for this group should succeed locally
@@ -376,7 +376,7 @@ suite "Multi-node — resolveGroupId consistency with raftPutInSpace":
       if leaderIdx < 0: continue
 
       let pk = findKeyForNode(nodes, groupIdx, space)
-      let key = encodeDataRowKey(seededTableId, pk)
+      let key = encodeDataRowScanBound(seededTableId, pk)
       discard nodes[leaderIdx].store.raftPut(key, "to_delete")
 
       let dr = nodes[leaderIdx].store.raftDelete(key)
@@ -390,7 +390,7 @@ suite "Multi-node — resolveGroupId consistency with raftPutInSpace":
 # Suite: cross-node forwarding via peer stores
 # ---------------------------------------------------------------------------
 
-suite "Multi-node — peer store forwarding for space-routed keys":
+suite "Multi-node — NOT_LEADER enforcement for space-routed keys":
 
   test "raftPut on wrong node returns not-leader":
     var nodes = makeCluster3()
@@ -405,7 +405,7 @@ suite "Multi-node — peer store forwarding for space-routed keys":
     let nonLeaderIdx = if leaderIdx == 0: 1 else: 0
     # Only test if leaderIdx != nonLeaderIdx (non-leader tries to write)
     if leaderIdx >= 0 and leaderIdx != nonLeaderIdx:
-      let key = encodeDataRowKey(seededTableId, pk)
+      let key = encodeDataRowScanBound(seededTableId, pk)
       let val = """{"wrong_node":true}"""
 
       # raftPut on non-leader for this group — should fail (not leader)
@@ -423,7 +423,7 @@ suite "Multi-node — peer store forwarding for space-routed keys":
     let gid = groupIDFromInt(SPACE_GROUP_START + 1)
     let leaderIdx = findLeaderNodeIdx(nodes, gid)
     if leaderIdx >= 0:
-      let key = encodeDataRowKey(seededTableId, pk)
+      let key = encodeDataRowScanBound(seededTableId, pk)
       # Insert on leader
       discard nodes[leaderIdx].store.raftPut(key, "will_delete")
 
@@ -433,7 +433,7 @@ suite "Multi-node — peer store forwarding for space-routed keys":
       check not dr.isOk
       check dr.error.kind == rseNotLeader
 
-  test "raftPutInSpace from non-leader forwards to leader":
+  test "raftPutInSpace from non-leader returns NOT_LEADER":
     var nodes = makeCluster3()
     defer: stopCluster(nodes)
 
@@ -443,24 +443,15 @@ suite "Multi-node — peer store forwarding for space-routed keys":
     let leaderIdx = findLeaderNodeIdx(nodes, gid)
     if leaderIdx >= 0:
       let nonLeaderIdx = if leaderIdx == 0: 1 else: 0
-      let key = encodeDataRowKey(seededTableId, pk)
+      let key = encodeDataRowScanBound(seededTableId, pk)
       let val = """{"space_forward":1}"""
 
-      # Write from non-leader — should succeed via forwarding
+      # Write from non-leader — should fail with NOT_LEADER (no forwarding)
       let wr = nodes[nonLeaderIdx].store.raftPutInSpace(key, val, space, pk)
-      check wr.isOk
-      if wr.isOk:
-        check wr.value.value == val
+      check not wr.isOk
+      check wr.error.kind == rseNotLeader
 
-      # Verify the data is readable from the owning leader
-      let gr = nodes[leaderIdx].store.raftGetInSpaceFromGroup(key, gid)
-      check gr.isOk
-      if gr.isOk:
-        check gr.value.isSome
-        if gr.value.isSome:
-          check gr.value.get().value == val
-
-  test "raftDeleteInSpace from non-leader forwards to leader":
+  test "raftDeleteInSpace from non-leader returns NOT_LEADER":
     var nodes = makeCluster3()
     defer: stopCluster(nodes)
 
@@ -470,27 +461,14 @@ suite "Multi-node — peer store forwarding for space-routed keys":
     let leaderIdx = findLeaderNodeIdx(nodes, gid)
     if leaderIdx >= 0:
       let nonLeaderIdx = if leaderIdx == 0: 1 else: 0
-      let key = encodeDataRowKey(seededTableId, pk)
-      let putRes = nodes[leaderIdx].store.raftPutInSpace(key, "to_del", space, pk)
-      check putRes.isOk
+      let key = encodeDataRowScanBound(seededTableId, pk)
 
-      # Wait for replication
-      sleep(200)
-
-      # Delete from non-leader — should succeed via forwarding
+      # Delete from non-leader — should fail with NOT_LEADER (no forwarding)
       let dr = nodes[nonLeaderIdx].store.raftDeleteInSpace(key, space, pk)
-      check dr.isOk
+      check not dr.isOk
+      check dr.error.kind == rseNotLeader
 
-      # Wait for replication
-      sleep(200)
-
-      # Verify the key is gone from the owning leader
-      let gr = nodes[leaderIdx].store.raftGetInSpaceFromGroup(key, gid)
-      check gr.isOk
-      if gr.isOk:
-        check gr.value.isNone
-
-  test "raftGetInSpace from non-leader forwards to leader":
+  test "raftGetInSpace from non-leader returns NOT_LEADER":
     var nodes = makeCluster3()
     defer: stopCluster(nodes)
 
@@ -500,23 +478,12 @@ suite "Multi-node — peer store forwarding for space-routed keys":
     let leaderIdx = findLeaderNodeIdx(nodes, gid)
     if leaderIdx >= 0:
       let nonLeaderIdx = if leaderIdx == 0: 1 else: 0
-      let key = encodeDataRowKey(seededTableId, pk)
-      let val = """{"get_forward":true}"""
+      let key = encodeDataRowScanBound(seededTableId, pk)
 
-      # Write on the owning leader
-      let wr = nodes[leaderIdx].store.raftPutInSpace(key, val, space, pk)
-      check wr.isOk
-
-      # Wait for replication
-      sleep(200)
-
-      # Read from non-leader — should forward to leader
+      # Read from non-leader — should fail with NOT_LEADER (no forwarding)
       let gr = nodes[nonLeaderIdx].store.raftGetInSpace(key, space, pk)
-      check gr.isOk
-      if gr.isOk:
-        check gr.value.isSome
-        if gr.value.isSome:
-          check gr.value.get().value == val
+      check not gr.isOk
+      check gr.error.kind == rseNotLeader
 
 # ---------------------------------------------------------------------------
 # Suite: routing validation
@@ -531,7 +498,7 @@ suite "Multi-node — routing validation for group-routed requests":
     let space = spaceInfo()
     # Find a key that routes to group 10 (first space group)
     let pk = findKeyForNode(nodes, 0, space)
-    let key = encodeDataRowKey(seededTableId, pk)
+    let key = encodeDataRowScanBound(seededTableId, pk)
 
     # Find leader for group 11 (wrong group for this key)
     let wrongGid = groupIDFromInt(SPACE_GROUP_START + 1)
@@ -549,7 +516,7 @@ suite "Multi-node — routing validation for group-routed requests":
 
     let space = spaceInfo()
     let pk = findKeyForNode(nodes, 0, space)
-    let key = encodeDataRowKey(seededTableId, pk)
+    let key = encodeDataRowScanBound(seededTableId, pk)
 
     let wrongGid = groupIDFromInt(SPACE_GROUP_START + 1)
     let leaderIdx = findLeaderNodeIdx(nodes, wrongGid)
@@ -565,7 +532,7 @@ suite "Multi-node — routing validation for group-routed requests":
 
     let space = spaceInfo()
     let pk = findKeyForNode(nodes, 0, space)
-    let key = encodeDataRowKey(seededTableId, pk)
+    let key = encodeDataRowScanBound(seededTableId, pk)
 
     let wrongGid = groupIDFromInt(SPACE_GROUP_START + 1)
     let leaderIdx = findLeaderNodeIdx(nodes, wrongGid)

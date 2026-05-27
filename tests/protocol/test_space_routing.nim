@@ -203,7 +203,7 @@ suite "Space routing — put and get with 3 groups":
     # Insert 30 keys
     for i in 0 ..< 30:
       let pk = $i
-      let key = encodeDataRowKey(testTableId, pk)
+      let key = encodeDataRowScanBound(testTableId, pk)
       let val = $ %*{"id": i, "val": "v" & $i}
       let wr = store.raftPutInSpace(key, val, space, pk)
       check wr.isOk
@@ -211,7 +211,7 @@ suite "Space routing — put and get with 3 groups":
     # Verify each key is retrievable
     for i in 0 ..< 30:
       let pk = $i
-      let key = encodeDataRowKey(testTableId, pk)
+      let key = encodeDataRowScanBound(testTableId, pk)
       let gr = store.raftGetInSpace(key, space, pk)
       check gr.isOk
       check gr.value.isSome
@@ -238,7 +238,7 @@ suite "Space routing — delete with multiple groups":
     defer: teardown(coord, "/tmp/fractio_sr_t10")
 
     let pk = "del_key"
-    let key = encodeDataRowKey(testTableId, pk)
+    let key = encodeDataRowScanBound(testTableId, pk)
     discard store.raftPutInSpace(key, "value", space, pk)
 
     let dr = store.raftDeleteInSpace(key, space, pk)
@@ -271,8 +271,8 @@ suite "Space routing — fan-out scan with merge-sort":
     defer: teardown(coord, "/tmp/fractio_sr_t20")
 
     let sr = store.raftScanSpace(
-        encodeDataRowKey(testTableId, ""),
-        encodeDataRowKey(testTableId3, ""),
+        encodeDataRowScanBound(testTableId, ""),
+        encodeDataRowScanBound(testTableId3, ""),
         space, 0, includeSystemKeys = true)
     check sr.isOk
     check sr.value.len == 0
@@ -285,12 +285,12 @@ suite "Space routing — fan-out scan with merge-sort":
     # Insert 20 keys that will be distributed across 3 groups
     for i in 0 ..< 20:
       let pk = $i
-      let key = encodeDataRowKey(testTableId, pk)
+      let key = encodeDataRowScanBound(testTableId, pk)
       let val = $ %*{"id": i}
       discard store.raftPutInSpace(key, val, space, pk)
 
-    let startKey = encodeDataRowKey(testTableId, "")
-    let endKey = encodeDataRowKey(testTableId3, "")
+    let startKey = encodeDataRowScanBound(testTableId, "")
+    let endKey = encodeDataRowScanBound(testTableId3, "")
     let sr = store.raftScanSpace(startKey, endKey, space, 0,
         includeSystemKeys = true)
     check sr.isOk
@@ -307,12 +307,12 @@ suite "Space routing — fan-out scan with merge-sort":
 
     for i in 0 ..< 15:
       let pk = $i
-      let key = encodeDataRowKey(testTableId, pk)
+      let key = encodeDataRowScanBound(testTableId, pk)
       discard store.raftPutInSpace(key, $ %*{"id": i}, space, pk)
 
     let sr = store.raftScanSpace(
-        encodeDataRowKey(testTableId, ""),
-        encodeDataRowKey(testTableId3, ""),
+        encodeDataRowScanBound(testTableId, ""),
+        encodeDataRowScanBound(testTableId3, ""),
         space, 5, includeSystemKeys = true)
     check sr.isOk
     check sr.value.len == 5
@@ -330,14 +330,14 @@ suite "Space routing — fan-out scan with merge-sort":
     for i in 0 ..< 5:
       let pk = $i
       discard store.raftPutInSpace(
-          encodeDataRowKey(testTableId, pk), $ %*{"id": i, "t": 100}, space, pk)
+          encodeDataRowScanBound(testTableId, pk), $ %*{"id": i, "t": 100}, space, pk)
       discard store.raftPutInSpace(
-          encodeDataRowKey(testTableId2, pk), $ %*{"id": i, "t": 200}, space, pk)
+          encodeDataRowScanBound(testTableId2, pk), $ %*{"id": i, "t": 200}, space, pk)
 
     # Scan only testTableId (range from testTableId to testTableId3, which excludes testTableId2)
     let sr = store.raftScanSpace(
-        encodeDataRowKey(testTableId, ""),
-        encodeDataRowKey(testTableId3, ""),
+        encodeDataRowScanBound(testTableId, ""),
+        encodeDataRowScanBound(testTableId3, ""),
         space, 0, includeSystemKeys = true)
     check sr.isOk
     check sr.value.len == 5
@@ -353,12 +353,12 @@ suite "Space routing — fan-out scan with merge-sort":
 
     for i in 0 ..< 5:
       let pk = $i
-      let key = encodeDataRowKey(testTableId, pk)
+      let key = encodeDataRowScanBound(testTableId, pk)
       discard store.raftPutInSpace(key, $ %*{"id": i}, space1, pk)
 
     let sr = store.raftScanSpace(
-        encodeDataRowKey(testTableId, ""),
-        encodeDataRowKey(testTableId3, ""),
+        encodeDataRowScanBound(testTableId, ""),
+        encodeDataRowScanBound(testTableId3, ""),
         space1, 0, includeSystemKeys = true)
     check sr.isOk
     check sr.value.len == 5
@@ -370,7 +370,7 @@ suite "Space routing — fan-out scan with merge-sort":
 
     # Insert a real key
     let pk = "real"
-    let key = encodeDataRowKey(testTableId, pk)
+    let key = encodeDataRowScanBound(testTableId, pk)
     discard store.raftPutInSpace(key, "value", space, pk)
 
     # Inject intent key directly into the backend

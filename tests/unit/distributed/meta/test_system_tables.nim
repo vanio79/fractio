@@ -150,27 +150,46 @@ suite "Key Classification":
     check tableIdFromKey(encodeTableKey(SYS_DATABASES_TABLE_ID, "db")) == SYS_DATABASES_TABLE_ID
 
 suite "User Table Key Helpers":
-  test "encodeDataRowKey":
+  test "encodeDataRowKey with groupId":
     let tableId = genTableIdLocal()
-    let key = encodeDataRowKey(tableId, "alice")
+    let groupId = genGroupIDLocal()
+    let key = encodeDataRowKey(tableId, groupId, "alice")
+    check key.startsWith("/t/")
+    check "/d/" in key
+    check $groupId in key
+    let (decodedId, decodedGroupId, decodedPk) = decodeDataRowKey(key)
+    check decodedId == tableId
+    check decodedGroupId == groupId
+    check decodedPk == "alice"
+
+  test "encodeDataRowScanBound (scan-bound format without groupId)":
+    let tableId = genTableIdLocal()
+    let key = encodeDataRowScanBound(tableId, "alice")
     check key.startsWith("/t/")
     check "/d/alice" in key
     let (decodedId, pk) = decodeTableKey(key)
     check decodedId == tableId
     check pk == "d/alice"
+    # decodeDataRowKey raises on scan-bound keys (no groupId)
+    doAssertRaises(ValueError):
+      discard decodeDataRowKey(key)
 
-  test "encodeIndexKey":
+  test "encodeIndexKey with groupId":
     let tableId = genTableIdLocal()
+    let groupId = genGroupIDLocal()
     let indexId = genTableIdLocal()
-    let key = encodeIndexKey(tableId, indexId, "alice@example.com", "alice")
+    let key = encodeIndexKey(tableId, groupId, indexId, "alice@example.com", "alice")
     check key.startsWith("/t/")
     check "/i/" in key
+    check $groupId in key
     check "alice@example.com" in key
 
   test "data rows sort before index entries":
     let tableId = genTableIdLocal()
-    let dataKey = encodeDataRowKey(tableId, "alice")
-    let indexKey = encodeIndexKey(tableId, genTableIdLocal(), "alice@example.com", "alice")
+    let groupId = genGroupIDLocal()
+    let dataKey = encodeDataRowKey(tableId, groupId, "alice")
+    let indexKey = encodeIndexKey(tableId, groupId, genTableIdLocal(),
+        "alice@example.com", "alice")
     check dataKey < indexKey # "d/" < "i/"
 
 suite "GroupDescriptor.isMetaGroup":

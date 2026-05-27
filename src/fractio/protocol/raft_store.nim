@@ -365,8 +365,13 @@ proc routeToGroup*(primaryKey: string, groupIds: seq[
 proc resolveGroupId*(store: RaftKVStoreExt, key: string): Option[
     GroupID] {.gcsafe, raises: [].} =
   ## Unified key → GroupID routing. Meta/system keys go to META_GROUP_ID,
-  ## user-table data keys in a space route to the space's Raft group via
-  ## hash(primaryKey), and everything else goes to DATA_GROUP_START_ID.
+  ## user-table data keys route via their embedded groupId, and everything
+  ## else goes to DATA_GROUP_START_ID.
+  ##
+  ## All stored data row keys include the groupId in the key format:
+  ##   /t/<tableId>/d/<groupId>/<pk>
+  ## For scan-bound keys without groupId (e.g. /t/<tableId>/d/<pk>),
+  ## hash-based routing on the primary key is used as a fallback.
   ##
   ## Handles MVCC-encoded keys (with intent suffix or version suffix) by
   ## stripping the suffix before routing.
@@ -376,20 +381,29 @@ proc resolveGroupId*(store: RaftKVStoreExt, key: string): Option[
 
   if isMetaGroupKey(routingKey):
     return some(META_GROUP_ID)
+
   # Check if this is a user-table data key that belongs to a space
   if isTableKey(routingKey):
     {.cast(raises: []).}:
       try:
+        # Data row keys with embedded groupId — extract directly
+        if isDataRowKey(routingKey):
+          try:
+            let extractedGid = extractGroupIdFromDataRowKey(routingKey)
+            if extractedGid != ZeroGroupID():
+              return some(extractedGid)
+          except ValueError:
+            # Key doesn't have a groupId (scan-bound format) — fall through
+            # to hash-based routing below
+            discard
+
+        # Fall back to hash-based routing for scan-bound keys without groupId
         let (tableId, primaryKey) = decodeTableKey(routingKey)
         if isUserTableId(tableId):
           var groupIds: seq[GroupID] = @[]
           withLock store.spacesMu:
-            # Only use the spaceId if the table is explicitly in the mapping
-            # and the spaceId is NOT ZeroULID() (which means "no space assignment")
             if store.tableSpaces.hasKey(tableId):
               let spaceId = store.tableSpaces[tableId]
-              # ZeroULID() means the table is not assigned to any space
-              # Only look up the space if spaceId is non-zero
               var spaceIdValid = false
               for b in ULID(spaceId).data:
                 if b != 0:
@@ -398,16 +412,15 @@ proc resolveGroupId*(store: RaftKVStoreExt, key: string): Option[
               if spaceIdValid and store.spaces.hasKey(spaceId):
                 groupIds = store.spaces[spaceId].groupIds
           if groupIds.len > 0:
-            # decodeTableKey returns "d/<pk>" for data rows; strip the
-            # "d/" prefix so we hash the same bare PK that raftPutInSpace
-            # and the SQL executor use.
-            # NOTE: We do NOT call stripMvccSuffix on the bare PK because:
-            # 1. The full routingKey was already stripped at line 300
-            # 2. Binary PKs may legitimately contain \x00 bytes (NULL flags/padding)
-            # 3. The MVCC suffix pattern (\x00\x01/\x00\x00 + 8 bytes) could
-            #    accidentally match binary PK content, causing incorrect truncation
+            # Extract bare primary key for hash routing.
+            # Stored keys: d/<groupId>/<pk> — skip groupId (26 chars) + "/"
+            # Scan-bound keys: d/<pk> — just the bare pk
             let pk = if primaryKey.startsWith("d/"):
-                       primaryKey[2 .. ^1]
+                       let afterDPrefix = primaryKey[2 .. ^1]
+                       if afterDPrefix.len >= 27 and afterDPrefix[26] == '/':
+                         afterDPrefix[27 .. ^1]
+                       else:
+                         afterDPrefix
                      else:
                        primaryKey
             let routedGid = routeToGroup(pk, groupIds)
@@ -418,12 +431,17 @@ proc resolveGroupId*(store: RaftKVStoreExt, key: string): Option[
 
 proc keyRoutesToGroupIdDuringRebalance*(store: RaftKVStoreExt, key: string,
     targetGroupId: GroupID): bool {.gcsafe, raises: [].} =
-  ## Check if a key routes to the target group, considering both old and new
-  ## groups during rebalancing. This implements dual-read mode.
+  ## Check if a key routes to the target group.
   ##
-  ## During rebalancing, a key that was routed to oldGroupIds when inserted
-  ## may route differently to newGroupIds now. We need to accept keys that
-  ## route to EITHER old or new groups to maintain data visibility.
+  ## All stored data row keys include the groupId in the key format:
+  ##   /t/<tableId>/d/<groupId>/<pk>
+  ## The groupId is extracted directly from the key — no hash routing needed.
+  ##
+  ## For scan-bound keys without groupId (e.g. /t/<tableId>/d/<pk>),
+  ## hash-based routing on the primary key is used as a fallback.
+  ##
+  ## During rebalancing, a key whose embedded groupId is in oldGroupIds
+  ## is also accepted (dual-read mode).
 
   let routingKey = stripMVCCSuffix(key)
 
@@ -433,6 +451,38 @@ proc keyRoutesToGroupIdDuringRebalance*(store: RaftKVStoreExt, key: string,
   if isTableKey(routingKey):
     {.cast(raises: []).}:
       try:
+        # Data row keys with embedded groupId — extract directly
+        if isDataRowKey(routingKey):
+          try:
+            let extractedGid = extractGroupIdFromDataRowKey(routingKey)
+            if extractedGid != ZeroGroupID():
+              # Key has embedded groupId — check if it matches the target
+              if extractedGid == targetGroupId:
+                return true
+              # During rebalancing, also accept keys in old groups
+              let (tableId, _) = decodeTableKey(routingKey)
+              if isUserTableId(tableId):
+                withLock store.spacesMu:
+                  if store.tableSpaces.hasKey(tableId):
+                    let spaceId = store.tableSpaces[tableId]
+                    var spaceIdValid = false
+                    for b in ULID(spaceId).data:
+                      if b != 0:
+                        spaceIdValid = true
+                        break
+                    if spaceIdValid and store.spaces.hasKey(spaceId):
+                      let space = store.spaces[spaceId]
+                      if space.workerState != wsIdle and space.oldGroupIds.len > 0:
+                        for oldGid in space.oldGroupIds:
+                          if oldGid == extractedGid:
+                            return true
+              return false
+          except ValueError:
+            # Key doesn't have a groupId (scan-bound format) — fall through
+            # to hash-based routing below
+            discard
+
+        # Fall back to hash-based routing for scan-bound keys without groupId
         let (tableId, primaryKey) = decodeTableKey(routingKey)
         if isUserTableId(tableId):
           var newGroupIds: seq[GroupID] = @[]
@@ -440,12 +490,8 @@ proc keyRoutesToGroupIdDuringRebalance*(store: RaftKVStoreExt, key: string,
           var rebalancing: bool = false
           var hasSpace: bool = false
           withLock store.spacesMu:
-            # Only use the spaceId if the table is explicitly in the mapping
-            # and the spaceId is NOT ZeroULID() (which means "no space assignment")
             if store.tableSpaces.hasKey(tableId):
               let spaceId = store.tableSpaces[tableId]
-              # ZeroULID() means the table is not assigned to any space
-              # Only look up the space if spaceId is non-zero
               var spaceIdValid = false
               for b in ULID(spaceId).data:
                 if b != 0:
@@ -460,16 +506,17 @@ proc keyRoutesToGroupIdDuringRebalance*(store: RaftKVStoreExt, key: string,
 
           if hasSpace and newGroupIds.len > 0:
             let pk = if primaryKey.startsWith("d/"):
-                       primaryKey[2 .. ^1]
+                       let afterDPrefix = primaryKey[2 .. ^1]
+                       # Stored keys: d/<groupId>/<pk> — skip groupId
+                       if afterDPrefix.len >= 27 and afterDPrefix[26] == '/':
+                         afterDPrefix[27 .. ^1]
+                       else:
+                         afterDPrefix  # Scan-bound key: just the pk
                      else:
                        primaryKey
-            # NOTE: Do NOT call stripMvccSuffix on bare PK - binary PKs may
-            # contain legitimate \x00 bytes that would match the MVCC suffix
-            # pattern incorrectly
 
             # Check if key routes to new group
             let newRoutedGid = routeToGroup(pk, newGroupIds)
-            
             if newRoutedGid == targetGroupId:
               return true
 

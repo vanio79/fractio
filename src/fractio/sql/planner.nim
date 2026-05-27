@@ -457,7 +457,10 @@ proc makeScanKeysFromRange*(tableId: TableId, rangeInfo: PkRangeInfo): tuple[
   ## For range scan, generates appropriate bounds.
   ##
   ## System tables use encodeTableKey (no "d/" prefix).
-  ## User tables use encodeDataRowKey (with "d/" prefix for data rows).
+  ## User tables use encodeDataRowScanBound (with "d/" prefix but no groupId).
+  ##
+  ## These are table-wide scan bounds. For multi-group tables, the client
+  ## narrows them to per-group bounds using narrowScanBoundsToGroup().
 
   let isSysTable = isSystemTableId(tableId)
 
@@ -467,7 +470,7 @@ proc makeScanKeysFromRange*(tableId: TableId, rangeInfo: PkRangeInfo): tuple[
     if isSysTable:
       result.startKey = encodeTableKey(tableId, pkVal)
     else:
-      result.startKey = encodeDataRowKey(tableId, pkVal)
+      result.startKey = encodeDataRowScanBound(tableId, pkVal)
     result.endKey = result.startKey
     return result
 
@@ -477,7 +480,7 @@ proc makeScanKeysFromRange*(tableId: TableId, rangeInfo: PkRangeInfo): tuple[
     if isSysTable:
       result.startKey = encodeTableKey(tableId, bound.value)
     else:
-      result.startKey = encodeDataRowKey(tableId, bound.value)
+      result.startKey = encodeDataRowScanBound(tableId, bound.value)
     # For exclusive lower bound (>), we need to skip exact match
     # The scan will naturally skip it since we filter rows
   else:
@@ -485,7 +488,7 @@ proc makeScanKeysFromRange*(tableId: TableId, rangeInfo: PkRangeInfo): tuple[
     if isSysTable:
       result.startKey = encodeTableKey(tableId, "")
     else:
-      result.startKey = encodeDataRowKey(tableId, "")
+      result.startKey = encodeDataRowScanBound(tableId, "")
 
   if rangeInfo.endBound.isSome:
     let bound = rangeInfo.endBound.get()
@@ -498,13 +501,13 @@ proc makeScanKeysFromRange*(tableId: TableId, rangeInfo: PkRangeInfo): tuple[
       if isSysTable:
         result.endKey = encodeTableKey(tableId, bound.value & "\xFF")
       else:
-        result.endKey = encodeDataRowKey(tableId, bound.value & "\xFF")
+        result.endKey = encodeDataRowScanBound(tableId, bound.value & "\xFF")
     else:
       # Exclude the bound - scan up to but not including
       if isSysTable:
         result.endKey = encodeTableKey(tableId, bound.value)
       else:
-        result.endKey = encodeDataRowKey(tableId, bound.value)
+        result.endKey = encodeDataRowScanBound(tableId, bound.value)
   else:
     # No upper bound - scan to end of table
     if isSysTable:

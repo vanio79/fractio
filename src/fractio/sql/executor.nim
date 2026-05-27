@@ -596,7 +596,7 @@ proc execDropDatabase(op: PlanOp, ctx: ExecutorContext): ExecResult =
       if rec.database == op.ddbName:
         let tableId = rec.tableId
         # Delete all data rows for this table
-        let dataStart = encodeDataRowKey(tableId, "")
+        let dataStart = encodeDataRowScanBound(tableId, "")
         let dataEnd = makeDataRowScanEndKey(tableId)
         let dataScan = ctx.kv.scan(dataStart, dataEnd, 0,
             txnId = internalTxnId, readTimestamp = internalReadTimestamp)
@@ -1093,7 +1093,7 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
           error = "INSERT requires a primary key value"
           break
         # Encode data row key with binary PK
-        let key = encodeDataRowKey(op.insTableId, pkBinary)
+        let key = encodeDataRowScanBound(op.insTableId, pkBinary)
         # Use active transaction if available, otherwise auto-transaction
         let res = ctx.kv.put(key, rowBinary, txnId = ctx.txnId)
         if res.isErr:
@@ -1113,7 +1113,7 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
       let key = if isSysTable:
         encodeTableKey(op.pgTableId, op.pgKey)
       else:
-        encodeDataRowKey(op.pgTableId, op.pgKey)
+        encodeDataRowScanBound(op.pgTableId, op.pgKey)
 
       if isSysTable:
         # System table lookup - use binary decoding
@@ -1398,7 +1398,7 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
 
     of poUpdate:
       # MVCC-aware UPDATE
-      let startKey = encodeDataRowKey(op.upTableId, "")
+      let startKey = encodeDataRowScanBound(op.upTableId, "")
       let endKey = makeDataRowScanEndKey(op.upTableId)
       # Use transaction context for consistent scan
       let res = ctx.kv.scan(startKey, endKey, 0, txnId = ctx.txnId,
@@ -1432,7 +1432,7 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
 
     of poDelete:
       # MVCC-aware DELETE
-      let startKey = encodeDataRowKey(op.delTableId, "")
+      let startKey = encodeDataRowScanBound(op.delTableId, "")
       let endKey = makeDataRowScanEndKey(op.delTableId)
       # Use transaction context for consistent scan
       let res = ctx.kv.scan(startKey, endKey, 0, txnId = ctx.txnId,

@@ -2452,7 +2452,7 @@ suite "Executor DML Operations with MockKVStore":
     discard executeWithTxn(commitPlan, ctx)
 
     # Verify row was inserted
-    let key = encodeDataRowKey(tableId, pkValue)
+    let key = encodeDataRowScanBound(tableId, pkValue)
     check mockKV.hasKey(key)
 
   test "executeWithTxn INSERT multiple rows":
@@ -2622,7 +2622,7 @@ suite "Executor DML Operations with MockKVStore":
       discard executeWithTxn(insertPlan, ctx)
 
     # Scan all rows
-    let startKey = encodeDataRowKey(tableId, "")
+    let startKey = encodeDataRowScanBound(tableId, "")
     let endKey = makeDataRowScanEndKey(tableId)
 
     let plan = newPlan()
@@ -2671,7 +2671,7 @@ suite "Executor DML Operations with MockKVStore":
       discard executeWithTxn(insertPlan, ctx)
 
     # Scan with limit
-    let startKey = encodeDataRowKey(tableId, "")
+    let startKey = encodeDataRowScanBound(tableId, "")
     let endKey = makeDataRowScanEndKey(tableId)
 
     let plan = newPlan()
@@ -2934,7 +2934,7 @@ suite "Executor ORDER BY with MockKVStore":
       discard executeWithTxn(insertPlan, ctx)
 
     # Scan with ORDER BY id ASC
-    let startKey = encodeDataRowKey(tableId, "")
+    let startKey = encodeDataRowScanBound(tableId, "")
     let endKey = makeDataRowScanEndKey(tableId)
 
     let sortSpecs = @[SortSpec(
@@ -3001,7 +3001,7 @@ suite "Executor ORDER BY with MockKVStore":
       discard executeWithTxn(insertPlan, ctx)
 
     # Scan with ORDER BY score DESC
-    let startKey = encodeDataRowKey(tableId, "")
+    let startKey = encodeDataRowScanBound(tableId, "")
     let endKey = makeDataRowScanEndKey(tableId)
 
     let sortSpecs = @[SortSpec(
@@ -3077,7 +3077,7 @@ suite "Executor ORDER BY with MockKVStore":
       discard executeWithTxn(insertPlan, ctx)
 
     # Scan with ORDER BY age ASC, name ASC
-    let startKey = encodeDataRowKey(tableId, "")
+    let startKey = encodeDataRowScanBound(tableId, "")
     let endKey = makeDataRowScanEndKey(tableId)
 
     let sortSpecs = @[
@@ -3146,7 +3146,7 @@ suite "Executor ORDER BY with MockKVStore":
     discard executeWithTxn(insertPlan, ctx)
 
     # Scan with filter that returns nothing, then ORDER BY
-    let startKey = encodeDataRowKey(tableId, "")
+    let startKey = encodeDataRowScanBound(tableId, "")
     let endKey = makeDataRowScanEndKey(tableId)
 
     let filter = Expr(kind: exBinOp, binOp: boGt,
@@ -3412,7 +3412,7 @@ suite "System Table Key Encoding":
     check not sysKey.contains("/d/")
 
     # encodeDataRowKey: /t/<tableId>/d/<pk>
-    let dataKey = encodeDataRowKey(sysTableId, pkValue)
+    let dataKey = encodeDataRowScanBound(sysTableId, pkValue)
     check dataKey.startsWith("/t/")
     check dataKey.contains("/d/")
 
