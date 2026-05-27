@@ -21,6 +21,7 @@ import std/typedthreads
 import std/algorithm
 import std/logging
 import std/sequtils
+import posix
 
 import fractio/core/types as core_types except NodeID
 import fractio/distributed/sharedtimer/timeprovider
@@ -39,7 +40,36 @@ from fractio/distributed/raft/multiplexed_bindings import deliverMessage
 
 # ============================================================================
 # Types
-# ============================================================================
+
+type
+  CommitWaitData = object
+    ## Condition variable for proposeAndWait to block on instead of polling.
+    ## Signaled from nuraftCommitCb when the state machine advances.
+    lock: Lock
+    cond: Cond
+
+proc timedWait(cond: var Cond, lock: var Lock, timeoutMs: int): bool =
+  ## Wait on condition variable with timeout in milliseconds.
+  ## Returns true if signaled (or spurious wakeup), false on timeout.
+  ## On Linux, Nim's Cond = pthread_cond_t and Lock = pthread_mutex_t,
+  ## so we can safely cast to posix types for pthread_cond_timedwait.
+  when defined(posix):
+    var ts: Timespec
+    discard clock_gettime(CLOCK_REALTIME, ts)
+    let extraNs = clong(timeoutMs) * 1_000_000
+    ts.tv_nsec = ts.tv_nsec + extraNs
+    while ts.tv_nsec >= 1_000_000_000:
+      ts.tv_nsec = ts.tv_nsec - 1_000_000_000
+      inc ts.tv_sec
+    # Cast Nim Lock/Cond to posix Pthread_mutex/Pthread_cond — same C type
+    let rc = pthread_cond_timedwait(
+      cast[ptr Pthread_cond](addr cond),
+      cast[ptr Pthread_mutex](addr lock),
+      addr ts)
+    result = rc == 0
+  else:
+    sleep(timeoutMs)
+    result = false
 
 type
   NuRaftGroupInstance* = object
@@ -65,6 +95,8 @@ type
     ## Prevents use-after-free when a group is removed while another thread
     ## holds a pointer to the instance.
     refCount*: Atomic[int32]
+    ## Condition variable for proposeAndWait — signaled on commit callback
+    commitWaitPtr*: pointer
 
   NuRaftGroupInstancePtr* = ptr NuRaftGroupInstance
 
@@ -144,9 +176,22 @@ proc allocInstance(): NuRaftGroupInstancePtr =
       NuRaftGroupInstance))))
   zeroMem(result, sizeof(NuRaftGroupInstance))
   result.refCount.store(1'i32, moRelaxed) # Group table holds one reference
+  # Allocate and initialize condition variable for proposeAndWait
+  let cw = cast[ptr CommitWaitData](c_malloc(csize_t(sizeof(CommitWaitData))))
+  zeroMem(cw, sizeof(CommitWaitData))
+  initLock(cw.lock)
+  initCond(cw.cond)
+  result.commitWaitPtr = cast[pointer](cw)
 
 proc freeInstance(p: NuRaftGroupInstancePtr) =
   if p != nil:
+    # Deinit and free the CommitWaitData
+    if p.commitWaitPtr != nil:
+      let cw = cast[ptr CommitWaitData](p.commitWaitPtr)
+      deinitCond(cw.cond)
+      deinitLock(cw.lock)
+      c_free(p.commitWaitPtr)
+      p.commitWaitPtr = nil
     c_free(p)
 
 # Forward declarations needed for releaseGroupInstance
@@ -291,6 +336,11 @@ proc nuraftCommitCb(ctx: pointer, logIdx: uint64,
   let coord = cast[NuRaftCoordinator](inst.coordPtr)
   if coord == nil or coord.kvStorePtr == nil:
     return
+
+  # Signal the condition variable so proposeAndWait stops polling
+  if inst.commitWaitPtr != nil:
+    let cw = cast[ptr CommitWaitData](inst.commitWaitPtr)
+    signal(cw.cond)
 
   {.cast(gcsafe).}:
     if applyBatchCallback != nil:
@@ -483,6 +533,7 @@ proc multiplexedSendCb(ctx: pointer, groupIdBytes: cstring, srcNodeId: int32,
 var gActiveTimers: nimtables.Table[tuple[timerId: int32, rpcCtx: pointer],
     tuple[expireNs: int64]]
 var gTimerLock: Lock
+var gTimerCond: Cond
 var gTimerThread: Thread[void]
 var gTimerThreadRunning: Atomic[bool]
 var gTimerThreadRefCount: int32 # Reference count for timer thread
@@ -492,6 +543,7 @@ var gValidContexts: nimtables.Table[pointer, bool]
 var gValidContextsLock: Lock
 
 initLock(gTimerLock)
+initCond(gTimerCond)
 initLock(gValidContextsLock)
 gTimerThreadRunning.store(false)
 gTimerThreadRefCount = 0
@@ -512,6 +564,8 @@ proc multiplexedScheduleTimerCb(ctx: pointer, timerId: int32,
       let expireNs = nowNs + delayMs.int64 * 1_000_000
       # Use (timerId, ctx) as key to avoid collisions between groups
       gActiveTimers[(timerId: timerId, rpcCtx: ctx)] = (expireNs: expireNs)
+      # Wake the timer thread so it can recalculate the minimum wait
+      signal(gTimerCond)
 
 proc multiplexedCancelTimerCb(ctx: pointer, timerId: int32) {.cdecl, gcsafe.} =
   {.cast(gcsafe).}:
@@ -550,25 +604,41 @@ proc cancelAllTimersForContext(ctx: pointer) =
       for key in keysToDelete:
         gActiveTimers.del(key)
 
-# Timer thread that polls for expired timers and invokes them
+# Timer thread that waits for expired timers and invokes them.
+# Uses a condition variable with a calculated timeout (minimum timer expiry)
+# instead of sleep(5) polling, reducing CPU waste and improving timer accuracy.
 proc timerThreadProc() {.thread, gcsafe.} =
-  var pollCount = 0
   while gTimerThreadRunning.load(moRelaxed):
-    sleep(5) # 5ms poll interval
-    pollCount += 1
-
     # Collect expired timers under lock
     var expiredTimers: seq[tuple[timerId: int32, rpcCtx: pointer]] = @[]
+    var waitMs = 100 # Default wait: 100ms if no timers are active
     {.cast(gcsafe).}:
-      withLock gTimerLock:
-        let nowNs = coordNowNs()
-        # Collect all expired timers
-        for key, entry in gActiveTimers:
-          if entry.expireNs <= nowNs:
-            expiredTimers.add(key)
-        # Delete expired timers
-        for key in expiredTimers:
-          gActiveTimers.del(key)
+      acquire(gTimerLock)
+      let nowNs = coordNowNs()
+      # Find the earliest timer expiry and collect all expired timers
+      var earliestNs: int64 = 0
+      for key, entry in gActiveTimers:
+        if entry.expireNs <= nowNs:
+          expiredTimers.add(key)
+        elif earliestNs == 0 or entry.expireNs < earliestNs:
+          earliestNs = entry.expireNs
+      # Delete expired timers
+      for key in expiredTimers:
+        gActiveTimers.del(key)
+      # Calculate wait time: sleep until earliest timer expires
+      if earliestNs > 0:
+        let delayNs = earliestNs - nowNs
+        waitMs = max(1, int(delayNs div 1_000_000)) # Convert ns→ms, min 1ms
+      elif gActiveTimers.len == 0:
+        waitMs = 100 # No timers active — wait longer
+      # Wait on condition variable with calculated timeout.
+      # The cond is signaled when: a new timer is scheduled, or the thread
+      # should stop. This replaces the old sleep(5) busy-poll.
+      if not gTimerThreadRunning.load(moRelaxed):
+        release(gTimerLock)
+        break
+      discard timedWait(gTimerCond, gTimerLock, waitMs)
+      release(gTimerLock)
 
     # Invoke timers WITHOUT holding the lock to avoid deadlock
     for item in expiredTimers:
@@ -599,12 +669,15 @@ proc stopTimerThread() =
         if gTimerThreadRefCount == 0:
           # Last reference - actually stop the thread
           gTimerThreadRunning.store(false)
+          # Signal the cond so the timer thread wakes up immediately
+          signal(gTimerCond)
   # Join outside lock to avoid deadlock
   if gTimerThreadRefCount == 0:
     joinThread(gTimerThread)
     {.cast(gcsafe).}:
       withLock gTimerLock:
         gActiveTimers.clear()
+      deinitCond(gTimerCond)
 
 # ============================================================================
 # Message Delivery (called by transport when messages arrive)
@@ -1498,9 +1571,14 @@ proc proposeAndWait*(c: NuRaftCoordinator, groupId: GroupID,
     if rc == 0:
       # Wait for the state machine to advance past the current index.
       # Since logIdx may be 0 (NuRaft API quirk), we wait for SM index to increment.
+      # Uses condition variable signaled by nuraftCommitCb instead of sleep(1)
+      # polling, reducing latency and CPU waste.
+      let cw = cast[ptr CommitWaitData](inst.commitWaitPtr)
       let startTime = coordNowNs().float / 1_000_000.0
+      acquire(cw.lock)
       while true:
         if inst.stopped:
+          release(cw.lock)
           return RaftResult(success: false,
               error: "Group shutting down during commit wait")
         let smLastIdx = nuraftSmLastCommitIndex(inst.sm)
@@ -1509,8 +1587,12 @@ proc proposeAndWait*(c: NuRaftCoordinator, groupId: GroupID,
           break
         let elapsed = (coordNowNs().float / 1_000_000.0) - startTime
         if elapsed > float(timeoutMs):
+          release(cw.lock)
           return RaftResult(success: false, error: "Timeout waiting for commit")
-        sleep(1) # 1ms poll interval
+        # Wait for commit callback to signal, with 10ms timeout as safety net
+        # (in case the signal was missed between the check and the wait)
+        discard timedWait(cw.cond, cw.lock, 10)
+      release(cw.lock)
       result = RaftResult(success: true, index: logIdx)
     else:
       result = RaftResult(success: false,

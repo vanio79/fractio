@@ -592,47 +592,76 @@ proc readOneMessage(client: Socket, t: MultiplexedRaftTransport): bool =
 proc acceptLoop(t: MultiplexedRaftTransport) {.thread.} =
   ## Accept incoming connections.
   ## Each connection can carry multiple RPC messages.
-  ## We use non-blocking mode and poll all connections to handle concurrent clients.
+  ## Uses poll() on ALL fds (listen socket + active clients) with a 50ms
+  ## timeout so the kernel blocks until something is readable, eliminating
+  ## the CPU busy-loop that occurred with per-client selectRead(fds, 0).
 
   var activeClients: seq[Socket] = @[]
-  var pollCount = 0
 
   while t.serverRunning.load():
     try:
-      pollCount += 1
+      # Build poll set: listen socket first, then all active client sockets
+      var pfds: seq[TPollfd] = @[]
+      var listenIdx = -1
 
-      # Check for new connections (with short timeout)
-      var listenFds = @[t.serverSocket.getFd()]
-      let listenReady = nativesockets.selectRead(listenFds, 10) # 10ms timeout
-
-      if listenReady > 0:
-        var client: Socket
-        t.serverSocket.accept(client)
-        # Set non-blocking mode for polling
-        setBlocking(client.getFd(), false)
-        activeClients.add(client)
+      # Always poll the listen socket for new connections
+      if not t.serverSocket.isNil:
+        listenIdx = pfds.len
+        pfds.add(TPollfd(
+          fd: t.serverSocket.getFd().cint,
+          events: POLLIN,
+          revents: 0
+        ))
 
       # Poll all active clients for data
-      if activeClients.len > 0:
-        var toRemove: seq[int] = @[]
-        for i, client in activeClients:
-          var fds = @[client.getFd()]
-          let ready = nativesockets.selectRead(fds, 0) # No timeout - just check
-          if ready > 0:
-            # Data available - try to read a message
-            if not readOneMessage(client, t):
-              # Connection closed or error
-              toRemove.add(i)
+      for client in activeClients:
+        pfds.add(TPollfd(
+          fd: client.getFd().cint,
+          events: POLLIN,
+          revents: 0
+        ))
 
-        # Remove closed connections (in reverse order to preserve indices)
-        for i in countdown(toRemove.len - 1, 0):
+      # Block in poll() for up to 50ms.  The kernel wakes us when any fd
+      # is readable, so we never spin idle — a major improvement over the
+      # previous per-client selectRead(fds, 0) busy-poll.
+      let nReady = poll(addr pfds[0], Tnfds(pfds.len), 50)
+
+      if nReady > 0:
+        # Check listen socket first
+        if listenIdx >= 0 and (pfds[listenIdx].revents and POLLIN) != 0:
           try:
-            activeClients[toRemove[i]].close()
+            var client: Socket
+            t.serverSocket.accept(client)
+            # Set non-blocking mode for polling
+            setBlocking(client.getFd(), false)
+            activeClients.add(client)
+            # Update the poll set: we'll include this client next iteration
           except:
             discard
-          activeClients.del(toRemove[i])
 
-      sleep(1) # Small yield to prevent busy-waiting
+        # Check active clients for data
+        if activeClients.len > 0:
+          var toRemove: seq[int] = @[]
+          for i, client in activeClients:
+            # pfds offset = listenIdx offset + (i + 1)
+            # But if listenIdx is -1 (no server socket), offset = i
+            let pfdIdx = if listenIdx >= 0: listenIdx + 1 + i else: i
+            if pfdIdx < pfds.len and
+                (pfds[pfdIdx].revents and (POLLIN or POLLHUP or POLLERR)) != 0:
+              if (pfds[pfdIdx].revents and (POLLHUP or POLLERR)) != 0:
+                # Socket error or hangup — remove it
+                toRemove.add(i)
+              elif not readOneMessage(client, t):
+                # readOneMessage returned false — connection closed or error
+                toRemove.add(i)
+
+          # Remove closed connections (in reverse order to preserve indices)
+          for i in countdown(toRemove.len - 1, 0):
+            try:
+              activeClients[toRemove[i]].close()
+            except:
+              discard
+            activeClients.del(toRemove[i])
 
     except Exception:
       if t.serverRunning.load():

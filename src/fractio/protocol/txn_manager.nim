@@ -96,7 +96,7 @@ proc setRaftCoordPtr*(mgr: TransactionManager,
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-proc allocTimestamp(mgr: TransactionManager): uint64 {.gcsafe, raises: [].} =
+proc allocTimestamp*(mgr: TransactionManager): uint64 {.gcsafe, raises: [].} =
   ## Monotonically-increasing nanosecond timestamp.
   ## When a TimeProvider is configured (Phase 5), uses cluster time.
   ## Always advances by at least 1 tick to ensure strict ordering.
@@ -325,3 +325,12 @@ proc totalTxnCount*(mgr: TransactionManager): int {.gcsafe, raises: [].} =
   acquire(mgr.mu)
   defer: release(mgr.mu)
   mgr.txns.len
+
+proc publishCommit*(mgr: TransactionManager, key: string,
+    commitTs: uint64) {.gcsafe, raises: [].} =
+  ## Publish a commit timestamp for a key in the commit index.
+  ## Used by single-round auto-commit writes to register their commit
+  ## so future transactions can detect conflicts.
+  acquire(mgr.mu)
+  mgr.commitIndex[key] = commitTs
+  release(mgr.mu)

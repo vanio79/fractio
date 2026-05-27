@@ -27,6 +27,7 @@ import ../distributed/meta/system_schemas
 import ../distributed/raft/group_types
 import ../storage/mvcc/types as mvccTypes
 import ../utils/logging
+import ../utils/rwlock
 
 # =============================================================================
 # Types
@@ -92,8 +93,8 @@ type
     # Key prefix to group mapping (for routing)
     keyPrefixToGroup*: stdtables.Table[string, GroupID]
 
-    # Lock for thread-safe access
-    lock*: Lock
+    # Lock for thread-safe access (RWLock: concurrent reads, exclusive writes)
+    lock*: RWLock
 
     # State
     initialized*: Atomic[bool]
@@ -152,7 +153,7 @@ proc newFractioClientConfig*(host: string, port: int): FractioClientConfig =
 proc newFractioClient*(config: FractioClientConfig): FractioClient =
   ## Create a new FractioClient
   result = FractioClient(config: config)
-  initLock(result.lock)
+  initRWLock(result.lock)
   result.initialized.store(false, moRelaxed)
 
 proc newFractioClient*(host: string, port: int): FractioClient =
@@ -212,7 +213,7 @@ proc getNodeConnectionInternal(client: FractioClient, nodeId: uint32): Option[
 proc getNodeConnection(client: FractioClient, nodeId: uint32): Option[
     ProtocolClient] =
   ## Get or create a connection to a specific node
-  withLock client.lock:
+  withWriteLock client.lock:
     return client.getNodeConnectionInternal(nodeId)
 
 # =============================================================================
@@ -256,7 +257,7 @@ proc fetchNodesTable(client: FractioClient, conn: ProtocolClient,
       return errFetch(scanRes.error.leaderRedirect)
     return errFetch()
 
-  withLock client.lock:
+  withWriteLock client.lock:
     for pair in scanRes.value.pairs:
       # Handle both MVCC-encoded and plain values defensively.
       # The server's snapshotStreamScan should strip MVCC headers, but
@@ -293,7 +294,7 @@ proc fetchGroupsTable(client: FractioClient, conn: ProtocolClient,
       return errFetch(scanRes.error.leaderRedirect)
     return errFetch()
 
-  withLock client.lock:
+  withWriteLock client.lock:
     for pair in scanRes.value.pairs:
       try:
         let (payload, isDeleted) = stripMVCCHeader(pair.value)
@@ -328,7 +329,7 @@ proc fetchTablesTable(client: FractioClient, conn: ProtocolClient,
       return errFetch(scanRes.error.leaderRedirect)
     return errFetch()
 
-  withLock client.lock:
+  withWriteLock client.lock:
     for pair in scanRes.value.pairs:
       try:
         let (payload, isDeleted) = stripMVCCHeader(pair.value)
@@ -358,7 +359,7 @@ proc fetchSpacesTable(client: FractioClient, conn: ProtocolClient,
       return errFetch(scanRes.error.leaderRedirect)
     return errFetch()
 
-  withLock client.lock:
+  withWriteLock client.lock:
     for pair in scanRes.value.pairs:
       try:
         let (payload, isDeleted) = stripMVCCHeader(pair.value)
@@ -450,7 +451,7 @@ proc refreshMetadata*(client: FractioClient): bool =
     else:
       # 2. Try all known nodes, skipping nodes that already returned NOT_LEADER
       var connected = false
-      withLock client.lock:
+      withReadLock client.lock:
         var nodeIds = newSeq[uint32]()
         for nid in client.nodes.keys:
           nodeIds.add(nid)
@@ -533,7 +534,7 @@ proc refreshMetadata*(client: FractioClient): bool =
 
       # No redirect info — connection is to a follower that doesn't know
       # the leader. Remember this node and try others.
-      withLock client.lock:
+      withReadLock client.lock:
         for nid, nodeInfo in client.nodes:
           if nodeInfo.client == conn or
              (nodeInfo.host == conn.config.host and
@@ -577,17 +578,39 @@ proc getGroupLeaderConnection*(client: FractioClient, groupId: GroupID): Option[
     ProtocolClient] =
   ## Get a connection to the leader of a specific group.
   ## Uses cached leader info, falls back to trying all replicas.
+  ##
+  ## Optimized with RWLock: the fast path (cached connection hit) uses a
+  ## read lock, allowing concurrent reads from multiple threads. Only the
+  ## slow path (connection creation / cache miss) requires a write lock.
 
-  withLock client.lock:
-    # Check if we have cached group info
+  # Fast path: read-only check for cached connection (concurrent readers OK)
+  withReadLock client.lock:
     if groupId notin client.groups:
       return none(ProtocolClient)
 
     let groupInfo = client.groups[groupId]
 
-    # If we know the leader and have a connection, use it
     if groupInfo.leaderNodeId != 0:
-      # Check cached connection - validate it matches current leader
+      if groupId in client.leaderConnections and groupId in
+          client.leaderConnectionNodes:
+        let cached = client.leaderConnections[groupId]
+        let cachedNodeId = client.leaderConnectionNodes[groupId]
+        if cached != nil and cached.connected.load(moRelaxed) and
+            cachedNodeId == groupInfo.leaderNodeId:
+          # Cache hit — return without upgrading to write lock
+          return some(cached)
+
+  # Slow path: need write lock to create/update connection
+  withWriteLock client.lock:
+    # Re-check under write lock (another thread may have updated while we
+    # were waiting for the write lock)
+    if groupId notin client.groups:
+      return none(ProtocolClient)
+
+    let groupInfo = client.groups[groupId]
+
+    # Re-check cached connection under write lock
+    if groupInfo.leaderNodeId != 0:
       if groupId in client.leaderConnections and groupId in
           client.leaderConnectionNodes:
         let cached = client.leaderConnections[groupId]
@@ -623,7 +646,7 @@ proc getGroupLeaderConnection*(client: FractioClient, groupId: GroupID): Option[
 proc invalidateGroupLeader*(client: FractioClient, groupId: GroupID) =
   ## Invalidate the leader for a group, forcing getGroupLeaderConnection
   ## to try all replicas.
-  withLock client.lock:
+  withWriteLock client.lock:
     if groupId in client.leaderConnections:
       try:
         client.leaderConnections[groupId].disconnect()
@@ -643,7 +666,7 @@ proc updateLeaderFromRedirect*(client: FractioClient, groupId: GroupID,
   ## the next attempt, avoiding repeated NOT_LEADER errors.
   if redirect.leaderId == 0:
     return
-  withLock client.lock:
+  withWriteLock client.lock:
     if groupId in client.groups:
       var info = client.groups[groupId]
       info.leaderNodeId = redirect.leaderId
@@ -685,7 +708,7 @@ proc updateLeaderFromRedirect*(client: FractioClient, groupId: GroupID,
 proc invalidateAllLeaderConnections*(client: FractioClient) =
   ## Invalidate ALL cached leader connections. Used when a leadership
   ## change is detected (e.g., after errors that suggest stale metadata).
-  withLock client.lock:
+  withWriteLock client.lock:
     for groupId, conn in client.leaderConnections:
       try:
         conn.disconnect()
@@ -719,7 +742,7 @@ proc refreshGroupLeader(client: FractioClient, groupId: GroupID): bool =
   ## Refresh leader info for a specific group after a "not leader" error
 
   # Clear cached connection
-  withLock client.lock:
+  withWriteLock client.lock:
     if groupId in client.leaderConnections:
       try:
         client.leaderConnections[groupId].disconnect()
@@ -754,7 +777,7 @@ proc getMaxRetries(client: FractioClient): int {.inline.} =
 proc getRoutingState*(client: FractioClient): RoutingState =
   ## Get a snapshot of routing state for pure routing functions.
   ## This creates a RoutingState that can be used with routing.nim functions.
-  withLock client.lock:
+  withReadLock client.lock:
     result = initRoutingState()
     for tableId, tableInfo in client.tables:
       result.addTable(tableId, tableInfo.name, tableInfo.spaceId)
@@ -927,7 +950,7 @@ method put*(client: FractioClient, key: string, value: string,
 
   # Track group participation for distributed transaction resolution
   if txnId != zeroTransactionID():
-    withLock client.lock:
+    withWriteLock client.lock:
       if txnId notin client.txnGroups:
         client.txnGroups[txnId] = initHashSet[GroupID]()
       client.txnGroups[txnId].incl(groupId)
@@ -1004,7 +1027,7 @@ method delete*(client: FractioClient, key: string,
 
   # Track group participation for distributed transaction resolution
   if txnId != zeroTransactionID():
-    withLock client.lock:
+    withWriteLock client.lock:
       if txnId notin client.txnGroups:
         client.txnGroups[txnId] = initHashSet[GroupID]()
       client.txnGroups[txnId].incl(groupId)
@@ -1315,7 +1338,7 @@ method commitTxn*(client: FractioClient, txnId: TransactionID): KVOpVoidResult =
   ## participated in writes. This ensures intents are resolved even when
   ## the META leader does not replicate the target group.
   var groupsToCommit: seq[GroupID] = @[]
-  withLock client.lock:
+  withWriteLock client.lock:
     if txnId in client.txnGroups:
       for gid in client.txnGroups[txnId]:
         groupsToCommit.add(gid)
@@ -1384,7 +1407,7 @@ method rollbackTxn*(client: FractioClient,
   ## Rollback a transaction by sending rollback to all group leaders that
   ## participated in writes.
   var groupsToRollback: seq[GroupID] = @[]
-  withLock client.lock:
+  withWriteLock client.lock:
     if txnId in client.txnGroups:
       for gid in client.txnGroups[txnId]:
         groupsToRollback.add(gid)
@@ -1652,7 +1675,7 @@ proc createSpace*(client: FractioClient, name: string,
       return spaceOpErr(resp.error)
 
     # Update local cache with new space and group records
-    withLock client.lock:
+    withWriteLock client.lock:
       # Parse and cache the space record
       let spaceRec = decodeSpaceRecord(resp.spaceRecord)
 
@@ -1720,7 +1743,7 @@ proc dropSpace*(client: FractioClient, name: string): SpaceOpResult =
       return spaceOpErr(resp.error)
 
     # Update local cache - remove space and groups
-    withLock client.lock:
+    withWriteLock client.lock:
       # Find and remove the space by name (since resp.spaceId is ULID)
       var spaceIdToRemove: SpaceID
       var found = false
@@ -1755,7 +1778,7 @@ proc dropSpace*(client: FractioClient, name: string): SpaceOpResult =
 
 proc close*(client: FractioClient) =
   ## Close all connections and clean up resources
-  withLock client.lock:
+  withWriteLock client.lock:
     # Disconnect all cached connections
     for nodeId, nodeInfo in client.nodes:
       if nodeInfo.client != nil:
@@ -1777,3 +1800,5 @@ proc close*(client: FractioClient) =
     client.leaderConnectionNodes.clear()
     client.txnGroups.clear()
     client.initialized.store(false, moRelaxed)
+
+  deinitRWLock(client.lock)

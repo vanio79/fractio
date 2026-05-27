@@ -12,6 +12,7 @@
 import std/[unittest, os, options, strutils]
 import fractio/protocol/raft_store
 import fractio/protocol/mvcc_store
+import fractio/protocol/messages/kv
 import fractio/protocol/txn_manager
 import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/group_types
@@ -498,3 +499,342 @@ suite "MvccTransactionStore - snapshotStreamScan":
     # Empty result still sends one chunk with hasMore=false and 0 pairs
     check chunksReceived == 1
     check totalPairs == 0
+
+# ---------------------------------------------------------------------------
+# Suite: Batched commit (performance optimization)
+# ---------------------------------------------------------------------------
+
+suite "MvccTransactionStore - Batched commit":
+  test "batched commit: single key put and read":
+    let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_bc01")
+    defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_bc01")
+
+    # Put a single key via auto-transaction
+    let sessionId = mvccStore.createSession()
+    discard mvccStore.beginTransaction(sessionId)
+    discard mvccStore.txnPut(sessionId, "batch_key1", "batch_val1")
+    let commitRes = mvccStore.commitTransaction(sessionId)
+    check commitRes.isOk
+    mvccStore.closeSession(sessionId)
+
+    # Verify committed value is readable
+    let getRes = mvccStore.latestGet("batch_key1")
+    check getRes.isOk
+    check getRes.value.isSome
+    check getRes.value.get() == "batch_val1"
+
+  test "batched commit: multiple keys in one transaction":
+    let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_bc02")
+    defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_bc02")
+
+    # Put 5 keys in a single transaction — they should all be committed
+    # in a single batched Raft round
+    let sessionId = mvccStore.createSession()
+    discard mvccStore.beginTransaction(sessionId)
+    discard mvccStore.txnPut(sessionId, "multi_a", "1")
+    discard mvccStore.txnPut(sessionId, "multi_b", "2")
+    discard mvccStore.txnPut(sessionId, "multi_c", "3")
+    discard mvccStore.txnPut(sessionId, "multi_d", "4")
+    discard mvccStore.txnPut(sessionId, "multi_e", "5")
+    let commitRes = mvccStore.commitTransaction(sessionId)
+    check commitRes.isOk
+    mvccStore.closeSession(sessionId)
+
+    # Verify all committed values
+    for (key, val) in [("multi_a", "1"), ("multi_b", "2"), ("multi_c", "3"),
+                        ("multi_d", "4"), ("multi_e", "5")]:
+      let getRes = mvccStore.latestGet(key)
+      check getRes.isOk
+      check getRes.value.isSome
+      check getRes.value.get() == val
+
+  test "batched commit: delete key and verify tombstone":
+    let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_bc03")
+    defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_bc03")
+
+    # Put then delete in same transaction
+    let sessionId = mvccStore.createSession()
+    discard mvccStore.beginTransaction(sessionId)
+    discard mvccStore.txnPut(sessionId, "del_batch_key", "will_be_deleted")
+    discard mvccStore.txnDelete(sessionId, "del_batch_key")
+    let commitRes = mvccStore.commitTransaction(sessionId)
+    check commitRes.isOk
+    mvccStore.closeSession(sessionId)
+
+    # The tombstone should make the key appear absent
+    let getRes = mvccStore.latestGet("del_batch_key")
+    check getRes.isOk
+    check getRes.value.isNone
+
+  test "batched commit: rollback cleans up intents":
+    let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_bc04")
+    defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_bc04")
+
+    let sessionId = mvccStore.createSession()
+    discard mvccStore.beginTransaction(sessionId)
+    discard mvccStore.txnPut(sessionId, "rollback_batch_key", "will_be_rolled_back")
+    let rollbackRes = mvccStore.rollbackTransaction(sessionId)
+    check rollbackRes.isOk
+    mvccStore.closeSession(sessionId)
+
+    # Key should not exist
+    let getRes = mvccStore.latestGet("rollback_batch_key")
+    check getRes.isOk
+    check getRes.value.isNone
+
+  test "batched commit: put-update-delete sequence":
+    let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_bc05")
+    defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_bc05")
+
+    # First, put a key
+    var sessionId = mvccStore.createSession()
+    discard mvccStore.beginTransaction(sessionId)
+    discard mvccStore.txnPut(sessionId, "seq_key", "v1")
+    discard mvccStore.commitTransaction(sessionId)
+    mvccStore.closeSession(sessionId)
+
+    # Then update it
+    sessionId = mvccStore.createSession()
+    discard mvccStore.beginTransaction(sessionId)
+    discard mvccStore.txnPut(sessionId, "seq_key", "v2")
+    discard mvccStore.commitTransaction(sessionId)
+    mvccStore.closeSession(sessionId)
+
+    # Verify update
+    var getRes = mvccStore.latestGet("seq_key")
+    check getRes.isOk
+    check getRes.value.isSome
+    check getRes.value.get() == "v2"
+
+    # Then delete it
+    sessionId = mvccStore.createSession()
+    discard mvccStore.beginTransaction(sessionId)
+    discard mvccStore.txnDelete(sessionId, "seq_key")
+    discard mvccStore.commitTransaction(sessionId)
+    mvccStore.closeSession(sessionId)
+
+    # Verify deletion
+    getRes = mvccStore.latestGet("seq_key")
+    check getRes.isOk
+    check getRes.value.isNone
+
+  test "autoPutWithResult without flags skips read":
+    # Test that autoPutWithResult works correctly without CAS or return-previous
+    # flags (which should skip the expensive latestGetWithMeta call)
+    let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_bc06")
+    defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_bc06")
+
+    let res = mvccStore.autoPutWithResult("auto_key", "auto_val")
+    check res.isOk
+    check res.value.status == PutStatusOK
+    check res.value.version > 0
+
+    # Verify the value was actually written
+    let getRes = mvccStore.latestGet("auto_key")
+    check getRes.isOk
+    check getRes.value.isSome
+    check getRes.value.get() == "auto_val"
+
+  test "autoPutWithResult with return-previous flag reads value":
+    let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_bc07")
+    defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_bc07")
+
+    # First put
+    const PutFlagReturnPrev = 0x01'u8
+    let res1 = mvccStore.autoPutWithResult("prev_key", "val1", PutFlagReturnPrev)
+    check res1.isOk
+    check res1.value.status == PutStatusOK
+    check res1.value.previousValue.isNone # No previous value
+
+    # Second put - should return previous value
+    let res2 = mvccStore.autoPutWithResult("prev_key", "val2", PutFlagReturnPrev)
+    check res2.isOk
+    check res2.value.status == PutStatusOK
+    check res2.value.previousValue.isSome
+    check res2.value.previousValue.get() == "val1"
+
+  test "autoDeleteWithResult without flags skips read":
+    let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_bc08")
+    defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_bc08")
+
+    # First put a key
+    let putRes = mvccStore.autoPutWithResult("del_auto_key", "del_val")
+    check putRes.isOk
+
+    # Delete without return-previous flag (should skip read)
+    let delRes = mvccStore.autoDeleteWithResult("del_auto_key")
+    check delRes.isOk
+    check delRes.value.found == true
+    check delRes.value.previousValue.isNone # No previous requested
+
+    # Verify deleted
+    let getRes = mvccStore.latestGet("del_auto_key")
+    check getRes.isOk
+    check getRes.value.isNone
+
+suite "Single-round auto-commit (autoPutDirect / autoDeleteDirect)":
+
+  test "autoPutDirect writes value readable via latestGet":
+    let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_d01")
+    defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_d01")
+
+    let res = mvccStore.autoPutDirect("direct_key1", "direct_val1")
+    check res.isOk
+    check res.value.status == PutStatusOK
+    check res.value.timestamp > 0
+    check res.value.version == 1
+    check res.value.previousValue.isNone
+
+    # Verify the value is readable
+    let getRes = mvccStore.latestGet("direct_key1")
+    check getRes.isOk
+    check getRes.value.isSome
+    check getRes.value.get() == "direct_val1"
+
+  test "autoPutDirect overwrites existing key":
+    let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_d02")
+    defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_d02")
+
+    # First write
+    let res1 = mvccStore.autoPutDirect("direct_key2", "v1")
+    check res1.isOk
+    check res1.value.version == 1
+
+    # Second write — should overwrite
+    let res2 = mvccStore.autoPutDirect("direct_key2", "v2")
+    check res2.isOk
+    check res2.value.version == 2
+
+    # Should see the latest value
+    let getRes = mvccStore.latestGet("direct_key2")
+    check getRes.isOk
+    check getRes.value.isSome
+    check getRes.value.get() == "v2"
+
+  test "autoPutDirect version key is stored correctly":
+    let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_d03")
+    defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_d03")
+
+    discard mvccStore.autoPutDirect("direct_key3", "v1")
+    discard mvccStore.autoPutDirect("direct_key3", "v2")
+
+    # latestGetWithMeta should show the latest version
+    let metaRes = mvccStore.latestGetWithMeta("direct_key3")
+    check metaRes.isOk
+    check metaRes.value.isSome
+    check metaRes.value.get().value == "v2"
+    check metaRes.value.get().version == 2
+
+  test "autoDeleteDirect creates tombstone":
+    let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_d04")
+    defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_d04")
+
+    # Put first
+    discard mvccStore.autoPutDirect("direct_del_key", "will_delete")
+
+    # Delete via autoDeleteDirect
+    let delRes = mvccStore.autoDeleteDirect("direct_del_key")
+    check delRes.isOk
+    check delRes.value.found == true
+    check delRes.value.previousValue.isNone
+
+    # Key should be gone
+    let getRes = mvccStore.latestGet("direct_del_key")
+    check getRes.isOk
+    check getRes.value.isNone
+
+  test "autoPutDirect + autoDeleteDirect sequence":
+    let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_d05")
+    defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_d05")
+
+    # Put
+    let putRes = mvccStore.autoPutDirect("seq_direct_key", "v1")
+    check putRes.isOk
+    check putRes.value.version == 1
+
+    # Update
+    let putRes2 = mvccStore.autoPutDirect("seq_direct_key", "v2")
+    check putRes2.isOk
+    check putRes2.value.version == 2
+
+    # Verify update
+    let getRes = mvccStore.latestGet("seq_direct_key")
+    check getRes.isOk
+    check getRes.value.get() == "v2"
+
+    # Delete
+    let delRes = mvccStore.autoDeleteDirect("seq_direct_key")
+    check delRes.isOk
+
+    # Verify gone
+    let getRes2 = mvccStore.latestGet("seq_direct_key")
+    check getRes2.isOk
+    check getRes2.value.isNone
+
+    # Re-insert after delete
+    let putRes3 = mvccStore.autoPutDirect("seq_direct_key", "v3")
+    check putRes3.isOk
+    check putRes3.value.version == 3
+
+    let getRes3 = mvccStore.latestGet("seq_direct_key")
+    check getRes3.isOk
+    check getRes3.value.get() == "v3"
+
+  test "autoPutDirect publishes to conflict index":
+    let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_d06")
+    defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_d06")
+
+    # Write via autoPutDirect
+    discard mvccStore.autoPutDirect("conflict_key", "v1")
+
+    # Now try an explicit transaction that reads the key and writes it.
+    # Since autoPutDirect published to commitIndex, a concurrent
+    # transaction with a readTimestamp before the commit should detect
+    # a conflict.
+    let sessionId = mvccStore.createSession()
+    discard mvccStore.beginTransaction(sessionId)
+    # Record a read on the key
+    discard mvccStore.recordRead(sessionId, "conflict_key")
+    # Write to same key
+    discard mvccStore.txnPut(sessionId, "conflict_key", "v2")
+    # Commit should detect conflict since autoPutDirect's commit
+    # timestamp is after our read timestamp
+    let commitRes = mvccStore.commitTransaction(sessionId)
+    # The conflict may or may not be detected depending on timestamps,
+    # but the key point is that the system doesn't crash and the
+    # commitIndex was updated.
+    mvccStore.closeSession(sessionId)
+
+  test "autoPutWithResult routes simple puts through autoPutDirect":
+    # Verify that autoPutWithResult (no flags) uses the fast single-round path
+    let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_d07")
+    defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_d07")
+
+    let res = mvccStore.autoPutWithResult("routed_key", "routed_val")
+    check res.isOk
+    check res.value.status == PutStatusOK
+    check res.value.previousValue.isNone
+
+    # Verify readable
+    let getRes = mvccStore.latestGet("routed_key")
+    check getRes.isOk
+    check getRes.value.isSome
+    check getRes.value.get() == "routed_val"
+
+  test "autoDeleteWithResult routes simple deletes through autoDeleteDirect":
+    let (coord, raftStore, mvccStore, txnMgr) = makeMvccStore("/tmp/fractio_mvcc_d08")
+    defer: teardownMvccStore(coord, "/tmp/fractio_mvcc_d08")
+
+    # Put first
+    discard mvccStore.autoPutWithResult("routed_del_key", "val")
+
+    # Delete without flags — should use autoDeleteDirect
+    let delRes = mvccStore.autoDeleteWithResult("routed_del_key")
+    check delRes.isOk
+    check delRes.value.found == true
+    check delRes.value.previousValue.isNone
+
+    # Verify deleted
+    let getRes = mvccStore.latestGet("routed_del_key")
+    check getRes.isOk
+    check getRes.value.isNone

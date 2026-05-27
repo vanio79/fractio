@@ -1882,6 +1882,56 @@ proc raftDelete*(store: RaftKVStoreExt,
 
   rsOk[Option[RaftKVEntry]](prevEntry)
 
+proc raftWriteBatch*(store: RaftKVStoreExt,
+    puts: openArray[tuple[key, value: string]],
+    deletes: openArray[string]): RSVoidResult {.gcsafe, raises: [].} =
+  ## Batch write: group puts and deletes by their Raft group and propose
+  ## one WriteBatch per group.  This reduces N individual Raft consensus
+  ## rounds to G rounds (where G = number of distinct groups touched).
+  ##
+  ## Used by MvccTransactionStore.commitTransaction to commit all a
+  ## transaction's writes (version keys, primary keys, intent deletions)
+  ## in a single Raft round per group instead of one round per key.
+  ##
+  ## Returns the first error encountered, or success if all batches applied.
+  if puts.len == 0 and deletes.len == 0:
+    return rsVOk()
+
+  # Collect operations per group.
+  # We use a Table[GroupID, WriteBatch] to accumulate.
+  var groupBatches: tables.Table[GroupID, WriteBatch] = tables.initTable[
+      GroupID, WriteBatch]()
+
+  for (k, v) in puts:
+    let ridOpt = store.resolveGroupId(k)
+    if ridOpt.isNone:
+      return rsVErr(newRSE(rseGroupNotFound,
+          "no shard for key '" & k & "'"))
+    let gid = ridOpt.get()
+    {.cast(raises: []).}:
+      if not groupBatches.hasKey(gid):
+        groupBatches[gid] = newWriteBatch()
+      groupBatches[gid].put(toBytes(k), toBytes(v))
+
+  for k in deletes:
+    let ridOpt = store.resolveGroupId(k)
+    if ridOpt.isNone:
+      return rsVErr(newRSE(rseGroupNotFound,
+          "no shard for key '" & k & "'"))
+    let gid = ridOpt.get()
+    {.cast(raises: []).}:
+      if not groupBatches.hasKey(gid):
+        groupBatches[gid] = newWriteBatch()
+      groupBatches[gid].delete(toBytes(k))
+
+  # Propose each group's batch. All must succeed.
+  for gid, batch in groupBatches.pairs:
+    let vr = proposeWrite(store, gid, batch)
+    if not vr.isOk:
+      return vr
+
+  rsVOk()
+
 proc validateKeyRouting(store: RaftKVStoreExt, key: string,
     groupId: GroupID): Option[RaftStoreError] {.gcsafe, raises: [].} =
   ## Validate that `key` actually routes to `groupId`. Returns an error if the

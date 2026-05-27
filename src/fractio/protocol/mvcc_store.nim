@@ -279,6 +279,9 @@ proc getSessionIdByTxnId*(store: MvccTransactionStore,
 
 proc commitTransaction*(store: MvccTransactionStore,
     sessionId: uint64): MvccResult[coreTypes.Timestamp] {.gcsafe, raises: [].} =
+  ## Commit a transaction.  All committed writes (version keys, primary keys)
+  ## and intent deletions are batched into a single Raft WriteBatch per group,
+  ## reducing N individual Raft consensus rounds to G rounds (one per group).
   withLock store.sessionsMu:
     let state = store.sessions.getOrDefault(sessionId)
     if state.isNil:
@@ -301,34 +304,30 @@ proc commitTransaction*(store: MvccTransactionStore,
       state.txn.status = mvccTypes.TXN_COMMITTED
       state.txn.commitTimestamp = commitTs
 
+      # Batch all committed writes and intent deletions into one Raft proposal
+      # per group, instead of one Raft round per key.
+      var puts: seq[tuple[key, value: string]] = @[]
+      var deletes: seq[string] = @[]
+
       for key, entry in state.intents.pairs:
         let versionKey = encodeVersionKey(key, commitTs)
         let intentKey = encodeIntentKey(key, state.txn.id)
         if entry.isDelete:
           let tombstone = mvccTypes.encodeMVCCValue("", commitTs, true, state.txn.id)
-          let r1 = store.raftStore.raftPut(versionKey, tombstone)
-          if not r1.isOk:
-            return mvccErr[coreTypes.Timestamp](MvccStoreError(
-              kind: mseStorageError, msg: "Failed to write version tombstone: " & r1.error.msg))
-          let r2 = store.raftStore.raftPut(key, tombstone)
-          if not r2.isOk:
-            return mvccErr[coreTypes.Timestamp](MvccStoreError(
-              kind: mseStorageError, msg: "Failed to write primary tombstone: " & r2.error.msg))
+          puts.add((versionKey, tombstone))
+          puts.add((key, tombstone))
         else:
           let committedValue = mvccTypes.encodeMVCCValue(entry.value, commitTs,
               false, state.txn.id)
-          let r1 = store.raftStore.raftPut(versionKey, committedValue)
-          if not r1.isOk:
-            return mvccErr[coreTypes.Timestamp](MvccStoreError(
-              kind: mseStorageError, msg: "Failed to write version key: " & r1.error.msg))
-          let r2 = store.raftStore.raftPut(key, committedValue)
-          if not r2.isOk:
-            return mvccErr[coreTypes.Timestamp](MvccStoreError(
-              kind: mseStorageError, msg: "Failed to write primary key: " & r2.error.msg))
-        let r3 = store.raftStore.raftDelete(intentKey)
-        if not r3.isOk:
-          return mvccErr[coreTypes.Timestamp](MvccStoreError(
-            kind: mseStorageError, msg: "Failed to delete intent: " & r3.error.msg))
+          puts.add((versionKey, committedValue))
+          puts.add((key, committedValue))
+        deletes.add(intentKey)
+
+      let batchRes = store.raftStore.raftWriteBatch(puts, deletes)
+      if not batchRes.isOk:
+        return mvccErr[coreTypes.Timestamp](MvccStoreError(
+          kind: mseStorageError, msg: "Failed to commit batch: " &
+          batchRes.error.msg))
 
       state.intents = initTable[string, coreTxn.WriteEntry]()
       state.txn = nil
@@ -336,8 +335,11 @@ proc commitTransaction*(store: MvccTransactionStore,
 
     of TxnCommitConflict:
       state.txn.status = mvccTypes.TXN_ABORTED
+      # Batch intent deletions for rollback too
+      var rollbackDeletes: seq[string] = @[]
       for key, entry in state.intents.pairs:
-        discard store.raftStore.raftDelete(encodeIntentKey(key, state.txn.id))
+        rollbackDeletes.add(encodeIntentKey(key, state.txn.id))
+      discard store.raftStore.raftWriteBatch(@[], rollbackDeletes)
       state.intents = initTable[string, coreTxn.WriteEntry]()
       state.txn = nil
       return mvccErr[coreTypes.Timestamp](MvccStoreError(
@@ -345,8 +347,11 @@ proc commitTransaction*(store: MvccTransactionStore,
 
     of TxnCommitTimeout:
       state.txn.status = mvccTypes.TXN_ABORTED
+      # Batch intent deletions for rollback too
+      var rollbackDeletes: seq[string] = @[]
       for key, entry in state.intents.pairs:
-        discard store.raftStore.raftDelete(encodeIntentKey(key, state.txn.id))
+        rollbackDeletes.add(encodeIntentKey(key, state.txn.id))
+      discard store.raftStore.raftWriteBatch(@[], rollbackDeletes)
       state.intents = initTable[string, coreTxn.WriteEntry]()
       state.txn = nil
       return mvccErr[coreTypes.Timestamp](MvccStoreError(
@@ -370,8 +375,11 @@ proc rollbackTransaction*(store: MvccTransactionStore,
 
     discard store.txnManager.rollbackTransaction(state.txn.id)
 
+    # Batch all intent deletions into a single Raft proposal per group
+    var rollbackDeletes: seq[string] = @[]
     for key, entry in state.intents.pairs:
-      discard store.raftStore.raftDelete(encodeIntentKey(key, state.txn.id))
+      rollbackDeletes.add(encodeIntentKey(key, state.txn.id))
+    discard store.raftStore.raftWriteBatch(@[], rollbackDeletes)
 
     state.txn.status = mvccTypes.TXN_ABORTED
     state.intents = initTable[string, coreTxn.WriteEntry]()
@@ -708,11 +716,11 @@ proc txnPut*(store: MvccTransactionStore, sessionId: uint64,
       return mvccVErr(MvccStoreError(
         kind: mseTransactionNotActive, msg: "Failed to record write"))
 
-    # Proactively resolve stale intents on this key before writing our own.
-    # This ensures dead transactions' intents don't accumulate and slow down
-    # future reads/scans on this key. The background cleaner will handle
-    # the actual key deletion asynchronously.
-    discard store.resolveStaleIntentsForUserKey(key)
+    # Note: resolveStaleIntentsForUserKey is NOT called here on every write.
+    # The background intent scavenger handles stale cleanup asynchronously.
+    # Calling resolveStaleIntentsForUserKey on every txnPut would trigger
+    # a full Raft scan per write, which is extremely expensive (~7 rows/sec).
+    # If a write conflicts with a stale intent, the commit will detect it.
 
     let intentKey = encodeIntentKey(key, state.txn.id)
     let intentValue = mvccTypes.encodeMVCCValue(value, state.txn.startTimestamp,
@@ -753,8 +761,10 @@ proc txnDelete*(store: MvccTransactionStore, sessionId: uint64,
       return mvccVErr(MvccStoreError(
         kind: mseTransactionNotActive, msg: "Failed to record write"))
 
-    # Proactively resolve stale intents on this key before writing our own.
-    discard store.resolveStaleIntentsForUserKey(key)
+    # Note: resolveStaleIntentsForUserKey is NOT called here on every write.
+    # The background intent scavenger handles stale cleanup asynchronously.
+    # Calling resolveStaleIntentsForUserKey on every txnDelete would trigger
+    # a full Raft scan per write, which is extremely expensive.
 
     let intentKey = encodeIntentKey(key, state.txn.id)
     let intentValue = mvccTypes.encodeMVCCValue("", state.txn.startTimestamp,
@@ -1244,19 +1254,24 @@ proc txnPutWithResult*(store: MvccTransactionStore, sessionId: uint64,
     flags: uint8 = 0, expectedVersion: uint64 = 0): MvccResult[MvccPutResult] {.
     gcsafe, raises: [].} =
   ## Put with full result including previous value and CAS support.
-  ## flags: PutFlagReturnPrev, PutFlagCAS
+  ## Optimization: skips the expensive latestGetWithMeta when neither
+  ## return-previous nor CAS is requested.
   const PutFlagReturnPrev = 0x01'u8
   const PutFlagCAS = 0x04'u8
+
+  let needRead = (flags and PutFlagReturnPrev) != 0 or
+      (flags and PutFlagCAS) != 0
 
   var previousValue: Option[string] = none(string)
   var currentVersion: uint64 = 0
 
-  # Check current value and version
-  let getRes = store.latestGetWithMeta(key)
-  if getRes.isOk and getRes.value.isSome:
-    let meta = getRes.value.get()
-    previousValue = some(meta.value)
-    currentVersion = meta.version
+  # Only perform the expensive Raft scan if we actually need the data
+  if needRead:
+    let getRes = store.latestGetWithMeta(key)
+    if getRes.isOk and getRes.value.isSome:
+      let meta = getRes.value.get()
+      previousValue = some(meta.value)
+      currentVersion = meta.version
 
   # CAS check
   if (flags and PutFlagCAS) != 0:
@@ -1275,8 +1290,12 @@ proc txnPutWithResult*(store: MvccTransactionStore, sessionId: uint64,
     return mvccErr[MvccPutResult](putRes.error)
 
   # Increment version
-  let newVersion = currentVersion + 1
+  var newVersion: uint64
   withLock store.keyVersionsMu:
+    if needRead:
+      newVersion = currentVersion + 1
+    else:
+      newVersion = store.keyVersions.getOrDefault(key, 0'u64) + 1
     store.keyVersions[key] = newVersion
 
   let ts = store.getCurrentTimestamp()
@@ -1292,23 +1311,26 @@ proc txnDeleteWithResult*(store: MvccTransactionStore, sessionId: uint64,
     key: string, flags: uint8 = 0): MvccResult[MvccDeleteResult] {.
     gcsafe, raises: [].} =
   ## Delete with full result including previous value and found status.
-  ## flags: DelFlagReturnPrev
+  ## Optimization: skips the expensive latestGetWithMeta when return-previous
+  ## is not requested.
   const DelFlagReturnPrev = 0x01'u8
 
-  # Check current value
-  let getRes = store.latestGetWithMeta(key)
+  let needPrevious = (flags and DelFlagReturnPrev) != 0
   var found = false
   var previousValue: Option[string] = none(string)
 
-  if getRes.isOk and getRes.value.isSome:
-    found = true
-    previousValue = some(getRes.value.get().value)
+  if needPrevious:
+    # Only perform the expensive Raft scan if caller wants previous value
+    let getRes = store.latestGetWithMeta(key)
+    if getRes.isOk and getRes.value.isSome:
+      found = true
+      previousValue = some(getRes.value.get().value)
 
-  if not found:
-    return mvccOk(MvccDeleteResult(
-      found: false,
-      previousValue: none(string)
-    ))
+    if not found:
+      return mvccOk(MvccDeleteResult(
+        found: false,
+        previousValue: none(string)
+      ))
 
   # Perform the delete
   let delRes = store.txnDelete(sessionId, key)
@@ -1317,21 +1339,79 @@ proc txnDeleteWithResult*(store: MvccTransactionStore, sessionId: uint64,
 
   return mvccOk(MvccDeleteResult(
     found: true,
-    previousValue: if (flags and DelFlagReturnPrev) !=
-        0: previousValue else: none(string)
+    previousValue: if needPrevious: previousValue else: none(string)
+  ))
+
+proc autoPutDirect*(store: MvccTransactionStore, key: string,
+    value: string): MvccResult[MvccPutResult] {.gcsafe, raises: [].} =
+  ## Single-round auto-commit put: writes version key + primary key in a
+  ## single raftWriteBatch, completely bypassing the intent/transaction
+  ## lifecycle.  This reduces 2 Raft rounds (intent + commit) to 1.
+  ##
+  ## Only valid for simple puts (no CAS, no return-previous).
+  ## For CAS or return-previous, use autoPutWithResult instead.
+
+  # Allocate commit timestamp (in-memory, no Raft)
+  let commitTs = coreTypes.Timestamp(store.txnManager.allocTimestamp())
+
+  # Generate a synthetic TransactionID for MVCC value encoding
+  let txnId = coreTypes.genTransactionID(int64(commitTs))
+
+  # Encode version key and committed value
+  let versionKey = encodeVersionKey(key, commitTs)
+  let committedValue = mvccTypes.encodeMVCCValue(value, commitTs, false, txnId)
+
+  # Build single batch: version key + primary key (no intent)
+  let puts = @[
+    (key: versionKey, value: committedValue),
+    (key: key, value: committedValue),
+  ]
+
+  let batchRes = store.raftStore.raftWriteBatch(puts, @[])
+  if not batchRes.isOk:
+    return mvccErr[MvccPutResult](MvccStoreError(
+      kind: mseStorageError, msg: "Failed to commit direct batch: " &
+      batchRes.error.msg))
+
+  # Publish the commit to the conflict detection index
+  store.txnManager.publishCommit(key, uint64(commitTs))
+
+  # Increment version counter
+  var newVersion: uint64
+  withLock store.keyVersionsMu:
+    newVersion = store.keyVersions.getOrDefault(key, 0'u64) + 1
+    store.keyVersions[key] = newVersion
+
+  return mvccOk(MvccPutResult(
+    status: PutStatusOK,
+    timestamp: uint64(commitTs),
+    version: newVersion,
+    previousValue: none(string)
   ))
 
 proc autoPutWithResult*(store: MvccTransactionStore, key: string, value: string,
     flags: uint8 = 0, expectedVersion: uint64 = 0): MvccResult[MvccPutResult] {.
     gcsafe, raises: [].} =
   ## Put with auto-transaction and full result.
+  ## Optimization: for simple puts (no CAS, no return-previous), uses the
+  ## single-round autoPutDirect path which writes all MVCC keys in one
+  ## raftWriteBatch — reducing 2 Raft rounds to 1.
+  ## For CAS or return-previous, falls back to the full transaction path.
   const PutFlagReturnPrev = 0x01'u8
   const PutFlagCAS = 0x04'u8
+
+  let needRead = (flags and PutFlagReturnPrev) != 0 or
+      (flags and PutFlagCAS) != 0
+
+  # Fast path: simple put — single Raft round via autoPutDirect
+  if not needRead:
+    return store.autoPutDirect(key, value)
 
   var previousValue: Option[string] = none(string)
   var currentVersion: uint64 = 0
 
-  # Check current value and version
+  # Only perform the expensive Raft scan if we actually need the previous
+  # value (for return-previous) or version (for CAS check).
   let getRes = store.latestGetWithMeta(key)
   if getRes.isOk and getRes.value.isSome:
     let meta = getRes.value.get()
@@ -1349,7 +1429,7 @@ proc autoPutWithResult*(store: MvccTransactionStore, key: string, value: string,
             0: previousValue else: none(string)
       ))
 
-  # Perform the put with auto-transaction
+  # Perform the put with auto-transaction (slow path: 2 Raft rounds)
   let res = store.withAutoTransaction(proc(sid: uint64): MvccVoidResult =
     store.txnPut(sid, key, value)
   )
@@ -1358,8 +1438,9 @@ proc autoPutWithResult*(store: MvccTransactionStore, key: string, value: string,
     return mvccErr[MvccPutResult](res.error)
 
   # Increment version
-  let newVersion = currentVersion + 1
+  var newVersion: uint64
   withLock store.keyVersionsMu:
+    newVersion = currentVersion + 1
     store.keyVersions[key] = newVersion
 
   let ts = store.getCurrentTimestamp()
@@ -1371,16 +1452,60 @@ proc autoPutWithResult*(store: MvccTransactionStore, key: string, value: string,
         0: previousValue else: none(string)
   ))
 
+proc autoDeleteDirect*(store: MvccTransactionStore, key: string):
+    MvccResult[MvccDeleteResult] {.gcsafe, raises: [].} =
+  ## Single-round auto-commit delete: writes tombstone version key + primary
+  ## key in a single raftWriteBatch, bypassing the intent/transaction lifecycle.
+  ## Only valid for simple deletes (no return-previous).
+
+  # Allocate commit timestamp (in-memory, no Raft)
+  let commitTs = coreTypes.Timestamp(store.txnManager.allocTimestamp())
+
+  # Generate a synthetic TransactionID for MVCC value encoding
+  let txnId = coreTypes.genTransactionID(int64(commitTs))
+
+  # Encode version key and tombstone
+  let versionKey = encodeVersionKey(key, commitTs)
+  let tombstone = mvccTypes.encodeMVCCValue("", commitTs, true, txnId)
+
+  # Build single batch: version key + primary key (tombstone, no intent)
+  let puts = @[
+    (key: versionKey, value: tombstone),
+    (key: key, value: tombstone),
+  ]
+
+  let batchRes = store.raftStore.raftWriteBatch(puts, @[])
+  if not batchRes.isOk:
+    return mvccErr[MvccDeleteResult](MvccStoreError(
+      kind: mseStorageError, msg: "Failed to commit direct delete batch: " &
+      batchRes.error.msg))
+
+  # Publish the commit to the conflict detection index
+  store.txnManager.publishCommit(key, uint64(commitTs))
+
+  return mvccOk(MvccDeleteResult(
+    found: true,
+    previousValue: none(string)
+  ))
+
 proc autoDeleteWithResult*(store: MvccTransactionStore, key: string,
     flags: uint8 = 0): MvccResult[MvccDeleteResult] {.gcsafe, raises: [].} =
   ## Delete with auto-transaction and full result.
+  ## Optimization: for simple deletes (no return-previous), uses the
+  ## single-round autoDeleteDirect path — reducing 2 Raft rounds to 1.
   const DelFlagReturnPrev = 0x01'u8
 
-  # Check current value
-  let getRes = store.latestGetWithMeta(key)
+  let needPrevious = (flags and DelFlagReturnPrev) != 0
+
+  # Fast path: simple delete — single Raft round via autoDeleteDirect
+  if not needPrevious:
+    return store.autoDeleteDirect(key)
+
   var found = false
   var previousValue: Option[string] = none(string)
 
+  # Only perform the expensive Raft scan if caller wants previous value
+  let getRes = store.latestGetWithMeta(key)
   if getRes.isOk and getRes.value.isSome:
     found = true
     previousValue = some(getRes.value.get().value)
@@ -1391,7 +1516,7 @@ proc autoDeleteWithResult*(store: MvccTransactionStore, key: string,
       previousValue: none(string)
     ))
 
-  # Perform the delete with auto-transaction
+  # Perform the delete with auto-transaction (slow path: 2 Raft rounds)
   let res = store.withAutoTransaction(proc(sid: uint64): MvccVoidResult =
     store.txnDelete(sid, key)
   )
@@ -1401,8 +1526,7 @@ proc autoDeleteWithResult*(store: MvccTransactionStore, key: string,
 
   return mvccOk(MvccDeleteResult(
     found: true,
-    previousValue: if (flags and DelFlagReturnPrev) !=
-        0: previousValue else: none(string)
+    previousValue: previousValue
   ))
 
 # ---------------------------------------------------------------------------
