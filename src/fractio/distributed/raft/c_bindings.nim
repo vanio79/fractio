@@ -194,6 +194,11 @@ proc nuraftLimitsSetBusyConnectionLimit*(limit: int32)
   ## When set to 0, disables the system_exit(-22) behavior during connection failures.
   ## This is useful during tests where shutdown causes expected connection failures.
 
+proc nuraftPurgeExpiredHandlers*() {.importc: "nuraft_purge_expired_handlers".}
+  ## Purge expired RPC handlers from the global pending handlers registry.
+  ## Should be called periodically (e.g., every 10 seconds) to prevent
+  ## unbounded growth from lost responses.
+
 # ============================================
 # State Machine
 # ============================================

@@ -182,8 +182,13 @@ public:
         if (!pack_cb_) {
             return buffer::alloc(0);
         }
-        // First call to get the required size
-        // Allocate a large buffer: each entry can be up to 64KB, cnt entries max
+        // Safety check: prevent unreasonably large allocations.
+        // cnt is bounded by NuRaft's max_append_size (default 100, we set it to 100).
+        // If cnt is negative, zero, or absurdly large, return empty buffer.
+        // Each entry is at most 64KB, so the max reasonable buffer is ~6.4MB.
+        if (cnt <= 0 || cnt > 10000) {
+            return buffer::alloc(0);
+        }
         size_t cap = static_cast<size_t>(cnt) * 64 * 1024 + 1024;
         char* buf = new char[cap];
         size_t actual_len = pack_cb_(ctx_, index, cnt, buf, cap);
@@ -255,10 +260,49 @@ public:
 // =============================================================================
 // Global Pending Handlers Registry (for response correlation)
 // =============================================================================
-// Key: (group_id_hex, src_node_id, dst_node_id) -> rpc_handler
+// Key: (group_id_hex, src_node_id, dst_node_id) -> deque of (handler, timestamp_ms)
+// Handlers older than PENDING_HANDLER_TIMEOUT_MS are purged to prevent unbounded
+// growth from lost responses (network failures, node crashes).
+
+#include <chrono>
+
+static const int64_t PENDING_HANDLER_TIMEOUT_MS = 30000; // 30 seconds
+
+struct PendingHandler {
+    rpc_handler handler;
+    int64_t enqueue_time_ms; // monotonic clock millis since epoch
+};
 
 static std::mutex g_handlers_lock;
-static std::map<std::tuple<std::string, int32_t, int32_t>, std::deque<rpc_handler>> g_pending_handlers;
+static std::map<std::tuple<std::string, int32_t, int32_t>, std::deque<PendingHandler>> g_pending_handlers;
+
+static int64_t current_time_ms() {
+    auto now = std::chrono::steady_clock::now();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch());
+    return ms.count();
+}
+
+// Purge expired handlers from the global registry. Called under g_handlers_lock.
+static void purgeExpiredHandlersLocked() {
+    int64_t now = current_time_ms();
+    for (auto it = g_pending_handlers.begin(); it != g_pending_handlers.end(); ) {
+        auto& deque = it->second;
+        while (!deque.empty() && (now - deque.front().enqueue_time_ms) > PENDING_HANDLER_TIMEOUT_MS) {
+            // Invoke the expired handler with a timeout error so NuRaft can
+            // clean up its internal state (e.g., pending append_entries responses).
+            auto& ph = deque.front();
+            ptr<resp_msg> null_resp;
+            ptr<rpc_exception> err = cs_new<rpc_exception>("RPC handler timeout", nullptr);
+            ph.handler(null_resp, err);
+            deque.pop_front();
+        }
+        if (deque.empty()) {
+            it = g_pending_handlers.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
 
 static void clearPendingHandlersForGroupAndServer(const std::string& gid_hex, int32_t server_id) {
     std::lock_guard<std::mutex> lock(g_handlers_lock);
@@ -269,6 +313,12 @@ static void clearPendingHandlersForGroupAndServer(const std::string& gid_hex, in
             ++it;
         }
     }
+}
+
+// Public API: purge expired handlers (called periodically from Nim timer)
+extern "C" void nuraft_purge_expired_handlers() {
+    std::lock_guard<std::mutex> lock(g_handlers_lock);
+    purgeExpiredHandlersLocked();
 }
 
 // =============================================================================
@@ -609,26 +659,6 @@ public:
             delete[] buf;
         }
 
-        // Apply catching_up flag (not persisted, set fresh each restart)
-        if (catching_up) {
-            saved_state_->set_catching_up(true);
-            saved_state_->allow_election_timer(false);
-        }
-
-        // Load config from Nim callbacks
-        if (config_load_cb_) {
-            size_t cap = 64 * 1024;  // 64KB buffer for config
-            char* buf = new char[cap];
-            size_t config_len = config_load_cb_(cb_ctx_, buf, cap);
-            if (config_len > 0 && config_len <= cap) {
-                ptr<buffer> config_buf = buffer::alloc(config_len);
-                std::memcpy(config_buf->data_begin(), buf, config_len);
-                config_buf->pos(0);
-                saved_config_ = cluster_config::deserialize(*config_buf);
-            }
-            delete[] buf;
-        }
-
         for (auto& kv : servers) {
             auto sc = cs_new<srv_config>(kv.first, kv.second);
             saved_config_->get_servers().push_back(sc);
@@ -794,7 +824,7 @@ public:
                 gid_hex += hex;
             }
             // Key: (groupId, our_id, target_id)
-            g_pending_handlers[std::make_tuple(gid_hex, server_id_, target_id_)].push_back(when_done);
+            g_pending_handlers[std::make_tuple(gid_hex, server_id_, target_id_)].push_back({when_done, current_time_ms()});
         }
 
         // Call Nim send callback
@@ -1433,18 +1463,20 @@ void nuraft_mp_deliver_message(void* mp_context, void* server,
          // Key: (groupId_hex, our_server_id, responder_id)
          auto key = std::make_tuple(gid_hex_key, mp_ctx->server_id, resp->get_src());
 
-        rpc_handler handler;
-        {
-            std::lock_guard<std::mutex> lock(g_handlers_lock);
-            auto it = g_pending_handlers.find(key);
-            if (it != g_pending_handlers.end() && !it->second.empty()) {
-                handler = it->second.front();
-                it->second.pop_front();
-                if (it->second.empty()) {
-                    g_pending_handlers.erase(it);
-                }
-            }
-        }
+         rpc_handler handler;
+         {
+             std::lock_guard<std::mutex> lock(g_handlers_lock);
+             // Purge expired handlers periodically (every call is fine, the lock is held)
+             purgeExpiredHandlersLocked();
+             auto it = g_pending_handlers.find(key);
+             if (it != g_pending_handlers.end() && !it->second.empty()) {
+                 handler = it->second.front().handler;
+                 it->second.pop_front();
+                 if (it->second.empty()) {
+                     g_pending_handlers.erase(it);
+                 }
+             }
+         }
 
         if (handler) {
             ptr<rpc_exception> no_err;

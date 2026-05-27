@@ -608,6 +608,7 @@ proc cancelAllTimersForContext(ctx: pointer) =
 # Uses a condition variable with a calculated timeout (minimum timer expiry)
 # instead of sleep(5) polling, reducing CPU waste and improving timer accuracy.
 proc timerThreadProc() {.thread, gcsafe.} =
+  var purgeCounter = 0
   while gTimerThreadRunning.load(moRelaxed):
     # Collect expired timers under lock
     var expiredTimers: seq[tuple[timerId: int32, rpcCtx: pointer]] = @[]
@@ -652,6 +653,12 @@ proc timerThreadProc() {.thread, gcsafe.} =
         discard
       except:
         discard
+
+    # Purge expired RPC handlers every ~10 seconds (100 iterations × 100ms)
+    inc purgeCounter
+    if purgeCounter >= 100:
+      purgeCounter = 0
+      nuraftPurgeExpiredHandlers()
 
 proc startTimerThread() =
   {.cast(gcsafe).}:
@@ -714,13 +721,13 @@ proc deliverBufferedMessages(c: NuRaftCoordinator,
         c.pendingMessages.del(groupId)
 
 proc clearPendingMessages(c: NuRaftCoordinator) {.gcsafe, raises: [].} =
-  ## Clear all pending messages (called during shutdown)
-  ## Note: We don't actually clear the table here to avoid GC issues with
-  ## cross-thread string deallocation. The strings were allocated in the
-  ## transport receive thread but would be deallocated here in the main thread.
-  ## Instead, we just set the running flag to false, which prevents new messages
-  ## from being buffered, and let the GC clean up when the coordinator is destroyed.
-  discard
+  ## Clear all pending messages (called during shutdown).
+  ## With AtomicArc GC, cross-thread string deallocation is safe because
+  ## reference counting is atomic. The transport receive thread has already
+  ## been stopped by this point, so no new messages can arrive.
+  {.cast(gcsafe).}:
+    withLock c.pendingMessagesLock:
+      c.pendingMessages.clear()
 
 proc deliverMessageToGroup(c: NuRaftCoordinator, groupId: GroupID,
     msgData: cstring, msgLen: csize_t) =
@@ -1156,6 +1163,13 @@ proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
       c.electionTimeoutUpperMs)
   nuraftParamsSetHeartbeatInterval(params, c.heartbeatIntervalMs)
   nuraftParamsSetReturnMethod(params, 0)
+  # Snapshot distance: set to 0 to disable automatic snapshots.
+  # NuRaft's snapshot mechanism requires a properly functioning state machine
+  # snapshot implementation. Our callback_state_machine's create_snapshot()
+  # stores metadata only (no KV state), and the log compaction that follows
+  # snapshot creation causes large allocations in callback_log_store::pack().
+  # TODO: Re-enable after implementing proper snapshot transfer and fixing
+  # the pack() memory allocation issue.
   nuraftParamsSetSnapshotDistance(params, 0)
   nuraftParamsSetClientReqTimeout(params, 5000)
   nuraftParamsSetMaxAppendSize(params, 100)

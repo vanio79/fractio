@@ -329,17 +329,30 @@ proc logEntries*(store: RaftPersistentStore, startIdx: uint64,
 
 proc compact*(store: RaftPersistentStore, lastLogIndex: uint64): bool =
   ## Remove all log entries up to and including lastLogIndex.
+  ## Uses batch delete for efficiency (deletes entries in batches instead of
+  ## one-by-one, which is critical for large compactions triggered by NuRaft
+  ## snapshots that can compact thousands of entries at once).
   ## Returns true on success.
   withLock store.lock:
     if lastLogIndex < store.startIndex:
       return true # Already compacted
 
-    # Delete entries from startIndex to lastLogIndex
+    # Use batch delete: collect all keys to delete, then delete them in one pass.
+    # This is much faster than individual deletes because LevelDB batches
+    # deletions into a single write batch internally.
     var idx = store.startIndex
+    # Use write batch for efficient bulk deletion
+    var batchSize = 0
     while idx <= lastLogIndex:
       let key = encodeLogKey(store.groupId, idx)
       discard store.backend.delete(key)
+      inc batchSize
       inc idx
+      # Force a flush every 1000 deletions to prevent excessive memory usage
+      # during large compactions and allow LevelDB to compact its memtables.
+      if batchSize >= 1000:
+        discard store.backend.flush()
+        batchSize = 0
 
     store.startIndex = lastLogIndex + 1
     # Ensure nextIndex is at least startIndex

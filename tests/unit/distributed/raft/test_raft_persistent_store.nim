@@ -278,6 +278,43 @@ suite "RaftPersistentStore - Log Operations":
     check store.getEntry(5).isSome
     store.close()
 
+  test "compact with large entry count flushes periodically":
+    # Test that compact works correctly with many entries (exercises the
+    # batch flush path that calls backend.flush() every 1000 entries)
+    let groupId = GroupID(systemTableULID(50'u8))
+    var store = newRaftPersistentStore(backend, groupId)
+    for i in 1..2500:
+      discard store.appendEntry(RaftLogEntry(term: uint64(i div 100),
+          valType: lvtAppLog, data: "entry_" & $i))
+    check store.nextSlot() == 2501
+    check store.startIndex() == 1
+    # Compact entries 1-2000 (should trigger multiple flush cycles)
+    check store.compact(2000)
+    check store.startIndex() == 2001
+    # Verify entries before startIndex are gone
+    check store.getEntry(1).isNone
+    check store.getEntry(1000).isNone
+    check store.getEntry(2000).isNone
+    # Verify entries after startIndex are intact
+    check store.getEntry(2001).isSome
+    check store.getEntry(2500).isSome
+    # Verify entryCount reflects compaction
+    check store.entryCount() == 500
+    store.close()
+
+  test "compact updates nextIndex when nextIndex < startIndex":
+    # Edge case: if nextIndex is less than startIndex after compaction
+    # (shouldn't happen in practice but the code handles it)
+    let groupId = GroupID(systemTableULID(51'u8))
+    var store = newRaftPersistentStore(backend, groupId)
+    discard store.appendEntry(RaftLogEntry(term: 1, valType: lvtAppLog, data: "a"))
+    discard store.appendEntry(RaftLogEntry(term: 1, valType: lvtAppLog, data: "b"))
+    check store.compact(2)
+    check store.startIndex() == 3
+    check store.nextSlot() == 3
+    check store.entryCount() == 0
+    store.close()
+
   test "compact with index below startIndex is no-op":
     let groupId = GroupID(systemTableULID(17'u8))
     var store = newRaftPersistentStore(backend, groupId)

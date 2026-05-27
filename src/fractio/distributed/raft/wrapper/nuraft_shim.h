@@ -146,6 +146,11 @@ void nuraft_params_set_auto_adjust_quorum(void* params, int32_t enable);
 
 void nuraft_limits_set_busy_connection_limit(int32_t limit);
 
+// Purge expired RPC handlers from the global pending handlers registry.
+// Should be called periodically (e.g., every 10 seconds) to prevent
+// unbounded growth from lost responses.
+void nuraft_purge_expired_handlers();
+
 // =============================================================================
 // State Machine
 // =============================================================================
