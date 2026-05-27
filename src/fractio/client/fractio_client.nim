@@ -258,16 +258,25 @@ proc fetchNodesTable(client: FractioClient, conn: ProtocolClient,
 
   withLock client.lock:
     for pair in scanRes.value.pairs:
-      # Server already stripped MVCC header - use direct decoder
-      let nodeRec = decodeNodeRecord(pair.value)
-      # Always add to cache (server filters out deleted entries)
-      client.nodes[nodeRec.nodeId] = NodeInfo(
-        nodeId: nodeRec.nodeId,
-        host: nodeRec.host,
-        clientPort: nodeRec.clientPort,
-        status: nodeRec.status,
-        client: nil # Will be created on-demand
-      )
+      # Handle both MVCC-encoded and plain values defensively.
+      # The server's snapshotStreamScan should strip MVCC headers, but
+      # race conditions or replication lag can cause MVCC-encoded data
+      # to appear in scan results.
+      try:
+        let (payload, isDeleted) = stripMVCCHeader(pair.value)
+        if isDeleted: continue
+        if payload.len < 10: continue
+        let nodeRec = decodeNodeRecord(payload)
+        client.nodes[nodeRec.nodeId] = NodeInfo(
+          nodeId: nodeRec.nodeId,
+          host: nodeRec.host,
+          clientPort: nodeRec.clientPort,
+          status: nodeRec.status,
+          client: nil # Will be created on-demand
+        )
+      except CatchableError:
+        # Skip corrupt entries rather than crashing
+        discard
 
   return okFetch()
 
@@ -286,19 +295,23 @@ proc fetchGroupsTable(client: FractioClient, conn: ProtocolClient,
 
   withLock client.lock:
     for pair in scanRes.value.pairs:
-      # Server already stripped MVCC header - use direct decoder
-      let groupRec = decodeGroupRecord(pair.value)
-      # Always add to cache (server filters out deleted entries)
-      var replicaNodeIds: seq[uint32] = @[]
-      for rep in groupRec.replicas:
-        replicaNodeIds.add(rep.nodeId)
+      try:
+        let (payload, isDeleted) = stripMVCCHeader(pair.value)
+        if isDeleted: continue
+        if payload.len < 8: continue
+        let groupRec = decodeGroupRecord(payload)
+        var replicaNodeIds: seq[uint32] = @[]
+        for rep in groupRec.replicas:
+          replicaNodeIds.add(rep.nodeId)
 
-      client.groups[groupIDFromULID(groupRec.groupId)] = GroupInfo(
-        groupId: groupIDFromULID(groupRec.groupId),
-        spaceId: groupRec.spaceId,
-        leaderNodeId: groupRec.leader,
-        replicaNodeIds: replicaNodeIds
-      )
+        client.groups[groupIDFromULID(groupRec.groupId)] = GroupInfo(
+          groupId: groupIDFromULID(groupRec.groupId),
+          spaceId: groupRec.spaceId,
+          leaderNodeId: groupRec.leader,
+          replicaNodeIds: replicaNodeIds
+        )
+      except CatchableError:
+        discard
 
   return okFetch()
 
@@ -317,14 +330,18 @@ proc fetchTablesTable(client: FractioClient, conn: ProtocolClient,
 
   withLock client.lock:
     for pair in scanRes.value.pairs:
-      # Server already stripped MVCC header - use direct decoder
-      let tableRec = decodeTableRecord(pair.value)
-      # Always add to cache (server filters out deleted entries)
-      client.tables[tableRec.tableId] = TableInfo(
-        tableId: tableRec.tableId,
-        name: tableRec.name,
-        spaceId: tableRec.spaceId
-      )
+      try:
+        let (payload, isDeleted) = stripMVCCHeader(pair.value)
+        if isDeleted: continue
+        if payload.len < 4: continue
+        let tableRec = decodeTableRecord(payload)
+        client.tables[tableRec.tableId] = TableInfo(
+          tableId: tableRec.tableId,
+          name: tableRec.name,
+          spaceId: tableRec.spaceId
+        )
+      except CatchableError:
+        discard
 
   return okFetch()
 
@@ -343,16 +360,19 @@ proc fetchSpacesTable(client: FractioClient, conn: ProtocolClient,
 
   withLock client.lock:
     for pair in scanRes.value.pairs:
-      # Server already stripped MVCC header - use direct decoder
-      let spaceRec = decodeSpaceRecord(pair.value)
-      # Always add to cache (server filters out deleted entries)
-      client.spaces[spaceRec.spaceId] = SpaceInfo(
-        spaceId: spaceRec.spaceId,
-        name: spaceRec.name,
-        groupIds: spaceRec.groupIds,
-        oldGroupIds: spaceRec.oldGroupIds,
-        rebalancing: spaceRec.workerState != uint8(wsrIdle)
-      )
+      try:
+        let (payload, isDeleted) = stripMVCCHeader(pair.value)
+        if isDeleted: continue
+        let spaceRec = decodeSpaceRecord(payload)
+        client.spaces[spaceRec.spaceId] = SpaceInfo(
+          spaceId: spaceRec.spaceId,
+          name: spaceRec.name,
+          groupIds: spaceRec.groupIds,
+          oldGroupIds: spaceRec.oldGroupIds,
+          rebalancing: spaceRec.workerState != uint8(wsrIdle)
+        )
+      except CatchableError:
+        discard
 
   return okFetch()
 

@@ -1,0 +1,18 @@
+# Fractio Node 3 — joins cluster via Node 1
+#
+# Ports:
+#   Raft:    8303
+#   Client:  9003
+#   Web:     9873
+
+[node]
+id = 3
+host = "127.0.0.1"
+raft-port = 8303
+client-port = 9003
+web-port = 9873
+data-dir = "examples/3node-cluster/data/node3"
+
+[storage]
+write-buffer-size-mb = 2
+block-cache-size-mb = 4

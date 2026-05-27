@@ -519,6 +519,29 @@ proc createSpace*(sm: SpaceManager, req: CreateSpaceRequest): CreateSpaceRespons
       # Ignore errors during group creation - groups will be created on demand
       discard
 
+    # 7b. Update group records with known leader IDs.
+    # For groups where we can immediately determine the leader, update sys.groups.
+    # Other leaders will be discovered asynchronously via onLeaderChanged callbacks.
+    # This is best-effort — we don't block if leaders aren't elected yet.
+    var updatedWrites: seq[tuple[key: string, value: string]] = @[]
+    for i, gr in groupRecs:
+      let gid = groupIds[i]
+      if sm.coord.hasGroup(gid):
+        let leaderId = sm.coord.getLeader(gid)
+        if leaderId > 0:
+          var updatedGr = gr
+          updatedGr.leader = uint32(leaderId)
+          groupRecs[i] = updatedGr
+          let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $updatedGr.groupId)
+          let value = encode(updatedGr)
+          updatedWrites.add((key: key, value: value))
+    if updatedWrites.len > 0:
+      timedLog(safeFmt("updating $# group records with leader IDs", $updatedWrites.len))
+      let updateResult = sm.store.sysTxnPutBatch(updatedWrites)
+      if not updateResult.isOk:
+        # Log but don't fail - leader info can be updated later via onLeaderChanged
+        sm.logError(safeFmt("failed to update group leaders: $#", $updateResult.error))
+
     # 8. Write space record to sys.spaces via Raft
     timedLog("writing space record")
     let spaceRec = SpaceRecord(

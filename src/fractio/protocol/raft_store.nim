@@ -510,6 +510,9 @@ proc getBackend*(store: RaftKVStoreExt): WiscKeyBackend {.inline.} =
   ## Return the WiscKey backend from the coordinator's store.
   store.coordinator.store
 
+# Forward declaration — defined after lookupNodeInfo
+proc populateNodeInfoCache*(store: RaftKVStoreExt) {.gcsafe, raises: [].}
+
 proc loadGroupMembers*(store: RaftKVStoreExt,
     waitForCatchUp: bool = false) {.gcsafe, raises: [].} =
   ## Scan sys.groups and populate the groupMembers table.
@@ -617,6 +620,11 @@ proc loadGroupMembers*(store: RaftKVStoreExt,
     store.groupMembers = newGroupMembers
     store.preferredLeaders = newPreferredLeaders
     store.groupLeaders = newGroupLeaders
+
+  # Also eagerly populate nodeInfoCache from sys.nodes so that
+  # forwardPutToLeader can find node addresses without waiting for
+  # on-demand lookupNodeInfo calls.
+  store.populateNodeInfoCache()
 
 # ---------------------------------------------------------------------------
 # Internal: propose a WriteBatch and apply to local state machine
@@ -960,9 +968,10 @@ proc processLeaderPersistReq*(s: RaftKVStoreExt,
   ## Process a queued leader persistence request from the async channel.
   ## This runs in the background rebalance thread, avoiding deadlock with
   ## ongoing proposeAndWait calls in the main client threads.
-  ## Retries up to 3 times with backoff to handle transient leader transitions.
+  ## Retries up to 5 times with backoff to handle transient leader transitions
+  ## and node info cache not being populated yet.
   ## Exported for testing purposes.
-  const maxRetries = 3
+  const maxRetries = 5
   try:
     let groupId = req.groupId
     let leaderNodeId = req.leaderNodeId
@@ -988,17 +997,21 @@ proc processLeaderPersistReq*(s: RaftKVStoreExt,
         let ts = s.nowNs()
         let encoded = mvccTypes.encodeMVCCValue(groupData, ts, false)
 
-        # Retry loop: after a failover, we may not yet recognize ourselves
-        # as the meta leader, so forwardPutToLeader can fail transiently.
+        # Retry loop: after a failover or initial startup, we may not yet
+        # recognize ourselves as the meta leader or have node info cached.
+        # Refresh group members and node info before each retry attempt.
         for attempt in 0 ..< maxRetries:
           let putRes = forwardPutToLeader(s, META_GROUP_ID, key, encoded)
           if putRes.isOk:
             break
+          # Refresh node info cache and group members before retrying.
+          # This handles the case where node info wasn't populated yet.
+          s.loadGroupMembers(waitForCatchUp = true)
           if attempt < maxRetries - 1:
             {.cast(gcsafe).}: {.cast(raises: []).}:
               debug("processLeaderPersistReq: retry attempt", {
                 "groupId": $groupId, "attempt": $(attempt + 1)}.toTable)
-            sleep(200) # Wait for leadership state to stabilize
+            sleep(500) # Wait for node info to be available
           else:
             {.cast(gcsafe).}: {.cast(raises: []).}:
               debug("processLeaderPersistReq: failed to persist after retries", {
@@ -1007,6 +1020,95 @@ proc processLeaderPersistReq*(s: RaftKVStoreExt,
       discard
   except Exception:
     discard
+
+proc syncGroupLeadersToSysTables*(s: RaftKVStoreExt) {.gcsafe, raises: [].} =
+  ## Periodic leader sync: compare live NuRaft leader state with sys.groups
+  ## and update any stale leader fields. This catches cases where
+  ## onLeaderChanged didn't fire (e.g., followers learning the leader via
+  ## heartbeats without a state transition, or processLeaderPersistReq
+  ## failing after retries).
+  ##
+  ## Only runs on the META leader since only the leader can write to
+  ## sys.groups via Raft.
+  if s.coordinator == nil or not s.coordinator.running.load():
+    return
+  if not s.coordinator.isLeader(META_GROUP_ID):
+    return
+
+  let backend = s.coordinator.store
+  if backend == nil or not backend.isOpen:
+    return
+
+  let startKey = encodeTableKey(SYS_GROUPS_TABLE_ID, "")
+  let endKey = makeScanEndKey(SYS_GROUPS_TABLE_ID)
+
+  var entries: seq[KeyValuePair] = @[]
+  {.cast(raises: []).}:
+    try:
+      entries = backend.scan(startKey, endKey)
+    except CatchableError:
+      return
+
+  # Group entries by user key, tracking latest version (MVCC dedup)
+  var latestVersions = tables.initTable[string, tuple[value: string, ts: int64]]()
+  for (k, v) in entries:
+    {.cast(raises: []).}:
+      try:
+        var userKey = k
+        var value = v
+        var ts: int64 = 0
+        if k.len >= 10 and k[k.len - 10] == '\x00' and k[k.len - 9] == '\x00':
+          userKey = k[0 ..< k.len - 10]
+          if v.len >= 17:
+            let mvccVal = mvccTypes.decodeMVCCValue(v)
+            if mvccVal.isDeleted:
+              continue
+            value = mvccVal.data
+            ts = mvccVal.timestamp
+        elif mvccTypes.isLikelyMVCCValue(v):
+          try:
+            let mvccVal = mvccTypes.decodeMVCCValue(v)
+            if mvccVal.isDeleted:
+              continue
+            value = mvccVal.data
+            ts = mvccVal.timestamp
+          except CatchableError:
+            discard
+        if not latestVersions.hasKey(userKey) or ts > latestVersions[userKey].ts:
+          latestVersions[userKey] = (value, ts)
+      except CatchableError:
+        if not latestVersions.hasKey(k):
+          latestVersions[k] = (v, 0'i64)
+
+  var updates: seq[tuple[key: string, value: string]] = @[]
+  for (k, entry) in latestVersions.pairs:
+    {.cast(raises: []).}:
+      try:
+        let groupRec = decodeGroupRecord(entry.value)
+        let gid = groupIDFromULID(groupRec.groupId)
+        # Skip META and DATA groups — their leaders are set during bootstrap
+        # and shouldn't be changed by this sync.
+        if gid == META_GROUP_ID or gid == DATA_GROUP_START_ID:
+          continue
+        # Query NuRaft for the live leader
+        let liveLeader = s.coordinator.getLeader(gid)
+        if liveLeader > 0 and uint32(liveLeader) != groupRec.leader:
+          # Leader mismatch — update sys.groups
+          var updatedRec = groupRec
+          updatedRec.leader = uint32(liveLeader)
+          let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupRec.groupId)
+          let ts = s.nowNs()
+          let encoded = mvccTypes.encodeMVCCValue(encode(updatedRec), ts, false)
+          updates.add((key: key, value: encoded))
+          # Also update in-memory cache
+          withLock s.groupMu:
+            s.groupLeaders[gid] = uint32(liveLeader)
+      except CatchableError:
+        discard
+
+  if updates.len > 0:
+    # Write updates via sysTablePutBatch for atomicity
+    discard s.sysTablePutBatch(updates)
 
 # ---------------------------------------------------------------------------
 # Data migration monitor thread
@@ -1115,6 +1217,11 @@ proc rebalanceLeadershipTask(s: RaftKVStoreExt) {.thread, gcsafe, raises: [].} =
       # Note: We don't call loadSpaces/loadTableSpaces here anymore since
       # applyBatchToSM updates those caches directly when Raft commits.
       s.loadGroupMembers(waitForCatchUp = true)
+
+      # Periodic leader sync: compare live NuRaft leaders with sys.groups
+      # and update any stale entries. This catches cases where
+      # onLeaderChanged didn't fire or processLeaderPersistReq failed.
+      s.syncGroupLeadersToSysTables()
 
       var toYield: seq[tuple[gid: GroupID, preferred: uint32]] = @[]
       let now = s.nowNs().float / 1_000_000_000.0
@@ -2772,6 +2879,41 @@ proc lookupNodeInfo*(store: RaftKVStoreExt,
       discard
   none(NodeInfo)
 
+proc populateNodeInfoCache*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
+  ## Eagerly populate nodeInfoCache by scanning sys.nodes from the local backend.
+  ## This should be called after Raft replication has brought sys.nodes data to
+  ## this node, so that forwardPutToLeader can find node addresses without delay.
+  let backend = store.getBackend()
+  if backend == nil or not backend.isOpen:
+    return
+  let startKey = encodeTableKey(SYS_NODES_TABLE_ID, "")
+  let endKey = makeScanEndKey(SYS_NODES_TABLE_ID)
+  {.cast(raises: []).}:
+    try:
+      let entries = backend.scan(startKey, endKey)
+      for (k, v) in entries:
+        try:
+          var value = v
+          # Strip MVCC encoding if present
+          if mvccTypes.isLikelyMVCCValue(value):
+            let mvccVal = mvccTypes.decodeMVCCValueFast(value)
+            if mvccVal.isDeleted:
+              continue
+            value = mvccVal.data
+          if value.len == 0:
+            continue
+          let nodeRec = decodeNodeRecord(value)
+          if nodeRec.host.len == 0 or nodeRec.clientPort == 0:
+            continue
+          let info: NodeInfo = (host: nodeRec.host,
+              clientPort: int(nodeRec.clientPort))
+          withLock store.groupMu:
+            store.nodeInfoCache[nodeRec.nodeId] = info
+        except CatchableError:
+          discard
+    except CatchableError:
+      discard
+
 
 proc raftPutInSpace*(store: RaftKVStoreExt, key, value: string,
     space: SpaceInfo, primaryKey: string): RSResult[RaftKVEntry] {.gcsafe,
@@ -2783,9 +2925,9 @@ proc raftPutInSpace*(store: RaftKVStoreExt, key, value: string,
   ## go to the new location). Updates/deletes should use raftPutInSpaceBoth
   ## to write to both old and new groups.
   ##
-  ## Forwards to the group leader over the network if this node is not the leader.
+  ## If this node is not the leader for the target group, returns NOT_LEADER
+  ## error with redirect info. The client should retry on the correct leader.
   let rid = routeToGroup(primaryKey, space.groupIds)
-  # Try local first
   {.cast(raises: []).}:
     if store.coordinator.hasGroup(rid):
       if store.coordinator.isLeader(rid):
@@ -2799,9 +2941,9 @@ proc raftPutInSpace*(store: RaftKVStoreExt, key, value: string,
               timestamp: ts))
         if vr.error.kind != rseNotLeader:
           return rsErr[RaftKVEntry](vr.error)
-        # Fall through to network forwarding if we lost leadership
-      # Forward to group leader via network
-  store.forwardPutToLeader(rid, key, value)
+        # We were leader but lost it - return NOT_LEADER
+  rsErr[RaftKVEntry](newRSE(rseNotLeader,
+      "not the leader for group " & $rid))
 
 proc raftPutInSpaceBoth*(store: RaftKVStoreExt, key, value: string,
     space: SpaceInfo, primaryKey: string): RSResult[RaftKVEntry] {.gcsafe,
@@ -2809,6 +2951,8 @@ proc raftPutInSpaceBoth*(store: RaftKVStoreExt, key, value: string,
   ## Write to BOTH old and new groups during rebalancing.
   ## Used for updates and deletes when we don't know if the record has migrated.
   ## Returns the result from the new group write.
+  ##
+  ## If this node is not the leader for the target group, returns NOT_LEADER.
   let newRid = routeToGroup(primaryKey, space.groupIds)
 
   # First, write to the new group
@@ -2828,9 +2972,13 @@ proc raftPutInSpaceBoth*(store: RaftKVStoreExt, key, value: string,
         elif vr.error.kind != rseNotLeader:
           newResult = rsErr[RaftKVEntry](vr.error)
         else:
-          newResult = store.forwardPutToLeader(newRid, key, value)
+          # We were leader but lost it - return NOT_LEADER
+          newResult = rsErr[RaftKVEntry](newRSE(rseNotLeader,
+              "not the leader for group " & $newRid))
       else:
-        newResult = store.forwardPutToLeader(newRid, key, value)
+        # Not the leader - return NOT_LEADER
+        newResult = rsErr[RaftKVEntry](newRSE(rseNotLeader,
+            "not the leader for group " & $newRid))
 
   # If rebalancing, also write to the old group (best-effort)
   if space.workerState != wsIdle and space.oldGroupIds.len > 0:
@@ -2843,6 +2991,7 @@ proc raftPutInSpaceBoth*(store: RaftKVStoreExt, key, value: string,
             batch.put(toBytes(key), toBytes(value))
             discard proposeWrite(store, oldRid, batch)
           else:
+            # Best-effort: forward for rebalancing (internal operation)
             discard store.forwardPutToLeader(oldRid, key, value)
 
   newResult
@@ -2851,7 +3000,8 @@ proc raftGetInSpaceFromGroup*(store: RaftKVStoreExt, key: string,
     rid: GroupID): RSResult[Option[RaftKVEntry]] {.gcsafe, raises: [].} =
   ## Internal helper: read `key` from a specific group.
   ## If this node is the leader, reads locally.
-  ## Otherwise, forwards to the group leader over the network.
+  ## Otherwise, returns NOT_LEADER error — the client should retry on the
+  ## correct leader node.
   ## Handles MVCC-encoded values (tombstones are returned as None).
   {.cast(raises: []).}:
     if store.coordinator.isLeader(rid):
@@ -2891,8 +3041,9 @@ proc raftGetInSpaceFromGroup*(store: RaftKVStoreExt, key: string,
             )
             return rsOk[Option[RaftKVEntry]](some(entry))
       return rsOk[Option[RaftKVEntry]](none(RaftKVEntry))
-    # Not leader — forward to the group leader via network
-    return store.forwardGetToLeader(rid, key)
+  # Not leader — return NOT_LEADER error so client retries on correct node
+  rsErr[Option[RaftKVEntry]](newRSE(rseNotLeader,
+      "not the leader for group " & $rid))
 
 proc raftGetInSpace*(store: RaftKVStoreExt, key: string,
     space: SpaceInfo, primaryKey: string): RSResult[Option[
@@ -2954,7 +3105,7 @@ proc raftDeleteInSpace*(store: RaftKVStoreExt, key: string,
   ## During rebalancing, deletes go to BOTH old and new groups since we don't
   ## know if the record has been migrated yet.
   ##
-  ## Forwards to the group leader over the network if this node is not the leader.
+  ## If this node is not the leader for the target group, returns NOT_LEADER.
   let newRid = routeToGroup(primaryKey, space.groupIds)
 
   # First, delete from the new group
@@ -2982,9 +3133,13 @@ proc raftDeleteInSpace*(store: RaftKVStoreExt, key: string,
         elif vr.error.kind != rseNotLeader:
           newResult = rsErr[Option[RaftKVEntry]](vr.error)
         else:
-          newResult = store.forwardDeleteToLeader(newRid, key)
+          # We were leader but lost it - return NOT_LEADER
+          newResult = rsErr[Option[RaftKVEntry]](newRSE(rseNotLeader,
+              "not the leader for group " & $newRid))
       else:
-        newResult = store.forwardDeleteToLeader(newRid, key)
+        # Not the leader - return NOT_LEADER
+        newResult = rsErr[Option[RaftKVEntry]](newRSE(rseNotLeader,
+            "not the leader for group " & $newRid))
 
   # If rebalancing, also delete from the old group (best-effort)
   if space.workerState != wsIdle and space.oldGroupIds.len > 0:
@@ -2997,6 +3152,7 @@ proc raftDeleteInSpace*(store: RaftKVStoreExt, key: string,
             batch.delete(toBytes(key))
             discard proposeWrite(store, oldRid, batch)
           else:
+            # Best-effort: forward for rebalancing (internal operation)
             discard store.forwardDeleteToLeader(oldRid, key)
 
   newResult

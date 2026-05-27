@@ -778,6 +778,29 @@ proc getGroupIdForKey(server: ProtocolServer, key: string): GroupID {.gcsafe,
   else:
     META_GROUP_ID
 
+proc checkLeadershipForGroup(server: ProtocolServer,
+    groupId: GroupID): Option[LeaderRedirect] {.gcsafe, raises: [].} =
+  ## Proactively check if this node is the leader for the given group.
+  ## Returns none() if this node IS the leader (request can proceed).
+  ## Returns some(LeaderRedirect) if this node is NOT the leader,
+  ## containing redirect info so the client can retry on the correct node.
+  ## This is called BEFORE processing KV operations to give fast NOT_LEADER
+  ## responses without wasting work on MVCC/raft proposals that will fail.
+  if server.raftCoord == nil or not server.raftCoord.running.load():
+    return none(LeaderRedirect)
+
+  # META group: check leadership directly
+  if groupId == META_GROUP_ID:
+    if not server.raftCoord.isLeader(groupId):
+      return some(server.getLeaderRedirect(groupId))
+    return none(LeaderRedirect)
+
+  # Data groups: check if this node is the leader
+  if not server.raftCoord.isLeader(groupId):
+    return some(server.getLeaderRedirect(groupId))
+
+  none(LeaderRedirect)
+
 # ---------------------------------------------------------------------------
 # Handshake (Phase 4: auth wired in)
 # ---------------------------------------------------------------------------
@@ -1062,6 +1085,17 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
       sendError(conn, requestId, ErrProtocol, ErrCatKV, "value too large")
       return
 
+    # Proactive NOT_LEADER check: determine the group for this key and verify
+    # this node is the leader. Return NOT_LEADER immediately if not, avoiding
+    # unnecessary MVCC/raft work that would fail anyway.
+    let groupId = if req.groupId != ZeroGroupID(): req.groupId
+                  else: server.getGroupIdForKey(req.key)
+    let redirectOpt = server.checkLeadershipForGroup(groupId)
+    if redirectOpt.isSome:
+      sendNotLeaderError(conn, requestId,
+          "not the leader for group " & $groupId, redirectOpt.get())
+      return
+
     if not server.mvccStore.isNil:
       if not isZero(req.txnId):
         let res = server.mvccStore.txnPutWithResultByTxnId(req.txnId, req.key, req.value,
@@ -1142,6 +1176,16 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
     let req = reqR.value
     if req.key.len == 0 or req.key.len > int(server.config.maxKeyBytes):
       sendError(conn, requestId, ErrProtocol, ErrCatKV, "invalid key length")
+      return
+
+    # Proactive NOT_LEADER check: verify this node leads the target group
+    # before processing the delete.
+    let groupId = if req.groupId != ZeroGroupID(): req.groupId
+                  else: server.getGroupIdForKey(req.key)
+    let redirectOpt = server.checkLeadershipForGroup(groupId)
+    if redirectOpt.isSome:
+      sendNotLeaderError(conn, requestId,
+          "not the leader for group " & $groupId, redirectOpt.get())
       return
 
     if not server.mvccStore.isNil:
