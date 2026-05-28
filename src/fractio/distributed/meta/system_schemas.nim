@@ -219,13 +219,20 @@ proc encode*(rec: GroupRecord): string =
   w.finish()
 
 proc decodeGroupRecord*(data: string): GroupRecord =
+  # Minimum size: 2*ULID_SIZE + 4*uint32 = 2*16 + 16 = 48 bytes
+  if data.len < 48:
+    raise newException(ValueError, "GroupRecord too short: " & $data.len &
+        " bytes (need at least 48)")
   var r = initBinaryReader(data)
   result.groupId = ulidFromBytes(r.readFixedString(ULID_SIZE))
   result.spaceId = spaceIDFromBytes(r.readFixedString(ULID_SIZE))
   result.preferredLeader = r.readU32()
   result.leader = r.readU32()
-  # Replicas
+  # Replicas — sanity check count to prevent OOM on corrupted data
   let repCount = int(r.readU32())
+  if repCount > 1000:
+    raise newException(ValueError, "GroupRecord unreasonable replica count: " &
+        $repCount & " (data len=" & $data.len & ")")
   result.replicas = newSeq[GroupReplicaBin](repCount)
   for i in 0..<repCount:
     result.replicas[i] = decodeGroupReplica(r)

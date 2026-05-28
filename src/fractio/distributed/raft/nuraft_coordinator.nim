@@ -795,16 +795,17 @@ type
     vlogCleanBufferSize*: int64
 
 proc newNuRaftCoordinator*(config: CoordinatorConfig): NuRaftCoordinator =
-  # Initialize the global NuRaft manager with a shared thread pool.
-  # Without this, each raft_server creates 2 dedicated threads (commit + append).
-  # With N groups, that's 2N threads × 8MB stack = 16N MB of stack memory.
-  # With the global manager, all groups share just 2 threads (1 commit + 1 append),
-  # reducing total stack memory to ~16MB regardless of group count.
-  let initResult = nuraftGlobalMgrInit(1, 1)
-  if initResult < 0:
-    raise newException(CatchableError, "Failed to initialize NuRaft global manager")
-  if initResult == 1:
-    info "NuRaft global manager initialized (shared thread pool)"
+  # The global NuRaft manager causes OOM during 3-replica group creation.
+  # Root cause: global_mgr worker threads trigger Nim code paths that conflict.
+  # Instead, use per-group threads but with reduced stack size (2MB vs default 8MB).
+  # With 5 groups per node (3 data + 2 meta), that's 10 threads × 2MB = 20MB.
+  # This is much better than the original 10 × 8MB = 80MB.
+  # NOTE: nuraftGlobalMgrInit is left disabled until the reentrancy issue is fixed.
+  # let initResult = nuraftGlobalMgrInit(1, 1)
+  # if initResult < 0:
+  #   raise newException(CatchableError, "Failed to initialize NuRaft global manager")
+  # if initResult == 1:
+  #   info "NuRaft global manager initialized (shared thread pool)"
 
   new(result)
   result.nodeId = config.nodeId
@@ -1010,11 +1011,9 @@ proc stop*(c: NuRaftCoordinator) =
   if c.store != nil:
     c.store.close()
 
-  # Shut down the global NuRaft manager (shared thread pool).
-  # MUST be called after all raft_server instances are destroyed,
-  # since the global manager's worker threads reference those instances.
-  nuraftGlobalMgrShutdown()
-  info "NuRaft global manager shut down"
+  # NOTE: nuraftGlobalMgrShutdown left disabled (matching init above).
+  # nuraftGlobalMgrShutdown()
+  # info "NuRaft global manager shut down"
 
   # Clear pending messages (prevent GC access during final cleanup)
   clearPendingMessages(c)

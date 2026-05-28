@@ -934,6 +934,13 @@ proc applyBatchToSM*(storePtr: pointer, rid: GroupID,
   if storePtr == nil or data == nil or len == 0:
     return
 
+  # Sanity check: prevent OOM from corrupted/unreasonable payload sizes.
+  # WriteBatch entries are typically small (< 1MB). Reject anything > 64MB
+  # as it's almost certainly a parsing error.
+  if len > 64 * 1024 * 1024:
+    # Reject unreasonably large payload (would cause OOM)
+    return
+
   let store = cast[RaftKVStoreExt](storePtr)
 
   # Copy C data into Nim-managed string (safe to allocate here)
