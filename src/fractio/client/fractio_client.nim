@@ -1238,9 +1238,9 @@ ProtocolError] =
         discard
 
       if connOpt.isNone:
-        # No cached connection — refresh metadata and retry.
+        # No cached connection — retry once (the leader may have been cached
+        # after a previous group's scan triggered a metadata refresh).
         if attempt < 2:
-          discard client.refreshMetadata()
           continue
         errors.add($groupId & ": no connection to leader after retries")
         break
@@ -1263,6 +1263,14 @@ ProtocolError] =
           continue
         errors.add($groupId & ": not leader after retries")
       else:
+        # Other errors (e.g., "send incomplete") — the connection is stale/broken.
+        # Close the broken connection and retry with a fresh one.
+        if attempt < 2:
+          # Remove the broken connection from the cache so we get a fresh one
+          withWriteLock client.lock:
+            client.leaderConnections.del(groupId)
+            client.leaderConnectionNodes.del(groupId)
+          continue
         errors.add($groupId & ": " & streamRes.error.msg)
         break
 
