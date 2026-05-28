@@ -1025,9 +1025,10 @@ proc snapshotStreamScan*(store: MvccTransactionStore,
     raftStore: RaftKVStoreExt = nil): bool {.gcsafe, raises: [].} =
   ## Stream MVCC scan results in chunks, calling `callback` for each chunk.
   ##
-  ## This avoids buffering the entire result set in memory. Instead, it reads
-  ## from Raft in batches, deduplicates MVCC versions, applies optional filters,
-  ## and yields sorted chunks via the callback.
+  ## Single-pass optimization: LevelDB returns keys in sorted order, and all
+  ## MVCC versions of the same user key are contiguous. We exploit this by
+  ## doing dedup + filter in a single pass over the sorted scan results,
+  ## maintaining natural key ordering without a separate sort step.
   ##
   ## Returns true if all chunks were sent successfully, false on error.
   ##
@@ -1042,91 +1043,152 @@ proc snapshotStreamScan*(store: MvccTransactionStore,
 
   # Step 1: Read all raw KV pairs from Raft (this is necessary because MVCC
   # dedup requires seeing all versions of a key to pick the latest).
-  # However, we can apply filters early to reduce memory pressure.
   let scanRes = store.raftStore.raftScan(startKey, endKey, 0,
       includeSystemKeys = true, includeMvccKeys = true)
   timer.stamp("raft_scan")
   if not scanRes.isOk:
     return false
 
-  # Step 2: Deduplicate MVCC keys (same logic as snapshotScan)
-  var keyVersions: tables.Table[string, tuple[value: string,
-      isDeleted: bool, timestamp: coreTypes.Timestamp]] = initTable[string,
-      tuple[value: string, isDeleted: bool, timestamp: coreTypes.Timestamp]]()
+  let rawCount = scanRes.value.len
 
-  # Pass 1: Collect latest versioned keys
+  # Step 2: Single-pass dedup + filter
+  # LevelDB returns keys in sorted order. All versions/intents for the same
+  # userKey are contiguous. We track the "current" userKey and keep the
+  # best (highest-timestamp <= readTs) version. When the userKey changes,
+  # we finalize it: apply filters, emit to result if it passes.
+  # This eliminates the hash table (pass 1+2), the separate filter pass,
+  # and the sort — all in one pass with O(1) per-entry overhead.
+
+  # Accumulator for the current user key being deduped.
+  # When we encounter a new userKey (or end of scan), we finalize the
+  # previous one by applying filters and appending to the result.
+  var curUserKey: string = ""
+  var curValue: string = ""
+  var curIsDeleted: bool = false
+  var curTimestamp: coreTypes.Timestamp = coreTypes.Timestamp(0)
+  var curHasEntry: bool = false
+
+  # Result buffer: naturally sorted because we iterate in LevelDB order.
+  var filteredPairs: seq[tuple[key: string, value: string]] = @[]
+
+  # If limit is set, we can stop early once we have enough results.
+  let hasLimit = limit > 0
+  let limitInt = int(limit)
+
+  # Finalize the current best version: apply filters, emit if it passes.
+  # Inlined as a template to avoid closure capture issues.
+  template finalizeCurrentKey(): untyped =
+    if curHasEntry and not curIsDeleted:
+      var passesFilter = true
+      if groupFilter != nil:
+        if not groupFilter(curUserKey):
+          passesFilter = false
+      if passesFilter and serverFilter != nil:
+        if not serverFilter(curValue):
+          passesFilter = false
+      if passesFilter:
+        filteredPairs.add((curUserKey, curValue))
+
   for (k, entry) in scanRes.value:
+    # Skip intent keys — they belong to uncommitted transactions
     if isIntentKeyMvcc(k): continue
+
+    var userKey: string
+    var isVersion: bool
+
     if isVersionKey(k):
       try:
         let decoded = decodeVersionKey(k)
-        if decoded.timestamp <= readTs:
-          let mvccVal = mvccTypes.decodeMVCCValue(entry.value)
-          if not keyVersions.hasKey(decoded.userKey) or decoded.timestamp >
-              keyVersions[decoded.userKey].timestamp:
-            keyVersions[decoded.userKey] = (mvccVal.data, mvccVal.isDeleted,
-                decoded.timestamp)
+        if decoded.timestamp > readTs:
+          continue # Future version — invisible at this snapshot
+        userKey = decoded.userKey
+        isVersion = true
       except:
-        discard
+        continue
+    else:
+      # Plain key (not version, not intent)
+      userKey = k
+      isVersion = false
 
-  # Pass 2: Plain keys with MVCC-encoded values
-  for (k, entry) in scanRes.value:
-    if isIntentKeyMvcc(k) or isVersionKey(k): continue
-    if mvccTypes.isLikelyMVCCValue(entry.value):
+    # Check if this key belongs to a new userKey group
+    if curHasEntry and userKey != curUserKey:
+      # New userKey — finalize the previous one
+      finalizeCurrentKey()
+      # Early exit if we've collected enough
+      if hasLimit and filteredPairs.len >= limitInt:
+        break
+      # Reset accumulator for the new userKey
+      curHasEntry = false
+
+    # Update the accumulator with this version
+    if isVersion:
+      # Version key: always MVCC-encoded. Keep if newer than current.
       try:
         let mvccVal = mvccTypes.decodeMVCCValue(entry.value)
-        if mvccVal.timestamp <= readTs:
-          if not keyVersions.hasKey(k) or mvccVal.timestamp > keyVersions[k].timestamp:
-            keyVersions[k] = (mvccVal.data, mvccVal.isDeleted,
-                mvccVal.timestamp)
+        if not curHasEntry or mvccVal.timestamp > curTimestamp:
+          curUserKey = userKey
+          curValue = mvccVal.data
+          curIsDeleted = mvccVal.isDeleted
+          curTimestamp = mvccVal.timestamp
+          curHasEntry = true
       except:
-        keyVersions[k] = (entry.value, false, coreTypes.Timestamp(0))
+        discard
     else:
-      if not keyVersions.hasKey(k):
-        keyVersions[k] = (entry.value, false, coreTypes.Timestamp(0))
+      # Plain key: may or may not be MVCC-encoded
+      if mvccTypes.isLikelyMVCCValue(entry.value):
+        try:
+          let mvccVal = mvccTypes.decodeMVCCValue(entry.value)
+          if mvccVal.timestamp <= readTs:
+            if not curHasEntry or mvccVal.timestamp > curTimestamp:
+              curUserKey = userKey
+              curValue = mvccVal.data
+              curIsDeleted = mvccVal.isDeleted
+              curTimestamp = mvccVal.timestamp
+              curHasEntry = true
+        except:
+          # Malformed MVCC value — treat as plain data
+          if not curHasEntry:
+            curUserKey = userKey
+            curValue = entry.value
+            curIsDeleted = false
+            curTimestamp = coreTypes.Timestamp(0)
+            curHasEntry = true
+      else:
+        # Plain value (no MVCC encoding) — oldest possible, only if no
+        # MVCC version was seen for this key.
+        if not curHasEntry:
+          curUserKey = userKey
+          curValue = entry.value
+          curIsDeleted = false
+          curTimestamp = coreTypes.Timestamp(0)
+          curHasEntry = true
 
-  timer.stamp("mvcc_dedup")
-  let rawCount = scanRes.value.len
-  let dedupCount = keyVersions.len
+  # Finalize the last userKey
+  if not hasLimit or filteredPairs.len < limitInt:
+    finalizeCurrentKey()
 
-  # Step 3: Collect non-deleted keys, apply filters, sort, and chunk
-  var filteredPairs: seq[tuple[key: string, value: string]] = @[]
-  for key, val in keyVersions.pairs:
-    if val.isDeleted: continue
+  timer.stamp("dedup_filter")
 
-    # Apply group routing filter
-    if groupFilter != nil:
-      if not groupFilter(key):
-        continue
+  let dedupCount = filteredPairs.len
 
-    # Apply server-side value filter
-    if serverFilter != nil:
-      if not serverFilter(val.value):
-        continue
+  # No separate sort needed — results are naturally in LevelDB key order.
+  # No separate filter pass needed — filters were applied during dedup.
 
-    filteredPairs.add((key, val.value))
-
-  # Sort by key for deterministic ordering
-  filteredPairs.sort(proc(a, b: tuple[key: string, value: string]): int =
-    cmp(a.key, b.key))
-
-  timer.stamp("filter_sort")
-
-  # Apply limit
-  if limit > 0 and uint32(filteredPairs.len) > limit:
-    filteredPairs.setLen(int(limit))
+  # Apply limit (may already be satisfied from early exit above)
+  if hasLimit and filteredPairs.len > limitInt:
+    filteredPairs.setLen(limitInt)
 
   let resultCount = filteredPairs.len
 
-  # Step 4: Send chunks via callback
+  # Step 3: Send chunks via callback
   if filteredPairs.len == 0:
     # Send empty result
     callback(ScanChunk(pairs: @[], hasMore: false))
     timer.stamp("send_chunks")
     let tb = timer.formatBreakdown()
     {.cast(gcsafe).}: {.cast(raises: []).}:
-      debug "[scan_timer] raw=" & $rawCount & " dedup=" & $dedupCount &
-          " filtered=" & $resultCount & " " & tb
+      debug "[scan_timer] raw=" & $rawCount & " dedup_filtered=" & $dedupCount &
+          " result=" & $resultCount & " " & tb
     return true
 
   var sent = 0
@@ -1141,8 +1203,8 @@ proc snapshotStreamScan*(store: MvccTransactionStore,
   timer.stamp("send_chunks")
   let tb2 = timer.formatBreakdown()
   {.cast(gcsafe).}: {.cast(raises: []).}:
-    debug "[scan_timer] raw=" & $rawCount & " dedup=" & $dedupCount &
-        " filtered=" & $resultCount & " " & tb2
+    debug "[scan_timer] raw=" & $rawCount & " dedup_filtered=" & $dedupCount &
+        " result=" & $resultCount & " " & tb2
   return true
 
 # ---------------------------------------------------------------------------
