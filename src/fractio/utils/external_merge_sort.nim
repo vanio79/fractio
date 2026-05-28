@@ -939,3 +939,104 @@ proc reverseRowsWithTempFiles*(rows: seq[seq[string]],
   iter.initReversePhase()
   result = iter.consumeAllRows()
   iter.closeIterator()
+
+# =============================================================================
+# Top-K Bounded Heap for ORDER BY + LIMIT Optimization
+# =============================================================================
+#
+# Instead of buffering all N rows and sorting them (O(N log N) time, O(N) memory),
+# a bounded top-K heap keeps only the K best rows as they stream in.
+# This gives O(N log K) time and O(K) memory, which is a massive improvement
+# when N >> K (e.g., 10K rows with LIMIT 10).
+#
+# The heap is a max-heap: the worst candidate sits at the top. When a new row
+# is better than the worst, we evict the worst and insert the new row.
+# This naturally maintains the top-K candidates.
+
+type
+  TopKHeap* = ref object
+    ## Bounded max-heap that keeps only the top-K rows according to SortSpecs.
+    ## Uses a max-heap so the worst element is at the root and can be evicted
+    ## when a better element arrives.
+    specs: seq[SortSpec] ## Sort specifications (column, direction)
+    allColumns: seq[string] ## All columns for computing sort keys
+    capacity: int ## Maximum number of rows to keep (LIMIT value)
+    heap: seq[SortedRow] ## Max-heap: worst element at index 0
+
+proc newTopKHeap*(specs: seq[SortSpec], allColumns: seq[string],
+    capacity: int): TopKHeap =
+  ## Create a new bounded top-K heap with the given capacity.
+  ## capacity should be the LIMIT value (how many top rows to keep).
+  new(result)
+  result.specs = specs
+  result.allColumns = allColumns
+  result.capacity = capacity
+  result.heap = @[]
+
+proc siftDown(heap: var seq[SortedRow], specs: seq[SortSpec],
+    i: int, n: int) =
+  ## Sift element at index i down in the max-heap.
+  ## For a max-heap, the element that compares GREATER stays at the top.
+  ## This means the WORST candidate (last in sort order) is at the root,
+  ## so it can be evicted when a better candidate arrives.
+  var i = i
+  while true:
+    let left = 2 * i + 1
+    let right = 2 * i + 2
+    var largest = i
+    if left < n and compareSortedRows(heap[left], heap[largest], specs) > 0:
+      largest = left
+    if right < n and compareSortedRows(heap[right], heap[largest], specs) > 0:
+      largest = right
+    if largest != i:
+      swap(heap[i], heap[largest])
+      i = largest
+    else:
+      break
+
+proc siftUp(heap: var seq[SortedRow], specs: seq[SortSpec], i: int) =
+  ## Sift element at index i up in the max-heap.
+  var i = i
+  while i > 0:
+    let parent = (i - 1) div 2
+    if compareSortedRows(heap[i], heap[parent], specs) > 0:
+      swap(heap[i], heap[parent])
+      i = parent
+    else:
+      break
+
+proc push*(heap: TopKHeap, row: seq[string]) =
+  ## Try to insert a row into the top-K heap.
+  ## If the heap is not full, the row is always added.
+  ## If the heap is full, the row is added only if it is better than
+  ## the worst element (the root of the max-heap).
+  let sortKeys = computeSortKeys(row, heap.specs, heap.allColumns)
+  let entry = SortedRow(row: row, sortKeys: sortKeys)
+
+  if heap.heap.len < heap.capacity:
+    # Heap not full yet — always add
+    heap.heap.add(entry)
+    siftUp(heap.heap, heap.specs, heap.heap.len - 1)
+  else:
+    # Heap full — check if new entry is better than the worst (root)
+    if compareSortedRows(entry, heap.heap[0], heap.specs) < 0:
+      # New entry is better (sorts earlier) than the worst — replace root
+      heap.heap[0] = entry
+      siftDown(heap.heap, heap.specs, 0, heap.heap.len)
+
+proc len*(heap: TopKHeap): int =
+  ## Number of rows currently in the heap.
+  heap.heap.len
+
+proc extractSorted*(heap: TopKHeap): seq[seq[string]] =
+  ## Extract all rows from the heap in sorted order (ascending by sort spec).
+  ## This sorts the heap contents in-memory since they fit in O(K) space.
+  if heap.heap.len <= 1:
+    return heap.heap.mapIt(it.row)
+
+  # Sort the K elements using the comparison function
+  var sorted = heap.heap
+  sorted.sort(proc(a, b: SortedRow): int =
+    compareSortedRows(a, b, heap.specs))
+
+  result = sorted.mapIt(it.row)

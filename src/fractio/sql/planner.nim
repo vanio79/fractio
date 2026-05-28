@@ -53,6 +53,7 @@ type
     oboNone        ## No optimization - use full sort algorithm
     oboPkAscMatch  ## Data already sorted by PK ASC - skip sorting
     oboPkDescMatch ## Data sorted by PK, needs reverse - use streaming reverse
+    oboTopK        ## ORDER BY + LIMIT: use bounded top-K heap instead of full sort
 
   PlanOp* = ref object
     case kind*: PlanOpKind
@@ -114,6 +115,7 @@ type
       scStartKey*: string
       scEndKey*: string
       scLimit*: uint32
+      scReverse*: bool             ## true = scan in reverse key order (for PK DESC + LIMIT)
       scFilter*: Option[Expr]
       scColumns*: seq[string]      # columns to return (empty = all)
       scAllColumns*: seq[string]   # all table columns for decoding
@@ -1114,17 +1116,44 @@ proc planSelect(stmt: Stmt, client: FractioClient,
   let (startKey, endKey) = makeScanKeysFromRange(desc.tableId, pkRangeInfo)
 
   # LIMIT handling:
-  # - PK ASC optimization: data already sorted, apply LIMIT during scan
-  # - PK DESC optimization: need to reverse, LIMIT after reverse
-  # - Full sort: LIMIT after sorting
+  # - PK ASC + LIMIT: data already sorted, push LIMIT to scan (scanLimit = limit)
+  # - PK DESC + LIMIT: use top-K heap with reverse comparator (scanLimit = 0, oboPkDescMatch + oboTopK)
+  #   TODO: When server supports ScanFlagReverse, use reverse scan + LIMIT pushdown instead
+  # - No ORDER BY + LIMIT: push LIMIT to scan (scanLimit = limit)
+  # - ORDER BY (non-PK) + LIMIT: scan all rows, use top-K heap (scanLimit = 0)
+  # - ORDER BY without LIMIT: scan all rows, full sort (scanLimit = 0)
   var scanLimit: uint32
+  var scanReverse: bool = false
+  var obOptimization: OrderByOptimization = oboNone
+
   if pkOptimization == oboPkAscMatch:
     # Data already sorted by PK ASC, can apply LIMIT during scan
     scanLimit = limit
-  elif pkOptimization == oboPkDescMatch or pkOptimization == oboNone and
-      stmt.selOrderBy.len > 0:
-    # Need to reverse/sort first, apply LIMIT after
+  elif pkOptimization == oboPkDescMatch:
+    if limit > 0:
+      # PK DESC + LIMIT: use reverse + top-K heap.
+      # Data arrives in ASC order from the scan. We need DESC order.
+      # Instead of buffering all N rows and reversing (O(N) memory),
+      # use a top-K heap with DESC sort spec that keeps only the
+      # highest-PK values. O(K) memory instead of O(N).
+      # TODO: When server supports ScanFlagReverse, replace this with
+      # reverse scan + LIMIT pushdown for O(K) I/O as well.
+      scanLimit = 0
+      obOptimization = oboPkDescMatch # Sort specs are empty, just reverse
+    else:
+      # PK DESC without LIMIT: scan all, reverse in client
+      scanLimit = 0
+      obOptimization = oboPkDescMatch
+  elif stmt.selOrderBy.len > 0 and limit > 0:
+    # Non-PK ORDER BY + LIMIT: scan all rows, use bounded top-K heap.
+    # This avoids materializing all rows for sorting — we only keep the
+    # top K rows in memory while streaming through all results.
     scanLimit = 0
+    obOptimization = oboTopK
+  elif stmt.selOrderBy.len > 0:
+    # Non-PK ORDER BY without LIMIT: scan all, full sort
+    scanLimit = 0
+    obOptimization = oboNone
   else:
     # No ORDER BY, apply LIMIT during scan
     scanLimit = limit
@@ -1134,22 +1163,44 @@ proc planSelect(stmt: Stmt, client: FractioClient,
     scStartKey: startKey,
     scEndKey: endKey,
     scLimit: scanLimit,
+    scReverse: scanReverse,
     scFilter: pkRangeInfo.remainingFilter, # Only non-PK conditions remain
     scColumns: fetchCols, # Fetch columns needed for ORDER BY
     scAllColumns: allCols,
   ))
 
   # Add ORDER BY plan op if specified
-  # Skip ORDER BY op entirely if PK ASC optimization (data already sorted)
-  if stmt.selOrderBy.len > 0 and pkOptimization != oboPkAscMatch:
-    if pkOptimization == oboPkDescMatch:
-      # PK DESC: data needs reversal, no sort specs needed
+  if stmt.selOrderBy.len > 0:
+    if obOptimization == oboPkDescMatch:
+      if limit > 0:
+        # PK DESC + LIMIT: use top-K heap with PK DESC sort specs.
+        # This avoids materializing all N rows for reversal — only K rows in memory.
+        # Generate PK DESC sort specs from the ORDER BY items.
+        let pkSortSpecs = orderItemsToSortSpecs(stmt.selOrderBy, allCols)
+        plan.add(PlanOp(kind: poOrderBy,
+          obSortSpecs: pkSortSpecs,
+          obColumns: reqCols,
+          obAllColumns: fetchCols,
+          obLimit: limit,
+          obOptimization: oboTopK,
+        ))
+      else:
+        # PK DESC without LIMIT: data needs full reversal, no sort specs needed
+        plan.add(PlanOp(kind: poOrderBy,
+          obSortSpecs: @[], # No sort specs - just reverse
+          obColumns: reqCols,
+          obAllColumns: fetchCols,
+          obLimit: limit,
+          obOptimization: oboPkDescMatch,
+        ))
+    elif obOptimization == oboTopK:
+      # Non-PK ORDER BY + LIMIT: use bounded top-K heap
       plan.add(PlanOp(kind: poOrderBy,
-        obSortSpecs: @[], # No sort specs - just reverse
+        obSortSpecs: sortSpecs,
         obColumns: reqCols,
         obAllColumns: fetchCols,
         obLimit: limit,
-        obOptimization: oboPkDescMatch,
+        obOptimization: oboTopK,
       ))
     else:
       # No optimization - full sort
@@ -1304,6 +1355,8 @@ proc formatPlanOp*(op: PlanOp): string =
       s &= &" filter=({formatExpr(op.scFilter.get())})"
     if op.scLimit > 0:
       s &= &" limit={op.scLimit}"
+    if op.scReverse:
+      s &= " reverse=true"
     s
   of poOrderBy:
     var s = "OrderBy"
@@ -1314,6 +1367,8 @@ proc formatPlanOp*(op: PlanOp): string =
       s &= " optimization=PK_ASC_SKIP"
     of oboPkDescMatch:
       s &= " optimization=PK_DESC_REVERSE"
+    of oboTopK:
+      s &= &" optimization=TOP_K specs=[{formatSortSpecs(op.obSortSpecs)}]"
     s &= &" cols={op.obColumns}"
     if op.obLimit > 0:
       s &= &" limit={op.obLimit}"

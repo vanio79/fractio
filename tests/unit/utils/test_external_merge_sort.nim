@@ -612,3 +612,173 @@ suite "Streaming Reverse (PK DESC Optimization)":
     check resultRows[0][0] == "6"
     check resultRows[1][0] == "5"
     check resultRows[2][0] == "4"
+
+suite "TopKHeap - Bounded ORDER BY + LIMIT":
+
+  test "top-K heap keeps smallest K rows in ASC order":
+    let specs = @[SortSpec(expr: Expr(kind: exColumn, colName: "id"),
+        descending: false)]
+    let allColumns = @["id", "name"]
+    let heap = newTopKHeap(specs, allColumns, capacity = 3)
+
+    # Add rows in random order
+    heap.push(@["5", "e"])
+    heap.push(@["1", "a"])
+    heap.push(@["3", "c"])
+    heap.push(@["2", "b"])
+    heap.push(@["4", "d"])
+
+    check heap.len == 3
+
+    let result = heap.extractSorted()
+    check result.len == 3
+    check result[0] == @["1", "a"]
+    check result[1] == @["2", "b"]
+    check result[2] == @["3", "c"]
+
+  test "top-K heap keeps largest K rows in DESC order":
+    # For DESC, the "best" rows have the highest values.
+    # A max-heap keeps the worst at root, so we evict the smallest.
+    let specs = @[SortSpec(expr: Expr(kind: exColumn, colName: "id"),
+        descending: true)]
+    let allColumns = @["id", "name"]
+    let heap = newTopKHeap(specs, allColumns, capacity = 3)
+
+    # Add rows in random order
+    heap.push(@["5", "e"])
+    heap.push(@["1", "a"])
+    heap.push(@["3", "c"])
+    heap.push(@["2", "b"])
+    heap.push(@["4", "d"])
+
+    check heap.len == 3
+
+    let result = heap.extractSorted()
+    check result.len == 3
+    # DESC order: largest first
+    check result[0] == @["5", "e"]
+    check result[1] == @["4", "d"]
+    check result[2] == @["3", "c"]
+
+  test "top-K heap with capacity larger than input":
+    let specs = @[SortSpec(expr: Expr(kind: exColumn, colName: "val"),
+        descending: false)]
+    let allColumns = @["val"]
+    let heap = newTopKHeap(specs, allColumns, capacity = 100)
+
+    heap.push(@["3"])
+    heap.push(@["1"])
+    heap.push(@["2"])
+
+    check heap.len == 3
+
+    let result = heap.extractSorted()
+    check result.len == 3
+    check result[0] == @["1"]
+    check result[1] == @["2"]
+    check result[2] == @["3"]
+
+  test "top-K heap with single row":
+    let specs = @[SortSpec(expr: Expr(kind: exColumn, colName: "x"),
+        descending: false)]
+    let allColumns = @["x"]
+    let heap = newTopKHeap(specs, allColumns, capacity = 5)
+
+    heap.push(@["42"])
+
+    check heap.len == 1
+    let result = heap.extractSorted()
+    check result.len == 1
+    check result[0] == @["42"]
+
+  test "top-K heap with empty input":
+    let specs = @[SortSpec(expr: Expr(kind: exColumn, colName: "x"),
+        descending: false)]
+    let allColumns = @["x"]
+    let heap = newTopKHeap(specs, allColumns, capacity = 5)
+
+    check heap.len == 0
+    let result = heap.extractSorted()
+    check result.len == 0
+
+  test "top-K heap with multi-column sort key":
+    let specs = @[
+      SortSpec(expr: Expr(kind: exColumn, colName: "age"), descending: false),
+      SortSpec(expr: Expr(kind: exColumn, colName: "name"), descending: true)
+    ]
+    let allColumns = @["age", "name"]
+    let heap = newTopKHeap(specs, allColumns, capacity = 2)
+
+    # (25, alice), (30, bob), (25, zara), (20, carl)
+    heap.push(@["25", "alice"])
+    heap.push(@["30", "bob"])
+    heap.push(@["25", "zara"])
+    heap.push(@["20", "carl"])
+
+    check heap.len == 2
+
+    let result = heap.extractSorted()
+    check result.len == 2
+    # ASC age first: 20 < 25, so (20, carl) and (25, zara) or (25, alice)?
+    # For age=25, DESC name: zara > alice, so zara sorts before alice in our DESC spec
+    # But the top-K heap keeps the BEST rows. For age ASC + name DESC:
+    # Sort order: (20, carl) < (25, zara) < (25, alice) < (30, bob)
+    # Top 2 in sorted order: (20, carl), (25, zara)
+    check result[0] == @["20", "carl"]
+    check result[1] == @["25", "zara"]
+
+  test "top-K heap with string sort keys":
+    let specs = @[SortSpec(expr: Expr(kind: exColumn, colName: "name"),
+        descending: false)]
+    let allColumns = @["id", "name"]
+    let heap = newTopKHeap(specs, allColumns, capacity = 3)
+
+    heap.push(@["5", "charlie"])
+    heap.push(@["1", "alice"])
+    heap.push(@["3", "bob"])
+    heap.push(@["2", "diana"])
+    heap.push(@["4", "eve"])
+
+    check heap.len == 3
+
+    let result = heap.extractSorted()
+    check result.len == 3
+    check result[0] == @["1", "alice"]
+    check result[1] == @["3", "bob"]
+    check result[2] == @["5", "charlie"]
+
+  test "top-K heap capacity 1 keeps only the best row":
+    let specs = @[SortSpec(expr: Expr(kind: exColumn, colName: "score"),
+        descending: true)]
+    let allColumns = @["score"]
+    let heap = newTopKHeap(specs, allColumns, capacity = 1)
+
+    heap.push(@["50"])
+    heap.push(@["90"])
+    heap.push(@["70"])
+    heap.push(@["30"])
+    heap.push(@["80"])
+
+    check heap.len == 1
+    let result = heap.extractSorted()
+    check result.len == 1
+    check result[0] == @["90"]
+
+  test "top-K heap with duplicate values":
+    let specs = @[SortSpec(expr: Expr(kind: exColumn, colName: "val"),
+        descending: false)]
+    let allColumns = @["val"]
+    let heap = newTopKHeap(specs, allColumns, capacity = 3)
+
+    heap.push(@["5"])
+    heap.push(@["5"])
+    heap.push(@["3"])
+    heap.push(@["3"])
+    heap.push(@["7"])
+    heap.push(@["1"])
+
+    check heap.len == 3
+    let result = heap.extractSorted()
+    check result.len == 3
+    # Top 3 smallest: 1, 3, 3 (or 1, 3, 5 — depends on how ties are handled)
+    check result[0][0] == "1"

@@ -1308,6 +1308,36 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
         else:
           errorResult("ORDER BY requires row results from previous operation")
 
+      elif op.obOptimization == oboTopK:
+        # ORDER BY + LIMIT with bounded top-K heap.
+        # Instead of buffering all N rows and sorting (O(N log N) time, O(N) memory),
+        # we use a bounded max-heap that keeps only the top K rows while streaming.
+        # This gives O(N log K) time and O(K) memory.
+        let limitRows = if op.obLimit > 0: int(op.obLimit) else: 10
+        let heap = newTopKHeap(op.obSortSpecs, op.obAllColumns, limitRows)
+
+        if lastResult.kind == erkRows:
+          # Already buffered — feed through heap
+          for row in lastResult.rows:
+            heap.push(row)
+          let sortedRows = heap.extractSorted()
+          var outputRows = extractRequestedColumns(sortedRows, op.obColumns,
+              op.obAllColumns)
+          rowsResult(op.obColumns, outputRows)
+        elif lastResult.kind == erkStreamingRows:
+          # Stream rows through the top-K heap
+          while lastResult.streamIterator.hasNextRow():
+            let rowOpt = lastResult.streamIterator.nextRow()
+            if rowOpt.isSome:
+              heap.push(rowOpt.get())
+          lastResult.streamIterator.closeIterator()
+          let sortedRows = heap.extractSorted()
+          var outputRows = extractRequestedColumns(sortedRows, op.obColumns,
+              op.obAllColumns)
+          rowsResult(op.obColumns, outputRows)
+        else:
+          errorResult("ORDER BY requires row results from previous operation")
+
       else:
         # No optimization - use full sort algorithm
         if lastResult.kind == erkRows:

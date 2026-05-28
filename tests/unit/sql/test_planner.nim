@@ -1524,3 +1524,48 @@ suite "Planner ORDER BY PK Optimization":
     let text = formatPlanOp(op)
     check "PK_DESC_REVERSE" in text
     check "limit=10" in text
+
+  test "formatPlanOp poOrderBy with top-K optimization":
+    let op = PlanOp(
+      kind: poOrderBy,
+      obSortSpecs: @[SortSpec(expr: Expr(kind: exColumn, colName: "name"),
+          descending: true)],
+      obColumns: @["id", "name"],
+      obLimit: 10,
+      obOptimization: oboTopK
+    )
+    let text = formatPlanOp(op)
+    check "TOP_K" in text
+    check "limit=10" in text
+
+  test "formatPlanOp poScan with reverse=true":
+    let op = PlanOp(
+      kind: poScan,
+      scTableId: zeroTableId(),
+      scStartKey: "/t/01KSPTJ47SXS9BR2WTTKV7N6BV/d/",
+      scEndKey: "/t/01KSPTJ47SXS9BR2WTTKV7N6BV/e",
+      scLimit: 10,
+      scReverse: true,
+      scFilter: none(Expr),
+      scColumns: @["id", "name"],
+      scAllColumns: @["id", "name", "email"]
+    )
+    let text = formatPlanOp(op)
+    check "reverse=true" in text
+    check "limit=10" in text
+
+suite "Planner ORDER BY + LIMIT Optimization (scanLimit and obOptimization)":
+
+  test "oboTopK formatPlanOp":
+    let op = PlanOp(
+      kind: poOrderBy,
+      obSortSpecs: @[SortSpec(expr: Expr(kind: exColumn, colName: "name"),
+          descending: true)],
+      obColumns: @["id", "name"],
+      obAllColumns: @["id", "name", "email"],
+      obLimit: 10,
+      obOptimization: oboTopK
+    )
+    let text = formatPlanOp(op)
+    check "TOP_K" in text
+    check "name" in text
