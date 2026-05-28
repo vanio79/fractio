@@ -358,3 +358,28 @@ proc nuraftServerGetPeerInfo*(server: NuRaftServer, peerId: int32,
 proc nuraftServerGetServerCount*(server: NuRaftServer): int32
   {.importc: "nuraft_server_get_server_count".}
   ## Get the number of servers in the current cluster config (peers + self).
+
+# =============================================================================
+# Global Manager: Shared thread pool for all Raft groups
+# =============================================================================
+
+proc nuraftGlobalMgrInit*(numCommitThreads: int32 = 1,
+    numAppendThreads: int32 = 1): int32
+  {.importc: "nuraft_global_mgr_init".}
+  ## Initialize the global NuRaft manager with a shared thread pool.
+  ##
+  ## Without this, each raft_server creates 2 dedicated threads
+  ## (bg_commit_thread_ and bg_append_thread_). With N groups, that's
+  ## 2N threads × 8MB stack = 16N MB of stack memory alone.
+  ##
+  ## With the global manager, all groups share numCommitThreads +
+  ## numAppendThreads threads total (default 2 threads), reducing
+  ## stack memory to ~16MB regardless of group count.
+  ##
+  ## MUST be called before creating any raft_server instances.
+  ##
+  ## Returns: 1 if initialized successfully, 0 if already initialized, -1 on error.
+
+proc nuraftGlobalMgrShutdown*() {.importc: "nuraft_global_mgr_shutdown".}
+  ## Shut down the global NuRaft manager and free resources.
+  ## All raft_server instances MUST be destroyed before calling this.

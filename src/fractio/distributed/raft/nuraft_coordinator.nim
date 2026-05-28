@@ -795,6 +795,17 @@ type
     vlogCleanBufferSize*: int64
 
 proc newNuRaftCoordinator*(config: CoordinatorConfig): NuRaftCoordinator =
+  # Initialize the global NuRaft manager with a shared thread pool.
+  # Without this, each raft_server creates 2 dedicated threads (commit + append).
+  # With N groups, that's 2N threads × 8MB stack = 16N MB of stack memory.
+  # With the global manager, all groups share just 2 threads (1 commit + 1 append),
+  # reducing total stack memory to ~16MB regardless of group count.
+  let initResult = nuraftGlobalMgrInit(1, 1)
+  if initResult < 0:
+    raise newException(CatchableError, "Failed to initialize NuRaft global manager")
+  if initResult == 1:
+    info "NuRaft global manager initialized (shared thread pool)"
+
   new(result)
   result.nodeId = config.nodeId
   result.port = config.port
@@ -998,6 +1009,12 @@ proc stop*(c: NuRaftCoordinator) =
 
   if c.store != nil:
     c.store.close()
+
+  # Shut down the global NuRaft manager (shared thread pool).
+  # MUST be called after all raft_server instances are destroyed,
+  # since the global manager's worker threads reference those instances.
+  nuraftGlobalMgrShutdown()
+  info "NuRaft global manager shut down"
 
   # Clear pending messages (prevent GC access during final cleanup)
   clearPendingMessages(c)

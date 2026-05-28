@@ -74,7 +74,7 @@ suite "Data Row Key Encoding with Group ID":
 
     check decodedTableId == tableId
     check decodedGroupId == groupId
-    check decodedPk == ""
+    check decodedPk == pk
 
 suite "primaryKeyFromDataRowKey — PK extraction for k-way merge":
 

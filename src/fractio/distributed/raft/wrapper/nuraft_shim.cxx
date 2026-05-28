@@ -1817,4 +1817,30 @@ int32_t nuraft_server_get_server_count(void* server) {
     return static_cast<int32_t>(config->get_servers().size());
 }
 
+// =============================================================================
+// Global Manager: Shared thread pool for all Raft groups
+// =============================================================================
+
+int32_t nuraft_global_mgr_init(int32_t num_commit_threads, int32_t num_append_threads) {
+    // Initialize the global NuRaft manager with a shared thread pool.
+    // Without this, each raft_server creates 2 dedicated threads (bg_commit_thread_
+    // and bg_append_thread_). With N groups, that's 2N threads × 8MB stack = 16N MB.
+    // With the global manager, all groups share num_commit_threads + num_append_threads
+    // threads total (default 2 threads), reducing stack to ~16MB regardless of group count.
+    nuraft_global_config config;
+    config.num_commit_threads_ = static_cast<size_t>(num_commit_threads);
+    config.num_append_threads_ = static_cast<size_t>(num_append_threads);
+    config.max_scheduling_unit_ms_ = 200;
+
+    nuraft_global_mgr* mgr = nuraft_global_mgr::init(config);
+    if (mgr) {
+        return 1;  // Successfully initialized
+    }
+    return -1;  // Error
+}
+
+void nuraft_global_mgr_shutdown() {
+    nuraft_global_mgr::shutdown();
+}
+
 } // extern "C"

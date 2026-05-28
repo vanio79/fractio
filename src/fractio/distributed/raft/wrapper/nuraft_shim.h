@@ -295,6 +295,21 @@ int32_t nuraft_server_get_peer_info(void* server, int32_t peer_id, nuraft_peer_i
 // Get the number of servers in the current cluster config (peers + self).
 int32_t nuraft_server_get_server_count(void* server);
 
+// Initialize the global NuRaft manager (shared thread pool for all Raft groups).
+// This MUST be called before creating any raft_server instances.
+// Without this, each raft_server creates 2 dedicated threads (commit + append),
+// which means 4 groups × 2 threads × 8MB stack = 64MB of thread stacks alone.
+// With this, all groups share 2 global threads (1 commit + 1 append = 16MB total).
+// Parameters:
+//   num_commit_threads: number of shared commit threads (default 1)
+//   num_append_threads: number of shared append threads (default 1)
+// Returns: 1 if initialized successfully, 0 if already initialized, -1 on error.
+int32_t nuraft_global_mgr_init(int32_t num_commit_threads, int32_t num_append_threads);
+
+// Shut down the global NuRaft manager and free resources.
+// All raft_server instances MUST be destroyed before calling this.
+void nuraft_global_mgr_shutdown();
+
 #ifdef __cplusplus
 }
 #endif
