@@ -6,25 +6,19 @@
 # Usage:
 #   import test_cluster_helper
 #
-#   # Per-test cluster (creates new cluster for each test)
-#   var cluster = newTestCluster(defaultTestClusterConfig())
+#   var cluster = newTestCluster(TestClusterConfig(
+#     nodeCount: 3,
+#     parallelStartup: true
+#   ))
 #   defer: cluster.stop()
 #
-#   # Shared fixture (cluster shared across tests in a suite)
-#   var fixture = newSharedClusterFixture(defaultTestClusterConfig())
-#   suite "My tests":
-#     setup:
-#       fixture.setup()
-#     teardown:
-#       fixture.teardown()
-#     test "example":
-#       let cluster = fixture.get()
-#       # use cluster...
+#   let leaderIdx = cluster.waitForLeader(META_GROUP_ID)
 
-import std/[os, locks, tables, options]
+import std/[os, atomics, locks, tables, options]
+import std/strformat
 
 import fractio/distributed/raft/nuraft_coordinator
-import fractio/distributed/raft/group_types 
+import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
 import fractio/distributed/meta/system_schemas
 import fractio/protocol/raft_store
@@ -39,26 +33,25 @@ type
   MemberInfo* = tuple
     nodeId: uint32
     host: string
-    port: int ## Single port for all Raft groups (multiplexed)
+    basePort: int
 
   TestClusterConfig* = object
     ## Configuration for a test cluster
     nodeCount*: int
-    port*: int                   ## Starting port (each node uses port + (nodeId-1)*1000)
-    portOffset*: int             ## Additional offset to avoid port conflicts between tests
-    preferredLeader*: uint32     ## Which node should be preferred leader (default: 1)
+    basePort*: int         ## Starting port (each node uses basePort + (nodeId-1)*1000)
+    portOffset*: int       ## Additional offset to avoid port conflicts between tests
+    preferredLeader*: uint32 ## Which node should be preferred leader (default: 1)
     electionTimeoutLowerMs*: int32
     electionTimeoutUpperMs*: int32
     heartbeatIntervalMs*: int32
-    parallelStartup*: bool       ## Create nodes in parallel (default: true)
-    parallelGroupCreation*: bool ## Create groups in parallel (default: true)
-    seedSystemTables*: bool      ## Automatically seed sys.nodes and sys.groups (default: true)
+    parallelStartup*: bool ## Create nodes in parallel (default: true)
+    seedSystemTables*: bool ## Automatically seed sys.nodes and sys.groups (default: true)
 
   TestNode* = object
     ## A single test node with its coordinator and store
     id*: int
     nodeId*: uint32
-    port*: int ## Single port for all Raft groups (multiplexed)
+    basePort*: int
     coord*: NuRaftCoordinator
     store*: RaftKVStoreExt
     storagePath*: string
@@ -81,14 +74,13 @@ type
 proc defaultTestClusterConfig*(): TestClusterConfig =
   result = TestClusterConfig(
     nodeCount: 3,
-    port: 29000,
+    basePort: 29000,
     portOffset: 0,
     preferredLeader: 1,
     electionTimeoutLowerMs: TEST_ELECTION_TIMEOUT_LOWER_MS_MULTINODE,
     electionTimeoutUpperMs: TEST_ELECTION_TIMEOUT_UPPER_MS_MULTINODE,
     heartbeatIntervalMs: TEST_HEARTBEAT_INTERVAL_MS_MULTINODE,
     parallelStartup: true,
-    parallelGroupCreation: true,
     seedSystemTables: true
   )
 
@@ -120,8 +112,8 @@ proc getMemberInfo(config: TestClusterConfig): seq[MemberInfo] =
   ## Generate member info for all nodes in the cluster
   for i in 1 .. config.nodeCount:
     let nodeId = uint32(i)
-    let port = config.port + config.portOffset + (i - 1) * 1000
-    result.add((nodeId: nodeId, host: "127.0.0.1", port: port))
+    let basePort = config.basePort + config.portOffset + (i - 1) * 1000
+    result.add((nodeId: nodeId, host: "127.0.0.1", basePort: basePort))
 
 proc getStoragePath(nodeId: uint32, portOffset: int): string =
   "/tmp/fractio_test_node" & $nodeId & "_" & $portOffset
@@ -133,7 +125,7 @@ proc getStoragePath(nodeId: uint32, portOffset: int): string =
 proc newTestNode(
   nodeId: uint32,
   host: string,
-  port: int,
+  basePort: int,
   storagePath: string,
   members: seq[MemberInfo],
   config: TestClusterConfig
@@ -145,8 +137,8 @@ proc newTestNode(
 
   # Create coordinator
   let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
-    nodeId: NodeID(nodeId),
-    port: port,
+    nodeId: rangeTypes.NodeID(nodeId),
+    basePort: basePort,
     host: host,
     dataDir: storagePath,
     electionTimeoutLowerMs: config.electionTimeoutLowerMs,
@@ -156,7 +148,7 @@ proc newTestNode(
 
   # Populate peer info
   for m in members:
-    coord.peerInfo[m.nodeId] = (host: m.host, port: m.port)
+    coord.peerInfo[m.nodeId] = (host: m.host, basePort: m.basePort)
 
   # Start coordinator (just sets running flag)
   coord.start()
@@ -164,7 +156,7 @@ proc newTestNode(
   result = TestNode(
     id: int(nodeId),
     nodeId: nodeId,
-    port: port,
+    basePort: basePort,
     coord: coord,
     storagePath: storagePath
   )
@@ -172,24 +164,21 @@ proc newTestNode(
 proc createGroups(node: var TestNode, members: seq[MemberInfo],
     config: TestClusterConfig): bool =
   ## Create META and DATA groups for a node.
-  ## Uses parallel creation if config.parallelGroupCreation is true.
 
   let preferredLeader = if config.preferredLeader >
       0: config.preferredLeader else: 0'u32
 
-  if config.parallelGroupCreation:
-    # Create both groups in parallel for faster startup
-    return node.coord.createAndStartGroupsParallel(
-      @[META_GROUP_ID, DATA_GROUP_START_ID], members, preferredLeader)
-  else:
-    # Sequential creation (fallback for debugging)
-    if not node.coord.createAndStartGroup(META_GROUP_ID, members,
-        preferredLeader):
-      return false
-    if not node.coord.createAndStartGroup(DATA_GROUP_START_ID, members,
-        preferredLeader):
-      return false
-    return true
+  # Create META group
+  if not node.coord.createAndStartGroup(META_GROUP_ID, members,
+      preferredLeader):
+    return false
+
+  # Create DATA group
+  if not node.coord.createAndStartGroup(DATA_GROUP_START_ID, members,
+      preferredLeader):
+    return false
+
+  return true
 
 proc createStore(node: var TestNode): bool =
   ## Create and bootstrap the RaftKVStoreExt for a node.
@@ -207,20 +196,25 @@ type
   NodeCreationArg = object
     nodeId: uint32
     host: string
-    port: int
+    basePort: int
     storagePath: string
     members: seq[MemberInfo]
     config: TestClusterConfig
+    result: TestNode
     success: bool
     error: string
 
 proc nodeCreationWorker(arg: ptr NodeCreationArg) {.thread.} =
-  ## Worker thread for parallel node creation.
-  ## Only prepares storage directory - refs must be allocated on main thread
-  ## to avoid atomicArc cross-thread dealloc crashes.
+  ## Worker thread for parallel node creation
   try:
-    cleanDir(arg.storagePath)
-    createDir(arg.storagePath)
+    arg.result = newTestNode(
+      arg.nodeId,
+      arg.host,
+      arg.basePort,
+      arg.storagePath,
+      arg.members,
+      arg.config
+    )
     arg.success = true
   except CatchableError as e:
     arg.success = false
@@ -229,8 +223,6 @@ proc nodeCreationWorker(arg: ptr NodeCreationArg) {.thread.} =
 proc createNodesParallel(config: TestClusterConfig, members: seq[
     MemberInfo]): seq[TestNode] =
   ## Create all nodes in parallel using threads.
-  ## Storage directories are created in parallel, but refs are allocated
-  ## on the main thread to avoid atomicArc cross-thread dealloc issues.
 
   var args = newSeq[NodeCreationArg](config.nodeCount)
   var threads = newSeq[Thread[ptr NodeCreationArg]](config.nodeCount)
@@ -238,40 +230,36 @@ proc createNodesParallel(config: TestClusterConfig, members: seq[
   # Initialize arguments
   for i in 0 ..< config.nodeCount:
     let nodeId = uint32(i + 1)
-    let port = config.port + config.portOffset + i * 1000
+    let basePort = config.basePort + config.portOffset + i * 1000
     let storagePath = getStoragePath(nodeId, config.portOffset)
 
     args[i] = NodeCreationArg(
       nodeId: nodeId,
       host: "127.0.0.1",
-      port: port,
+      basePort: basePort,
       storagePath: storagePath,
       members: members,
       config: config
     )
 
-  # Start all threads to prepare storage dirs in parallel
+  # Start all threads
   for i in 0 ..< config.nodeCount:
     createThread(threads[i], nodeCreationWorker, addr args[i])
 
   # Wait for all threads
   for i in 0 ..< config.nodeCount:
     joinThread(threads[i])
-    if not args[i].success:
-      raise newException(IOError, "Failed to prepare storage for node " & $(i +
-          1) & ": " & args[i].error)
 
-  # Now create nodes sequentially on main thread (refs allocated here)
-  for i in 0 ..< config.nodeCount:
-    var node = newTestNode(
-      args[i].nodeId,
-      args[i].host,
-      args[i].port,
-      args[i].storagePath,
-      args[i].members,
-      args[i].config
-    )
-    result.add(node)
+    if args[i].success:
+      result.add(args[i].result)
+    else:
+      # Clean up on failure
+      for j in 0 ..< i:
+        if args[j].success:
+          args[j].result.coord.stop()
+          cleanDir(args[j].result.storagePath)
+      raise newException(IOError, "Failed to create node " & $(i + 1) & ": " &
+          args[i].error)
 
 proc createNodesSequential(config: TestClusterConfig, members: seq[
     MemberInfo]): seq[TestNode] =
@@ -279,10 +267,10 @@ proc createNodesSequential(config: TestClusterConfig, members: seq[
 
   for i in 0 ..< config.nodeCount:
     let nodeId = uint32(i + 1)
-    let port = config.port + config.portOffset + i * 1000
+    let basePort = config.basePort + config.portOffset + i * 1000
     let storagePath = getStoragePath(nodeId, config.portOffset)
 
-    var node = newTestNode(nodeId, "127.0.0.1", port, storagePath, members, config)
+    var node = newTestNode(nodeId, "127.0.0.1", basePort, storagePath, members, config)
     result.add(node)
 
 # ============================================================================
@@ -417,7 +405,6 @@ proc waitForAllLeaders*(cluster: TestCluster): bool =
 
 proc seedSystemTables*(cluster: TestCluster) =
   ## Seed sys.nodes and sys.groups tables on the cluster.
-  ## Uses batch writes for efficiency.
   ## Must be called after leader election.
 
   let leaderIdx = cluster.findLeader(META_GROUP_ID)
@@ -427,39 +414,37 @@ proc seedSystemTables*(cluster: TestCluster) =
   let leader = cluster.nodes[leaderIdx]
   let config = cluster.config
 
-  # Build batch of node records
-  var nodeWrites: seq[tuple[key: string, value: string]] = @[]
+  # Seed sys.nodes
   for i, node in cluster.nodes:
     let key = encodeTableKey(SYS_NODES_TABLE_ID, $node.nodeId)
     let nodeRec = NodeRecord(
       nodeId: node.nodeId,
       host: "127.0.0.1",
-      raftPort: uint16(node.port),
+      raftPort: uint16(node.basePort),
       clientPort: uint16(19000 + i),
       status: nsAlive,
     )
-    nodeWrites.add((key: key, value: nodeRec.encode()))
+    let res = leader.store.raftPut(key, nodeRec.encode())
+    if not res.isOk:
+      echo "WARN: Failed to seed sys.nodes for node ", node.nodeId, ": ", res.error.msg
 
-  # Build batch of group records
-  var groupWrites: seq[tuple[key: string, value: string]] = @[]
+  # Seed sys.groups
   for gid in [META_GROUP_ID, DATA_GROUP_START_ID]:
-    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid)
+    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
     var replicasSeq: seq[GroupReplicaBin] = @[]
     for node in cluster.nodes:
       replicasSeq.add(GroupReplicaBin(nodeId: node.nodeId,
           replicaType: rtVoter))
     let groupRec = GroupRecord(
-      groupId: groupIDToULID(gid),
+      groupId: gid.uint64,
       replicas: replicasSeq,
       preferredLeader: config.preferredLeader,
     )
-    groupWrites.add((key: key, value: groupRec.encode()))
+    let res = leader.store.raftPut(key, groupRec.encode())
+    if not res.isOk:
+      echo "WARN: Failed to seed sys.groups for gid ", gid, ": ", res.error.msg
 
-  # Write all records in batches (same timestamp for atomicity)
-  discard leader.store.sysTablePutBatch(nodeWrites)
-  discard leader.store.sysTablePutBatch(groupWrites)
-
-  # Wait for state machine to catch up (need enough time for replication)
+  # Wait for state machine to catch up (multiple intervals to be safe)
   sleep(TEST_REPLICATION_WAIT_MS * 4) # 400ms total
 
 # ============================================================================
@@ -503,153 +488,3 @@ proc kvGet*(node: TestNode, key: string): Option[string] =
   if res.isOk and res.value.isSome:
     return some(res.value.get.value)
   none(string)
-
-proc sysTablePutBatch*(node: TestNode,
-    writes: openArray[tuple[key: string, value: string]]): bool =
-  ## Write multiple sys table entries atomically with MVCC encoding.
-  ## All entries get the same timestamp for atomicity.
-  ## Returns true on success, false on failure.
-  node.store.sysTablePutBatch(writes)
-
-proc sysTableDeleteBatch*(node: TestNode, keys: openArray[string]): bool =
-  ## Delete multiple sys table entries through Raft.
-  ## Returns true on success, false on failure.
-  node.store.sysTableDeleteBatch(keys)
-
-proc sysTablePutAndDeleteBatch*(node: TestNode,
-    puts: openArray[tuple[key: string, value: string]],
-    deletes: openArray[string]): bool =
-  ## Write and delete sys table entries atomically through Raft.
-  ## Returns true on success, false on failure.
-  node.store.sysTablePutAndDeleteBatch(puts, deletes)
-
-# ============================================================================
-# Shared Test Fixtures
-# ============================================================================
-
-type
-  SharedClusterFixture* = ref object
-    ## A shared test fixture that allows multiple tests to reuse the same cluster.
-    ## This avoids the overhead of creating/destroying clusters between tests.
-    ##
-    ## Usage:
-    ##   var fixture = newSharedClusterFixture(defaultTestClusterConfig())
-    ##   suite "My tests":
-    ##     setup:
-    ##       fixture.setup()
-    ##     teardown:
-    ##       fixture.teardown()
-    ##     test "example 1":
-    ##       let cluster = fixture.get()
-    ##       # use cluster...
-    ##     test "example 2":
-    ##       let cluster = fixture.get()  # Same cluster, state persists
-    ##       # use cluster...
-    ##
-    ## The cluster is created lazily on first setup() and destroyed when
-    ## the fixture is garbage collected or stop() is called.
-    config: TestClusterConfig
-    cluster: TestCluster
-    initialized: bool
-    testCount: int
-    lock: Lock
-
-proc newSharedClusterFixture*(config: TestClusterConfig): SharedClusterFixture =
-  ## Create a new shared cluster fixture with the given configuration.
-  ## The cluster is not created until setup() is called.
-  result = SharedClusterFixture(
-    config: config,
-    initialized: false,
-    testCount: 0
-  )
-  initLock(result.lock)
-
-proc setup*(fixture: SharedClusterFixture) =
-  ## Setup for each test. Creates the cluster on first call.
-  ## Subsequent calls return the same cluster.
-  withLock fixture.lock:
-    if not fixture.initialized:
-      fixture.cluster = newTestCluster(fixture.config)
-      fixture.initialized = true
-    inc fixture.testCount
-
-proc teardown*(fixture: SharedClusterFixture) =
-  ## Teardown for each test. Currently a no-op since the cluster is shared.
-  ## Override this in your tests if you need per-test cleanup.
-  discard
-
-proc get*(fixture: SharedClusterFixture): var TestCluster =
-  ## Get the shared cluster. Must call setup() first.
-  doAssert fixture.initialized, "Fixture not initialized - call setup() first"
-  fixture.cluster
-
-proc stop*(fixture: SharedClusterFixture) =
-  ## Stop the shared cluster and clean up.
-  withLock fixture.lock:
-    if fixture.initialized:
-      fixture.cluster.stop()
-      fixture.initialized = false
-
-proc isInitialized*(fixture: SharedClusterFixture): bool =
-  ## Check if the fixture has been initialized.
-  withLock fixture.lock:
-    result = fixture.initialized
-
-proc reset*(fixture: SharedClusterFixture) =
-  ## Reset the cluster by stopping and recreating it.
-  ## Use this if tests corrupt the cluster state.
-  withLock fixture.lock:
-    if fixture.initialized:
-      fixture.cluster.stop()
-    fixture.cluster = newTestCluster(fixture.config)
-    fixture.initialized = true
-
-# ============================================================================
-# Test State Isolation Helpers
-# ============================================================================
-
-proc clearTestData*(cluster: var TestCluster) =
-  ## Clear all user data from the cluster, keeping system tables.
-  ## Use this between tests to isolate test data while reusing the cluster.
-  for node in cluster.nodes.mitems:
-    # Clear any user-created groups (keep META and DATA_GROUP_START)
-    var groupsToRemove: seq[GroupID] = @[]
-    for gid, _ in node.coord.groups:
-      if gid != META_GROUP_ID and gid != DATA_GROUP_START_ID:
-        groupsToRemove.add(gid)
-    for gid in groupsToRemove:
-      node.coord.removeGroup(gid)
-
-proc reseedSystemTables*(cluster: var TestCluster) =
-  ## Re-seed system tables after clearing or modifying cluster state.
-  cluster.seedSystemTables()
-
-# ============================================================================
-# Test Suite Template
-# ============================================================================
-
-template sharedClusterSuite*(suiteName: string, config: TestClusterConfig,
-                             body: untyped): untyped =
-  ## Template to create a test suite with a shared cluster fixture.
-  ## The cluster is created once and shared across all tests in the suite.
-  ##
-  ## Usage:
-  ##   sharedClusterSuite("My Cluster Tests", defaultTestClusterConfig()):
-  ##     test "first test":
-  ##       let cluster = fixture.get()
-  ##       # ...
-  ##     test "second test":
-  ##       let cluster = fixture.get()
-  ##       # ... (same cluster, state persists from first test)
-  ##
-  ## If you need isolated state between tests, call fixture.reset() in setup.
-  var fixture {.global.} = newSharedClusterFixture(config)
-
-  suite suiteName:
-    setup:
-      fixture.setup()
-
-    teardown:
-      fixture.teardown()
-
-    body

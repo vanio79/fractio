@@ -2824,7 +2824,16 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
     if grpScan.isOk:
       for (key, entry) in grpScan.value:
         try:
-          let rec = decodeGroupRecord(entry.value)
+          # sys.groups values are MVCC-encoded (written via MicroTransaction).
+          # We must decode the MVCC wrapper before passing to decodeGroupRecord.
+          var groupValue = entry.value
+          if mvccValueTypes.isLikelyMVCCValue(groupValue):
+            let mvccVal = mvccValueTypes.decodeMVCCValueFast(groupValue)
+            if mvccVal.isDeleted:
+              continue # Skip tombstones
+            groupValue = mvccVal.data
+
+          let rec = decodeGroupRecord(groupValue)
           let gid = GroupID(rec.groupId)
           if gid == META_GROUP_ID or gid == DATA_GROUP_START_ID: continue
           if coord.hasGroup(gid): continue

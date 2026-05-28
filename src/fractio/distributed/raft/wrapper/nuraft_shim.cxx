@@ -286,17 +286,16 @@ static int64_t current_time_ms() {
 }
 
 // Purge expired handlers from the global registry. Called under g_handlers_lock.
+// IMPORTANT: Do NOT invoke expired handlers — they may reference destroyed
+// raft_server instances (use-after-free). Just remove them.
 static void purgeExpiredHandlersLocked() {
     int64_t now = current_time_ms();
     for (auto it = g_pending_handlers.begin(); it != g_pending_handlers.end(); ) {
         auto& deque = it->second;
         while (!deque.empty() && (now - deque.front().enqueue_time_ms) > PENDING_HANDLER_TIMEOUT_MS) {
-            // Invoke the expired handler with a timeout error so NuRaft can
-            // clean up its internal state (e.g., pending append_entries responses).
-            auto& ph = deque.front();
-            ptr<resp_msg> null_resp;
-            ptr<rpc_exception> err = cs_new<rpc_exception>("RPC handler timeout", nullptr);
-            ph.handler(null_resp, err);
+            // Drop the expired handler without invoking it.
+            // Invoking would call raft_server internals which may be freed,
+            // causing SIGSEGV (use-after-free on raft_server ptr).
             deque.pop_front();
         }
         if (deque.empty()) {

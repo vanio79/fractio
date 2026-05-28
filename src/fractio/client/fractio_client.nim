@@ -1676,11 +1676,14 @@ proc createSpace*(client: FractioClient, name: string,
   ## replicas: replication factor (0 = ALL nodes)
 
   # Retry loop for leader redirect
-  for attempt in 0 ..< 3:
+  for attempt in 0 ..< 10:
     # Get connection to META group leader
     let connOpt = client.getGroupLeaderConnection(META_GROUP_ID)
     if connOpt.isNone:
-      return spaceOpErr("no connection to META group leader")
+      # No known leader — try refreshing metadata
+      discard client.refreshMetadata()
+      sleep(500)
+      continue
 
     let conn = connOpt.get()
 
@@ -1694,6 +1697,8 @@ proc createSpace*(client: FractioClient, name: string,
               res.error.leaderRedirect)
         else:
           discard client.refreshMetadata()
+        # Small backoff before retry to avoid leader redirect loops
+        sleep(100 * (attempt + 1))
         continue
       return spaceOpErr(res.error.msg)
 

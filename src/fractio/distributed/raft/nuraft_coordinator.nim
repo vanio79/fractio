@@ -1091,8 +1091,12 @@ proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
   # Cache peer info
   # IMPORTANT: Use "serverId@host:port" format so NuRaft can extract the server ID
   # from the endpoint when creating RPC clients
+  # NOTE: NuRaft uses int32 for server IDs. Our nodeIds are uint32 in range 1..65535
+  # (validated in config), so they always fit in int32. Use cast[int32] instead of
+  # int32() to avoid RangeDefect when recovering from corrupted group records where
+  # nodeId may exceed int32.max (e.g. from MVCC-encoded data being misread).
   for i, m in sortedMembers:
-    serverIds[i] = int32(m.nodeId)
+    serverIds[i] = cast[int32](m.nodeId)
     # Format: serverId@host:port - NuRaft expects this format for create_client
     endpoints[i] = $m.nodeId & "@" & m.host & ":" & $m.port
     if m.nodeId == c.nodeId.uint32:
@@ -1149,7 +1153,7 @@ proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
   # The callbacks bridge C++ → Nim → RaftPersistentStore → WiscKey
   inst.smgr = createCallbackSmgr(
     persistentStore,
-    int32(c.nodeId.uint32),
+    cast[int32](c.nodeId.uint32),
     myEndpoint,
     serverIds,
     endpoints,
@@ -1216,7 +1220,7 @@ proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
 
   # Create per-group RPC context
   inst.rpcContext = nuraftMpContextCreate(
-    int32(c.nodeId.uint32),
+    cast[int32](c.nodeId.uint32),
     cast[pointer](inst),
     multiplexedSendCb,
     cast[pointer](c),
@@ -1246,7 +1250,7 @@ proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
   # Get and setup the listener for response handling
   inst.listener = setupListener(
     inst.rpcContext,
-    int32(c.nodeId.uint32),
+    cast[int32](c.nodeId.uint32),
     cast[pointer](inst),
     multiplexedSendCb
   )
@@ -1531,7 +1535,7 @@ proc isPeerAlive*(c: NuRaftCoordinator, groupId: GroupID,
   if inst.stopped or inst.server == nil:
     return true # Can't check, assume alive
   var info: NuRaftPeerInfo
-  let rc = nuraftServerGetPeerInfo(inst.server, int32(peerId), addr info)
+  let rc = nuraftServerGetPeerInfo(inst.server, cast[int32](peerId), addr info)
   if rc != 0 or info.exists == 0:
     return true # Peer not in config, assume alive (may not have been added yet)
   # lastSuccRespUs is the elapsed time since the last successful response.
@@ -1726,7 +1730,8 @@ proc setPriority*(c: NuRaftCoordinator, groupId: GroupID,
   defer: releaseGroupInstance(inst)
   if inst.stopped or inst.server == nil: return false
 
-  let rc = nuraftServerSetPriority(inst.server, int32(targetNodeId.uint32), priority)
+  let rc = nuraftServerSetPriority(inst.server, cast[int32](
+      targetNodeId.uint32), priority)
   if rc != 0:
     warn("Failed to set priority", "groupId", $groupId, "target",
         $targetNodeId.uint32, "rc", $rc)
@@ -1753,8 +1758,8 @@ proc transferLeadership*(c: NuRaftCoordinator, groupId: GroupID,
   # Graceful handoff waits for election timeout before stepping down,
   # giving the successor time to prepare and win.
 
-  let myNodeId = int32(c.nodeId.uint32)
-  let targetId = int32(targetNodeId.uint32)
+  let myNodeId = cast[int32](c.nodeId.uint32)
+  let targetId = cast[int32](targetNodeId.uint32)
 
   # Set target node priority to highest (100) - ensures it wins election
   let rc1 = nuraftServerSetPriority(inst.server, targetId, 100)
@@ -1809,7 +1814,7 @@ proc addServerToGroup*(c: NuRaftCoordinator, groupId: GroupID,
   # IMPORTANT: Use "serverId@host:port" format so NuRaft can extract the server ID
   # from the endpoint when creating RPC clients (same format as createAndStartGroup)
   let endpoint = $nodeId & "@" & host & ":" & $port
-  let rc = nuraftServerAddSrv(inst.server, int32(nodeId), cstring(endpoint))
+  let rc = nuraftServerAddSrv(inst.server, cast[int32](nodeId), cstring(endpoint))
   return rc
 
 proc removeServerFromGroup*(c: NuRaftCoordinator, groupId: GroupID,
@@ -1822,7 +1827,7 @@ proc removeServerFromGroup*(c: NuRaftCoordinator, groupId: GroupID,
 
   defer: releaseGroupInstance(inst)
   if inst.stopped or inst.server == nil: return -1
-  return nuraftServerRemoveSrv(inst.server, int32(nodeId))
+  return nuraftServerRemoveSrv(inst.server, cast[int32](nodeId))
 
 # ============================================================================
 # Convenience: register group (for raft_store compatibility)
