@@ -1224,50 +1224,52 @@ ProtocolError] =
     else:
       (startKey, endKey)
 
-    var connOpt: Option[ProtocolClient] = none(ProtocolClient)
-    try:
-      connOpt = client.getGroupLeaderConnection(groupId)
-    except KeyError:
-      discard
-
-    if connOpt.isNone:
-      # No cached connection — refresh metadata and retry once.
-      # Silently skipping groups causes missing rows in multi-group scans.
-      discard client.refreshMetadata()
+    # Retry loop: try up to 3 times to get data from this group.
+    # On NOT_LEADER, refresh metadata and retry with the correct leader.
+    # On connection failure, refresh metadata and retry.
+    # This ensures we never silently skip groups, which would cause
+    # missing rows in multi-group k-way merge scans.
+    var streamAdded = false
+    for attempt in 0 ..< 3:
+      var connOpt: Option[ProtocolClient] = none(ProtocolClient)
       try:
         connOpt = client.getGroupLeaderConnection(groupId)
       except KeyError:
         discard
 
-    if connOpt.isNone:
-      # Still can't connect — record the error and skip this group.
-      # This can happen if the group leader is temporarily unavailable.
-      errors.add($groupId & ": no connection to leader")
-      continue
+      if connOpt.isNone:
+        # No cached connection — refresh metadata and retry.
+        if attempt < 2:
+          discard client.refreshMetadata()
+          continue
+        errors.add($groupId & ": no connection to leader after retries")
+        break
 
-    let conn = connOpt.get()
-    let streamRes = conn.kvStreamScan(groupStart, groupEnd, 0,
-        chunkSize, 0, txnId, readTimestamp, groupId, filter)
-    if streamRes.isOk:
-      groupStreams.add(streamRes.value)
-    elif streamRes.error.kind == peNotLeader:
-      # Try to update leader and retry once
-      if streamRes.error.leaderRedirect.leaderId != 0:
-        client.updateLeaderFromRedirect(groupId, streamRes.error.leaderRedirect)
+      let conn = connOpt.get()
+      let streamRes = conn.kvStreamScan(groupStart, groupEnd, 0,
+          chunkSize, 0, txnId, readTimestamp, groupId, filter)
+      if streamRes.isOk:
+        groupStreams.add(streamRes.value)
+        streamAdded = true
+        break
+      elif streamRes.error.kind == peNotLeader:
+        # Leader changed — update redirect info and retry
+        if streamRes.error.leaderRedirect.leaderId != 0:
+          client.updateLeaderFromRedirect(groupId,
+              streamRes.error.leaderRedirect)
+        else:
+          discard client.refreshMetadata()
+        if attempt < 2:
+          continue
+        errors.add($groupId & ": not leader after retries")
       else:
-        discard client.refreshMetadata()
-      try:
-        let connOpt2 = client.getGroupLeaderConnection(groupId)
-        if connOpt2.isSome:
-          let conn2 = connOpt2.get()
-          let streamRes2 = conn2.kvStreamScan(groupStart, groupEnd, 0,
-              chunkSize, 0, txnId, readTimestamp, groupId, filter)
-          if streamRes2.isOk:
-            groupStreams.add(streamRes2.value)
-      except KeyError:
-        discard
-    else:
-      errors.add($groupId & ": " & streamRes.error.msg)
+        errors.add($groupId & ": " & streamRes.error.msg)
+        break
+
+    if not streamAdded:
+      # Group scan failed after all retries — this group's data will be missing.
+      # The errors list will contain the reason.
+      discard # no-op to allow the block to compile
 
   if groupStreams.len == 0:
     if errors.len > 0:

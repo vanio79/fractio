@@ -917,10 +917,6 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
     let startTime = cpuTime()
     var execResult: ExecResult
     {.cast(gcsafe).}:
-      # Proactively refresh stale metadata before attempting the query.
-      # After a leader failover, the gClient's cached leader info may point
-      # to the dead leader. Refreshing metadata ensures we know the current
-      # leader and avoids long retry loops that block the HTTP response.
       let cl = getClient()
       if not cl.initialized.load(moRelaxed) or cl.groups.len == 0:
         discard cl.forceMetadataRefresh()

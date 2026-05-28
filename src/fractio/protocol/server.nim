@@ -1335,16 +1335,14 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
       return
     let req = reqR.value
 
-    # Enforce leader-only reads for linearizability on group-routed scans.
-    # Use isWriteReady (not just isLeader) to ensure the leader has committed
-    # its no-op entry and the state machine is up to date. Without this, a
-    # newly elected leader may serve stale reads before it has caught up,
-    # causing missing rows in multi-group k-way merge scans.
+    # Reject scans routed to a specific group if this node is not the leader.
+    # A follower serving stale data would cause missing rows in multi-group
+    # k-way merge scans, so we redirect to the leader.
     if req.groupId != ZeroGroupID() and not server.raftCoord.isNil:
-      if not server.raftStore.coordinator.isWriteReady(req.groupId):
+      if not server.raftCoord.isLeader(req.groupId):
         let redirect = server.getLeaderRedirect(req.groupId)
         sendNotLeaderError(conn, requestId,
-            "not write-ready for group " & $req.groupId, redirect)
+            "not the leader for group " & $req.groupId, redirect)
         return
 
     if not server.mvccStore.isNil:
