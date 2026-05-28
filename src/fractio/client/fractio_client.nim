@@ -1231,7 +1231,18 @@ ProtocolError] =
       discard
 
     if connOpt.isNone:
-      # Skip this group if we can't connect
+      # No cached connection — refresh metadata and retry once.
+      # Silently skipping groups causes missing rows in multi-group scans.
+      discard client.refreshMetadata()
+      try:
+        connOpt = client.getGroupLeaderConnection(groupId)
+      except KeyError:
+        discard
+
+    if connOpt.isNone:
+      # Still can't connect — record the error and skip this group.
+      # This can happen if the group leader is temporarily unavailable.
+      errors.add($groupId & ": no connection to leader")
       continue
 
     let conn = connOpt.get()
