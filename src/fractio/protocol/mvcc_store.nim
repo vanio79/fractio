@@ -9,6 +9,7 @@
 
 import std/[tables, locks, options, atomics, algorithm, sets]
 import ../core/types as coreTypes
+import ../utils/query_timer
 import ../core/transaction as coreTxn
 import ../core/timestamp_provider
 import ../storage/mvcc/types as mvccTypes
@@ -1037,11 +1038,14 @@ proc snapshotStreamScan*(store: MvccTransactionStore,
   ## `chunkSize` controls how many filtered pairs are accumulated before
   ## invoking the callback. The final chunk may be smaller and has hasMore=false.
 
+  let timer = newQueryTimer()
+
   # Step 1: Read all raw KV pairs from Raft (this is necessary because MVCC
   # dedup requires seeing all versions of a key to pick the latest).
   # However, we can apply filters early to reduce memory pressure.
   let scanRes = store.raftStore.raftScan(startKey, endKey, 0,
       includeSystemKeys = true, includeMvccKeys = true)
+  timer.stamp("raft_scan")
   if not scanRes.isOk:
     return false
 
@@ -1081,6 +1085,10 @@ proc snapshotStreamScan*(store: MvccTransactionStore,
       if not keyVersions.hasKey(k):
         keyVersions[k] = (entry.value, false, coreTypes.Timestamp(0))
 
+  timer.stamp("mvcc_dedup")
+  let rawCount = scanRes.value.len
+  let dedupCount = keyVersions.len
+
   # Step 3: Collect non-deleted keys, apply filters, sort, and chunk
   var filteredPairs: seq[tuple[key: string, value: string]] = @[]
   for key, val in keyVersions.pairs:
@@ -1102,14 +1110,23 @@ proc snapshotStreamScan*(store: MvccTransactionStore,
   filteredPairs.sort(proc(a, b: tuple[key: string, value: string]): int =
     cmp(a.key, b.key))
 
+  timer.stamp("filter_sort")
+
   # Apply limit
   if limit > 0 and uint32(filteredPairs.len) > limit:
     filteredPairs.setLen(int(limit))
+
+  let resultCount = filteredPairs.len
 
   # Step 4: Send chunks via callback
   if filteredPairs.len == 0:
     # Send empty result
     callback(ScanChunk(pairs: @[], hasMore: false))
+    timer.stamp("send_chunks")
+    let tb = timer.formatBreakdown()
+    {.cast(gcsafe).}: {.cast(raises: []).}:
+      debug "[scan_timer] raw=" & $rawCount & " dedup=" & $dedupCount &
+          " filtered=" & $resultCount & " " & tb
     return true
 
   var sent = 0
@@ -1121,6 +1138,11 @@ proc snapshotStreamScan*(store: MvccTransactionStore,
     let hasMore = sent < filteredPairs.len
     callback(ScanChunk(pairs: chunkPairs, hasMore: hasMore))
 
+  timer.stamp("send_chunks")
+  let tb2 = timer.formatBreakdown()
+  {.cast(gcsafe).}: {.cast(raises: []).}:
+    debug "[scan_timer] raw=" & $rawCount & " dedup=" & $dedupCount &
+        " filtered=" & $resultCount & " " & tb2
   return true
 
 # ---------------------------------------------------------------------------

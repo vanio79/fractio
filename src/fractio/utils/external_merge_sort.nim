@@ -962,6 +962,7 @@ type
     allColumns: seq[string] ## All columns for computing sort keys
     capacity: int ## Maximum number of rows to keep (LIMIT value)
     heap: seq[SortedRow] ## Max-heap: worst element at index 0
+    totalPushed*: int ## Total number of rows pushed (including evicted)
 
 proc newTopKHeap*(specs: seq[SortSpec], allColumns: seq[string],
     capacity: int): TopKHeap =
@@ -1010,6 +1011,7 @@ proc push*(heap: TopKHeap, row: seq[string]) =
   ## If the heap is not full, the row is always added.
   ## If the heap is full, the row is added only if it is better than
   ## the worst element (the root of the max-heap).
+  inc heap.totalPushed
   let sortKeys = computeSortKeys(row, heap.specs, heap.allColumns)
   let entry = SortedRow(row: row, sortKeys: sortKeys)
 

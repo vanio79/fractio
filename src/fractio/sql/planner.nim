@@ -1128,7 +1128,11 @@ proc planSelect(stmt: Stmt, client: FractioClient,
 
   if pkOptimization == oboPkAscMatch:
     # Data already sorted by PK ASC, can apply LIMIT during scan
+    # The k-way merge uses primaryKeyFromDataRowKey to produce globally
+    # sorted output across groups, so PK ASC optimization is valid for
+    # both single-group and multi-group tables.
     scanLimit = limit
+    obOptimization = oboPkAscMatch
   elif pkOptimization == oboPkDescMatch:
     if limit > 0:
       # PK DESC + LIMIT: use reverse + top-K heap.
@@ -1171,7 +1175,17 @@ proc planSelect(stmt: Stmt, client: FractioClient,
 
   # Add ORDER BY plan op if specified
   if stmt.selOrderBy.len > 0:
-    if obOptimization == oboPkDescMatch:
+    if obOptimization == oboPkAscMatch:
+      # PK ASC: data is already sorted, skip sorting — just apply column
+      # extraction and LIMIT pushdown (scan already has LIMIT if present)
+      plan.add(PlanOp(kind: poOrderBy,
+        obSortSpecs: @[], # No sort needed
+        obColumns: reqCols,
+        obAllColumns: fetchCols,
+        obLimit: limit,
+        obOptimization: oboPkAscMatch,
+      ))
+    elif obOptimization == oboPkDescMatch:
       if limit > 0:
         # PK DESC + LIMIT: use top-K heap with PK DESC sort specs.
         # This avoids materializing all N rows for reversal — only K rows in memory.

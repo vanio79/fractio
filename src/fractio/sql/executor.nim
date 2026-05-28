@@ -24,6 +24,8 @@ import ../protocol/client # For StreamingScanClient
 import ../protocol/types # For ProtocolError, peErr
 import ../protocol/messages/kv as kvMsgs # For ScanPair
 import ../utils/external_merge_sort # For SortSpec, sortRowsInMemory, StreamingSortIterator
+import ../utils/query_timer
+import ../utils/logging
 
 # ---------------------------------------------------------------------------
 # Result types
@@ -73,6 +75,7 @@ type
     error*: Option[string] ## Error message if stream failed
     isSystemTable*: bool ## True if scanning a system table
     systemTableId*: TableId ## Table ID for system table decoding
+    scanTimer*: QueryTimer ## Timing instrumentation for scan phases
 
   ExecutorContext* = ref object
     ## Execution context for a session, holding transaction state.
@@ -107,8 +110,11 @@ proc rowsResult*(columns: seq[string], rows: seq[seq[string]]): ExecResult =
   ExecResult(kind: erkRows, columns: columns, rows: rows)
 
 proc streamingRowsResult*(columns: seq[string],
-    rowIter: StreamingRowIterator): ExecResult =
+    rowIter: StreamingRowIterator,
+    scanTimer: QueryTimer = nil): ExecResult =
   ## Create a streaming result that yields rows lazily.
+  if scanTimer != nil:
+    rowIter.scanTimer = scanTimer
   ExecResult(kind: erkStreamingRows, streamColumns: columns,
              streamIterator: rowIter)
 
@@ -1176,7 +1182,9 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
         if op.scFilter.isSome:
           serverFilter = some(exprToWireFilterExpr(op.scFilter.get()))
 
+        let scanTimer = newQueryTimer()
         let streamRes = execTxnStreamScan(ctx, op.scStartKey, op.scEndKey, 0, serverFilter)
+        scanTimer.stamp("stream_scan_setup")
         if streamRes.isErr:
           return errorResult(&"failed to start streaming scan: {streamRes.error.msg}")
 
@@ -1193,7 +1201,7 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
           op.scTableId
         )
 
-        streamingRowsResult(op.scColumns, rowIter)
+        streamingRowsResult(op.scColumns, rowIter, scanTimer)
       else:
         # Fallback to buffered scan for mock/testing contexts
         let res = execTxnScan(ctx, op.scStartKey, op.scEndKey, 0)
@@ -1237,6 +1245,12 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
       # - oboNone: full sort algorithm
 
       # Handle optimization cases
+      let orderTimer = if lastResult.kind == erkStreamingRows and
+          lastResult.streamIterator.scanTimer != nil:
+        lastResult.streamIterator.scanTimer
+      else:
+        newQueryTimer()
+
       if op.obOptimization == oboPkAscMatch:
         # Data is already sorted by PK ASC - skip sorting
         # Just extract requested columns and apply LIMIT
@@ -1253,6 +1267,7 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
         elif lastResult.kind == erkStreamingRows:
           # Data is already in PK ASC order from the scan, so no sort needed.
           # Stream rows directly with LIMIT pushdown instead of buffering all.
+          orderTimer.stamp("order_start")
           var outputRows: seq[seq[string]] = @[]
           let limitRows = if op.obLimit > 0: int(op.obLimit) else: -1
           while lastResult.streamIterator.hasNextRow():
@@ -1261,10 +1276,13 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
               outputRows.add(rowOpt.get())
               if limitRows > 0 and outputRows.len >= limitRows:
                 break
+          orderTimer.stamp("stream_consume")
           # Extract only requested columns if needed
           if op.obColumns.len != lastResult.streamColumns.len:
             outputRows = extractRequestedColumns(outputRows, op.obColumns,
                 op.obAllColumns)
+          orderTimer.stamp("column_extract")
+          debug &"[exec_timer] obOptimization=PK_ASC_MATCH rows={outputRows.len} {orderTimer.formatBreakdown()}"
           rowsResult(op.obColumns, outputRows)
         else:
           errorResult("ORDER BY requires row results from previous operation")
@@ -1291,7 +1309,9 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
             rowsResult(op.obColumns, outputRows)
         elif lastResult.kind == erkStreamingRows:
           # Buffer streaming rows, then reverse
+          orderTimer.stamp("order_start")
           let bufferedRows = lastResult.streamIterator.consumeAllRows()
+          orderTimer.stamp("stream_consume")
           if bufferedRows.len <= 1:
             var outputRows = bufferedRows
             if op.obColumns.len != lastResult.streamColumns.len:
@@ -1301,9 +1321,11 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
           else:
             let reversedRows = reverseRowsWithTempFiles(bufferedRows,
                 op.obColumns, op.obAllColumns)
+            orderTimer.stamp("reverse")
             var outputRows = reversedRows
             if op.obLimit > 0 and outputRows.len > int(op.obLimit):
               outputRows = outputRows[0..<int(op.obLimit)]
+            debug &"[exec_timer] obOptimization=PK_DESC_MATCH rows={outputRows.len} {orderTimer.formatBreakdown()}"
             rowsResult(op.obColumns, outputRows)
         else:
           errorResult("ORDER BY requires row results from previous operation")
@@ -1326,14 +1348,19 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
           rowsResult(op.obColumns, outputRows)
         elif lastResult.kind == erkStreamingRows:
           # Stream rows through the top-K heap
+          orderTimer.stamp("order_start")
           while lastResult.streamIterator.hasNextRow():
             let rowOpt = lastResult.streamIterator.nextRow()
             if rowOpt.isSome:
               heap.push(rowOpt.get())
+          orderTimer.stamp("stream_consume+topk")
           lastResult.streamIterator.closeIterator()
           let sortedRows = heap.extractSorted()
+          orderTimer.stamp("extract_sorted")
           var outputRows = extractRequestedColumns(sortedRows, op.obColumns,
               op.obAllColumns)
+          orderTimer.stamp("column_extract")
+          debug &"[exec_timer] obOptimization=TOP_K rows={outputRows.len}/{heap.totalPushed} {orderTimer.formatBreakdown()}"
           rowsResult(op.obColumns, outputRows)
         else:
           errorResult("ORDER BY requires row results from previous operation")
@@ -1363,6 +1390,7 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
           # Stream rows through external merge sort to avoid buffering
           # everything in memory. For small result sets, falls back to
           # in-memory sort after consuming the stream.
+          orderTimer.stamp("order_start")
           const EXTERNAL_SORT_THRESHOLD = 10000
           let hasLimit = op.obLimit > 0
           let estimatedRows = op.obLimit.int # rough upper bound if LIMIT present
@@ -1372,6 +1400,7 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
           if hasLimit and estimatedRows < EXTERNAL_SORT_THRESHOLD:
             # Small result set expected — buffer and sort in memory
             let bufferedRows = lastResult.streamIterator.consumeAllRows()
+            orderTimer.stamp("stream_consume")
             if bufferedRows.len <= 1:
               if op.obLimit > 0 and bufferedRows.len > int(op.obLimit):
                 rowsResult(op.obColumns, bufferedRows[0..<int(op.obLimit)])
@@ -1380,10 +1409,12 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
             else:
               let sortedRows = sortRowsInMemory(bufferedRows, op.obSortSpecs,
                   op.obAllColumns)
+              orderTimer.stamp("sort")
               var outputRows = extractRequestedColumns(sortedRows, op.obColumns,
                   op.obAllColumns)
               if op.obLimit > 0 and outputRows.len > int(op.obLimit):
                 outputRows = outputRows[0..<int(op.obLimit)]
+              debug &"[exec_timer] obOptimization=NONE(inmem) rows={outputRows.len} {orderTimer.formatBreakdown()}"
               rowsResult(op.obColumns, outputRows)
           else:
             # Large result set or no limit — use external merge sort
@@ -1406,6 +1437,7 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
             # Flush remaining rows
             if feedChunk.len > 0:
               sortIter.addRowsToIterator(feedChunk)
+            orderTimer.stamp("stream_consume+feed")
 
             # Finalize and read sorted rows
             sortIter.finalizeIterator()
@@ -1415,12 +1447,14 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
               if rowOpt.isSome:
                 sortedRows.add(rowOpt.get())
             sortIter.closeSortIterator()
+            orderTimer.stamp("external_sort")
 
             # Apply column extraction (ORDER BY may reference columns
             # not in the output SELECT list)
             var outputRows = extractRequestedColumns(sortedRows, op.obColumns,
                 op.obAllColumns)
             # LIMIT already applied by StreamingSortIterator if set
+            debug &"[exec_timer] obOptimization=NONE(extsort) rows={outputRows.len} {orderTimer.formatBreakdown()}"
             rowsResult(op.obColumns, outputRows)
         else:
           # Previous result is not rows - ORDER BY is invalid here

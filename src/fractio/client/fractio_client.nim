@@ -28,6 +28,7 @@ import ../distributed/raft/group_types
 import ../storage/mvcc/types as mvccTypes
 import ../utils/logging
 import ../utils/rwlock
+import ../utils/query_timer
 
 # =============================================================================
 # Types
@@ -1183,12 +1184,14 @@ ProtocolError] =
   ## This method creates a streaming client that merges results from all groups
   ## in key order using k-way merge.
   ## filter: optional server-side filter for reducing network traffic
+  let scanTimer = newQueryTimer()
   if not client.initialized.load(moRelaxed):
     return peErr(newProtocolError(peInternal, "client not initialized"))
 
   # Determine which table this scan is for
   let tableId = client.getTableIdFromKey(startKey)
   let groupIds = client.getGroupsForTable(tableId)
+  scanTimer.stamp("resolve_groups")
 
   # Use per-group scan bounds to reduce I/O: each group only reads
   # its own key range instead of scanning the entire table.
@@ -1300,6 +1303,9 @@ ProtocolError] =
   else:
     nil
   let mergeClient = newKWayMergeScanClient(groupStreams, limit, extractor)
+  scanTimer.stamp("merge_setup")
+  debug "[scan_client] groups=" & $groupIds.len & " streams=" &
+      $groupStreams.len & " " & scanTimer.formatBreakdown()
   return peOk(mergeClient)
 
 method beginTxn*(client: FractioClient): KVOpResult[TxnBeginResult] =
