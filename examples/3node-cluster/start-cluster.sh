@@ -52,6 +52,7 @@ wait_for_port() {
 
 stop_nodes() {
     echo "Stopping Fractio nodes..."
+    # Kill by PID files first (SIGTERM)
     for i in 1 2 3; do
         local pidfile="$PID_DIR/node${i}.pid"
         if [ -f "$pidfile" ]; then
@@ -64,16 +65,29 @@ stop_nodes() {
             rm -f "$pidfile"
         fi
     done
-    # Also kill any fractio processes on our ports
-    for port in "$NODE1_CLIENT" "$NODE2_CLIENT" "$NODE3_CLIENT"; do
+    sleep 1
+    # Force-kill any remaining processes on ALL our ports (client, raft, web)
+    for port in "$NODE1_CLIENT" "$NODE2_CLIENT" "$NODE3_CLIENT" \
+                "$NODE1_RAFT" "$NODE2_RAFT" "$NODE3_RAFT" \
+                "$NODE1_WEB" "$NODE2_WEB" "$NODE3_WEB"; do
         local pids
         pids=$(lsof -ti :"$port" 2>/dev/null || true)
         if [ -n "$pids" ]; then
-            echo "  Killing process on port $port: $pids"
-            echo "$pids" | xargs kill 2>/dev/null || true
+            echo "  Force-killing process on port $port: $pids"
+            echo "$pids" | xargs kill -9 2>/dev/null || true
         fi
     done
     sleep 1
+    # Verify ports are free
+    local still_busy=false
+    for port in "$NODE1_CLIENT" "$NODE2_CLIENT" "$NODE3_CLIENT"; do
+        if nc -z 127.0.0.1 "$port" 2>/dev/null; then
+            still_busy=true
+        fi
+    done
+    if [ "$still_busy" = true ]; then
+        echo "WARNING: some ports still busy after kill"
+    fi
     echo "All nodes stopped."
 }
 
@@ -99,6 +113,9 @@ start_cluster() {
     echo "=== Starting 3-node Fractio cluster ==="
     echo ""
 
+    # cd to project root so relative paths in toml resolve correctly
+    cd "$PROJECT_DIR"
+
     # --- Node 1: seed node (becomes leader) ---
     echo "[Node 1] Starting seed node (Raft=$NODE1_RAFT, Client=$NODE1_CLIENT, Web=$NODE1_WEB)..."
     nohup "$BIN" start \
@@ -108,8 +125,9 @@ start_cluster() {
     local node1_pid=$!
     echo $node1_pid > "$PID_DIR/node1.pid"
 
-    # Wait for node 1 to be ready
+    # Wait for node 1 to be ready (both client and web ports)
     wait_for_port "$NODE1_CLIENT" 30
+    wait_for_port "$NODE1_WEB" 30
     sleep 2
     echo ""
 
@@ -124,6 +142,7 @@ start_cluster() {
     echo $node2_pid > "$PID_DIR/node2.pid"
 
     wait_for_port "$NODE2_CLIENT" 30
+    wait_for_port "$NODE2_WEB" 30
     sleep 3
     echo ""
 
@@ -138,6 +157,7 @@ start_cluster() {
     echo $node3_pid > "$PID_DIR/node3.pid"
 
     wait_for_port "$NODE3_CLIENT" 30
+    wait_for_port "$NODE3_WEB" 30
     sleep 3
     echo ""
 

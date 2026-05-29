@@ -1213,9 +1213,10 @@ proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
   let majorityQuorum = int32(members.len div 2 + 1)
   let quorumSize = majorityQuorum # Fixed: was majorityQuorum + 1 (too high)
   nuraftParamsSetCustomElectionQuorumSize(params, quorumSize)
-  # Enable auto-adjust quorum for small clusters so that a 2-node cluster
-  # can reduce quorum to 1 when one node is unavailable, allowing the
-  # surviving node to elect itself as leader.
+  # Enable auto-adjust quorum for small clusters so that the seed node can
+  # win election with a single member, then the quorum callback updates it
+  # as peers are added. Without this, a 1-member cluster with quorum=2 can
+  # never elect a leader, blocking peer addition entirely.
   nuraftParamsSetAutoAdjustQuorum(params, 1)
 
   # Create per-group RPC context

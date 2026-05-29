@@ -301,35 +301,29 @@ proc cmdStart(flags: Table[string, string]) =
           
           echo "[DEBUG] preferredLeader=" & $preferredLeader & " creating single-member config for join"
           
-          # CRITICAL: Create Raft groups with ONLY ourselves initially.
-          # 
-          # NuRaft's join protocol requires joining nodes to start with a
-          # single-member configuration (just themselves). This allows:
+          # CRITICAL: Wait for the leader's JoinGroup RPC before creating
+          # any local Raft groups. The leader's addPeerToRaft sends JoinGroup
+          # RPCs which create multi-member groups with the correct config.
+          # If we create single-member groups first, we create split-brain
+          # where both the leader and us think we're the leader of the same
+          # GroupID but with different configs, causing infinite redirect loops.
           #
-          # 1. handle_join_cluster_req at line 170 checks if size > 1
-          # 2. If size = 1 (single-member), join is accepted without comparison
-          # 3. Leader then commits new config [leader, joining_node]
-          # 4. Node becomes proper follower via reconfigure
-          #
-          # If we start with multi-member config [1, 2]:
-          # - size > 1 → enters comparison logic
-          # - After join, config [1] is saved (doesn't include us!)
-          # - reconfigure removes us from peers but catching_up prevents step-down
-          # - Node enters inconsistent state and may act as leader
-          #
-          # peerInfo table is already populated above, so we know how to reach
-          # other members. We just don't include them in initial Raft config.
-          #
-          # skipInitialElection=true prevents self-promotion before join.
-          # IMPORTANT: Check if groups already exist before creating.
-          # The JoinGroup RPC (sent by leader during addPeerToRaft) may have
-          # already created multi-member groups. If so, skip creation.
+          # Only create single-member groups as a fallback if the leader's
+          # JoinGroup RPC doesn't arrive (e.g. leader crashed after HTTP join).
           for groupId in [META_GROUP_ID, DATA_GROUP_START_ID]:
             let ulid = groupIDToULID(groupId)
-            if server.raftCoord.hasGroup(groupId):
-              echo "[DEBUG] Group " & $ulid & " already exists (from JoinGroup RPC), skipping single-member creation"
+            # Wait up to 5 seconds for JoinGroup RPC to create the group
+            var groupCreated = false
+            for waitAttempt in 0 ..< 25:
+              if server.raftCoord.hasGroup(groupId):
+                groupCreated = true
+                break
+              sleep(200)
+            if groupCreated:
+              echo "[DEBUG] Group " & $ulid & " created by JoinGroup RPC from leader"
             else:
-              echo "[DEBUG] Creating group " & $ulid & " with single-member config"
+              # Fallback: create single-member group if leader never sent JoinGroup
+              echo "[DEBUG] JoinGroup RPC did not arrive for " & $ulid & ", creating single-member fallback"
               discard server.raftCoord.createAndStartGroup(groupId, singleMember,
                   preferredLeader)
           

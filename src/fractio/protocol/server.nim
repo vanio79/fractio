@@ -2386,16 +2386,29 @@ proc addPeerToRaft*(server: ProtocolServer, peerNodeId: uint32,
   ## Dynamically add a peer to the NuRaft coordinator for system groups.
   ## Called when a new node joins the cluster.
   ## Also inserts the node into sys.nodes table (only if this node is the leader).
-  ## CRITICAL: Sends JoinGroup RPCs to the joining node so it can replace its
-  ## single-member groups with proper multi-member groups.
+  ## CRITICAL: Sends JoinGroup RPCs to the joining node BEFORE calling add_srv,
+  ## so the joining node has its local groups ready when heartbeats arrive.
   let coord = server.raftCoord
   if coord.isNil: return
 
-  # Only the meta leader should drive peer addition; followers return immediately.
-  if not coord.isLeader(META_GROUP_ID):
+  # Only the meta leader should drive peer addition.
+  # CRITICAL: During cluster startup, the seed node may not have won the META
+  # group election yet (election timeout is 300-600ms). If we bail immediately,
+  # JoinGroup RPCs are never sent and the joining node falls back to creating
+  # a single-member group, causing split-brain with the same GroupID.
+  # Wait up to 1.5 seconds for the election to complete.
+  var isMetaLeader = false
+  for attempt in 0 ..< 15:
+    if coord.isLeader(META_GROUP_ID):
+      isMetaLeader = true
+      break
+    if attempt == 0:
+      echo "[addPeerToRaft] waiting for META leader election before adding peerNodeId=", peerNodeId
+    sleep(100)
+  if not isMetaLeader:
+    echo "[addPeerToRaft] NOT meta leader after 1.5s, skipping add_srv for peerNodeId=", peerNodeId
     # Still register peer info so this node knows about the new peer
     coord.peerInfo[peerNodeId] = (host: host, port: raftPort)
-    echo "[addPeerToRaft] NOT meta leader, skipping add_srv for peerNodeId=", peerNodeId
     return
 
   echo "[addPeerToRaft] meta leader, adding peerNodeId=", peerNodeId, " host=",
@@ -2415,7 +2428,104 @@ proc addPeerToRaft*(server: ProtocolServer, peerNodeId: uint32,
       status: clusterMsgs.NodeStatusActive
     ))
 
-  # Add the peer as a server to the meta and default data groups.
+  # Build members list - includes SELF (leader) + all known peers
+  var members: seq[clusterMsgs.CreateGroupMember] = @[]
+
+  # Helper to add a node to the members list
+  template addMemberToList(mnid: uint32, mhost: string, mraftPort: int,
+      mclientPort: int) =
+    members.add(clusterMsgs.CreateGroupMember(
+      nodeId: uint16(mnid),
+      host: mhost,
+      raftPort: uint16(mraftPort),
+      clientPort: uint16(mclientPort)
+    ))
+
+  # Add ourselves (the leader) first
+  addMemberToList(
+    uint32(server.config.serverId),
+    server.config.host,
+    coord.port,
+    server.config.port
+  )
+
+  # Add all known peers
+  for (nodeId, peerData) in coord.peerInfo.pairs:
+    # Look up the correct client port from the node registry or KV store.
+    # peerData.port is the RAFT port, NOT the client port — deriving it
+    # as raft+100 is wrong because the mapping is config-dependent.
+    var memberClientPort = uint16(0)
+    if nodeId == peerNodeId:
+      memberClientPort = uint16(clientPort)
+    elif nodeId == uint32(server.config.serverId):
+      memberClientPort = uint16(server.config.port)
+    else:
+      # Try node registry first (fast, in-memory)
+      if server.nodeRegistry != nil:
+        withLock server.nodeRegistry.mu:
+          if uint16(nodeId) in server.nodeRegistry.nodes:
+            memberClientPort = server.nodeRegistry.nodes[uint16(
+                nodeId)].clientPort
+      # Fall back to sys.nodes KV store
+      if memberClientPort == 0:
+        let (kvHost, kvPort) = server.lookupNodeFromKVStore(nodeId)
+        if kvPort > 0:
+          memberClientPort = kvPort
+    addMemberToList(nodeId, peerData.host, peerData.port, int(memberClientPort))
+
+  # STEP 1: Send JoinGroup RPCs to the joining node BEFORE add_srv.
+  # This ensures the joining node creates its local Raft groups before
+  # the leader starts sending heartbeats. Without this, the leader may
+  # try to send heartbeats to a node that doesn't have the group yet,
+  # causing heartbeat failures and election timeouts that lead to
+  # leader redirect loops.
+  let myNodeId = server.config.serverId
+  let myRaftPort = coord.port
+  let myHost = server.config.host
+
+  for groupId in [META_GROUP_ID, DATA_GROUP_START_ID]:
+    let groupUlid = groupIDToULID(groupId)
+    let groupIdBytes = ulidToBytes(groupUlid)
+
+    let joinReq = clusterMsgs.JoinGroupRequest(
+      groupId: groupIdBytes,
+      creatorNodeId: uint16(myNodeId),
+      creatorHost: myHost,
+      creatorPort: uint16(myRaftPort),
+      members: members
+    )
+
+    # Determine client port for connecting to the joining node
+    var targetClientPort = clientPort
+    if targetClientPort == 0 and server.nodeRegistry != nil:
+      withLock server.nodeRegistry.mu:
+        if uint16(peerNodeId) in server.nodeRegistry.nodes:
+          targetClientPort = int(server.nodeRegistry.nodes[uint16(
+              peerNodeId)].clientPort)
+    if targetClientPort == 0:
+      let (_, kvPort) = server.lookupNodeFromKVStore(peerNodeId)
+      if kvPort > 0:
+        targetClientPort = int(kvPort)
+    if targetClientPort == 0:
+      # Cannot determine client port — skip sending JoinGroup RPC
+      continue
+    try:
+      let cfg = ClientConfig(
+        host: host,
+        port: targetClientPort,
+        timeoutMs: 5000
+      )
+      let pc = newProtocolClient(cfg)
+      let cr = pc.connect()
+      if cr.isOk:
+        defer: pc.disconnect()
+        discard pc.joinGroup(joinReq)
+    except CatchableError:
+      discard
+
+  # STEP 2: Add the peer as a server to the meta and default data groups.
+  # Now that the joining node has its local groups, add_srv will trigger
+  # heartbeats that the joining node can actually receive.
   # CRITICAL: The data group leader may not be elected yet (election timeout
   # 300-600ms). Retry up to 3 times with a short delay to avoid silently
   # skipping the data group addition.
@@ -2471,81 +2581,6 @@ proc addPeerToRaft*(server: ProtocolServer, peerNodeId: uint32,
         break # data leader exists but we can't forward - don't retry
       # No data group leader yet, wait and retry
       sleep(200)
-
-  # Build members list from peerInfo - includes all known cluster members
-  var members: seq[clusterMsgs.CreateGroupMember] = @[]
-  for (nodeId, peerData) in coord.peerInfo.pairs:
-    # Look up the correct client port from the node registry or KV store.
-    # peerData.port is the RAFT port, NOT the client port — deriving it
-    # as raft+100 is wrong because the mapping is config-dependent.
-    var memberClientPort = uint16(0)
-    if nodeId == peerNodeId:
-      memberClientPort = uint16(clientPort)
-    elif nodeId == uint32(server.config.serverId):
-      memberClientPort = uint16(server.config.port)
-    else:
-      # Try node registry first (fast, in-memory)
-      if server.nodeRegistry != nil:
-        withLock server.nodeRegistry.mu:
-          if uint16(nodeId) in server.nodeRegistry.nodes:
-            memberClientPort = server.nodeRegistry.nodes[uint16(
-                nodeId)].clientPort
-      # Fall back to sys.nodes KV store
-      if memberClientPort == 0:
-        let (kvHost, kvPort) = server.lookupNodeFromKVStore(nodeId)
-        if kvPort > 0:
-          memberClientPort = kvPort
-    members.add(clusterMsgs.CreateGroupMember(
-      nodeId: uint16(nodeId),
-      host: peerData.host,
-      raftPort: uint16(peerData.port),
-      clientPort: memberClientPort
-    ))
-
-  # Send JoinGroup RPCs for both system groups
-  let myNodeId = server.config.serverId
-  let myRaftPort = coord.port
-  let myHost = server.config.host
-
-  for groupId in [META_GROUP_ID, DATA_GROUP_START_ID]:
-    let groupUlid = groupIDToULID(groupId)
-    let groupIdBytes = ulidToBytes(groupUlid)
-
-    let joinReq = clusterMsgs.JoinGroupRequest(
-      groupId: groupIdBytes,
-      creatorNodeId: uint16(myNodeId),
-      creatorHost: myHost,
-      creatorPort: uint16(myRaftPort),
-      members: members
-    )
-
-    # Determine client port for connecting to the joining node
-    var targetClientPort = clientPort
-    if targetClientPort == 0 and server.nodeRegistry != nil:
-      withLock server.nodeRegistry.mu:
-        if uint16(peerNodeId) in server.nodeRegistry.nodes:
-          targetClientPort = int(server.nodeRegistry.nodes[uint16(
-              peerNodeId)].clientPort)
-    if targetClientPort == 0:
-      let (_, kvPort) = server.lookupNodeFromKVStore(peerNodeId)
-      if kvPort > 0:
-        targetClientPort = int(kvPort)
-    if targetClientPort == 0:
-      # Cannot determine client port — skip sending JoinGroup RPC
-      continue
-    try:
-      let cfg = ClientConfig(
-        host: host,
-        port: targetClientPort,
-        timeoutMs: 5000
-      )
-      let pc = newProtocolClient(cfg)
-      let cr = pc.connect()
-      if cr.isOk:
-        defer: pc.disconnect()
-        discard pc.joinGroup(joinReq)
-    except CatchableError:
-      discard
 
   # Only insert into sys.nodes and update sys.groups if we're the meta group leader
   if coord.isLeader(META_GROUP_ID):
