@@ -2557,7 +2557,8 @@ suite "Executor DML Operations with MockKVStore":
       pgKey: pkValue,
       pgPkSpec: PrimaryKeySpec(columns: @[("id", cdtInt, 0)]),
       pgColumns: @["id", "name"],
-      pgAllColumns: @["id", "name"]
+      pgAllColumns: @["id", "name"],
+      pgKeyEncoding: tkeDataRow
     ))
 
     let result = executeWithTxn(plan, ctx)
@@ -2584,7 +2585,8 @@ suite "Executor DML Operations with MockKVStore":
       pgKey: pkValue,
       pgPkSpec: PrimaryKeySpec(columns: @[("id", cdtInt, 0)]),
       pgColumns: @["id", "name"],
-      pgAllColumns: @["id", "name"]
+      pgAllColumns: @["id", "name"],
+      pgKeyEncoding: tkeDataRow
     ))
 
     let result = executeWithTxn(plan, ctx)
@@ -2634,7 +2636,8 @@ suite "Executor DML Operations with MockKVStore":
       scLimit: 0,
       scFilter: none(Expr),
       scColumns: @["id", "value"],
-      scAllColumns: @["id", "value"]
+      scAllColumns: @["id", "value"],
+      scKeyEncoding: tkeDataRow
     ))
 
     let result = executeWithTxn(plan, ctx)
@@ -2683,7 +2686,8 @@ suite "Executor DML Operations with MockKVStore":
       scLimit: 3,
       scFilter: none(Expr),
       scColumns: @["id"],
-      scAllColumns: @["id"]
+      scAllColumns: @["id"],
+      scKeyEncoding: tkeDataRow
     ))
 
     let result = executeWithTxn(plan, ctx)
@@ -2951,7 +2955,8 @@ suite "Executor ORDER BY with MockKVStore":
       scLimit: 0,
       scFilter: none(Expr),
       scColumns: @["id", "name"],
-      scAllColumns: @["id", "name"]
+      scAllColumns: @["id", "name"],
+      scKeyEncoding: tkeDataRow
     ))
     plan.add(PlanOp(
       kind: poOrderBy,
@@ -3018,7 +3023,8 @@ suite "Executor ORDER BY with MockKVStore":
       scLimit: 0,
       scFilter: none(Expr),
       scColumns: @["id", "score"],
-      scAllColumns: @["id", "score"]
+      scAllColumns: @["id", "score"],
+      scKeyEncoding: tkeDataRow
     ))
     plan.add(PlanOp(
       kind: poOrderBy,
@@ -3094,7 +3100,8 @@ suite "Executor ORDER BY with MockKVStore":
       scLimit: 0,
       scFilter: none(Expr),
       scColumns: @["id", "name", "age"],
-      scAllColumns: @["id", "name", "age"]
+      scAllColumns: @["id", "name", "age"],
+      scKeyEncoding: tkeDataRow
     ))
     plan.add(PlanOp(
       kind: poOrderBy,
@@ -3167,7 +3174,8 @@ suite "Executor ORDER BY with MockKVStore":
       scLimit: 0,
       scFilter: some(filter),
       scColumns: @["id"],
-      scAllColumns: @["id"]
+      scAllColumns: @["id"],
+      scKeyEncoding: tkeDataRow
     ))
     plan.add(PlanOp(
       kind: poOrderBy,
@@ -3222,7 +3230,8 @@ suite "Executor ORDER BY with MockKVStore":
       pgKey: pkValue,
       pgPkSpec: pkSpec,
       pgColumns: @["id", "name"],
-      pgAllColumns: @["id", "name"]
+      pgAllColumns: @["id", "name"],
+      pgKeyEncoding: tkeDataRow
     ))
     plan.add(PlanOp(
       kind: poOrderBy,
@@ -3430,7 +3439,7 @@ suite "System Table Key Encoding":
     )
 
     let sysTableId = SYS_NODES_TABLE_ID
-    let (startKey, endKey) = makeScanKeysFromRange(sysTableId, rangeInfo)
+    let (startKey, endKey) = makeScanKeysFromRange(sysTableId, rangeInfo, tkeSystemTable)
 
     # System table keys should NOT have d/ prefix
     check startKey.startsWith("/t/")
@@ -3488,7 +3497,9 @@ suite "System Table Scan via Executor":
       scFilter: none(Expr),
       scColumns: @["_key", "nodeId", "host", "raftPort", "clientPort",
           "status"],
-      scAllColumns: @["_key", "nodeId", "host", "raftPort", "clientPort", "status"]
+      scAllColumns: @["_key", "nodeId", "host", "raftPort", "clientPort",
+          "status"],
+      scKeyEncoding: tkeSystemTable
     ))
 
     let result = executeWithTxn(plan, ctx)
@@ -3516,7 +3527,8 @@ suite "System Table Scan via Executor":
       pgKey: "testdb",
       pgPkSpec: PrimaryKeySpec(columns: @[("_key", cdtString, 64)]),
       pgColumns: @["_key", "name", "createdAt"],
-      pgAllColumns: @["_key", "name", "createdAt"]
+      pgAllColumns: @["_key", "name", "createdAt"],
+      pgKeyEncoding: tkeSystemTable
     ))
 
     let result = executeWithTxn(plan, ctx)

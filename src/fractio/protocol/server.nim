@@ -2922,9 +2922,19 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
   if startAsLeader and not isRejoining and not hasExistingSpaces:
     let seedTsNs = try: server.sharedTimer.now() except Exception:
       let t = getTime(); t.toUnix * 1_000_000_000 + t.nanosecond.int64
+
+    # Pre-build system table catalog entries outside the closure to avoid
+    # GC-safety issues with accessing the global SYSTEM_TABLES_REGISTRY.
+    var sysTableEntries: seq[tuple[key: string, value: string]] = @[]
+    for info in SYSTEM_TABLES_REGISTRY:
+      let tableRecord = systemTableInfoToTableRecord(info)
+      let tablesKey = encodeTableKey(SYS_TABLES_TABLE_ID,
+          info.database & "." & info.schema & "." & info.name)
+      sysTableEntries.add((key: tablesKey, value: encode(tableRecord)))
+
     # Use a single transaction for all seeding operations
     discard mvccStore.withAutoTransaction(proc(
-        sessionId: uint64): MvccVoidResult =
+        sessionId: uint64): MvccVoidResult {.gcsafe.} =
       let nodeKey = encodeTableKey(SYS_NODES_TABLE_ID, $server.config.serverId)
       let nodeRec = NodeRecord(
         nodeId: server.config.serverId,
@@ -2997,6 +3007,12 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
             if server.sharedTimer.isNil: nil else: server.sharedTimer)
       )
       discard mvccStore.txnPut(sessionId, spaceKey, encode(spaceRec))
+
+      # Seed system table entries into sys.tables so they can be queried
+      # via the same catalog path as user tables. Each system table gets a
+      # TableRecord with keyEncoding = tkeSystemTable.
+      for (tablesKey, tableRecordValue) in sysTableEntries:
+        discard mvccStore.txnPut(sessionId, tablesKey, tableRecordValue)
 
       return mvccVOk()
     )

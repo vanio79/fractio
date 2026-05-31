@@ -61,7 +61,7 @@ type
       cdbName*: string
       cdbIfNotExists*: bool
       cdbReplicas*: Option[int]
-      cdbValue*: string            # JSON value to store
+      cdbValue*: string                # JSON value to store
 
     of poDropDatabase:
       ddbName*: string
@@ -72,7 +72,7 @@ type
       csIfNotExists*: bool
       csReplicas*: Option[int]
       csValue*: string
-      csDatabase*: string          # owning database
+      csDatabase*: string              # owning database
 
     of poDropSchema:
       dsName*: string
@@ -82,10 +82,10 @@ type
     of poCreateTable:
       ctName*: string
       ctIfNotExists*: bool
-      ctValue*: string             # JSON table descriptor
+      ctValue*: string                 # JSON table descriptor
       ctSchema*: string
       ctDatabase*: string
-      ctSpaceName*: Option[string] # IN SPACE <name>
+      ctSpaceName*: Option[string]     # IN SPACE <name>
 
     of poDropTable:
       dtName*: string
@@ -96,35 +96,37 @@ type
     of poInsert:
       insTableId*: TableId
       insTableName*: string
-      insColumns*: seq[string]     # column names in order
-      insPkColumn*: string         # primary key column name
-      insPkSpec*: PrimaryKeySpec   # primary key spec for binary encoding
-      insRows*: seq[string]        # binary-encoded DataRow objects
-      insPkValues*: seq[string]    # binary-encoded primary key values
+      insColumns*: seq[string]         # column names in order
+      insPkColumn*: string             # primary key column name
+      insPkSpec*: PrimaryKeySpec       # primary key spec for binary encoding
+      insRows*: seq[string]            # binary-encoded DataRow objects
+      insPkValues*: seq[string]        # binary-encoded primary key values
 
     of poPointGet:
       pgTableId*: TableId
-      pgKey*: string               # binary-encoded primary key value
-      pgPkSpec*: PrimaryKeySpec    # primary key spec for decoding
-      pgColumns*: seq[string]      # columns to return (empty = all)
-      pgAllColumns*: seq[string]   # all table columns for decoding
-      pgFilter*: Option[Expr]      # remaining filter after PK extraction (optional)
+      pgKey*: string                   # binary-encoded primary key value
+      pgPkSpec*: PrimaryKeySpec        # primary key spec for decoding
+      pgColumns*: seq[string]          # columns to return (empty = all)
+      pgAllColumns*: seq[string]       # all table columns for decoding
+      pgFilter*: Option[Expr]          # remaining filter after PK extraction (optional)
+      pgKeyEncoding*: TableKeyEncoding # key encoding strategy for this table
 
     of poScan:
       scTableId*: TableId
       scStartKey*: string
       scEndKey*: string
       scLimit*: uint32
-      scReverse*: bool             ## true = scan in reverse key order (for PK DESC + LIMIT)
+      scReverse*: bool ## true = scan in reverse key order (for PK DESC + LIMIT)
       scFilter*: Option[Expr]
-      scColumns*: seq[string]      # columns to return (empty = all)
-      scAllColumns*: seq[string]   # all table columns for decoding
+      scColumns*: seq[string]          # columns to return (empty = all)
+      scAllColumns*: seq[string]       # all table columns for decoding
+      scKeyEncoding*: TableKeyEncoding # key encoding strategy for this table
 
     of poOrderBy:
-      obSortSpecs*: seq[SortSpec]  ## Sort specifications from ORDER BY
-      obColumns*: seq[string]      ## Columns to return (passed from scan)
-      obAllColumns*: seq[string]   ## All fetched columns for expression evaluation
-      obLimit*: uint32             ## LIMIT to apply after sorting (0 = no limit)
+      obSortSpecs*: seq[SortSpec]      ## Sort specifications from ORDER BY
+      obColumns*: seq[string]          ## Columns to return (passed from scan)
+      obAllColumns*: seq[string]       ## All fetched columns for expression evaluation
+      obLimit*: uint32                 ## LIMIT to apply after sorting (0 = no limit)
       obOptimization*: OrderByOptimization ## Optimization type for PK-based sorting
 
     of poUpdate:
@@ -146,19 +148,19 @@ type
       discard
 
     of poShowSchemas:
-      ssDatabase*: string          # filter by database (empty = current)
+      ssDatabase*: string              # filter by database (empty = current)
 
     of poShowTables:
-      stDatabase*: string          # filter by database (empty = current)
-      stSchema*: string            # filter by schema (empty = current)
+      stDatabase*: string              # filter by database (empty = current)
+      stSchema*: string                # filter by schema (empty = current)
 
     of poShowSpaces:
       discard
 
     of poCreateSpace:
       cspName*: string
-      cspReplicas*: int            # 0 = ALL
-      cspValue*: string            # JSON value to store
+      cspReplicas*: int                # 0 = ALL
+      cspValue*: string                # JSON value to store
 
     of poDropSpace:
       dspName*: string
@@ -179,7 +181,7 @@ type
       discard
 
     of poExplain:
-      exInnerPlan*: Plan           ## the plan being explained
+      exInnerPlan*: Plan               ## the plan being explained
 
   Plan* = ref object
     ops*: seq[PlanOp]
@@ -216,8 +218,9 @@ type
     database*: string
     columns*: seq[ColDef]
     primaryKey*: seq[string]
-    pkSpec*: PrimaryKeySpec ## Primary key spec for binary encoding
+    pkSpec*: PrimaryKeySpec        ## Primary key spec for binary encoding
     spaceId*: SpaceID
+    keyEncoding*: TableKeyEncoding ## Key encoding strategy for this table
 
 proc findPkColumn*(desc: TableDescriptor): string =
   ## Find the primary key column name. Returns the first PK column or
@@ -452,19 +455,20 @@ proc extractPkRangeFromWhere*(where: Option[Expr], pkCol: string,
   # No PK condition found - full scan with original filter
   result.remainingFilter = where
 
-proc makeScanKeysFromRange*(tableId: TableId, rangeInfo: PkRangeInfo): tuple[
-    startKey: string, endKey: string] =
+proc makeScanKeysFromRange*(tableId: TableId, rangeInfo: PkRangeInfo,
+    keyEncoding: TableKeyEncoding = tkeDataRow): tuple[
+        startKey: string, endKey: string] =
   ## Generate start and end keys for scan from PK range info.
   ## For exact match, both keys are the same (point get).
   ## For range scan, generates appropriate bounds.
   ##
-  ## System tables use encodeTableKey (no "d/" prefix).
-  ## User tables use encodeDataRowScanBound (with "d/" prefix but no groupId).
+  ## Tables with tkeSystemTable encoding use encodeTableKey (no "d/" prefix).
+  ## Tables with tkeDataRow encoding use encodeDataRowScanBound (with "d/" prefix but no groupId).
   ##
   ## These are table-wide scan bounds. For multi-group tables, the client
   ## narrows them to per-group bounds using narrowScanBoundsToGroup().
 
-  let isSysTable = isSystemTableId(tableId)
+  let isSysTable = keyEncoding == tkeSystemTable
 
   if rangeInfo.isPointGet and rangeInfo.exactMatch.isSome:
     # Point get - single key
@@ -553,28 +557,6 @@ proc sysPkSpecToPrimaryKeySpec(sysPk: SysPrimaryKeySpec): PrimaryKeySpec =
   ## Convert a SysPrimaryKeySpec to a PrimaryKeySpec.
   PrimaryKeySpec(columns: sysPk.columns)
 
-proc getSystemTableDescriptor*(tableName: string): Option[TableDescriptor] =
-  ## Return a table descriptor for a system table when querying from sys schema.
-  ## Converts from the self-contained SystemTableInfo in SYSTEM_TABLES_REGISTRY
-  ## to the planner's TableDescriptor type.
-  let infoOpt = getSystemTableInfoByName(tableName)
-  if infoOpt.isNone:
-    return none(TableDescriptor)
-  let info = infoOpt.get()
-  var columns: seq[ColDef] = @[]
-  for sysCol in info.columns:
-    columns.add(sysColDefToColDef(sysCol))
-  some(TableDescriptor(
-    tableId: info.tableId,
-    name: info.name,
-    schema: info.schema,
-    database: info.database,
-    columns: columns,
-    primaryKey: info.primaryKey,
-    pkSpec: sysPkSpecToPrimaryKeySpec(info.pkSpec),
-    spaceId: zeroSpaceID()
-  ))
-
 proc resolveTable*(client: FractioClient,
     database, schema, tableName: string): Option[TableDescriptor] =
   ## Look up a table descriptor from the system catalog.
@@ -595,6 +577,7 @@ proc resolveTable*(client: FractioClient,
     database: rec.database,
     spaceId: rec.spaceId,
     pkSpec: primaryKeySpecFromTable(rec),
+    keyEncoding: rec.keyEncoding,
   )
   # Copy primary key columns
   for pk in rec.primaryKey:
@@ -617,13 +600,9 @@ proc resolveQualifiedTableRef*(client: FractioClient,
   ##   - "table" (uses default database/schema)
   ##   - "schema.table" (uses default database, explicit schema)
   ##   - "database.schema.table" (fully qualified)
-  ##   - "sys.table" (system table, returns built-in descriptor)
-
-  # Check for sys schema first (system tables)
-  let schemaName = if tableRef.schema != "": tableRef.schema else: defaultSchema
-  if schemaName.toLowerAscii() == "sys":
-    # System table - return built-in descriptor
-    return getSystemTableDescriptor(tableRef.table)
+  ##
+  ## System tables and user tables are resolved identically via the
+  ## sys.tables catalog. Every table (including sys.*) must have an entry.
 
   # Resolve database and schema from tableRef or defaults
   let dbName = if tableRef.database != "": tableRef.database else: defaultDatabase
@@ -1100,6 +1079,7 @@ proc planSelect(stmt: Stmt, client: FractioClient,
       pgColumns: fetchCols, # Fetch columns needed for ORDER BY
       pgAllColumns: allCols,
       pgFilter: pkRangeInfo.remainingFilter, # Apply remaining conditions to row
+      pgKeyEncoding: desc.keyEncoding,
     ))
     # ORDER BY is applied after point get for consistency
     # Note: optimization doesn't matter for single row
@@ -1113,7 +1093,8 @@ proc planSelect(stmt: Stmt, client: FractioClient,
     return plan
 
   # Range scan (with optimized key bounds if available)
-  let (startKey, endKey) = makeScanKeysFromRange(desc.tableId, pkRangeInfo)
+  let (startKey, endKey) = makeScanKeysFromRange(desc.tableId, pkRangeInfo,
+      desc.keyEncoding)
 
   # LIMIT handling:
   # - PK ASC + LIMIT: data already sorted, push LIMIT to scan (scanLimit = limit)
@@ -1171,6 +1152,7 @@ proc planSelect(stmt: Stmt, client: FractioClient,
     scFilter: pkRangeInfo.remainingFilter, # Only non-PK conditions remain
     scColumns: fetchCols, # Fetch columns needed for ORDER BY
     scAllColumns: allCols,
+    scKeyEncoding: desc.keyEncoding,
   ))
 
   # Add ORDER BY plan op if specified

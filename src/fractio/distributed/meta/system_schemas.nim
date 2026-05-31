@@ -91,6 +91,13 @@ type
     cfNotNull
     cfUnique
 
+  TableKeyEncoding* = enum
+    ## Key encoding strategy for a table, stored in sys.tables.
+    ## System tables use tkeSystemTable (no "d/" prefix, no groupId).
+    ## User (data) tables use tkeDataRow ("d/" prefix with groupId in stored keys).
+    tkeSystemTable = 0'u8
+    tkeDataRow = 1'u8
+
   ColumnDefBin* = object
     ## Binary-encoded column definition
     name*: string
@@ -125,6 +132,7 @@ type
     spaceId*: SpaceID ## Space this table belongs to
     primaryKey*: seq[string] ## Column names forming the primary key
     columns*: seq[ColumnDefBin]
+    keyEncoding*: TableKeyEncoding ## Key encoding strategy for this table
 
 proc encode*(rec: TableRecord): string =
   var w = initBinaryWriter()
@@ -141,6 +149,8 @@ proc encode*(rec: TableRecord): string =
   w.writeU32(uint32(rec.columns.len))
   for col in rec.columns:
     encodeColumnDef(col, w)
+  # Key encoding strategy
+  w.writeU8(uint8(rec.keyEncoding))
   w.finish()
 
 proc decodeTableRecord*(data: string): TableRecord =
@@ -160,6 +170,8 @@ proc decodeTableRecord*(data: string): TableRecord =
   result.columns = newSeq[ColumnDefBin](colCount)
   for i in 0..<colCount:
     result.columns[i] = decodeColumnDef(r)
+  # Key encoding strategy (mandatory field)
+  result.keyEncoding = TableKeyEncoding(r.readU8())
 
 # =============================================================================
 # Group Replica (for GroupRecord)
@@ -219,8 +231,8 @@ proc encode*(rec: GroupRecord): string =
   w.finish()
 
 proc decodeGroupRecord*(data: string): GroupRecord =
-  # Minimum size: 2*ULID_SIZE + 4*uint32 = 2*16 + 16 = 48 bytes
-  if data.len < 48:
+  # Minimum size: 2*ULID_SIZE + 3*uint32 = 32 + 12 = 44 bytes
+  if data.len < 44:
     raise newException(ValueError, "GroupRecord too short: " & $data.len &
         " bytes (need at least 48)")
   var r = initBinaryReader(data)

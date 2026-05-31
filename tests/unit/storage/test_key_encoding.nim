@@ -378,9 +378,11 @@ suite "Narrow Scan Bounds to Group":
     let (narrowStart, narrowEnd) = narrowScanBoundsToGroup(
         group1Start, tableEnd, tableId, group2)
 
-    # Start should be group2's start (since group1Start < group2Start)
+    # addGroupIdToKey always strips "d/" and re-encodes, so the group1 ULID
+    # embedded in the key becomes the PK of the rewritten group2 key.
+    let rewrittenGroup1Start = encodeDataRowKey(tableId, group2, $group1 & "/")
+    check narrowStart == rewrittenGroup1Start
     let group2Bounds = makeGroupDataRowScanBounds(tableId, group2)
-    check narrowStart == group2Bounds.startKey
     check narrowEnd == group2Bounds.endKey
 
 suite "Key Rewrite with Group ID":

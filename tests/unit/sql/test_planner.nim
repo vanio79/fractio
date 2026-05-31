@@ -76,63 +76,6 @@ suite "Planner TableDescriptor":
     let names = columnNames(desc)
     check names == @["id", "name", "email"]
 
-suite "Planner System Table Descriptor Conversion":
-  test "getSystemTableDescriptor finds databases":
-    let opt = getSystemTableDescriptor("databases")
-    check opt.isSome
-    let desc = opt.get()
-    check desc.name == "databases"
-    check desc.schema == "sys"
-    check desc.database == "sys"
-    check desc.tableId == SYS_DATABASES_TABLE_ID
-    check desc.columns.len > 0
-    check desc.primaryKey == @["_key"]
-    check desc.pkSpec.columns.len > 0
-
-  test "getSystemTableDescriptor finds nodes":
-    let opt = getSystemTableDescriptor("nodes")
-    check opt.isSome
-    let desc = opt.get()
-    check desc.name == "nodes"
-    check desc.columns.len >= 6 # _key, nodeId, host, raftPort, clientPort, status
-
-  test "getSystemTableDescriptor is case insensitive":
-    let opt1 = getSystemTableDescriptor("Databases")
-    let opt2 = getSystemTableDescriptor("DATABASES")
-    check opt1.isSome
-    check opt2.isSome
-    check opt1.get().name == "databases"
-    check opt2.get().name == "databases"
-
-  test "getSystemTableDescriptor returns none for unknown table":
-    let opt = getSystemTableDescriptor("nonexistent_table")
-    check opt.isNone
-
-  test "sysColDef conversion preserves all fields":
-    let info = getSystemTableInfoByName("databases").get()
-    let desc = getSystemTableDescriptor("databases").get()
-    # Check column count matches
-    check desc.columns.len == info.columns.len
-    # Check column names match
-    for i in 0..<info.columns.len:
-      check desc.columns[i].name == info.columns[i].name
-      check desc.columns[i].dataType == info.columns[i].dataType
-      check desc.columns[i].maxLen == info.columns[i].maxLen
-      check desc.columns[i].primaryKey == info.columns[i].primaryKey
-      check desc.columns[i].notNull == info.columns[i].notNull
-
-  test "getSystemTableDescriptor returns correct tableId for all system tables":
-    check getSystemTableDescriptor("databases").get().tableId == SYS_DATABASES_TABLE_ID
-    check getSystemTableDescriptor("schemas").get().tableId == SYS_SCHEMAS_TABLE_ID
-    check getSystemTableDescriptor("tables").get().tableId == SYS_TABLES_TABLE_ID
-    check getSystemTableDescriptor("groups").get().tableId == SYS_GROUPS_TABLE_ID
-    check getSystemTableDescriptor("nodes").get().tableId == SYS_NODES_TABLE_ID
-    check getSystemTableDescriptor("settings").get().tableId == SYS_SETTINGS_TABLE_ID
-    check getSystemTableDescriptor("spaces").get().tableId == SYS_SPACES_TABLE_ID
-    check getSystemTableDescriptor("node_metrics").get().tableId == SYS_NODE_METRICS_ID
-    check getSystemTableDescriptor("group_metrics").get().tableId == SYS_GROUP_METRICS_ID
-    check getSystemTableDescriptor("events").get().tableId == SYS_EVENTS_TABLE_ID
-
 suite "Planner exprToDataRowValue":
 
   test "integer literal":

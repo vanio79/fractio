@@ -1940,7 +1940,11 @@ proc validateKeyRouting(store: RaftKVStoreExt, key: string,
   {.cast(raises: []).}:
     try:
       let (tableId, primaryKey) = decodeTableKey(key)
-      if isSystemTableId(tableId):
+      # Skip routing validation for keys that are not data row keys.
+      # System table keys (/t/<tableId>/<pk>) and non-table keys skip validation.
+      # Data row keys (/t/<tableId>/d/<groupId>/<pk>) and index keys
+      # (/t/<tableId>/i/<groupId>/...) require routing validation.
+      if not primaryKey.startsWith("d/") and not primaryKey.startsWith("i/"):
         return none(RaftStoreError)
       acquire(store.spacesMu)
       let sid = store.tableSpaces.getOrDefault(tableId, zeroSpaceID())

@@ -145,6 +145,7 @@ type
     columns*: seq[SysColDef] ## Column definitions
     primaryKey*: seq[string] ## Primary key column names
     pkSpec*: SysPrimaryKeySpec ## Primary key spec for binary encoding
+    keyEncoding*: TableKeyEncoding ## Always tkeSystemTable for system tables
 
 let
   SYSTEM_TABLES_REGISTRY* = [
@@ -162,7 +163,9 @@ let
         SysColDef(name: "createdAt", dataType: dtDateTime)
     ],
     primaryKey: @["_key"],
-    pkSpec: SysPrimaryKeySpec(columns: @[(name: "_key", dataType: cdtString, maxLen: 64)])
+    pkSpec: SysPrimaryKeySpec(columns: @[(name: "_key", dataType: cdtString,
+        maxLen: 64)]),
+    keyEncoding: tkeSystemTable
   ),
     SystemTableInfo(
       tableNum: SYS_SCHEMAS_TABLE_NUM,
@@ -179,7 +182,9 @@ let
         SysColDef(name: "createdAt", dataType: dtDateTime)
     ],
     primaryKey: @["_key"],
-    pkSpec: SysPrimaryKeySpec(columns: @[(name: "_key", dataType: cdtString, maxLen: 64)])
+    pkSpec: SysPrimaryKeySpec(columns: @[(name: "_key", dataType: cdtString,
+        maxLen: 64)]),
+    keyEncoding: tkeSystemTable
   ),
     SystemTableInfo(
       tableNum: SYS_TABLES_TABLE_NUM,
@@ -200,7 +205,9 @@ let
         SysColDef(name: "columns", dataType: dtBytes)
     ],
     primaryKey: @["_key"],
-    pkSpec: SysPrimaryKeySpec(columns: @[(name: "_key", dataType: cdtString, maxLen: 64)])
+    pkSpec: SysPrimaryKeySpec(columns: @[(name: "_key", dataType: cdtString,
+        maxLen: 64)]),
+    keyEncoding: tkeSystemTable
   ),
     SystemTableInfo(
       tableNum: SYS_GROUPS_TABLE_NUM,
@@ -219,7 +226,9 @@ let
         SysColDef(name: "replicas", dataType: dtBytes)
     ],
     primaryKey: @["_key"],
-    pkSpec: SysPrimaryKeySpec(columns: @[(name: "_key", dataType: cdtString, maxLen: 64)])
+    pkSpec: SysPrimaryKeySpec(columns: @[(name: "_key", dataType: cdtString,
+        maxLen: 64)]),
+    keyEncoding: tkeSystemTable
   ),
     SystemTableInfo(
       tableNum: SYS_NODES_TABLE_NUM,
@@ -239,7 +248,9 @@ let
         SysColDef(name: "status", dataType: dtInt)
     ],
     primaryKey: @["_key"],
-    pkSpec: SysPrimaryKeySpec(columns: @[(name: "_key", dataType: cdtString, maxLen: 64)])
+    pkSpec: SysPrimaryKeySpec(columns: @[(name: "_key", dataType: cdtString,
+        maxLen: 64)]),
+    keyEncoding: tkeSystemTable
   ),
     SystemTableInfo(
       tableNum: SYS_SETTINGS_TABLE_NUM,
@@ -254,7 +265,9 @@ let
         SysColDef(name: "value", dataType: dtString)
     ],
     primaryKey: @["_key"],
-    pkSpec: SysPrimaryKeySpec(columns: @[(name: "_key", dataType: cdtString, maxLen: 64)])
+    pkSpec: SysPrimaryKeySpec(columns: @[(name: "_key", dataType: cdtString,
+        maxLen: 64)]),
+    keyEncoding: tkeSystemTable
   ),
     SystemTableInfo(
       tableNum: SYS_SPACES_TABLE_NUM,
@@ -276,7 +289,9 @@ let
         SysColDef(name: "createdAt", dataType: dtDateTime)
     ],
     primaryKey: @["_key"],
-    pkSpec: SysPrimaryKeySpec(columns: @[(name: "_key", dataType: cdtString, maxLen: 64)])
+    pkSpec: SysPrimaryKeySpec(columns: @[(name: "_key", dataType: cdtString,
+        maxLen: 64)]),
+    keyEncoding: tkeSystemTable
   ),
     SystemTableInfo(
       tableNum: SYS_NODE_METRICS_NUM,
@@ -294,7 +309,9 @@ let
         SysColDef(name: "diskUsedBytes", dataType: dtInt)
     ],
     primaryKey: @["_key"],
-    pkSpec: SysPrimaryKeySpec(columns: @[(name: "_key", dataType: cdtString, maxLen: 64)])
+    pkSpec: SysPrimaryKeySpec(columns: @[(name: "_key", dataType: cdtString,
+        maxLen: 64)]),
+    keyEncoding: tkeSystemTable
   ),
     SystemTableInfo(
       tableNum: SYS_GROUP_METRICS_NUM,
@@ -313,7 +330,9 @@ let
         SysColDef(name: "writeQps", dataType: dtFloat)
     ],
     primaryKey: @["_key"],
-    pkSpec: SysPrimaryKeySpec(columns: @[(name: "_key", dataType: cdtString, maxLen: 64)])
+    pkSpec: SysPrimaryKeySpec(columns: @[(name: "_key", dataType: cdtString,
+        maxLen: 64)]),
+    keyEncoding: tkeSystemTable
   ),
     SystemTableInfo(
       tableNum: SYS_EVENTS_TABLE_NUM,
@@ -349,6 +368,45 @@ proc getSystemTableInfoById*(tableId: TableId): Option[SystemTableInfo] =
     if info.tableId == tableId:
       return some(info)
   none(SystemTableInfo)
+
+proc dataTypeToColumnDataType*(dt: DataType): ColumnDataType =
+  ## Convert core DataType to binary format ColumnDataType.
+  ## Defined here (not in planner) to avoid circular imports.
+  case dt
+  of dtInt: cdtInt
+  of dtFloat: cdtFloat
+  of dtString: cdtString
+  of dtBool: cdtBool
+  of dtBytes: cdtBytes
+  of dtDate: cdtDate
+  of dtDateTime: cdtDateTime
+  of dtULID: cdtULID
+
+proc systemTableInfoToTableRecord*(info: SystemTableInfo): TableRecord =
+  ## Convert a SystemTableInfo to a TableRecord for storing in sys.tables.
+  ## This enables system tables to be queried via the same catalog path as
+  ## user tables, eliminating the need for hardcoded system table resolution.
+  var columns: seq[ColumnDefBin] = @[]
+  for sysCol in info.columns:
+    var flags: uint8 = 0
+    if sysCol.primaryKey: flags = flags or 0x01
+    if sysCol.notNull: flags = flags or 0x02
+    columns.add(ColumnDefBin(
+      name: sysCol.name,
+      dataType: dataTypeToColumnDataType(sysCol.dataType),
+      maxLen: uint16(sysCol.maxLen),
+      flags: flags
+    ))
+  TableRecord(
+    tableId: info.tableId,
+    name: info.name,
+    schema: info.schema,
+    database: info.database,
+    spaceId: zeroSpaceID(),
+    primaryKey: info.primaryKey,
+    columns: columns,
+    keyEncoding: info.keyEncoding
+  )
 
 # ============================================================================
 # Key encoding constants
@@ -698,32 +756,35 @@ proc addGroupIdToKey*(key: string, groupId: GroupID): string =
   ## This is used by the client layer to convert planner-generated scan-bound
   ## keys (without groupId) into the canonical stored key format (with groupId).
   ##
-  ## If the key already has a groupId (i.e., it's in stored format), returns
-  ## it unchanged. If the key is not a data row key, returns it unchanged.
+  ## If the key already contains the target groupId, returns it unchanged.
+  ## If the key is not a data row key, returns it unchanged.
+  ##
+  ## To avoid the old false-positive bug (decodeDataRowKey misreading scan-bound
+  ## keys whose pk happened to look like a ULID + '/'), we check whether the
+  ## embedded prefix matches the *specific* groupId we are about to add.
+  ## A collision is impossible in practice because groupIds are 128-bit random
+  ## values; a scan-bound pk would need to start with exactly that value.
   if not isDataRowKey(key):
     return key
 
   try:
-    let (tableId, existingGroupId, pk) = decodeDataRowKey(key)
-    # Key already has groupId — return as-is
-    if existingGroupId != ZeroGroupID():
+    let (tableId, primaryKey) = decodeTableKey(key)
+    let groupIdStr = $groupId
+
+    # If the key is already a stored-format key with this groupId,
+    # return it unchanged (idempotent).
+    let expectedPrefix = DATA_ROW_PREFIX & groupIdStr & "/"
+    if primaryKey.startsWith(expectedPrefix):
       return key
-    # This shouldn't happen since decodeDataRowKey now raises on missing groupId,
-    # but handle it gracefully by re-encoding
-    return encodeDataRowKey(tableId, groupId, pk)
+
+    # It's a scan-bound key (no groupId) — strip "d/" and add groupId
+    let barePk = if primaryKey.startsWith(DATA_ROW_PREFIX):
+                   primaryKey[DATA_ROW_PREFIX.len .. ^1]
+                 else:
+                   primaryKey
+    return encodeDataRowKey(tableId, groupId, barePk)
   except ValueError:
-    # Not a decodable data row key — might be a scan-bound key without groupId.
-    # Parse manually to extract the table ID and primary key.
-    try:
-      let (tableId, primaryKey) = decodeTableKey(key)
-      # primaryKey is "d/<pk>" for a scan-bound key without groupId
-      let barePk = if primaryKey.startsWith(DATA_ROW_PREFIX):
-                     primaryKey[DATA_ROW_PREFIX.len .. ^1]
-                   else:
-                     primaryKey
-      return encodeDataRowKey(tableId, groupId, barePk)
-    except ValueError:
-      return key
+    return key
 
 proc narrowScanBoundsToGroup*(startKey, endKey: string,
     tableId: TableId, groupId: GroupID): tuple[startKey: string,

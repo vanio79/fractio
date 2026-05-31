@@ -1113,7 +1113,8 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
       modifiedResult(count, &"INSERT {count}")
 
     of poPointGet:
-      let isSysTable = isSystemTableId(op.pgTableId)
+      # Use correct key encoding based on table descriptor's keyEncoding
+      let isSysTable = op.pgKeyEncoding == tkeSystemTable
 
       # Use correct key encoding based on table type
       let key = if isSysTable:
@@ -1171,7 +1172,7 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
       # Fall back to buffered scan for MockKVStore tests
       # Handle system tables specially - they use binary encoding, not DataRow
 
-      let isSysTable = isSystemTableId(op.scTableId)
+      let isSysTable = op.scKeyEncoding == tkeSystemTable
 
       if ctx.client != nil:
         # Convert Expr to WireFilterExpr for server-side filtering
@@ -1197,8 +1198,8 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
           op.scColumns,
           op.scAllColumns,
           op.scLimit,
-          isSysTable,
-          op.scTableId
+          isSysTable,  # iter.isSystemTable
+          op.scTableId # iter.systemTableId
         )
 
         streamingRowsResult(op.scColumns, rowIter, scanTimer)
