@@ -690,7 +690,7 @@ proc stopTimerThread() =
 # Message Delivery (called by transport when messages arrive)
 # ============================================================================
 
-proc bufferMessage(c: NuRaftCoordinator, groupId: GroupID, msgData: cstring,
+proc bufferMessage(c: NuRaftCoordinator, groupId: GroupID, msgData: pointer,
     msgLen: csize_t) {.gcsafe.} =
   var data = newString(msgLen.int)
   if msgLen > 0:
@@ -730,7 +730,7 @@ proc clearPendingMessages(c: NuRaftCoordinator) {.gcsafe, raises: [].} =
       c.pendingMessages.clear()
 
 proc deliverMessageToGroup(c: NuRaftCoordinator, groupId: GroupID,
-    msgData: cstring, msgLen: csize_t) =
+    msgData: pointer, msgLen: csize_t) =
   # Check if coordinator is still running
   if not c.running.load(moRelaxed):
     return
@@ -767,7 +767,7 @@ proc deliverMessageToGroup(c: NuRaftCoordinator, groupId: GroupID,
     releaseGroupInstance(inst)
 
 proc deliverMessageWrapper(coordPtr: pointer, groupId: GroupID,
-    msgData: cstring, msgLen: csize_t) {.gcsafe, cdecl.} =
+    msgData: pointer, msgLen: csize_t) {.gcsafe, cdecl.} =
   let c = cast[NuRaftCoordinator](coordPtr)
   if c != nil and c.running.load(moRelaxed):
     {.cast(gcsafe).}:
@@ -867,7 +867,7 @@ proc start*(c: NuRaftCoordinator) =
 
   # Set up the coordinator callback for message delivery
   let coordPtr = cast[pointer](c)
-  c.transport.setCoordinatorCallback(proc(groupId: GroupID, msgData: cstring,
+  c.transport.setCoordinatorCallback(proc(groupId: GroupID, msgData: pointer,
       msgLen: csize_t) {.gcsafe, closure.} =
     deliverMessageWrapper(coordPtr, groupId, msgData, msgLen)
   )
@@ -1213,11 +1213,19 @@ proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
   let majorityQuorum = int32(members.len div 2 + 1)
   let quorumSize = majorityQuorum # Fixed: was majorityQuorum + 1 (too high)
   nuraftParamsSetCustomElectionQuorumSize(params, quorumSize)
-  # Enable auto-adjust quorum for small clusters so that the seed node can
-  # win election with a single member, then the quorum callback updates it
-  # as peers are added. Without this, a 1-member cluster with quorum=2 can
-  # never elect a leader, blocking peer addition entirely.
-  nuraftParamsSetAutoAdjustQuorum(params, 1)
+  # NOTE: auto_adjust_quorum is DISABLED. When enabled, NuRaft overrides the
+  # manually-set custom_election_quorum_size after add_srv(), which causes
+  # quorum to stay at 1 even after peers join. This allows ANY single node to
+  # declare itself leader, producing split-brain on identical GroupIDs and
+  # infinite redirect loops (the root cause of the 3-replica OOM).
+  #
+  # With auto_adjust disabled:
+  # - 1-member group: quorum=1, leader elected immediately (1 alive >= 1)
+  # - After add_srv: quorum callback updates to 2 (majority of 2 nodes)
+  # - After 2nd add_srv: quorum=2 (majority of 3 nodes)
+  #
+  # This is correct and safe.
+  nuraftParamsSetAutoAdjustQuorum(params, 0)
 
   # Create per-group RPC context
   inst.rpcContext = nuraftMpContextCreate(
@@ -1589,7 +1597,7 @@ proc proposeAndWait*(c: NuRaftCoordinator, groupId: GroupID,
     let smIdxBefore = nuraftSmLastCommitIndex(inst.sm)
 
     var logIdx: uint64 = 0
-    let rc = nuraftServerAppendEntry(inst.server, cstring(payload),
+    let rc = nuraftServerAppendEntry(inst.server, payload.strPtr,
         csize_t(payload.len), addr logIdx)
 
     if rc != 0:

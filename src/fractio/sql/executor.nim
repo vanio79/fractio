@@ -1277,6 +1277,13 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
               if limitRows > 0 and outputRows.len >= limitRows:
                 break
           orderTimer.stamp("stream_consume")
+          # CRITICAL: close the iterator to prevent TCP frame bleed.
+          # When a streaming scan is abandoned before exhaustion (e.g., LIMIT
+          # reached or early break), the server may have already sent additional
+          # response frames into the socket buffer. Reusing the cached
+          # connection for the next RPC would read those stale frames instead
+          # of the expected response, causing silent data corruption.
+          lastResult.streamIterator.closeIterator()
           # Extract only requested columns if needed
           if op.obColumns.len != lastResult.streamColumns.len:
             outputRows = extractRequestedColumns(outputRows, op.obColumns,

@@ -290,3 +290,58 @@ suite "WiscKey Backend Tests":
 
     check backend.put(binaryKey, binaryValue) == true
     check backend.get(binaryKey).get() == binaryValue
+
+  test "Binary data with null bytes in middle (DataRow encoding)":
+    backend = createWiscKeyBackend(testDir)
+
+    # DataRow encoding: magic "DR" + version + u32 column count.
+    # For little-endian, u32(1) = \x01\x00\x00\x00 — null bytes in the middle.
+    # This was the exact bug: .cstring truncated at the first \x00.
+    let dataRowLikeValue = "DR\x01\x01\x00\x00\x00" &
+                           "\x00\x00\x00\x03" & "col" & # col name len=3, "col"
+      "\x00" &                     # type = string
+      "\x00\x00\x00\x05" & "hello" # str len=5, "hello"
+    let key = "data_row_test"
+    check backend.put(key, dataRowLikeValue) == true
+    let result = backend.get(key)
+    check result.isSome
+    check result.get().len == dataRowLikeValue.len
+    check result.get() == dataRowLikeValue
+
+  test "Write batch with null bytes in values":
+    backend = createWiscKeyBackend(testDir)
+
+    let v1 = "\x00\x01\x02"
+    let v2 = "\xff\x00\xfe"
+    let v3 = "\x00\x00\x00"
+    let pairs = @[
+      ("null_batch_1", v1),
+      ("null_batch_2", v2),
+      ("null_batch_3", v3)
+    ]
+    check backend.writeBatch(pairs, @[]) == true
+    check backend.get("null_batch_1").get() == v1
+    check backend.get("null_batch_2").get() == v2
+    check backend.get("null_batch_3").get() == v3
+
+  test "Iterator scan with null bytes in keys and values":
+    backend = createWiscKeyBackend(testDir)
+
+    # Keys with null bytes (like MVCC version keys: userKey + \x00\x00 + timestamp)
+    let k1 = "pk\x00\x00\x00\x00\x00\x00\x00\x01"
+    let k2 = "pk\x00\x00\x00\x00\x00\x00\x00\x02"
+    let v1 = "MVCC\x00\x00\x00\x00\x00\x00\x00\x01\x00data1"
+    let v2 = "MVCC\x00\x00\x00\x00\x00\x00\x00\x02\x00data2"
+
+    check backend.put(k1, v1) == true
+    check backend.put(k2, v2) == true
+
+    let iter = backend.newIterator()
+    check iter != nil
+    check seekIter(iter, k1) == true
+    check keyIter(iter) == k1
+    check valueIter(iter) == v1
+    check nextIter(iter) == true
+    check keyIter(iter) == k2
+    check valueIter(iter) == v2
+    destroyIter(iter)

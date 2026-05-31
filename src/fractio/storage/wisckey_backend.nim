@@ -47,13 +47,13 @@ proc c_leveldb_open(options: pointer, name: cstring,
   importc: "leveldb_open", dynlib: "libleveldb.so".}
 proc c_leveldb_close(db: pointer) {.
   importc: "leveldb_close", dynlib: "libleveldb.so".}
-proc c_leveldb_put(db, writeOptions: pointer; key: cstring, keylen: csize_t;
-    val: cstring, vallen: csize_t; err: ptr cstring) {.
+proc c_leveldb_put(db, writeOptions: pointer; key: pointer, keylen: csize_t;
+    val: pointer, vallen: csize_t; err: ptr cstring) {.
   importc: "leveldb_put", dynlib: "libleveldb.so".}
-proc c_leveldb_get(db, readOptions: pointer; key: cstring, keylen: csize_t;
+proc c_leveldb_get(db, readOptions: pointer; key: pointer, keylen: csize_t;
     vallen: ptr csize_t; err: ptr cstring): cstring {.
   importc: "leveldb_get", dynlib: "libleveldb.so".}
-proc c_leveldb_delete(db, writeOptions: pointer; key: cstring, keylen: csize_t;
+proc c_leveldb_delete(db, writeOptions: pointer; key: pointer, keylen: csize_t;
     err: ptr cstring) {.
   importc: "leveldb_delete", dynlib: "libleveldb.so".}
 proc c_leveldb_create_iterator(db, readOptions: pointer): pointer {.
@@ -66,7 +66,7 @@ proc c_leveldb_iter_seek_to_first(iter: pointer) {.
   importc: "leveldb_iter_seek_to_first", dynlib: "libleveldb.so".}
 proc c_leveldb_iter_seek_to_last(iter: pointer) {.
   importc: "leveldb_iter_seek_to_last", dynlib: "libleveldb.so".}
-proc c_leveldb_iter_seek(iter: pointer; key: cstring, keylen: csize_t) {.
+proc c_leveldb_iter_seek(iter: pointer; key: pointer, keylen: csize_t) {.
   importc: "leveldb_iter_seek", dynlib: "libleveldb.so".}
 proc c_leveldb_iter_next(iter: pointer) {.
   importc: "leveldb_iter_next", dynlib: "libleveldb.so".}
@@ -131,12 +131,26 @@ proc c_leveldb_writebatch_destroy(batch: pointer) {.
   importc: "leveldb_writebatch_destroy", dynlib: "libleveldb.so".}
 proc c_leveldb_writebatch_clear(batch: pointer) {.
   importc: "leveldb_writebatch_clear", dynlib: "libleveldb.so".}
-proc c_leveldb_writebatch_put(batch: pointer; key: cstring, keylen: csize_t;
-    val: cstring, vallen: csize_t) {.
+proc c_leveldb_writebatch_put(batch: pointer; key: pointer, keylen: csize_t;
+    val: pointer, vallen: csize_t) {.
   importc: "leveldb_writebatch_put", dynlib: "libleveldb.so".}
-proc c_leveldb_writebatch_delete(batch: pointer; key: cstring,
+proc c_leveldb_writebatch_delete(batch: pointer; key: pointer,
     keylen: csize_t) {.
-  importc: "leveldb_writebatch_delete", dynlib: "libleveldb.so".}
+    importc: "leveldb_writebatch_delete", dynlib: "libleveldb.so".}
+
+# ---------------------------------------------------------------------------
+# Binary-safe pointer helper
+# ---------------------------------------------------------------------------
+# Nim's `.cstring` conversion creates a null-terminated C string that
+# TRUNCATES at the first \x00 byte. This corrupts binary data (e.g. DataRow
+# encoding, MVCC values, ULID-based keys) which legitimately contain nulls.
+# We pass the raw pointer + explicit length to the C API instead.
+proc strPtr*(s: string): pointer {.inline.} =
+  ## Return a pointer to string data for C API calls.
+  ## Returns nil for empty strings; caller must check length separately.
+  if s.len == 0:
+    return nil
+  unsafeAddr s[0]
 
 proc newWiscKeyBackend*(config: StorageConfig): WiscKeyBackend =
   ## Create a new WiscKey backend
@@ -288,8 +302,8 @@ method put*(backend: WiscKeyBackend, key: string, value: string): bool =
     return false
 
   var errPtr: cstring
-  c_leveldb_put(backend.db, backend.writeOptions, key.cstring, key.len.csize_t,
-               value.cstring, value.len.csize_t, addr errPtr)
+  c_leveldb_put(backend.db, backend.writeOptions, key.strPtr, key.len.csize_t,
+               value.strPtr, value.len.csize_t, addr errPtr)
 
   return not checkError(backend, errPtr)
 
@@ -301,7 +315,7 @@ method get*(backend: WiscKeyBackend, key: string): Option[string] =
 
   var errPtr: cstring
   var vallen: csize_t
-  let val = c_leveldb_get(backend.db, backend.readOptions, key.cstring, key.len.csize_t,
+  let val = c_leveldb_get(backend.db, backend.readOptions, key.strPtr, key.len.csize_t,
                           addr vallen, addr errPtr)
 
   if errPtr != nil:
@@ -326,7 +340,7 @@ method delete*(backend: WiscKeyBackend, key: string): bool =
     return false
 
   var errPtr: cstring
-  c_leveldb_delete(backend.db, backend.writeOptions, key.cstring,
+  c_leveldb_delete(backend.db, backend.writeOptions, key.strPtr,
       key.len.csize_t, addr errPtr)
 
   return not checkError(backend, errPtr)
@@ -346,11 +360,11 @@ method writeBatch*(backend: WiscKeyBackend, pairs: seq[KeyValuePair],
   let batch = c_leveldb_writebatch_create()
 
   for pair in pairs:
-    c_leveldb_writebatch_put(batch, pair.key.cstring, pair.key.len.csize_t,
-                             pair.value.cstring, pair.value.len.csize_t)
+    c_leveldb_writebatch_put(batch, pair.key.strPtr, pair.key.len.csize_t,
+                             pair.value.strPtr, pair.value.len.csize_t)
 
   for key in deletes:
-    c_leveldb_writebatch_delete(batch, key.cstring, key.len.csize_t)
+    c_leveldb_writebatch_delete(batch, key.strPtr, key.len.csize_t)
 
   c_leveldb_write(backend.db, backend.writeOptions, batch, addr errPtr)
   c_leveldb_writebatch_destroy(batch)
@@ -372,11 +386,11 @@ method writeBatchNoSync*(backend: WiscKeyBackend, pairs: seq[KeyValuePair],
   let batch = c_leveldb_writebatch_create()
 
   for pair in pairs:
-    c_leveldb_writebatch_put(batch, pair.key.cstring, pair.key.len.csize_t,
-                             pair.value.cstring, pair.value.len.csize_t)
+    c_leveldb_writebatch_put(batch, pair.key.strPtr, pair.key.len.csize_t,
+                             pair.value.strPtr, pair.value.len.csize_t)
 
   for key in deletes:
-    c_leveldb_writebatch_delete(batch, key.cstring, key.len.csize_t)
+    c_leveldb_writebatch_delete(batch, key.strPtr, key.len.csize_t)
 
   c_leveldb_write(backend.db, backend.noSyncWriteOptions, batch, addr errPtr)
   c_leveldb_writebatch_destroy(batch)
@@ -406,7 +420,7 @@ proc seekToLastWiscKey*(iter: WiscKeyIterator): bool =
   return c_leveldb_iter_valid(iter.iter) != 0
 
 proc seekWiscKey*(iter: WiscKeyIterator, key: string): bool =
-  c_leveldb_iter_seek(iter.iter, key.cstring, key.len.csize_t)
+  c_leveldb_iter_seek(iter.iter, key.strPtr, key.len.csize_t)
   return c_leveldb_iter_valid(iter.iter) != 0
 
 proc nextWiscKey*(iter: WiscKeyIterator): bool =
@@ -520,7 +534,7 @@ proc scan*(backend: WiscKeyBackend, startKey, endKey: string,
   defer: c_leveldb_iter_destroy(iter)
 
   if startKey.len > 0:
-    c_leveldb_iter_seek(iter, startKey.cstring, startKey.len.csize_t)
+    c_leveldb_iter_seek(iter, startKey.strPtr, startKey.len.csize_t)
   else:
     c_leveldb_iter_seek_to_first(iter)
 
@@ -642,7 +656,7 @@ proc prefetchWorker(args: PrefetchWorkerArgs) {.thread.} =
 
   # Position iterator
   if args.startKey.len > 0:
-    c_leveldb_iter_seek(iter, args.startKey.cstring, args.startKey.len.csize_t)
+    c_leveldb_iter_seek(iter, args.startKey.strPtr, args.startKey.len.csize_t)
   else:
     c_leveldb_iter_seek_to_first(iter)
 

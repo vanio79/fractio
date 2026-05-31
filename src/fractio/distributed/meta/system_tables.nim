@@ -691,43 +691,6 @@ proc extractGroupIdFromDataRowKey*(key: string): GroupID =
   let (_, groupId, _) = decodeDataRowKey(key)
   groupId
 
-proc narrowScanBoundsToGroup*(startKey, endKey: string,
-    tableId: TableId, groupId: GroupID): tuple[startKey: string,
-        endKey: string] =
-  ## Narrow table-wide scan bounds to a specific group's key range.
-  ##
-  ## Given a start/end key range for a table, intersect it with the group's
-  ## data row prefix range. This enables per-group range scans that avoid
-  ## reading data from other groups.
-  ##
-  ## For data row keys (starting with /t/<tableId>/d/), the intersection is:
-  ##   group_start = max(startKey, /t/<tableId>/d/<groupId>/)
-  ##   group_end   = min(endKey, /t/<tableId>/d/<groupId>{)
-  ##
-  ## For non-data-row keys (system tables, etc.), returns the original range
-  ## unchanged since group routing doesn't apply to those keys.
-  let (groupStart, groupEnd) = makeGroupDataRowScanBounds(tableId, groupId)
-
-  # Intersect: max of starts, min of ends
-  if startKey.len > 0 and startKey > groupStart:
-    result.startKey = startKey
-  else:
-    result.startKey = groupStart
-
-  if endKey.len > 0 and endKey < groupEnd:
-    result.endKey = endKey
-  else:
-    result.endKey = groupEnd
-
-proc encodeIndexKey*(tableId: TableId, groupId: GroupID, indexId: TableId,
-                     indexKey: string, primaryKey: string): string =
-  ## Encode a secondary index entry key:
-  ## /t/<tableId>/i/<groupId>/<indexId>/<indexKey>/<primaryKey>
-  ##
-  ## The groupId enables per-group index scans.
-  encodeTableKey(tableId, INDEX_PREFIX & $groupId & "/" &
-                 formatTableId(indexId) & "/" & indexKey & "/" & primaryKey)
-
 proc addGroupIdToKey*(key: string, groupId: GroupID): string =
   ## Add a group ID to a data row scan-bound key.
   ##
@@ -761,6 +724,51 @@ proc addGroupIdToKey*(key: string, groupId: GroupID): string =
       return encodeDataRowKey(tableId, groupId, barePk)
     except ValueError:
       return key
+
+proc narrowScanBoundsToGroup*(startKey, endKey: string,
+    tableId: TableId, groupId: GroupID): tuple[startKey: string,
+        endKey: string] =
+  ## Narrow table-wide scan bounds to a specific group's key range.
+  ##
+  ## Given a start/end key range for a table, intersect it with the group's
+  ## data row prefix range. This enables per-group range scans that avoid
+  ## reading data from other groups.
+  ##
+  ## The planner generates scan bounds WITHOUT the groupId (e.g.
+  ## `/t/<tableId>/d/<binaryPk>`). Stored keys INCLUDE the groupId (e.g.
+  ## `/t/<tableId>/d/<groupId>/<binaryPk>`). If we intersect the planner
+  ## bounds directly with group bounds, binary PK bytes (e.g. \x01 for small
+  ## ints) sort BEFORE the ASCII `0` of the ULID groupId, producing
+  ## `startKey > endKey` and an empty scan.
+  ##
+  ## Fix: first convert planner bounds to group-aware format using
+  ## `addGroupIdToKey`, THEN intersect with the group range.
+  let (groupStart, groupEnd) = makeGroupDataRowScanBounds(tableId, groupId)
+
+  # Convert planner bounds (no groupId) to group-aware stored-key format
+  let plannerStart = if startKey.len > 0: addGroupIdToKey(startKey,
+      groupId) else: ""
+  let plannerEnd = if endKey.len > 0: addGroupIdToKey(endKey, groupId) else: ""
+
+  # Intersect: max of starts, min of ends
+  if plannerStart.len > 0 and plannerStart > groupStart:
+    result.startKey = plannerStart
+  else:
+    result.startKey = groupStart
+
+  if plannerEnd.len > 0 and plannerEnd < groupEnd:
+    result.endKey = plannerEnd
+  else:
+    result.endKey = groupEnd
+
+proc encodeIndexKey*(tableId: TableId, groupId: GroupID, indexId: TableId,
+                     indexKey: string, primaryKey: string): string =
+  ## Encode a secondary index entry key:
+  ## /t/<tableId>/i/<groupId>/<indexId>/<indexKey>/<primaryKey>
+  ##
+  ## The groupId enables per-group index scans.
+  encodeTableKey(tableId, INDEX_PREFIX & $groupId & "/" &
+                 formatTableId(indexId) & "/" & indexKey & "/" & primaryKey)
 
 proc encodeSpaceKey*(spaceId: SpaceID): string =
   ## Encode a space catalog key: /t/<SYS_SPACES_TABLE_ID>/<spaceId>

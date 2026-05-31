@@ -137,7 +137,7 @@ type
     queueCond*: bool
 
     # Coordinator callback for message delivery
-    coordinatorCb*: proc(groupId: GroupID, msgData: cstring,
+    coordinatorCb*: proc(groupId: GroupID, msgData: pointer,
         msgLen: csize_t) {.gcsafe, closure.}
 
 proc newMultiplexedRaftTransport*(nodeId: core_types.NodeID, host: string,
@@ -452,7 +452,10 @@ proc handleMessage(t: MultiplexedRaftTransport, conn: PeerConnection,
 
     # If we have a coordinator callback, deliver directly
     if t.coordinatorCb != nil:
-      t.coordinatorCb(groupId, cstring(payload), csize_t(payload.len))
+      var dataPtr: pointer = nil
+      if payload.len > 0:
+        dataPtr = unsafeAddr payload[0]
+      t.coordinatorCb(groupId, dataPtr, csize_t(payload.len))
       return
 
     # Otherwise, look up handler for this group (legacy path)
@@ -583,7 +586,10 @@ proc readOneMessage(client: Socket, t: MultiplexedRaftTransport): bool =
 
     # Deliver to coordinator
     if t.coordinatorCb != nil:
-      t.coordinatorCb(groupId, cstring(payload), csize_t(payloadLen))
+      var dataPtr: pointer = nil
+      if payloadLen > 0:
+        dataPtr = unsafeAddr payload[0]
+      t.coordinatorCb(groupId, dataPtr, csize_t(payloadLen))
 
     return true
   except:
@@ -741,7 +747,7 @@ proc stopServer*(t: MultiplexedRaftTransport) =
 # =============================================================================
 
 proc setCoordinatorCallback*(t: MultiplexedRaftTransport,
-    cb: proc(groupId: GroupID, msgData: cstring, msgLen: csize_t) {.gcsafe, closure.}) =
+    cb: proc(groupId: GroupID, msgData: pointer, msgLen: csize_t) {.gcsafe, closure.}) =
   ## Set the coordinator callback for message delivery.
   t.coordinatorCb = cb
 

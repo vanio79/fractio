@@ -1430,7 +1430,7 @@ void nuraft_mp_listener_destroy(void* listener_ptr) {
 // =============================================================================
 
 void nuraft_mp_deliver_message(void* mp_context, void* server,
-                               const char* msg_data, size_t msg_len) {
+                               const void* msg_data, size_t msg_len) {
     if (!mp_context || !msg_data || msg_len == 0) {
         return;
     }
@@ -1707,7 +1707,7 @@ bool nuraft_server_is_initialized(void* server) {
     return wrapper->server && wrapper->server->is_initialized();
 }
 
-int nuraft_server_append_entry(void* server, const char* data, size_t len, uint64_t* out_log_idx) {
+int nuraft_server_append_entry(void* server, const void* data, size_t len, uint64_t* out_log_idx) {
     if (!server || !data || len == 0) return -1;
     auto* wrapper = static_cast<server_wrapper*>(server);
     if (!wrapper->server) return -1;

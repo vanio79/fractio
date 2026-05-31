@@ -888,6 +888,9 @@ proc getWithFilter*(client: FractioClient, key: string,
 
   let groupId = client.getGroupForKey(key)
 
+  # Add groupId to data row keys (scan-bound format → stored key format)
+  let rewrittenKey = addGroupIdToKey(key, groupId)
+
   let maxRetries = client.getMaxRetries()
   const baseBackoffMs = 50
 
@@ -902,7 +905,7 @@ proc getWithFilter*(client: FractioClient, key: string,
       return kvOpErr[Option[string]]("no connection to group leader")
 
     let conn = connOpt.get()
-    let res = conn.kvGetInGroup(key, groupId, filter = filter, txnId = txnId,
+    let res = conn.kvGetInGroup(rewrittenKey, groupId, filter = filter, txnId = txnId,
                          readTimestamp = readTimestamp)
 
     if res.isOk:

@@ -244,7 +244,7 @@ void nuraft_mp_listener_destroy(void* listener_ptr);
 // For requests: processes via raft_server and sends response via send_cb
 // For responses: matches to pending handler, which may trigger further send_cb calls
 void nuraft_mp_deliver_message(void* mp_context, void* server,
-                               const char* msg_data, size_t msg_len);
+                               const void* msg_data, size_t msg_len);
 
 // Invoke a scheduled timer by ID.
 // Nim calls this when its timer fires to execute the delayed task.
@@ -276,7 +276,7 @@ uint64_t nuraft_server_get_committed_log_idx(void* server);
 uint64_t nuraft_server_get_last_log_idx(void* server);
 bool nuraft_server_is_initialized(void* server);
 
-int nuraft_server_append_entry(void* server, const char* data, size_t len, uint64_t* out_log_idx);
+int nuraft_server_append_entry(void* server, const void* data, size_t len, uint64_t* out_log_idx);
 int nuraft_server_add_srv(void* server, int32_t srv_id, const char* endpoint);
 int nuraft_server_remove_srv(void* server, int32_t srv_id);
 int nuraft_server_set_priority(void* server, int32_t srv_id, int32_t priority);

@@ -298,7 +298,7 @@ proc nuraftMpListenerDestroy*(listener: MultiplexedListener)
 # ============================================
 
 proc nuraftMpDeliverMessage*(ctx: MultiplexedContext, server: NuRaftServer,
-                              msgData: cstring, msgLen: csize_t)
+                              msgData: pointer, msgLen: csize_t)
   {.importc: "nuraft_mp_deliver_message".}
 
 # Timer invocation (called by Nim when timer fires)
@@ -329,7 +329,7 @@ proc nuraftServerGetCommittedLogIdx*(server: NuRaftServer): uint64 {.importc: "n
 proc nuraftServerGetLastLogIdx*(server: NuRaftServer): uint64 {.importc: "nuraft_server_get_last_log_idx".}
 proc nuraftServerIsInitialized*(server: NuRaftServer): bool {.importc: "nuraft_server_is_initialized".}
 
-proc nuraftServerAppendEntry*(server: NuRaftServer, data: cstring,
+proc nuraftServerAppendEntry*(server: NuRaftServer, data: pointer,
     len: csize_t, outLogIdx: ptr uint64): int32 {.importc: "nuraft_server_append_entry".}
 proc nuraftServerAddSrv*(server: NuRaftServer, srvId: int32,
     endpoint: cstring): int32 {.importc: "nuraft_server_add_srv".}

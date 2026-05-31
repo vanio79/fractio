@@ -3,8 +3,10 @@
 
 import unittest
 import std/options
+import std/atomics
 import fractio/protocol/messages/kv as kvMsgs
 import fractio/protocol/types
+import fractio/protocol/client
 import fractio/core/types
 import fractio/distributed/raft/group_types
 
@@ -225,3 +227,35 @@ suite "ScanPair":
     )
     check pair.key == "key_only"
     check pair.value == ""
+
+# ---------------------------------------------------------------------------
+# Regression: closeStream must disconnect abandoned single-group streams
+# to prevent TCP frame bleed on cached connections.
+# ---------------------------------------------------------------------------
+
+suite "closeStream disconnects abandoned single-group streams":
+
+  test "closeStream on non-exhausted stream disconnects client":
+    let cfg = defaultClientConfig()
+    let client = newProtocolClient(cfg)
+    client.connected.store(true) # simulate a live connection
+    let ss = newStreamingScanClient(client)
+    check ss.exhausted == false
+    ss.closeStream()
+    check ss.exhausted == true
+    check client.connected.load() == false
+
+  test "closeStream on exhausted stream does not disconnect":
+    let cfg = defaultClientConfig()
+    let client = newProtocolClient(cfg)
+    client.connected.store(true)
+    let ss = newStreamingScanClient(client)
+    ss.exhausted = true
+    ss.closeStream()
+    check ss.exhausted == true
+    check client.connected.load() == true # connection preserved
+
+  test "closeStream on nil client is safe":
+    let ss = newStreamingScanClient(nil)
+    ss.closeStream()
+    check ss.exhausted == true

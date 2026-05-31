@@ -677,29 +677,17 @@ proc loadGroupMembers*(store: RaftKVStoreExt,
 # Internal: propose a WriteBatch and apply to local state machine
 # ---------------------------------------------------------------------------
 
-# Helper: string → seq[byte] (zero-copy via cast)
+# Helper: string → seq[byte] (safe explicit copy)
 proc toBytes*(s: string): seq[byte] {.inline.} =
-  when nimvm:
-    result = newSeq[byte](s.len)
-    for i in 0 ..< s.len:
-      result[i] = byte(s[i])
-  else:
-    if s.len == 0:
-      result = newSeq[byte](0)
-    else:
-      result = cast[seq[byte]](s)
+  result = newSeq[byte](s.len)
+  if s.len > 0:
+    copyMem(addr result[0], unsafeAddr s[0], s.len)
 
-# Helper: seq[byte] → string (zero-copy via cast)
+# Helper: seq[byte] → string (safe explicit copy)
 proc fromBytes*(b: seq[byte]): string {.inline.} =
-  when nimvm:
-    result = newString(b.len)
-    for i in 0 ..< b.len:
-      result[i] = char(b[i])
-  else:
-    if b.len == 0:
-      result = ""
-    else:
-      result = cast[string](b)
+  result = newString(b.len)
+  if b.len > 0:
+    copyMem(addr result[0], unsafeAddr b[0], b.len)
 
 # Forward declarations
 proc raftPut*(store: RaftKVStoreExt, key, value: string): RSResult[

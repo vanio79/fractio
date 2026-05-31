@@ -417,7 +417,8 @@ proc connect*(client: ProtocolClient): PResult {.raises: [].} =
 proc disconnect*(client: ProtocolClient) {.gcsafe, raises: [].} =
   if not client.connected.load(): return
   client.connected.store(false)
-  try: client.socket.close() except CatchableError: discard
+  if client.socket != nil:
+    try: client.socket.close() except CatchableError: discard
 
 # ---------------------------------------------------------------------------
 # Read one response frame from socket (non-blocking with select)
@@ -718,7 +719,10 @@ proc newStreamingScanClient*(client: ProtocolClient): StreamingScanClient =
   ## Create a new streaming scan client state object for single-group mode.
   new(result)
   result.client = client
-  result.streamId = client.nextRequestId.fetchAdd(1)
+  if client != nil:
+    result.streamId = client.nextRequestId.fetchAdd(1)
+  else:
+    result.streamId = 0
   result.hasMore = false
   result.exhausted = false
   result.currentFrame = ScanResponseFrame()
@@ -1046,9 +1050,25 @@ proc hasNext*(ss: StreamingScanClient): bool {.gcsafe, raises: [].} =
 
 proc closeStream*(ss: StreamingScanClient) {.gcsafe, raises: [].} =
   ## Close the streaming scan and mark it exhausted.
+  ##
+  ## CRITICAL: If the stream was abandoned before exhaustion (user broke
+  ## early, hit a LIMIT, or encountered an error), the server may have
+  ## already sent additional response frames into the TCP socket buffer.
+  ## Reusing this cached connection for a subsequent RPC would cause the
+  ## next readOneFrame() to consume a stale scan frame instead of the
+  ## expected response, leading to silent data corruption ("table not found",
+  ## "invalid magic header", wrong row counts, etc.).
+  ##
+  ## To prevent this, we disconnect the underlying ProtocolClient whenever
+  ## closeStream is called on a non-exhausted stream. The FractioClient
+  ## leader-connection cache checks `connected.load()` before reusing a
+  ## connection, so a disconnected connection will be replaced on the next
+  ## operation. Fully-consumed streams (wasExhausted == true) skip the
+  ## disconnect to avoid unnecessary connection churn.
+  let wasExhausted = ss.exhausted
   ss.exhausted = true
   ss.hasMore = false
-  # In k-way merge mode, close all group streams
+  # In k-way merge mode, close all group streams (recursive)
   if ss.kWayMergeMode:
     for swk in mitems(ss.mergeStreams):
       if swk.stream != nil:
@@ -1057,6 +1077,10 @@ proc closeStream*(ss: StreamingScanClient) {.gcsafe, raises: [].} =
       swk.peekPair = none(kvMsgs.ScanPair)
       swk.exhausted = true
     ss.mergeStreams = @[]
+  else:
+    # Single-group mode: disconnect if stream was abandoned mid-way.
+    if not wasExhausted and ss.client != nil:
+      ss.client.disconnect()
 
 proc getError*(ss: StreamingScanClient): Option[ProtocolError] {.gcsafe,
     raises: [].} =

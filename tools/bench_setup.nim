@@ -112,16 +112,17 @@ proc main() =
     quit(1)
   echo "  Table created"
 
-  # Step 4: Insert 10,000 rows
+  # Step 4: Insert rows
   echo ""
-  echo "Step 4: Inserting 10,000 rows..."
+  let NUM_ROWS = 500
+  echo "Step 4: Inserting ", NUM_ROWS, " rows..."
   discard client.forceMetadataRefresh()
 
   var inserted = 0
   var errors = 0
   let t0 = getMonoTime()
 
-  for i in 1..10000:
+  for i in 1..NUM_ROWS:
     let sql = "INSERT INTO benchspace.public.users (id, name, email) VALUES (" &
         $i & ", 'user_" & $i & "', 'user_" & $i & "@example.com')"
     let res = client.query(sql, database = "benchspace", schema = "public")
@@ -136,12 +137,13 @@ proc main() =
     if i mod 1000 == 0:
       let elapsed = inMilliseconds(getMonoTime() - t0).float
       let rate = if elapsed > 0: inserted.float / (elapsed / 1000.0) else: 0.0
-      echo "  ", inserted, "/10000 rows, ", elapsed.int, "ms, ", rate.int, " rows/sec"
+      echo "  ", inserted, "/", NUM_ROWS, " rows, ", elapsed.int, "ms, ",
+          rate.int, " rows/sec"
 
   let elapsed = inMilliseconds(getMonoTime() - t0).float
   let rate = if elapsed > 0: inserted.float / (elapsed / 1000.0) else: 0.0
   echo ""
-  echo "  Result: ", inserted, "/10000 rows inserted in ", elapsed.int,
+  echo "  Result: ", inserted, "/", NUM_ROWS, " rows inserted in ", elapsed.int,
       "ms (", rate.int, " rows/sec)"
   if errors > 0:
     echo "  Errors: ", errors
@@ -175,7 +177,7 @@ proc main() =
   echo "  ./bin/fractio --port=9001 node ls"
   echo ""
   echo "The space 'benchspace' has 3 replicas across 3 nodes."
-  echo "Table 'benchspace.public.users' has 10,000 rows (id, name, email)."
+  echo "Table 'benchspace.public.users' has ", NUM_ROWS, " rows (id, name, email)."
 
   client.close()
 

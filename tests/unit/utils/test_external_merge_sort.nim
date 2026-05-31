@@ -556,18 +556,34 @@ suite "Streaming Reverse (PK DESC Optimization)":
     check reversed[0][0] == "25"
     check reversed[24][0] == "1"
 
-  test "reverse empty dataset":
-    let rows: seq[seq[string]] = @[]
-    let columns = @["id"]
+  test "reverse 10001 rows (realistic data, triggers temp file path)":
+    # 10001 rows > DEFAULT_CHUNK_SIZE (10000), so temp files are used.
+    # This reproduces the BinaryReader bug in ORDER BY DESC without LIMIT.
+    var rows: seq[seq[string]] = @[]
+    for i in 1..10001:
+      rows.add(@[$i, "user_" & $i, "user_" & $i & "@example.com"])
+    let columns = @["id", "name", "email"]
     let reversed = reverseRowsWithTempFiles(rows, columns, columns, testTempDir)
-    check reversed.len == 0
+    check reversed.len == 10001
+    check reversed[0][0] == "10001"
+    check reversed[0][1] == "user_10001"
+    check reversed[10000][0] == "1"
+    check reversed[10000][1] == "user_1"
+
+  test "reverse empty dataset":
+    let emptyRows: seq[seq[string]] = @[]
+    let emptyColumns = @["id"]
+    let emptyReversed = reverseRowsWithTempFiles(emptyRows, emptyColumns,
+        emptyColumns, testTempDir)
+    check emptyReversed.len == 0
 
   test "reverse single row":
-    let rows = @[@["42", "test"]]
-    let columns = @["id", "name"]
-    let reversed = reverseRowsWithTempFiles(rows, columns, columns, testTempDir)
-    check reversed.len == 1
-    check reversed[0] == @["42", "test"]
+    let singleRow = @[@["42", "test"]]
+    let singleColumns = @["id", "name"]
+    let reversedSingle = reverseRowsWithTempFiles(singleRow, singleColumns,
+        singleColumns, testTempDir)
+    check reversedSingle.len == 1
+    check reversedSingle[0] == @["42", "test"]
 
   test "StreamingReverseIterator basic usage":
     let columns = @["id", "name"]

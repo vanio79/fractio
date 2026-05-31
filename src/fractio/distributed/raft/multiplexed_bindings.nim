@@ -14,13 +14,16 @@ const wrapperPath = "src/fractio/distributed/raft/wrapper/build"
 # =============================================================================
 
 proc deliverMessage*(ctx: MultiplexedContext, server: NuRaftServer,
-                     msgData: string) =
+                      msgData: string) =
   ## Deliver a message to NuRaft for processing.
   ## Handles both requests (sends response via callback) and responses
   ## (matches to pending handler).
   if msgData.len == 0 or ctx.isNil or server.isNil:
     return
-  nuraftMpDeliverMessage(ctx, server, cstring(msgData), csize_t(msgData.len))
+  var dataPtr: pointer = nil
+  if msgData.len > 0:
+    dataPtr = unsafeAddr msgData[0]
+  nuraftMpDeliverMessage(ctx, server, dataPtr, csize_t(msgData.len))
 
 # =============================================================================
 # Listener Setup
