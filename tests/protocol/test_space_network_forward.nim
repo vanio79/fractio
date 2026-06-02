@@ -268,6 +268,7 @@ proc makeCluster3(): seq[TestNode] =
     schema: "public",
     database: "default",
     spaceId: seededSpaceUid, # TableRecord.spaceId is SpaceID
+    keyEncoding: tkeDataRow,
   )
   discard nodes[leaderIdx].store.raftPut(tableKey, tableRec.encode())
 

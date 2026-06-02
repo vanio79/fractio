@@ -169,7 +169,32 @@ proc decodeSystemTableRecord*(tableId: TableId, rawValue: string, columns: seq[
       of "database": result[i] = rec.database
       of "spaceid": result[i] = $rec.spaceId
       of "primarykey": result[i] = rec.primaryKey.join(",")
-      of "columns": result[i] = $rec.columns.len & " columns" # Summary
+      of "columns": result[i] = "in sys.columns"
+      else: result[i] = ""
+
+  of SYS_COLUMNS_TABLE_NUM:
+    let rec = decodeColumnRecord(payload)
+    result = newSeq[string](columns.len)
+    for i, col in columns:
+      case col.toLowerAscii()
+      of "_key": result[i] = $rec.tableId & "/" & $rec.ordinal
+      of "tableid": result[i] = $rec.tableId
+      of "name": result[i] = rec.name
+      of "ordinal": result[i] = $rec.ordinal
+      of "datatype":
+        var dt: string
+        case rec.dataType
+        of cdtInt: dt = "INT"
+        of cdtFloat: dt = "FLOAT"
+        of cdtString: dt = "TEXT"
+        of cdtBool: dt = "BOOL"
+        of cdtBytes: dt = "BLOB"
+        of cdtDate: dt = "DATE"
+        of cdtDateTime: dt = "DATETIME"
+        of cdtULID: dt = "ULID"
+        result[i] = dt
+      of "maxlen": result[i] = $rec.maxLen
+      of "flags": result[i] = $rec.flags
       else: result[i] = ""
 
   of SYS_GROUPS_TABLE_NUM:
@@ -696,6 +721,7 @@ proc execDropSchema(op: PlanOp, ctx: ExecutorContext): ExecResult =
 
 proc execCreateTable(op: PlanOp, ctx: ExecutorContext): ExecResult =
   ## Execute CREATE TABLE with internal MVCC transaction for consistency.
+  ## Writes the TableRecord into sys.tables and column definitions into sys.columns.
   let key = encodeTableKey(SYS_TABLES_TABLE_ID,
       op.ctDatabase & "." & op.ctSchema & "." & op.ctName)
 
@@ -719,6 +745,7 @@ proc execCreateTable(op: PlanOp, ctx: ExecutorContext): ExecResult =
   # CREATE SPACE writes the space record, and we need to see that write immediately.
   # Using the transaction's read timestamp would cause us to not see the newly created space.
   var tableValue = op.ctValue
+  var tableId = op.ctTableId
   if op.ctSpaceName.isSome:
     let spaceName = op.ctSpaceName.get()
     let sStart = encodeTableKey(SYS_SPACES_TABLE_ID, "")
@@ -743,10 +770,29 @@ proc execCreateTable(op: PlanOp, ctx: ExecutorContext): ExecResult =
     rec.spaceId = spaceId
     tableValue = encode(rec)
 
+  # Write the table record to sys.tables
   let putRes = ctx.kv.put(key, tableValue, txnId = internalTxnId)
   if putRes.isErr:
     discard ctx.kv.rollbackTxn(internalTxnId)
     return errorResult(&"failed to create table: {putRes.err}")
+
+  # Write column definitions to sys.columns
+  var ordinal = 0
+  for col in op.ctColumns:
+    let colRec = ColumnRecord(
+      tableId: tableId,
+      name: col.name,
+      ordinal: int32(ordinal),
+      dataType: col.dataType,
+      maxLen: col.maxLen,
+      flags: col.flags
+    )
+    let colKey = encodeColumnKey(tableId, ordinal)
+    let colPutRes = ctx.kv.put(colKey, encode(colRec), txnId = internalTxnId)
+    if colPutRes.isErr:
+      discard ctx.kv.rollbackTxn(internalTxnId)
+      return errorResult(&"failed to create column: {colPutRes.err}")
+    inc ordinal
 
   let commitRes = ctx.kv.commitTxn(internalTxnId)
   if commitRes.isErr:
@@ -822,6 +868,18 @@ proc execDropTable(op: PlanOp, ctx: ExecutorContext): ExecResult =
   if delRes.isErr:
     discard ctx.kv.rollbackTxn(internalTxnId)
     return errorResult(&"failed to drop table: {delRes.err}")
+
+  # Also delete column definitions from sys.columns
+  let colStart = encodeTableKey(SYS_COLUMNS_TABLE_ID, $(tableId) & "/")
+  let colEnd = encodeTableKey(SYS_COLUMNS_TABLE_ID, $(tableId) & "{")
+  let colScan = ctx.kv.scan(colStart, colEnd, 0,
+      txnId = internalTxnId, readTimestamp = internalReadTimestamp)
+  if colScan.isOk:
+    for entry in colScan.val:
+      let colDelRes = ctx.kv.delete(entry.key, txnId = internalTxnId)
+      if colDelRes.isErr:
+        discard ctx.kv.rollbackTxn(internalTxnId)
+        return errorResult(&"failed to delete column: {colDelRes.err}")
 
   let commitRes = ctx.kv.commitTxn(internalTxnId)
   if commitRes.isErr:

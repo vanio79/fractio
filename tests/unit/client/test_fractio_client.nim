@@ -9,6 +9,7 @@ import fractio/core/kv_interface
 import fractio/distributed/raft/group_types
 import fractio/distributed/meta/system_schemas
 import fractio/distributed/meta/system_tables
+import fractio/utils/rwlock
 import fractio/client/fractio_client as client
 
 # =============================================================================
@@ -757,23 +758,21 @@ suite "Fractio Client - GroupInfo Edge Cases":
 
 suite "Fractio Client - Lock Operations":
   test "lock acquire and release":
-    let c = client.newFractioClient("localhost", 9000)
-    c.lock.acquire()
-    c.lock.release()
+    var c = client.newFractioClient("localhost", 9000)
+    withWriteLock c.lock:
+      check c.initialized.load(moRelaxed) == false
     c.close()
 
   test "lock withLock block":
-    let c = client.newFractioClient("localhost", 9000)
-    withLock c.lock:
+    var c = client.newFractioClient("localhost", 9000)
+    withWriteLock c.lock:
       check c.initialized.load(moRelaxed) == false
     c.close()
 
   test "nested lock acquire fails gracefully":
-    let c = client.newFractioClient("localhost", 9000)
-    c.lock.acquire()
-    # Note: Nim Lock is non-recursive by default
-    # Attempting to acquire again would hang, so we release first
-    c.lock.release()
+    var c = client.newFractioClient("localhost", 9000)
+    withWriteLock c.lock:
+      check c.initialized.load(moRelaxed) == false
     c.close()
 
 # =============================================================================
@@ -921,7 +920,9 @@ suite "Fractio Client - Space Operations Error Handling":
     c.initialized.store(true, moRelaxed)
     let result = c.createSpace("test_space", replicas = 3)
     check result.isOk == false
-    check result.err == "no connection to META group leader"
+    # createSpace has a 10-attempt retry loop; after exhausting retries
+    # it returns "too many retries" rather than the immediate connection error.
+    check result.err == "too many retries"
     c.close()
 
   test "createSpace returns error with zero replicas":
@@ -929,7 +930,7 @@ suite "Fractio Client - Space Operations Error Handling":
     c.initialized.store(true, moRelaxed)
     let result = c.createSpace("test_space", replicas = 0)
     check result.isOk == false
-    check result.err == "no connection to META group leader"
+    check result.err == "too many retries"
     c.close()
 
   test "dropSpace returns error when no META group connection":
@@ -1675,16 +1676,16 @@ suite "Fractio Client - Config Edge Cases":
 
 suite "Fractio Client - Lock Stress":
   test "many lock acquire/release cycles":
-    let c = client.newFractioClient("localhost", 9000)
+    var c = client.newFractioClient("localhost", 9000)
     for i in 0..<1000:
-      c.lock.acquire()
-      c.lock.release()
+      withWriteLock c.lock:
+        discard i
     c.close()
 
   test "many withLock cycles":
-    let c = client.newFractioClient("localhost", 9000)
+    var c = client.newFractioClient("localhost", 9000)
     for i in 0..<500:
-      withLock c.lock:
+      withWriteLock c.lock:
         discard i
     c.close()
 

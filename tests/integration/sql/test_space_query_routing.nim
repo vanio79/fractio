@@ -214,12 +214,24 @@ proc seedSpaceTable(client: FractioClient, store: RaftKVStoreExt,
     schema: schema,
     spaceId: spaceId, # TableRecord.spaceId is SpaceID
     primaryKey: @["id"],
-    columns: @[
-      ColumnDefBin(name: "id", dataType: cdtInt, flags: 0x01), # primaryKey
-    ColumnDefBin(name: "val", dataType: cdtString, flags: 0x00),
-  ]
+    keyEncoding: tkeDataRow,
   )
   discard store.sysTablePut(tableKey, encode(tableRec))
+  # Write column records to sys.columns
+  let colDefs = @[
+    ColumnDefBin(name: "id", dataType: cdtInt, flags: 0x01), # primaryKey
+    ColumnDefBin(name: "val", dataType: cdtString, flags: 0x00),
+  ]
+  for ordinal, col in colDefs:
+    let colRec = ColumnRecord(
+      tableId: tableId,
+      name: col.name,
+      ordinal: int32(ordinal),
+      dataType: col.dataType,
+      maxLen: col.maxLen,
+      flags: col.flags
+    )
+    discard store.sysTablePut(encodeColumnKey(tableId, ordinal), encode(colRec))
   store.loadTableSpaces()
   # Refresh client metadata to pick up the new table
   discard client.refreshMetadata()
@@ -237,13 +249,25 @@ proc seedSpaceTableThreeCol(client: FractioClient, store: RaftKVStoreExt,
     schema: schema,
     spaceId: spaceId, # TableRecord.spaceId is SpaceID
     primaryKey: @["id"],
-    columns: @[
-      ColumnDefBin(name: "id", dataType: cdtInt, flags: 0x01), # primaryKey
+    keyEncoding: tkeDataRow,
+  )
+  discard store.sysTablePut(tableKey, encode(tableRec))
+  # Write column records to sys.columns
+  let colDefs = @[
+    ColumnDefBin(name: "id", dataType: cdtInt, flags: 0x01), # primaryKey
     ColumnDefBin(name: "name", dataType: cdtString, flags: 0x00),
     ColumnDefBin(name: "score", dataType: cdtInt, flags: 0x00),
   ]
-  )
-  discard store.sysTablePut(tableKey, encode(tableRec))
+  for ordinal, col in colDefs:
+    let colRec = ColumnRecord(
+      tableId: tableId,
+      name: col.name,
+      ordinal: int32(ordinal),
+      dataType: col.dataType,
+      maxLen: col.maxLen,
+      flags: col.flags
+    )
+    discard store.sysTablePut(encodeColumnKey(tableId, ordinal), encode(colRec))
   store.loadTableSpaces()
   # Refresh client metadata to pick up the new table
   discard client.refreshMetadata()

@@ -117,6 +117,7 @@ proc seedSpaceAndTable(store: RaftKVStoreExt, spaceIdNum: int,
     schema: "public",
     database: "default",
     spaceId: spaceId, # TableRecord.spaceId is SpaceID
+    keyEncoding: tkeDataRow,
   )
   discard store.raftPut(tableKey, tableRec.encode())
 

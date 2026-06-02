@@ -144,7 +144,7 @@ proc exec(client: FractioClient, sql: string, database = "default",
 proc seedTable(store: RaftKVStoreExt, database, schema, name: string,
     tableId: TableId, columns: seq[tuple[name: string, typ: string]],
     pk: seq[string]) =
-  # Build binary TableRecord
+  # Build binary TableRecord and column definitions
   var cols: seq[ColumnDefBin] = @[]
   for (cname, ctype) in columns:
     var dt = cdtString
@@ -167,11 +167,23 @@ proc seedTable(store: RaftKVStoreExt, database, schema, name: string,
     schema: schema,
     spaceId: zeroSpaceID(), # default space (zero SpaceID)
     primaryKey: pk,
-    columns: cols,
+    keyEncoding: tkeDataRow,
   )
   let key = encodeTableKey(SYS_TABLES_TABLE_ID,
       database & "." & schema & "." & name)
   discard store.sysTablePut(key, encode(tableRec))
+  # Write column records to sys.columns
+  for ordinal, col in cols:
+    let colRec = ColumnRecord(
+      tableId: tableId,
+      name: col.name,
+      ordinal: int32(ordinal),
+      dataType: col.dataType,
+      maxLen: col.maxLen,
+      flags: col.flags
+    )
+    let colKey = encodeColumnKey(tableId, ordinal)
+    discard store.sysTablePut(colKey, encode(colRec))
 
 # ---------------------------------------------------------------------------
 # Suite 1: Lexer — EXPLAIN token

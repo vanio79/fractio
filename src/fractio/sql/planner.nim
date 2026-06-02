@@ -86,6 +86,8 @@ type
       ctSchema*: string
       ctDatabase*: string
       ctSpaceName*: Option[string]     # IN SPACE <name>
+      ctColumns*: seq[ColumnDefBin]    # column definitions for sys.columns
+      ctTableId*: TableId              # generated table id
 
     of poDropTable:
       dtName*: string
@@ -576,20 +578,38 @@ proc resolveTable*(client: FractioClient,
     schema: rec.schema,
     database: rec.database,
     spaceId: rec.spaceId,
-    pkSpec: primaryKeySpecFromTable(rec),
     keyEncoding: rec.keyEncoding,
   )
   # Copy primary key columns
   for pk in rec.primaryKey:
     desc.primaryKey.add(pk)
-  # Convert columns
-  for col in rec.columns:
-    var cd = ColDef(name: col.name)
-    cd.dataType = columnDataTypeToDataType(col.dataType)
-    cd.maxLen = int(col.maxLen)
-    cd.primaryKey = (col.flags and 0x01) != 0
-    cd.notNull = (col.flags and 0x02) != 0
-    desc.columns.add(cd)
+
+  # Fetch columns from sys.columns
+  var colBins: seq[ColumnDefBin] = @[]
+  let colStart = encodeTableKey(SYS_COLUMNS_TABLE_ID, $(rec.tableId) & "/")
+  let colEnd = encodeTableKey(SYS_COLUMNS_TABLE_ID, $(rec.tableId) & "/{")
+  let colScan = client.kvScan(colStart, colEnd, 0)
+  if colScan.isOk:
+    for entry in colScan.val:
+      try:
+        let colRec = decodeColumnRecord(entry.value)
+        var cd = ColDef(name: colRec.name)
+        cd.dataType = columnDataTypeToDataType(colRec.dataType)
+        cd.maxLen = int(colRec.maxLen)
+        cd.primaryKey = (colRec.flags and 0x01) != 0
+        cd.notNull = (colRec.flags and 0x02) != 0
+        desc.columns.add(cd)
+        colBins.add(ColumnDefBin(
+          name: colRec.name,
+          dataType: colRec.dataType,
+          maxLen: colRec.maxLen,
+          flags: colRec.flags
+        ))
+      except ValueError:
+        discard # skip malformed column record
+
+  # Build pkSpec from columns
+  desc.pkSpec = primaryKeySpecFromTable(rec, colBins)
   some(desc)
 
 proc resolveQualifiedTableRef*(client: FractioClient,
@@ -603,12 +623,22 @@ proc resolveQualifiedTableRef*(client: FractioClient,
   ##
   ## System tables and user tables are resolved identically via the
   ## sys.tables catalog. Every table (including sys.*) must have an entry.
+  ##
+  ## The "sys" schema is special: it is a virtual schema accessible from any
+  ## database, and all system table entries in sys.tables use database="sys".
+  ## When the target schema is "sys", we must look up the catalog using
+  ## database="sys" rather than the current default database.
 
   # Resolve database and schema from tableRef or defaults
   let dbName = if tableRef.database != "": tableRef.database else: defaultDatabase
   let scName = if tableRef.schema != "": tableRef.schema else: defaultSchema
 
-  resolveTable(client, dbName, scName, tableRef.table)
+  # System tables live in the "sys" database namespace regardless of
+  # the current database. The "sys" schema is virtual and accessible
+  # from any database.
+  let catalogDbName = if scName == "sys": "sys" else: dbName
+
+  resolveTable(client, catalogDbName, scName, tableRef.table)
 
 proc genNewTableId*(timeProvider: TimeProvider = nil): TableId =
   ## Generate a new globally unique TableId using ULID.
@@ -907,7 +937,7 @@ proc planCreateTable(stmt: Stmt, client: FractioClient,
     database: dbName,
     spaceId: placeholderSpaceId, # Will be resolved at execution time
     primaryKey: pk,
-    columns: columns
+    keyEncoding: tkeDataRow
   )
 
   plan.add(PlanOp(kind: poCreateTable,
@@ -917,6 +947,8 @@ proc planCreateTable(stmt: Stmt, client: FractioClient,
     ctSchema: scName,
     ctDatabase: dbName,
     ctSpaceName: spaceName,
+    ctColumns: columns,
+    ctTableId: tableId,
   ))
   plan
 

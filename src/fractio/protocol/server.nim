@@ -2926,11 +2926,16 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
     # Pre-build system table catalog entries outside the closure to avoid
     # GC-safety issues with accessing the global SYSTEM_TABLES_REGISTRY.
     var sysTableEntries: seq[tuple[key: string, value: string]] = @[]
+    var sysColumnEntries: seq[tuple[key: string, value: string]] = @[]
     for info in SYSTEM_TABLES_REGISTRY:
       let tableRecord = systemTableInfoToTableRecord(info)
       let tablesKey = encodeTableKey(SYS_TABLES_TABLE_ID,
           info.database & "." & info.schema & "." & info.name)
       sysTableEntries.add((key: tablesKey, value: encode(tableRecord)))
+      let colRecs = systemTableInfoToColumnRecords(info)
+      for colRec in colRecs:
+        let colKey = encodeColumnKey(colRec.tableId, int(colRec.ordinal))
+        sysColumnEntries.add((key: colKey, value: encode(colRec)))
 
     # Use a single transaction for all seeding operations
     discard mvccStore.withAutoTransaction(proc(
@@ -3013,6 +3018,10 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
       # TableRecord with keyEncoding = tkeSystemTable.
       for (tablesKey, tableRecordValue) in sysTableEntries:
         discard mvccStore.txnPut(sessionId, tablesKey, tableRecordValue)
+
+      # Seed column definitions into sys.columns for each system table.
+      for (colKey, colValue) in sysColumnEntries:
+        discard mvccStore.txnPut(sessionId, colKey, colValue)
 
       return mvccVOk()
     )

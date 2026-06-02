@@ -145,7 +145,20 @@ proc createTestEnv(suiteName: string): tuple[client: FractioClient,
     database: "default",
     createdAtNs: 0
   )
-  discard store.sysTablePutBatch(@[
+  # Build system table entries for sys.tables and sys.columns
+  var sysTableEntries: seq[tuple[key: string, value: string]] = @[]
+  var sysColumnEntries: seq[tuple[key: string, value: string]] = @[]
+  for info in SYSTEM_TABLES_REGISTRY:
+    let tableRecord = systemTableInfoToTableRecord(info)
+    let tablesKey = encodeTableKey(SYS_TABLES_TABLE_ID,
+        info.database & "." & info.schema & "." & info.name)
+    sysTableEntries.add((key: tablesKey, value: encode(tableRecord)))
+    let colRecs = systemTableInfoToColumnRecords(info)
+    for colRec in colRecs:
+      let colKey = encodeColumnKey(colRec.tableId, int(colRec.ordinal))
+      sysColumnEntries.add((key: colKey, value: encode(colRec)))
+
+  var batch = @[
     (key: encodeTableKey(SYS_NODES_TABLE_ID, "1"), value: encode(nodeRec)),
     (key: encodeTableKey(SYS_GROUPS_TABLE_ID, $groupIDToULID(META_GROUP_ID)),
         value: encode(metaGroupRec)),
@@ -156,7 +169,12 @@ proc createTestEnv(suiteName: string): tuple[client: FractioClient,
     (key: encodeTableKey(SYS_DATABASES_TABLE_ID, "default"), value: encode(
         defaultDbRec)),
     (key: encodeTableKey(SYS_SCHEMAS_TABLE_ID, "default.public"), value: encode(publicSchemaRec))
-  ])
+  ]
+  for e in sysTableEntries:
+    batch.add(e)
+  for e in sysColumnEntries:
+    batch.add(e)
+  discard store.sysTablePutBatch(batch)
 
   # Start ProtocolServer
   var srvConfig = defaultServerConfig()
@@ -282,7 +300,18 @@ suite "SQL Executor — DDL":
     check got.val.isSome
     let rec = decodeTableRecord(got.val.get())
     check rec.name == "users"
-    check rec.columns.len == 3
+
+    # Verify column definitions were stored in sys.columns
+    let colStart = encodeColumnKey(rec.tableId, 0)
+    let colEnd = makeScanEndKey(SYS_COLUMNS_TABLE_ID)
+    let colScan = client.kvScan(colStart, colEnd, 0)
+    check colScan.isOk
+    var colCount = 0
+    for entry in colScan.val:
+      let colRec = decodeColumnRecord(entry.value)
+      if colRec.tableId == rec.tableId:
+        inc colCount
+    check colCount == 3
 
   test "CREATE TABLE IF NOT EXISTS":
     discard client.exec(
@@ -1269,6 +1298,8 @@ suite "System Table SELECT Queries":
 
   test "System table data is properly decoded (not raw bytes)":
     let res = client.exec("SELECT * FROM sys.spaces")
+    if res.kind == erkError:
+      echo "DEBUG sys.spaces error: ", res.error
     check res.kind == erkRows
 
     if res.rows.len > 0:

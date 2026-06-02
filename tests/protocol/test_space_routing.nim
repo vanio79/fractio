@@ -330,9 +330,11 @@ suite "Space routing — fan-out scan with merge-sort":
     for i in 0 ..< 5:
       let pk = $i
       discard store.raftPutInSpace(
-          encodeDataRowScanBound(testTableId, pk), $ %*{"id": i, "t": 100}, space, pk)
+          encodeDataRowScanBound(testTableId, pk), $ %*{"id": i, "t": 100},
+              space, pk)
       discard store.raftPutInSpace(
-          encodeDataRowScanBound(testTableId2, pk), $ %*{"id": i, "t": 200}, space, pk)
+          encodeDataRowScanBound(testTableId2, pk), $ %*{"id": i, "t": 200},
+              space, pk)
 
     # Scan only testTableId (range from testTableId to testTableId3, which excludes testTableId2)
     let sr = store.raftScanSpace(
@@ -430,7 +432,7 @@ suite "Space routing — cache loading":
       schema: "public",
       spaceId: spaceId, # TableRecord.spaceId is SpaceID
       primaryKey: @[],
-      columns: @[]
+      keyEncoding: tkeDataRow,
     )
     discard store.raftPut(tableKey, encode(tableRec))
 

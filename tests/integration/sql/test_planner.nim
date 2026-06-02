@@ -138,7 +138,7 @@ proc cleanupTestDir(testDir: string) =
 proc seedTable(client: FractioClient, database, schema, name: string,
     tableId: TableId, columns: seq[tuple[name: string, typ: string]],
     pk: seq[string]) =
-  # Build binary TableRecord
+  # Build binary TableRecord and column definitions
   var cols: seq[ColumnDefBin] = @[]
   for (cname, ctype) in columns:
     var dt = cdtString
@@ -161,12 +161,25 @@ proc seedTable(client: FractioClient, database, schema, name: string,
     schema: schema,
     spaceId: zeroSpaceID(), # default space (zero SpaceID)
     primaryKey: pk,
-    columns: cols,
+    keyEncoding: tkeDataRow,
   )
   let key = encodeTableKey(SYS_TABLES_TABLE_ID,
       database & "." & schema & "." & name)
   let putRes = client.kvPut(key, encode(tableRec))
   doAssert putRes.isOk, "seedTable failed: " & putRes.err
+  # Write column records to sys.columns
+  for ordinal, col in cols:
+    let colRec = ColumnRecord(
+      tableId: tableId,
+      name: col.name,
+      ordinal: int32(ordinal),
+      dataType: col.dataType,
+      maxLen: col.maxLen,
+      flags: col.flags
+    )
+    let colKey = encodeColumnKey(tableId, ordinal)
+    let colPutRes = client.kvPut(colKey, encode(colRec))
+    doAssert colPutRes.isOk, "seedTable column write failed: " & colPutRes.err
 
 # ---------------------------------------------------------------------------
 # Tests
@@ -247,10 +260,11 @@ suite "SQL Planner":
     check plan.ops.len == 1
     check plan.ops[0].kind == poCreateTable
     check plan.ops[0].ctName == "users"
-    # Verify the binary TableRecord contains column info
+    # Verify the binary TableRecord
     let rec = decodeTableRecord(plan.ops[0].ctValue)
     check rec.name == "users"
-    check rec.columns.len == 3
+    # Columns are stored separately in sys.columns
+    check plan.ops[0].ctColumns.len == 3
     # tableId is now a ULID, just verify it's set (non-zero or valid)
     check rec.tableId != zeroTableId()
 

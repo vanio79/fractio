@@ -375,14 +375,15 @@ proc decodePrimaryKey*(data: string, spec: PrimaryKeySpec): PrimaryKey =
 # Primary Key Spec from TableRecord
 # =============================================================================
 
-proc primaryKeySpecFromTable*(rec: TableRecord): PrimaryKeySpec =
-  ## Build a PrimaryKeySpec from a TableRecord.
-  ## Looks up PK columns and their types/max lengths.
+proc primaryKeySpecFromTable*(rec: TableRecord, columns: seq[ColumnDefBin] = @[]): PrimaryKeySpec =
+  ## Build a PrimaryKeySpec from a TableRecord and its columns.
+  ## The columns are now stored in sys.columns rather than embedded in the
+  ## TableRecord. Pass them in from the resolved TableDescriptor.
   result.columns = @[]
   for pkColName in rec.primaryKey:
     # Find the column definition
     var found = false
-    for col in rec.columns:
+    for col in columns:
       if col.name == pkColName:
         result.columns.add((name: col.name, dataType: col.dataType,
             maxLen: int(col.maxLen)))

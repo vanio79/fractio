@@ -2026,14 +2026,16 @@ suite "Executor DDL Operations with MockKVStore":
       database: "default",
       schema: "public",
       spaceId: genSpaceIDLocal(),
-      columns: @[ColumnDefBin(name: "id", dataType: cdtInt,
-                               flags: uint8(cfPrimaryKey.ord))],
-      primaryKey: @["id"]
+      primaryKey: @["id"],
+      keyEncoding: tkeDataRow,
     )
     let plan = newPlan()
     plan.add(PlanOp(kind: poCreateTable, ctDatabase: "default",
                     ctSchema: "public", ctName: "users",
-                    ctValue: encode(tableRec), ctIfNotExists: false))
+                    ctValue: encode(tableRec), ctIfNotExists: false,
+                    ctColumns: @[ColumnDefBin(name: "id", dataType: cdtInt,
+                                              flags: uint8(cfPrimaryKey.ord))],
+                    ctTableId: tableRec.tableId))
 
     let result = executeWithTxn(plan, ctx)
     check result.kind == erkOk
@@ -2102,14 +2104,17 @@ suite "Executor SHOW Operations with MockKVStore":
       database: "default",
       schema: "public",
       spaceId: genSpaceIDLocal(),
-      columns: @[ColumnDefBin(name: "id", dataType: cdtInt,
-                               flags: uint8(cfPrimaryKey.ord))],
-      primaryKey: @["id"]
+      primaryKey: @["id"],
+      keyEncoding: tkeDataRow,
     )
+    let cols = @[ColumnDefBin(name: "id", dataType: cdtInt,
+                              flags: uint8(cfPrimaryKey.ord))]
     var createTablePlan = newPlan()
     createTablePlan.add(PlanOp(kind: poCreateTable, ctDatabase: "default",
                                ctSchema: "public", ctName: "users",
-                               ctValue: encode(tableRec)))
+                               ctValue: encode(tableRec),
+                               ctColumns: cols,
+                               ctTableId: tableRec.tableId))
     discard executeWithTxn(createTablePlan, ctx)
 
     # Show tables
@@ -2211,14 +2216,17 @@ suite "Executor DDL Forbidden in Transaction":
       database: "default",
       schema: "public",
       spaceId: genSpaceIDLocal(),
-      columns: @[ColumnDefBin(name: "id", dataType: cdtInt,
-                               flags: uint8(cfPrimaryKey.ord))],
-      primaryKey: @["id"]
+      primaryKey: @["id"],
+      keyEncoding: tkeDataRow,
     )
+    let cols = @[ColumnDefBin(name: "id", dataType: cdtInt,
+                              flags: uint8(cfPrimaryKey.ord))]
     let plan = newPlan()
     plan.add(PlanOp(kind: poCreateTable, ctDatabase: "default",
                     ctSchema: "public", ctName: "users",
-                    ctValue: encode(tableRec)))
+                    ctValue: encode(tableRec),
+                    ctColumns: cols,
+                    ctTableId: tableRec.tableId))
 
     let result = executeWithTxn(plan, ctx)
     check result.kind == erkError
@@ -2304,14 +2312,17 @@ suite "Executor DROP Operations with MockKVStore":
       database: "default",
       schema: "public",
       spaceId: genSpaceIDLocal(),
-      columns: @[ColumnDefBin(name: "id", dataType: cdtInt,
-                               flags: uint8(cfPrimaryKey.ord))],
-      primaryKey: @["id"]
+      primaryKey: @["id"],
+      keyEncoding: tkeDataRow,
     )
+    let cols = @[ColumnDefBin(name: "id", dataType: cdtInt,
+                              flags: uint8(cfPrimaryKey.ord))]
     var createTablePlan = newPlan()
     createTablePlan.add(PlanOp(kind: poCreateTable, ctDatabase: "default",
                                ctSchema: "public", ctName: "users",
-                               ctValue: encode(tableRec)))
+                               ctValue: encode(tableRec),
+                               ctColumns: cols,
+                               ctTableId: tableRec.tableId))
     discard executeWithTxn(createTablePlan, ctx)
 
     # Drop the table
@@ -2369,14 +2380,17 @@ suite "Executor DROP Operations with MockKVStore":
       database: "default",
       schema: "public",
       spaceId: genSpaceIDLocal(),
-      columns: @[ColumnDefBin(name: "id", dataType: cdtInt,
-                               flags: uint8(cfPrimaryKey.ord))],
-      primaryKey: @["id"]
+      primaryKey: @["id"],
+      keyEncoding: tkeDataRow,
     )
+    let cols = @[ColumnDefBin(name: "id", dataType: cdtInt,
+                              flags: uint8(cfPrimaryKey.ord))]
     var createTablePlan = newPlan()
     createTablePlan.add(PlanOp(kind: poCreateTable, ctDatabase: "default",
                                ctSchema: "public", ctName: "orders",
-                               ctValue: encode(tableRec)))
+                               ctValue: encode(tableRec),
+                               ctColumns: cols,
+                               ctTableId: tableRec.tableId))
     discard executeWithTxn(createTablePlan, ctx)
 
     # Insert some data rows directly into the mock store

@@ -46,6 +46,7 @@ const
   SYS_NODES_TABLE_NUM* = 5'u8
   SYS_SETTINGS_TABLE_NUM* = 6'u8
   SYS_SPACES_TABLE_NUM* = 7'u8
+  SYS_COLUMNS_TABLE_NUM* = 8'u8
   SYS_NODE_METRICS_NUM* = 10'u8
   SYS_GROUP_METRICS_NUM* = 11'u8
   SYS_EVENTS_TABLE_NUM* = 12'u8
@@ -80,6 +81,10 @@ let
     ## Space catalog: /t/<SYS_SPACES_TABLE_ID>/<spaceId>
     ## Value: JSON {spaceId, name, replicas, groupCount, groupIds, createdAt}
 
+  SYS_COLUMNS_TABLE_ID* = TableId(systemTableULID(SYS_COLUMNS_TABLE_NUM))
+    ## Column descriptors: /t/<SYS_COLUMNS_TABLE_ID>/<tableId>/<ordinal>
+    ## Value: binary ColumnRecord
+
   SYS_NODE_METRICS_ID* = TableId(systemTableULID(SYS_NODE_METRICS_NUM))
     ## Per-node performance metrics: /t/<SYS_NODE_METRICS_ID>/<nodeId>/<metricName>
     ## Value: numeric string
@@ -100,8 +105,8 @@ const
   MAX_SYSTEM_TABLE_NUM* = 99'u8
     ## System tables use numbers 1-99
 
-  MAX_META_GROUP_TABLE_NUM* = 7'u8
-    ## Tables 1-7 live in the meta group (Group 1)
+  MAX_META_GROUP_TABLE_NUM* = 8'u8
+    ## Tables 1-8 live in the meta group (Group 1)
 
 # ============================================================================
 # System Table Registry
@@ -294,6 +299,28 @@ let
     keyEncoding: tkeSystemTable
   ),
     SystemTableInfo(
+      tableNum: SYS_COLUMNS_TABLE_NUM,
+      tableId: SYS_COLUMNS_TABLE_ID,
+      name: "columns",
+      schema: "sys",
+      database: "sys",
+      description: "Column descriptors",
+      columns: @[
+        SysColDef(name: "_key", dataType: dtString, maxLen: 64,
+            primaryKey: true, notNull: true),
+        SysColDef(name: "tableId", dataType: dtULID),
+        SysColDef(name: "name", dataType: dtString),
+        SysColDef(name: "ordinal", dataType: dtInt),
+        SysColDef(name: "dataType", dataType: dtString),
+        SysColDef(name: "maxLen", dataType: dtInt),
+        SysColDef(name: "flags", dataType: dtInt)
+    ],
+    primaryKey: @["_key"],
+    pkSpec: SysPrimaryKeySpec(columns: @[(name: "_key", dataType: cdtString,
+        maxLen: 64)]),
+    keyEncoding: tkeSystemTable
+  ),
+    SystemTableInfo(
       tableNum: SYS_NODE_METRICS_NUM,
       tableId: SYS_NODE_METRICS_ID,
       name: "node_metrics",
@@ -384,19 +411,7 @@ proc dataTypeToColumnDataType*(dt: DataType): ColumnDataType =
 
 proc systemTableInfoToTableRecord*(info: SystemTableInfo): TableRecord =
   ## Convert a SystemTableInfo to a TableRecord for storing in sys.tables.
-  ## This enables system tables to be queried via the same catalog path as
-  ## user tables, eliminating the need for hardcoded system table resolution.
-  var columns: seq[ColumnDefBin] = @[]
-  for sysCol in info.columns:
-    var flags: uint8 = 0
-    if sysCol.primaryKey: flags = flags or 0x01
-    if sysCol.notNull: flags = flags or 0x02
-    columns.add(ColumnDefBin(
-      name: sysCol.name,
-      dataType: dataTypeToColumnDataType(sysCol.dataType),
-      maxLen: uint16(sysCol.maxLen),
-      flags: flags
-    ))
+  ## Column definitions are stored in sys.columns separately for normalisation.
   TableRecord(
     tableId: info.tableId,
     name: info.name,
@@ -404,9 +419,27 @@ proc systemTableInfoToTableRecord*(info: SystemTableInfo): TableRecord =
     database: info.database,
     spaceId: zeroSpaceID(),
     primaryKey: info.primaryKey,
-    columns: columns,
     keyEncoding: info.keyEncoding
   )
+
+proc systemTableInfoToColumnRecords*(info: SystemTableInfo): seq[ColumnRecord] =
+  ## Convert a SystemTableInfo's column definitions to ColumnRecords.
+  ## These are stored in sys.columns keyed by (tableId, ordinal).
+  result = @[]
+  var ordinal = 0
+  for sysCol in info.columns:
+    var flags: uint8 = 0
+    if sysCol.primaryKey: flags = flags or 0x01
+    if sysCol.notNull: flags = flags or 0x02
+    result.add(ColumnRecord(
+      tableId: info.tableId,
+      name: sysCol.name,
+      ordinal: int32(ordinal),
+      dataType: dataTypeToColumnDataType(sysCol.dataType),
+      maxLen: uint16(sysCol.maxLen),
+      flags: flags
+    ))
+    inc ordinal
 
 # ============================================================================
 # Key encoding constants
@@ -830,6 +863,36 @@ proc encodeIndexKey*(tableId: TableId, groupId: GroupID, indexId: TableId,
   ## The groupId enables per-group index scans.
   encodeTableKey(tableId, INDEX_PREFIX & $groupId & "/" &
                  formatTableId(indexId) & "/" & indexKey & "/" & primaryKey)
+
+proc encodeColumnKey*(tableId: TableId, ordinal: int): string =
+  ## Encode a column record key: /t/<SYS_COLUMNS_TABLE_ID>/<tableId>/<ordinal>
+  ## This stores column metadata separately from sys.tables for normalisation.
+  encodeTableKey(SYS_COLUMNS_TABLE_ID, $(tableId) & "/" & $ordinal)
+
+proc decodeColumnKey*(key: string): tuple[tableId: TableId, ordinal: int] =
+  ## Decode a column key back to its components.
+  ## Raises ValueError if the key format is invalid.
+  if not key.startsWith(TABLE_KEY_PREFIX):
+    raise newException(ValueError, "Not a table key: " & key)
+
+  let afterPrefix = key[TABLE_KEY_PREFIX.len .. ^1]
+  if afterPrefix.len < TABLE_ID_WIDTH + 1:
+    raise newException(ValueError, "Column key too short: " & key)
+
+  let tableIdStr = afterPrefix[0 ..< TABLE_ID_WIDTH]
+  let tableId = tableIdFromString(tableIdStr)
+
+  let rest = afterPrefix[TABLE_ID_WIDTH + 1 .. ^1]
+  let sepIdx = rest.find('/')
+  if sepIdx < 0:
+    raise newException(ValueError, "Column key missing ordinal: " & key)
+
+  let tableId2Str = rest[0 ..< sepIdx]
+  let tableId2 = tableIdFromString(tableId2Str)
+  let ordinalStr = rest[sepIdx + 1 .. ^1]
+  let ordinal = parseInt(ordinalStr)
+
+  result = (tableId: tableId2, ordinal: ordinal)
 
 proc encodeSpaceKey*(spaceId: SpaceID): string =
   ## Encode a space catalog key: /t/<SYS_SPACES_TABLE_ID>/<spaceId>

@@ -28,6 +28,7 @@ import fractio/distributed/sharedtimer/types as timerTypes
 import fractio/core/timestamp_provider
 import fractio/storage/wisckey_backend
 import fractio/storage/mvcc/types as mvccTypes
+import fractio/utils/rwlock
 import fractio/sql/executor
 import fractio/client/fractio_client
 import fractio/client/sql_client
@@ -778,8 +779,8 @@ proc replicateMetadata(nodes: seq[TestNode]) =
   for n in nodes:
     if n.id == leaderNode.id:
       continue
-    withLock n.client.lock:
-      withLock leaderNode.client.lock:
+    withWriteLock n.client.lock:
+      withWriteLock leaderNode.client.lock:
         n.client.groups = leaderNode.client.groups
         n.client.spaces = leaderNode.client.spaces
         n.client.tables = leaderNode.client.tables

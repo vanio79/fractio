@@ -132,8 +132,6 @@ suite "TableRecord":
   test "encode/decode roundtrip basic":
     let tableId = genTableIdLocal()
     let spaceId = genSpaceIDLocal()
-    let col = ColumnDefBin(name: "id", dataType: cdtInt, maxLen: 0'u16,
-        flags: 0x01'u8)
     let rec = TableRecord(
       tableId: tableId,
       name: "users",
@@ -141,7 +139,7 @@ suite "TableRecord":
       database: "mydb",
       spaceId: spaceId,
       primaryKey: @["id"],
-      columns: @[col]
+      keyEncoding: tkeDataRow
     )
     let encoded = encode(rec)
     let decoded = decodeTableRecord(encoded)
@@ -152,23 +150,10 @@ suite "TableRecord":
     check decoded.spaceId == spaceId
     check decoded.primaryKey.len == 1
     check decoded.primaryKey[0] == "id"
-    check decoded.columns.len == 1
-    check decoded.columns[0].name == "id"
-    check decoded.columns[0].dataType == cdtInt
 
-  test "encode/decode roundtrip multiple columns":
+  test "encode/decode roundtrip with pk":
     let tableId = genTableIdLocal()
     let spaceId = genSpaceIDLocal()
-    let cols = @[
-      ColumnDefBin(name: "id", dataType: cdtULID, maxLen: 0'u16,
-          flags: 0x01'u8),
-      ColumnDefBin(name: "email", dataType: cdtString, maxLen: 255'u16,
-          flags: 0x06'u8),
-      ColumnDefBin(name: "created", dataType: cdtDateTime, maxLen: 0'u16,
-          flags: 0'u8),
-      ColumnDefBin(name: "active", dataType: cdtBool, maxLen: 0'u16,
-          flags: 0x02'u8)
-    ]
     let rec = TableRecord(
       tableId: tableId,
       name: "users",
@@ -176,20 +161,15 @@ suite "TableRecord":
       database: "testdb",
       spaceId: spaceId,
       primaryKey: @["id", "email"],
-      columns: cols
+      keyEncoding: tkeDataRow
     )
     let encoded = encode(rec)
     let decoded = decodeTableRecord(encoded)
-    check decoded.columns.len == 4
-    check decoded.columns[0].dataType == cdtULID
-    check decoded.columns[1].maxLen == 255'u16
-    check decoded.columns[2].dataType == cdtDateTime
-    check decoded.columns[3].dataType == cdtBool
     check decoded.primaryKey.len == 2
     check decoded.primaryKey[0] == "id"
     check decoded.primaryKey[1] == "email"
 
-  test "encode/decode roundtrip empty columns":
+  test "encode/decode roundtrip empty pk":
     let tableId = genTableIdLocal()
     let spaceId = genSpaceIDLocal()
     let rec = TableRecord(
@@ -199,11 +179,10 @@ suite "TableRecord":
       database: "db",
       spaceId: spaceId,
       primaryKey: @[],
-      columns: @[]
+      keyEncoding: tkeDataRow
     )
     let encoded = encode(rec)
     let decoded = decodeTableRecord(encoded)
-    check decoded.columns.len == 0
     check decoded.primaryKey.len == 0
 
   test "encode/decode roundtrip zero ULIDs":
@@ -216,7 +195,7 @@ suite "TableRecord":
       database: "sys",
       spaceId: spaceId,
       primaryKey: @[],
-      columns: @[]
+      keyEncoding: tkeSystemTable
     )
     let encoded = encode(rec)
     let decoded = decodeTableRecord(encoded)
@@ -651,8 +630,7 @@ suite "decodeTableRecordFromMVCC":
       database: "testdb",
       spaceId: spaceId,
       primaryKey: @["id"],
-      columns: @[ColumnDefBin(name: "id", dataType: cdtInt, maxLen: 0'u16,
-          flags: 0x01'u8)]
+      keyEncoding: tkeDataRow
     )
     let payload = encode(rec)
     var w = initBinaryWriter()
@@ -880,7 +858,7 @@ suite "toJson SchemaRecord":
     check json.hasKey("createdAt")
 
 suite "toJson TableRecord":
-  test "converts to JSON with columns":
+  test "converts to JSON without columns":
     let tableId = genTableIdLocal()
     let spaceId = genSpaceIDLocal()
     let rec = TableRecord(
@@ -890,27 +868,18 @@ suite "toJson TableRecord":
       database: "mydb",
       spaceId: spaceId,
       primaryKey: @["id"],
-      columns: @[
-        ColumnDefBin(name: "id", dataType: cdtInt, maxLen: 0'u16,
-            flags: 0x01'u8),
-        ColumnDefBin(name: "email", dataType: cdtString, maxLen: 255'u16,
-            flags: 0x06'u8)
-      ]
+      keyEncoding: tkeDataRow
     )
     let json = toJson(rec)
     check json["name"].getStr() == "users"
     check json["schema"].getStr() == "public"
     check json["database"].getStr() == "mydb"
     check json["primaryKey"].len == 1
-    check json["columns"].len == 2
-    check json["columns"][0]["name"].getStr() == "id"
-    check json["columns"][0]["type"].getStr() == "INT"
-    check json["columns"][0]["primaryKey"].getBool() == true
-    check json["columns"][1]["type"].getStr() == "TEXT"
+    check not json.hasKey("columns")
 
-  test "converts all data types correctly":
-    let tableId = genTableIdLocal()
-    let spaceId = genSpaceIDLocal()
+  test "converts zero ULIDs correctly":
+    let tableId = TableId(ZeroULID())
+    let spaceId = SpaceID(ZeroULID())
     let rec = TableRecord(
       tableId: tableId,
       name: "test",
@@ -918,33 +887,10 @@ suite "toJson TableRecord":
       database: "db",
       spaceId: spaceId,
       primaryKey: @[],
-      columns: @[
-        ColumnDefBin(name: "c_int", dataType: cdtInt, maxLen: 0'u16,
-            flags: 0'u8),
-        ColumnDefBin(name: "c_float", dataType: cdtFloat, maxLen: 0'u16,
-            flags: 0'u8),
-        ColumnDefBin(name: "c_string", dataType: cdtString, maxLen: 0'u16,
-            flags: 0'u8),
-        ColumnDefBin(name: "c_bool", dataType: cdtBool, maxLen: 0'u16,
-            flags: 0'u8),
-        ColumnDefBin(name: "c_bytes", dataType: cdtBytes, maxLen: 0'u16,
-            flags: 0'u8),
-        ColumnDefBin(name: "c_date", dataType: cdtDate, maxLen: 0'u16,
-            flags: 0'u8),
-        ColumnDefBin(name: "c_datetime", dataType: cdtDateTime, maxLen: 0'u16,
-            flags: 0'u8),
-        ColumnDefBin(name: "c_ulid", dataType: cdtULID, maxLen: 0'u16, flags: 0'u8)
-      ]
+      keyEncoding: tkeSystemTable
     )
     let json = toJson(rec)
-    check json["columns"][0]["type"].getStr() == "INT"
-    check json["columns"][1]["type"].getStr() == "FLOAT"
-    check json["columns"][2]["type"].getStr() == "TEXT"
-    check json["columns"][3]["type"].getStr() == "BOOL"
-    check json["columns"][4]["type"].getStr() == "BLOB"
-    check json["columns"][5]["type"].getStr() == "DATE"
-    check json["columns"][6]["type"].getStr() == "DATETIME"
-    check json["columns"][7]["type"].getStr() == "ULID"
+    check json["tableId"].getStr() == $(tableId)
 
 suite "toJson GroupRecord":
   test "converts to JSON with replicas":

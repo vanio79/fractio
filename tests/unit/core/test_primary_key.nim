@@ -808,80 +808,80 @@ suite "Edge Cases":
 suite "PrimaryKeySpec from TableRecord":
 
   test "primaryKeySpecFromTable single PK column":
+    let columns = @[
+      ColumnDefBin(name: "id", dataType: cdtInt, maxLen: 0,
+          flags: uint8(1 shl int(cfPrimaryKey) or 1 shl int(cfNotNull))),
+      ColumnDefBin(name: "name", dataType: cdtString, maxLen: 64, flags: 0)
+    ]
     let rec = TableRecord(
       tableId: genTableIdLocal(),
       name: "users",
       schema: "public",
       database: "testdb",
       spaceId: genSpaceIDLocal(),
-      columns: @[
-        ColumnDefBin(name: "id", dataType: cdtInt, maxLen: 0,
-            flags: uint8(1 shl int(cfPrimaryKey) or 1 shl int(cfNotNull))),
-        ColumnDefBin(name: "name", dataType: cdtString, maxLen: 64, flags: 0)
-      ],
       primaryKey: @["id"]
     )
-    let spec = primaryKeySpecFromTable(rec)
+    let spec = primaryKeySpecFromTable(rec, columns)
     check spec.columns.len == 1
     check spec.columns[0].name == "id"
     check spec.columns[0].dataType == cdtInt
     check spec.columns[0].maxLen == 0
 
   test "primaryKeySpecFromTable composite PK":
+    let columns = @[
+      ColumnDefBin(name: "user_id", dataType: cdtInt, maxLen: 0,
+          flags: uint8(1 shl int(cfPrimaryKey) or 1 shl int(cfNotNull))),
+      ColumnDefBin(name: "order_id", dataType: cdtInt, maxLen: 0,
+          flags: uint8(1 shl int(cfPrimaryKey) or 1 shl int(cfNotNull))),
+      ColumnDefBin(name: "status", dataType: cdtString, maxLen: 32, flags: 0)
+    ]
     let rec = TableRecord(
       tableId: genTableIdLocal(),
       name: "orders",
       schema: "public",
       database: "testdb",
       spaceId: genSpaceIDLocal(),
-      columns: @[
-        ColumnDefBin(name: "user_id", dataType: cdtInt, maxLen: 0,
-            flags: uint8(1 shl int(cfPrimaryKey) or 1 shl int(cfNotNull))),
-        ColumnDefBin(name: "order_id", dataType: cdtInt, maxLen: 0,
-            flags: uint8(1 shl int(cfPrimaryKey) or 1 shl int(cfNotNull))),
-        ColumnDefBin(name: "status", dataType: cdtString, maxLen: 32, flags: 0)
-      ],
       primaryKey: @["user_id", "order_id"]
     )
-    let spec = primaryKeySpecFromTable(rec)
+    let spec = primaryKeySpecFromTable(rec, columns)
     check spec.columns.len == 2
     check spec.columns[0].name == "user_id"
     check spec.columns[1].name == "order_id"
 
   test "primaryKeySpecFromTable with string PK":
+    let columns = @[
+      ColumnDefBin(name: "code", dataType: cdtString, maxLen: 4,
+          flags: uint8(1 shl int(cfPrimaryKey) or 1 shl int(cfNotNull))),
+      ColumnDefBin(name: "name", dataType: cdtString, maxLen: 64, flags: 0)
+    ]
     let rec = TableRecord(
       tableId: genTableIdLocal(),
       name: "countries",
       schema: "public",
       database: "testdb",
       spaceId: genSpaceIDLocal(),
-      columns: @[
-        ColumnDefBin(name: "code", dataType: cdtString, maxLen: 4,
-            flags: uint8(1 shl int(cfPrimaryKey) or 1 shl int(cfNotNull))),
-        ColumnDefBin(name: "name", dataType: cdtString, maxLen: 64, flags: 0)
-      ],
       primaryKey: @["code"]
     )
-    let spec = primaryKeySpecFromTable(rec)
+    let spec = primaryKeySpecFromTable(rec, columns)
     check spec.columns.len == 1
     check spec.columns[0].dataType == cdtString
     check spec.columns[0].maxLen == 4
 
   test "primaryKeySpecFromTable missing PK column raises error":
+    let columns = @[
+      ColumnDefBin(name: "id", dataType: cdtInt, maxLen: 0, flags: 0)
+    ]
     let rec = TableRecord(
       tableId: genTableIdLocal(),
       name: "bad_table",
       schema: "public",
       database: "testdb",
       spaceId: genSpaceIDLocal(),
-      columns: @[
-        ColumnDefBin(name: "id", dataType: cdtInt, maxLen: 0, flags: 0)
-      ],
       primaryKey: @["missing_column"]
     )
     var raised = false
     try:
-      discard primaryKeySpecFromTable(rec)
+      discard primaryKeySpecFromTable(rec, columns)
     except ValueError:
       raised = true
     check raised

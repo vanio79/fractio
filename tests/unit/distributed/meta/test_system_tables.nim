@@ -229,8 +229,8 @@ suite "Constants":
     check ulid.data[15] == SYS_SPACES_TABLE_NUM
 
 suite "System Table Registry":
-  test "registry has 10 entries":
-    check SYSTEM_TABLES_REGISTRY.len == 10
+  test "registry has 11 entries":
+    check SYSTEM_TABLES_REGISTRY.len == 11
 
   test "all registry entries have well-known ULIDs":
     for info in SYSTEM_TABLES_REGISTRY:
@@ -250,9 +250,10 @@ suite "System Table Registry":
     check SYSTEM_TABLES_REGISTRY[4].tableNum == SYS_NODES_TABLE_NUM
     check SYSTEM_TABLES_REGISTRY[5].tableNum == SYS_SETTINGS_TABLE_NUM
     check SYSTEM_TABLES_REGISTRY[6].tableNum == SYS_SPACES_TABLE_NUM
-    check SYSTEM_TABLES_REGISTRY[7].tableNum == SYS_NODE_METRICS_NUM
-    check SYSTEM_TABLES_REGISTRY[8].tableNum == SYS_GROUP_METRICS_NUM
-    check SYSTEM_TABLES_REGISTRY[9].tableNum == SYS_EVENTS_TABLE_NUM
+    check SYSTEM_TABLES_REGISTRY[7].tableNum == SYS_COLUMNS_TABLE_NUM
+    check SYSTEM_TABLES_REGISTRY[8].tableNum == SYS_NODE_METRICS_NUM
+    check SYSTEM_TABLES_REGISTRY[9].tableNum == SYS_GROUP_METRICS_NUM
+    check SYSTEM_TABLES_REGISTRY[10].tableNum == SYS_EVENTS_TABLE_NUM
 
   test "tableId matches well-known ID constant":
     check SYSTEM_TABLES_REGISTRY[0].tableId == SYS_DATABASES_TABLE_ID
@@ -262,9 +263,10 @@ suite "System Table Registry":
     check SYSTEM_TABLES_REGISTRY[4].tableId == SYS_NODES_TABLE_ID
     check SYSTEM_TABLES_REGISTRY[5].tableId == SYS_SETTINGS_TABLE_ID
     check SYSTEM_TABLES_REGISTRY[6].tableId == SYS_SPACES_TABLE_ID
-    check SYSTEM_TABLES_REGISTRY[7].tableId == SYS_NODE_METRICS_ID
-    check SYSTEM_TABLES_REGISTRY[8].tableId == SYS_GROUP_METRICS_ID
-    check SYSTEM_TABLES_REGISTRY[9].tableId == SYS_EVENTS_TABLE_ID
+    check SYSTEM_TABLES_REGISTRY[7].tableId == SYS_COLUMNS_TABLE_ID
+    check SYSTEM_TABLES_REGISTRY[8].tableId == SYS_NODE_METRICS_ID
+    check SYSTEM_TABLES_REGISTRY[9].tableId == SYS_GROUP_METRICS_ID
+    check SYSTEM_TABLES_REGISTRY[10].tableId == SYS_EVENTS_TABLE_ID
 
   test "all entries have sys schema and database":
     for info in SYSTEM_TABLES_REGISTRY:

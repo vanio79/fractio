@@ -117,6 +117,37 @@ proc decodeColumnDef*(r: var BinaryReader): ColumnDefBin =
   result.maxLen = r.readU16()
   result.flags = r.readU8()
 
+type
+  ColumnRecord* = object
+    ## Record stored in SYS_COLUMNS_TABLE
+    ## Key: /t/<SYS_COLUMNS_TABLE_ID>/<tableId>/<ordinal>
+    ## Value: binary encoded
+    tableId*: TableId
+    name*: string
+    ordinal*: int32
+    dataType*: ColumnDataType
+    maxLen*: uint16
+    flags*: uint8
+
+proc encode*(rec: ColumnRecord): string =
+  var w = initBinaryWriter()
+  w.writeBytes(tableIdToBytes(rec.tableId))
+  w.writeString(rec.name)
+  w.writeI32(rec.ordinal)
+  w.writeU8(uint8(rec.dataType))
+  w.writeU16(rec.maxLen)
+  w.writeU8(rec.flags)
+  w.finish()
+
+proc decodeColumnRecord*(data: string): ColumnRecord =
+  var r = initBinaryReader(data)
+  result.tableId = tableIdFromBytes(r.readFixedString(ULID_SIZE))
+  result.name = r.readString()
+  result.ordinal = r.readI32()
+  result.dataType = ColumnDataType(r.readU8())
+  result.maxLen = r.readU16()
+  result.flags = r.readU8()
+
 # =============================================================================
 # Table Record (sys.tables)
 # =============================================================================
@@ -125,13 +156,13 @@ type
   TableRecord* = object
     ## Record stored in SYS_TABLES_TABLE
     ## Key: /t/<SYS_TABLES_TABLE_ID>/<database>.<schema>.<tableName>
+    ## Column definitions are stored separately in sys.columns.
     tableId*: TableId ## ULID-based table ID for globally unique, sortable IDs
     name*: string
     schema*: string
     database*: string
     spaceId*: SpaceID ## Space this table belongs to
     primaryKey*: seq[string] ## Column names forming the primary key
-    columns*: seq[ColumnDefBin]
     keyEncoding*: TableKeyEncoding ## Key encoding strategy for this table
 
 proc encode*(rec: TableRecord): string =
@@ -145,10 +176,6 @@ proc encode*(rec: TableRecord): string =
   w.writeU32(uint32(rec.primaryKey.len))
   for pk in rec.primaryKey:
     w.writeString(pk)
-  # Columns
-  w.writeU32(uint32(rec.columns.len))
-  for col in rec.columns:
-    encodeColumnDef(col, w)
   # Key encoding strategy
   w.writeU8(uint8(rec.keyEncoding))
   w.finish()
@@ -165,11 +192,6 @@ proc decodeTableRecord*(data: string): TableRecord =
   result.primaryKey = newSeq[string](pkCount)
   for i in 0..<pkCount:
     result.primaryKey[i] = r.readString()
-  # Columns
-  let colCount = int(r.readU32())
-  result.columns = newSeq[ColumnDefBin](colCount)
-  for i in 0..<colCount:
-    result.columns[i] = decodeColumnDef(r)
   # Key encoding strategy (mandatory field)
   result.keyEncoding = TableKeyEncoding(r.readU8())
 
@@ -478,25 +500,29 @@ proc toJson*(rec: SchemaRecord): JsonNode =
     "createdAt": $fromUnix(rec.createdAtNs div 1_000_000_000)
   }
 
+proc toJson*(rec: ColumnRecord): JsonNode =
+  var dt: string
+  case rec.dataType
+  of cdtInt: dt = "INT"
+  of cdtFloat: dt = "FLOAT"
+  of cdtString: dt = "TEXT"
+  of cdtBool: dt = "BOOL"
+  of cdtBytes: dt = "BLOB"
+  of cdtDate: dt = "DATE"
+  of cdtDateTime: dt = "DATETIME"
+  of cdtULID: dt = "ULID"
+  result = %*{
+    "tableId": $(rec.tableId),
+    "name": rec.name,
+    "ordinal": rec.ordinal,
+    "dataType": dt,
+    "maxLen": rec.maxLen,
+    "primaryKey": (rec.flags and 0x01) != 0,
+    "notNull": (rec.flags and 0x02) != 0,
+    "unique": (rec.flags and 0x04) != 0
+  }
+
 proc toJson*(rec: TableRecord): JsonNode =
-  var columns = newJArray()
-  for col in rec.columns:
-    var dt: string
-    case col.dataType
-    of cdtInt: dt = "INT"
-    of cdtFloat: dt = "FLOAT"
-    of cdtString: dt = "TEXT"
-    of cdtBool: dt = "BOOL"
-    of cdtBytes: dt = "BLOB"
-    of cdtDate: dt = "DATE"
-    of cdtDateTime: dt = "DATETIME"
-    of cdtULID: dt = "ULID"
-    columns.add(%*{
-      "name": col.name,
-      "type": dt,
-      "primaryKey": (col.flags and 0x01) != 0,
-      "notNull": (col.flags and 0x02) != 0
-    })
   var pkArr = newJArray()
   for pk in rec.primaryKey:
     pkArr.add(%pk)
@@ -506,8 +532,7 @@ proc toJson*(rec: TableRecord): JsonNode =
     "schema": rec.schema,
     "database": rec.database,
     "spaceId": $(rec.spaceId),
-    "primaryKey": pkArr,
-    "columns": columns
+    "primaryKey": pkArr
   }
 
 proc toJson*(rec: GroupRecord): JsonNode =
