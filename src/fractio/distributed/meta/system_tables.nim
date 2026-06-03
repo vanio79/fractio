@@ -819,6 +819,43 @@ proc addGroupIdToKey*(key: string, groupId: GroupID): string =
   except ValueError:
     return key
 
+proc rewriteGroupIdInKey*(key: string, newGroupId: GroupID): string =
+  ## Replace the group ID in a stored data row key with a new group ID.
+  ##
+  ## Handles three key types:
+  ##   Plain data key:  /t/<tableId>/d/<oldGid>/<pk>
+  ##   Version key:     /t/<tableId>/d/<oldGid>/<pk>\x00\x00<8 bytes timestamp>
+  ##   Intent key:      /t/<tableId>/d/<oldGid>/<pk>\x00\x01<16 bytes txnId>
+  ##
+  ## For all three, the group ID portion is replaced while preserving the
+  ## rest of the key (PK, MVCC suffix). If the key is not a data row key
+  ## or does not contain a group ID, returns the key unchanged.
+  if not key.startsWith(TABLE_KEY_PREFIX):
+    return key
+
+  try:
+    let (tableId, primaryKey) = decodeTableKey(key)
+    if not primaryKey.startsWith(DATA_ROW_PREFIX):
+      return key
+
+    let afterDataPrefix = primaryKey[DATA_ROW_PREFIX.len .. ^1]
+
+    # Check if the key already has a group ID (26-char ULID + "/")
+    if afterDataPrefix.len < GROUP_ID_WIDTH + 1 or
+       afterDataPrefix[GROUP_ID_WIDTH] != '/':
+      # No group ID present — this is a scan-bound key, just add
+      return addGroupIdToKey(key, newGroupId)
+
+    let rest = afterDataPrefix[GROUP_ID_WIDTH + 1 .. ^1]
+    # `rest` is the bare PK, possibly with MVCC suffix (\x00\x00<ts> or \x00\x01<txnId>)
+
+    # Rebuild the key with the new group ID
+    let newGroupIdStr = $newGroupId
+    let newPrimaryKey = DATA_ROW_PREFIX & newGroupIdStr & "/" & rest
+    return encodeTableKey(tableId, newPrimaryKey)
+  except ValueError:
+    return key
+
 proc narrowScanBoundsToGroup*(startKey, endKey: string,
     tableId: TableId, groupId: GroupID): tuple[startKey: string,
         endKey: string] =

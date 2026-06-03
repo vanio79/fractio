@@ -139,6 +139,7 @@ type
     # Coordinator callback for message delivery
     coordinatorCb*: proc(groupId: GroupID, msgData: pointer,
         msgLen: csize_t) {.gcsafe, closure.}
+    cbEnabled*: Atomic[bool]
 
 proc newMultiplexedRaftTransport*(nodeId: core_types.NodeID, host: string,
     port: int): MultiplexedRaftTransport =
@@ -148,6 +149,7 @@ proc newMultiplexedRaftTransport*(nodeId: core_types.NodeID, host: string,
   result.host = host
   result.port = port
   result.serverRunning.store(false)
+  result.cbEnabled.store(true)
   result.connections = nimtables.initTable[core_types.NodeID, PeerConnection]()
   result.groupHandlers = nimtables.initTable[GroupID, MessageHandler]()
   result.pendingResponses = nimtables.initTable[uint64, PendingResponse]()
@@ -451,7 +453,7 @@ proc handleMessage(t: MultiplexedRaftTransport, conn: PeerConnection,
     # echo "DEBUG: handleMessage received groupId=", groupId, " payloadLen=", payload.len
 
     # If we have a coordinator callback, deliver directly
-    if t.coordinatorCb != nil:
+    if t.cbEnabled.load(moRelaxed) and t.coordinatorCb != nil:
       var dataPtr: pointer = nil
       if payload.len > 0:
         dataPtr = unsafeAddr payload[0]
@@ -585,7 +587,7 @@ proc readOneMessage(client: Socket, t: MultiplexedRaftTransport): bool =
         return false
 
     # Deliver to coordinator
-    if t.coordinatorCb != nil:
+    if t.cbEnabled.load(moRelaxed) and t.coordinatorCb != nil:
       var dataPtr: pointer = nil
       if payloadLen > 0:
         dataPtr = unsafeAddr payload[0]
@@ -749,7 +751,14 @@ proc stopServer*(t: MultiplexedRaftTransport) =
 proc setCoordinatorCallback*(t: MultiplexedRaftTransport,
     cb: proc(groupId: GroupID, msgData: pointer, msgLen: csize_t) {.gcsafe, closure.}) =
   ## Set the coordinator callback for message delivery.
-  t.coordinatorCb = cb
+  ## When cb is nil, disables the callback via atomic flag instead of
+  ## assigning nil (which triggers ARC deallocation that can crash under
+  ## AtomicArc if the closure's env was shared across threads).
+  if cb == nil:
+    t.cbEnabled.store(false, moRelease)
+  else:
+    t.coordinatorCb = cb
+    t.cbEnabled.store(true, moRelease)
 
 proc registerGroupHandler*(t: MultiplexedRaftTransport, groupId: GroupID,
     handler: MessageHandler) =

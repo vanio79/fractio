@@ -51,7 +51,7 @@ proc main() =
   echo ""
   echo "Creating table 'testspace.public.users'..."
   let tableRes = client.query(
-    "CREATE TABLE testspace.public.users (id INT64 PRIMARY KEY, name STRING)",
+    "CREATE TABLE testspace.public.users (id INT PRIMARY KEY, name STRING)",
     database = "testspace",
     schema = "public"
   )

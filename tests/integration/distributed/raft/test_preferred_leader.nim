@@ -18,6 +18,7 @@ import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
 import fractio/distributed/meta/system_schemas
+import fractio/core/types except NodeID
 import fractio/protocol/raft_store
 import ../../../test_config
 import ../../../test_cluster_helper
@@ -33,11 +34,10 @@ suite "Preferred leader rebalancing — 3-node cluster":
     globalLogger.setMinLevel(llDebug)
 
   test "loadGroupMembers reads preferredLeader from sys.groups":
-    var cluster = newTestCluster(TestClusterConfig(
-      nodeCount: 3,
-      portOffset: 50000, # Use different port range
-      parallelStartup: false
-    ))
+    var cfg = defaultTestClusterConfig()
+    cfg.portOffset = 50000
+    cfg.parallelStartup = false
+    var cluster = newTestCluster(cfg)
     defer: cluster.stop()
 
     # Find meta leader
@@ -56,11 +56,9 @@ suite "Preferred leader rebalancing — 3-node cluster":
         DATA_GROUP_START_ID] == 1'u32
 
   test "transferLeadership moves leadership to target node":
-    var cluster = newTestCluster(TestClusterConfig(
-      nodeCount: 3,
-      portOffset: 10000,
-      parallelStartup: true
-    ))
+    var cfg = defaultTestClusterConfig()
+    cfg.portOffset = 10000
+    var cluster = newTestCluster(cfg)
     defer: cluster.stop()
 
     # Load preferred leaders on all nodes
@@ -104,11 +102,9 @@ suite "Preferred leader rebalancing — 3-node cluster":
   test "preferred leader wins via NuRaft election":
     ## Verifies that after leadership transfer, the preferred leader
     ## can take over and remain stable.
-    var cluster = newTestCluster(TestClusterConfig(
-      nodeCount: 3,
-      portOffset: 20000,
-      parallelStartup: true
-    ))
+    var cfg = defaultTestClusterConfig()
+    cfg.portOffset = 20000
+    var cluster = newTestCluster(cfg)
     defer: cluster.stop()
 
     # Load preferred leaders on all nodes
@@ -116,19 +112,20 @@ suite "Preferred leader rebalancing — 3-node cluster":
       node.store.loadGroupMembers()
 
     # Create a space group (gid=100) with preferredLeader = 2
-    let testGid = GroupID(100)
+    let testGid = groupIDFromInt(100)
 
     # Find meta leader to write sys.groups
     let metaLeader = cluster.findLeader(META_GROUP_ID)
     doAssert metaLeader >= 0
 
     # Write sys.groups record with preferredLeader = 2
-    let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $testGid.uint64)
+    let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $testGid)
     var replicasSeq: seq[GroupReplicaBin] = @[]
     for n in 1..3:
       replicasSeq.add(GroupReplicaBin(nodeId: uint32(n), replicaType: rtVoter))
     let groupRec = GroupRecord(
-      groupId: testGid.uint64,
+      groupId: ULID(testGid),
+      spaceId: zeroSpaceID(),
       replicas: replicasSeq,
       preferredLeader: 2,
     )
@@ -185,28 +182,27 @@ suite "Preferred leader rebalancing — 3-node cluster":
   test "non-preferred leader is replaced exactly once (no repeated stepdowns)":
     ## Verifies that once the preferred leader takes over, there are no
     ## further elections (the stepdown-election cycle is broken).
-    var cluster = newTestCluster(TestClusterConfig(
-      nodeCount: 3,
-      portOffset: 30000,
-      parallelStartup: true
-    ))
+    var cfg = defaultTestClusterConfig()
+    cfg.portOffset = 30000
+    var cluster = newTestCluster(cfg)
     defer: cluster.stop()
 
     for node in cluster.nodes:
       node.store.loadGroupMembers()
 
     # Create group 101 with preferredLeader = node 3
-    let testGid = GroupID(101)
+    let testGid = groupIDFromInt(101)
 
     let metaLeader = cluster.findLeader(META_GROUP_ID)
     doAssert metaLeader >= 0
 
-    let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $testGid.uint64)
+    let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $testGid)
     var replicasSeq: seq[GroupReplicaBin] = @[]
     for n in 1..3:
       replicasSeq.add(GroupReplicaBin(nodeId: uint32(n), replicaType: rtVoter))
     let groupRec = GroupRecord(
-      groupId: testGid.uint64,
+      groupId: ULID(testGid),
+      spaceId: zeroSpaceID(),
       replicas: replicasSeq,
       preferredLeader: 3,
     )

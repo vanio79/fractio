@@ -582,6 +582,7 @@ proc loadGroupMembers*(store: RaftKVStoreExt,
   let endKey = makeScanEndKey(SYS_GROUPS_TABLE_ID)
   let backend = store.getBackend()
   var entries: seq[KeyValuePair] = @[]
+
   if backend != nil and backend.isOpen:
     {.cast(raises: []).}:
       entries = backend.scan(startKey, endKey)
@@ -631,6 +632,11 @@ proc loadGroupMembers*(store: RaftKVStoreExt,
   var newPreferredLeaders = tables.initTable[GroupID, uint32]()
   var newGroupLeaders = tables.initTable[GroupID, uint32]()
 
+  {.cast(raises: []).}:
+    {.cast(gcsafe).}:
+      debug("loadGroupMembers: scanning entries",
+        {"latestVersions": $latestVersions.len}.toTable)
+
   for (k, entry) in latestVersions.pairs:
     {.cast(raises: []).}:
       try:
@@ -653,7 +659,10 @@ proc loadGroupMembers*(store: RaftKVStoreExt,
         if leader > 0:
           newGroupLeaders[gid] = leader
       except:
-        discard
+        {.cast(raises: []).}:
+          {.cast(gcsafe).}:
+            debug("loadGroupMembers: failed to decode group record",
+              {"keyLen": $k.len, "valueLen": $entry.value.len}.toTable)
 
   # Preserve in-memory leader info for groups where we know the leader
   # (onLeaderChanged is the source of truth, backend may be stale during rebalancing)
@@ -1003,7 +1012,8 @@ proc applyBatchToSM*(storePtr: pointer, rid: GroupID,
 
 # Forward declaration for use in processLeaderPersistReq
 proc forwardPutToLeader(store: RaftKVStoreExt, groupId: GroupID,
-    key, value: string): RSResult[RaftKVEntry] {.gcsafe, raises: [].}
+    key, value: string,
+    migrationWrite: bool = false): RSResult[RaftKVEntry] {.gcsafe, raises: [].}
 
 proc processLeaderPersistReq*(s: RaftKVStoreExt,
     req: LeaderPersistReq) {.gcsafe, raises: [].} =
@@ -1958,21 +1968,55 @@ proc validateKeyRouting(store: RaftKVStoreExt, key: string,
       if hasNonZero and store.spaces.hasKey(sid):
         let space = store.spaces.getOrDefault(sid)
         release(store.spacesMu)
-        let pk = if primaryKey.startsWith("d/"):
-                   primaryKey[2 .. ^1]
-                 else:
-                   primaryKey
+        # Extract the bare primary key from the stored key.
+        # Stored format: /t/<tableId>/d/<groupId>/<pk>
+        # Scan-bound format: /t/<tableId>/d/<pk>
+        # For stored format keys, we must strip the group ID to get the
+        # bare PK that routeToGroup uses for consistent hashing.
+        var barePk: string
+        if primaryKey.startsWith("d/"):
+          try:
+            let (_, _, pk) = decodeDataRowKey(key)
+            barePk = pk
+          except ValueError:
+            # Not a valid stored-format key — may be scan-bound.
+            # Fall back to stripping just "d/" prefix.
+            barePk = primaryKey[2 .. ^1]
+        else:
+          barePk = primaryKey
         # NOTE: Do NOT call stripMvccSuffix on bare PK - binary PKs may
         # contain legitimate \x00 bytes that would incorrectly match MVCC pattern
-        let expected = routeToGroup(pk, space.groupIds)
+        let expected = routeToGroup(barePk, space.groupIds)
         if expected != groupId:
           # During rebalancing, also check if the key routes to an old group
           if space.workerState != wsIdle and space.oldGroupIds.len > 0:
-            let oldExpected = routeToGroup(pk, space.oldGroupIds)
+            let oldExpected = routeToGroup(barePk, space.oldGroupIds)
             if oldExpected == groupId:
               # Key routes to an old group during rebalancing - this is valid
               return none(RaftStoreError)
-          # Key routes to wrong group - return error (unless rebalancing matched old group)
+          # Routing mismatch — the in-memory cache may be stale.
+          # Reload spaces and table-spaces from backend and retry once.
+          store.loadSpaces()
+          store.loadTableSpaces()
+          acquire(store.spacesMu)
+          let sid2 = store.tableSpaces.getOrDefault(tableId, zeroSpaceID())
+          var sid2HasNonZero = false
+          for b in ULID(sid2).data:
+            if b != 0: sid2HasNonZero = true; break
+          if sid2HasNonZero and store.spaces.hasKey(sid2):
+            let space2 = store.spaces.getOrDefault(sid2)
+            release(store.spacesMu)
+            let expected2 = routeToGroup(barePk, space2.groupIds)
+            if expected2 == groupId:
+              return none(RaftStoreError)
+            # Still wrong after reload — also check old groups during rebalance
+            if space2.workerState != wsIdle and space2.oldGroupIds.len > 0:
+              let oldExpected2 = routeToGroup(barePk, space2.oldGroupIds)
+              if oldExpected2 == groupId:
+                return none(RaftStoreError)
+          else:
+            release(store.spacesMu)
+          # Key routes to wrong group - return error
           return some(newRSE(rseBadRouting,
               "key routes to group " & $expected &
               " not " & $groupId))
@@ -1983,13 +2027,17 @@ proc validateKeyRouting(store: RaftKVStoreExt, key: string,
   none(RaftStoreError)
 
 proc raftPutInGroup*(store: RaftKVStoreExt, key, value: string,
-    groupId: GroupID): RSResult[RaftKVEntry] {.gcsafe, raises: [].} =
+    groupId: GroupID,
+    skipRoutingValidation: bool = false): RSResult[RaftKVEntry] {.gcsafe, raises: [].} =
   ## Write `value` under `key` through Raft consensus, routed to a specific group.
   ## Used by the protocol server for group-routed forwarded requests.
   ## Validates that the key routes to this group and that this node is the leader.
-  let routeErr = store.validateKeyRouting(key, groupId)
-  if routeErr.isSome:
-    return rsErr[RaftKVEntry](routeErr.get())
+  ## When `skipRoutingValidation` is true, skips key routing validation (used
+  ## for migration writes where the remote node's space cache may be stale).
+  if not skipRoutingValidation:
+    let routeErr = store.validateKeyRouting(key, groupId)
+    if routeErr.isSome:
+      return rsErr[RaftKVEntry](routeErr.get())
   let batch = newWriteBatch()
   batch.put(toBytes(key), toBytes(value))
   let vr = proposeWrite(store, groupId, batch)
@@ -2592,7 +2640,8 @@ proc getSpaceForTable*(store: RaftKVStoreExt,
 
 # Forward declarations for helper procedures
 proc forwardPutToLeaderRemote(store: RaftKVStoreExt, groupId: GroupID,
-    targetNodeId: uint32, key, value: string): RSResult[RaftKVEntry] {.gcsafe,
+    targetNodeId: uint32, key, value: string,
+    migrationWrite: bool = false): RSResult[RaftKVEntry] {.gcsafe,
         raises: [].}
 proc forwardDeleteToLeaderRemote(store: RaftKVStoreExt, groupId: GroupID,
     targetNodeId: uint32, key: string): RSResult[Option[RaftKVEntry]] {.gcsafe,
@@ -2636,11 +2685,15 @@ proc findLeaderForGroup*(store: RaftKVStoreExt,
   return some(targetNode)
 
 proc forwardPutToLeader(store: RaftKVStoreExt, groupId: GroupID,
-    key, value: string): RSResult[RaftKVEntry] {.gcsafe, raises: [].} =
+    key, value: string,
+    migrationWrite: bool = false): RSResult[RaftKVEntry] {.gcsafe, raises: [].} =
   ## Forward a PUT to the leader of `groupId`. If the local node is the
   ## leader (verified by coordinator), performs a local write.
   ## If the local write fails (e.g., leadership changed), falls back to
   ## forwarding to another group member.
+  ## When `migrationWrite` is true, the remote put request includes a flag
+  ## that tells the server to skip key routing validation (the remote node's
+  ## space cache may be stale during migration).
   let localNodeId = store.coordinator.nodeId.uint32
 
   # Check if we think we're the leader AND verify with coordinator
@@ -2722,13 +2775,16 @@ proc forwardPutToLeader(store: RaftKVStoreExt, groupId: GroupID,
       return rsErr[RaftKVEntry](newRSE(rseNotLeader,
           "no other members for group " & $groupId))
     # Forward to the other member using remote procedure
-    return forwardPutToLeaderRemote(store, groupId, targetNodeId, key, value)
+    return forwardPutToLeaderRemote(store, groupId, targetNodeId, key, value,
+        migrationWrite)
 
   # Remote write - look up node info and forward
-  return forwardPutToLeaderRemote(store, groupId, leaderNodeId, key, value)
+  return forwardPutToLeaderRemote(store, groupId, leaderNodeId, key, value,
+      migrationWrite)
 
 proc forwardPutToLeaderRemote(store: RaftKVStoreExt, groupId: GroupID,
-    targetNodeId: uint32, key, value: string): RSResult[RaftKVEntry] {.gcsafe,
+    targetNodeId: uint32, key, value: string,
+    migrationWrite: bool = false): RSResult[RaftKVEntry] {.gcsafe,
         raises: [].} =
   ## Helper: forward a PUT to a specific remote node
   let infoOpt = store.lookupNodeInfo(targetNodeId)
@@ -2737,6 +2793,14 @@ proc forwardPutToLeaderRemote(store: RaftKVStoreExt, groupId: GroupID,
         "no node info for leader " & $targetNodeId))
   let info = infoOpt.get()
   {.cast(raises: []).}:
+    {.cast(gcsafe).}:
+      debug("forwardPutToLeaderRemote: connecting", {
+        "targetNodeId": $targetNodeId,
+        "host": info.host,
+        "port": $info.clientPort,
+        "groupId": $groupId,
+        "migrationWrite": $migrationWrite
+      }.toTable)
     try:
       let cfg = ClientConfig(host: info.host, port: info.clientPort,
                              timeoutMs: 5000)
@@ -2746,7 +2810,8 @@ proc forwardPutToLeaderRemote(store: RaftKVStoreExt, groupId: GroupID,
         return rsErr[RaftKVEntry](newRSE(rseNotLeader,
             "failed to connect to leader: " & $cr.err))
       defer: pc.disconnect()
-      let pr = pc.kvRawPutInGroup(key, value, groupId)
+      let flags = if migrationWrite: PutFlagMigrationWrite else: 0'u8
+      let pr = pc.kvRawPutInGroup(key, value, groupId, flags = flags)
       if not pr.isOk:
         if pr.err.kind == peNotLeader:
           return rsErr[RaftKVEntry](newRSE(rseNotLeader, pr.err.msg,
@@ -3838,7 +3903,21 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: SpaceID) {.raises: [
     # Set startedAtNs if this is a fresh claim (not a resume)
     if space.checkpoint.startedAtNs == 0:
       space.checkpoint.startedAtNs = nowNs
-    if not store.updateSpaceRecord(space):
+    # Retry claiming worker role in case of transient leadership changes
+    var claimRetries = 0
+    while not store.updateSpaceRecord(space) and claimRetries < 5:
+      if not store.coordinator.running.load(): return
+      inc claimRetries
+      sleep(200)
+      # Re-read space state in case it changed during the wait
+      acquire(store.spacesMu)
+      if store.spaces.hasKey(spaceId):
+        space = store.spaces[spaceId]
+      release(store.spacesMu)
+      space.workerState = wsMigrating
+      space.workerNodeId = myNodeId
+      space.workerHeartbeat = store.nowNs()
+    if claimRetries >= 5:
       # Cannot claim worker role - not the leader or Raft issue
       {.cast(raises: []).}:
         {.cast(gcsafe).}:
@@ -3888,6 +3967,11 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: SpaceID) {.raises: [
     var completedSet = tables.initTable[TableId, bool]()
     for tid in space.checkpoint.completedTables:
       completedSet[tid] = true
+
+    # Ensure node info cache and group member cache are warm before migration.
+    # Migration uses forwardPutToLeader which needs node connection info.
+    store.populateNodeInfoCache()
+    store.loadGroupMembers()
 
     # Debug: log migration start state
     {.cast(raises: []).}:
@@ -3945,37 +4029,80 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: SpaceID) {.raises: [
 
       for (k, v) in entries:
         if not store.coordinator.running.load(): return
-        # Extract primary key from the LevelDB key: /t/<tableId>/d/<pk>
+        # Extract bare primary key from the LevelDB key.
+        # Stored key format: /t/<tableId>/d/<groupId>/<pk>
+        # Version keys append: \x00\x00<8 bytes timestamp>
+        # Intent keys append:  \x00\x01<16 bytes txnId>
         try:
           let decoded = decodeTableKey(k)
           if decoded.tableId != tableId: continue
           let afterD = decoded.primaryKey
           if not afterD.startsWith("d/"): continue
-          let pk = afterD[2..^1]
 
-          # NOTE: Do NOT call stripMvccSuffix on bare PK - binary PKs may
-          # contain legitimate \x00 bytes that would incorrectly match MVCC pattern
-          let oldGroup = routeToGroup(pk, oldGroupIds)
-          let newGroup = routeToGroup(pk, newGroupIds)
+          # Skip intent keys — they represent in-progress transactions and
+          # should not be migrated. They will be resolved (committed/aborted)
+          # by the normal transaction path before or during migration.
+          if isIntentKeyMvcc(k):
+            continue
+
+          # For version keys, strip the \x00\x00<8 bytes> suffix to get
+          # the userKey, then decode it to extract the bare PK.
+          # For plain data keys, decode directly.
+          var barePk: string
+          var isVersion = isVersionKey(k)
+          if isVersion:
+            # Strip the 10-byte version suffix (\x00\x00 + 8 bytes timestamp)
+            let userKey = k[0 ..< k.len - 10]
+            try:
+              let (_, _, pk) = decodeDataRowKey(userKey)
+              barePk = pk
+            except ValueError:
+              # Not a valid data row key after stripping suffix — skip
+              continue
+          else:
+            # Plain data key — decode group ID and PK directly
+            try:
+              let (_, _, pk) = decodeDataRowKey(k)
+              barePk = pk
+            except ValueError:
+              # Key doesn't have a group ID — skip (scan-bound key, shouldn't
+              # exist in the backend but handle gracefully)
+              continue
+
+          # NOTE: barePk may contain \x00 bytes for binary PKs — that's fine.
+          # routeToGroup hashes the full binary PK consistently.
+
+          let oldGroup = routeToGroup(barePk, oldGroupIds)
+          let newGroup = routeToGroup(barePk, newGroupIds)
 
           # Debug: log routing for each key
           {.cast(raises: []).}:
             {.cast(gcsafe).}:
               debug("runRebalanceMigration: key routing", {
-                "key": $k[0..min(40, k.len-1)],
-                "pk": $pk,
+                "keyLen": $k.len,
+                "barePkLen": $barePk.len,
                 "oldGroup": $oldGroup,
                 "newGroup": $newGroup,
-                "needsMigration": $(oldGroup != newGroup)
+                "needsMigration": $(oldGroup != newGroup),
+                "isVersionKey": $isVersion
               }.toTable)
 
           # Only migrate if the key moves to a different group
           if oldGroup != newGroup:
             let newRid = GroupID(newGroup)
 
+            # CRITICAL: Rewrite the key with the new group ID.
+            # The stored key contains the OLD group ID: /t/<tid>/d/<oldGid>/<pk>
+            # After migration, queries scan the NEW group's prefix:
+            # /t/<tid>/d/<newGid>/<pk>. Without rewriting, the migrated data
+            # is invisible because the old group prefix no longer matches.
+            let rewrittenKey = rewriteGroupIdInKey(k, newRid)
+
             # Forward to leader - this handles both local and remote cases
-            # The data is in the shared backend, accessible by both old and new groups
-            var writeResult = store.forwardPutToLeader(newRid, k, v)
+            # Use migrationWrite=true to skip routing validation on remote nodes
+            # (their space cache may be stale during migration)
+            var writeResult = store.forwardPutToLeader(newRid, rewrittenKey, v,
+                migrationWrite = true)
             var retries = 0
             while not writeResult.isOk and retries < 20:
               if not store.coordinator.running.load(): return
@@ -3984,7 +4111,8 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: SpaceID) {.raises: [
                 withLock store.groupMu:
                   store.groupLeaders[newRid] = writeResult.error.leaderHint
               sleep(100)
-              writeResult = store.forwardPutToLeader(newRid, k, v)
+              writeResult = store.forwardPutToLeader(newRid, rewrittenKey, v,
+                  migrationWrite = true)
               inc retries
             if not writeResult.isOk:
               # Migration failed - mark as failed and return
@@ -3992,13 +4120,19 @@ proc runRebalanceMigration*(store: RaftKVStoreExt, spaceId: SpaceID) {.raises: [
               space.checkpoint.lastProgressNs = store.nowNs()
               discard store.updateSpaceRecord(space)
               debug("runRebalanceMigration: forwardPutToLeader failed",
-                {"spaceId": $spaceId, "key": $k, "newGroup": $newRid,
+                {"spaceId": $spaceId, "rewrittenKeyLen": $rewrittenKey.len,
+                 "origKeyLen": $k.len,
+                 "newGroup": $newRid,
                  "error": $writeResult.error}.toTable)
               return
-            # Note: We do NOT delete from old group here because:
-            # 1. Both groups share the same backend
-            # 2. Deleting would remove the data we just wrote
-            # 3. The old group will be removed at cutover
+
+            # Delete the old key from the old group (best-effort).
+            # Since both groups share one LevelDB backend, the old key (with
+            # the old group ID prefix) would remain as orphaned data if not
+            # deleted. This is best-effort because leadership of the old group
+            # may have changed; failure is non-fatal.
+            let oldRid = GroupID(oldGroup)
+            discard store.forwardDeleteToLeader(oldRid, k)
 
           inc keysMigrated
 

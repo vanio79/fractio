@@ -22,6 +22,7 @@ import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
 import fractio/distributed/meta/system_schemas
 import fractio/protocol/raft_store
+import fractio/core/types except NodeID
 
 import test_config
 
@@ -33,7 +34,7 @@ type
   MemberInfo* = tuple
     nodeId: uint32
     host: string
-    basePort: int
+    port: int
 
   TestClusterConfig* = object
     ## Configuration for a test cluster
@@ -113,7 +114,7 @@ proc getMemberInfo(config: TestClusterConfig): seq[MemberInfo] =
   for i in 1 .. config.nodeCount:
     let nodeId = uint32(i)
     let basePort = config.basePort + config.portOffset + (i - 1) * 1000
-    result.add((nodeId: nodeId, host: "127.0.0.1", basePort: basePort))
+    result.add((nodeId: nodeId, host: "127.0.0.1", port: basePort))
 
 proc getStoragePath(nodeId: uint32, portOffset: int): string =
   "/tmp/fractio_test_node" & $nodeId & "_" & $portOffset
@@ -138,7 +139,7 @@ proc newTestNode(
   # Create coordinator
   let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
     nodeId: rangeTypes.NodeID(nodeId),
-    basePort: basePort,
+    port: basePort,
     host: host,
     dataDir: storagePath,
     electionTimeoutLowerMs: config.electionTimeoutLowerMs,
@@ -148,7 +149,7 @@ proc newTestNode(
 
   # Populate peer info
   for m in members:
-    coord.peerInfo[m.nodeId] = (host: m.host, basePort: m.basePort)
+    coord.peerInfo[m.nodeId] = (host: m.host, port: m.port)
 
   # Start coordinator (just sets running flag)
   coord.start()
@@ -426,17 +427,19 @@ proc seedSystemTables*(cluster: TestCluster) =
     )
     let res = leader.store.raftPut(key, nodeRec.encode())
     if not res.isOk:
-      echo "WARN: Failed to seed sys.nodes for node ", node.nodeId, ": ", res.error.msg
+      echo "WARN: Failed to seed sys.nodes for node ", node.nodeId, ": ",
+          res.error.msg
 
   # Seed sys.groups
   for gid in [META_GROUP_ID, DATA_GROUP_START_ID]:
-    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid.uint64)
+    let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $gid)
     var replicasSeq: seq[GroupReplicaBin] = @[]
     for node in cluster.nodes:
       replicasSeq.add(GroupReplicaBin(nodeId: node.nodeId,
           replicaType: rtVoter))
     let groupRec = GroupRecord(
-      groupId: gid.uint64,
+      groupId: ULID(gid),
+      spaceId: zeroSpaceID(),
       replicas: replicasSeq,
       preferredLeader: config.preferredLeader,
     )
@@ -488,3 +491,137 @@ proc kvGet*(node: TestNode, key: string): Option[string] =
   if res.isOk and res.value.isSome:
     return some(res.value.get.value)
   none(string)
+
+# ============================================================================
+# Shared Test Fixtures
+# ============================================================================
+
+type
+  SharedClusterFixture* = ref object
+    ## A shared test fixture that allows multiple tests to reuse the same cluster.
+    ## This avoids the overhead of creating/destroying clusters between tests.
+    ##
+    ## Usage:
+    ##   var fixture = newSharedClusterFixture(TestClusterConfig(
+    ##     nodeCount: 3,
+    ##     parallelStartup: true
+    ##   ))
+    ##   suite "My tests":
+    ##     setup:
+    ##       fixture.setup()
+    ##     teardown:
+    ##       fixture.teardown()
+    ##     test "example 1":
+    ##       let cluster = fixture.get()
+    ##       # use cluster...
+    ##     test "example 2":
+    ##       let cluster = fixture.get()  # Same cluster, state persists
+    ##       # use cluster...
+    ##
+    ## The cluster is created lazily on first setup() and destroyed when
+    ## the fixture is garbage collected or stop() is called.
+    config: TestClusterConfig
+    cluster: TestCluster
+    initialized: bool
+    testCount: int
+    lock: Lock
+
+proc newSharedClusterFixture*(config: TestClusterConfig): SharedClusterFixture =
+  ## Create a new shared cluster fixture with the given configuration.
+  ## The cluster is not created until setup() is called.
+  result = SharedClusterFixture(
+    config: config,
+    initialized: false,
+    testCount: 0
+  )
+  initLock(result.lock)
+
+proc setup*(fixture: SharedClusterFixture) =
+  ## Setup for each test. Creates the cluster on first call.
+  ## Subsequent calls return the same cluster.
+  withLock fixture.lock:
+    if not fixture.initialized:
+      fixture.cluster = newTestCluster(fixture.config)
+      fixture.initialized = true
+    inc fixture.testCount
+
+proc teardown*(fixture: SharedClusterFixture) =
+  ## Teardown for each test. Currently a no-op since the cluster is shared.
+  ## Override this in your tests if you need per-test cleanup.
+  discard
+
+proc get*(fixture: SharedClusterFixture): var TestCluster =
+  ## Get the shared cluster. Must call setup() first.
+  doAssert fixture.initialized, "Fixture not initialized - call setup() first"
+  fixture.cluster
+
+proc stop*(fixture: SharedClusterFixture) =
+  ## Stop the shared cluster and clean up.
+  withLock fixture.lock:
+    if fixture.initialized:
+      fixture.cluster.stop()
+      fixture.initialized = false
+
+proc isInitialized*(fixture: SharedClusterFixture): bool =
+  ## Check if the fixture has been initialized.
+  withLock fixture.lock:
+    result = fixture.initialized
+
+proc reset*(fixture: SharedClusterFixture) =
+  ## Reset the cluster by stopping and recreating it.
+  ## Use this if tests corrupt the cluster state.
+  withLock fixture.lock:
+    if fixture.initialized:
+      fixture.cluster.stop()
+    fixture.cluster = newTestCluster(fixture.config)
+    fixture.initialized = true
+
+# ============================================================================
+# Test State Isolation Helpers
+# ============================================================================
+
+proc clearTestData*(cluster: var TestCluster) =
+  ## Clear all user data from the cluster, keeping system tables.
+  ## Use this between tests to isolate test data while reusing the cluster.
+  for node in cluster.nodes.mitems:
+    # Clear any user-created groups (keep META and DATA_GROUP_START)
+    var groupsToRemove: seq[GroupID] = @[]
+    for gid, _ in node.coord.groups:
+      if gid != META_GROUP_ID and gid != DATA_GROUP_START_ID:
+        groupsToRemove.add(gid)
+    for gid in groupsToRemove:
+      node.coord.removeGroup(gid)
+
+proc reseedSystemTables*(cluster: var TestCluster) =
+  ## Re-seed system tables after clearing or modifying cluster state.
+  cluster.seedSystemTables()
+
+# ============================================================================
+# Test Suite Template
+# ============================================================================
+
+template sharedClusterSuite*(suiteName: string, config: TestClusterConfig,
+                             body: untyped): untyped =
+  ## Template to create a test suite with a shared cluster fixture.
+  ## The cluster is created once and shared across all tests in the suite.
+  ##
+  ## Usage:
+  ##   sharedClusterSuite("My Cluster Tests", TestClusterConfig(nodeCount: 3)):
+  ##     test "first test":
+  ##       let cluster = fixture.get()
+  ##       # ...
+  ##     test "second test":
+  ##       let cluster = fixture.get()
+  ##       # ... (same cluster, state persists from first test)
+  ##
+  ## If you need isolated state between tests, call fixture.reset() in setup.
+  var fixture {.global.} = newSharedClusterFixture(config)
+
+  suite suiteName:
+    setup:
+      fixture.setup()
+
+    teardown:
+      fixture.teardown()
+
+    body

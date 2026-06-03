@@ -436,3 +436,95 @@ suite "Key Rewrite with Group ID":
     check decodedTableId == tableId
     check decodedGroupId == groupId
     check decodedPk == ""
+
+suite "Rewrite Group ID in Key":
+
+  test "rewriteGroupIdInKey replaces groupId in plain data key":
+    let tableId = makeTableId()
+    let oldGroup = makeGroupId(1)
+    let newGroup = makeGroupId(2)
+    let pk = "\x01\x80\x00\x00\x00\x00\x00\x00\x2a"
+
+    let key = encodeDataRowKey(tableId, oldGroup, pk)
+    let rewrittenKey = rewriteGroupIdInKey(key, newGroup)
+
+    # Decode the rewritten key — should have the new group ID
+    let (decodedTableId, decodedGroupId, decodedPk) = decodeDataRowKey(rewrittenKey)
+    check decodedTableId == tableId
+    check decodedGroupId == newGroup
+    check decodedPk == pk
+
+  test "rewriteGroupIdInKey preserves MVCC version suffix":
+    let tableId = makeTableId()
+    let oldGroup = makeGroupId(1)
+    let newGroup = makeGroupId(2)
+    let pk = "test-pk"
+
+    # Create a data row key with the old group
+    let userKey = encodeDataRowKey(tableId, oldGroup, pk)
+
+    # Simulate a version key by appending \x00\x00 + 8-byte timestamp
+    var versionKey = userKey
+    versionKey.add("\x00\x00")
+    for i in 0..<8:
+      versionKey.add(chr(i)) # fake timestamp bytes
+
+    let rewrittenKey = rewriteGroupIdInKey(versionKey, newGroup)
+
+    # The rewritten key should have the new group ID and still end with
+    # the version suffix
+    check rewrittenKey.len == versionKey.len
+    check rewrittenKey.endsWith("\x00\x00" & "\x00\x01\x02\x03\x04\x05\x06\x07")
+
+    # Strip the version suffix and decode the userKey portion
+    let rewrittenUserKey = rewrittenKey[0 ..< rewrittenKey.len - 10]
+    let (decodedTableId, decodedGroupId, decodedPk) = decodeDataRowKey(rewrittenUserKey)
+    check decodedTableId == tableId
+    check decodedGroupId == newGroup
+    check decodedPk == pk
+
+  test "rewriteGroupIdInKey preserves MVCC intent suffix":
+    let tableId = makeTableId()
+    let oldGroup = makeGroupId(1)
+    let newGroup = makeGroupId(2)
+    let pk = "intent-test"
+
+    # Create a data row key with the old group
+    let userKey = encodeDataRowKey(tableId, oldGroup, pk)
+
+    # Simulate an intent key by appending \x00\x01 + 16-byte ULID
+    var intentKey = userKey
+    intentKey.add("\x00\x01")
+    for i in 0..<16:
+      intentKey.add(chr(i)) # fake ULID bytes
+
+    let rewrittenKey = rewriteGroupIdInKey(intentKey, newGroup)
+
+    # The rewritten key should have the new group ID and still end with
+    # the intent suffix
+    check rewrittenKey.len == intentKey.len
+    # Check the intent suffix is preserved
+    check rewrittenKey[rewrittenKey.len - 18 .. rewrittenKey.len - 17] == "\x00\x01"
+
+  test "rewriteGroupIdInKey returns non-data-row keys unchanged":
+    let nodeKey = encodeTableKey(SYS_NODES_TABLE_ID, "1")
+    let newGroup = makeGroupId(2)
+
+    let rewrittenKey = rewriteGroupIdInKey(nodeKey, newGroup)
+    check rewrittenKey == nodeKey
+
+  test "rewriteGroupIdInKey adds groupId to scan-bound key":
+    let tableId = makeTableId()
+    let newGroup = makeGroupId(5)
+    let pk = "\x01\x80\x00\x00\x00\x00\x00\x00\x2a"
+
+    # Create a scan-bound key (without groupId)
+    let scanKey = encodeDataRowScanBound(tableId, pk)
+
+    let rewrittenKey = rewriteGroupIdInKey(scanKey, newGroup)
+
+    # Should now be in the stored format with the new group ID
+    let (decodedTableId, decodedGroupId, decodedPk) = decodeDataRowKey(rewrittenKey)
+    check decodedTableId == tableId
+    check decodedGroupId == newGroup
+    check decodedPk == pk

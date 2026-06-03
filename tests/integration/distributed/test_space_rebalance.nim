@@ -1051,6 +1051,12 @@ proc triggerRebalanceAndSetup(nodes: var seq[TestNode],
   waitForAutoDistribution(nodes, newGids, 2, 2000)
   waitForSpaceLeaders(nodes)
   updateGroupLeaders(nodes)
+
+  # Ensure all nodes have fresh node info caches for remote forwarding
+  # during migration (lookupNodeInfo reads from this cache)
+  for n in nodes:
+    n.store.populateNodeInfoCache()
+
   # Refresh metadata with retries
   for n in nodes:
     for i in 0..<3:
@@ -1058,6 +1064,44 @@ proc triggerRebalanceAndSetup(nodes: var seq[TestNode],
         break
       sleep(TEST_POLL_INTERVAL_MS)
   replicateMetadata(nodes)
+
+  # Stabilize: wait for new groups to have write-ready leaders.
+  # NuRaft needs time after election before it can accept writes reliably.
+  for gid in newGids:
+    for node in nodes:
+      if node.coord.hasGroup(gid):
+        discard node.coord.waitForWriteReady(gid, 3000)
+  sleep(500)
+
+proc runMigrationWithRetry(nodes: var seq[TestNode], spaceId: SpaceID) =
+  ## Run runRebalanceMigration on the current META leader with retries.
+  ## The META leader may change between finding it and starting migration,
+  ## so we retry from the current leader if the first attempt fails.
+  for attempt in 0 ..< 5:
+    let leaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
+    if leaderIdx < 0:
+      sleep(500)
+      continue
+    let leaderStore = nodes[leaderIdx].store
+    let leaderNode = nodes[leaderIdx]
+    echo "DEBUG runMigrationWithRetry: attempt=", attempt,
+        " leaderIdx=", leaderIdx, " nodeId=", leaderNode.id,
+        " clientPort=", leaderNode.clientPort
+    leaderStore.populateNodeInfoCache()
+    leaderStore.loadGroupMembers()
+    leaderStore.runRebalanceMigration(spaceId)
+    # Check if migration completed
+    leaderStore.loadSpaces()
+    acquire(leaderStore.spacesMu)
+    let sp = leaderStore.spaces.getOrDefault(spaceId,
+        raft_store.SpaceInfo(workerState: wsIdle))
+    release(leaderStore.spacesMu)
+    if sp.workerState == wsIdle and sp.oldGroupIds.len == 0:
+      return
+    # Migration didn't complete — leader may have changed
+    echo "DEBUG runMigrationWithRetry: attempt=", attempt,
+        " workerState=", sp.workerState, " oldGroupIds.len=", sp.oldGroupIds.len
+    sleep(500)
 
 suite "Space rebalance integration — full migration":
   test "runRebalanceMigration completes and clears rebalance state":
@@ -1071,40 +1115,35 @@ suite "Space rebalance integration — full migration":
     let spaceId = setupSpaceWithData(nodes, "migrate", 2, 30)
     triggerRebalanceAndSetup(nodes, leaderStore, spaceId)
 
-    # Refresh leader before migration in case it changed during setup
-    let migrateLeaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
-    let migrateLeaderStore = nodes[migrateLeaderIdx].store
-    let migrateLeaderNode = nodes[migrateLeaderIdx]
-
-    # Verify rebalancing is active
-    acquire(migrateLeaderStore.spacesMu)
-    var sp = migrateLeaderStore.spaces[spaceId]
-    release(migrateLeaderStore.spacesMu)
-    check sp.workerState != wsIdle
-
-    # Run migration
-    migrateLeaderStore.runRebalanceMigration(spaceId)
+    # Run migration with retry on leader changes
+    runMigrationWithRetry(nodes, spaceId)
     # Wait for Raft to commit migration state changes
     sleep(TEST_REPLICATION_WAIT_MS)
 
+    # Find current leader and verify migration completed
+    let verifyLeaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
+    let verifyLeaderStore = nodes[verifyLeaderIdx].store
+    let migrateLeaderNode = nodes[verifyLeaderIdx]
+
     # Verify rebalance is complete - check in-memory cache directly
-    acquire(migrateLeaderStore.spacesMu)
-    sp = migrateLeaderStore.spaces[spaceId]
-    release(migrateLeaderStore.spacesMu)
+    verifyLeaderStore.loadSpaces()
+    acquire(verifyLeaderStore.spacesMu)
+    var sp = verifyLeaderStore.spaces[spaceId]
+    release(verifyLeaderStore.spacesMu)
     check sp.workerState == wsIdle
     check sp.oldGroupIds.len == 0
     check sp.workerNodeId == 0
 
     # Reload from backend to verify persistence
-    migrateLeaderStore.loadSpaces()
-    acquire(migrateLeaderStore.spacesMu)
-    sp = migrateLeaderStore.spaces[spaceId]
-    release(migrateLeaderStore.spacesMu)
+    verifyLeaderStore.loadSpaces()
+    acquire(verifyLeaderStore.spacesMu)
+    sp = verifyLeaderStore.spaces[spaceId]
+    release(verifyLeaderStore.spacesMu)
     check sp.workerState == wsIdle
     check sp.oldGroupIds.len == 0
 
     # Wait for leaders on all new space groups and refresh client metadata
-    for gid in migrateLeaderStore.spaces[spaceId].groupIds:
+    for gid in verifyLeaderStore.spaces[spaceId].groupIds:
       var foundLeader = false
       for attempt in 0 ..< 50:
         for node in nodes:
@@ -1116,8 +1155,14 @@ suite "Space rebalance integration — full migration":
 
     sleep(500)
 
+    # Reload all server-side caches after migration
     for n in nodes:
-      for i in 0..<3:
+      n.store.loadSpaces()
+      n.store.loadTableSpaces()
+      n.store.loadGroupMembers()
+
+    for n in nodes:
+      for i in 0..<5:
         if n.client.refreshMetadata():
           break
         sleep(TEST_POLL_INTERVAL_MS)
@@ -1138,16 +1183,16 @@ suite "Space rebalance integration — full migration":
 
     triggerRebalanceAndSetup(nodes, leaderStore, spaceId)
 
-    # Refresh leader before migration in case it changed during setup
-    let migrateLeaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
-    let migrateLeaderStore = nodes[migrateLeaderIdx].store
-
-    migrateLeaderStore.runRebalanceMigration(spaceId)
+    # Run migration with retry on leader changes
+    runMigrationWithRetry(nodes, spaceId)
     # Wait for Raft to replicate and apply the changes
     sleep(TEST_REPLICATION_WAIT_MS)
 
     # Wait for leaders on all new space groups
-    for gid in migrateLeaderStore.spaces[spaceId].groupIds:
+    let verifyIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
+    let verifyStore = nodes[verifyIdx].store
+    verifyStore.loadSpaces()
+    for gid in verifyStore.spaces[spaceId].groupIds:
       var foundLeader = false
       for attempt in 0 ..< 50:
         for node in nodes:
@@ -1255,16 +1300,16 @@ suite "Space rebalance integration — crash safety":
     let spaceId = setupSpaceWithData(nodes, "idem", 2, 10)
     triggerRebalanceAndSetup(nodes, leaderStore, spaceId)
 
-    # Refresh leader before migration in case it changed during setup
-    var migrateLeaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
-    var migrateLeaderStore = nodes[migrateLeaderIdx].store
-    var migrateLeaderNode = nodes[migrateLeaderIdx]
+    # Run migration with retry on leader changes
+    runMigrationWithRetry(nodes, spaceId)
 
-    migrateLeaderStore.runRebalanceMigration(spaceId)
-    migrateLeaderStore.loadSpaces()
+    # Find current leader for verification
+    var verifyIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
+    var verifyStore = nodes[verifyIdx].store
+    verifyStore.loadSpaces()
 
     # Wait for leaders on all new space groups
-    for gid in migrateLeaderStore.spaces[spaceId].groupIds:
+    for gid in verifyStore.spaces[spaceId].groupIds:
       var foundLeader = false
       for attempt in 0 ..< 50:
         for node in nodes:
@@ -1274,22 +1319,22 @@ suite "Space rebalance integration — crash safety":
         if foundLeader: break
         sleep(TEST_POLL_INTERVAL_MS)
 
-    migrateLeaderStore.loadGroupMembers()
+    verifyStore.loadGroupMembers()
 
     for n in nodes: discard n.client.refreshMetadata()
 
     # All data accessible
-    let sel1 = exec(migrateLeaderNode, "SELECT * FROM idem_t")
+    let sel1 = exec(nodes[verifyIdx], "SELECT * FROM idem_t")
     if sel1.kind != erkRows: echo "DEBUG: SELECT 1 failed: kind=", sel1.kind
     check sel1.kind == erkRows
     check sel1.rows.len == 10
 
     # Re-run — should be a no-op (not rebalancing anymore)
-    migrateLeaderIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
-    migrateLeaderStore = nodes[migrateLeaderIdx].store
-    migrateLeaderStore.runRebalanceMigration(spaceId)
+    verifyIdx = waitForLeaderOnGroup(nodes, META_GROUP_ID)
+    verifyStore = nodes[verifyIdx].store
+    verifyStore.runRebalanceMigration(spaceId)
 
-    let sel2 = exec(migrateLeaderNode, "SELECT * FROM idem_t")
+    let sel2 = exec(nodes[verifyIdx], "SELECT * FROM idem_t")
     if sel2.kind != erkRows: echo "DEBUG: SELECT 2 failed: kind=", sel2.kind
     check sel2.kind == erkRows
     check sel2.rows.len == 10

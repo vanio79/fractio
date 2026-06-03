@@ -722,12 +722,19 @@ proc deliverBufferedMessages(c: NuRaftCoordinator,
 
 proc clearPendingMessages(c: NuRaftCoordinator) {.gcsafe, raises: [].} =
   ## Clear all pending messages (called during shutdown).
-  ## With AtomicArc GC, cross-thread string deallocation is safe because
-  ## reference counting is atomic. The transport receive thread has already
-  ## been stopped by this point, so no new messages can arrive.
-  {.cast(gcsafe).}:
-    withLock c.pendingMessagesLock:
-      c.pendingMessages.clear()
+  ## IMPORTANT: Under AtomicArc, we must NOT destroy the pendingMessages table
+  ## synchronously because NuRaft's ASIO threads may still be executing
+  ## bufferMessage callbacks that reference the table's internal data structures.
+  ## Even though setCoordinatorCallback(nil) was called earlier, in-flight
+  ## callbacks can still complete and access the table under pendingMessagesLock.
+  ## Destroying the table (via clear, swap, or =sink) while a callback is
+  ## concurrently holding the lock leads to a use-after-free in Nim's allocator
+  ## (addToSharedFreeList crash).
+  ## Instead, we just reset the running flag (already done) and leave the table
+  ## to be cleaned up by GC when the coordinator object is collected. The
+  ## transport has been destroyed, so no new messages will arrive. Any
+  ## in-flight callbacks will find running=false and return early.
+  discard
 
 proc deliverMessageToGroup(c: NuRaftCoordinator, groupId: GroupID,
     msgData: pointer, msgLen: csize_t) =

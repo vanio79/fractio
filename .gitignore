@@ -121,6 +121,7 @@ src/fractio/distributed/raft/raft_store_callbacks
 src/fractio/protocol/mvcc_store
 src/fractio/protocol/raft_store
 src/fractio/sql/executor
+src/fractio/sql/planner
 src/fractio/storage/mvcc/types
 src/fractio/cli/main
 src/fractio/web/dashboard
@@ -134,3 +135,10 @@ src/fractio/web/static/app_debug.js
 tests/integration/web/start_test_cluster
 tests/integration/web/test_rest_api
 scheduler/
+
+# Debug tools and temp UI snapshots
+tools/debug_*.nim
+tools/scale_setup.nim
+tools/verify_query.nim
+ui_*.yml
+examples/3node-cluster/pids/

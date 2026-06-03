@@ -251,7 +251,8 @@ const
   PutFlagReturnPrev* = 0x01'u8
   PutFlagSyncWrite* = 0x02'u8
   PutFlagCAS* = 0x04'u8
-  PutFlagGroupRouted* = 0x10'u8 ## groupId appended after value
+  PutFlagGroupRouted* = 0x10'u8    ## groupId appended after value
+  PutFlagMigrationWrite* = 0x20'u8 ## migration write: skip routing validation
 
   PutStatusOK* = 0x00'u8
   PutStatusCASFailed* = 0x01'u8

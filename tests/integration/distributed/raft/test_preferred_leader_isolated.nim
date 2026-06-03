@@ -1,34 +1,34 @@
-# Isolated test for preferred leader rebalancing.
-import std/[unittest, os, atomics]
+import std/[unittest, os, atomics, tables]
 
+import fractio/distributed/raft/nuraft_coordinator
 import fractio/distributed/raft/group_types as rangeTypes
 import fractio/distributed/meta/system_tables
 import fractio/distributed/meta/system_schemas
+import fractio/core/types except NodeID
 import fractio/protocol/raft_store
 import ../../../test_config
 import ../../../test_cluster_helper
 
 suite "Preferred leader isolated test":
   test "non-preferred leader is replaced exactly once":
-    var cluster = newTestCluster(TestClusterConfig(
-      nodeCount: 3,
-      portOffset: 10000,
-      parallelStartup: true
-    ))
+    var cfg = defaultTestClusterConfig()
+    cfg.portOffset = 10000
+    var cluster = newTestCluster(cfg)
     defer: cluster.stop()
 
     for node in cluster.nodes: node.store.loadGroupMembers()
 
-    let testGid = rangeTypes.GroupID(101)
+    let testGid = groupIDFromInt(101)
     let metaLeader = cluster.waitForLeader(META_GROUP_ID)
     doAssert metaLeader >= 0
 
-    let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $testGid.uint64)
+    let groupKey = encodeTableKey(SYS_GROUPS_TABLE_ID, $testGid)
     var replicasSeq: seq[GroupReplicaBin] = @[]
     for n in 1..3:
       replicasSeq.add(GroupReplicaBin(nodeId: uint32(n), replicaType: rtVoter))
     let groupRec = GroupRecord(
-      groupId: testGid.uint64,
+      groupId: ULID(testGid),
+      spaceId: zeroSpaceID(),
       replicas: replicasSeq,
       preferredLeader: 3,
     )

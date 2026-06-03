@@ -1072,7 +1072,8 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
       return
 
     let writeRes = raftPutInGroup(server.raftStore, req.key, req.value,
-        req.groupId)
+        req.groupId,
+        skipRoutingValidation = (req.flags and PutFlagMigrationWrite) != 0)
     if writeRes.isOk:
       sendFrame(conn, encodePutResponse(PutResponse(
         status: PutStatusOK, timestamp: 0, version: 1)), requestId)
