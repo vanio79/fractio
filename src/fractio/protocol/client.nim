@@ -805,13 +805,18 @@ proc startStreamScan*(ss: StreamingScanClient, startKey: string = "",
     flags: uint8 = 0, txnId: TransactionID = zeroTransactionID(),
     readTimestamp: uint64 = 0,
     groupId: GroupID = ZeroGroupID(),
-    filter: Option[WireFilterExpr] = none(WireFilterExpr)): Result[
+    filter: Option[WireFilterExpr] = none(WireFilterExpr),
+    columns: Option[seq[string]] = none(seq[string])): Result[
         ScanResponseFrame, ProtocolError] {.
     gcsafe, raises: [].} =
   ## Start a streaming scan. Sends the initial request and receives the first frame.
   ## Returns the first frame of results.
   ## chunkSize: number of items per frame (0 = DEFAULT_SCAN_CHUNK_SIZE)
   ## filter: optional server-side filter for reducing network traffic
+  ## columns: optional column names to project server-side (Tier-3a optimization);
+  ##          when set and non-empty, server decodes each DataRow and re-emits
+  ##          only the requested columns, reducing wire size for SELECT id,name
+  ##          style queries on wide tables.
   ## Note: Only valid for single-group mode (not k-way merge mode).
   if ss.kWayMergeMode:
     return peErr(newProtocolError(peInternal,
@@ -824,6 +829,8 @@ proc startStreamScan*(ss: StreamingScanClient, startKey: string = "",
     actualFlags = actualFlags or kvMsgs.ScanFlagGroupRouted
   if filter.isSome:
     actualFlags = actualFlags or kvMsgs.ScanFlagHasFilter
+  if columns.isSome and columns.get().len > 0:
+    actualFlags = actualFlags or kvMsgs.ScanFlagHasColumns
 
   ss.reqFlags = actualFlags
 
@@ -837,6 +844,7 @@ proc startStreamScan*(ss: StreamingScanClient, startKey: string = "",
     groupId: groupId,
     chunkSize: chunkSize,
     filter: filter,
+    columns: columns,
   )
 
   let r = ss.client.send(encodeScanRequest(req))
@@ -1197,7 +1205,8 @@ proc kvStreamScan*(client: ProtocolClient, startKey: string = "",
     readTimestamp: uint64 = 0,
     groupId: GroupID = ZeroGroupID(),
     filter: Option[WireFilterExpr] = none(WireFilterExpr),
-    reverse: bool = false): Result[
+    reverse: bool = false,
+    columns: Option[seq[string]] = none(seq[string])): Result[
         StreamingScanClient, ProtocolError] {.
     gcsafe, raises: [].} =
   ## Start a streaming scan and return a StreamingScanClient for iteration.
@@ -1206,12 +1215,16 @@ proc kvStreamScan*(client: ProtocolClient, startKey: string = "",
   ## filter: optional server-side filter for reducing network traffic
   ## reverse: when true, results are returned in descending key order.
   ##          The server interprets bounds as (startKey, endKey] in this case.
+  ## columns: optional column-name list for server-side projection (Tier-3a);
+  ##          when set and non-empty, server decodes each DataRow, projects
+  ##          to the requested columns, and re-encodes. Cuts wire bytes by
+  ##          N_requested / N_total for wide-table SELECT col1, col2 queries.
   var combinedFlags = flags
   if reverse:
     combinedFlags = combinedFlags or kvMsgs.ScanFlagReverse
   let ss = newStreamingScanClient(client)
   let firstFrameR = ss.startStreamScan(startKey, endKey, limit, chunkSize, combinedFlags,
-                                        txnId, readTimestamp, groupId, filter)
+                                        txnId, readTimestamp, groupId, filter, columns)
   if firstFrameR.isErr:
     return peErr(firstFrameR.error)
   peOk(ss)

@@ -49,6 +49,7 @@ import ../distributed/space_manager
 import ../core/timestamp_provider
 import ../storage/backend
 import ../storage/mvcc/types as mvccValueTypes
+import ../sql/data_row as dataRow
 import ./active_txn_registry
 
 # ---------------------------------------------------------------------------
@@ -1385,6 +1386,16 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
 
       # Use streaming path for large scans to avoid buffering everything in
       # memory. The streaming callback sends frames incrementally.
+      #
+      # Tier-3a: when req.columns is set and non-empty, the client asked the
+      # server to project DataRow values down to a subset of columns BEFORE
+      # shipping over the wire. This dramatically reduces wire size for
+      # SELECT col1, col2 ... FROM wide_table (cut by N_requested/N_total).
+      # Trade: ~1-2ms CPU per 10K rows for decode+project+re-encode; we save
+      # ~40ms of network transfer (10K rows × ~150 bytes per extra column).
+      let projCols = req.columns
+      let hasProjection = projCols.isSome and projCols.get().len > 0
+
       proc sendChunk(chunk: ScanChunk) {.gcsafe, raises: [].} =
         let chunkPairs = chunk.pairs
         var scanPairs = newSeq[ScanPair](chunkPairs.len)
@@ -1392,9 +1403,23 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
           var ver: uint64 = 1
           withLock server.mvccStore.keyVersionsMu:
             ver = server.mvccStore.keyVersions.getOrDefault(p.key, 1'u64)
+          var outValue = p.value
+          if hasProjection:
+            try:
+              let decoded = dataRow.decodeDataRow(p.value)
+              var projected = dataRow.newDataRow()
+              for cname in projCols.get():
+                if decoded.hasColumn(cname):
+                  projected.columns.add(dataRow.newColumn(
+                      cname, decoded[cname]))
+              outValue = dataRow.encodeDataRow(projected)
+            except ValueError:
+              # Not a DataRow (system-table or unencoded value): pass through.
+              # Streaming row iterator on the client falls back gracefully.
+              discard
           scanPairs[i] = ScanPair(
             key: p.key,
-            value: p.value,
+            value: outValue,
             timestamp: uint64(currentTs),
             version: ver,
           )

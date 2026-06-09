@@ -650,6 +650,7 @@ const
   ScanFlagGroupRouted* = 0x10'u8  ## groupId appended for routing filter
   ScanFlagStreaming* = 0x20'u8    ## streaming scan - multiple frames
   ScanFlagHasFilter* = 0x40'u8    ## serialized filter appended for server-side filtering
+  ScanFlagHasColumns* = 0x80'u8 ## serialized column-name list appended for server-side column projection
 
   ScanRespFlagHasMore* = 0x01'u8
   ScanRespFlagEndOfScan* = 0x02'u8
@@ -981,6 +982,7 @@ type
     groupId*: GroupID ## non-zero when GroupRouted flag is set - for server-side routing filter
     chunkSize*: uint32 ## items per frame for streaming (0 = DEFAULT_SCAN_CHUNK_SIZE)
     filter*: Option[WireFilterExpr] ## serialized filter for server-side filtering
+    columns*: Option[seq[string]] ## column names to project (server-side projection)
 
   ScanPair* = object
     key*: string
@@ -1011,6 +1013,8 @@ proc encodeScanRequest*(req: ScanRequest): string =
     flags = flags or ScanFlagGroupRouted
   if req.filter.isSome:
     flags = flags or ScanFlagHasFilter
+  if req.columns.isSome and req.columns.get().len > 0:
+    flags = flags or ScanFlagHasColumns
   buf.writeUint16BE(uint16(mtScan))
   buf.writeUint8(flags)
   buf.add(transactionIDToBytes(req.txnId))
@@ -1026,6 +1030,12 @@ proc encodeScanRequest*(req: ScanRequest): string =
   # Include filter for server-side filtering
   if req.filter.isSome:
     encodeWireFilterExpr(req.filter.get(), buf)
+  # Include column projection list (server-side projection of DataRow columns)
+  if req.columns.isSome and req.columns.get().len > 0:
+    let cols = req.columns.get()
+    buf.writeUint32BE(uint32(cols.len))
+    for c in cols:
+      buf.writeBytes(c)
   buf
 
 proc decodeScanRequest*(payload: string): Result[ScanRequest, ProtocolError] =
@@ -1081,6 +1091,18 @@ proc decodeScanRequest*(payload: string): Result[ScanRequest, ProtocolError] =
     let filterR = decodeWireFilterExpr(payload, pos)
     if filterR.isErr: return peErr(filterR.error)
     req.filter = some(filterR.value)
+
+  # Read column projection list if HasColumns flag is set
+  if (req.flags and ScanFlagHasColumns) != 0:
+    let cntR = readUint32BE(payload, pos)
+    if cntR.isErr: return peErr(cntR.error)
+    let ncols = int(cntR.value)
+    var cols = newSeq[string](ncols)
+    for i in 0 ..< ncols:
+      let cR = readBytes(payload, pos)
+      if cR.isErr: return peErr(cR.error)
+      cols[i] = cR.value
+    req.columns = some(cols)
 
   peOk(req)
 
