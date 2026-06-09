@@ -1457,6 +1457,14 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
         # — the per-group heaps were computed independently and the k-way
         # merge has already globally ordered them by PK. Just collect the
         # candidates, apply column extraction, and apply LIMIT.
+        #
+        # IMPORTANT: this shortcut is ONLY valid when the k-way merge's
+        # order matches the ORDER BY direction. That is true for PK ASC
+        # and PK DESC (the planner routes those through oboPkAscMatch /
+        # oboPkDescMatch+reverse-merge, not through this branch). For
+        # non-PK ORDER BY (oboTopK), the merge is in PK order, which is
+        # wrong for the LIMIT — so the planner sets obServerTopK=false in
+        # that case and the client-side top-K heap below is used.
         if op.obServerTopK:
           orderTimer.stamp("order_start")
           var outputRows: seq[seq[string]] = @[]

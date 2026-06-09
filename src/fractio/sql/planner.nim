@@ -1320,10 +1320,17 @@ proc planSelect(stmt: Stmt, client: FractioClient,
         ))
     elif obOptimization == oboTopK:
       # Non-PK ORDER BY + LIMIT: use bounded top-K heap
-      # Server-side top-K pushdown: signal the executor that the server
-      # already applied the heap (each group returned ≤K candidates).
-      let hasServerTopK = sortSpecs.len > 0 and
-          sortSpecs.allIt(it.columnIndex >= 0)
+      # Server-side top-K pushdown: the server still runs a per-group top-K
+      # heap (via scTopK on the scan op) and ships only K candidates per
+      # group, dramatically reducing wire traffic for wide queries. However,
+      # the client MUST re-heap the K×Ngroups candidates: the k-way merge
+      # orders by PK (LevelDB key order), not by the ORDER BY column, so
+      # the first K candidates from the merged stream are not necessarily
+      # the global top-K. We therefore set obServerTopK=false so the
+      # executor's client-side top-K heap path is taken (executor.nim
+      # oboTopK branch). The server's per-group heap is still active via
+      # scTopK; this just tells the executor not to skip the client merge.
+      let hasServerTopK = false
       plan.add(PlanOp(kind: poOrderBy,
         obSortSpecs: sortSpecs,
         obColumns: reqCols,

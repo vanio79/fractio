@@ -1552,15 +1552,6 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
             except CatchableError:
               discard
           let winners = heap.extractSorted()
-          if server.logger != nil:
-            try:
-              server.logger.log(llDebug,
-                "scan topK: pushed=" & $heap.totalPushed &
-                " fast=" & $heap.fastPathHits &
-                " slow=" & $heap.slowPathHits &
-                " kept=" & $winners.len & " of " & $topKBuffer.len)
-            except CatchableError: discard
-            except Exception: discard
           # Re-encode winners to ScanPairs with the projected column names
           # (or no projection metadata if not projecting).
           var finalPairs = newSeq[ScanPair](winners.len)

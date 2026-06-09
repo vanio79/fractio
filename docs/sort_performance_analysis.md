@@ -472,3 +472,92 @@ T5/T6 dropped from ~70ms to sub-millisecond. The remaining 0.3ms is plan + itera
 ```
 
 `obOptimization=TOP_K_SERVER` confirms the server-side heap path was taken. `stream_consume+server_topk` is now 0.01ms (the client just iterates 5 candidates) vs 62ms previously. The 120ms in `stream_scan_setup` is the three group server-side heap operations running in parallel via threads.
+
+---
+
+## Post-Tier-3b bug fix: planner sets `obServerTopK=true` for non-PK ORDER BY (bug)
+
+**Date:** 2026-06-10
+**Status:** Fixed and verified
+**Severity:** High — produces wrong query results (not just slow), only in multi-group spaces
+
+### Symptom
+
+On a 3-node cluster with a multi-group space:
+
+```sql
+SELECT * FROM scaletest.public.users2 ORDER BY name DESC LIMIT 5
+```
+
+Returned: `id 999, 998, 997, 996, 995` (the **first 5 rows from one group's PK range**).
+
+Expected: `id 8465, 8464, 8463, 8462, 8461` (the **global top-5 by `name DESC`**).
+
+The bug also surfaced with WHERE clauses:
+
+```sql
+SELECT * FROM scaletest.public.users2 WHERE id < 5000 ORDER BY name DESC LIMIT 5
+```
+
+Returned wrong rows from one group's range, not the global top-5 of the filtered set.
+
+### Root cause
+
+The `obServerTopK` flag in `src/fractio/sql/planner.nim` was set to `true` for **all** non-PK ORDER BY + LIMIT queries (the `oboTopK` branch), based on a flawed assumption: that the server's per-group top-K heap output is already globally ordered.
+
+In reality, the k-way merge in `src/fractio/client/fractio_client.nim` (function `streamScan`, k-way setup at line 1379) **orders by PK (LevelDB key order)**, not by the ORDER BY column. The merge is a heap of "next row from each group stream" where the comparison is on the encoded PK.
+
+So:
+- Each group ships its top-K candidates by `name` (correct, via `scTopK` heap on the server).
+- The k-way merge at the client receives N=3 streams and pops the next row in **PK order**, not `name` order.
+- The executor's "skip client re-heap" path (line 1468 of `executor.nim`, gated on `obServerTopK=true`) takes the **first K rows from the PK-ordered merged stream**.
+- The first K rows from the PK-ordered stream come from a single group (the group with the lowest PK range), so the result is wrong.
+
+This was a **correctness bug**, not a performance bug. The previous tier-3b work made the server-side heap fast (60ms → 0.01ms), but the result was still wrong.
+
+### Fix
+
+In `src/fractio/sql/planner.nim`, the `oboTopK` branch now sets `hasServerTopK = false`:
+
+```nim
+elif obOptimization == oboTopK:
+  # Non-PK ORDER BY + LIMIT: use bounded top-K heap
+  # Server-side top-K pushdown: the server still runs a per-group top-K
+  # heap (via scTopK on the scan op) and ships only K candidates per
+  # group, dramatically reducing wire traffic for wide queries. However,
+  # the client MUST re-heap the K×Ngroups candidates: the k-way merge
+  # orders by PK (LevelDB key order), not by the ORDER BY column, so
+  # the first K candidates from the merged stream are not necessarily
+  # the global top-K. We therefore set obServerTopK=false so the
+  # executor's client-side top-K heap path is taken.
+  let hasServerTopK = false
+  plan.add(PlanOp(kind: poOrderBy, ...))
+```
+
+The `obServerTopK=true` shortcut in `executor.nim` is now correctly **only used when the k-way merge's order matches the ORDER BY direction**. That is:
+- `oboPkAscMatch` (PK ASC) — merge is in PK order, matches ORDER BY → shortcut is correct
+- `oboPkDescMatch` (PK DESC) — merge is reversed, matches ORDER BY → shortcut is correct
+- `oboTopK` (non-PK ORDER BY) — merge is in PK order, **does not** match ORDER BY → shortcut is wrong, must not use it
+
+### Verification
+
+- **Unit tests:** all 115 unit tests pass.
+- **Integration test** (`test_space_query_routing.nim`): 4 new regression tests added in the suite `"SQL Executor — non-PK ORDER BY + LIMIT across groups"`:
+  - `ORDER BY name DESC LIMIT 5 returns global top-5 names` → `item100, item099, item098, item097, item096` ✓
+  - `ORDER BY name ASC LIMIT 5 returns global bottom-5 names` → `item001, item002, item003, item004, item005` ✓
+  - `ORDER BY name DESC + WHERE id < 50 LIMIT 5 returns correct top-5` → `item049, item048, item047, item046, item045` ✓
+  - `ORDER BY score DESC LIMIT 3 returns top-3 by score` → scores `100, 95, 90` ✓
+
+  All use a 3-group space (via `createMultiGroupTestStore(testDir, 3)`) and 100 rows, exercising the exact k-way merge code path that was buggy.
+
+- **Existing integration tests:** `test_executor.nim` failure set is **identical** with and without the fix (10 pre-existing failures, all in `"ORDER BY multiple columns mixed ASC/DESC"`, unrelated to this bug — multi-column ORDER BY uses the `external_sort` path, not the `oboTopK` path).
+
+### Performance impact
+
+- **Wire traffic:** unchanged — server still ships K candidates per group via `scTopK`.
+- **Server CPU:** unchanged — server's per-group heap still runs and ships only K candidates.
+- **Client CPU:** small increase — the client now runs a top-K heap of K×Ngroups rows (e.g., 5×3=15 rows for LIMIT 5 with 3 groups) instead of taking the first K from the merged stream. This is O(K log K) work, microseconds.
+
+### Test data note: zero-padded names
+
+The integration test uses `align($i, 3, '0')` to produce zero-padded names like `item001, item002, ..., item100`. This is critical for predictable lex order: without padding, `item9 > item89` lexically (single-digit > two-digit at position 4), but with padding `item099 > item100` is a clean reverse sequence matching the integer order. Zero-padding is recommended for any test that mixes `ORDER BY <text_col> ASC/DESC` with `WHERE id < N`.

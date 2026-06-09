@@ -617,6 +617,131 @@ suite "SQL Executor — space routing full round-trip":
     check nonEmpty >= 3
 
 # ---------------------------------------------------------------------------
+# Suite: regression — non-PK ORDER BY + LIMIT with multi-group space
+# ---------------------------------------------------------------------------
+#
+# Bug: planner.nim set obServerTopK=true for non-PK ORDER BY + LIMIT
+# (ORDER BY name DESC LIMIT 5) even though the k-way merge orders by PK,
+# not by the ORDER BY column. The executor's "skip client re-heap" path
+# then took the first K rows from the PK-ordered stream, which are not
+# the global top-K by name. The bug surfaced as: non-PK ORDER BY queries
+# returning rows from only the first group's range.
+#
+# Fix: planner.nim now sets obServerTopK=false in the non-PK oboTopK
+# branch, so the executor's client-side top-K heap re-heaps the K×Ngroups
+# per-group candidates for the correct global order. The server's per-group
+# top-K (scTopK) is still active, so wire traffic is still bounded.
+# ---------------------------------------------------------------------------
+
+suite "SQL Executor — non-PK ORDER BY + LIMIT across groups":
+  var client: FractioClient
+  var server: ProtocolServer
+  var store: RaftKVStoreExt
+  var spaceGroupIds: seq[GroupID]
+  var testSpaceId: SpaceID
+  var testDir: string
+
+  setup:
+    testDir = nextTestDir("orderby_multigroup")
+    cleanupTestDir(testDir)
+    # 3 groups, table with 3 columns: id (PK), name (TEXT), score (INT).
+    # Data is routed by hash(id) across the 3 groups, so each group holds
+    # ~1/3 of the rows. The non-PK ORDER BY + LIMIT bug only manifests
+    # in multi-group setups (k-way merge path).
+    (client, server, store, spaceGroupIds,
+        testSpaceId) = createMultiGroupTestStore(testDir, 3)
+    seedSpaceTableThreeCol(client, store, genTableIdLocal(), "products", testSpaceId)
+
+  teardown:
+    client.close()
+    server.stop()
+    store.coordinator.stop()
+    cleanupTestDir(testDir)
+
+  test "ORDER BY name DESC LIMIT 5 returns global top-5 names":
+    # Insert 100 rows: name = 'item_NNN' (3-digit zero-padded), score = N*10.
+    # Zero-padding gives predictable lex order: 'item100' > 'item099' > ...
+    # > 'item001'. The 5 largest lex names are: item100, item099, item098,
+    # item097, item096. Without padding, 'item9' would sort after 'item89'
+    # which produces confusing results; with padding, id order matches
+    # name lex order.
+    for i in 1 .. 100:
+      let name = "item" & align($i, 3, '0')
+      discard exec(client,
+          "INSERT INTO products (id, name, score) VALUES (" &
+          $i & ", '" & name & "', " & $(i * 10) & ")")
+
+    let res = exec(client,
+        "SELECT id, name FROM products ORDER BY name DESC LIMIT 5")
+    check res.kind == erkRows
+    check res.rows.len == 5
+    check res.rows[0][1] == "item100"
+    check res.rows[1][1] == "item099"
+    check res.rows[2][1] == "item098"
+    check res.rows[3][1] == "item097"
+    check res.rows[4][1] == "item096"
+
+  test "ORDER BY name ASC LIMIT 5 returns global bottom-5 names":
+    # With zero-padded names, the bottom-5 by name ASC are item001..item005.
+    for i in 1 .. 100:
+      let name = "item" & align($i, 3, '0')
+      discard exec(client,
+          "INSERT INTO products (id, name, score) VALUES (" &
+          $i & ", '" & name & "', " & $(i * 10) & ")")
+
+    let res = exec(client,
+        "SELECT id, name FROM products ORDER BY name ASC LIMIT 5")
+    check res.kind == erkRows
+    check res.rows.len == 5
+    check res.rows[0][1] == "item001"
+    check res.rows[1][1] == "item002"
+    check res.rows[2][1] == "item003"
+    check res.rows[3][1] == "item004"
+    check res.rows[4][1] == "item005"
+
+  test "ORDER BY name DESC + WHERE id < 50 LIMIT 5 returns correct top-5":
+    # NOTE: names are zero-padded to 3 digits for predictable lex order.
+    # Without padding, lex DESC of "item1".."item49" gives "item9", "item8",
+    # ... "item5", "item49", "item48", ... (single-digit > two-digit lex).
+    # With padding, lex DESC of "item001".."item049" gives "item049", "item048",
+    # "item047", "item046", "item045" — the expected global top-5.
+    for i in 1 .. 100:
+      let name = "item" & align($i, 3, '0')
+      discard exec(client,
+          "INSERT INTO products (id, name, score) VALUES (" &
+          $i & ", '" & name & "', " & $(i * 10) & ")")
+
+    let res = exec(client,
+        "SELECT id, name FROM products WHERE id < 50 ORDER BY name DESC LIMIT 5")
+    check res.kind == erkRows
+    check res.rows.len == 5
+    check res.rows[0][1] == "item049"
+    check res.rows[1][1] == "item048"
+    check res.rows[2][1] == "item047"
+    check res.rows[3][1] == "item046"
+    check res.rows[4][1] == "item045"
+
+  test "ORDER BY score DESC LIMIT 3 returns top-3 by score":
+    # Insert 30 rows where score is independent of id, so we can predict
+    # the top-3 by score. Assign explicit high scores to ids 1, 2, 3
+    # (100, 95, 90) and default low scores to the rest.
+    for i in 1 .. 30:
+      let score = if i == 1: 100 elif i == 2: 95 elif i == 3: 90 else: 10
+      let name = "item" & align($i, 3, '0')
+      discard exec(client,
+          "INSERT INTO products (id, name, score) VALUES (" &
+          $i & ", '" & name & "', " & $score & ")")
+
+    let res = exec(client,
+        "SELECT id, name, score FROM products ORDER BY score DESC LIMIT 3")
+    check res.kind == erkRows
+    check res.rows.len == 3
+    # Top 3 by score DESC: id=1 (100), id=2 (95), id=3 (90).
+    check res.rows[0][2] == "100"
+    check res.rows[1][2] == "95"
+    check res.rows[2][2] == "90"
+
+# ---------------------------------------------------------------------------
 # Suite: backward compatibility — default space tables unaffected
 # ---------------------------------------------------------------------------
 
