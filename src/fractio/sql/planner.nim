@@ -1148,23 +1148,30 @@ proc planSelect(stmt: Stmt, client: FractioClient,
     obOptimization = oboPkAscMatch
   elif pkOptimization == oboPkDescMatch:
     if limit > 0:
-      # PK DESC + LIMIT: use reverse + top-K heap.
-      # Data arrives in ASC order from the scan. We need DESC order.
-      # Instead of buffering all N rows and reversing (O(N) memory),
-      # use a top-K heap with DESC sort spec that keeps only the
-      # highest-PK values. O(K) memory instead of O(N).
-      # TODO: When server supports ScanFlagReverse, replace this with
-      # reverse scan + LIMIT pushdown for O(K) I/O as well.
-      scanLimit = 0
-      obOptimization = oboPkDescMatch # Sort specs are empty, just reverse
+      # PK DESC + LIMIT: use server-side reverse scan with LIMIT pushdown.
+      # The server scans each group in descending key order, returning only
+      # the top K (largest) rows from each group. The k-way merge in
+      # reverse mode picks the K largest rows across all groups, giving
+      # us the correct global top K by PK DESC. This avoids scanning all
+      # N rows and using a top-K heap (was O(N log K) heap operations).
+      scanLimit = limit
+      scanReverse = true
+      # The data arrives already in PK DESC order, so the executor can
+      # treat it as if it were PK ASC (the merge already ordered it).
+      obOptimization = oboPkAscMatch
     else:
-      # PK DESC without LIMIT: scan all, reverse in client
+      # PK DESC without LIMIT: server-side reverse scan gives us all
+      # rows in DESC order directly. The executor just iterates and
+      # applies LIMIT (or none) — no client-side reversal needed.
       scanLimit = 0
-      obOptimization = oboPkDescMatch
+      scanReverse = true
+      obOptimization = oboPkAscMatch
   elif stmt.selOrderBy.len > 0 and limit > 0:
     # Non-PK ORDER BY + LIMIT: scan all rows, use bounded top-K heap.
-    # This avoids materializing all rows for sorting — we only keep the
-    # top K rows in memory while streaming through all results.
+    # We can't push LIMIT per-group here because each group's storage
+    # order is by PK (not by the ORDER BY column), so the per-group
+    # "top K" in storage order is not the per-group "top K" by the
+    # ORDER BY column. Must scan all rows; heap keeps O(K) memory.
     scanLimit = 0
     obOptimization = oboTopK
   elif stmt.selOrderBy.len > 0:

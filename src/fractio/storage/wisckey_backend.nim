@@ -521,10 +521,15 @@ proc destroyIter*(iter: StorageIterator) =
     witer.backendRef = nil
 
 proc scan*(backend: WiscKeyBackend, startKey, endKey: string,
-           limit: int = 0): seq[KeyValuePair] =
+           limit: int = 0, reverse: bool = false): seq[KeyValuePair] =
   ## High-level range scan: collect key-value pairs in [startKey, endKey).
-  ## If endKey is empty, scans to the end of the database.
+  ## If endKey is empty, scans to the end of the database (or to the start
+  ## if reverse=true).
   ## If limit > 0, returns at most `limit` pairs.
+  ## If reverse=true, iterates keys in descending order. In this case the
+  ## semantics are (endKey, startKey] (i.e., strictly greater than startKey
+  ## and less than or equal to endKey) — this matches the caller convention
+  ## for descending PK scans where endKey is the inclusive upper bound.
   acquire(backend.mu)
   defer: release(backend.mu)
   if not backend.isOpen:
@@ -533,34 +538,81 @@ proc scan*(backend: WiscKeyBackend, startKey, endKey: string,
   let iter = c_leveldb_create_iterator(backend.db, backend.readOptions)
   defer: c_leveldb_iter_destroy(iter)
 
-  if startKey.len > 0:
-    c_leveldb_iter_seek(iter, startKey.strPtr, startKey.len.csize_t)
+  if reverse:
+    # Reverse iteration: seek to endKey, then move backward until we drop
+    # below startKey (exclusive on startKey side) or hit the limit.
+    if endKey.len > 0:
+      c_leveldb_iter_seek(iter, endKey.strPtr, endKey.len.csize_t)
+      # If we landed strictly past endKey, back up one — LevelDB's seek
+      # finds the first key >= target. For descending order, if exact
+      # match, good; if we're past, step back to be at the largest key
+      # <= endKey.
+      if c_leveldb_iter_valid(iter) == 0:
+        c_leveldb_iter_seek_to_last(iter)
+      else:
+        var keylen: csize_t
+        let keyC = c_leveldb_iter_key(iter, addr keylen)
+        if keyC != nil:
+          var k = newString(keylen)
+          if keylen > 0:
+            copyMem(k[0].addr, keyC, keylen)
+          if k > endKey:
+            c_leveldb_iter_prev(iter)
+    else:
+      c_leveldb_iter_seek_to_last(iter)
+
+    while c_leveldb_iter_valid(iter) != 0:
+      var keylen: csize_t
+      let keyC = c_leveldb_iter_key(iter, addr keylen)
+      if keyC == nil: break
+      var k = newString(keylen)
+      if keylen > 0:
+        copyMem(k[0].addr, keyC, keylen)
+
+      # Reverse stop condition: stop when key <= startKey (exclusive)
+      if startKey.len > 0 and k <= startKey:
+        break
+
+      var vallen: csize_t
+      let valC = c_leveldb_iter_value(iter, addr vallen)
+      var v = newString(vallen)
+      if vallen > 0 and valC != nil:
+        copyMem(v[0].addr, valC, vallen)
+
+      result.add((key: k, value: v))
+      if limit > 0 and result.len >= limit:
+        break
+
+      c_leveldb_iter_prev(iter)
   else:
-    c_leveldb_iter_seek_to_first(iter)
+    if startKey.len > 0:
+      c_leveldb_iter_seek(iter, startKey.strPtr, startKey.len.csize_t)
+    else:
+      c_leveldb_iter_seek_to_first(iter)
 
-  while c_leveldb_iter_valid(iter) != 0:
-    var keylen: csize_t
-    let keyC = c_leveldb_iter_key(iter, addr keylen)
-    if keyC == nil: break
-    var k = newString(keylen)
-    if keylen > 0:
-      copyMem(k[0].addr, keyC, keylen)
+    while c_leveldb_iter_valid(iter) != 0:
+      var keylen: csize_t
+      let keyC = c_leveldb_iter_key(iter, addr keylen)
+      if keyC == nil: break
+      var k = newString(keylen)
+      if keylen > 0:
+        copyMem(k[0].addr, keyC, keylen)
 
-    # Check upper bound
-    if endKey.len > 0 and k >= endKey:
-      break
+      # Check upper bound
+      if endKey.len > 0 and k >= endKey:
+        break
 
-    var vallen: csize_t
-    let valC = c_leveldb_iter_value(iter, addr vallen)
-    var v = newString(vallen)
-    if vallen > 0 and valC != nil:
-      copyMem(v[0].addr, valC, vallen)
+      var vallen: csize_t
+      let valC = c_leveldb_iter_value(iter, addr vallen)
+      var v = newString(vallen)
+      if vallen > 0 and valC != nil:
+        copyMem(v[0].addr, valC, vallen)
 
-    result.add((key: k, value: v))
-    if limit > 0 and result.len >= limit:
-      break
+      result.add((key: k, value: v))
+      if limit > 0 and result.len >= limit:
+        break
 
-    c_leveldb_iter_next(iter)
+      c_leveldb_iter_next(iter)
 
 method compactRange*(backend: WiscKeyBackend, startKey: Option[string] = none(string),
                    endKey: Option[string] = none(string)) =

@@ -560,17 +560,21 @@ proc sendRaw(conn: ClientConnection, data: string) {.gcsafe, raises: [].} =
   ##
   ## IMPORTANT: Nim's socket.send() with SafeDisconn flag has a bug where
   ## EPIPE causes an infinite loop (socketError returns without raising,
-  ## but the while loop in send() continues forever). We use trySend()
-  ## which calls the low-level send() directly and returns false on error.
-  try:
-    # Use trySend to avoid Nim's SafeDisconn infinite loop bug
-    # trySend calls low-level send() directly and returns false on any error
-    discard conn.socket.trySend(data)
-  except CatchableError:
-    discard
-  except Defect:
-    # AssertionDefect can be raised when socket is closed during shutdown
-    discard
+  ## but the while loop in send() continues forever). We use sendNonBlocking
+  ## which calls the low-level send() directly with select polling and
+  ## returns once all bytes are sent or the timeout expires. Unlike
+  ## trySend() (a single non-blocking call), sendNonBlocking handles the
+  ## case where the kernel send buffer cannot accept a large payload in
+  ## one go (e.g. a 170KB scan response) — without that, partial sends
+  ## would interleave with subsequent frames on the wire, corrupting
+  ## the stream.
+  let fd = conn.socket.getFd().cint
+  let timeoutMs = 5000
+  let sent = sendNonBlocking(fd, data, timeoutMs)
+  if sent != data.len:
+    # Partial send or timeout - the connection is likely broken. Close it
+    # so the reader thread exits cleanly on its next loop iteration.
+    try: conn.socket.close() except CatchableError: discard
 
 proc sendFrame(conn: ClientConnection, payload: string,
     requestId: uint32, flags: uint16 = FlagIsResponse) {.gcsafe, raises: [].} =
@@ -1348,8 +1352,21 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
 
     if not server.mvccStore.isNil:
       let isStreaming = (req.flags and ScanFlagStreaming) != 0
-      let chunkSize = if req.chunkSize > 0: int(req.chunkSize)
-                      else: DEFAULT_SCAN_CHUNK_SIZE
+      # For non-streaming (legacy) scan requests, deliver all results in a
+      # single response frame. The non-streaming client only reads one frame,
+      # so any additional frames we send would be left in the TCP buffer and
+      # later be mistakenly consumed as responses to subsequent requests,
+      # corrupting the protocol stream. We still respect the requested
+      # chunkSize for streaming clients to bound memory usage per frame.
+      let chunkSize =
+        if isStreaming:
+          if req.chunkSize > 0: int(req.chunkSize)
+          else: DEFAULT_SCAN_CHUNK_SIZE
+        else:
+          # Largest possible int — guarantees a single callback invocation
+          # for non-streaming clients. Safe because the entire result set
+          # is bounded by `req.limit` (if set) or by scan range size.
+          int(high(int32))
       let needGroupFilter = req.groupId != ZeroGroupID()
       let needServerFilter = req.filter.isSome
 
@@ -1403,6 +1420,11 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
       let readTs = if not isZero(req.txnId): LATEST_READ_TIMESTAMP
                    else: LATEST_READ_TIMESTAMP
 
+      # Honor ScanFlagReverse: when set, scan in descending key order.
+      # This is used by the planner for PK DESC + LIMIT pushdown to avoid
+      # scanning all N rows and using a top-K heap.
+      let isReverse = (req.flags and ScanFlagReverse) != 0
+
       discard server.mvccStore.snapshotStreamScan(
         startKey = req.startKey,
         endKey = req.endKey,
@@ -1411,7 +1433,8 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
         chunkSize = chunkSize,
         callback = sendChunk,
         groupFilter = groupFilterProc,
-        serverFilter = serverFilterProc
+        serverFilter = serverFilterProc,
+        reverse = isReverse
       )
     else:
       sendError(conn, requestId, ErrInternal, ErrCatKV, "MVCC store not initialized")
@@ -2947,6 +2970,7 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
         host: server.config.host,
         raftPort: uint16(raftPort),
         clientPort: uint16(server.config.port),
+        webPort: uint16(server.config.webPort),
         status: nsAlive
       )
       discard mvccStore.txnPut(sessionId, nodeKey, encode(nodeRec))

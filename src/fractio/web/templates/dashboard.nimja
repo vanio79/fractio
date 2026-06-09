@@ -64,7 +64,7 @@
     <h2 class='panel-title'>Spaces</h2>
   </div>
   <table class='data-table'>
-    <thead><tr><th>Name</th><th>Database</th><th>Groups</th></tr></thead>
+    <thead><tr><th>Name</th><th>Space ID</th><th>Groups</th></tr></thead>
     <tbody>
       {% for space in spacesData %}
       <tr>

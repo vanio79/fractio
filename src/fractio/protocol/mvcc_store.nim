@@ -1022,13 +1022,22 @@ proc snapshotStreamScan*(store: MvccTransactionStore,
     callback: proc(chunk: ScanChunk) {.gcsafe, raises: [].},
     groupFilter: proc(key: string): bool {.gcsafe, raises: [].} = nil,
     serverFilter: proc(value: string): bool {.gcsafe, raises: [].} = nil,
-    raftStore: RaftKVStoreExt = nil): bool {.gcsafe, raises: [].} =
+    raftStore: RaftKVStoreExt = nil,
+    reverse: bool = false): bool {.gcsafe, raises: [].} =
   ## Stream MVCC scan results in chunks, calling `callback` for each chunk.
   ##
   ## Single-pass optimization: LevelDB returns keys in sorted order, and all
   ## MVCC versions of the same user key are contiguous. We exploit this by
   ## doing dedup + filter in a single pass over the sorted scan results,
   ## maintaining natural key ordering without a separate sort step.
+  ##
+  ## If `reverse=true`, the scan is performed in descending key order. The
+  ## results are emitted in descending user-key order, with the latest
+  ## version of each user key selected (same dedup semantics as forward mode).
+  ## The bounds are interpreted as (endKey, startKey] — i.e., the caller
+  ## passes startKey as the lower bound (exclusive in reverse) and endKey
+  ## as the upper bound (inclusive in reverse). This matches the standard
+  ## convention for descending range scans.
   ##
   ## Returns true if all chunks were sent successfully, false on error.
   ##
@@ -1043,14 +1052,15 @@ proc snapshotStreamScan*(store: MvccTransactionStore,
 
   # Step 1: Read all raw KV pairs from Raft (this is necessary because MVCC
   # dedup requires seeing all versions of a key to pick the latest).
+  # In reverse mode, the underlying backend handles the (startKey, endKey]
+  # bounds semantics internally; raftScan just forwards the flag.
   let scanRes = store.raftStore.raftScan(startKey, endKey, 0,
-      includeSystemKeys = true, includeMvccKeys = true)
+      includeSystemKeys = true, includeMvccKeys = true, reverse = reverse)
   timer.stamp("raft_scan")
   if not scanRes.isOk:
     return false
 
   let rawCount = scanRes.value.len
-
   # Step 2: Single-pass dedup + filter
   # LevelDB returns keys in sorted order. All versions/intents for the same
   # userKey are contiguous. We track the "current" userKey and keep the

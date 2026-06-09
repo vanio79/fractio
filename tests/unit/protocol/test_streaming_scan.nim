@@ -229,28 +229,30 @@ suite "ScanPair":
     check pair.value == ""
 
 # ---------------------------------------------------------------------------
-# Regression: closeStream must disconnect abandoned single-group streams
-# to prevent TCP frame bleed on cached connections.
+# Regression: closeStream must clean up streams properly.
+# New behavior: closeStream drains remaining frames instead of disconnecting,
+# preserving the TCP connection for reuse. Disconnect only happens on error.
 # ---------------------------------------------------------------------------
 
-suite "closeStream disconnects abandoned single-group streams":
+suite "closeStream handles stream cleanup":
 
-  test "closeStream on non-exhausted stream disconnects client":
+  test "closeStream on exhausted stream preserves connection":
     let cfg = defaultClientConfig()
     let client = newProtocolClient(cfg)
     client.connected.store(true) # simulate a live connection
     let ss = newStreamingScanClient(client)
-    check ss.exhausted == false
+    ss.exhausted = true
     ss.closeStream()
     check ss.exhausted == true
-    check client.connected.load() == false
+    check client.connected.load() == true # connection preserved
 
-  test "closeStream on exhausted stream does not disconnect":
+  test "closeStream on stream with no more data preserves connection":
+    # When hasMore=false, there's nothing to drain and no reason to disconnect
     let cfg = defaultClientConfig()
     let client = newProtocolClient(cfg)
     client.connected.store(true)
     let ss = newStreamingScanClient(client)
-    ss.exhausted = true
+    ss.hasMore = false
     ss.closeStream()
     check ss.exhausted == true
     check client.connected.load() == true # connection preserved
@@ -259,3 +261,13 @@ suite "closeStream disconnects abandoned single-group streams":
     let ss = newStreamingScanClient(nil)
     ss.closeStream()
     check ss.exhausted == true
+
+  test "closeStream on disconnected client is safe":
+    let cfg = defaultClientConfig()
+    let client = newProtocolClient(cfg)
+    client.connected.store(false) # already disconnected
+    let ss = newStreamingScanClient(client)
+    ss.hasMore = true # has more data, but client is disconnected
+    ss.closeStream()
+    check ss.exhausted == true
+    check client.connected.load() == false # still disconnected

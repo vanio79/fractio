@@ -12,7 +12,7 @@
         <sl-option value='{{ db }}'>{{ db }}</sl-option>
         {% endfor %}
       </sl-select>
-      <sl-select name='schema' size='small' value='public'>
+      <sl-select name='schema' size='small' value='sys'>
         {% for schema in schemas %}
         <sl-option value='{{ schema }}'>{{ schema }}</sl-option>
         {% endfor %}

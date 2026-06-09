@@ -210,8 +210,13 @@ proc sendNonBlocking(fd: cint, data: string, timeoutMs: int): int {.gcsafe,
   while total < data.len and retries < maxRetries:
     # Poll for write readiness
     if not pollForWrite(fd, timeoutMs):
-      # Timeout or error
-      return total
+      # pollForWrite can spuriously report "not writable" on a freshly-
+      # established socket (e.g., right after connect(), or with MSG_NOSIGNAL
+      # semantics). Treat it like EAGAIN: brief yield, then retry.
+      inc retries
+      when defined(posix):
+        discard posix.usleep(1000)
+      continue
 
     # Socket is ready - attempt send
     let sent = posix.send(sockFd, addr data[total], data.len - total, 0)
@@ -220,8 +225,12 @@ proc sendNonBlocking(fd: cint, data: string, timeoutMs: int): int {.gcsafe,
       total += sent
       retries = 0
     elif sent == 0:
-      # Shouldn't happen, but treat as error
-      return total
+      # posix.send() returning 0 is unusual but can occur on some platforms
+      # (e.g., right after connect, or with MSG_NOSIGNAL) when the kernel has
+      # no space to write. Treat it like EAGAIN: brief yield, then retry.
+      inc retries
+      when defined(posix):
+        discard posix.usleep(1000)
     else:
       # sent < 0 - check errno
       let err = errno
@@ -414,8 +423,12 @@ proc connect*(client: ProtocolClient): PResult {.raises: [].} =
   clientLog("connected to " & client.config.host & ":" & $client.config.port)
   pOk()
 
-proc disconnect*(client: ProtocolClient) {.gcsafe, raises: [].} =
+proc disconnect*(client: ProtocolClient, reason: string = "") {.gcsafe,
+    raises: [].} =
   if not client.connected.load(): return
+  let r = if reason.len > 0: " (" & reason & ")" else: ""
+  clientLog("disconnecting from " & client.config.host & ":" &
+      $client.config.port & r)
   client.connected.store(false)
   if client.socket != nil:
     try: client.socket.close() except CatchableError: discard
@@ -474,9 +487,18 @@ proc send*(client: ProtocolClient,
     return peErr(sr.error)
 
   let frameR = readOneFrame(client)
-  if frameR.isErr: return peErr(frameR.error)
+  if frameR.isErr:
+    return peErr(frameR.error)
 
   let f = frameR.value
+  # Verify the response's requestId matches the request we just sent. Without
+  # this check, a response for an in-flight or stale request (e.g. a streaming
+  # scan continuation frame) could be returned to the wrong caller, leading
+  # to malformed-payload decode errors downstream.
+  if f.header.requestId != reqId:
+    return peErr(newProtocolError(peInvalidFrame,
+      &"response requestId mismatch: sent {reqId}, got {f.header.requestId}"))
+
   if (f.header.flags and FlagIsError) != 0:
     var pos = 2 # skip MessageType prefix
     let codeR = readUint32BE(f.payload, pos)
@@ -582,6 +604,9 @@ type
       ## single-group and system table scans). For multi-group data table
       ## scans, set to primaryKeyFromDataRowKey to compare by PK value
       ## across groups instead of by groupId prefix.
+    mergeReverse*: bool
+      ## When true, the k-way merge selects the LARGEST key (descending order)
+      ## instead of the smallest. Used for PK DESC + LIMIT pushdown.
 
 proc kvGet*(client: ProtocolClient, key: string,
     flags: uint8 = 0, txnId: TransactionID = zeroTransactionID(),
@@ -737,7 +762,8 @@ proc newStreamingScanClient*(client: ProtocolClient): StreamingScanClient =
 
 proc newKWayMergeScanClient*(streams: seq[StreamingScanClient],
     limit: uint32 = 0,
-    keyExtractor: KeyExtractor = nil): StreamingScanClient =
+    keyExtractor: KeyExtractor = nil,
+    reverse: bool = false): StreamingScanClient =
   ## Create a streaming scan client that merges multiple group streams
   ## using k-way merge. All streams must already be started (have their
   ## first frame loaded). Results are returned in globally sorted key order.
@@ -748,6 +774,7 @@ proc newKWayMergeScanClient*(streams: seq[StreamingScanClient],
   ##   When nil, full storage key string comparison is used. For multi-group
   ##   data table scans, pass primaryKeyFromDataRowKey to compare by PK value
   ##   instead of by groupId prefix.
+  ## reverse: when true, the merge selects the LARGEST key first (descending).
   new(result)
   result.client = nil
   result.streamId = if streams.len > 0: streams[0].streamId else: 0
@@ -762,6 +789,7 @@ proc newKWayMergeScanClient*(streams: seq[StreamingScanClient],
   result.kWayMergeMode = true
   result.mergeInitialized = false
   result.keyExtractor = keyExtractor
+  result.mergeReverse = reverse
   # Initialize merge streams - peek state will be filled on first nextPair() call
   for stream in streams:
     result.mergeStreams.add(StreamWithKey(
@@ -927,7 +955,7 @@ proc nextPair*(ss: StreamingScanClient): Option[kvMsgs.ScanPair] {.gcsafe,
           ss.mergeStreams[i].exhausted = true
       ss.mergeInitialized = true
 
-    # Find the stream with the smallest peek key
+    # Find the stream with the smallest peek key (or largest if reverse).
     # Use keyExtractor if available to compare by PK across groups
     var bestIdx = -1
     var bestCompareKey = ""
@@ -939,9 +967,18 @@ proc nextPair*(ss: StreamingScanClient): Option[kvMsgs.ScanPair] {.gcsafe,
         continue
       let compareKey = if ss.keyExtractor != nil:
         ss.keyExtractor(swk.peekKey) else: swk.peekKey
-      if bestIdx < 0 or compareKey < bestCompareKey:
+      if bestIdx < 0:
         bestIdx = i
         bestCompareKey = compareKey
+      else:
+        if ss.mergeReverse:
+          if compareKey > bestCompareKey:
+            bestIdx = i
+            bestCompareKey = compareKey
+        else:
+          if compareKey < bestCompareKey:
+            bestIdx = i
+            bestCompareKey = compareKey
 
     if bestIdx < 0:
       ss.exhausted = true
@@ -1048,28 +1085,67 @@ proc hasNext*(ss: StreamingScanClient): bool {.gcsafe, raises: [].} =
     return false
   return ss.hasMore
 
+const MAX_DRAIN_FRAMES = 1000
+  ## Maximum number of frames to drain before giving up and disconnecting.
+  ## Prevents blocking the client if the server has an extremely large
+  ## number of buffered frames. Typical scans have < 100 frames.
+
+proc drainStreamFrames*(ss: StreamingScanClient) {.gcsafe, raises: [].} =
+  ## Drain remaining frames from the server to leave the connection clean.
+  ##
+  ## When a stream is abandoned early (e.g., LIMIT hit, error), the server
+  ## may still be sending frames into the TCP socket buffer. If we don't
+  ## consume them, the next RPC on this connection would read a stale scan
+  ## frame instead of the expected response, causing silent data corruption.
+  ##
+  ## This proc reads and discards all remaining frames until EndOfScan or
+  ## error, leaving the ProtocolClient connection in a clean state for reuse.
+  ## If too many frames remain (unlikely), we disconnect as a fallback.
+  if ss.client == nil or not ss.client.connected.load(moRelaxed):
+    return
+
+  # Already exhausted or no more data — nothing to drain
+  if ss.exhausted or not ss.hasMore:
+    return
+
+  # Read frames until EndOfScan or error, with a safety limit
+  var drainedFrames = 0
+  var drainedPairs = 0
+  while not ss.exhausted and ss.hasMore and drainedFrames < MAX_DRAIN_FRAMES:
+    let frameR = ss.nextFrame()
+    if frameR.isErr:
+      # Error during drain — connection state is uncertain, disconnect
+      clientLog("drain error after " & $drainedFrames &
+          " frames, disconnecting")
+      ss.client.disconnect()
+      return
+    drainedFrames += 1
+    drainedPairs += frameR.value.pairs.len
+
+  if drainedFrames >= MAX_DRAIN_FRAMES and (not ss.exhausted or ss.hasMore):
+    # Too many frames — give up and disconnect
+    clientLog("drain limit (" & $MAX_DRAIN_FRAMES &
+        " frames) reached, disconnecting")
+    ss.client.disconnect()
+  else:
+    clientLog("drained " & $drainedFrames & " frames (" & $drainedPairs &
+        " pairs) for clean connection reuse")
+
 proc closeStream*(ss: StreamingScanClient) {.gcsafe, raises: [].} =
   ## Close the streaming scan and mark it exhausted.
   ##
-  ## CRITICAL: If the stream was abandoned before exhaustion (user broke
-  ## early, hit a LIMIT, or encountered an error), the server may have
-  ## already sent additional response frames into the TCP socket buffer.
-  ## Reusing this cached connection for a subsequent RPC would cause the
-  ## next readOneFrame() to consume a stale scan frame instead of the
-  ## expected response, leading to silent data corruption ("table not found",
-  ## "invalid magic header", wrong row counts, etc.).
-  ##
-  ## To prevent this, we disconnect the underlying ProtocolClient whenever
-  ## closeStream is called on a non-exhausted stream. The FractioClient
-  ## leader-connection cache checks `connected.load()` before reusing a
-  ## connection, so a disconnected connection will be replaced on the next
-  ## operation. Fully-consumed streams (wasExhausted == true) skip the
-  ## disconnect to avoid unnecessary connection churn.
+  ## For non-exhausted streams, we drain remaining server frames instead of
+  ## disconnecting the TCP connection. This preserves the connection cache
+  ## and avoids the ~100ms reconnect cost on subsequent queries.
   let wasExhausted = ss.exhausted
-  ss.exhausted = true
-  ss.hasMore = false
+  let wasKWay = ss.kWayMergeMode
+  let hadMore = ss.hasMore
+
   # In k-way merge mode, close all group streams (recursive)
   if ss.kWayMergeMode:
+    # Drain each sub-stream before marking exhausted
+    clientLog("closeStream: k-way merge with " & $ss.mergeStreams.len &
+        " sub-streams (exhausted=" & $wasExhausted & ")")
     for swk in mitems(ss.mergeStreams):
       if swk.stream != nil:
         swk.stream.closeStream()
@@ -1078,9 +1154,18 @@ proc closeStream*(ss: StreamingScanClient) {.gcsafe, raises: [].} =
       swk.exhausted = true
     ss.mergeStreams = @[]
   else:
-    # Single-group mode: disconnect if stream was abandoned mid-way.
-    if not wasExhausted and ss.client != nil:
-      ss.client.disconnect()
+    # Single-group mode: drain remaining frames to keep connection clean.
+    # This avoids the ~100ms reconnect cost of disconnect().
+    if not wasExhausted:
+      clientLog("closeStream: draining non-exhausted stream (hasMore=" &
+          $hadMore & ", totalReceived=" & $ss.totalReceived & ")")
+      ss.drainStreamFrames()
+    else:
+      clientLog("closeStream: stream already exhausted (kWay=" & $wasKWay &
+          ", totalReceived=" & $ss.totalReceived & ")")
+
+  ss.exhausted = true
+  ss.hasMore = false
 
 proc getError*(ss: StreamingScanClient): Option[ProtocolError] {.gcsafe,
     raises: [].} =
@@ -1111,15 +1196,21 @@ proc kvStreamScan*(client: ProtocolClient, startKey: string = "",
     flags: uint8 = 0, txnId: TransactionID = zeroTransactionID(),
     readTimestamp: uint64 = 0,
     groupId: GroupID = ZeroGroupID(),
-    filter: Option[WireFilterExpr] = none(WireFilterExpr)): Result[
+    filter: Option[WireFilterExpr] = none(WireFilterExpr),
+    reverse: bool = false): Result[
         StreamingScanClient, ProtocolError] {.
     gcsafe, raises: [].} =
   ## Start a streaming scan and return a StreamingScanClient for iteration.
   ## Use ss.nextPair() to get individual pairs, or ss.consumeStreamScan() to
   ## get all results as a sequence.
   ## filter: optional server-side filter for reducing network traffic
+  ## reverse: when true, results are returned in descending key order.
+  ##          The server interprets bounds as (startKey, endKey] in this case.
+  var combinedFlags = flags
+  if reverse:
+    combinedFlags = combinedFlags or kvMsgs.ScanFlagReverse
   let ss = newStreamingScanClient(client)
-  let firstFrameR = ss.startStreamScan(startKey, endKey, limit, chunkSize, flags,
+  let firstFrameR = ss.startStreamScan(startKey, endKey, limit, chunkSize, combinedFlags,
                                         txnId, readTimestamp, groupId, filter)
   if firstFrameR.isErr:
     return peErr(firstFrameR.error)

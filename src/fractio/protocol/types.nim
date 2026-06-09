@@ -299,3 +299,8 @@ const
   MAX_KEY_BYTES* = 4 * 1024           # 4 KB
   MAX_VALUE_BYTES* = 64 * 1024 * 1024 # 64 MB
   MAX_BATCH_OPS* = 10_000
+  # Max encoded batch RPC payload that becomes a single Raft log entry.
+  # Larger entries (e.g. 25KB+ with 300+ ops) have triggered intermittent
+  # SIGSEGV in NuRaft's deliverMessage on the follower side. Keep this
+  # well under the danger zone — 4 KB is a safe ceiling.
+  MAX_BATCH_PAYLOAD_BYTES* = 4 * 1024

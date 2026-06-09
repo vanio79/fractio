@@ -574,6 +574,23 @@ proc createSpace*(sm: SpaceManager, req: CreateSpaceRequest): CreateSpaceRespons
         error: "failed to write space record to Raft"
       )
 
+    # 8b. Seed a default "public" schema for the new space.
+    # This mirrors the behavior of CREATE DATABASE (see execCreateDatabase in
+    # sql/executor.nim) so that tables can be created immediately in
+    # "<space>.public" without an explicit CREATE SCHEMA.
+    # Key format: /t/0000000002/<spaceName>.public (matches execCreateDatabase)
+    let pubSchemaKey = encodeTableKey(SYS_SCHEMAS_TABLE_ID, req.name & ".public")
+    let pubSchemaRec = SchemaRecord(
+      name: "public",
+      database: req.name,
+      createdAtNs: nowNs()
+    )
+    let pubSchemaValue = encode(pubSchemaRec)
+    if not sm.store.sysTablePut(pubSchemaKey, pubSchemaValue):
+      # Schema seeding failure is non-fatal — the space was created and the
+      # user can still run CREATE SCHEMA manually. Log and continue.
+      sm.logError("createSpace: failed to seed public schema (non-fatal)")
+
     timedLog(safeFmt("Created space '$#' (spaceId=$#)", req.name, $spaceId))
 
     # 10. Build response with updated sys table data

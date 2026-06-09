@@ -562,6 +562,7 @@ proc toJson*(rec: NodeRecord): JsonNode =
     "host": rec.host,
     "raftPort": rec.raftPort,
     "clientPort": rec.clientPort,
+    "webPort": rec.webPort,
     "status": status
   }
 

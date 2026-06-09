@@ -610,20 +610,40 @@ proc loadGroupMembers*(store: RaftKVStoreExt,
             value = mvccVal.data
             ts = mvccVal.timestamp
         elif mvccTypes.isLikelyMVCCValue(v):
-          # Non-version key but value is MVCC-encoded (sysTablePut case)
-          try:
-            let mvccVal = mvccTypes.decodeMVCCValue(v)
-            if mvccVal.isDeleted:
-              continue # Skip tombstones
-            value = mvccVal.data
-            ts = mvccVal.timestamp
-          except:
-            discard # Not MVCC-encoded, use as-is
+          # Non-version key but value is MVCC-encoded (sysTablePut case).
+          # Defensively strip MVCC headers in a loop in case a legacy write
+          # path stored a double-encoded value. As of 2026-06, the only known
+          # producer of double-encoded sys.groups records was
+          # syncGroupLeadersToSysTables (now fixed: it must pass the raw
+          # value to sysTablePutBatch, which applies the MVCC header
+          # inside MicroTransaction.commit). The defensive loop here
+          # tolerates any double-encoded values that may still be on disk
+          # from before the fix.
+          var curVal = v
+          var curTs: int64 = 0
+          var stripped = false
+          for stripAttempt in 0..<2:
+            if not mvccTypes.isLikelyMVCCValue(curVal):
+              break
+            try:
+              let mvccVal = mvccTypes.decodeMVCCValue(curVal)
+              if mvccVal.isDeleted:
+                curVal = ""
+                break
+              curVal = mvccVal.data
+              if curTs == 0:
+                curTs = mvccVal.timestamp
+              stripped = true
+            except CatchableError:
+              break
+          if stripped:
+            value = curVal
+            ts = curTs
 
         # Keep only latest version for each user key
         if not latestVersions.hasKey(userKey) or ts > latestVersions[userKey].ts:
           latestVersions[userKey] = (value, ts)
-      except:
+      except CatchableError:
         # If decoding fails, try as raw key-value
         if not latestVersions.hasKey(k):
           latestVersions[k] = (v, 0'i64)
@@ -1149,9 +1169,13 @@ proc syncGroupLeadersToSysTables*(s: RaftKVStoreExt) {.gcsafe, raises: [].} =
           var updatedRec = groupRec
           updatedRec.leader = uint32(liveLeader)
           let key = encodeTableKey(SYS_GROUPS_TABLE_ID, $groupRec.groupId)
-          let ts = s.nowNs()
-          let encoded = mvccTypes.encodeMVCCValue(encode(updatedRec), ts, false)
-          updates.add((key: key, value: encoded))
+          # Pass RAW (unencoded) value to sysTablePutBatch — it will apply
+          # the MVCC header inside MicroTransaction.commit. Pre-encoding
+          # here would cause sysTablePutBatch to wrap the value a second
+          # time, producing a double-MVCC-encoded record (e.g. 117 bytes
+          # for a 3-replica group: 29-byte outer header + 88-byte inner
+          # 29+59) that loadGroupMembers cannot decode.
+          updates.add((key: key, value: encode(updatedRec)))
           # Also update in-memory cache
           withLock s.groupMu:
             s.groupLeaders[gid] = uint32(liveLeader)
@@ -2100,7 +2124,8 @@ proc raftGetInGroup*(store: RaftKVStoreExt, key: string,
 proc raftScan*(store: RaftKVStoreExt, startKey, endKey: string,
     limit: uint32,
     includeSystemKeys: bool = false,
-    includeMvccKeys: bool = false): RSResult[seq[(string,
+    includeMvccKeys: bool = false,
+    reverse: bool = false): RSResult[seq[(string,
         RaftKVEntry)]] {.gcsafe, raises: [].} =
   ## Scan keys in [startKey, endKey) up to `limit` results.
   ## Uses WiscKey backend.scan() directly — results are already sorted by key.
@@ -2110,14 +2135,17 @@ proc raftScan*(store: RaftKVStoreExt, startKey, endKey: string,
   ## internals that handle their own filtering).
   ## By default, system table keys (/t/0000000001/... through /t/0000000099/...)
   ## are excluded from results. Set includeSystemKeys=true to include them.
+  ## If reverse=true, results are returned in descending key order. The
+  ## bounds in reverse mode are (endKey, startKey] (exclusive on startKey).
   var pairs: seq[(string, RaftKVEntry)] = @[]
   let backend = store.getBackend()
   if backend == nil or not backend.isOpen:
     return rsOk[seq[(string, RaftKVEntry)]](@[])
 
   {.cast(raises: []).}:
-    # Scan with no limit; we filter below. LevelDB iterates in sorted order.
-    let raw = backend.scan(startKey, endKey)
+    # Scan with no limit; we filter below. LevelDB iterates in sorted order
+    # (or descending order when reverse=true).
+    let raw = backend.scan(startKey, endKey, 0, reverse)
     let ts = uint64(store.nowNs())
     for (k, v) in raw:
       if isIntentKey(k) or isCoordKey(k): continue
@@ -2530,16 +2558,34 @@ proc loadSpaces*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
               continue # Skip tombstones
             value = mvccVal.data
             ts = mvccVal.timestamp
-        else:
-          # Raw key (non-MVCC) - check if value is MVCC-encoded
-          if mvccTypes.isLikelyMVCCValue(v):
+        elif mvccTypes.isLikelyMVCCValue(v):
+          # Raw key (non-MVCC) but value is MVCC-encoded (sysTablePut case).
+          # Defensively strip MVCC headers in a loop in case a legacy write
+          # path stored a double-encoded value. As of 2026-06, the only known
+          # producer of double-encoded sys.spaces records was any code path
+          # that pre-encoded values then passed them to sysTablePutBatch
+          # (which re-encodes inside MicroTransaction.commit). The defensive
+          # loop here tolerates any such values that may still be on disk.
+          var curVal = v
+          var curTs: int64 = 0
+          var stripped = false
+          for stripAttempt in 0..<2:
+            if not mvccTypes.isLikelyMVCCValue(curVal):
+              break
             try:
-              let mvccVal = mvccTypes.decodeMVCCValueFast(v)
-              if not mvccVal.isDeleted:
-                value = mvccVal.data
-                ts = mvccVal.timestamp
+              let mvccVal = mvccTypes.decodeMVCCValueFast(curVal)
+              if mvccVal.isDeleted:
+                curVal = ""
+                break
+              curVal = mvccVal.data
+              if curTs == 0:
+                curTs = mvccVal.timestamp
+              stripped = true
             except:
-              discard
+              break
+          if stripped:
+            value = curVal
+            ts = curTs
 
         # Keep only latest version for each user key
         if not latestVersions.hasKey(userKey) or ts > latestVersions[userKey].ts:
@@ -2592,15 +2638,29 @@ proc loadTableSpaces*(store: RaftKVStoreExt) {.gcsafe, raises: [].} =
             value = mvccVal.data
             ts = mvccVal.timestamp
         elif mvccTypes.isLikelyMVCCValue(v):
-          # Non-version key but value is MVCC-encoded (sysTablePut case)
-          try:
-            let mvccVal = mvccTypes.decodeMVCCValueFast(v)
-            if mvccVal.isDeleted:
-              continue # Skip tombstones
-            value = mvccVal.data
-            ts = mvccVal.timestamp
-          except:
-            discard # Not MVCC-encoded, use as-is
+          # Non-version key but value is MVCC-encoded (sysTablePut case).
+          # Defensively strip MVCC headers in a loop in case a write path
+          # double-encoded the value.
+          var curVal = v
+          var curTs: int64 = 0
+          var stripped = false
+          for stripAttempt in 0..<2:
+            if not mvccTypes.isLikelyMVCCValue(curVal):
+              break
+            try:
+              let mvccVal = mvccTypes.decodeMVCCValueFast(curVal)
+              if mvccVal.isDeleted:
+                curVal = ""
+                break
+              curVal = mvccVal.data
+              if curTs == 0:
+                curTs = mvccVal.timestamp
+              stripped = true
+            except:
+              break
+          if stripped:
+            value = curVal
+            ts = curTs
 
         # Keep only latest version for each user key
         if not latestVersions.hasKey(userKey) or ts > latestVersions[userKey].ts:

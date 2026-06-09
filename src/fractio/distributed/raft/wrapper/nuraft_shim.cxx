@@ -1435,121 +1435,139 @@ void nuraft_mp_deliver_message(void* mp_context, void* server,
         return;
     }
 
-    auto* mp_ctx = static_cast<mp_context_t*>(mp_context);
-    auto* wrapper = static_cast<server_wrapper*>(server);
+    // Log entry for visibility on large messages.
+    if (msg_len > 8 * 1024) {
+        std::cerr << "[shim] deliver_message: msg_len=" << msg_len
+                  << " (large message - vulnerable to SIGSEGV)"
+                  << std::endl;
+    }
 
-    // Deserialize message - allocate buffer and copy data
-    // IMPORTANT: buffer::alloc creates buffer with given size, and pos=0
-    ptr<buffer> msg_buf = buffer::alloc(msg_len);
-    std::memcpy(msg_buf->data_begin(), msg_data, msg_len);
-    msg_buf->pos(0);  // Reset position for reading
+    try {
+        auto* mp_ctx = static_cast<mp_context_t*>(mp_context);
+        auto* wrapper = static_cast<server_wrapper*>(server);
 
-    msg_type type = get_msg_type(*msg_buf);
+        // Deserialize message - allocate buffer and copy data
+        // IMPORTANT: buffer::alloc creates buffer with given size, and pos=0
+        ptr<buffer> msg_buf = buffer::alloc(msg_len);
+        std::memcpy(msg_buf->data_begin(), msg_data, msg_len);
+        msg_buf->pos(0);  // Reset position for reading
 
-    // std::cerr << "[shim] deliver_message: server_id=" << mp_ctx->server_id
-    //           << " group=" << gid_short << " msg_type=" << static_cast<int>(type)
-    //           << " len=" << msg_len << std::endl;
+        msg_type type = get_msg_type(*msg_buf);
 
-    if (is_response_type(type)) {
-         // It's a response - match to pending handler
-         ptr<resp_msg> resp = deserialize_resp_msg(*msg_buf);
+        // std::cerr << "[shim] deliver_message: server_id=" << mp_ctx->server_id
+        //           << " group=" << gid_short << " msg_type=" << static_cast<int>(type)
+        //           << " len=" << msg_len << std::endl;
 
-         // Build group_id hex for handler lookup key
-         std::string gid_hex_key;
-         for (int i = 0; i < 16; i++) {
-             char hex[3];
-             sprintf(hex, "%02x", (unsigned char)mp_ctx->group_id_bytes[i]);
-             gid_hex_key += hex;
-         }
+        if (is_response_type(type)) {
+             // It's a response - match to pending handler
+             ptr<resp_msg> resp = deserialize_resp_msg(*msg_buf);
 
-         // Key: (groupId_hex, our_server_id, responder_id)
-         auto key = std::make_tuple(gid_hex_key, mp_ctx->server_id, resp->get_src());
+             // Build group_id hex for handler lookup key
+             std::string gid_hex_key;
+             for (int i = 0; i < 16; i++) {
+                 char hex[3];
+                 sprintf(hex, "%02x", (unsigned char)mp_ctx->group_id_bytes[i]);
+                 gid_hex_key += hex;
+             }
 
-         rpc_handler handler;
-         {
-             std::lock_guard<std::mutex> lock(g_handlers_lock);
-             // Purge expired handlers periodically (every call is fine, the lock is held)
-             purgeExpiredHandlersLocked();
-             auto it = g_pending_handlers.find(key);
-             if (it != g_pending_handlers.end() && !it->second.empty()) {
-                 handler = it->second.front().handler;
-                 it->second.pop_front();
-                 if (it->second.empty()) {
-                     g_pending_handlers.erase(it);
+             // Key: (groupId_hex, our_server_id, responder_id)
+             auto key = std::make_tuple(gid_hex_key, mp_ctx->server_id, resp->get_src());
+
+             rpc_handler handler;
+             {
+                 std::lock_guard<std::mutex> lock(g_handlers_lock);
+                 // Purge expired handlers periodically (every call is fine, the lock is held)
+                 purgeExpiredHandlersLocked();
+                 auto it = g_pending_handlers.find(key);
+                 if (it != g_pending_handlers.end() && !it->second.empty()) {
+                     handler = it->second.front().handler;
+                     it->second.pop_front();
+                     if (it->second.empty()) {
+                         g_pending_handlers.erase(it);
+                     }
                  }
              }
-         }
 
-        if (handler) {
-            ptr<rpc_exception> no_err;
-            handler(resp, no_err);
-        }
-    } else {
-        // It's a request - process and send response
-        ptr<req_msg> req = deserialize_req_msg(*msg_buf);
+            if (handler) {
+                ptr<rpc_exception> no_err;
+                handler(resp, no_err);
+            }
+        } else {
+            // It's a request - process and send response
+            ptr<req_msg> req = deserialize_req_msg(*msg_buf);
 
-        raft_server* srv = wrapper ? wrapper->server.get() : nullptr;
-        if (!srv) {
-            return;
-        }
+            raft_server* srv = wrapper ? wrapper->server.get() : nullptr;
+            if (!srv) {
+                return;
+            }
 
-        // --- FRACTIO: longest-log-wins pre-vote gate ---
-        // NuRaft's handle_prevote_req grants pre-vote whenever
-        // `!hb_alive_`, with no log comparison. That allows a node
-        // with FEWER entries to start an election, become leader,
-        // and then crash into "peer last_log_idx too large".
-        // We gate pre-vote here (in Fractio code, not NuRaft) so
-        // that only the longest-log node can pass pre-vote.
-        ptr<resp_msg> resp;
-        if (req->get_type() == msg_type::pre_vote_request) {
-            ulong my_last_log_idx = srv->get_last_log_idx();
-            ulong req_last_log_idx = req->get_last_log_idx();
-            if (my_last_log_idx > req_last_log_idx) {
-                // We have more entries: deny pre-vote so the shorter-log
-                // node cannot become leader.
-                // next_idx == MAX with accepted==false signals a "live"
-                // peer to handle_prevote_resp (counts toward live_ counter).
-                resp = cs_new<resp_msg>(
-                    req->get_term(),
-                    msg_type::pre_vote_response,
-                    mp_ctx->server_id,
-                    req->get_src(),
-                    std::numeric_limits<ulong>::max(),
-                    false
-                );
+            // --- FRACTIO: longest-log-wins pre-vote gate ---
+            // NuRaft's handle_prevote_req grants pre-vote whenever
+            // `!hb_alive_`, with no log comparison. That allows a node
+            // with FEWER entries to start an election, become leader,
+            // and then crash into "peer last_log_idx too large".
+            // We gate pre-vote here (in Fractio code, not NuRaft) so
+            // that only the longest-log node can pass pre-vote.
+            ptr<resp_msg> resp;
+            if (req->get_type() == msg_type::pre_vote_request) {
+                ulong my_last_log_idx = srv->get_last_log_idx();
+                ulong req_last_log_idx = req->get_last_log_idx();
+                if (my_last_log_idx > req_last_log_idx) {
+                    // We have more entries: deny pre-vote so the shorter-log
+                    // node cannot become leader.
+                    // next_idx == MAX with accepted==false signals a "live"
+                    // peer to handle_prevote_resp (counts toward live_ counter).
+                    resp = cs_new<resp_msg>(
+                        req->get_term(),
+                        msg_type::pre_vote_response,
+                        mp_ctx->server_id,
+                        req->get_src(),
+                        std::numeric_limits<ulong>::max(),
+                        false
+                    );
+                }
+            }
+
+            if (!resp) {
+                // Normal path: let NuRaft handle the request
+                resp = raft_server_access::call_process_req(srv, *req);
+            }
+
+            if (resp) {
+                // std::cerr << "[shim] deliver_message: got response, sending via listener" << std::endl;
+                // Send response via listener's callback
+                auto& listener = mp_ctx->listener;
+                if (listener && listener->has_send_response_callback()) {
+                    ptr<buffer> resp_buf = serialize_resp_msg(resp);
+                    const char* resp_data = reinterpret_cast<const char*>(resp_buf->data_begin());
+                    size_t resp_len = resp_buf->size();
+
+                    // std::cerr << "[shim] deliver_message: response src=" << resp->get_src()
+                    //           << " dst=" << resp->get_dst() << " accepted=" << resp->get_accepted() << std::endl;
+
+                    listener->get_send_resp_cb()(
+                        listener->get_send_resp_ctx(),
+                        listener->get_group_id(),
+                        resp->get_src(),   // Our node ID
+                        resp->get_dst(),   // Target node ID
+                        resp_data,
+                        resp_len
+                    );
+                    // std::cerr << "[shim] deliver_message: response sent" << std::endl;
+                } else {
+                    // std::cerr << "[shim] deliver_message: no listener or callback" << std::endl;
+                }
             }
         }
-
-        if (!resp) {
-            // Normal path: let NuRaft handle the request
-            resp = raft_server_access::call_process_req(srv, *req);
-        }
-
-        if (resp) {
-            // std::cerr << "[shim] deliver_message: got response, sending via listener" << std::endl;
-            // Send response via listener's callback
-            auto& listener = mp_ctx->listener;
-            if (listener && listener->has_send_response_callback()) {
-                ptr<buffer> resp_buf = serialize_resp_msg(resp);
-                const char* resp_data = reinterpret_cast<const char*>(resp_buf->data_begin());
-                size_t resp_len = resp_buf->size();
-
-                // std::cerr << "[shim] deliver_message: response src=" << resp->get_src()
-                //           << " dst=" << resp->get_dst() << " accepted=" << resp->get_accepted() << std::endl;
-
-                listener->get_send_resp_cb()(
-                    listener->get_send_resp_ctx(),
-                    listener->get_group_id(),
-                    resp->get_src(),   // Our node ID
-                    resp->get_dst(),   // Target node ID
-                    resp_data,
-                    resp_len
-                );
-                // std::cerr << "[shim] deliver_message: response sent" << std::endl;
-            } else {
-                // std::cerr << "[shim] deliver_message: no listener or callback" << std::endl;
-            }
-        }
+    } catch (const std::exception& ex) {
+        // C++ exceptions (e.g. out_of_range, bad_alloc) caught here.
+        // SIGSEGV is NOT a C++ exception and cannot be caught.
+        std::cerr << "[shim] deliver_message: C++ exception caught: "
+                  << ex.what() << " (msg_len=" << msg_len << ")"
+                  << std::endl;
+    } catch (...) {
+        std::cerr << "[shim] deliver_message: unknown exception caught"
+                  << " (msg_len=" << msg_len << ")" << std::endl;
     }
 }
 

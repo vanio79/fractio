@@ -13,13 +13,14 @@
 ## Implements KVStoreWithRouting interface for testable code.
 
 import std/[options, tables as stdtables, sets, locks, atomics, strutils,
-    hashes, algorithm, os, sequtils]
+    hashes, algorithm, os, sequtils, monotimes, times, typedthreads]
 import posix
 import ../core/types
 import ../core/kv_interface # KVStore interface
 import ./routing # Pure routing functions
 import ../protocol/client
 import ../protocol/types
+import ../protocol/codec
 import ../protocol/messages/kv as kvMsgs
 import ../protocol/messages/txn as txnMsgs
 import ../distributed/meta/system_tables
@@ -391,7 +392,7 @@ proc initialize*(client: FractioClient): bool =
     return false
 
   let conn = connOpt.get()
-  defer: conn.disconnect()
+  defer: conn.disconnect("initialize")
 
   # Fetch system tables
   let nodesResult = client.fetchNodesTable(conn)
@@ -1079,6 +1080,193 @@ method delete*(client: FractioClient, key: string,
 
   return kvVoidErr("too many retries")
 
+# ---------------------------------------------------------------------------
+# Internal helper: send a single BatchRequest to a group leader with retries
+# ---------------------------------------------------------------------------
+
+proc sendBatchToGroup(client: FractioClient, groupId: GroupID,
+                      req: BatchRequest): Result[int, string] {.gcsafe.} =
+  ## Send a BatchRequest to the leader of `groupId`, retry on not-leader
+  ## / internal-error. Returns the number of successful ops in the response
+  ## (or an error message on terminal failure).
+  let maxRetries = client.getMaxRetries()
+  const baseBackoffMs = 50
+
+  for attempt in 0 ..< maxRetries:
+    let connOpt = client.getGroupLeaderConnection(groupId)
+    if connOpt.isNone:
+      if attempt < maxRetries - 1:
+        discard client.refreshMetadata()
+        sleep(baseBackoffMs + attempt * 5)
+        continue
+      return Result[int, string](isOk: false,
+        err: "no connection to group leader for " & $groupId)
+
+    let conn = connOpt.get()
+    let res = conn.kvBatch(req)
+
+    if res.isOk:
+      # Count successful ops in the response. We accept both AllOK and
+      # PartialFailure (per-op status is non-zero for failures); for delete
+      # operations, "not found" still counts as success from the caller's
+      # perspective, so we count any per-op status 0x00 as success.
+      var successCount = 0
+      for opRes in res.value.results:
+        if opRes.status == 0x00'u8:
+          inc successCount
+      return Result[int, string](isOk: true, val: successCount)
+
+    if res.error.kind == peNotLeader:
+      if res.error.leaderRedirect.leaderId != 0:
+        client.updateLeaderFromRedirect(groupId, res.error.leaderRedirect)
+      else:
+        discard client.refreshMetadata()
+      if attempt < maxRetries - 1:
+        sleep(baseBackoffMs + attempt * 5)
+      continue
+
+    if res.error.kind == peInternal:
+      client.invalidateGroupLeader(groupId)
+      discard client.refreshMetadata()
+      if attempt < maxRetries - 1:
+        sleep(baseBackoffMs + attempt * 5)
+      continue
+
+    return Result[int, string](isOk: false,
+      err: "batch RPC failed: " & res.error.msg)
+
+  return Result[int, string](isOk: false,
+    err: "too many retries for batch to group " & $groupId)
+
+# ---------------------------------------------------------------------------
+# KVStore.batch implementation
+#
+# Groups ops by destination group (via getGroupForKey) and dispatches one
+# BatchRequest per group. Each per-group BatchRequest is chunked into
+# sub-batches of MAX_BATCH_OPS (10K) so the protocol limit is respected.
+# The op.key passed by the caller is the scan-bound form (no groupId);
+# this method adds the groupId before transmitting so the leader can
+# index into the correct shard.
+# ---------------------------------------------------------------------------
+
+method batch*(client: FractioClient, ops: seq[KVBatchOp],
+              txnId: TransactionID = zeroTransactionID()): KVOpResult[
+                  KVBatchResult] =
+  ## Implements KVStore.batch: execute a batch of operations, routing each
+  ## op to its group leader and using one BatchRequest per group.
+  if not client.initialized.load(moRelaxed):
+    return kvBatchErr("client not initialized")
+
+  if ops.len == 0:
+    return kvBatchOk(0)
+
+  # Per-group bucket: original index in `ops` and the rewritten key (with groupId).
+  type BatchEntry = object
+    origIdx: int
+    rewrittenKey: string
+  var byGroup: stdtables.Table[GroupID, seq[BatchEntry]] =
+    stdtables.initTable[GroupID, seq[BatchEntry]]()
+  # Track transaction group participation for distributed transaction
+  # resolution (matches the behaviour of per-op delete/put).
+  if txnId != zeroTransactionID():
+    withWriteLock client.lock:
+      if txnId notin client.txnGroups:
+        client.txnGroups[txnId] = initHashSet[GroupID]()
+      for op in ops:
+        let gid = client.getGroupForKey(op.key)
+        client.txnGroups[txnId].incl(gid)
+
+  for i, op in ops:
+    let gid = client.getGroupForKey(op.key)
+    let rewritten = addGroupIdToKey(op.key, gid)
+    if gid notin byGroup:
+      byGroup[gid] = @[]
+    byGroup[gid].add(BatchEntry(origIdx: i, rewrittenKey: rewritten))
+
+  var totalSuccess = 0
+  var totalFailure = 0
+  var firstError = ""
+
+  # Send one BatchRequest per group (chunked by payload size to keep each
+  # resulting Raft log entry under MAX_BATCH_PAYLOAD_BYTES).
+  #
+  # Why chunk by bytes, not by op count:
+  # 1. ops vary wildly in size (small delete vs large value put), so a
+  #    10K-op cap is misleading.
+  # 2. Larger Raft log entries (> ~4KB) have been observed to trigger
+  #    intermittent SIGSEGV in NuRaft's deliverMessage on the follower
+  #    side, crashing the node. Chunking to small entries avoids the
+  #    bug while still amortizing Raft consensus over many ops.
+  for gid, indexedKeys in byGroup.pairs:
+    var startIdx = 0
+    while startIdx < indexedKeys.len:
+      # Greedily extend the chunk while encoded size is under the limit.
+      # Always include at least one op per chunk to avoid an infinite loop
+      # on pathological inputs (e.g. a single op whose encoded form alone
+      # exceeds the limit).
+      var endIdx = startIdx + 1
+      var batchOps = newSeqOfCap[BatchOp](min(indexedKeys.len - startIdx,
+          MAX_BATCH_OPS))
+      var totalBytes = 0
+      while endIdx <= indexedKeys.len and endIdx - startIdx < MAX_BATCH_OPS:
+        let entry = indexedKeys[endIdx - 1]
+        let op = ops[entry.origIdx]
+        var opData = ""
+        case op.kind
+        of bopDelete:
+          opData.writeBytes(entry.rewrittenKey)
+          batchOps.add(BatchOp(
+            kind: BatchOpDelete,
+            flags: 0,
+            data: opData))
+        of bopPut:
+          # opData is two length-prefixed strings: key then value
+          opData.writeBytes(entry.rewrittenKey)
+          opData.writeBytes(op.value)
+          batchOps.add(BatchOp(
+            kind: BatchOpPut,
+            flags: 0,
+            data: opData))
+        # Estimate encoded size: per-op prefix (kind:1 + flags:1 + len:4 = 6)
+        # plus opData length. The request header is small (~10 bytes).
+        totalBytes += 6 + opData.len
+        if totalBytes > MAX_BATCH_PAYLOAD_BYTES and batchOps.len > 1:
+          # Removing the last op keeps the chunk under the cap.
+          discard batchOps.pop()
+          endIdx -= 1
+          break
+        inc endIdx
+
+      # Use batchOps.len (the actual number of ops we packed) rather than
+      # endIdx - startIdx (which overcounts by 1 when the loop ran endIdx past
+      # indexedKeys.len). See chunking loop above.
+      let chunkLen = batchOps.len
+
+      let req = BatchRequest(
+        flags: BatchFlagContinueOnErr, # ContinueOnErr: per-op failures don't abort batch
+        txnId: txnId,
+        operations: batchOps)
+
+      let res = client.sendBatchToGroup(gid, req)
+      if not res.isOk:
+        # Whole batch RPC failed: count all ops in this chunk as failed
+        totalFailure += chunkLen
+        if firstError.len == 0:
+          firstError = res.err
+      else:
+        # Count successes: any op whose per-op status is 0x00
+        let succ = res.val
+        let fail = chunkLen - succ
+        totalSuccess += succ
+        totalFailure += fail
+        if succ < chunkLen and firstError.len == 0:
+          firstError = "partial failure in batch (group=" & $gid &
+                       "): " & $succ & "/" & $chunkLen & " ops succeeded"
+
+      startIdx = endIdx
+
+  return kvBatchOk(totalSuccess, totalFailure, firstError)
+
 method scan*(client: FractioClient, startKey: string, endKey: string,
             limit: uint32 = 0,
             txnId: TransactionID = zeroTransactionID(),
@@ -1105,6 +1293,7 @@ method scan*(client: FractioClient, startKey: string, endKey: string,
 
   # Collect results from all groups, deduplicating by key
   var resultMap = stdtables.initTable[string, string]()
+  var scanErrors: seq[string] = @[]
 
   for groupId in groupIds:
     # Compute per-group scan bounds for data tables
@@ -1113,18 +1302,13 @@ method scan*(client: FractioClient, startKey: string, endKey: string,
     else:
       (startKey, endKey)
 
+    var groupOk = false
     for attempt in 0 ..< 3:
       let connOpt = client.getGroupLeaderConnection(groupId)
       if connOpt.isNone:
-        # Skip this group if we can't connect - it may not have data for this range
-        when defined(debug):
-          try:
-            {.cast(gcsafe).}:
-              debug("kvScan: no connection for group", {
-                  "groupId": $groupId}.toTable)
-          except:
-            discard
-        break
+        if attempt == 2:
+          scanErrors.add($groupId & ": no connection to leader")
+        continue
 
       let conn = connOpt.get()
       # Use per-group scan bounds for efficient reads.
@@ -1137,9 +1321,16 @@ method scan*(client: FractioClient, startKey: string, endKey: string,
           # Deduplicate: keep first occurrence
           if pair.key notin resultMap:
             resultMap[pair.key] = pair.value
+        groupOk = true
         break # Success, move to next group
 
       if res.error.kind == peNotLeader:
+        # Connection is pointing to a non-leader. Invalidate the cached
+        # connection so getGroupLeaderConnection picks a different replica,
+        # then refresh metadata to learn the new leader. Without the
+        # invalidate, the next attempt would reuse the same broken
+        # connection and loop forever.
+        client.invalidateGroupLeader(groupId)
         if res.error.leaderRedirect.leaderId != 0:
           client.updateLeaderFromRedirect(groupId, res.error.leaderRedirect)
         else:
@@ -1152,7 +1343,18 @@ method scan*(client: FractioClient, startKey: string, endKey: string,
         discard client.refreshMetadata()
         continue
 
-      break # Other error, skip this group
+      # Other error — record and stop retrying this group
+      scanErrors.add($groupId & ": " & res.error.msg)
+      break
+
+    if not groupOk and scanErrors.len == 0:
+      scanErrors.add($groupId & ": failed after 3 attempts")
+
+  # If any group failed in a multi-group scan, return error instead of partial data
+  if scanErrors.len > 0 and groupIds.len > 1:
+    return kvOpErr[seq[tuple[key, value: string]]](
+        "partial scan failure: " & scanErrors.join("; ") &
+        " (all groups required for correct results)")
 
   # Convert to result sequence
   var entries: seq[tuple[key, value: string]] = @[]
@@ -1179,7 +1381,8 @@ method streamScan*(client: FractioClient, startKey: string, endKey: string,
                   txnId: TransactionID = zeroTransactionID(),
                   readTimestamp: uint64 = 0,
                   filter: Option[kvMsgs.WireFilterExpr] = none(
-                      kvMsgs.WireFilterExpr)): Result[StreamingScanClient,
+                      kvMsgs.WireFilterExpr),
+                  reverse: bool = false): Result[StreamingScanClient,
 
 ProtocolError] =
   ## Streaming scan across ALL groups in the space.
@@ -1187,6 +1390,9 @@ ProtocolError] =
   ## This method creates a streaming client that merges results from all groups
   ## in key order using k-way merge.
   ## filter: optional server-side filter for reducing network traffic
+  ## reverse: when true, each group scans in descending key order; the k-way
+  ##          merge also runs in descending order. This is used by the planner
+  ##          for PK DESC + LIMIT pushdown to avoid scanning all N rows.
   let scanTimer = newQueryTimer()
   if not client.initialized.load(moRelaxed):
     return peErr(newProtocolError(peInternal, "client not initialized"))
@@ -1214,76 +1420,247 @@ ProtocolError] =
           "no connection to group leader"))
     let conn = connOpt.get()
     return conn.kvStreamScan(groupStart, groupEnd, limit, 0, 0, txnId,
-        readTimestamp, groupId, filter)
+        readTimestamp, groupId, filter, reverse)
 
-  # For multi-group, use k-way merge: open all group streams simultaneously
+  # For multi-group, use k-way merge: open all group streams in PARALLEL
   # and merge results by key order. This produces globally sorted output
   # without needing a post-hoc sort.
+  #
+  # Previously, streams were opened sequentially in a for-loop, which meant
+  # 3 groups × ~110ms = ~330ms just for setup. By opening them in parallel,
+  # the setup time drops to ~110ms (the slowest group's first-frame time).
   let chunkSize = 100'u32 # Default chunk size for streaming
-  var groupStreams: seq[StreamingScanClient] = @[]
-  var errors: seq[string] = @[]
+
+  # Step 1: Resolve connections and compute per-group scan bounds on the main thread.
+  #
+  # CRITICAL: ProtocolClient wraps a single TCP socket. If two groups share the
+  # same leader node, getGroupLeaderConnection returns the SAME ProtocolClient
+  # instance for both. Two concurrent kvStreamScan calls on the same socket would
+  # interleave their frames, corrupting both streams. This causes wrong ordering
+  # results in k-way merge because the streams receive each other's data.
+  #
+  # Fix: for groups sharing a leader node, create a separate TCP connection for
+  # each group so that parallel streams don't interfere.
+  type GroupScanArgs = object
+    groupId: GroupID
+    groupStart: string
+    groupEnd: string
+    conn: ProtocolClient
+    filter: Option[kvMsgs.WireFilterExpr]
+    ownsConnection: bool ## True if we created a dedicated connection (must close after)
+
+  var groupArgs: seq[GroupScanArgs] = @[]
+  var resolveErrors: seq[string] = @[]
+  var seenConns: seq[ProtocolClient] = @[] ## Track connections already in use
+
+  debug "[scan_client] streamScan: " & $groupIds.len & " groups, isDataTable=" &
+      (if isDataTable: "true" else: "false")
 
   for groupId in groupIds:
-    # Compute per-group scan bounds for efficient reads
     let (groupStart, groupEnd) = if isDataTable:
       narrowScanBoundsToGroup(startKey, endKey, tableId, groupId)
     else:
       (startKey, endKey)
 
-    # Retry loop: try up to 3 times to get data from this group.
-    # On NOT_LEADER, refresh metadata and retry with the correct leader.
-    # On connection failure, refresh metadata and retry.
-    # This ensures we never silently skip groups, which would cause
-    # missing rows in multi-group k-way merge scans.
-    var streamAdded = false
-    for attempt in 0 ..< 3:
-      var connOpt: Option[ProtocolClient] = none(ProtocolClient)
-      try:
-        connOpt = client.getGroupLeaderConnection(groupId)
-      except KeyError:
-        discard
+    # Get connection to group leader (uses cached connection)
+    var connOpt: Option[ProtocolClient] = none(ProtocolClient)
+    try:
+      connOpt = client.getGroupLeaderConnection(groupId)
+    except KeyError:
+      discard
 
-      if connOpt.isNone:
-        # No cached connection — retry once (the leader may have been cached
-        # after a previous group's scan triggered a metadata refresh).
-        if attempt < 2:
-          continue
-        errors.add($groupId & ": no connection to leader after retries")
-        break
+    if connOpt.isNone:
+      resolveErrors.add($groupId & ": no connection to leader")
+      continue
 
-      let conn = connOpt.get()
-      let streamRes = conn.kvStreamScan(groupStart, groupEnd, 0,
-          chunkSize, 0, txnId, readTimestamp, groupId, filter)
-      if streamRes.isOk:
-        groupStreams.add(streamRes.value)
-        streamAdded = true
-        break
-      elif streamRes.error.kind == peNotLeader:
-        # Leader changed — update redirect info and retry
-        if streamRes.error.leaderRedirect.leaderId != 0:
-          client.updateLeaderFromRedirect(groupId,
-              streamRes.error.leaderRedirect)
+    let cachedConn = connOpt.get()
+
+    # Check if this connection is already used by another group.
+    # If so, create a dedicated connection to the same node to avoid
+    # frame interleaving when parallel streams run concurrently.
+    var conn: ProtocolClient = cachedConn
+    var ownsConn: bool = false
+
+    if seenConns.contains(cachedConn):
+      # Shared connection — create a new one for this group to avoid
+      # frame interleaving when parallel streams run concurrently on
+      # the same TCP socket.
+      var leaderHost: string
+      var leaderPort: uint16
+      withReadLock client.lock:
+        if groupId in client.groups:
+          let nodeId = client.groups[groupId].leaderNodeId
+          if nodeId != 0 and nodeId in client.nodes:
+            leaderHost = client.nodes[nodeId].host
+            leaderPort = client.nodes[nodeId].clientPort
+      if leaderHost.len > 0:
+        let newConn = client.connectToNode(leaderHost, int(leaderPort))
+        if newConn.isSome:
+          conn = newConn.get()
+          ownsConn = true
         else:
-          discard client.refreshMetadata()
-        if attempt < 2:
+          # Failed to create a dedicated connection for this group.
+          # We MUST NOT reuse the shared connection — it would cause
+          # frame interleaving with the other group's stream. Instead,
+          # skip this group and report an error.
+          resolveErrors.add($groupId & ": failed to create dedicated connection to " &
+              leaderHost & ":" & $leaderPort & " (shared leader connection already in use)")
           continue
-        errors.add($groupId & ": not leader after retries")
-      else:
-        # Other errors (e.g., "send incomplete") — the connection is stale/broken.
-        # Close the broken connection and retry with a fresh one.
-        if attempt < 2:
-          # Remove the broken connection from the cache so we get a fresh one
-          withWriteLock client.lock:
-            client.leaderConnections.del(groupId)
-            client.leaderConnectionNodes.del(groupId)
-          continue
-        errors.add($groupId & ": " & streamRes.error.msg)
-        break
 
-    if not streamAdded:
-      # Group scan failed after all retries — this group's data will be missing.
-      # The errors list will contain the reason.
-      discard # no-op to allow the block to compile
+    seenConns.add(cachedConn)
+
+    groupArgs.add(GroupScanArgs(
+      groupId: groupId,
+      groupStart: groupStart,
+      groupEnd: groupEnd,
+      conn: conn,
+      filter: filter,
+      ownsConnection: ownsConn
+    ))
+
+  if groupArgs.len == 0:
+    if resolveErrors.len > 0:
+      return peErr(newProtocolError(peInternal,
+          "failed to connect to any group: " & resolveErrors.join("; ")))
+    return peErr(newProtocolError(peInternal,
+        "no groups available for scan"))
+
+  # Step 2: Open streams. For single group, do it directly on the main thread.
+  # For multiple groups, open them concurrently using threads.
+  #
+  # Each kvStreamScan call takes ~110ms (server processes first batch).
+  # Running them concurrently drops total setup from sum(N×110ms) to max(110ms).
+  #
+  # Thread communication: each thread writes to its own slot in a shared
+  # result array via raw pointer. ProtocolClient and StreamingScanClient are
+  # ref objects that can't cross Thread[T] boundaries, so we use pointer casts.
+  # GroupID/TransactionID are distinct ULID (value types, array[16,uint8])
+  # and CAN be passed directly, but we serialize as strings to avoid issues
+  # with distinct-type handling in Nim's thread system.
+  var groupStreams: seq[StreamingScanClient] = @[]
+  var errors: seq[string] = @[]
+
+  type StreamSetupResult = object
+    ok: bool
+    streamPtr: pointer # StreamingScanClient cast to pointer (valid only if ok)
+    errorMsg: string
+
+  if groupArgs.len == 1:
+    # Single group — no need for threads
+    let args = groupArgs[0]
+    let streamRes = args.conn.kvStreamScan(args.groupStart, args.groupEnd, 0,
+        chunkSize, 0, txnId, readTimestamp, args.groupId, args.filter, reverse)
+    if streamRes.isOk:
+      groupStreams.add(streamRes.value)
+    else:
+      if args.ownsConnection:
+        args.conn.disconnect("scan_failed_single")
+      errors.add($args.groupId & ": " & streamRes.error.msg)
+  else:
+    # Multiple groups — open streams in parallel using threads.
+    # Each thread calls kvStreamScan and writes to its own result slot
+    # via a raw pointer, avoiding closure captures.
+    var setupResults = newSeq[StreamSetupResult](groupArgs.len)
+    var threads = newSeq[Thread[pointer]](groupArgs.len)
+
+    # Thread arg: all data needed to open one group stream. Must be a
+    # plain object (no GC refs) for safe cross-thread passing via pointer.
+    type SetupArg = object
+      idx: int
+      connPtr: pointer
+      groupStart: string
+      groupEnd: string
+      groupIdStr: string
+      chunkSizeVal: uint32
+      txnIdStr: string
+      readTs: uint64
+      reverseVal: bool
+      resultPtr: pointer
+
+    var setupArgs = newSeq[SetupArg](groupArgs.len)
+    for i in 0 ..< groupArgs.len:
+      let args = groupArgs[i]
+      setupArgs[i] = SetupArg(
+        idx: i,
+        connPtr: cast[pointer](args.conn),
+        groupStart: args.groupStart,
+        groupEnd: args.groupEnd,
+        groupIdStr: $args.groupId,
+        chunkSizeVal: chunkSize,
+        txnIdStr: $txnId,
+        readTs: readTimestamp,
+        reverseVal: reverse,
+        resultPtr: addr(setupResults[i])
+      )
+
+    {.cast(raises: []).}:
+      for i in 0 ..< groupArgs.len:
+        let arg = setupArgs[i]
+        createThread(threads[i], proc(a: pointer) {.thread.} =
+          {.cast(gcsafe).}:
+            let sa = cast[ptr SetupArg](a)[]
+            let conn = cast[ProtocolClient](sa.connPtr)
+            let groupId = parseGroupID(sa.groupIdStr)
+            let txnIdVal = transactionIDFromString(sa.txnIdStr)
+            let filterOpt: Option[kvMsgs.WireFilterExpr] = none(
+                kvMsgs.WireFilterExpr)
+            let streamRes = conn.kvStreamScan(sa.groupStart, sa.groupEnd, 0,
+                sa.chunkSizeVal, 0, txnIdVal, sa.readTs, groupId, filterOpt,
+                sa.reverseVal)
+            let slot = cast[ptr StreamSetupResult](sa.resultPtr)
+            if streamRes.isOk:
+              # CRITICAL: Prevent use-after-free when the thread's local
+              # streamRes goes out of scope. With --mm:atomicArc, ref
+              # objects use atomic reference counting. When streamRes is
+              # destroyed at thread exit, it decrements the ref count.
+              # Without GC_ref, the count drops to 0 and the object is freed
+              # before the main thread can adopt it via cast[pointer].
+              # GC_ref adds +1 so the count stays >= 1 after streamRes
+              # destruction. The main thread's groupStreams.add() will
+              # adopt the reference, and the extra GC_ref is balanced by
+              # streamRes's =destroy decrement.
+              GC_ref(streamRes.value)
+              slot[] = StreamSetupResult(
+                ok: true,
+                streamPtr: cast[pointer](streamRes.value),
+                errorMsg: ""
+              )
+            else:
+              slot[] = StreamSetupResult(
+                ok: false,
+                streamPtr: nil,
+                errorMsg: streamRes.error.msg
+              )
+        , cast[pointer](addr(setupArgs[i])))
+
+    # Wait for all threads to complete
+    for i in 0 ..< groupArgs.len:
+      joinThread(threads[i])
+
+    # Collect results — cast pointers back to ref types
+    for i in 0 ..< groupArgs.len:
+      let res = setupResults[i]
+      if res.ok:
+        groupStreams.add(cast[StreamingScanClient](res.streamPtr))
+      else:
+        # Stream failed — disconnect owned connections to prevent leaks
+        if groupArgs[i].ownsConnection:
+          groupArgs[i].conn.disconnect("scan_failed_parallel")
+        errors.add(setupArgs[i].groupIdStr & ": " & res.errorMsg)
+
+    # If any stream failed in a multi-group scan, return an error instead
+    # of producing partial results. Partial data silently returns wrong
+    # answers (e.g., 322 rows instead of 999) and corrupts ORDER BY results.
+    if errors.len > 0:
+      # Clean up any successfully opened streams before returning error
+      for stream in groupStreams:
+        stream.closeStream()
+      groupStreams = @[]
+      return peErr(newProtocolError(peInternal,
+          "partial stream failure: " & errors.join("; ") &
+          " (all groups required for correct results)"))
+
+  scanTimer.stamp("merge_setup")
 
   if groupStreams.len == 0:
     if errors.len > 0:
@@ -1305,8 +1682,7 @@ ProtocolError] =
       primaryKeyFromDataRowKey(key)
   else:
     nil
-  let mergeClient = newKWayMergeScanClient(groupStreams, limit, extractor)
-  scanTimer.stamp("merge_setup")
+  let mergeClient = newKWayMergeScanClient(groupStreams, limit, extractor, reverse)
   debug "[scan_client] groups=" & $groupIds.len & " streams=" &
       $groupStreams.len & " " & scanTimer.formatBreakdown()
   return peOk(mergeClient)
@@ -1703,6 +2079,16 @@ proc createSpace*(client: FractioClient, name: string,
         # Small backoff before retry to avoid leader redirect loops
         sleep(100 * (attempt + 1))
         continue
+      # Connection failure (e.g. "send incomplete" on freshly-established
+      # socket) — invalidate the cached META leader connection and retry.
+      # This is the same pattern used by kvPut/kvDelete. The previous behavior
+      # of returning immediately caused intermittent CREATE SPACE failures on
+      # the first request after client initialization.
+      if res.error.kind == peInternal:
+        client.invalidateGroupLeader(META_GROUP_ID)
+        discard client.refreshMetadata()
+        sleep(100 * (attempt + 1))
+        continue
       return spaceOpErr(res.error.msg)
 
     let resp = res.value
@@ -1770,6 +2156,12 @@ proc dropSpace*(client: FractioClient, name: string): SpaceOpResult =
               res.error.leaderRedirect)
         else:
           discard client.refreshMetadata()
+        continue
+      # Connection failure (e.g. "send incomplete" on freshly-established
+      # socket) — invalidate the cached META leader connection and retry.
+      if res.error.kind == peInternal:
+        client.invalidateGroupLeader(META_GROUP_ID)
+        discard client.refreshMetadata()
         continue
       return spaceOpErr(res.error.msg)
 

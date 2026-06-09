@@ -548,6 +548,7 @@ proc encodeBatchRequest*(req: BatchRequest): string =
 proc decodeBatchRequest*(payload: string): Result[BatchRequest, ProtocolError] =
   var pos = 2
   var req: BatchRequest
+
   let flagsR = readUint8(payload, pos)
   if flagsR.isErr: return peErr(flagsR.error)
   req.flags = flagsR.value

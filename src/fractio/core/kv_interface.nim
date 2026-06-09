@@ -7,6 +7,7 @@ import std/options
 import ./types
 import ../distributed/raft/group_types # for GroupID
 import ../storage/backend # for StreamResultSet, StreamConfig, KeyValuePair
+import ../protocol/types # for MAX_BATCH_OPS
 
 # ---------------------------------------------------------------------------
 # Result types
@@ -125,7 +126,49 @@ method delete*(store: KVStore, key: string,
                txnId: TransactionID = zeroTransactionID()): KVOpVoidResult {.base, gcsafe.} =
   ## Delete a key.
   ## If txnId is provided, deletion is staged until commit.
+  ## Otherwise, writes immediately.
   kvVoidErr("not implemented")
+
+# Batch operation type for bulk operations
+type
+  KVBatchOpKind* = enum
+    bopDelete ## Delete a key
+    bopPut    ## Put a key-value pair
+
+  KVBatchOp* = object
+    kind*: KVBatchOpKind
+    key*: string
+    value*: string ## Only used for bopPut
+
+  KVBatchResult* = object
+    ## Result of a batch operation.
+    successCount*: int
+    failureCount*: int
+    firstError*: string
+
+proc kvBatchOk*(success: int, failure: int = 0,
+                err: string = ""): KVOpResult[KVBatchResult] =
+  KVOpResult[KVBatchResult](isOk: true, val: KVBatchResult(
+    successCount: success, failureCount: failure, firstError: err))
+
+proc kvBatchErr*(msg: string): KVOpResult[KVBatchResult] =
+  KVOpResult[KVBatchResult](isOk: false, err: msg)
+
+# Batch operation (delete multiple keys across one or more groups atomically)
+method batch*(store: KVStore, ops: seq[KVBatchOp],
+              txnId: TransactionID = zeroTransactionID()): KVOpResult[
+                  KVBatchResult] {.base, gcsafe.} =
+  ## Execute a batch of operations (currently only Delete is used by executor).
+  ## For multi-group distributed stores, this routes operations to the
+  ## appropriate group leaders and uses a single Batch RPC per group,
+  ## reducing Raft commits from N to ceil(N / groups).
+  ##
+  ## If txnId is provided, operations are staged until commit.
+  ## Otherwise, operations are committed immediately.
+  ##
+  ## Implementations must respect the MAX_BATCH_OPS limit per RPC; if the
+  ## caller passes more, the implementation chunks automatically.
+  kvBatchErr("not implemented")
 
 # Scan operation (returns all results as array - deprecated for large scans)
 method scan*(store: KVStore, startKey: string, endKey: string,
@@ -213,6 +256,11 @@ proc txnDelete*(store: KVStore, key: string,
     txnId: TransactionID): KVOpVoidResult =
   ## Delete within a transaction context.
   store.delete(key, txnId = txnId)
+
+proc txnBatch*(store: KVStore, ops: seq[KVBatchOp],
+    txnId: TransactionID): KVOpResult[KVBatchResult] =
+  ## Batch within a transaction context.
+  store.batch(ops, txnId = txnId)
 
 proc txnScan*(store: KVStore, startKey: string, endKey: string,
               txnId: TransactionID, readTimestamp: uint64,

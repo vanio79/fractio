@@ -3,8 +3,8 @@
 
 import httpbeast
 import nimja/parser
-import std/[json, strutils, strformat, times, os, atomics,
-    tables as stdtables, httpclient, uri, options, asyncfutures, net]
+import std/[json, strutils, strformat, times, os, atomics, algorithm,
+    tables as stdtables, httpclient, uri, options, asyncfutures, net, locks]
 import zippy
 import ../core/types as coreTypes except Table
 import ../protocol/server as pserver
@@ -27,17 +27,38 @@ import ../storage/backend
 var gSrvPtr {.global.}: pointer
 var gWebPort {.global.}: int
 var gClient {.global.}: FractioClient
+var gClientLock {.global.}: Lock
 var gWebThread {.global.}: Thread[int]
-var gClientLastRefresh {.global.}: float64 = 0.0  # epochTime of last successful refresh
+var gClientLastRefresh {.global.}: float64 = 0.0 # epochTime of last successful refresh
 
 template getSrv(): pserver.ProtocolServer =
   cast[pserver.ProtocolServer](gSrvPtr)
 
-proc getClient(): FractioClient =
-  ## Get or create the global FractioClient.
-  ## If the client metadata is stale (older than 2 seconds), force a refresh
-  ## to ensure we know the current leader. This prevents long retry loops when
-  ## the leader changes after a failover.
+# ---------------------------------------------------------------------------
+# Thread-safe client access
+# ---------------------------------------------------------------------------
+# The global FractioClient is shared across httpbeast's async event loop.
+# Concurrent HTTP handlers calling getClient().query() on the same client
+# would interleave ProtocolClient socket reads/writes, causing data corruption.
+# The lock serializes all client operations to prevent this.
+
+template withClient*(body: untyped): untyped =
+  ## Acquire the client lock, get the client, execute body, release lock.
+  ## Use this for ALL FractioClient operations to prevent concurrent
+  ## access to shared ProtocolClient connections.
+  acquire(gClientLock)
+  try:
+    let cl {.inject.} = getClientLocked()
+    body
+  finally:
+    release(gClientLock)
+
+proc getClientLocked(): FractioClient =
+  ## Get or create the global FractioClient. MUST be called under gClientLock.
+  ## NOTE: We intentionally do NOT call forceMetadataRefresh() here because
+  ## it acquires the FractioClient's internal RWLock with a write lock, which
+  ## could invalidate connection cache entries that the current query is using.
+  ## Metadata refreshes happen at query retry time via resetClient().
   if gClient == nil:
     let srv = getSrv()
     let host = if srv.config.host == "0.0.0.0": "127.0.0.1" else: srv.config.host
@@ -50,23 +71,8 @@ proc getClient(): FractioClient =
     cfg.connectionTimeoutMs = 2000
     cfg.requestTimeoutMs = 3000
     gClient = newFractioClient(cfg)
-    discard gClient.initialize()
+    let initOk = gClient.initialize()
     gClientLastRefresh = epochTime()
-  else:
-    # Proactively refresh metadata if it's stale (older than 10 seconds).
-    # This prevents long retry loops after a leader failover.
-    # NOTE: The previous 2-second threshold caused excessive refreshes that
-    # blocked the event loop. 10 seconds is a better balance between freshness
-    # and not blocking the HTTP handler.
-    let now = epochTime()
-    if now - gClientLastRefresh > 10.0:
-      try:
-        discard gClient.forceMetadataRefresh()
-        gClientLastRefresh = epochTime()
-      except CatchableError:
-        # Refresh failed — don't block the event loop, just use stale metadata.
-        # The next request will try again.
-        discard
   gClient
 
 proc resetClient() =
@@ -155,6 +161,74 @@ proc getHeader(req: Request, name: string): string =
     let h = headersOpt.get()
     if h.hasKey(name): return h[name]
   return ""
+
+proc listSpaceNames(): seq[string] =
+  ## Query the META group for all space names. Used by both the REST
+  ## /api/sql/databases endpoint and the HTMX tab dropdowns.
+  ##
+  ## In Fractio, "databases" in the UI correspond to spaces (each space
+  ## is a sharded data plane). SHOW SPACES returns: [space_id, name,
+  ## replicas, group_count, group_ids]. We extract the 'name' column.
+  ##
+  ## Returns an empty seq if the server is not ready or the query fails,
+  ## which keeps the UI usable (the empty dropdown is preferable to a 500).
+  result = @[]
+  let srv = getSrv()
+  if srv.isNil or srv.raftStore.isNil:
+    return
+  var dbRes: ExecResult
+  {.cast(gcsafe).}:
+    withClient:
+      dbRes = cl.query("SHOW SPACES", "default", "public")
+  # Find the 'name' column index, fall back to column 1 (name is always
+  # the second column of SHOW SPACES output).
+  let nameIdx: int =
+    if dbRes.kind == erkStreamingRows and dbRes.streamColumns.len > 1:
+      let idx = dbRes.streamColumns.find("name")
+      if idx >= 0: idx else: 1
+    elif dbRes.kind == erkRows and dbRes.columns.len > 1:
+      let idx = dbRes.columns.find("name")
+      if idx >= 0: idx else: 1
+    else:
+      0
+  if dbRes.kind == erkStreamingRows:
+    let iter = dbRes.streamIterator
+    while iter.hasNextRow():
+      let rowOpt = iter.nextRow()
+      if rowOpt.isSome:
+        let row = rowOpt.get()
+        if row.len > nameIdx and row[nameIdx].len > 0:
+          result.add(row[nameIdx])
+    iter.closeIterator()
+  elif dbRes.kind == erkRows:
+    for row in dbRes.rows:
+      if row.len > nameIdx and row[nameIdx].len > 0:
+        result.add(row[nameIdx])
+
+proc listSchemaNames(db: string): seq[string] =
+  ## Query the META group for all schema names in a given space.
+  ## Returns an empty seq on failure.
+  result = @[]
+  let srv = getSrv()
+  if srv.isNil or srv.raftStore.isNil:
+    return
+  var schemaRes: ExecResult
+  {.cast(gcsafe).}:
+    withClient:
+      schemaRes = cl.query("SHOW SCHEMAS", db, "public")
+  if schemaRes.kind == erkStreamingRows:
+    let iter = schemaRes.streamIterator
+    while iter.hasNextRow():
+      let rowOpt = iter.nextRow()
+      if rowOpt.isSome:
+        let row = rowOpt.get()
+        if row.len > 0:
+          result.add(row[0])
+    iter.closeIterator()
+  elif schemaRes.kind == erkRows:
+    for row in schemaRes.rows:
+      if row.len > 0:
+        result.add(row[0])
 
 proc getRoleString(role: int): string =
   case role
@@ -246,8 +320,9 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
       return fut
     var infoResult: ExecResult
     {.cast(gcsafe).}:
-      infoResult = getClient().query("SELECT * FROM sys.nodes WHERE nodeId = " &
-          $srv.config.serverId.int)
+      withClient:
+        infoResult = cl.query("SELECT * FROM sys.nodes WHERE nodeId = " &
+            $srv.config.serverId.int)
     let nodeId = $srv.config.serverId.int
     let role = if not srv.raftCoord.isNil and srv.raftCoord.isLeader(
         META_GROUP_ID): "Leader" else: "Follower"
@@ -261,7 +336,8 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
     var nodesData: seq[(string, string, string, string, string)] = @[]
     var nodesResult: ExecResult
     {.cast(gcsafe).}:
-      nodesResult = getClient().query("SELECT * FROM sys.nodes")
+      withClient:
+        nodesResult = cl.query("SELECT * FROM sys.nodes")
     case nodesResult.kind
     of erkRows:
       for row in nodesResult.rows:
@@ -282,24 +358,30 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
     else:
       discard
 
-    # Get spaces
+    # Get spaces - use explicit column list to avoid _key column at index 0
+    # sys.spaces columns (after _key): spaceId, name, replicas, groupCount, ...
     var spacesResult: ExecResult
     {.cast(gcsafe).}:
-      spacesResult = getClient().query("SELECT * FROM sys.spaces")
-    var spacesData: seq[(string, string, int)] = @[]
+      withClient:
+        spacesResult = cl.query("SELECT spaceId, name, replicas, groupCount FROM sys.spaces")
+    var spacesData: seq[tuple[name, spaceId: string, groupCount: int]] = @[]
+    template extractSpaces(rows: openArray[seq[string]]) =
+      for row in rows:
+        if row.len >= 4:
+          let groupCount = parseInt(row[3])
+          spacesData.add((row[1], row[0], groupCount))
     case spacesResult.kind
     of erkRows:
-      for row in spacesResult.rows:
-        if row.len >= 3:
-          spacesData.add((row[0], row[1] & "?", if row.len > 2: 1 else: 0))
+      extractSpaces(spacesResult.rows)
     of erkStreamingRows:
       let iter = spacesResult.streamIterator
       while iter.hasNextRow():
         let rowOpt = iter.nextRow()
         if rowOpt.isSome:
           let row = rowOpt.get()
-          if row.len >= 3:
-            spacesData.add((row[0], row[1] & "?", if row.len > 2: 1 else: 0))
+          if row.len >= 4:
+            let groupCount = parseInt(row[3])
+            spacesData.add((row[1], row[0], groupCount))
       iter.closeIterator()
     else:
       discard
@@ -323,7 +405,8 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
     # Query nodes from sys.nodes table
     var nodesResult: ExecResult
     {.cast(gcsafe).}:
-      nodesResult = getClient().query("SELECT * FROM sys.nodes")
+      withClient:
+        nodesResult = cl.query("SELECT * FROM sys.nodes")
     case nodesResult.kind
     of erkRows:
       for row in nodesResult.rows:
@@ -446,7 +529,12 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
 
   # ---- HTMX: Data tab ----
   if path == "/htmx/data" and httpMethod == HttpGet:
-    let databases = @["default"]
+    # Dynamically query the META group for the list of spaces (Fractio's
+    # notion of "databases" in the UI). Falls back to ["default"] if the
+    # server is not ready or the query fails, so the UI still loads.
+    var databases = listSpaceNames()
+    if databases.len == 0:
+      databases = @["default"]
     var html: string = ""
     compileTemplateFile("data.nimja", baseDir = getTemplateDir(),
         varname = "html", blockToRender = "content")
@@ -456,7 +544,9 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
   # ---- HTMX: schemas dropdown ----
   if path == "/htmx/schemas" and httpMethod == HttpGet:
     let db = getQueryParam(queryParams, "db-select")
-    var schemasData: seq[string] = @["sys", "public"]
+    var schemasData = listSchemaNames(db)
+    if schemasData.len == 0:
+      schemasData = @["sys", "public"]
     var html = "<sl-select id='schema-select' placeholder='Select schema' size='small' hoist "
     html.add("hx-get='/htmx/tables' hx-trigger='sl-change' hx-target='#tables-list' ")
     html.add("hx-vals=\"js:{'db-select':document.getElementById('db-select').value,'schema-select':event.target.value}\">")
@@ -472,30 +562,60 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
     let schema = getQueryParam(queryParams, "schema-select")
     var tablesData: seq[string] = @[]
     if schema.len > 0:
-      # sys schema has hardcoded system tables
-      if schema == "sys":
-        tablesData = @["databases", "schemas", "tables", "nodes", "spaces", "groups", "settings"]
-      else:
-        var execResult: ExecResult
-        {.cast(gcsafe).}:
-          execResult = getClient().query("SELECT name FROM sys.tables WHERE database = '" &
-              db & "' AND schema = '" & schema & "'")
-        case execResult.kind
-        of erkRows:
-          for row in execResult.rows:
-            if row.len > 0:
-              tablesData.add(row[0])
-        of erkStreamingRows:
-          let iter = execResult.streamIterator
-          while iter.hasNextRow():
-            let rowOpt = iter.nextRow()
-            if rowOpt.isSome:
-              let row = rowOpt.get()
-              if row.len > 0:
-                tablesData.add(row[0])
-          iter.closeIterator()
+      # Query sys.tables for table names in this schema.
+      # NOTE: WHERE-clause filtering is currently skipped on system tables
+      # (see executor.nim fetchNextMatchingRow, which doesn't apply
+      # scFilter for system table records). We fetch all tables and
+      # filter client-side by database and schema.
+      var execResult: ExecResult
+      {.cast(gcsafe).}:
+        withClient:
+          execResult = cl.query("SELECT name, schema, database FROM sys.tables")
+      let dbCol: int =
+        if execResult.kind == erkStreamingRows and
+            execResult.streamColumns.len > 0:
+          let idx = execResult.streamColumns.find("database")
+          if idx >= 0: idx else: 2
+        elif execResult.kind == erkRows and execResult.columns.len > 0:
+          let idx = execResult.columns.find("database")
+          if idx >= 0: idx else: 2
         else:
-          discard
+          -1
+      let schemaCol: int =
+        if execResult.kind == erkStreamingRows and
+            execResult.streamColumns.len > 0:
+          let idx = execResult.streamColumns.find("schema")
+          if idx >= 0: idx else: 1
+        elif execResult.kind == erkRows and execResult.columns.len > 0:
+          let idx = execResult.columns.find("schema")
+          if idx >= 0: idx else: 1
+        else:
+          -1
+      let nameCol: int =
+        if execResult.kind == erkStreamingRows and
+            execResult.streamColumns.len > 0:
+          let idx = execResult.streamColumns.find("name")
+          if idx >= 0: idx else: 0
+        elif execResult.kind == erkRows and execResult.columns.len > 0:
+          let idx = execResult.columns.find("name")
+          if idx >= 0: idx else: 0
+        else:
+          0
+      if execResult.kind == erkRows:
+        for row in execResult.rows:
+          if row.len > max(max(nameCol, schemaCol), dbCol):
+            if row[dbCol] == db and row[schemaCol] == schema:
+              tablesData.add(row[nameCol])
+      elif execResult.kind == erkStreamingRows:
+        let iter = execResult.streamIterator
+        while iter.hasNextRow():
+          let rowOpt = iter.nextRow()
+          if rowOpt.isSome:
+            let row = rowOpt.get()
+            if row.len > max(max(nameCol, schemaCol), dbCol):
+              if row[dbCol] == db and row[schemaCol] == schema:
+                tablesData.add(row[nameCol])
+        iter.closeIterator()
     var html = ""
     for table in tablesData:
       html.add("<button class='htmx-table-item' hx-get='/htmx/data/" & db &
@@ -516,27 +636,48 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
     let tableName = parts[5]
     var execResult: ExecResult
     {.cast(gcsafe).}:
-      execResult = getClient().query("SELECT * FROM " & db & "." & schema &
-          "." & tableName & " LIMIT 100")
+      withClient:
+        # Pass the database from the URL path so the query runs in the
+        # correct database context. Without this, the query defaults to
+        # database="default" and can't find tables in other databases.
+        execResult = cl.query("SELECT * FROM " & db & "." & schema &
+             "." & tableName & " LIMIT 100", database = db, schema = schema)
+    # Filter out the internal _key column from display
+    var displayColumns: seq[string] = @[]
+    var columnIndices: seq[int] = @[]
+    case execResult.kind
+    of erkRows:
+      for i, col in execResult.columns:
+        if col != "_key":
+          displayColumns.add(col)
+          columnIndices.add(i)
+    of erkStreamingRows:
+      for i, col in execResult.streamColumns:
+        if col != "_key":
+          displayColumns.add(col)
+          columnIndices.add(i)
+    else:
+      discard
+
     var html = "<table class='htmx-data-table'>"
     case execResult.kind
     of erkRows:
       html.add("<thead><tr>")
-      for col in execResult.columns:
+      for col in displayColumns:
         html.add("<th>" & col & "</th>")
       html.add("</tr></thead><tbody>")
       for row in execResult.rows:
         html.add("<tr>")
-        for i, col in execResult.columns:
-          if i < row.len:
-            html.add("<td>" & row[i] & "</td>")
+        for idx in columnIndices:
+          if idx < row.len:
+            html.add("<td>" & row[idx] & "</td>")
           else:
             html.add("<td></td>")
         html.add("</tr>")
       html.add("</tbody></table>")
     of erkStreamingRows:
       html.add("<thead><tr>")
-      for col in execResult.streamColumns:
+      for col in displayColumns:
         html.add("<th>" & col & "</th>")
       html.add("</tr></thead><tbody>")
       let iter = execResult.streamIterator
@@ -545,9 +686,9 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
         if rowOpt.isSome:
           let row = rowOpt.get()
           html.add("<tr>")
-          for i, col in execResult.streamColumns:
-            if i < row.len:
-              html.add("<td>" & row[i] & "</td>")
+          for idx in columnIndices:
+            if idx < row.len:
+              html.add("<td>" & row[idx] & "</td>")
             else:
               html.add("<td></td>")
           html.add("</tr>")
@@ -560,8 +701,15 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
 
   # ---- HTMX: SQL tab ----
   if path == "/htmx/sql" and httpMethod == HttpGet:
-    let databases = @["default"]
-    let schemas = @["sys", "public"]
+    # Dynamically populate the database/schema dropdowns from the META group.
+    # Default to ["default"] / ["sys","public"] if the server is not ready
+    # or the query fails, so the UI still loads.
+    var databases = listSpaceNames()
+    if databases.len == 0:
+      databases = @["default"]
+    var schemas = listSchemaNames("default")
+    if schemas.len == 0:
+      schemas = @["sys", "public"]
     let defaultQuery = "SELECT * FROM sys.nodes"
     var html: string = ""
     compileTemplateFile("sql.nimja", baseDir = getTemplateDir(),
@@ -625,7 +773,7 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
           let rec = try: decodeNodeRecord(payload) except: continue
           if uint16(nodeId) == srv.config.serverId:
             foundLocal = true
-          nodesJson.add(%* {
+          nodesJson.add( %* {
             "nodeId": $rec.nodeId,
             "host": rec.host,
             "raftPort": $rec.raftPort,
@@ -635,7 +783,7 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
           })
     # Fallback: local node not found in sys.nodes yet (during bootstrap)
     if not foundLocal:
-      nodesJson.add(%* {
+      nodesJson.add( %* {
         "nodeId": $srv.config.serverId,
         "host": srv.config.host,
         "raftPort": $srv.config.port,
@@ -686,10 +834,12 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
         newClientPort = parseInt(formData.getOrDefault("clientPort"))
         newWebPort = parseInt(formData.getOrDefault("webPort"))
       except ValueError:
-        sendJson(Http400, %* {"success": false, "error": "invalid numeric value"})
+        sendJson(Http400, %* {"success": false,
+            "error": "invalid numeric value"})
         return fut
     if newNodeId <= 0 or newHost == "" or newRaftPort <= 0:
-      sendJson(Http400, %* {"success": false, "error": "missing required fields"})
+      sendJson(Http400, %* {"success": false,
+          "error": "missing required fields"})
       return fut
     # Add the new node as a Raft peer and insert into sys.nodes
     {.cast(gcsafe).}:
@@ -714,7 +864,7 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
           let (payload, isDeleted) = stripMVCCHeader(rawV)
           if isDeleted or payload.len == 0: continue
           let rec = try: decodeNodeRecord(payload) except: continue
-          membersJson.add(%* {
+          membersJson.add( %* {
             "nodeId": rec.nodeId.int,
             "host": rec.host,
             "raftPort": rec.raftPort.int,
@@ -756,14 +906,15 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
     if srv.raftCoord != nil and srv.raftCoord.running.load():
       let metaLeader = srv.raftCoord.getLeader(system_tables.META_GROUP_ID)
       metaLeaderOK = metaLeader > 0
-      let dataLeader = srv.raftCoord.getLeader(system_tables.DATA_GROUP_START_ID)
+      let dataLeader = srv.raftCoord.getLeader(
+          system_tables.DATA_GROUP_START_ID)
       dataLeaderOK = dataLeader > 0
       if not metaLeaderOK:
-        status = 2  # No meta leader
+        status = 2 # No meta leader
       elif not dataLeaderOK:
-        status = 3  # Meta leader OK but data group leader missing
+        status = 3 # Meta leader OK but data group leader missing
     else:
-      status = 1  # Server not fully initialized
+      status = 1 # Server not fully initialized
     # Include server counts in response for diagnostics
     var metaSrvCount = -1
     var dataSrvCount = -1
@@ -814,7 +965,8 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
         sendJson(Http400, %* {"success": false, "message": "invalid JSON"})
         return fut
       except ValueError:
-        sendJson(Http400, %* {"success": false, "message": "invalid numeric value"})
+        sendJson(Http400, %* {"success": false,
+            "message": "invalid numeric value"})
         return fut
     else:
       let formData = parseFormData(bodyStr)
@@ -825,11 +977,13 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
         clientPort = parseInt(formData.getOrDefault("clientPort"))
         webPort = parseInt(formData.getOrDefault("webPort"))
       except ValueError:
-        sendJson(Http400, %* {"success": false, "message": "invalid numeric value"})
+        sendJson(Http400, %* {"success": false,
+            "message": "invalid numeric value"})
         return fut
     # Validate required fields
     if newNodeId == 0:
-      sendJson(Http400, %* {"success": false, "message": "nodeId 0 is reserved"})
+      sendJson(Http400, %* {"success": false,
+          "message": "nodeId 0 is reserved"})
       return fut
     if host.len == 0:
       sendJson(Http400, %* {"success": false, "message": "missing host"})
@@ -848,7 +1002,8 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
     srv.nodeRegistry.addNode(newNode)
     if srv.config.dataDir != "":
       pserver.saveRegistry(srv.nodeRegistry, srv.config.dataDir / "node_registry.dat")
-    sendJson(Http200, %* {"success": true, "message": "node added", "nodeId": newNodeId})
+    sendJson(Http200, %* {"success": true, "message": "node added",
+        "nodeId": newNodeId})
     return fut
 
   # ---- REST: Remove node ----
@@ -867,7 +1022,8 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
     let removed = srv.nodeRegistry.removeNode(uint16(id))
     if removed and srv.config.dataDir != "":
       pserver.saveRegistry(srv.nodeRegistry, srv.config.dataDir / "node_registry.dat")
-    sendJson(Http200, %* {"success": removed, "message": if removed: "node removed" else: "node not found", "nodeId": id})
+    sendJson(Http200, %* {"success": removed,
+        "message": if removed: "node removed" else: "node not found", "nodeId": id})
     return fut
 
   # ---- REST: Rebalance spaces ----
@@ -893,6 +1049,12 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
       return fut
     let bodyStr = bodyOpt.get()
     let contentType = getHeader(req, "Content-Type")
+    # Database and schema may come from the JSON body, form body, or
+    # X-Database/X-Schema headers (in that priority order). Headers are
+    # useful for clients that don't control the request body (e.g. HTMX
+    # forms, fetch wrappers, curl scripts).
+    let dbHeader = getHeader(req, "X-Database")
+    let scHeader = getHeader(req, "X-Schema")
     var sql, db, sc: string
     if contentType.contains("application/json"):
       var j: JsonNode
@@ -902,14 +1064,20 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
         sendJson(Http400, %* {"error": "invalid JSON"})
         return fut
       sql = j.getOrDefault("sql").getStr("")
-      db = j.getOrDefault("database").getStr("default")
-      sc = j.getOrDefault("schema").getStr("public")
+      db = j.getOrDefault("database").getStr("")
+      if db.len == 0: db = dbHeader
+      if db.len == 0: db = "default"
+      sc = j.getOrDefault("schema").getStr("")
+      if sc.len == 0: sc = scHeader
+      if sc.len == 0: sc = "public"
     else:
       let formData = parseFormData(bodyStr)
       sql = formData.getOrDefault("sql")
       db = formData.getOrDefault("database")
+      if db.len == 0: db = dbHeader
       if db.len == 0: db = "default"
       sc = formData.getOrDefault("schema")
+      if sc.len == 0: sc = scHeader
       if sc.len == 0: sc = "public"
     if sql.len == 0:
       sendJson(Http400, %* {"error": "missing sql"})
@@ -917,35 +1085,38 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
     let startTime = cpuTime()
     var execResult: ExecResult
     {.cast(gcsafe).}:
-      let cl = getClient()
-      if not cl.initialized.load(moRelaxed) or cl.groups.len == 0:
-        discard cl.forceMetadataRefresh()
-      execResult = cl.query(sql, db, sc)
-      # If the query failed with a connection/leader error, reset the client
-      # and retry once. This handles stale cached connections after a failover.
-      # The retry is limited to ONE attempt to avoid blocking the event loop.
-      # IMPORTANT: Do NOT retry DDL statements (CREATE/DROP/ALTER) — they are
-      # not idempotent and the first attempt may have succeeded even though we
-      # got a "short header" error reading the response. Retrying would create
-      # duplicate spaces/tables/etc.
-      if execResult.kind == erkError:
-        let errLower = execResult.error.toLowerAscii()
-        let isDdl = sql.toLowerAscii().startsWith("create ") or
-                    sql.toLowerAscii().startsWith("drop ") or
-                    sql.toLowerAscii().startsWith("alter ")
-        let isRetryable = errLower.contains("no connection") or
-           errLower.contains("not leader") or
-           errLower.contains("not the leader") or
-           errLower.contains("send incomplete") or
-           errLower.contains("not connected") or
-           errLower.contains("connection refused") or
-           errLower.contains("too many retries") or
-           errLower.contains("failed to initialize client") or
-           errLower.contains("short header")
-        if isRetryable and not isDdl:
-          {.cast(gcsafe).}:
+      withClient:
+        execResult = cl.query(sql, db, sc)
+        # If the query failed with a connection/leader error, reset the client
+        # and retry once. This handles stale cached connections after a failover.
+        # The retry is limited to ONE attempt to avoid blocking the event loop.
+        # IMPORTANT: Do NOT retry DDL statements (CREATE/DROP/ALTER) — they are
+        # not idempotent and the first attempt may have succeeded even though we
+        # got a "short header" error reading the response. Retrying would create
+        # duplicate spaces/tables/etc.
+        if execResult.kind == erkError:
+          let errLower = execResult.error.toLowerAscii()
+          let isDdl = sql.toLowerAscii().startsWith("create ") or
+                      sql.toLowerAscii().startsWith("drop ") or
+                      sql.toLowerAscii().startsWith("alter ")
+          let isRetryable = errLower.contains("no connection") or
+             errLower.contains("not leader") or
+             errLower.contains("not the leader") or
+             errLower.contains("send incomplete") or
+             errLower.contains("not connected") or
+             errLower.contains("connection refused") or
+             errLower.contains("too many retries") or
+             errLower.contains("failed to initialize client") or
+             errLower.contains("short header")
+          if isRetryable and not isDdl:
             resetClient()
-            execResult = getClient().query(sql, db, sc)
+            execResult = getClientLocked().query(sql, db, sc)
+        # IMPORTANT: consume streaming results INSIDE the lock to prevent
+        # concurrent requests from interleaving ProtocolClient socket reads.
+        # The lock is held for the entire query lifecycle including stream
+        # consumption, which serializes all FractioClient operations.
+        if execResult.kind == erkStreamingRows:
+          execResult = bufferRows(execResult)
     let elapsed = cpuTime() - startTime
     let elapsedMs = (elapsed * 1000).formatFloat(format = ffDecimal, precision = 2)
 
@@ -955,25 +1126,39 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
                      acceptHeader.contains("application/json")
 
     if wantsJson:
-      # Return JSON response for API clients
+      # Return JSON response for API clients — filter out internal _key column
       case execResult.kind
       of erkRows:
+        # Build filtered column list and index mapping
+        var filteredCols: seq[string] = @[]
+        var colIndices: seq[int] = @[]
+        for i, col in execResult.columns:
+          if col != "_key":
+            filteredCols.add(col)
+            colIndices.add(i)
         var rowsJson: seq[JsonNode] = @[]
         for row in execResult.rows:
           var rowObj = newJObject()
-          for i, col in execResult.columns:
-            if i < row.len:
-              rowObj[col] = %row[i]
+          for j, idx in colIndices:
+            if idx < row.len:
+              rowObj[filteredCols[j]] = %row[idx]
             else:
-              rowObj[col] = %""
+              rowObj[filteredCols[j]] = %""
           rowsJson.add(rowObj)
         sendJson(Http200, %* {
           "kind": "rows",
-          "columns": execResult.columns,
+          "columns": filteredCols,
           "rows": rowsJson,
           "elapsedMs": elapsedMs
         })
       of erkStreamingRows:
+        # Build filtered column list and index mapping
+        var filteredCols: seq[string] = @[]
+        var colIndices: seq[int] = @[]
+        for i, col in execResult.streamColumns:
+          if col != "_key":
+            filteredCols.add(col)
+            colIndices.add(i)
         var rowsJson: seq[JsonNode] = @[]
         let iter = execResult.streamIterator
         while iter.hasNextRow():
@@ -981,16 +1166,16 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
           if rowOpt.isSome:
             let row = rowOpt.get()
             var rowObj = newJObject()
-            for i, col in execResult.streamColumns:
-              if i < row.len:
-                rowObj[col] = %row[i]
+            for j, idx in colIndices:
+              if idx < row.len:
+                rowObj[filteredCols[j]] = %row[idx]
               else:
-                rowObj[col] = %""
+                rowObj[filteredCols[j]] = %""
             rowsJson.add(rowObj)
         iter.closeIterator()
         sendJson(Http200, %* {
           "kind": "rows",
-          "columns": execResult.streamColumns,
+          "columns": filteredCols,
           "rows": rowsJson,
           "elapsedMs": elapsedMs
         })
@@ -1010,28 +1195,42 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
         sendJson(Http200, %* {"kind": "ok", "elapsedMs": elapsedMs})
       return fut
 
-    # HTML response for web dashboard
+    # HTML response for web dashboard — filter out internal _key column
     var html = "<div class='sql-stats'>Executed in " & elapsedMs & "ms"
     case execResult.kind
     of erkRows:
+      # Build display columns and index mapping, excluding _key
+      var displayCols: seq[string] = @[]
+      var colIndices: seq[int] = @[]
+      for i, col in execResult.columns:
+        if col != "_key":
+          displayCols.add(col)
+          colIndices.add(i)
       html.add(" • " & $execResult.rows.len & " rows</div>")
       html.add("<table class='data-table'><thead><tr>")
-      for col in execResult.columns:
+      for col in displayCols:
         html.add("<th>" & col & "</th>")
       html.add("</tr></thead><tbody>")
       for row in execResult.rows:
         html.add("<tr>")
-        for i, col in execResult.columns:
-          if i < row.len:
-            html.add("<td>" & row[i] & "</td>")
+        for idx in colIndices:
+          if idx < row.len:
+            html.add("<td>" & row[idx] & "</td>")
           else:
             html.add("<td></td>")
         html.add("</tr>")
       html.add("</tbody></table>")
     of erkStreamingRows:
+      # Build display columns and index mapping, excluding _key
+      var displayCols: seq[string] = @[]
+      var colIndices: seq[int] = @[]
+      for i, col in execResult.streamColumns:
+        if col != "_key":
+          displayCols.add(col)
+          colIndices.add(i)
       var rowCount = 0
       html.add("</div><table class='data-table'><thead><tr>")
-      for col in execResult.streamColumns:
+      for col in displayCols:
         html.add("<th>" & col & "</th>")
       html.add("</tr></thead><tbody>")
       let iter = execResult.streamIterator
@@ -1041,9 +1240,9 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
           rowCount += 1
           let row = rowOpt.get()
           html.add("<tr>")
-          for i, col in execResult.streamColumns:
-            if i < row.len:
-              html.add("<td>" & row[i] & "</td>")
+          for idx in colIndices:
+            if idx < row.len:
+              html.add("<td>" & row[idx] & "</td>")
             else:
               html.add("<td></td>")
           html.add("</tr>")
@@ -1188,21 +1387,23 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
       sendJson(Http503, %* {"error": "server not ready"})
       return fut
     var spacesList: seq[JsonNode] = @[]
+    var spacesRes: ExecResult
     {.cast(gcsafe).}:
-      let res = getClient().query("SELECT name FROM sys.spaces", "default", "sys")
-      if res.kind == erkStreamingRows:
-        let iter = res.streamIterator
-        while iter.hasNextRow():
-          let rowOpt = iter.nextRow()
-          if rowOpt.isSome:
-            let row = rowOpt.get()
-            if row.len > 0:
-              spacesList.add(%row[0])
-        iter.closeIterator()
-      elif res.kind == erkRows:
-        for row in res.rows:
+      withClient:
+        spacesRes = cl.query("SELECT name FROM sys.spaces", "default", "sys")
+    if spacesRes.kind == erkStreamingRows:
+      let iter = spacesRes.streamIterator
+      while iter.hasNextRow():
+        let rowOpt = iter.nextRow()
+        if rowOpt.isSome:
+          let row = rowOpt.get()
           if row.len > 0:
             spacesList.add(%row[0])
+      iter.closeIterator()
+    elif spacesRes.kind == erkRows:
+      for row in spacesRes.rows:
+        if row.len > 0:
+          spacesList.add(%row[0])
     sendJson(Http200, %* spacesList)
     return fut
 
@@ -1212,23 +1413,9 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
     if srv.isNil or srv.raftStore.isNil:
       sendJson(Http503, %* {"error": "server not ready"})
       return fut
-    var dbList: seq[string] = @[]
-    {.cast(gcsafe).}:
-      let res = getClient().query("SHOW DATABASES", "default", "public")
-      if res.kind == erkStreamingRows:
-        let iter = res.streamIterator
-        while iter.hasNextRow():
-          let rowOpt = iter.nextRow()
-          if rowOpt.isSome:
-            let row = rowOpt.get()
-            if row.len > 0:
-              dbList.add(row[0])
-        iter.closeIterator()
-      elif res.kind == erkRows:
-        for row in res.rows:
-          if row.len > 0:
-            dbList.add(row[0])
-    sendJson(Http200, %dbList)
+    # Shared helper: in Fractio, "databases" in the UI correspond to
+    # spaces (each space is a sharded data plane).
+    sendJson(Http200, %listSpaceNames())
     return fut
 
   # ---- REST: Schema list ----
@@ -1241,21 +1428,23 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
     let dbHeader = getHeader(req, "X-Database")
     let db = if dbHeader.len > 0: dbHeader else: "default"
     var schemaList: seq[string] = @[]
+    var schemaRes: ExecResult
     {.cast(gcsafe).}:
-      let res = getClient().query("SHOW SCHEMAS", db, "public")
-      if res.kind == erkStreamingRows:
-        let iter = res.streamIterator
-        while iter.hasNextRow():
-          let rowOpt = iter.nextRow()
-          if rowOpt.isSome:
-            let row = rowOpt.get()
-            if row.len > 0:
-              schemaList.add(row[0])
-        iter.closeIterator()
-      elif res.kind == erkRows:
-        for row in res.rows:
+      withClient:
+        schemaRes = cl.query("SHOW SCHEMAS", db, "public")
+    if schemaRes.kind == erkStreamingRows:
+      let iter = schemaRes.streamIterator
+      while iter.hasNextRow():
+        let rowOpt = iter.nextRow()
+        if rowOpt.isSome:
+          let row = rowOpt.get()
           if row.len > 0:
             schemaList.add(row[0])
+      iter.closeIterator()
+    elif schemaRes.kind == erkRows:
+      for row in schemaRes.rows:
+        if row.len > 0:
+          schemaList.add(row[0])
     sendJson(Http200, %schemaList)
     return fut
 
@@ -1271,21 +1460,23 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
     let db = if dbHeader.len > 0: dbHeader else: "default"
     let sc = if schemaHeader.len > 0: schemaHeader else: "public"
     var tableList: seq[string] = @[]
+    var tableRes: ExecResult
     {.cast(gcsafe).}:
-      let res = getClient().query("SHOW TABLES", db, sc)
-      if res.kind == erkStreamingRows:
-        let iter = res.streamIterator
-        while iter.hasNextRow():
-          let rowOpt = iter.nextRow()
-          if rowOpt.isSome:
-            let row = rowOpt.get()
-            if row.len > 0:
-              tableList.add(row[0])
-        iter.closeIterator()
-      elif res.kind == erkRows:
-        for row in res.rows:
+      withClient:
+        tableRes = cl.query("SHOW TABLES", db, sc)
+    if tableRes.kind == erkStreamingRows:
+      let iter = tableRes.streamIterator
+      while iter.hasNextRow():
+        let rowOpt = iter.nextRow()
+        if rowOpt.isSome:
+          let row = rowOpt.get()
           if row.len > 0:
             tableList.add(row[0])
+      iter.closeIterator()
+    elif tableRes.kind == erkRows:
+      for row in tableRes.rows:
+        if row.len > 0:
+          tableList.add(row[0])
     sendJson(Http200, %tableList)
     return fut
 
@@ -1300,7 +1491,7 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
     {.cast(gcsafe).}:
       for info in SYSTEM_TABLES_REGISTRY:
         if info.tableNum <= MAX_META_GROUP_TABLE_NUM:
-          sysTablesArr.add(%* {"id": int(info.tableNum),
+          sysTablesArr.add( %* {"id": int(info.tableNum),
             "name": info.schema & "." & info.name,
             "description": info.description, "rowCount": -1})
     sendJson(Http200, sysTablesArr)
@@ -1331,26 +1522,17 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
     # Query the table
     var columns: seq[string] = @[]
     var rowsData: seq[JsonNode] = @[]
+    var sysTableRes: ExecResult
     {.cast(gcsafe).}:
-      let res = getClient().query("SELECT * FROM " & tableName, "default", "sys")
-      if res.kind == erkStreamingRows:
-        columns = res.streamColumns
-        let iter = res.streamIterator
-        while iter.hasNextRow():
-          let rowOpt = iter.nextRow()
-          if rowOpt.isSome:
-            let row = rowOpt.get()
-            var rowObj = newJObject()
-            for i, col in columns:
-              if i < row.len:
-                rowObj[col] = %row[i]
-              else:
-                rowObj[col] = %""
-            rowsData.add(rowObj)
-        iter.closeIterator()
-      elif res.kind == erkRows:
-        columns = res.columns
-        for row in res.rows:
+      withClient:
+        sysTableRes = cl.query("SELECT * FROM " & tableName, "default", "sys")
+    if sysTableRes.kind == erkStreamingRows:
+      columns = sysTableRes.streamColumns
+      let iter = sysTableRes.streamIterator
+      while iter.hasNextRow():
+        let rowOpt = iter.nextRow()
+        if rowOpt.isSome:
+          let row = rowOpt.get()
           var rowObj = newJObject()
           for i, col in columns:
             if i < row.len:
@@ -1358,9 +1540,20 @@ proc onRequestHandler(req: Request): Future[void] {.gcsafe.} =
             else:
               rowObj[col] = %""
           rowsData.add(rowObj)
-      elif res.kind == erkError:
-        sendJson(Http400, %* {"error": res.error})
-        return fut
+      iter.closeIterator()
+    elif sysTableRes.kind == erkRows:
+      columns = sysTableRes.columns
+      for row in sysTableRes.rows:
+        var rowObj = newJObject()
+        for i, col in columns:
+          if i < row.len:
+            rowObj[col] = %row[i]
+          else:
+            rowObj[col] = %""
+        rowsData.add(rowObj)
+    elif sysTableRes.kind == erkError:
+      sendJson(Http400, %* {"error": sysTableRes.error})
+      return fut
     sendJson(Http200, %* {
       "tableId": idStr,
       "tableName": tableName,
@@ -1397,6 +1590,7 @@ proc webThreadFunc(port: int) {.thread.} =
     run(onRequestHandler, settings)
 
 proc launchWebDashboard*(srv: pserver.ProtocolServer) =
+  initLock(gClientLock)
   gSrvPtr = cast[pointer](srv)
   gWebPort = srv.config.webPort
   gClient = nil

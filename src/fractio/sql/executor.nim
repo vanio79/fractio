@@ -220,6 +220,7 @@ proc decodeSystemTableRecord*(tableId: TableId, rawValue: string, columns: seq[
       of "host": result[i] = rec.host
       of "raftport": result[i] = $rec.raftPort
       of "clientport": result[i] = $rec.clientPort
+      of "webport": result[i] = $rec.webPort
       of "status":
         # Strip the 'ns' prefix from enum value for cleaner output
         let statusStr = $rec.status
@@ -321,8 +322,17 @@ proc fetchNextMatchingRow*(iter: StreamingRowIterator): Option[seq[string]] =
         # System tables use binary encoding
         let rowVals = decodeSystemTableRecord(iter.systemTableId, pair.value, iter.columns)
         if rowVals.len > 0:
-          # Note: System table filter matching needs special handling
-          # For now, skip filter matching on system tables
+          # Convert the system-table row (string values) into a DataRow
+          # so the same WHERE filter logic used for data tables can be
+          # applied. All values are treated as strings since the filter
+          # expressions compare against string literals (e.g.
+          # `WHERE name = 'users'`).
+          var filterRow = newDataRow()
+          for i, colName in iter.columns:
+            if i < rowVals.len:
+              filterRow.setColumn(colName, newRowValue(rowVals[i]))
+          if not matchesFilterDataRow(iter.filter, filterRow):
+            continue # Skip non-matching row
           inc iter.rowsReturned
           return some(rowVals)
       else:
@@ -522,15 +532,19 @@ proc execTxnScan(ctx: ExecutorContext, startKey, endKey: string,
 proc execTxnStreamScan(ctx: ExecutorContext, startKey, endKey: string,
     limit: uint32 = 0,
     filter: Option[kvMsgs.WireFilterExpr] = none(
-        kvMsgs.WireFilterExpr)): Result[StreamingScanClient, ProtocolError] =
+        kvMsgs.WireFilterExpr),
+    reverse: bool = false): Result[StreamingScanClient, ProtocolError] =
   ## Streaming scan keys with MVCC awareness.
   ## Returns a StreamingScanClient for lazy iteration.
   ## Requires ctx.client to be a FractioClient (uses its streamScan method).
   ## filter: optional server-side filter for reducing network traffic.
+  ## reverse: when true, scan in descending key order. Used for PK DESC
+  ##          + LIMIT pushdown to avoid scanning all N rows.
   if ctx.client == nil:
     return peErr(newProtocolError(peInternal,
         "streaming scan requires FractioClient"))
-  ctx.client.streamScan(startKey, endKey, limit, ctx.txnId, ctx.readTimestamp, filter)
+  ctx.client.streamScan(startKey, endKey, limit, ctx.txnId, ctx.readTimestamp,
+                        filter, reverse)
 
 # ---------------------------------------------------------------------------
 # Per-op executors
@@ -1242,7 +1256,8 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
           serverFilter = some(exprToWireFilterExpr(op.scFilter.get()))
 
         let scanTimer = newQueryTimer()
-        let streamRes = execTxnStreamScan(ctx, op.scStartKey, op.scEndKey, 0, serverFilter)
+        let streamRes = execTxnStreamScan(ctx, op.scStartKey, op.scEndKey, 0,
+            serverFilter, op.scReverse)
         scanTimer.stamp("stream_scan_setup")
         if streamRes.isErr:
           return errorResult(&"failed to start streaming scan: {streamRes.error.msg}")
@@ -1571,23 +1586,54 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
       if res.isErr:
         return errorResult(&"failed to scan for delete: {res.err}")
 
-      var count = 0
-      var error: string = ""
+      # First pass: collect keys that match the filter.
+      var matchingKeys: seq[string] = @[]
       for entry in res.val:
         try:
           let row = decodeDataRow(entry.value)
           if matchesFilterDataRow(op.delFilter, row):
-            # Use active transaction if available
-            let delRes = ctx.kv.delete(entry.key, txnId = ctx.txnId)
-            if delRes.isErr:
-              error = &"failed to delete row: {delRes.err}"
-              break
-            inc count
+            matchingKeys.add(entry.key)
         except ValueError:
           discard
 
-      if error.len > 0:
-        return errorResult(error)
+      if matchingKeys.len == 0:
+        return modifiedResult(0, "DELETE 0")
+
+      # Build batch ops.
+      var batchOps: seq[KVBatchOp] = newSeqOfCap[KVBatchOp](matchingKeys.len)
+      for k in matchingKeys:
+        batchOps.add(KVBatchOp(kind: bopDelete, key: k, value: ""))
+
+      # Prefer the batch RPC (one per group, not one per row). The
+      # FractioClient's batch method routes the ops to group leaders
+      # and uses the BatchRequest RPC; this collapses N per-row commits
+      # to ceil(N / groups) commits.
+      #
+      # Fall back to per-row delete if the batch method is unavailable
+      # (e.g. on MockKVStore / InMemoryKVStore / other implementations
+      # that don't override the base default).
+      var count = 0
+      let batchRes = ctx.kv.batch(batchOps, txnId = ctx.txnId)
+      if batchRes.isOk:
+        count = batchRes.val.successCount
+        if batchRes.val.failureCount > 0 and
+            batchRes.val.firstError.len > 0:
+          # Partial failure: surface the error to the caller.
+          return errorResult(&"batch delete had {batchRes.val.failureCount}" &
+              " failures: " & batchRes.val.firstError)
+      else:
+        # Batch not supported on this KVStore: fall back to per-row delete.
+        var firstErr = ""
+        var successCount = 0
+        for k in matchingKeys:
+          let delRes = ctx.kv.delete(k, txnId = ctx.txnId)
+          if delRes.isErr:
+            firstErr = delRes.err
+            break
+          inc successCount
+        if firstErr.len > 0:
+          return errorResult(&"failed to delete row: {firstErr}")
+        count = successCount
 
       modifiedResult(count, &"DELETE {count}")
 
