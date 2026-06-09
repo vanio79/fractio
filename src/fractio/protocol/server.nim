@@ -1426,7 +1426,7 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
                 var projectedRow: seq[string] = @[]
                 for cname in projCols.get():
                   if decoded.hasColumn(cname):
-                    projectedRow.add($decoded[cname])
+                    projectedRow.add(decoded[cname].toStringValue())
                   else:
                     projectedRow.add("")
                 topKBuffer.add(projectedRow)
@@ -1441,7 +1441,7 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
                 let decoded = dataRow.decodeDataRow(p.value)
                 var rowVals: seq[string] = @[]
                 for c in decoded.columns:
-                  rowVals.add($c.value)
+                  rowVals.add(c.value.toStringValue())
                 topKBuffer.add(rowVals)
               except ValueError:
                 topKBuffer.add(@[p.value])

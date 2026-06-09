@@ -267,6 +267,41 @@ proc columnNames*(desc: TableDescriptor): seq[string] =
   for col in desc.columns:
     result.add(col.name)
 
+proc collectExprColumns*(e: Expr, into: var seq[string]) =
+  ## Walk an expression tree and append every column name referenced in it to
+  ## `into`. Duplicates may be added; callers should de-dupe if they care.
+  ## Used by the planner to discover which columns a WHERE / filter
+  ## expression depends on, so we can keep them in the projection list when
+  ## the SELECT list is narrower than the filter.
+  if e == nil:
+    return
+  case e.kind
+  of exColumn:
+    into.add(e.colName)
+  of exBinOp:
+    collectExprColumns(e.binLeft, into)
+    collectExprColumns(e.binRight, into)
+  of exUnaryOp:
+    collectExprColumns(e.unaryExpr, into)
+  of exIn:
+    collectExprColumns(e.inExpr, into)
+    for item in e.inList:
+      collectExprColumns(item, into)
+  of exIsNull:
+    collectExprColumns(e.isNullExpr, into)
+  of exBetween:
+    collectExprColumns(e.betweenExpr, into)
+    collectExprColumns(e.betweenLo, into)
+    collectExprColumns(e.betweenHi, into)
+  of exLike:
+    collectExprColumns(e.likeExpr, into)
+    collectExprColumns(e.likePattern, into)
+  of exList:
+    for item in e.listItems:
+      collectExprColumns(item, into)
+  of exLiteral, exParam, exStar:
+    discard
+
 # ---------------------------------------------------------------------------
 # Primary Key Range Extraction from WHERE Clause
 # ---------------------------------------------------------------------------
@@ -1107,7 +1142,19 @@ proc planSelect(stmt: Stmt, client: FractioClient,
           sortCols.add(colName)
 
   # Columns to fetch from storage = requested + ORDER BY referenced columns
-  let fetchCols = reqCols & sortCols
+  # + WHERE filter referenced columns. The server applies the residual filter
+  # after projecting down to scColumns, so any column the filter reads must
+  # still be present in the projected row — even when the SELECT list does
+  # not include it (e.g. `SELECT id, name FROM t WHERE value > 5`).
+  var filterCols: seq[string] = @[]
+  if pkRangeInfo.remainingFilter.isSome:
+    collectExprColumns(pkRangeInfo.remainingFilter.get(), filterCols)
+  # De-dupe filterCols against the columns we already plan to fetch.
+  var filterColsUnique: seq[string] = @[]
+  for c in filterCols:
+    if c notin reqCols and c notin sortCols and c notin filterColsUnique:
+      filterColsUnique.add(c)
+  let fetchCols = reqCols & sortCols & filterColsUnique
 
   # Generate plan based on PK range info
   if pkRangeInfo.isPointGet and pkRangeInfo.exactMatch.isSome:
@@ -1118,7 +1165,7 @@ proc planSelect(stmt: Stmt, client: FractioClient,
       pgTableId: desc.tableId,
       pgKey: pkVal,
       pgPkSpec: desc.pkSpec,
-      pgColumns: fetchCols, # Fetch columns needed for ORDER BY
+      pgColumns: fetchCols, # SELECT cols + ORDER BY cols + WHERE filter cols
       pgAllColumns: allCols,
       pgFilter: pkRangeInfo.remainingFilter, # Apply remaining conditions to row
       pgKeyEncoding: desc.keyEncoding,
@@ -1200,7 +1247,7 @@ proc planSelect(stmt: Stmt, client: FractioClient,
     scLimit: scanLimit,
     scReverse: scanReverse,
     scFilter: pkRangeInfo.remainingFilter, # Only non-PK conditions remain
-    scColumns: fetchCols, # Fetch columns needed for ORDER BY
+    scColumns: fetchCols, # SELECT cols + ORDER BY cols + WHERE filter cols
     scAllColumns: allCols,
     scKeyEncoding: desc.keyEncoding,
     # Tier-3b: server-side top-K heap pushdown. Only set for oboTopK cases

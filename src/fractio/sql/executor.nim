@@ -1289,9 +1289,17 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
         # Create streaming row iterator that handles filtering and LIMIT
         # Pass original Expr filter for complex client-side conditions
         # For system tables, use special decoder
+        #
+        # When the server ran a top-K heap (Tier-3b) it has already applied
+        # the server-side filter AND trimmed to the K winners. The client
+        # iterator MUST NOT re-apply the filter — the rows it receives have
+        # already been filtered, and the projected DataRow may not even
+        # contain the columns the filter would need to read.
+        let clientFilter: Option[Expr] =
+          if op.scTopK.isSome: none(Expr) else: op.scFilter
         let rowIter = newStreamingRowIterator(
           streamRes.value,
-          op.scFilter,
+          clientFilter,
           op.scColumns,
           op.scAllColumns,
           op.scLimit,

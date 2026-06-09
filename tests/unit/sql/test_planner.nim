@@ -1512,3 +1512,115 @@ suite "Planner ORDER BY + LIMIT Optimization (scanLimit and obOptimization)":
     let text = formatPlanOp(op)
     check "TOP_K" in text
     check "name" in text
+
+suite "Planner collectExprColumns":
+  ## Verifies that the helper used by the T10 filter-column fix walks every
+  ## kind of expression and collects every column name it finds. This is the
+  ## fix for the pre-existing bug where the server-side filter was applied
+  ## to a projected row that no longer contained the filter-referenced
+  ## column (returning 0 rows when it should have returned 5).
+
+  test "simple column reference":
+    var cols: seq[string] = @[]
+    collectExprColumns(Expr(kind: exColumn, colName: "value"), cols)
+    check cols == @["value"]
+
+  test "binary op: column > literal (T10 case)":
+    var cols: seq[string] = @[]
+    let e = Expr(kind: exBinOp, binOp: boGt,
+        binLeft: Expr(kind: exColumn, colName: "value"),
+        binRight: Expr(kind: exLiteral,
+            litValue: newValueRef(5000'i64)))
+    collectExprColumns(e, cols)
+    check cols == @["value"]
+
+  test "AND: two column refs":
+    var cols: seq[string] = @[]
+    let e = Expr(kind: exBinOp, binOp: boAnd,
+        binLeft: Expr(kind: exColumn, colName: "name"),
+        binRight: Expr(kind: exColumn, colName: "value"))
+    collectExprColumns(e, cols)
+    check "name" in cols
+    check "value" in cols
+    check cols.len == 2
+
+  test "OR and nested binary ops":
+    var cols: seq[string] = @[]
+    # (a > 1 AND b < 2) OR c = 3
+    let inner = Expr(kind: exBinOp, binOp: boAnd,
+        binLeft: Expr(kind: exBinOp, binOp: boGt,
+            binLeft: Expr(kind: exColumn, colName: "a"),
+            binRight: Expr(kind: exLiteral, litValue: newValueRef(1'i64))),
+        binRight: Expr(kind: exBinOp, binOp: boLt,
+            binLeft: Expr(kind: exColumn, colName: "b"),
+            binRight: Expr(kind: exLiteral, litValue: newValueRef(2'i64))))
+    let outer = Expr(kind: exBinOp, binOp: boOr,
+        binLeft: inner,
+        binRight: Expr(kind: exBinOp, binOp: boEq,
+            binLeft: Expr(kind: exColumn, colName: "c"),
+            binRight: Expr(kind: exLiteral, litValue: newValueRef(3'i64))))
+    collectExprColumns(outer, cols)
+    check cols == @["a", "b", "c"]
+
+  test "IN list with column refs":
+    var cols: seq[string] = @[]
+    let e = Expr(kind: exIn,
+        inExpr: Expr(kind: exColumn, colName: "status"),
+        inNot: false,
+        inList: @[
+          Expr(kind: exColumn, colName: "alt_status_1"),
+          Expr(kind: exColumn, colName: "alt_status_2")
+      ])
+    collectExprColumns(e, cols)
+    check "status" in cols
+    check "alt_status_1" in cols
+    check "alt_status_2" in cols
+
+  test "BETWEEN with column refs":
+    var cols: seq[string] = @[]
+    let e = Expr(kind: exBetween,
+        betweenExpr: Expr(kind: exColumn, colName: "x"),
+        betweenNot: false,
+        betweenLo: Expr(kind: exColumn, colName: "lo"),
+        betweenHi: Expr(kind: exColumn, colName: "hi"))
+    collectExprColumns(e, cols)
+    check cols == @["x", "lo", "hi"]
+
+  test "IS NULL with column ref":
+    var cols: seq[string] = @[]
+    let e = Expr(kind: exIsNull,
+        isNullExpr: Expr(kind: exColumn, colName: "deleted_at"),
+        isNullNot: false)
+    collectExprColumns(e, cols)
+    check cols == @["deleted_at"]
+
+  test "LIKE with column refs":
+    var cols: seq[string] = @[]
+    let e = Expr(kind: exLike,
+        likeExpr: Expr(kind: exColumn, colName: "name"),
+        likeNot: false,
+        likePattern: Expr(kind: exLiteral,
+            litValue: newValueRef("user_%"))) # pattern is a literal
+    collectExprColumns(e, cols)
+    # The pattern is a literal, not a column — should only return [name].
+    check cols == @["name"]
+
+  test "nil expression is a no-op":
+    var cols: seq[string] = @[]
+    collectExprColumns(nil, cols)
+    check cols.len == 0
+
+  test "literal-only expression collects nothing":
+    var cols: seq[string] = @[]
+    let e = Expr(kind: exBinOp, binOp: boEq,
+        binLeft: Expr(kind: exLiteral, litValue: newValueRef(1'i64)),
+        binRight: Expr(kind: exLiteral, litValue: newValueRef(1'i64)))
+    collectExprColumns(e, cols)
+    check cols.len == 0
+
+  test "unary op with column ref":
+    var cols: seq[string] = @[]
+    let e = Expr(kind: exUnaryOp, unaryOp: uoNot,
+        unaryExpr: Expr(kind: exColumn, colName: "active"))
+    collectExprColumns(e, cols)
+    check cols == @["active"]

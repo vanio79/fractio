@@ -1,6 +1,6 @@
 # Sort Performance Analysis & Improvement Plan
 
-**Status:** Tier-1, Tier-2, Tier-3a, and Tier-3b implemented and verified (5 commits on main).
+**Status:** Tier-1, Tier-2, Tier-3a, Tier-3b, and T10 filter-column fix implemented and verified (6 commits on main).
 **Date:** 2026-06-09
 **Test setup:** 3-node cluster, `scaletest.public.users2` (10K rows, 4 cols: id, name, email, value)
 
@@ -428,6 +428,7 @@ For 1M rows this scales linearly: 1-column query is ~6 seconds vs 10 seconds for
 | T7: `SELECT * ... ORDER BY name` (full sort 10K) | ~92ms | **81ms** | 1.13x |
 | T8: 2-col projection + sort LIMIT 5 | (comparable) | **0.31ms** | — |
 | T9: 1-col projection + sort LIMIT 5 | (comparable) | **0.32ms** | — |
+| T10: `WHERE value > 5000 ORDER BY name LIMIT 5` | 0 rows (bug) | **0.33ms** | **correctness fix** |
 
 T5/T6 dropped from ~70ms to sub-millisecond. The remaining 0.3ms is plan + iterate + JSON-serialize 5 rows; the actual scan and sort are now invisible.
 
@@ -435,7 +436,24 @@ T5/T6 dropped from ~70ms to sub-millisecond. The remaining 0.3ms is plan + itera
 
 **Scaling to millions of rows:** The per-group heap is O(N log K) time and O(K) memory. For 1M rows with LIMIT 5 across 3 groups, each server scans ~333K rows, does 333K heap operations, and ships only 5 rows. Network transfer drops from ~50MB (1M rows × ~50 bytes) to ~750 bytes. Total wall time: scan cost + JSON serialize K rows = O(milliseconds) instead of O(seconds).
 
-**Pre-existing bug found during benchmarking (NOT Tier-3b):** T10 (`SELECT id, name FROM users2 WHERE value > 5000 ORDER BY name LIMIT 5`) returns 0 rows because the planner's `scColumns` excludes the `value` column used in the WHERE filter, so the server projects the row down to `{id, name}` before applying the filter, and the filter compares against an absent column. The fix is to include filter-referenced columns in `scColumns` even when they're not in the SELECT list. Tracked separately.
+### T10 filter-column fix (the pre-existing bug, now fixed)
+
+**Symptom:** `SELECT id, name FROM users2 WHERE value > 5000 ORDER BY name LIMIT 5` returned 0 rows instead of 5.
+
+**Root cause:** Two issues, both surfaced by Tier-3a column projection:
+
+1. **Planner bug** (`src/fractio/sql/planner.nim`): The planner's `scColumns` only included columns from the SELECT list and the ORDER BY. Columns referenced by the WHERE filter (e.g. `value` in `WHERE value > 5000`) were excluded. The server then projected the row down to `{id, name}` *before* applying the server-side filter, so the filter tried to read `value` from a row that no longer had it.
+
+2. **Client double-filter bug** (`src/fractio/sql/executor.nim`): Even after the planner fix above, the `StreamingRowIterator` re-applies the WHERE filter to every row it reads. When the server has already filtered (with the topK heap), this double-filtering has a second issue: the projected DataRow may not contain every column the filter needs.
+
+3. **Server `$` formatting bug** (`src/fractio/protocol/server.nim`): The server's projection code was using `$decoded[cname]` which calls Nim's default `$` on a `DataRowValue` case object — producing output like `"(kind: drvkInt, intVal: 1000)"` instead of `"1000"`. The `toStringValue()` proc gives the correct result.
+
+**Fix:**
+1. Added a `collectExprColumns(expr, into)` helper that walks any `Expr` and collects all column names referenced. Applied to `pkRangeInfo.remainingFilter`; columns found are de-duped against `reqCols`/`sortCols` and appended to `fetchCols = reqCols & sortCols & filterColsUnique`. This is the same fix for both the point-get path (`pgColumns`) and the scan path (`scColumns`).
+2. In the executor, when `op.scTopK.isSome` (server-side top-K path), pass `none(Expr)` to `newStreamingRowIterator` as the client-side filter — the server has already filtered, the client iterator just iterates the K candidates.
+3. In the server's topK path's `sendChunk` callback, use `c.value.toStringValue()` instead of `$c.value` to get the human-readable string form.
+
+**Measured impact:** T10 now returns 5 correctly-filtered, correctly-sorted rows in ~0.33ms (same as T8/T9, since the work is identical once the planner and projection are correct).
 
 ### Server log diagnostic (Tier-2 fast path verified)
 
