@@ -533,18 +533,24 @@ proc execTxnStreamScan(ctx: ExecutorContext, startKey, endKey: string,
     limit: uint32 = 0,
     filter: Option[kvMsgs.WireFilterExpr] = none(
         kvMsgs.WireFilterExpr),
-    reverse: bool = false): Result[StreamingScanClient, ProtocolError] =
+    reverse: bool = false,
+    columns: Option[seq[string]] = none(seq[string])): Result[
+        StreamingScanClient, ProtocolError] =
   ## Streaming scan keys with MVCC awareness.
   ## Returns a StreamingScanClient for lazy iteration.
   ## Requires ctx.client to be a FractioClient (uses its streamScan method).
   ## filter: optional server-side filter for reducing network traffic.
   ## reverse: when true, scan in descending key order. Used for PK DESC
   ##          + LIMIT pushdown to avoid scanning all N rows.
+  ## columns: optional column names for server-side projection (Tier-3a).
+  ##          When set and non-empty, server decodes each DataRow, projects
+  ##          to the requested columns, and re-encodes — reducing wire size
+  ##          for SELECT col1, col2 ... FROM wide_table.
   if ctx.client == nil:
     return peErr(newProtocolError(peInternal,
         "streaming scan requires FractioClient"))
   ctx.client.streamScan(startKey, endKey, limit, ctx.txnId, ctx.readTimestamp,
-                        filter, reverse)
+                        filter, reverse, columns)
 
 # ---------------------------------------------------------------------------
 # Per-op executors
@@ -1256,8 +1262,17 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
           serverFilter = some(exprToWireFilterExpr(op.scFilter.get()))
 
         let scanTimer = newQueryTimer()
-        let streamRes = execTxnStreamScan(ctx, op.scStartKey, op.scEndKey, 0,
-            serverFilter, op.scReverse)
+        # Pass op.scLimit to the storage layer so the server can stop
+        # scanning as soon as it has produced `limit` matching rows.
+        # For LIMIT 5, this avoids materializing all 10K (or N) rows.
+        # Pass op.scColumns for server-side column projection (Tier-3a):
+        # when non-empty, server decodes each DataRow and re-emits only
+        # the requested columns, reducing wire size for wide tables.
+        let projCols: Option[seq[string]] =
+          if op.scColumns.len > 0: some(op.scColumns) else: none(seq[string])
+        let streamRes = execTxnStreamScan(ctx, op.scStartKey, op.scEndKey,
+            op.scLimit,
+            serverFilter, op.scReverse, projCols)
         scanTimer.stamp("stream_scan_setup")
         if streamRes.isErr:
           return errorResult(&"failed to start streaming scan: {streamRes.error.msg}")
@@ -1441,7 +1456,7 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
           var outputRows = extractRequestedColumns(sortedRows, op.obColumns,
               op.obAllColumns)
           orderTimer.stamp("column_extract")
-          debug &"[exec_timer] obOptimization=TOP_K rows={outputRows.len}/{heap.totalPushed} {orderTimer.formatBreakdown()}"
+          debug &"[exec_timer] obOptimization=TOP_K rows={outputRows.len}/{heap.totalPushed} fast={heap.fastPathHits} slow={heap.slowPathHits} {orderTimer.formatBreakdown()}"
           rowsResult(op.obColumns, outputRows)
         else:
           errorResult("ORDER BY requires row results from previous operation")

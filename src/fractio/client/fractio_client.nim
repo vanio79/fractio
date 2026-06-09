@@ -1382,7 +1382,9 @@ method streamScan*(client: FractioClient, startKey: string, endKey: string,
                   readTimestamp: uint64 = 0,
                   filter: Option[kvMsgs.WireFilterExpr] = none(
                       kvMsgs.WireFilterExpr),
-                  reverse: bool = false): Result[StreamingScanClient,
+                  reverse: bool = false,
+                  columns: Option[seq[string]] = none(
+                      seq[string])): Result[StreamingScanClient,
 
 ProtocolError] =
   ## Streaming scan across ALL groups in the space.
@@ -1393,6 +1395,10 @@ ProtocolError] =
   ## reverse: when true, each group scans in descending key order; the k-way
   ##          merge also runs in descending order. This is used by the planner
   ##          for PK DESC + LIMIT pushdown to avoid scanning all N rows.
+  ## columns: optional column names for server-side projection (Tier-3a).
+  ##          When set and non-empty, each group server decodes DataRows and
+  ##          re-emits only the requested columns. Reduces wire size for
+  ##          SELECT col1, col2 ... FROM wide_table.
   let scanTimer = newQueryTimer()
   if not client.initialized.load(moRelaxed):
     return peErr(newProtocolError(peInternal, "client not initialized"))
@@ -1420,7 +1426,7 @@ ProtocolError] =
           "no connection to group leader"))
     let conn = connOpt.get()
     return conn.kvStreamScan(groupStart, groupEnd, limit, 0, 0, txnId,
-        readTimestamp, groupId, filter, reverse)
+        readTimestamp, groupId, filter, reverse, columns)
 
   # For multi-group, use k-way merge: open all group streams in PARALLEL
   # and merge results by key order. This produces globally sorted output
@@ -1448,6 +1454,8 @@ ProtocolError] =
     conn: ProtocolClient
     filter: Option[kvMsgs.WireFilterExpr]
     ownsConnection: bool ## True if we created a dedicated connection (must close after)
+    limit: uint32 ## Per-group scan limit. 0 means no limit (full scan).
+    columns: Option[seq[string]] ## Column names for server-side projection (Tier-3a)
 
   var groupArgs: seq[GroupScanArgs] = @[]
   var resolveErrors: seq[string] = @[]
@@ -1515,7 +1523,9 @@ ProtocolError] =
       groupEnd: groupEnd,
       conn: conn,
       filter: filter,
-      ownsConnection: ownsConn
+      ownsConnection: ownsConn,
+      limit: limit,
+      columns: columns
     ))
 
   if groupArgs.len == 0:
@@ -1548,8 +1558,12 @@ ProtocolError] =
   if groupArgs.len == 1:
     # Single group — no need for threads
     let args = groupArgs[0]
-    let streamRes = args.conn.kvStreamScan(args.groupStart, args.groupEnd, 0,
-        chunkSize, 0, txnId, readTimestamp, args.groupId, args.filter, reverse)
+    # Use args.limit (carried from caller) so LIMIT can be pushed all
+    # the way down to the server's LevelDB iterator.
+    let streamRes = args.conn.kvStreamScan(args.groupStart, args.groupEnd,
+        args.limit,
+        chunkSize, 0, txnId, readTimestamp, args.groupId, args.filter, reverse,
+        args.columns)
     if streamRes.isOk:
       groupStreams.add(streamRes.value)
     else:
@@ -1575,11 +1589,16 @@ ProtocolError] =
       txnIdStr: string
       readTs: uint64
       reverseVal: bool
+      limitVal: uint32      ## Per-group scan limit. 0 means no limit (full scan).
+      columnsJoined: string ## "\0"-joined column names (empty = no projection)
       resultPtr: pointer
 
     var setupArgs = newSeq[SetupArg](groupArgs.len)
     for i in 0 ..< groupArgs.len:
       let args = groupArgs[i]
+      var colsJoined = ""
+      if args.columns.isSome and args.columns.get().len > 0:
+        colsJoined = args.columns.get().join("\0")
       setupArgs[i] = SetupArg(
         idx: i,
         connPtr: cast[pointer](args.conn),
@@ -1590,6 +1609,8 @@ ProtocolError] =
         txnIdStr: $txnId,
         readTs: readTimestamp,
         reverseVal: reverse,
+        limitVal: args.limit,
+        columnsJoined: colsJoined,
         resultPtr: addr(setupResults[i])
       )
 
@@ -1604,9 +1625,15 @@ ProtocolError] =
             let txnIdVal = transactionIDFromString(sa.txnIdStr)
             let filterOpt: Option[kvMsgs.WireFilterExpr] = none(
                 kvMsgs.WireFilterExpr)
-            let streamRes = conn.kvStreamScan(sa.groupStart, sa.groupEnd, 0,
+            let colsOpt: Option[seq[string]] =
+              if sa.columnsJoined.len > 0:
+                some(sa.columnsJoined.split('\0'))
+              else:
+                none(seq[string])
+            let streamRes = conn.kvStreamScan(sa.groupStart, sa.groupEnd,
+                sa.limitVal,
                 sa.chunkSizeVal, 0, txnIdVal, sa.readTs, groupId, filterOpt,
-                sa.reverseVal)
+                sa.reverseVal, colsOpt)
             let slot = cast[ptr StreamSetupResult](sa.resultPtr)
             if streamRes.isOk:
               # CRITICAL: Prevent use-after-free when the thread's local

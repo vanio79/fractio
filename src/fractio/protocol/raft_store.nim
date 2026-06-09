@@ -2143,9 +2143,15 @@ proc raftScan*(store: RaftKVStoreExt, startKey, endKey: string,
     return rsOk[seq[(string, RaftKVEntry)]](@[])
 
   {.cast(raises: []).}:
-    # Scan with no limit; we filter below. LevelDB iterates in sorted order
-    # (or descending order when reverse=true).
-    let raw = backend.scan(startKey, endKey, 0, reverse)
+    # Pass the limit down to the LevelDB iterator so it stops as soon as
+    # we have `limit` matching pairs. Without this, the iterator scans
+    # the entire key range (10K, 1M, ... rows) and we filter and truncate
+    # in Nim — pure wasted work. backend.scan is honored in the iterator
+    # loop, but the post-filter check below is still needed because the
+    # filter runs AFTER the iterator (intent/coord/MVCC/system keys are
+    # interleaved with user data), so the iterator may produce more raw
+    # pairs than the user-requested limit before finding `limit` matches.
+    let raw = backend.scan(startKey, endKey, int(limit), reverse)
     let ts = uint64(store.nowNs())
     for (k, v) in raw:
       if isIntentKey(k) or isCoordKey(k): continue
