@@ -772,11 +772,11 @@ suite "KV Constants":
     check BatchStatusAllFailed == 0x02'u8
 
   test "Scan flag values":
-    check ScanFlagIncludeTimestamp == 0x01'u8
-    check ScanFlagIncludeVersion == 0x02'u8
-    check ScanFlagKeysOnly == 0x04'u8
-    check ScanFlagReverse == 0x08'u8
-    check ScanFlagGroupRouted == 0x10'u8
+    check ScanFlagIncludeTimestamp == 0x01'u16
+    check ScanFlagIncludeVersion == 0x02'u16
+    check ScanFlagKeysOnly == 0x04'u16
+    check ScanFlagReverse == 0x08'u16
+    check ScanFlagGroupRouted == 0x10'u16
 
   test "Scan response flag values":
     check ScanRespFlagHasMore == 0x01'u8

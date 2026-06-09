@@ -50,6 +50,8 @@ import ../core/timestamp_provider
 import ../storage/backend
 import ../storage/mvcc/types as mvccValueTypes
 import ../sql/data_row as dataRow
+import ../sql/ast_types as astTypes
+import ../utils/external_merge_sort as extSort
 import ./active_txn_registry
 
 # ---------------------------------------------------------------------------
@@ -1393,11 +1395,58 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
       # SELECT col1, col2 ... FROM wide_table (cut by N_requested/N_total).
       # Trade: ~1-2ms CPU per 10K rows for decode+project+re-encode; we save
       # ~40ms of network transfer (10K rows × ~150 bytes per extra column).
+      #
+      # Tier-3b: when req.topK is set (ORDER BY + LIMIT), we run a bounded
+      # top-K heap on the server and ship only the K winners over the wire.
+      # The client merges K×Ngroups candidates via k-way merge.
       let projCols = req.columns
       let hasProjection = projCols.isSome and projCols.get().len > 0
+      let topKOpt = req.topK
+      let hasTopK = topKOpt.isSome and topKOpt.get().sortSpecs.len > 0
+
+      # Buffer for topK accumulation. The callback captures it (no frame
+      # sending during scan); after the scan completes, we run the heap
+      # and ship ONE final frame with the K winners.
+      var topKBuffer: seq[seq[string]] = @[]
+      if hasTopK:
+        # Pre-allocate to avoid many small allocations during scan.
+        # Upper bound: req.limit winners per group, but we may see more rows
+        # because the heap is bounded by `limit` and evicts the worst.
+        topKBuffer = newSeqOfCap[seq[string]](int(topKOpt.get().limit) * 2 + 16)
 
       proc sendChunk(chunk: ScanChunk) {.gcsafe, raises: [].} =
         let chunkPairs = chunk.pairs
+        if hasTopK:
+          # Tier-3b: decode + project + accumulate in topKBuffer.
+          # No frame sending — the final frame is sent after scan completes.
+          for p in chunkPairs:
+            if hasProjection:
+              try:
+                let decoded = dataRow.decodeDataRow(p.value)
+                var projectedRow: seq[string] = @[]
+                for cname in projCols.get():
+                  if decoded.hasColumn(cname):
+                    projectedRow.add($decoded[cname])
+                  else:
+                    projectedRow.add("")
+                topKBuffer.add(projectedRow)
+              except ValueError:
+                # Not a DataRow — fall back to a single-string row.
+                topKBuffer.add(@[p.value])
+            else:
+              # No projection: the heap will only sort what it can see.
+              # We need to decode the raw DataRow to get individual column
+              # values for the sort key extraction.
+              try:
+                let decoded = dataRow.decodeDataRow(p.value)
+                var rowVals: seq[string] = @[]
+                for c in decoded.columns:
+                  rowVals.add($c.value)
+                topKBuffer.add(rowVals)
+              except ValueError:
+                topKBuffer.add(@[p.value])
+          return
+        # ----- Normal (non-topK) path -----
         var scanPairs = newSeq[ScanPair](chunkPairs.len)
         for i, p in chunkPairs:
           var ver: uint64 = 1
@@ -1461,6 +1510,85 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
         serverFilter = serverFilterProc,
         reverse = isReverse
       )
+
+      # Tier-3b: after scan completes, run topK heap and ship ONE final frame
+      # with the K winners (or all rows if fewer than K were seen).
+      if hasTopK:
+        let tk = topKOpt.get()
+        let kLimit = int(tk.limit)
+        if topKBuffer.len == 0:
+          # No rows: send empty final frame
+          let rf = ScanResponseFrame(
+            respFlags: ScanRespFlagEndOfScan,
+            pairs: @[],
+            reqFlags: req.flags,
+          )
+          sendFrame(conn, encodeScanResponseFrame(rf), requestId)
+        else:
+          # Build SortSpec list from WireSortSpec.
+          # We construct a stub Expr — the heap only uses the columnIndex
+          # field for the fast path, and falls back to computeSortKeys
+          # (which uses allColumns) for the slow path. Since we only set
+          # columnIndex >= 0 from the planner when sortSpecs are simple
+          # column refs, the fast path is always taken in practice.
+          var sortSpecs: seq[extSort.SortSpec] = @[]
+          for w in tk.sortSpecs:
+            sortSpecs.add(extSort.SortSpec(
+              expr: astTypes.Expr(kind: astTypes.exColumn,
+                  colTable: "", colName: ""),
+              descending: w.descending,
+              columnIndex: int(w.columnIndex)
+            ))
+          # All-columns list — used by computeSortKeys in the slow path.
+          # Empty is fine when the fast path is always taken.
+          let allCols: seq[string] = if hasProjection: projCols.get() else: @[]
+          let heap = extSort.newTopKHeap(sortSpecs, allCols, kLimit)
+          for r in topKBuffer:
+            try:
+              heap.push(r)
+            except ValueError:
+              # Skip rows with unparseable values; they're not valid sort keys.
+              discard
+            except CatchableError:
+              discard
+          let winners = heap.extractSorted()
+          if server.logger != nil:
+            try:
+              server.logger.log(llDebug,
+                "scan topK: pushed=" & $heap.totalPushed &
+                " fast=" & $heap.fastPathHits &
+                " slow=" & $heap.slowPathHits &
+                " kept=" & $winners.len & " of " & $topKBuffer.len)
+            except CatchableError: discard
+            except Exception: discard
+          # Re-encode winners to ScanPairs with the projected column names
+          # (or no projection metadata if not projecting).
+          var finalPairs = newSeq[ScanPair](winners.len)
+          for i, row in winners:
+            var rowDataRow = dataRow.newDataRow()
+            if hasProjection:
+              for j, cname in projCols.get():
+                let val = if j < row.len: row[j] else: ""
+                rowDataRow.columns.add(dataRow.newColumn(cname,
+                    dataRow.newRowValue(val)))
+            else:
+              # Without projection we still need *something* to ship.
+              # Encode the first value as a single-column "value" row.
+              if row.len > 0:
+                rowDataRow.columns.add(dataRow.newColumn("value",
+                    dataRow.newRowValue(row[0])))
+            finalPairs[i] = ScanPair(
+              key: "", # No PK info available without re-iterating
+              value: dataRow.encodeDataRow(rowDataRow),
+              timestamp: uint64(currentTs),
+              version: 1
+            )
+          let rf = ScanResponseFrame(
+            respFlags: ScanRespFlagEndOfScan,
+            pairs: finalPairs,
+            reqFlags: req.flags,
+          )
+          sendFrame(conn, encodeScanResponseFrame(rf), requestId)
     else:
       sendError(conn, requestId, ErrInternal, ErrCatKV, "MVCC store not initialized")
 

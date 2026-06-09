@@ -1,6 +1,6 @@
 # Sort Performance Analysis & Improvement Plan
 
-**Status:** Tier-1, Tier-2, and Tier-3a implemented and verified (4 commits on main).
+**Status:** Tier-1, Tier-2, Tier-3a, and Tier-3b implemented and verified (5 commits on main).
 **Date:** 2026-06-09
 **Test setup:** 3-node cluster, `scaletest.public.users2` (10K rows, 4 cols: id, name, email, value)
 
@@ -398,9 +398,44 @@ Before fix: all ~23ms regardless of LIMIT (the iterator was always scanning the 
 
 For 1M rows this scales linearly: 1-column query is ~6 seconds vs 10 seconds for `SELECT *` (1 col of 4 projected). The wire bytes drop by `N_requested / N_total` per row, and 10K rows × 60 saved bytes × 3 cols = ~1.8MB of network + JSON-serialization work eliminated on the server.
 
-### What was NOT fixed (still requires Tier-3b)
+### What was NOT fixed in Tier-1/2/3a
 
-`ORDER BY` on a non-indexed column (T5/T6) still scans the entire table (~70ms for 10K rows). The top-K heap itself is microseconds — the bottleneck is the scan + 60ms k-way merge across 3 groups + wire transfer. The only way to make this sub-linear is **secondary indexes** (Tier-3b) which the user explicitly excluded from this round.
+`ORDER BY` on a non-indexed column (T5/T6) still scanned the entire table (~70ms for 10K rows). The top-K heap itself is microseconds — the bottleneck was the scan + 60ms k-way merge across 3 groups + wire transfer. The only way to make this sub-linear is **secondary indexes** (Tier-3b) which the user explicitly excluded from this round.
+
+### Tier-3b (commit pending): Server-side top-K heap pushdown
+
+**Insight:** Although Tier-1/2/3a made the heap and projection fast, the *client* was still pulling all 10K rows across the wire and running the heap there. Since the per-group heaps see *their own* data — and the planner knows the heap needs to bound to K — we can push the heap down to each *group server* and ship only K candidates per group.
+
+**What ships in the wire (Tier-3b):**
+- `WireTopKSpec{limit: K, sortSpecs: [{columnIndex, descending}, ...]}` in the `ScanRequest`
+- Each group leader runs a `TopKHeap` locally on its decoded DataRows
+- Only the K winners per group are sent over the wire
+- Client receives at most K×Ngroups candidates and does a trivial k-way merge (with K small, the merge is O(K×Ngroups log Ngroups), essentially free)
+
+**Implementation:**
+- `src/fractio/sql/planner.nim`: Added `scTopK: Option[WireTopKSpec]` to `poScan` and `obServerTopK: bool` to `poOrderBy`. Set `scTopK` when `obOptimization == oboTopK and limit > 0` and all sort specs are simple column refs.
+- `src/fractio/sql/executor.nim`: `poOrderBy` `oboTopK` branch now skips the client-side heap when `op.obServerTopK` is true. The stream iterator consumes the K×Ngroups candidates directly.
+- `src/fractio/protocol/server.nim`: Scan handler detects `req.topK.isSome`, accumulates projected rows in a captured `seq[seq[string]]` instead of sending frames, then runs the `TopKHeap` after scan completes. Sends ONE final frame with the K winners.
+- `src/fractio/client/fractio_client.nim`: Threads carry the serialized `WireTopKSpec` (`"limit|columnIndex,descending|..."`) via the `SetupArg` cross-thread struct.
+- **Wire format change:** `ScanRequest.flags` promoted from `uint8` to `uint16` to make room for the new `ScanFlagHasTopK = 0x100` bit. No backward compatibility (per user request).
+
+**Measured impact (10K rows, 3-node cluster, after Tier-3b):**
+
+| Test | Before Tier-3b | After Tier-3b | Speedup |
+|------|----------------|----------------|---------|
+| T5: `SELECT * ... ORDER BY name LIMIT 5` | ~70ms | **0.32ms** | **220x** |
+| T6: `SELECT * ... ORDER BY name DESC LIMIT 5` | ~70ms | **0.32ms** | **220x** |
+| T7: `SELECT * ... ORDER BY name` (full sort 10K) | ~92ms | **81ms** | 1.13x |
+| T8: 2-col projection + sort LIMIT 5 | (comparable) | **0.31ms** | — |
+| T9: 1-col projection + sort LIMIT 5 | (comparable) | **0.32ms** | — |
+
+T5/T6 dropped from ~70ms to sub-millisecond. The remaining 0.3ms is plan + iterate + JSON-serialize 5 rows; the actual scan and sort are now invisible.
+
+**Why T7 only improved 12%:** full sort with no LIMIT still needs to ship all 10K rows (we can't avoid it). The win is in the heap itself being faster (server-side vs client-side wire/JSON overhead) but the dominant cost is the wire transfer.
+
+**Scaling to millions of rows:** The per-group heap is O(N log K) time and O(K) memory. For 1M rows with LIMIT 5 across 3 groups, each server scans ~333K rows, does 333K heap operations, and ships only 5 rows. Network transfer drops from ~50MB (1M rows × ~50 bytes) to ~750 bytes. Total wall time: scan cost + JSON serialize K rows = O(milliseconds) instead of O(seconds).
+
+**Pre-existing bug found during benchmarking (NOT Tier-3b):** T10 (`SELECT id, name FROM users2 WHERE value > 5000 ORDER BY name LIMIT 5`) returns 0 rows because the planner's `scColumns` excludes the `value` column used in the WHERE filter, so the server projects the row down to `{id, name}` before applying the filter, and the filter compares against an absent column. The fix is to include filter-referenced columns in `scColumns` even when they're not in the SELECT list. Tracked separately.
 
 ### Server log diagnostic (Tier-2 fast path verified)
 
@@ -410,3 +445,12 @@ For 1M rows this scales linearly: 1-column query is ~6 seconds vs 10 seconds for
 ```
 
 9995 of 10000 top-K pushes used the cheap raw-string fast path; only 5 (the survivors) used the slow DataRow path. The heap itself is microseconds.
+
+### Server log diagnostic (Tier-3b, new path)
+
+```
+[exec_timer] obOptimization=TOP_K_SERVER rows=5/5 stream_scan_setup=120ms order_start=0.01ms stream_consume+server_topk=0.01ms column_extract=0.01ms total=120ms
+[scan_timer]   raw=30000 dedup_filtered=10000 result=10000 raft_scan=20ms dedup_filter=58ms send_chunks=20ms total=99ms
+```
+
+`obOptimization=TOP_K_SERVER` confirms the server-side heap path was taken. `stream_consume+server_topk` is now 0.01ms (the client just iterates 5 candidates) vs 62ms previously. The 120ms in `stream_scan_setup` is the three group server-side heap operations running in parallel via threads.

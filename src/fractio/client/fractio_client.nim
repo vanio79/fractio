@@ -1384,7 +1384,9 @@ method streamScan*(client: FractioClient, startKey: string, endKey: string,
                       kvMsgs.WireFilterExpr),
                   reverse: bool = false,
                   columns: Option[seq[string]] = none(
-                      seq[string])): Result[StreamingScanClient,
+                      seq[string]),
+                  topK: Option[kvMsgs.WireTopKSpec] = none(
+                      kvMsgs.WireTopKSpec)): Result[StreamingScanClient,
 
 ProtocolError] =
   ## Streaming scan across ALL groups in the space.
@@ -1399,6 +1401,10 @@ ProtocolError] =
   ##          When set and non-empty, each group server decodes DataRows and
   ##          re-emits only the requested columns. Reduces wire size for
   ##          SELECT col1, col2 ... FROM wide_table.
+  ## topK: optional server-side top-K heap spec (Tier-3b). When set, each
+  ##       group server runs a bounded top-K heap locally and ships only the
+  ##       K winners over the wire. Client merges at most K×Ngroups candidates
+  ##       (typically a few dozen for K=5, Ngroups=3).
   let scanTimer = newQueryTimer()
   if not client.initialized.load(moRelaxed):
     return peErr(newProtocolError(peInternal, "client not initialized"))
@@ -1426,7 +1432,7 @@ ProtocolError] =
           "no connection to group leader"))
     let conn = connOpt.get()
     return conn.kvStreamScan(groupStart, groupEnd, limit, 0, 0, txnId,
-        readTimestamp, groupId, filter, reverse, columns)
+        readTimestamp, groupId, filter, reverse, columns, topK)
 
   # For multi-group, use k-way merge: open all group streams in PARALLEL
   # and merge results by key order. This produces globally sorted output
@@ -1456,6 +1462,7 @@ ProtocolError] =
     ownsConnection: bool ## True if we created a dedicated connection (must close after)
     limit: uint32 ## Per-group scan limit. 0 means no limit (full scan).
     columns: Option[seq[string]] ## Column names for server-side projection (Tier-3a)
+    topK: Option[kvMsgs.WireTopKSpec] ## Top-K spec for server-side heap pushdown (Tier-3b)
 
   var groupArgs: seq[GroupScanArgs] = @[]
   var resolveErrors: seq[string] = @[]
@@ -1525,7 +1532,8 @@ ProtocolError] =
       filter: filter,
       ownsConnection: ownsConn,
       limit: limit,
-      columns: columns
+      columns: columns,
+      topK: topK
     ))
 
   if groupArgs.len == 0:
@@ -1563,7 +1571,7 @@ ProtocolError] =
     let streamRes = args.conn.kvStreamScan(args.groupStart, args.groupEnd,
         args.limit,
         chunkSize, 0, txnId, readTimestamp, args.groupId, args.filter, reverse,
-        args.columns)
+        args.columns, args.topK)
     if streamRes.isOk:
       groupStreams.add(streamRes.value)
     else:
@@ -1591,6 +1599,8 @@ ProtocolError] =
       reverseVal: bool
       limitVal: uint32      ## Per-group scan limit. 0 means no limit (full scan).
       columnsJoined: string ## "\0"-joined column names (empty = no projection)
+      topKJoined: string    ## Tier-3b: serialized WireTopKSpec. Format:
+                           ## "limit|columnIndex,descending|columnIndex,descending|..." (empty = no topK)
       resultPtr: pointer
 
     var setupArgs = newSeq[SetupArg](groupArgs.len)
@@ -1599,6 +1609,17 @@ ProtocolError] =
       var colsJoined = ""
       if args.columns.isSome and args.columns.get().len > 0:
         colsJoined = args.columns.get().join("\0")
+      # Serialize topK for cross-thread passing. Format: "limit|spec1|spec2|..."
+      # where each spec is "columnIndex,descending" (descending: 0/1).
+      var topKJoined = ""
+      if args.topK.isSome and args.topK.get().sortSpecs.len > 0:
+        let t = args.topK.get()
+        topKJoined = $t.limit
+        for s in t.sortSpecs:
+          topKJoined.add('|')
+          topKJoined.add($s.columnIndex)
+          topKJoined.add(',')
+          topKJoined.add(if s.descending: "1" else: "0")
       setupArgs[i] = SetupArg(
         idx: i,
         connPtr: cast[pointer](args.conn),
@@ -1611,6 +1632,7 @@ ProtocolError] =
         reverseVal: reverse,
         limitVal: args.limit,
         columnsJoined: colsJoined,
+        topKJoined: topKJoined,
         resultPtr: addr(setupResults[i])
       )
 
@@ -1630,10 +1652,31 @@ ProtocolError] =
                 some(sa.columnsJoined.split('\0'))
               else:
                 none(seq[string])
+            # Deserialize topK from "limit|spec1|spec2|..." format where each
+            # spec is "columnIndex,descending" (descending: 0/1).
+            let topKOpt: Option[kvMsgs.WireTopKSpec] =
+              if sa.topKJoined.len > 0:
+                let parts = sa.topKJoined.split('|')
+                if parts.len > 0:
+                  let limVal = parseUInt(parts[0])
+                  var specs: seq[kvMsgs.WireSortSpec] = @[]
+                  for i in 1 ..< parts.len:
+                    let specParts = parts[i].split(',')
+                    if specParts.len == 2:
+                      let ci = parseInt(specParts[0])
+                      let desc = specParts[1] == "1"
+                      specs.add(kvMsgs.WireSortSpec(columnIndex: ci.int32,
+                          descending: desc))
+                  some(kvMsgs.WireTopKSpec(limit: limVal.uint32,
+                      sortSpecs: specs))
+                else:
+                  none(kvMsgs.WireTopKSpec)
+              else:
+                none(kvMsgs.WireTopKSpec)
             let streamRes = conn.kvStreamScan(sa.groupStart, sa.groupEnd,
                 sa.limitVal,
                 sa.chunkSizeVal, 0, txnIdVal, sa.readTs, groupId, filterOpt,
-                sa.reverseVal, colsOpt)
+                sa.reverseVal, colsOpt, topKOpt)
             let slot = cast[ptr StreamSetupResult](sa.resultPtr)
             if streamRes.isOk:
               # CRITICAL: Prevent use-after-free when the thread's local

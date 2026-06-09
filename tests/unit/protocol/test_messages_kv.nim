@@ -1071,7 +1071,7 @@ suite "Scan Request Messages":
     let encoded = encodeScanRequest(req)
     var pos = 0
     discard readUint16BE(encoded, pos)
-    let flags = readUint8(encoded, pos)
+    let flags = readUint16BE(encoded, pos)
     check flags.value == (ScanFlagIncludeTimestamp or ScanFlagIncludeVersion)
 
   test "encodeScanRequest KeysOnly":
@@ -1088,8 +1088,8 @@ suite "Scan Request Messages":
     let encoded = encodeScanRequest(req)
     var pos = 0
     discard readUint16BE(encoded, pos)
-    let flags = readUint8(encoded, pos)
-    check (flags.value and ScanFlagKeysOnly) != 0'u8
+    let flags = readUint16BE(encoded, pos)
+    check (flags.value and ScanFlagKeysOnly) != 0'u16
 
   test "encodeScanRequest Reverse":
     let txnId = genULIDLocal()
@@ -1105,8 +1105,8 @@ suite "Scan Request Messages":
     let encoded = encodeScanRequest(req)
     var pos = 0
     discard readUint16BE(encoded, pos)
-    let flags = readUint8(encoded, pos)
-    check (flags.value and ScanFlagReverse) != 0'u8
+    let flags = readUint16BE(encoded, pos)
+    check (flags.value and ScanFlagReverse) != 0'u16
 
   test "encodeScanRequest with groupId":
     let txnId = genULIDLocal()
@@ -1189,7 +1189,7 @@ suite "Scan Response Frame Messages":
     let rf = ScanResponseFrame(
       respFlags: ScanRespFlagEndOfScan,
       pairs: @[],
-      reqFlags: 0x00'u8
+      reqFlags: 0x00'u16
     )
     let encoded = encodeScanResponseFrame(rf)
     var pos = 0
@@ -1204,7 +1204,7 @@ suite "Scan Response Frame Messages":
       respFlags: ScanRespFlagHasMore,
       pairs: @[ScanPair(key: "k1", value: "v1", timestamp: 0'u64,
           version: 0'u64)],
-      reqFlags: 0x00'u8
+      reqFlags: 0x00'u16
     )
     let encoded = encodeScanResponseFrame(rf)
     var pos = 0
@@ -1222,7 +1222,7 @@ suite "Scan Response Frame Messages":
         ScanPair(key: "k2", value: "v2", timestamp: 0'u64, version: 0'u64),
         ScanPair(key: "k3", value: "v3", timestamp: 0'u64, version: 0'u64)
       ],
-      reqFlags: 0x00'u8
+      reqFlags: 0x00'u16
     )
     let encoded = encodeScanResponseFrame(rf)
     let decoded = decodeScanResponseFrame(encoded, 0x00'u8)
@@ -1285,7 +1285,7 @@ suite "Scan Response Frame Messages":
     let rf = ScanResponseFrame(
       respFlags: ScanRespFlagEndOfScan,
       pairs: @[],
-      reqFlags: 0x00'u8
+      reqFlags: 0x00'u16
     )
     let encoded = encodeScanResponseFrame(rf)
     let decoded = decodeScanResponseFrame(encoded, 0x00'u8)
@@ -1300,7 +1300,7 @@ suite "Scan Response Frame Messages":
         ScanPair(key: "k1", value: "v1", timestamp: 0'u64, version: 0'u64),
         ScanPair(key: "k2", value: "v2", timestamp: 0'u64, version: 0'u64)
       ],
-      reqFlags: 0x00'u8
+      reqFlags: 0x00'u16
     )
     let encoded = encodeScanResponseFrame(rf)
     let decoded = decodeScanResponseFrame(encoded, 0x00'u8)
@@ -1434,10 +1434,10 @@ suite "KV Constants":
     check ScanFlagKeysOnly == 0x04'u8
 
   test "ScanFlagReverse value":
-    check ScanFlagReverse == 0x08'u8
+    check ScanFlagReverse == 0x08'u16
 
   test "ScanFlagGroupRouted value":
-    check ScanFlagGroupRouted == 0x10'u8
+    check ScanFlagGroupRouted == 0x10'u16
 
   test "ScanRespFlagHasMore value":
     check ScanRespFlagHasMore == 0x01'u8
@@ -1756,7 +1756,7 @@ suite "ScanRequest with filter":
     let encoded = encodeScanRequest(req)
     # Check HasFilter flag is set
     var pos = 2
-    let flagsR = readUint8(encoded, pos)
+    let flagsR = readUint16BE(encoded, pos)
     check (flagsR.value and ScanFlagHasFilter) != 0
 
     let decodedR = decodeScanRequest(encoded)
@@ -1770,7 +1770,7 @@ suite "ScanRequest with filter":
     check decodedFilter.binRight.litIntVal == 1'i64
 
   test "ScanFlagHasFilter value":
-    check ScanFlagHasFilter == 0x40'u8
+    check ScanFlagHasFilter == 0x40'u16
 
 suite "WireFilterExpr evaluation (matchesWireFilter)":
 

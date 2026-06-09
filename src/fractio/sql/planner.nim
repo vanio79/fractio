@@ -123,6 +123,11 @@ type
       scColumns*: seq[string]          # columns to return (empty = all)
       scAllColumns*: seq[string]       # all table columns for decoding
       scKeyEncoding*: TableKeyEncoding # key encoding strategy for this table
+      scTopK*: Option[WireTopKSpec]    ## Tier-3b: server-side top-K heap
+                                      ## pushdown. When set, each group server runs a bounded top-K heap
+                                      ## locally and ships only the K winners over the wire. Used for
+                                      ## `ORDER BY non_pk_col LIMIT K` to cut wire traffic and client-side
+                                      ## decode work from O(N) to O(K). When `none`, no server-side top-K.
 
     of poOrderBy:
       obSortSpecs*: seq[SortSpec]      ## Sort specifications from ORDER BY
@@ -130,6 +135,11 @@ type
       obAllColumns*: seq[string]       ## All fetched columns for expression evaluation
       obLimit*: uint32                 ## LIMIT to apply after sorting (0 = no limit)
       obOptimization*: OrderByOptimization ## Optimization type for PK-based sorting
+      obServerTopK*: bool              ## Tier-3b: true if the server already ran
+                            ## the top-K heap (each group returned ≤K candidates). When true, the
+                            ## executor just merges the K×Ngroups candidates via the k-way merge
+                            ## (no client-side heap needed). When false, the executor runs the
+                                       ## top-K heap locally on the streamed rows.
 
     of poUpdate:
       upTableId*: TableId
@@ -1121,6 +1131,7 @@ proc planSelect(stmt: Stmt, client: FractioClient,
         obColumns: reqCols, # Output columns (original requested)
         obAllColumns: fetchCols, # Columns in the rows (for expression evaluation)
         obOptimization: oboNone,
+        obServerTopK: false,
       ))
     return plan
 
@@ -1192,6 +1203,29 @@ proc planSelect(stmt: Stmt, client: FractioClient,
     scColumns: fetchCols, # Fetch columns needed for ORDER BY
     scAllColumns: allCols,
     scKeyEncoding: desc.keyEncoding,
+    # Tier-3b: server-side top-K heap pushdown. Only set for oboTopK cases
+    # (non-PK ORDER BY + LIMIT, and PK DESC + LIMIT). The `limit` field on
+    # the spec is the per-group candidate size — same K as obLimit since each
+    # group independently selects its top K and the client merges the global
+    # top K via k-way merge. We only ship specs whose columnIndex is set
+    # (skip sort specs that need expression evaluation — those need a slow
+    # path we'll handle later if needed).
+    scTopK: if obOptimization == oboTopK and limit > 0:
+      var wireSpecs: seq[WireSortSpec] = @[]
+      for spec in (if stmt.selOrderBy.len > 0 and pkOptimization == oboNone:
+                     sortSpecs
+                   else: @[]):
+        if spec.columnIndex >= 0:
+          wireSpecs.add(WireSortSpec(
+            columnIndex: int32(spec.columnIndex),
+            descending: spec.descending
+          ))
+      if wireSpecs.len > 0:
+        some(WireTopKSpec(limit: limit, sortSpecs: wireSpecs))
+      else:
+        none(WireTopKSpec)
+    else:
+      none(WireTopKSpec),
   ))
 
   # Add ORDER BY plan op if specified
@@ -1205,6 +1239,7 @@ proc planSelect(stmt: Stmt, client: FractioClient,
         obAllColumns: fetchCols,
         obLimit: limit,
         obOptimization: oboPkAscMatch,
+        obServerTopK: false,
       ))
     elif obOptimization == oboPkDescMatch:
       if limit > 0:
@@ -1212,12 +1247,19 @@ proc planSelect(stmt: Stmt, client: FractioClient,
         # This avoids materializing all N rows for reversal — only K rows in memory.
         # Generate PK DESC sort specs from the ORDER BY items.
         let pkSortSpecs = orderItemsToSortSpecs(stmt.selOrderBy, allCols)
+        # Server-side top-K pushdown: signal the executor that the server
+        # already applied the heap (each group returned ≤K candidates).
+        let hasServerTopK = stmt.selOrderBy.len > 0 and
+            stmt.selOrderBy.allIt(it.expr.kind == exColumn) and
+            (let specs = orderItemsToSortSpecs(stmt.selOrderBy, allCols);
+             specs.allIt(it.columnIndex >= 0))
         plan.add(PlanOp(kind: poOrderBy,
           obSortSpecs: pkSortSpecs,
           obColumns: reqCols,
           obAllColumns: fetchCols,
           obLimit: limit,
           obOptimization: oboTopK,
+          obServerTopK: hasServerTopK,
         ))
       else:
         # PK DESC without LIMIT: data needs full reversal, no sort specs needed
@@ -1227,15 +1269,21 @@ proc planSelect(stmt: Stmt, client: FractioClient,
           obAllColumns: fetchCols,
           obLimit: limit,
           obOptimization: oboPkDescMatch,
+          obServerTopK: false,
         ))
     elif obOptimization == oboTopK:
       # Non-PK ORDER BY + LIMIT: use bounded top-K heap
+      # Server-side top-K pushdown: signal the executor that the server
+      # already applied the heap (each group returned ≤K candidates).
+      let hasServerTopK = sortSpecs.len > 0 and
+          sortSpecs.allIt(it.columnIndex >= 0)
       plan.add(PlanOp(kind: poOrderBy,
         obSortSpecs: sortSpecs,
         obColumns: reqCols,
         obAllColumns: fetchCols,
         obLimit: limit,
         obOptimization: oboTopK,
+        obServerTopK: hasServerTopK,
       ))
     else:
       # No optimization - full sort
@@ -1245,6 +1293,7 @@ proc planSelect(stmt: Stmt, client: FractioClient,
         obAllColumns: fetchCols,
         obLimit: limit,
         obOptimization: oboNone,
+        obServerTopK: false,
       ))
 
   plan

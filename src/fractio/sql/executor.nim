@@ -534,7 +534,9 @@ proc execTxnStreamScan(ctx: ExecutorContext, startKey, endKey: string,
     filter: Option[kvMsgs.WireFilterExpr] = none(
         kvMsgs.WireFilterExpr),
     reverse: bool = false,
-    columns: Option[seq[string]] = none(seq[string])): Result[
+    columns: Option[seq[string]] = none(seq[string]),
+    topK: Option[kvMsgs.WireTopKSpec] = none(
+        kvMsgs.WireTopKSpec)): Result[
         StreamingScanClient, ProtocolError] =
   ## Streaming scan keys with MVCC awareness.
   ## Returns a StreamingScanClient for lazy iteration.
@@ -546,11 +548,14 @@ proc execTxnStreamScan(ctx: ExecutorContext, startKey, endKey: string,
   ##          When set and non-empty, server decodes each DataRow, projects
   ##          to the requested columns, and re-encodes — reducing wire size
   ##          for SELECT col1, col2 ... FROM wide_table.
+  ## topK: optional server-side top-K heap spec (Tier-3b). When set, each
+  ##       group server runs a bounded top-K heap locally and ships only the
+  ##       K winners over the wire. Client merges at most K×Ngroups candidates.
   if ctx.client == nil:
     return peErr(newProtocolError(peInternal,
         "streaming scan requires FractioClient"))
   ctx.client.streamScan(startKey, endKey, limit, ctx.txnId, ctx.readTimestamp,
-                        filter, reverse, columns)
+                        filter, reverse, columns, topK)
 
 # ---------------------------------------------------------------------------
 # Per-op executors
@@ -1270,9 +1275,13 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
         # the requested columns, reducing wire size for wide tables.
         let projCols: Option[seq[string]] =
           if op.scColumns.len > 0: some(op.scColumns) else: none(seq[string])
+        # Pass op.scTopK for server-side top-K heap pushdown (Tier-3b):
+        # when set, each group server runs a bounded top-K heap locally and
+        # ships only the K winners over the wire (instead of all N rows).
+        let topKOpt: Option[kvMsgs.WireTopKSpec] = op.scTopK
         let streamRes = execTxnStreamScan(ctx, op.scStartKey, op.scEndKey,
             op.scLimit,
-            serverFilter, op.scReverse, projCols)
+            serverFilter, op.scReverse, projCols, topKOpt)
         scanTimer.stamp("stream_scan_setup")
         if streamRes.isErr:
           return errorResult(&"failed to start streaming scan: {streamRes.error.msg}")
@@ -1432,6 +1441,34 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
         # we use a bounded max-heap that keeps only the top K rows while streaming.
         # This gives O(N log K) time and O(K) memory.
         let limitRows = if op.obLimit > 0: int(op.obLimit) else: 10
+
+        # Tier-3b: when obServerTopK is true, each group server already ran
+        # the top-K heap and shipped only its K candidates. The client-side
+        # stream now contains at most K×Ngroups total candidates (typically
+        # 5×3=15 for K=5 across 3 groups). We MUST NOT re-heap on the client
+        # — the per-group heaps were computed independently and the k-way
+        # merge has already globally ordered them by PK. Just collect the
+        # candidates, apply column extraction, and apply LIMIT.
+        if op.obServerTopK:
+          orderTimer.stamp("order_start")
+          var outputRows: seq[seq[string]] = @[]
+          while lastResult.streamIterator.hasNextRow():
+            let rowOpt = lastResult.streamIterator.nextRow()
+            if rowOpt.isSome:
+              outputRows.add(rowOpt.get())
+              if limitRows > 0 and outputRows.len >= limitRows:
+                break
+          orderTimer.stamp("stream_consume+server_topk")
+          lastResult.streamIterator.closeIterator()
+          # Extract only requested columns if needed
+          if op.obColumns.len != lastResult.streamColumns.len:
+            outputRows = extractRequestedColumns(outputRows, op.obColumns,
+                op.obAllColumns)
+          orderTimer.stamp("column_extract")
+          debug &"[exec_timer] obOptimization=TOP_K_SERVER rows={outputRows.len}/{outputRows.len} {orderTimer.formatBreakdown()}"
+          return rowsResult(op.obColumns, outputRows)
+
+        # Client-side top-K heap (the original Tier-1+2 path)
         let heap = newTopKHeap(op.obSortSpecs, op.obAllColumns, limitRows)
 
         if lastResult.kind == erkRows:

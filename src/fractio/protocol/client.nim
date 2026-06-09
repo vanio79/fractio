@@ -576,7 +576,7 @@ type
 
     # Single-group mode fields
     client*: ProtocolClient
-    reqFlags*: uint8
+    reqFlags*: uint16
     streamId*: uint32
     hasMore*: bool
     exhausted*: bool
@@ -713,7 +713,7 @@ proc kvBatch*(client: ProtocolClient,
 
 proc kvScan*(client: ProtocolClient, startKey: string = "",
     endKey: string = "", limit: uint32 = 0,
-    flags: uint8 = 0, txnId: TransactionID = zeroTransactionID(),
+    flags: uint16 = 0, txnId: TransactionID = zeroTransactionID(),
     readTimestamp: uint64 = 0,
     groupId: GroupID = ZeroGroupID()): Result[ScanResponseFrame,
         ProtocolError] {.
@@ -802,11 +802,12 @@ proc newKWayMergeScanClient*(streams: seq[StreamingScanClient],
 proc startStreamScan*(ss: StreamingScanClient, startKey: string = "",
     endKey: string = "", limit: uint32 = 0,
     chunkSize: uint32 = 0,
-    flags: uint8 = 0, txnId: TransactionID = zeroTransactionID(),
+    flags: uint16 = 0, txnId: TransactionID = zeroTransactionID(),
     readTimestamp: uint64 = 0,
     groupId: GroupID = ZeroGroupID(),
     filter: Option[WireFilterExpr] = none(WireFilterExpr),
-    columns: Option[seq[string]] = none(seq[string])): Result[
+    columns: Option[seq[string]] = none(seq[string]),
+    topK: Option[kvMsgs.WireTopKSpec] = none(kvMsgs.WireTopKSpec)): Result[
         ScanResponseFrame, ProtocolError] {.
     gcsafe, raises: [].} =
   ## Start a streaming scan. Sends the initial request and receives the first frame.
@@ -817,6 +818,10 @@ proc startStreamScan*(ss: StreamingScanClient, startKey: string = "",
   ##          when set and non-empty, server decodes each DataRow and re-emits
   ##          only the requested columns, reducing wire size for SELECT id,name
   ##          style queries on wide tables.
+  ## topK: optional server-side top-K heap pushdown (Tier-3b). When set with
+  ##       non-empty sortSpecs, server runs a bounded top-K heap locally and
+  ##       ships only the K winners per group over the wire. Client merges
+  ##       at most K×Ngroups candidates instead of N×Ngroups rows.
   ## Note: Only valid for single-group mode (not k-way merge mode).
   if ss.kWayMergeMode:
     return peErr(newProtocolError(peInternal,
@@ -831,6 +836,8 @@ proc startStreamScan*(ss: StreamingScanClient, startKey: string = "",
     actualFlags = actualFlags or kvMsgs.ScanFlagHasFilter
   if columns.isSome and columns.get().len > 0:
     actualFlags = actualFlags or kvMsgs.ScanFlagHasColumns
+  if topK.isSome and topK.get().sortSpecs.len > 0:
+    actualFlags = actualFlags or kvMsgs.ScanFlagHasTopK
 
   ss.reqFlags = actualFlags
 
@@ -845,6 +852,7 @@ proc startStreamScan*(ss: StreamingScanClient, startKey: string = "",
     chunkSize: chunkSize,
     filter: filter,
     columns: columns,
+    topK: topK,
   )
 
   let r = ss.client.send(encodeScanRequest(req))
@@ -1201,12 +1209,13 @@ proc consumeStreamScan*(ss: StreamingScanClient): Result[seq[kvMsgs.ScanPair],
 proc kvStreamScan*(client: ProtocolClient, startKey: string = "",
     endKey: string = "", limit: uint32 = 0,
     chunkSize: uint32 = 0,
-    flags: uint8 = 0, txnId: TransactionID = zeroTransactionID(),
+    flags: uint16 = 0, txnId: TransactionID = zeroTransactionID(),
     readTimestamp: uint64 = 0,
     groupId: GroupID = ZeroGroupID(),
     filter: Option[WireFilterExpr] = none(WireFilterExpr),
     reverse: bool = false,
-    columns: Option[seq[string]] = none(seq[string])): Result[
+    columns: Option[seq[string]] = none(seq[string]),
+    topK: Option[kvMsgs.WireTopKSpec] = none(kvMsgs.WireTopKSpec)): Result[
         StreamingScanClient, ProtocolError] {.
     gcsafe, raises: [].} =
   ## Start a streaming scan and return a StreamingScanClient for iteration.
@@ -1219,12 +1228,16 @@ proc kvStreamScan*(client: ProtocolClient, startKey: string = "",
   ##          when set and non-empty, server decodes each DataRow, projects
   ##          to the requested columns, and re-encodes. Cuts wire bytes by
   ##          N_requested / N_total for wide-table SELECT col1, col2 queries.
+  ## topK: optional server-side top-K heap spec (Tier-3b). When set, each
+  ##       group server runs a bounded top-K heap locally and ships only the
+  ##       K winners over the wire. Client merges at most K×Ngroups candidates.
   var combinedFlags = flags
   if reverse:
     combinedFlags = combinedFlags or kvMsgs.ScanFlagReverse
   let ss = newStreamingScanClient(client)
   let firstFrameR = ss.startStreamScan(startKey, endKey, limit, chunkSize, combinedFlags,
-                                        txnId, readTimestamp, groupId, filter, columns)
+                                        txnId, readTimestamp, groupId, filter,
+                                        columns, topK)
   if firstFrameR.isErr:
     return peErr(firstFrameR.error)
   peOk(ss)

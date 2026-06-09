@@ -12,7 +12,7 @@ import fractio/distributed/raft/group_types
 
 suite "Scan Streaming Flags":
   test "ScanFlagStreaming is defined":
-    check kvMsgs.ScanFlagStreaming == 0x20'u8
+    check kvMsgs.ScanFlagStreaming == 0x20'u16
 
   test "Scan streaming flag can combine with other flags":
     let flags = kvMsgs.ScanFlagStreaming or kvMsgs.ScanFlagIncludeTimestamp

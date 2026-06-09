@@ -643,14 +643,15 @@ proc decodeBatchResponse*(payload: string): Result[BatchResponse,
 # ---------------------------------------------------------------------------
 
 const
-  ScanFlagIncludeTimestamp* = 0x01'u8
-  ScanFlagIncludeVersion* = 0x02'u8
-  ScanFlagKeysOnly* = 0x04'u8
-  ScanFlagReverse* = 0x08'u8
-  ScanFlagGroupRouted* = 0x10'u8  ## groupId appended for routing filter
-  ScanFlagStreaming* = 0x20'u8    ## streaming scan - multiple frames
-  ScanFlagHasFilter* = 0x40'u8    ## serialized filter appended for server-side filtering
-  ScanFlagHasColumns* = 0x80'u8 ## serialized column-name list appended for server-side column projection
+  ScanFlagIncludeTimestamp* = 0x01'u16
+  ScanFlagIncludeVersion* = 0x02'u16
+  ScanFlagKeysOnly* = 0x04'u16
+  ScanFlagReverse* = 0x08'u16
+  ScanFlagGroupRouted* = 0x10'u16 ## groupId appended for routing filter
+  ScanFlagStreaming* = 0x20'u16   ## streaming scan - multiple frames
+  ScanFlagHasFilter* = 0x40'u16   ## serialized filter appended for server-side filtering
+  ScanFlagHasColumns* = 0x80'u16 ## serialized column-name list appended for server-side column projection
+  ScanFlagHasTopK* = 0x100'u16 ## serialized top-K spec appended for server-side top-K heap pushdown (bit 8)
 
   ScanRespFlagHasMore* = 0x01'u8
   ScanRespFlagEndOfScan* = 0x02'u8
@@ -972,17 +973,39 @@ proc matchesWireFilterWithDecodedValue*(filter: Option[WireFilterExpr],
     return true
 
 type
+  WireSortSpec* = object
+    ## Wire-encoded sort specification for server-side top-K.
+    ## Only simple column references are supported (columnIndex + direction).
+    ## Complex expression-based ORDER BY falls back to client-side sorting.
+    columnIndex*: int32 ## -1 = invalid/unset
+    descending*: bool
+
+  WireTopKSpec* = object
+    ## Wire-encoded top-K specification. Server runs a bounded top-K heap
+    ## locally on each chunk's pairs and ships only the K winners over the
+    ## wire. Client merges K×Ngroups rows instead of N×Ngroups.
+    ##
+    ## For multi-group scans, the same topK spec is sent to each group leader;
+    ## each group independently selects its local top-K, and the client merges.
+    ## The final LIMIT must be applied at the client (after k-way merge) to get
+    ## the global top-K. To make this work, `limit` is set to the per-group
+    ## candidate size (K, not the user LIMIT) so each group returns at most K
+    ## candidates.
+    limit*: uint32 ## Per-group candidate size (the topKHeap capacity)
+    sortSpecs*: seq[WireSortSpec] ## Sort keys; empty sortSpecs = no-op heap
+
   ScanRequest* = object
-    flags*: uint8
+    flags*: uint16
     txnId*: TransactionID
     readTimestamp*: uint64
-    startKey*: string ## empty = beginning of keyspace
-    endKey*: string   ## empty = end of keyspace
-    limit*: uint32    ## 0 = no limit
+    startKey*: string           ## empty = beginning of keyspace
+    endKey*: string             ## empty = end of keyspace
+    limit*: uint32              ## 0 = no limit
     groupId*: GroupID ## non-zero when GroupRouted flag is set - for server-side routing filter
-    chunkSize*: uint32 ## items per frame for streaming (0 = DEFAULT_SCAN_CHUNK_SIZE)
+    chunkSize*: uint32          ## items per frame for streaming (0 = DEFAULT_SCAN_CHUNK_SIZE)
     filter*: Option[WireFilterExpr] ## serialized filter for server-side filtering
     columns*: Option[seq[string]] ## column names to project (server-side projection)
+    topK*: Option[WireTopKSpec] ## top-K heap spec for server-side top-K pushdown
 
   ScanPair* = object
     key*: string
@@ -995,8 +1018,8 @@ type
     respFlags*: uint8 ## ScanRespFlag* bits
     pairs*: seq[ScanPair]
     ## Mirror of the request flags so encode/decode know which optional
-    ## fields are present in each pair.
-    reqFlags*: uint8
+    ## fields are present in each pair. uint16 to match the request flags.
+    reqFlags*: uint16
 
   StreamingScanResult* = object
     ## Result of a streaming scan operation - tracks state across frames
@@ -1015,8 +1038,10 @@ proc encodeScanRequest*(req: ScanRequest): string =
     flags = flags or ScanFlagHasFilter
   if req.columns.isSome and req.columns.get().len > 0:
     flags = flags or ScanFlagHasColumns
+  if req.topK.isSome and req.topK.get().sortSpecs.len > 0:
+    flags = flags or ScanFlagHasTopK
   buf.writeUint16BE(uint16(mtScan))
-  buf.writeUint8(flags)
+  buf.writeUint16BE(flags)
   buf.add(transactionIDToBytes(req.txnId))
   buf.writeUint64BE(req.readTimestamp)
   buf.writeBytes(req.startKey)
@@ -1036,12 +1061,20 @@ proc encodeScanRequest*(req: ScanRequest): string =
     buf.writeUint32BE(uint32(cols.len))
     for c in cols:
       buf.writeBytes(c)
+  # Include top-K spec (server-side top-K heap pushdown)
+  if req.topK.isSome and req.topK.get().sortSpecs.len > 0:
+    let topK = req.topK.get()
+    buf.writeUint32BE(topK.limit)
+    buf.writeUint32BE(uint32(topK.sortSpecs.len))
+    for s in topK.sortSpecs:
+      buf.writeInt32BE(s.columnIndex)
+      buf.writeUint8(if s.descending: 1'u8 else: 0'u8)
   buf
 
 proc decodeScanRequest*(payload: string): Result[ScanRequest, ProtocolError] =
   var pos = 2
   var req: ScanRequest
-  let flagsR = readUint8(payload, pos)
+  let flagsR = readUint16BE(payload, pos)
   if flagsR.isErr: return peErr(flagsR.error)
   req.flags = flagsR.value
 
@@ -1104,6 +1137,22 @@ proc decodeScanRequest*(payload: string): Result[ScanRequest, ProtocolError] =
       cols[i] = cR.value
     req.columns = some(cols)
 
+  # Read top-K spec if HasTopK flag is set
+  if (req.flags and ScanFlagHasTopK) != 0:
+    let limitR = readUint32BE(payload, pos)
+    if limitR.isErr: return peErr(limitR.error)
+    let cntR = readUint32BE(payload, pos)
+    if cntR.isErr: return peErr(cntR.error)
+    let nspecs = int(cntR.value)
+    var specs = newSeq[WireSortSpec](nspecs)
+    for i in 0 ..< nspecs:
+      let ciR = readInt32BE(payload, pos)
+      if ciR.isErr: return peErr(ciR.error)
+      let dR = readUint8(payload, pos)
+      if dR.isErr: return peErr(dR.error)
+      specs[i] = WireSortSpec(columnIndex: ciR.value, descending: dR.value == 1)
+    req.topK = some(WireTopKSpec(limit: limitR.value, sortSpecs: specs))
+
   peOk(req)
 
 proc encodeScanResponseFrame*(rf: ScanResponseFrame): string =
@@ -1127,7 +1176,7 @@ proc encodeScanResponseFrame*(rf: ScanResponseFrame): string =
   buf
 
 proc decodeScanResponseFrame*(payload: string,
-    reqFlags: uint8): Result[ScanResponseFrame, ProtocolError] =
+    reqFlags: uint16): Result[ScanResponseFrame, ProtocolError] =
   var pos = 2
   var rf: ScanResponseFrame
   rf.reqFlags = reqFlags
