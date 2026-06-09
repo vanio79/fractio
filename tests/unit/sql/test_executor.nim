@@ -2957,7 +2957,8 @@ suite "Executor ORDER BY with MockKVStore":
 
     let sortSpecs = @[SortSpec(
       expr: Expr(kind: exColumn, colName: "id"),
-      descending: false
+      descending: false,
+      columnIndex: 0
     )]
 
     let plan = newPlan()
@@ -3025,7 +3026,8 @@ suite "Executor ORDER BY with MockKVStore":
 
     let sortSpecs = @[SortSpec(
       expr: Expr(kind: exColumn, colName: "score"),
-      descending: true
+      descending: true,
+      columnIndex: 1
     )]
 
     let plan = newPlan()
@@ -3101,8 +3103,10 @@ suite "Executor ORDER BY with MockKVStore":
     let endKey = makeDataRowScanEndKey(tableId)
 
     let sortSpecs = @[
-      SortSpec(expr: Expr(kind: exColumn, colName: "age"), descending: false),
-      SortSpec(expr: Expr(kind: exColumn, colName: "name"), descending: false)
+      SortSpec(expr: Expr(kind: exColumn, colName: "age"), descending: false,
+               columnIndex: 2),
+      SortSpec(expr: Expr(kind: exColumn, colName: "name"), descending: false,
+               columnIndex: 1)
     ]
 
     let plan = newPlan()
@@ -3176,7 +3180,8 @@ suite "Executor ORDER BY with MockKVStore":
 
     let sortSpecs = @[SortSpec(
       expr: Expr(kind: exColumn, colName: "id"),
-      descending: false
+      descending: false,
+      columnIndex: 0
     )]
 
     let plan = newPlan()
@@ -3234,7 +3239,8 @@ suite "Executor ORDER BY with MockKVStore":
     # PointGet followed by ORDER BY
     let sortSpecs = @[SortSpec(
       expr: Expr(kind: exColumn, colName: "name"),
-      descending: true
+      descending: true,
+      columnIndex: 1
     )]
 
     let plan = newPlan()

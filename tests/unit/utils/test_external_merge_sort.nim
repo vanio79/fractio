@@ -120,7 +120,7 @@ suite "In-Memory Sort":
       @["3", "charlie"]
     ]
     let specs = @[SortSpec(expr: Expr(kind: exColumn, colName: "name"),
-        descending: false)]
+        descending: false, columnIndex: 1)]
     let columns = @["id", "name"]
     let sorted = sortRowsInMemory(rows, specs, columns)
     check sorted.len == 3
@@ -136,8 +136,10 @@ suite "In-Memory Sort":
       @["20", "dave"]
     ]
     let specs = @[
-      SortSpec(expr: Expr(kind: exColumn, colName: "age"), descending: false),
-      SortSpec(expr: Expr(kind: exColumn, colName: "name"), descending: false)
+      SortSpec(expr: Expr(kind: exColumn, colName: "age"), descending: false,
+               columnIndex: 0),
+      SortSpec(expr: Expr(kind: exColumn, colName: "name"), descending: false,
+               columnIndex: 1)
     ]
     let columns = @["age", "name"]
     let sorted = sortRowsInMemory(rows, specs, columns)
@@ -633,7 +635,7 @@ suite "TopKHeap - Bounded ORDER BY + LIMIT":
 
   test "top-K heap keeps smallest K rows in ASC order":
     let specs = @[SortSpec(expr: Expr(kind: exColumn, colName: "id"),
-        descending: false)]
+        descending: false, columnIndex: 0)]
     let allColumns = @["id", "name"]
     let heap = newTopKHeap(specs, allColumns, capacity = 3)
 
@@ -656,7 +658,7 @@ suite "TopKHeap - Bounded ORDER BY + LIMIT":
     # For DESC, the "best" rows have the highest values.
     # A max-heap keeps the worst at root, so we evict the smallest.
     let specs = @[SortSpec(expr: Expr(kind: exColumn, colName: "id"),
-        descending: true)]
+        descending: true, columnIndex: 0)]
     let allColumns = @["id", "name"]
     let heap = newTopKHeap(specs, allColumns, capacity = 3)
 
@@ -678,7 +680,7 @@ suite "TopKHeap - Bounded ORDER BY + LIMIT":
 
   test "top-K heap with capacity larger than input":
     let specs = @[SortSpec(expr: Expr(kind: exColumn, colName: "val"),
-        descending: false)]
+        descending: false, columnIndex: 0)]
     let allColumns = @["val"]
     let heap = newTopKHeap(specs, allColumns, capacity = 100)
 
@@ -696,7 +698,7 @@ suite "TopKHeap - Bounded ORDER BY + LIMIT":
 
   test "top-K heap with single row":
     let specs = @[SortSpec(expr: Expr(kind: exColumn, colName: "x"),
-        descending: false)]
+        descending: false, columnIndex: 0)]
     let allColumns = @["x"]
     let heap = newTopKHeap(specs, allColumns, capacity = 5)
 
@@ -709,7 +711,7 @@ suite "TopKHeap - Bounded ORDER BY + LIMIT":
 
   test "top-K heap with empty input":
     let specs = @[SortSpec(expr: Expr(kind: exColumn, colName: "x"),
-        descending: false)]
+        descending: false, columnIndex: 0)]
     let allColumns = @["x"]
     let heap = newTopKHeap(specs, allColumns, capacity = 5)
 
@@ -719,8 +721,10 @@ suite "TopKHeap - Bounded ORDER BY + LIMIT":
 
   test "top-K heap with multi-column sort key":
     let specs = @[
-      SortSpec(expr: Expr(kind: exColumn, colName: "age"), descending: false),
-      SortSpec(expr: Expr(kind: exColumn, colName: "name"), descending: true)
+      SortSpec(expr: Expr(kind: exColumn, colName: "age"), descending: false,
+               columnIndex: 0),
+      SortSpec(expr: Expr(kind: exColumn, colName: "name"), descending: true,
+               columnIndex: 1)
     ]
     let allColumns = @["age", "name"]
     let heap = newTopKHeap(specs, allColumns, capacity = 2)
@@ -745,7 +749,7 @@ suite "TopKHeap - Bounded ORDER BY + LIMIT":
 
   test "top-K heap with string sort keys":
     let specs = @[SortSpec(expr: Expr(kind: exColumn, colName: "name"),
-        descending: false)]
+        descending: false, columnIndex: 1)]
     let allColumns = @["id", "name"]
     let heap = newTopKHeap(specs, allColumns, capacity = 3)
 
@@ -765,7 +769,7 @@ suite "TopKHeap - Bounded ORDER BY + LIMIT":
 
   test "top-K heap capacity 1 keeps only the best row":
     let specs = @[SortSpec(expr: Expr(kind: exColumn, colName: "score"),
-        descending: true)]
+        descending: true, columnIndex: 0)]
     let allColumns = @["score"]
     let heap = newTopKHeap(specs, allColumns, capacity = 1)
 
@@ -782,7 +786,7 @@ suite "TopKHeap - Bounded ORDER BY + LIMIT":
 
   test "top-K heap with duplicate values":
     let specs = @[SortSpec(expr: Expr(kind: exColumn, colName: "val"),
-        descending: false)]
+        descending: false, columnIndex: 0)]
     let allColumns = @["val"]
     let heap = newTopKHeap(specs, allColumns, capacity = 3)
 
