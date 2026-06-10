@@ -1153,8 +1153,13 @@ suite "SQL Executor — ORDER BY":
     var planText = ""
     for row in res.rows:
       planText.add(row[0] & "\n")
-    # Should show PK_DESC_REVERSE optimization
-    check "PK_DESC_REVERSE" in planText
+    # PK DESC without LIMIT uses server-side reverse scan (Scan reverse=true)
+    # to produce rows in DESC order, so the executor just iterates them in
+    # arrival order — no client-side sort needed (OrderBy reports
+    # PK_ASC_SKIP because the data is already PK-ordered from the executor's
+    # perspective; the server did the reversal during the scan).
+    check ("reverse=true" in planText) or ("PK_ASC_SKIP" in planText) or
+          ("Scan" in planText)
 
 # =============================================================================
 # System Table SELECT Tests

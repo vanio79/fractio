@@ -1147,13 +1147,12 @@ proc planSelect(stmt: Stmt, client: FractioClient,
   if stmt.selOrderBy.len > 0:
     pkOptimization = detectOrderByPkOptimization(stmt.selOrderBy, pkColumns)
 
-  # Convert ORDER BY items to SortSpecs and determine sort columns
-  # Skip this if we have PK optimization (no extra columns needed)
-  var sortSpecs: seq[SortSpec] = @[]
+  # Determine which extra columns are needed for sorting (the column
+  # *names*). We can't build the full SortSpecs (with columnIndex) yet
+  # because that requires fetchCols (which depends on sortCols). Skip
+  # this if we have PK optimization (no extra columns needed).
   var sortCols: seq[string] = @[] # Columns needed for sorting
   if stmt.selOrderBy.len > 0 and pkOptimization == oboNone:
-    sortSpecs = orderItemsToSortSpecs(stmt.selOrderBy, allCols)
-    # Extract column names referenced in ORDER BY expressions
     for item in stmt.selOrderBy:
       if item.expr.kind == exColumn:
         let colName = item.expr.colName
@@ -1175,6 +1174,24 @@ proc planSelect(stmt: Stmt, client: FractioClient,
     if c notin reqCols and c notin sortCols and c notin filterColsUnique:
       filterColsUnique.add(c)
   let fetchCols = reqCols & sortCols & filterColsUnique
+
+  # Now build the SortSpecs. CRITICAL: pass `fetchCols` (the projected
+  # row layout) rather than `allCols` (the full table layout) so that
+  # `columnIndex` aligns with the row the executor actually receives.
+  # Previously this used `allCols`, which produced columnIndex values
+  # like "age"->2 / "score"->3 against the full `users` table, but the
+  # server projects the row down to `scColumns = fetchCols` (e.g.
+  # `["name", "age", "score"]` for `SELECT name, age, score ORDER BY
+  # age, score`). The executor's `computeSortKeys` then read
+  # `row[2]`/`row[3]` of a 3-column row, getting out-of-bounds nulls —
+  # and the sort silently degraded to "no sort at all" for non-PK
+  # ORDER BY clauses. See the failing tests:
+  #   - "ORDER BY multiple columns mixed ASC/DESC"
+  #   - "ORDER BY with LIMIT"  (non-PK + LIMIT)
+  #   - "ORDER BY with WHERE"
+  var sortSpecs: seq[SortSpec] = @[]
+  if stmt.selOrderBy.len > 0 and pkOptimization == oboNone:
+    sortSpecs = orderItemsToSortSpecs(stmt.selOrderBy, fetchCols)
 
   # Generate plan based on PK range info
   if pkRangeInfo.isPointGet and pkRangeInfo.exactMatch.isSome:
@@ -1328,13 +1345,16 @@ proc planSelect(stmt: Stmt, client: FractioClient,
       if limit > 0:
         # PK DESC + LIMIT: use top-K heap with PK DESC sort specs.
         # This avoids materializing all N rows for reversal — only K rows in memory.
-        # Generate PK DESC sort specs from the ORDER BY items.
-        let pkSortSpecs = orderItemsToSortSpecs(stmt.selOrderBy, allCols)
+        # Generate PK DESC sort specs from the ORDER BY items. Use fetchCols
+        # (projected row layout) so columnIndex aligns with the rows the
+        # executor actually receives — same rationale as the non-PK sort
+        # path above.
+        let pkSortSpecs = orderItemsToSortSpecs(stmt.selOrderBy, fetchCols)
         # Server-side top-K pushdown: signal the executor that the server
         # already applied the heap (each group returned ≤K candidates).
         let hasServerTopK = stmt.selOrderBy.len > 0 and
             stmt.selOrderBy.allIt(it.expr.kind == exColumn) and
-            (let specs = orderItemsToSortSpecs(stmt.selOrderBy, allCols);
+            (let specs = orderItemsToSortSpecs(stmt.selOrderBy, fetchCols);
              specs.allIt(it.columnIndex >= 0))
         plan.add(PlanOp(kind: poOrderBy,
           obSortSpecs: pkSortSpecs,
