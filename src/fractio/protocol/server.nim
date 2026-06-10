@@ -2134,13 +2134,57 @@ proc handleBuiltinCluster(server: ProtocolServer, conn: ClientConnection,
     let groupId = groupIDFromULID(ulidFromBytes(req.groupId))
 
     # Check if group already exists
+    # CRITICAL: We must NOT just return success here if the group exists with a
+    # different member config. The "single-member fallback" path in
+    # cli/main.nim (when the JoinGroup RPC doesn't arrive in time) creates a
+    # local group with only ourselves. If the leader's JoinGroup RPC then
+    # arrives, the local group is in the wrong state and the subsequent
+    # add_srv RPC will fail (cluster config mismatch), causing split-brain
+    # and SIGSEGV in raftPutInGroup.
+    #
+    # The fix: if the existing group's server count differs from the requested
+    # member count, destroy the local group so createAndStartGroup can re-create
+    # it with the correct multi-member config.
     if server.raftStore.coordinator.hasGroup(groupId):
-      let resp = clusterMsgs.JoinGroupResponse(
-        success: true,
-        groupId: req.groupId
-      )
-      sendFrame(conn, clusterMsgs.encodeJoinGroupResponse(resp), requestId)
-      return
+      # Count requested members from the request (or from sys.groups if not in req)
+      let requestedMemberCount = if req.members.len > 0:
+        int32(req.members.len)
+      else:
+        # We need to look up sys.groups to count members; conservatively assume
+        # the existing group is correct and skip the destroy path. This is
+        # safe because if sys.groups has more members than the existing group,
+        # the subsequent add_srv from the leader will add them.
+        int32(0)
+      let existingServerCount = server.raftStore.coordinator.getGroupServerCount(
+          groupId)
+      if requestedMemberCount > 0 and
+         existingServerCount > 0 and
+         existingServerCount != requestedMemberCount:
+        # Existing group has wrong member count (e.g., single-member fallback
+        # created a 1-member group, but the leader's request is for 3 members).
+        # Destroy and let createAndStartGroup re-create it with the correct
+        # config. We log this so operators can see when the fallback path hit.
+        {.cast(gcsafe).}: {.cast(raises: []).}:
+          warn("JoinGroup: existing group has wrong member count, recreating",
+            {"groupId": $groupId,
+             "existing": $existingServerCount,
+             "requested": $requestedMemberCount}.toTable)
+        # removeGroup may raise KeyError if the group was destroyed concurrently
+        # (e.g., by another JoinGroup RPC). Catch and continue — the fall-through
+        # will just hit createAndStartGroup which will return success/failure.
+        try:
+          server.raftStore.coordinator.removeGroup(groupId)
+        except KeyError, Exception:
+          discard
+        # Fall through to createAndStartGroup below
+      else:
+        # Existing group is correct (or we can't determine — assume correct)
+        let resp = clusterMsgs.JoinGroupResponse(
+          success: true,
+          groupId: req.groupId
+        )
+        sendFrame(conn, clusterMsgs.encodeJoinGroupResponse(resp), requestId)
+        return
 
     # Build member list - we join the existing group created by creatorNodeId
     # IMPORTANT: First try to use the members from the request (most reliable).
@@ -2571,16 +2615,22 @@ proc addPeerToRaft*(server: ProtocolServer, peerNodeId: uint32,
       isMetaLeader = true
       break
     if attempt == 0:
-      echo "[addPeerToRaft] waiting for META leader election before adding peerNodeId=", peerNodeId
+      {.cast(gcsafe).}: {.cast(raises: []).}:
+        info("addPeerToRaft: waiting for META leader election",
+          {"peerNodeId": $peerNodeId}.toTable)
     sleep(100)
   if not isMetaLeader:
-    echo "[addPeerToRaft] NOT meta leader after 1.5s, skipping add_srv for peerNodeId=", peerNodeId
+    {.cast(gcsafe).}: {.cast(raises: []).}:
+      warn("addPeerToRaft: NOT meta leader after 1.5s, skipping add_srv",
+        {"peerNodeId": $peerNodeId}.toTable)
     # Still register peer info so this node knows about the new peer
     coord.peerInfo[peerNodeId] = (host: host, port: raftPort)
     return
 
-  echo "[addPeerToRaft] meta leader, adding peerNodeId=", peerNodeId, " host=",
-      host, " raftPort=", raftPort
+  {.cast(gcsafe).}: {.cast(raises: []).}:
+    info("addPeerToRaft: meta leader, adding peer",
+      {"peerNodeId": $peerNodeId, "host": host,
+       "raftPort": $raftPort}.toTable)
 
   # Register peer info for future group creation
   coord.peerInfo[peerNodeId] = (host: host, port: raftPort)

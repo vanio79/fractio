@@ -1259,11 +1259,16 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
       # is the op responsible for applying the limit, return an empty
       # result set immediately, before any RPC to the storage layer. This
       # avoids materializing N rows from a remote scan just to throw them
-      # all away. The check uses scAppliesLimit (not scHasLimit) because
+      # all away. The check uses scAppliesLimit (not scHasLimit alone) because
       # for non-PK ORDER BY + LIMIT, the scan returns all rows and the
       # downstream poOrderBy (with its top-K heap) applies the limit —
       # the scan MUST NOT short-circuit in that case.
-      if op.scAppliesLimit and op.scLimit == 0:
+      # CRITICAL: also require scHasLimit. For PK ASC queries with NO LIMIT
+      # clause, the planner sets scAppliesLimit=true (so the scan CAN apply
+      # the limit if needed) and scLimit=0 (no limit specified). Without the
+      # scHasLimit guard, the scan would short-circuit to 0 rows even though
+      # the user asked for ALL rows.
+      if op.scAppliesLimit and op.scHasLimit and op.scLimit == 0:
         return rowsResult(op.scColumns, @[])
 
       let isSysTable = op.scKeyEncoding == tkeSystemTable

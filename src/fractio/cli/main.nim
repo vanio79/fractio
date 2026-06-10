@@ -298,20 +298,21 @@ proc cmdStart(flags: Table[string, string]) =
           # Create single-member group: just ourselves
           var singleMember: seq[tuple[nodeId: uint32, host: string, port: int]] = @[]
           singleMember.add((nodeId: uint32(conf.nodeId), host: conf.host, port: conf.raftPort))
-          
-          echo "[DEBUG] preferredLeader=" & $preferredLeader & " creating single-member config for join"
-          
+
           # CRITICAL: Wait for the leader's JoinGroup RPC before creating
           # any local Raft groups. The leader's addPeerToRaft sends JoinGroup
           # RPCs which create multi-member groups with the correct config.
           # If we create single-member groups first, we create split-brain
           # where both the leader and us think we're the leader of the same
-          # GroupID but with different configs, causing infinite redirect loops.
+          # GroupID but with different configs, causing infinite redirect loops
+          # and SIGSEGV in raftPutInGroup.
           #
           # Only create single-member groups as a fallback if the leader's
           # JoinGroup RPC doesn't arrive (e.g. leader crashed after HTTP join).
+          # When the JoinGroup RPC eventually does arrive, it now detects the
+          # existing single-member group and destroys + recreates it with the
+          # correct multi-member config (see server.nim mtJoinGroup handler).
           for groupId in [META_GROUP_ID, DATA_GROUP_START_ID]:
-            let ulid = groupIDToULID(groupId)
             # Wait up to 5 seconds for JoinGroup RPC to create the group
             var groupCreated = false
             for waitAttempt in 0 ..< 25:
@@ -319,11 +320,11 @@ proc cmdStart(flags: Table[string, string]) =
                 groupCreated = true
                 break
               sleep(200)
-            if groupCreated:
-              echo "[DEBUG] Group " & $ulid & " created by JoinGroup RPC from leader"
-            else:
-              # Fallback: create single-member group if leader never sent JoinGroup
-              echo "[DEBUG] JoinGroup RPC did not arrive for " & $ulid & ", creating single-member fallback"
+            if not groupCreated:
+              # Fallback: create single-member group if leader never sent JoinGroup.
+              # This is safe because the JoinGroup handler in server.nim will
+              # detect the wrong member count and destroy + recreate the group
+              # when the leader eventually sends its JoinGroup RPC.
               discard server.raftCoord.createAndStartGroup(groupId, singleMember,
                   preferredLeader)
           
