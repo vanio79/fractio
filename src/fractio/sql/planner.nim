@@ -118,6 +118,17 @@ type
       scStartKey*: string
       scEndKey*: string
       scLimit*: uint32
+      scHasLimit*: bool                ## True if the user wrote a LIMIT clause (even LIMIT 0).
+                                       ## This distinguishes "no LIMIT clause" (scLimit unused)
+                                       ## from "LIMIT 0" (scLimit=0, scHasLimit=true) which
+                                       ## means "return zero rows".
+      scAppliesLimit*: bool            ## True if this scan is responsible for applying the
+                                       ## LIMIT (i.e., the planner decided scanLimit is the
+                                       ## authoritative limit). False when the scan returns
+                                       ## all rows because a downstream op (e.g. poOrderBy
+                                       ## with oboTopK heap) will apply the limit. Only when
+                                       ## scAppliesLimit is true can the executor safely
+                                       ## short-circuit on scLimit==0.
       scReverse*: bool ## true = scan in reverse key order (for PK DESC + LIMIT)
       scFilter*: Option[Expr]
       scColumns*: seq[string]          # columns to return (empty = all)
@@ -133,7 +144,11 @@ type
       obSortSpecs*: seq[SortSpec]      ## Sort specifications from ORDER BY
       obColumns*: seq[string]          ## Columns to return (passed from scan)
       obAllColumns*: seq[string]       ## All fetched columns for expression evaluation
-      obLimit*: uint32                 ## LIMIT to apply after sorting (0 = no limit)
+      obLimit*: uint32 ## LIMIT to apply after sorting (0 = no limit, but see hasLimit)
+      hasLimit*: bool                  ## True if the user wrote a LIMIT clause (even LIMIT 0).
+                                       ## This distinguishes "no LIMIT clause" (obLimit unused)
+                                       ## from "LIMIT 0" (obLimit=0, hasLimit=true) which means
+                                       ## "return zero rows".
       obOptimization*: OrderByOptimization ## Optimization type for PK-based sorting
       obServerTopK*: bool              ## Tier-3b: true if the server already ran
                             ## the top-K heap (each group returned ≤K candidates). When true, the
@@ -1110,9 +1125,14 @@ proc planSelect(stmt: Stmt, client: FractioClient,
   let pkColumns = findPkColumns(desc) # All PK columns for optimization detection
   let pkRangeInfo = extractPkRangeFromWhere(stmt.selWhere, pkCol, desc.pkSpec)
 
-  # Extract LIMIT value
+  # Extract LIMIT value. hasLimit tracks whether the user wrote a LIMIT
+  # clause (even LIMIT 0). This distinguishes "no LIMIT clause" from
+  # "LIMIT 0", so the executor returns 0 rows for the latter instead of
+  # defaulting to a sentinel value.
   var limit: uint32 = 0
+  var hasLimit: bool = false
   if stmt.selLimit.isSome:
+    hasLimit = true
     let limExpr = stmt.selLimit.get()
     if limExpr.kind == exLiteral and limExpr.litValue != nil and
        limExpr.litValue.kind == dtInt:
@@ -1195,6 +1215,7 @@ proc planSelect(stmt: Stmt, client: FractioClient,
   # - ORDER BY without LIMIT: scan all rows, full sort (scanLimit = 0)
   var scanLimit: uint32
   var scanReverse: bool = false
+  var scanAppliesLimit: bool = false # true if this scan is the one that applies the LIMIT
   var obOptimization: OrderByOptimization = oboNone
 
   if pkOptimization == oboPkAscMatch:
@@ -1203,6 +1224,7 @@ proc planSelect(stmt: Stmt, client: FractioClient,
     # sorted output across groups, so PK ASC optimization is valid for
     # both single-group and multi-group tables.
     scanLimit = limit
+    scanAppliesLimit = true
     obOptimization = oboPkAscMatch
   elif pkOptimization == oboPkDescMatch:
     if limit > 0:
@@ -1214,6 +1236,7 @@ proc planSelect(stmt: Stmt, client: FractioClient,
       # N rows and using a top-K heap (was O(N log K) heap operations).
       scanLimit = limit
       scanReverse = true
+      scanAppliesLimit = true
       # The data arrives already in PK DESC order, so the executor can
       # treat it as if it were PK ASC (the merge already ordered it).
       obOptimization = oboPkAscMatch
@@ -1239,12 +1262,24 @@ proc planSelect(stmt: Stmt, client: FractioClient,
   else:
     # No ORDER BY, apply LIMIT during scan
     scanLimit = limit
+    scanAppliesLimit = true
 
   plan.add(PlanOp(kind: poScan,
     scTableId: desc.tableId,
     scStartKey: startKey,
     scEndKey: endKey,
     scLimit: scanLimit,
+    # scHasLimit tracks whether the user wrote a LIMIT clause (even LIMIT 0).
+      # Used by the executor to distinguish "no LIMIT clause" from "LIMIT 0".
+    scHasLimit: hasLimit,
+    # scAppliesLimit is true ONLY when the scan is the one that applies the
+    # LIMIT (i.e., scanLimit is the authoritative limit, not just a placeholder
+    # for a downstream op to read). When scanAppliesLimit is true and
+    # scLimit == 0, the executor can safely short-circuit and return 0 rows.
+    # For non-PK ORDER BY + LIMIT, the scan returns all rows and the top-K
+    # heap applies the limit — scAppliesLimit must be false in that case
+    # to avoid the scan dropping rows the heap needs.
+    scAppliesLimit: scanAppliesLimit,
     scReverse: scanReverse,
     scFilter: pkRangeInfo.remainingFilter, # Only non-PK conditions remain
     scColumns: fetchCols, # SELECT cols + ORDER BY cols + WHERE filter cols
@@ -1285,6 +1320,7 @@ proc planSelect(stmt: Stmt, client: FractioClient,
         obColumns: reqCols,
         obAllColumns: fetchCols,
         obLimit: limit,
+        hasLimit: hasLimit,
         obOptimization: oboPkAscMatch,
         obServerTopK: false,
       ))
@@ -1305,6 +1341,7 @@ proc planSelect(stmt: Stmt, client: FractioClient,
           obColumns: reqCols,
           obAllColumns: fetchCols,
           obLimit: limit,
+          hasLimit: hasLimit,
           obOptimization: oboTopK,
           obServerTopK: hasServerTopK,
         ))
@@ -1315,6 +1352,7 @@ proc planSelect(stmt: Stmt, client: FractioClient,
           obColumns: reqCols,
           obAllColumns: fetchCols,
           obLimit: limit,
+          hasLimit: hasLimit,
           obOptimization: oboPkDescMatch,
           obServerTopK: false,
         ))
@@ -1336,6 +1374,7 @@ proc planSelect(stmt: Stmt, client: FractioClient,
         obColumns: reqCols,
         obAllColumns: fetchCols,
         obLimit: limit,
+        hasLimit: hasLimit,
         obOptimization: oboTopK,
         obServerTopK: hasServerTopK,
       ))
@@ -1346,6 +1385,7 @@ proc planSelect(stmt: Stmt, client: FractioClient,
         obColumns: reqCols,
         obAllColumns: fetchCols,
         obLimit: limit,
+        hasLimit: hasLimit,
         obOptimization: oboNone,
         obServerTopK: false,
       ))

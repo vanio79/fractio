@@ -1255,6 +1255,17 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
       # Fall back to buffered scan for MockKVStore tests
       # Handle system tables specially - they use binary encoding, not DataRow
 
+      # LIMIT 0 short-circuit: when the user wrote `LIMIT 0` and this scan
+      # is the op responsible for applying the limit, return an empty
+      # result set immediately, before any RPC to the storage layer. This
+      # avoids materializing N rows from a remote scan just to throw them
+      # all away. The check uses scAppliesLimit (not scHasLimit) because
+      # for non-PK ORDER BY + LIMIT, the scan returns all rows and the
+      # downstream poOrderBy (with its top-K heap) applies the limit —
+      # the scan MUST NOT short-circuit in that case.
+      if op.scAppliesLimit and op.scLimit == 0:
+        return rowsResult(op.scColumns, @[])
+
       let isSysTable = op.scKeyEncoding == tkeSystemTable
 
       if ctx.client != nil:
@@ -1360,14 +1371,18 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
       if op.obOptimization == oboPkAscMatch:
         # Data is already sorted by PK ASC - skip sorting
         # Just extract requested columns and apply LIMIT
+        # LIMIT 0 short-circuit: return empty result immediately, before any work.
+        if op.hasLimit and op.obLimit == 0:
+          return rowsResult(op.obColumns, @[])
         if lastResult.kind == erkRows:
           var outputRows = lastResult.rows
           # Extract only requested columns if needed
           if op.obColumns.len != lastResult.columns.len:
             outputRows = extractRequestedColumns(outputRows, op.obColumns,
                 op.obAllColumns)
-          # Apply LIMIT
-          if op.obLimit > 0 and outputRows.len > int(op.obLimit):
+          # Apply LIMIT (only when user wrote LIMIT and it is non-zero;
+          # LIMIT 0 was short-circuited above)
+          if op.hasLimit and outputRows.len > int(op.obLimit):
             outputRows = outputRows[0..<int(op.obLimit)]
           rowsResult(op.obColumns, outputRows)
         elif lastResult.kind == erkStreamingRows:
@@ -1375,7 +1390,7 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
           # Stream rows directly with LIMIT pushdown instead of buffering all.
           orderTimer.stamp("order_start")
           var outputRows: seq[seq[string]] = @[]
-          let limitRows = if op.obLimit > 0: int(op.obLimit) else: -1
+          let limitRows = if op.hasLimit: int(op.obLimit) else: -1
           while lastResult.streamIterator.hasNextRow():
             let rowOpt = lastResult.streamIterator.nextRow()
             if rowOpt.isSome:
@@ -1403,6 +1418,9 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
       elif op.obOptimization == oboPkDescMatch:
         # Data is sorted by PK ASC but needs to be reversed to DESC
         # Use temp-file based reversal for memory-limited operation
+        # LIMIT 0 short-circuit: return empty result immediately.
+        if op.hasLimit and op.obLimit == 0:
+          return rowsResult(op.obColumns, @[])
         if lastResult.kind == erkRows:
           if lastResult.rows.len <= 1:
             # No reversal needed for empty or single-row results
@@ -1417,7 +1435,7 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
                 op.obColumns, op.obAllColumns)
             var outputRows = reversedRows
             # Apply LIMIT after reversal
-            if op.obLimit > 0 and outputRows.len > int(op.obLimit):
+            if op.hasLimit and outputRows.len > int(op.obLimit):
               outputRows = outputRows[0..<int(op.obLimit)]
             rowsResult(op.obColumns, outputRows)
         elif lastResult.kind == erkStreamingRows:
@@ -1436,7 +1454,7 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
                 op.obColumns, op.obAllColumns)
             orderTimer.stamp("reverse")
             var outputRows = reversedRows
-            if op.obLimit > 0 and outputRows.len > int(op.obLimit):
+            if op.hasLimit and outputRows.len > int(op.obLimit):
               outputRows = outputRows[0..<int(op.obLimit)]
             debug &"[exec_timer] obOptimization=PK_DESC_MATCH rows={outputRows.len} {orderTimer.formatBreakdown()}"
             rowsResult(op.obColumns, outputRows)
@@ -1448,7 +1466,17 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
         # Instead of buffering all N rows and sorting (O(N log N) time, O(N) memory),
         # we use a bounded max-heap that keeps only the top K rows while streaming.
         # This gives O(N log K) time and O(K) memory.
-        let limitRows = if op.obLimit > 0: int(op.obLimit) else: 10
+        #
+        # limitRows: the heap capacity. We use op.obLimit when set (including
+        # LIMIT 0 → capacity 0), and a sensible default (10) only when the
+        # user wrote no LIMIT clause at all. The previous code defaulted to
+        # 10 for obLimit=0, which incorrectly returned 10 rows for
+        # "ORDER BY name LIMIT 0" instead of 0 rows.
+        let limitRows = if op.hasLimit: int(op.obLimit) else: 10
+        # LIMIT 0 short-circuit: return an empty result set immediately,
+        # before any heap allocation or stream consumption.
+        if op.hasLimit and op.obLimit == 0:
+          return rowsResult(op.obColumns, @[])
 
         # Tier-3b: when obServerTopK is true, each group server already ran
         # the top-K heap and shipped only its K candidates. The client-side
@@ -1516,12 +1544,15 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
 
       else:
         # No optimization - use full sort algorithm
+        # LIMIT 0 short-circuit: return empty result immediately.
+        if op.hasLimit and op.obLimit == 0:
+          return rowsResult(op.obColumns, @[])
         if lastResult.kind == erkRows:
           # In-memory sort for buffered results
           if lastResult.rows.len <= 1:
             # No sorting needed for empty or single-row results
-            # Still apply LIMIT if present
-            if op.obLimit > 0 and lastResult.rows.len > int(op.obLimit):
+            # Still apply LIMIT if present (LIMIT 0 was short-circuited above)
+            if op.hasLimit and lastResult.rows.len > int(op.obLimit):
               rowsResult(op.obColumns, lastResult.rows[0..<int(op.obLimit)])
             else:
               lastResult
@@ -1532,7 +1563,7 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
             var outputRows = extractRequestedColumns(sortedRows, op.obColumns,
                 op.obAllColumns)
             # Apply LIMIT after sorting
-            if op.obLimit > 0 and outputRows.len > int(op.obLimit):
+            if op.hasLimit and outputRows.len > int(op.obLimit):
               outputRows = outputRows[0..<int(op.obLimit)]
             rowsResult(op.obColumns, outputRows)
         elif lastResult.kind == erkStreamingRows:
@@ -1541,17 +1572,17 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
           # in-memory sort after consuming the stream.
           orderTimer.stamp("order_start")
           const EXTERNAL_SORT_THRESHOLD = 10000
-          let hasLimit = op.obLimit > 0
+          let hasUserLimit = op.hasLimit
           let estimatedRows = op.obLimit.int # rough upper bound if LIMIT present
 
           # For small expected results or when no ORDER BY specs, buffer and
           # sort in memory. For large results, use external merge sort.
-          if hasLimit and estimatedRows < EXTERNAL_SORT_THRESHOLD:
+          if hasUserLimit and estimatedRows < EXTERNAL_SORT_THRESHOLD:
             # Small result set expected — buffer and sort in memory
             let bufferedRows = lastResult.streamIterator.consumeAllRows()
             orderTimer.stamp("stream_consume")
             if bufferedRows.len <= 1:
-              if op.obLimit > 0 and bufferedRows.len > int(op.obLimit):
+              if op.hasLimit and bufferedRows.len > int(op.obLimit):
                 rowsResult(op.obColumns, bufferedRows[0..<int(op.obLimit)])
               else:
                 rowsResult(op.obColumns, bufferedRows)
@@ -1561,7 +1592,7 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
               orderTimer.stamp("sort")
               var outputRows = extractRequestedColumns(sortedRows, op.obColumns,
                   op.obAllColumns)
-              if op.obLimit > 0 and outputRows.len > int(op.obLimit):
+              if op.hasLimit and outputRows.len > int(op.obLimit):
                 outputRows = outputRows[0..<int(op.obLimit)]
               debug &"[exec_timer] obOptimization=NONE(inmem) rows={outputRows.len} {orderTimer.formatBreakdown()}"
               rowsResult(op.obColumns, outputRows)
@@ -1570,7 +1601,7 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
             # to avoid OOM on large datasets.
             let sortIter = newStreamingSortIterator(op.obSortSpecs,
                 op.obAllColumns)
-            if op.obLimit > 0:
+            if op.hasLimit:
               sortIter.limit = uint32(op.obLimit)
 
             # Feed streaming rows into the sorter in chunks

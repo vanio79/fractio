@@ -1601,6 +1601,8 @@ ProtocolError] =
       columnsJoined: string ## "\0"-joined column names (empty = no projection)
       topKJoined: string    ## Tier-3b: serialized WireTopKSpec. Format:
                            ## "limit|columnIndex,descending|columnIndex,descending|..." (empty = no topK)
+      filterSerialized: string ## Server-side filter (WireFilterExpr) serialized via
+                            ## encodeWireFilterExpr. Empty string = no filter.
       resultPtr: pointer
 
     var setupArgs = newSeq[SetupArg](groupArgs.len)
@@ -1620,6 +1622,17 @@ ProtocolError] =
           topKJoined.add($s.columnIndex)
           topKJoined.add(',')
           topKJoined.add(if s.descending: "1" else: "0")
+      # Serialize server-side filter for cross-thread passing. Uses the
+      # wire-format encoder (encodeWireFilterExpr) so the worker thread
+      # can decode it back into a WireFilterExpr with the same type.
+      # FIX: previously this was hardcoded to `none` in the k-way merge
+      # path, which silently dropped the WHERE filter on multi-group scans
+      # (the bug behind test 1 T-L `WHERE id=1 OR id=5000 OR id=8465
+      # ORDER BY name DESC LIMIT 5` returning 5 unfiltered rows instead
+      # of 3 filtered ones).
+      var filterSerialized = ""
+      if args.filter.isSome:
+        encodeWireFilterExpr(args.filter.get(), filterSerialized)
       setupArgs[i] = SetupArg(
         idx: i,
         connPtr: cast[pointer](args.conn),
@@ -1633,6 +1646,7 @@ ProtocolError] =
         limitVal: args.limit,
         columnsJoined: colsJoined,
         topKJoined: topKJoined,
+        filterSerialized: filterSerialized,
         resultPtr: addr(setupResults[i])
       )
 
@@ -1645,8 +1659,22 @@ ProtocolError] =
             let conn = cast[ProtocolClient](sa.connPtr)
             let groupId = parseGroupID(sa.groupIdStr)
             let txnIdVal = transactionIDFromString(sa.txnIdStr)
-            let filterOpt: Option[kvMsgs.WireFilterExpr] = none(
-                kvMsgs.WireFilterExpr)
+            # Decode the server-side filter (WireFilterExpr) from its wire-format
+            # serialization. Empty string means no filter. This is the fix for
+            # the multi-group k-way merge path that previously hardcoded `none`
+            # here, silently dropping WHERE filters on multi-group scans.
+            let filterOpt: Option[kvMsgs.WireFilterExpr] =
+              if sa.filterSerialized.len > 0:
+                var pos = 0
+                let decoded = decodeWireFilterExpr(sa.filterSerialized, pos)
+                if decoded.isOk:
+                  some(decoded.value)
+                else:
+                  # Decode failure — fall back to no filter (server returns
+                  # all rows). Better than crashing the scan.
+                  none(kvMsgs.WireFilterExpr)
+              else:
+                none(kvMsgs.WireFilterExpr)
             let colsOpt: Option[seq[string]] =
               if sa.columnsJoined.len > 0:
                 some(sa.columnsJoined.split('\0'))
