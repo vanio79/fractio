@@ -484,9 +484,37 @@ suite "REST API — SQL Endpoints (3-node cluster)":
     check cluster.start()
     check waitForWebReady(cluster)
     sleep(TEST_ELECTION_SETTLE_MS * 2)
-    # Create test database and table
+    # Create test database and space. The /api/sql/databases endpoint returns
+    # spaces (Fractio's UI notion of "databases" — see listSpaceNames in
+    # src/fractio/web/dashboard.nim), so a CREATE DATABASE alone is not
+    # enough to make "testdb" appear in the databases list. We must also
+    # CREATE SPACE testdb so the space list contains it.
     discard httpPostJson(getLeaderUrl(cluster) & "/api/sql",
       %*{"sql": "CREATE DATABASE testdb"})
+    # CREATE SPACE involves creating multiple Raft groups asynchronously.
+    # Retry on transient errors (leader changes during group creation).
+    # A previous attempt may have partially succeeded (space created but
+    # response lost); subsequent attempts return "already exists" which
+    # we treat as success. See the CREATE SPACE test below for the same
+    # retry pattern.
+    var spaceResult: JsonNode
+    for attempt in 0 ..< 5:
+      spaceResult = httpPostJson(getLeaderUrl(cluster) & "/api/sql",
+        %*{"sql": "CREATE SPACE testdb WITH REPLICAS = 3"})
+      if spaceResult["kind"].getStr == "ok":
+        break
+      if spaceResult.hasKey("error") and
+          spaceResult["error"].getStr.contains("already exists"):
+        spaceResult = %*{"kind": "ok"}
+        break
+      echo "  CREATE SPACE testdb attempt ", attempt + 1, " error: ",
+        spaceResult["error"].getStr
+      sleep(TEST_ELECTION_SETTLE_MS)
+    # Wait for the new space's Raft groups to elect a leader before
+    # creating the table (CREATE TABLE auto-resolves the database name
+    # to the space, see planCreateTable in src/fractio/sql/planner.nim).
+    sleep(TEST_REPLICATION_WAIT_MS * 3)
+    # Create table and seed data
     discard httpPostJson(getLeaderUrl(cluster) & "/api/sql",
       %*{"sql": "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT)",
          "database": "testdb"})
@@ -618,10 +646,15 @@ suite "REST API — SQL Endpoints (3-node cluster)":
   # -------------------------------------------------------------------------
 
   test "GET /api/sql/databases returns database list":
+    # The /api/sql/databases endpoint returns the list of SPACES (which
+    # correspond to databases in the UI). See listSpaceNames in
+    # src/fractio/web/dashboard.nim. The setup creates a 'testdb' space
+    # (in addition to the auto-seeded 'default' space) so the list
+    # should contain both.
     let dbs = httpGetJson(cluster.getWebUrl() & "/api/sql/databases")
     check dbs.kind == JArray
-    check dbs.len >= 1
-    # Should contain 'default' and 'testdb'
+    check dbs.len >= 2
+    # Should contain 'default' (auto-seeded) and 'testdb' (created in setup)
     var dbNames: seq[string] = @[]
     for db in dbs:
       check db.kind == JString
