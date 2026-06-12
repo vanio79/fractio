@@ -6,10 +6,15 @@
 # Thread safety: writes are serialised via writeMu. readOneFrame is called
 # synchronously from send() — only one caller at a time in Phase 1/2.
 #
-# I/O Model: NON-BLOCKING sockets with select() polling.
-# All socket operations use non-blocking I/O with select() to poll for
+# I/O Model: NON-BLOCKING sockets with poll() polling.
+# All socket operations use non-blocking I/O with poll() to poll for
 # readiness before recv/send. This prevents blocking the event loop when
 # called from async contexts (like httpbeast handlers).
+#
+# We use poll() rather than select() to avoid the FD_SETSIZE (typically
+# 1024) limit: under sustained HTTP load the web server creates a new
+# socket per request, so file descriptors can easily exceed 1024 and
+# the FD_SET macro inside select() would corrupt memory.
 
 import std/[net, strformat, atomics, locks, options, strutils, nativesockets]
 import posix
@@ -93,59 +98,95 @@ proc setSocketNonBlocking(fd: cint): bool {.raises: [].} =
   rc != -1
 
 # ---------------------------------------------------------------------------
-# Select polling helpers with timeout
+# poll() polling helpers with timeout
+# ---------------------------------------------------------------------------
+#
+# We use posix.poll() rather than posix.select()+FD_SET() because the
+# latter silently writes past the end of the fd_set bitset when the
+# file descriptor is >= FD_SETSIZE (1024 on Linux). The web server
+# creates a new FractioClient (and hence a new TCP socket) per HTTP
+# request, so under sustained load we routinely have fds > 1024 and
+# the FD_SET macro would corrupt memory.
+#
+# poll() has no FD_SETSIZE limit: each fd is described by a
+# heap/stack-allocated struct pollfd, so it scales to any fd value.
+#
+# Behavioural contract preserved from the old select()-based code:
+#   - timeoutMs > 0  -> wait at most timeoutMs milliseconds
+#   - timeoutMs <= 0 -> block indefinitely (mapped to poll() -1)
+#   - EINTR is retried in a tight loop so callers don't have to
+#   - On timeout (poll() returns 0) or error (poll() returns -1) we
+#     return false; on ready (poll() returns 1) we return true iff
+#     the relevant event bit is set in revents. POLLERR and POLLHUP
+#     are always treated as "ready" because they signal a closed or
+#     failing socket that the caller must observe.
 # ---------------------------------------------------------------------------
 
 proc pollForRead(fd: cint, timeoutMs: int): bool {.gcsafe, raises: [].} =
-  ## Poll socket for read readiness using select() with timeout.
-  ## Returns true if data is available, false on timeout or error.
-  if timeoutMs <= 0:
-    # No timeout - wait indefinitely (dangerous, but allow for edge cases)
-    var readSet: TFdSet
-    posix.FD_ZERO(readSet)
-    posix.FD_SET(fd, readSet)
-    let rc = posix.select(fd + 1, addr readSet, nil, nil, nil)
-    return rc > 0
+  ## Poll socket for read readiness using poll() with timeout.
+  ## Returns true if data is available (or POLLERR/POLLHUP), false on
+  ## timeout or error. Safe for any fd value (no FD_SETSIZE limit).
+  let waitMs: cint = if timeoutMs <= 0: -1 else: timeoutMs.cint
+  var pfd: TPollfd
+  pfd.fd = fd
+  pfd.events = cshort(POLLIN or POLLERR or POLLHUP)
+  pfd.revents = 0
 
-  var tv: Timeval
-  tv.tv_sec = Time(timeoutMs div 1000)
-  tv.tv_usec = Suseconds((timeoutMs mod 1000) * 1000)
-
-  var readSet: TFdSet
-  posix.FD_ZERO(readSet)
-  posix.FD_SET(fd, readSet)
-
-  let rc = posix.select(fd + 1, addr readSet, nil, nil, addr tv)
-  return rc > 0 and posix.FD_ISSET(fd, readSet) != 0
+  var attempts = 0
+  const maxAttempts = 16
+  while true:
+    let rc = posix.poll(addr pfd, Tnfds(1), waitMs)
+    if rc > 0:
+      # Ready. revents may include POLLERR/POLLHUP — treat as "woken".
+      return (pfd.revents and cshort(POLLIN or POLLERR or POLLHUP)) != 0
+    if rc == 0:
+      # Timeout.
+      return false
+    # rc < 0 — EINTR is the only retry-worthy error here.
+    let err = errno
+    if err == EINTR:
+      inc attempts
+      if attempts >= maxAttempts: return false
+      continue
+    # Any other error (EFAULT, EINVAL, ENOMEM, …).
+    return false
 
 proc pollForWrite(fd: cint, timeoutMs: int): bool {.gcsafe, raises: [].} =
-  ## Poll socket for write readiness using select() with timeout.
-  ## Returns true if socket is writable, false on timeout or error.
-  if timeoutMs <= 0:
-    var writeSet: TFdSet
-    posix.FD_ZERO(writeSet)
-    posix.FD_SET(fd, writeSet)
-    let rc = posix.select(fd + 1, nil, addr writeSet, nil, nil)
-    return rc > 0
+  ## Poll socket for write readiness using poll() with timeout.
+  ## Returns true if socket is writable (or POLLERR/POLLHUP), false on
+  ## timeout or error. Safe for any fd value (no FD_SETSIZE limit).
+  let waitMs: cint = if timeoutMs <= 0: -1 else: timeoutMs.cint
+  var pfd: TPollfd
+  pfd.fd = fd
+  pfd.events = cshort(POLLOUT or POLLERR or POLLHUP)
+  pfd.revents = 0
 
-  var tv: Timeval
-  tv.tv_sec = Time(timeoutMs div 1000)
-  tv.tv_usec = Suseconds((timeoutMs mod 1000) * 1000)
-
-  var writeSet: TFdSet
-  posix.FD_ZERO(writeSet)
-  posix.FD_SET(fd, writeSet)
-
-  let rc = posix.select(fd + 1, nil, addr writeSet, nil, addr tv)
-  return rc > 0 and posix.FD_ISSET(fd, writeSet) != 0
+  var attempts = 0
+  const maxAttempts = 16
+  while true:
+    let rc = posix.poll(addr pfd, Tnfds(1), waitMs)
+    if rc > 0:
+      # Ready. revents may include POLLERR/POLLHUP — treat as "woken".
+      return (pfd.revents and cshort(POLLOUT or POLLERR or POLLHUP)) != 0
+    if rc == 0:
+      # Timeout.
+      return false
+    # rc < 0 — EINTR is the only retry-worthy error here.
+    let err = errno
+    if err == EINTR:
+      inc attempts
+      if attempts >= maxAttempts: return false
+      continue
+    # Any other error (EFAULT, EINVAL, ENOMEM, …).
+    return false
 
 # ---------------------------------------------------------------------------
-# Non-blocking recv with select polling
+# Non-blocking recv with poll() polling
 # ---------------------------------------------------------------------------
 
 proc recvExactNonBlocking(fd: cint, buf: var string, size: int,
                           timeoutMs: int): int {.gcsafe, raises: [].} =
-  ## Read exactly `size` bytes using non-blocking recv with select polling.
+  ## Read exactly `size` bytes using non-blocking recv with poll() polling.
   ## Returns the number of bytes actually read (< size means timeout/error/closed).
   buf.setLen(size)
   var total = 0
@@ -195,12 +236,12 @@ proc recvNNonBlocking(fd: cint, n: int, timeoutMs: int): string {.gcsafe,
   result.setLen(got)
 
 # ---------------------------------------------------------------------------
-# Non-blocking send with select polling
+# Non-blocking send with poll() polling
 # ---------------------------------------------------------------------------
 
 proc sendNonBlocking(fd: cint, data: string, timeoutMs: int): int {.gcsafe,
     raises: [].} =
-  ## Send data using non-blocking socket with select polling.
+  ## Send data using non-blocking socket with poll() polling.
   ## Returns number of bytes sent (< data.len means timeout/error).
   var total = 0
   var retries = 0
@@ -249,7 +290,7 @@ proc sendNonBlocking(fd: cint, data: string, timeoutMs: int): int {.gcsafe,
 # ---------------------------------------------------------------------------
 
 proc sendRaw(client: ProtocolClient, data: string): PResult {.gcsafe, raises: [].} =
-  ## Send raw data using non-blocking socket with select polling.
+  ## Send raw data using non-blocking socket with poll() polling.
   acquire(client.writeMu)
   try:
     if not client.connected.load():
@@ -275,7 +316,7 @@ proc sendPayload(client: ProtocolClient, payload: string,
 # ---------------------------------------------------------------------------
 
 proc connect*(client: ProtocolClient): PResult {.raises: [].} =
-  ## Connect with timeout using non-blocking socket + select().
+  ## Connect with timeout using non-blocking socket + poll().
   ## Socket remains non-blocking after connect for all subsequent I/O.
   if client.connected.load(): return pOk()
 
@@ -300,7 +341,7 @@ proc connect*(client: ProtocolClient): PResult {.raises: [].} =
         client.socket.close()
         return pErr(newProtocolError(peInternal, "connect failed: " & e.msg))
 
-    # Wait for connection with timeout using select()
+    # Wait for connection with timeout using poll()
     if not pollForWrite(client.fd, client.config.timeoutMs):
       client.socket.close()
       return pErr(newProtocolError(peInternal, "connect timeout"))
@@ -434,7 +475,7 @@ proc disconnect*(client: ProtocolClient, reason: string = "") {.gcsafe,
     try: client.socket.close() except CatchableError: discard
 
 # ---------------------------------------------------------------------------
-# Read one response frame from socket (non-blocking with select)
+# Read one response frame from socket (non-blocking with poll)
 # ---------------------------------------------------------------------------
 
 proc readOneFrame(client: ProtocolClient): Result[Frame,
