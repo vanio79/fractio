@@ -251,6 +251,34 @@ proc planError(msg: string): ref PlanError =
   newException(PlanError, msg)
 
 # ---------------------------------------------------------------------------
+# Expression helpers
+# ---------------------------------------------------------------------------
+
+proc extractLiteralInt(e: Expr): Option[int64] =
+  ## Try to extract a constant integer from an expression AST node.
+  ## Returns:
+  ##   - Some(n)  for a positive integer literal (exLiteral/dtInt/n)
+  ##   - Some(-n) for a unary-minus integer literal (exUnaryOp/uoNeg/exLiteral/dtInt/n)
+  ##   - None     for everything else (parameters, columns, complex expressions)
+  ## The parser produces exUnaryOp(uoNeg, litInt(n)) for inputs like `-1`,
+  ## not exBinOp("0 - 1"), so we only handle that one case. Anything that
+  ## requires runtime evaluation (parameters, columns, computed expressions)
+  ## must be rejected from a LIMIT/OFFSET clause since those values must be
+  ## known at plan time to push the bound into the scan.
+  case e.kind
+  of exLiteral:
+    if e.litValue != nil and e.litValue.kind == dtInt:
+      return some(int64(e.litValue.intValue))
+    return none(int64)
+  of exUnaryOp:
+    if e.unaryOp == uoNeg and e.unaryExpr.kind == exLiteral and
+       e.unaryExpr.litValue != nil and e.unaryExpr.litValue.kind == dtInt:
+      return some(int64(-e.unaryExpr.litValue.intValue))
+    return none(int64)
+  else:
+    return none(int64)
+
+# ---------------------------------------------------------------------------
 # Table descriptor helpers
 # ---------------------------------------------------------------------------
 
@@ -1146,14 +1174,22 @@ proc planSelect(stmt: Stmt, client: FractioClient,
   # clause (even LIMIT 0). This distinguishes "no LIMIT clause" from
   # "LIMIT 0", so the executor returns 0 rows for the latter instead of
   # defaulting to a sentinel value.
+  #
+  # LIMIT must be a non-negative integer literal known at plan time so we
+  # can push the bound into the scan. Anything else (parameters, columns,
+  # computed expressions) is rejected rather than silently coerced to a
+  # default — the same rule applies to OFFSET below.
   var limit: uint32 = 0
   var hasLimit: bool = false
   if stmt.selLimit.isSome:
     hasLimit = true
-    let limExpr = stmt.selLimit.get()
-    if limExpr.kind == exLiteral and limExpr.litValue != nil and
-       limExpr.litValue.kind == dtInt:
-      limit = uint32(limExpr.litValue.intValue)
+    let limValOpt = extractLiteralInt(stmt.selLimit.get())
+    if limValOpt.isNone:
+      raise planError("LIMIT must be a non-negative integer literal")
+    let limVal = limValOpt.get()
+    if limVal < 0:
+      raise planError(&"LIMIT must be non-negative, got {limVal}")
+    limit = uint32(limVal)
 
   # Extract OFFSET value. hasOffset tracks whether the user wrote an
   # OFFSET clause (even OFFSET 0). The executor applies offset AFTER
@@ -1162,17 +1198,23 @@ proc planSelect(stmt: Stmt, client: FractioClient,
   # execution. For PK ASC + LIMIT + OFFSET we also push offset down
   # to the scan (scanLimit = limit + offset) so the server doesn't
   # materialize more rows than we need.
+  #
+  # OFFSET must be a non-negative integer literal known at plan time so we
+  # can push the bound into the scan. A non-literal value (parameter,
+  # column reference, computed expression) is rejected with a planning
+  # error rather than silently coerced to 0 — silent zero would mask
+  # bugs where the user expected paging to actually skip rows.
   var offset: uint32 = 0
   var hasOffset: bool = false
   if stmt.selOffset.isSome:
     hasOffset = true
-    let offExpr = stmt.selOffset.get()
-    if offExpr.kind == exLiteral and offExpr.litValue != nil and
-       offExpr.litValue.kind == dtInt:
-      let v = offExpr.litValue.intValue
-      if v < 0:
-        raise planError(&"OFFSET must be non-negative, got {v}")
-      offset = uint32(v)
+    let offValOpt = extractLiteralInt(stmt.selOffset.get())
+    if offValOpt.isNone:
+      raise planError("OFFSET must be a non-negative integer literal")
+    let offVal = offValOpt.get()
+    if offVal < 0:
+      raise planError(&"OFFSET must be non-negative, got {offVal}")
+    offset = uint32(offVal)
 
   # Detect ORDER BY PK optimization
   # When ORDER BY matches PK ordering, we can skip or simplify sorting.

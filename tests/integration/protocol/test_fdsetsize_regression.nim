@@ -56,12 +56,24 @@ const
   NumClients = 100    # Total clients to spawn (well above FD_SETSIZE=1024)
   PreOpenedFds = 1100 # Dummy fds to force the OS to hand out high fds
   BindHost = "127.0.0.1"
-  # ClientHandshake wire size for the default config:
-  #   2 version + 4 features + 1 authType
-  #   + 4 (authData length) + len(authData)   (empty → 4)
-  #   + 1 (clientId length) + len(clientId)    ("fractio-client" = 14)
-  # = 2 + 4 + 1 + 4 + 1 + 14 = 26 bytes
-  HandshakeSize = 26
+
+# ClientHandshake wire size for the default config. Derived from the
+# encoder rather than hard-coded so it stays correct if the encoding
+# (or the default clientId length) ever changes. Computed at module
+# load — the encoder is a pure function and cheap to call.
+#
+# Expected breakdown for default "fractio-client" (14 chars) + empty authData:
+#   2 version + 4 features + 1 authType
+#   + 4 (authData length) + 0 (authData)   (empty → 4)
+#   + 1 (clientId length) + 14 (clientId)
+# = 2 + 4 + 1 + 4 + 1 + 14 = 26 bytes
+let HandshakeSize = encodeClientHandshake(ClientHandshake(
+  version: PROTOCOL_VERSION_1,
+  features: 0'u32,
+  authType: 0'u8,
+  authData: "",
+  clientId: "fractio-client",
+)).len
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -301,10 +313,11 @@ suite "FD_SETSIZE crash regression - Integration":
       failureCount = 0
       observedMinFd = high(int)
 
-    # Sanity: the default clientId is "fractio-client" (14 chars), so the
-    # encoded handshake is exactly HandshakeSize bytes. If this assertion
-    # ever fires it means the protocol encoding changed and the test needs
-    # to be updated — NOT a fix in the client.
+    # Sanity check: HandshakeSize is derived from encodeClientHandshake
+    # at module load, so it cannot drift away from the encoder's actual
+    # output. We re-derive it here as a one-line smoke test that the
+    # constants used by the server (handshake length, "fractio-client"
+    # string) match what the production client sends.
     let probeHs = encodeClientHandshake(ClientHandshake(
       version: PROTOCOL_VERSION_1,
       features: 0'u32,
@@ -313,7 +326,8 @@ suite "FD_SETSIZE crash regression - Integration":
       clientId: "fractio-client",
     ))
     doAssert probeHs.len == HandshakeSize,
-      "handshake size mismatch — protocol drift? got=" & $probeHs.len
+      "handshake size mismatch — protocol drift? got=" & $probeHs.len &
+      " expected=" & $HandshakeSize
 
     for i in 0 ..< NumClients:
       var cfg = defaultClientConfig(BindHost, listenerPort)

@@ -416,24 +416,67 @@ suite "SQL Planner":
     check plan.ops[0].scHasOffset == true
     check plan.ops[0].scOffset == 0'u32
 
-  test "plan SELECT with non-literal OFFSET is treated as zero":
-    # The SQL parser turns unary-minus literals (e.g. `OFFSET -1`) into a
-    # binary expression `0 - 1` rather than a literal int, so the planner
-    # cannot statically validate the sign. For consistency with how LIMIT
-    # handles the same parser quirk, a non-literal OFFSET silently falls
-    # back to offset=0 (no rows skipped). This test pins that behavior so
-    # a future parser change is forced to update the planner check.
+  test "plan SELECT with non-literal OFFSET is rejected":
+    # OFFSET must be a non-negative integer literal known at plan time
+    # so we can push the bound into the scan. Anything else (parameter,
+    # column reference, computed expression like `(1 - 1)`) is a hard
+    # plan error — silently coercing to 0 would mask bugs where the
+    # user expected paging to actually skip rows.
     let tid = testTableId()
     seedTable(client, "default", "public", "users", tid,
       @[("id", "INT"), ("name", "TEXT")], @["id"])
     let stmt = parseStatement("SELECT * FROM users LIMIT 5 OFFSET (1 - 1)")
+    expect PlanError:
+      discard planStatement(stmt, client)
+
+  test "plan SELECT with non-literal LIMIT is rejected":
+    # LIMIT has the same rule as OFFSET: a non-literal value is a hard
+    # plan error. This used to silently fall back to limit=0 (no LIMIT
+    # applied) which masked real bugs in caller-generated SQL.
+    let tid = testTableId()
+    seedTable(client, "default", "public", "users", tid,
+      @[("id", "INT"), ("name", "TEXT")], @["id"])
+    let stmt = parseStatement("SELECT * FROM users LIMIT (1 + 1)")
+    expect PlanError:
+      discard planStatement(stmt, client)
+
+  test "plan SELECT with negative LIMIT is rejected":
+    # `LIMIT -1` parses as exUnaryOp(uoNeg, litInt(1)), not as a
+    # literal int, so the planner's literal-only check would silently
+    # miss it. extractLiteralInt folds the unary minus and the planner
+    # then rejects the negative value.
+    let tid = testTableId()
+    seedTable(client, "default", "public", "users", tid,
+      @[("id", "INT"), ("name", "TEXT")], @["id"])
+    let stmt = parseStatement("SELECT * FROM users LIMIT -1")
+    expect PlanError:
+      discard planStatement(stmt, client)
+
+  test "plan SELECT with negative OFFSET is rejected":
+    # Same as LIMIT -1, but for OFFSET. The parser produces
+    # exUnaryOp(uoNeg, litInt(1)) for `OFFSET -1`, extractLiteralInt
+    # folds it to -1, and the planner rejects it.
+    let tid = testTableId()
+    seedTable(client, "default", "public", "users", tid,
+      @[("id", "INT"), ("name", "TEXT")], @["id"])
+    let stmt = parseStatement("SELECT * FROM users LIMIT 5 OFFSET -1")
+    expect PlanError:
+      discard planStatement(stmt, client)
+
+  test "plan SELECT accepts OFFSET before LIMIT (reversed keyword order)":
+    # SQL standard allows "OFFSET m LIMIT n" — verify the parser
+    # accepts both orders and the planner extracts both values
+    # correctly regardless of source order.
+    let tid = testTableId()
+    seedTable(client, "default", "public", "users", tid,
+      @[("id", "INT"), ("name", "TEXT")], @["id"])
+    let stmt = parseStatement("SELECT * FROM users OFFSET 7 LIMIT 3")
     let plan = planStatement(stmt, client)
     check plan.ops[0].kind == poScan
-    # The planner cannot fold (1-1) at plan time, so it leaves offset at 0.
+    # (limit+offset) is pushed to the scan as the bound
+    check plan.ops[0].scLimit == 10'u32
     check plan.ops[0].scHasOffset == true
-    check plan.ops[0].scOffset == 0'u32
-    # Scan still has a real limit, so the result is bounded.
-    check plan.ops[0].scLimit == 5'u32
+    check plan.ops[0].scOffset == 7'u32
 
   test "plan SELECT with ORDER BY non-PK + LIMIT + OFFSET (top-K path)":
     # For non-PK ORDER BY, the scan returns ALL rows; the executor

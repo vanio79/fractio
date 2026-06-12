@@ -258,6 +258,46 @@ suite "Parser Edge Cases - LIMIT/OFFSET":
     let s = parseStatement("SELECT * FROM t LIMIT 1000000")
     check s.selLimit.get().litValue.intValue == 1000000
 
+  test "OFFSET before LIMIT (reversed keyword order)":
+    # SQL standard allows "OFFSET m LIMIT n" — the parser should accept
+    # both orders and assign each value to the correct field.
+    let s = parseStatement("SELECT * FROM t OFFSET 7 LIMIT 3")
+    check s.selLimit.isSome
+    check s.selOffset.isSome
+    check s.selLimit.get().litValue.intValue == 3
+    check s.selOffset.get().litValue.intValue == 7
+
+  test "LIMIT then OFFSET (canonical order) still works":
+    # Regression check: the parser change from two sequential `if` blocks
+    # to a single `while` loop must not break the original order.
+    let s = parseStatement("SELECT * FROM t LIMIT 3 OFFSET 7")
+    check s.selLimit.isSome
+    check s.selOffset.isSome
+    check s.selLimit.get().litValue.intValue == 3
+    check s.selOffset.get().litValue.intValue == 7
+
+  test "duplicate LIMIT clause is rejected":
+    # Two LIMIT clauses is a SQL syntax error. The parser must reject
+    # it, not silently let the second one win.
+    expect ParseError:
+      discard parseStatement("SELECT * FROM t LIMIT 3 LIMIT 5")
+
+  test "duplicate OFFSET clause is rejected":
+    # Same as duplicate LIMIT — the parser must reject it, not
+    # silently let the second one win.
+    expect ParseError:
+      discard parseStatement("SELECT * FROM t OFFSET 3 OFFSET 5")
+
+  test "negative LIMIT parses as unary-minus expression":
+    # The parser produces exUnaryOp(uoNeg, litInt(1)) for `-1`, not a
+    # binary `0 - 1` and not a literal. The planner is responsible for
+    # rejecting the negative value; this test just pins the AST shape.
+    let s = parseStatement("SELECT * FROM t LIMIT -1")
+    check s.selLimit.get().kind == exUnaryOp
+    check s.selLimit.get().unaryOp == uoNeg
+    check s.selLimit.get().unaryExpr.kind == exLiteral
+    check s.selLimit.get().unaryExpr.litValue.intValue == 1
+
 suite "Parser Edge Cases - CREATE TABLE":
 
   test "CREATE TABLE with single column":

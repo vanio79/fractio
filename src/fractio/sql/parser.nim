@@ -459,13 +459,21 @@ proc parseSelect(p: var Parser): Stmt =
       orderBy.add(OrderItem(expr: e, desc: desc))
       if not p.match(tkComma): break
 
+  # LIMIT and OFFSET can appear in either order: "LIMIT n OFFSET m" or
+  # "OFFSET m LIMIT n" — both are accepted by the SQL standard. We loop
+  # until neither keyword is next, and reject duplicate clauses with a
+  # parse error rather than silently letting the second one win.
   var limitExpr: Option[Expr]
-  if p.match(tkLimit):
-    limitExpr = some(p.parseExpr)
-
   var offsetExpr: Option[Expr]
-  if p.match(tkOffset):
-    offsetExpr = some(p.parseExpr)
+  while p.peekKind in {tkLimit, tkOffset}:
+    if p.match(tkLimit):
+      if limitExpr.isSome:
+        raise parseError("duplicate LIMIT clause", p.peek)
+      limitExpr = some(p.parseExpr)
+    elif p.match(tkOffset):
+      if offsetExpr.isSome:
+        raise parseError("duplicate OFFSET clause", p.peek)
+      offsetExpr = some(p.parseExpr)
 
   result = Stmt(kind: stmtSelect,
     selDistinct: isDistinct,

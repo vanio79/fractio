@@ -505,6 +505,83 @@ suite "SQL Executor — DML":
     check res.kind == erkRows
     check res.rows.len == 0
 
+  test "SELECT with reversed OFFSET...LIMIT (OFFSET first)":
+    # SQL standard allows "OFFSET m LIMIT n" — verify the executor
+    # produces the same result as the canonical "LIMIT n OFFSET m"
+    # order. Regression check for the parser keyword-order change.
+    for i in 1..10:
+      discard client.exec(
+        "INSERT INTO users (id, name, age) VALUES (" &
+        $i & ", 'u" & $i & "', " & $i & "0)")
+
+    # Same as the canonical-order test above, just written in the
+    # reverse direction. Skip first 5, take the next 5.
+    let res = client.exec(
+        "SELECT id FROM users ORDER BY id ASC OFFSET 5 LIMIT 5")
+    check res.kind == erkRows
+    check res.rows.len == 5
+    check res.rows[0][0] == "6"
+    check res.rows[1][0] == "7"
+    check res.rows[2][0] == "8"
+    check res.rows[3][0] == "9"
+    check res.rows[4][0] == "10"
+
+  test "SELECT with negative LIMIT is a plan error":
+    # LIMIT -1 must be rejected at plan time, not silently coerced to 0
+    # (which would return ALL rows from a 5-row table instead of 0).
+    # The parser folds `-1` to exUnaryOp(uoNeg, litInt(1)); the planner
+    # detects the negative value and raises PlanError, which the SQL
+    # client surfaces as a result with kind == erkError.
+    for i in 1..5:
+      discard client.exec(
+        "INSERT INTO users (id, name, age) VALUES (" &
+        $i & ", 'u" & $i & "', " & $i & "0)")
+
+    let bad = client.exec("SELECT * FROM users LIMIT -1")
+    check bad.kind == erkError
+    check "LIMIT" in bad.error
+    check "non-negative" in bad.error
+
+  test "SELECT with negative OFFSET is a plan error":
+    # OFFSET -1 must be rejected at plan time for the same reason as
+    # LIMIT -1: silently zeroing the offset would mask paging bugs.
+    for i in 1..5:
+      discard client.exec(
+        "INSERT INTO users (id, name, age) VALUES (" &
+        $i & ", 'u" & $i & "', " & $i & "0)")
+
+    let bad = client.exec("SELECT * FROM users LIMIT 3 OFFSET -1")
+    check bad.kind == erkError
+    check "OFFSET" in bad.error
+    check "non-negative" in bad.error
+
+  test "SELECT with non-literal LIMIT is a plan error":
+    # LIMIT (1+1) parses as exBinOp, which extractLiteralInt cannot
+    # fold — planner rejects with "must be a non-negative integer
+    # literal" rather than silently zeroing the limit.
+    for i in 1..5:
+      discard client.exec(
+        "INSERT INTO users (id, name, age) VALUES (" &
+        $i & ", 'u" & $i & "', " & $i & "0)")
+
+    let bad = client.exec("SELECT * FROM users LIMIT (1+1)")
+    check bad.kind == erkError
+    check "LIMIT" in bad.error
+    check "literal" in bad.error
+
+  test "SELECT with non-literal OFFSET is a plan error":
+    # OFFSET (1-1) parses as exBinOp — same rejection path as the
+    # non-literal LIMIT case above.
+    for i in 1..5:
+      discard client.exec(
+        "INSERT INTO users (id, name, age) VALUES (" &
+        $i & ", 'u" & $i & "', " & $i & "0)")
+
+    let bad = client.exec("SELECT * FROM users LIMIT 5 OFFSET (1-1)")
+    check bad.kind == erkError
+    check "OFFSET" in bad.error
+    check "literal" in bad.error
+
   test "SELECT specific columns":
     discard client.exec(
         "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)")
