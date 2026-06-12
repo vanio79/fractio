@@ -355,6 +355,111 @@ suite "SQL Planner":
     let plan = planStatement(stmt, client)
     check plan.ops[0].kind == poScan
     check plan.ops[0].scLimit == 10'u32
+    check plan.ops[0].scHasLimit == true
+    # No OFFSET clause => scHasOffset must be false
+    check plan.ops[0].scHasOffset == false
+    check plan.ops[0].scOffset == 0'u32
+
+  test "plan SELECT with LIMIT and OFFSET (PK ASC pushdown)":
+    # PK ASC + LIMIT + OFFSET pushes (limit+offset) to the scan as the
+    # server-side bound, but the scan does NOT pre-apply the offset
+    # (scHasOffset=false). The downstream poOrderBy op (PK_ASC_MATCH)
+    # receives all (limit+offset) sorted rows and applies offset+limit
+    # post-extract. This avoids the scan's per-row offset-skip
+    # interfering with the global sort order in multi-group k-way merge.
+    let tid = testTableId()
+    seedTable(client, "default", "public", "users", tid,
+      @[("id", "INT"), ("name", "TEXT")], @["id"])
+    let stmt = parseStatement("SELECT * FROM users ORDER BY id ASC LIMIT 5 OFFSET 10")
+    let plan = planStatement(stmt, client)
+    check plan.ops[0].kind == poScan
+    # Scanner is asked for limit+offset rows so it doesn't ship more
+    # than needed, but the offset is NOT encoded in the scan's offset
+    # fields — the scan is a row source, the OrderBy op applies offset.
+    check plan.ops[0].scLimit == 15'u32
+    check plan.ops[0].scAppliesLimit == false
+    check plan.ops[0].scHasOffset == false
+    check plan.ops[0].scOffset == 0'u32
+    # Downstream op (poOrderBy PK_ASC_MATCH) carries the offset and
+    # limit that the executor applies post-extract.
+    var sawOrderBy = false
+    for op in plan.ops:
+      if op.kind == poOrderBy:
+        sawOrderBy = true
+        check op.obOffset == 10'u32
+        check op.hasOffset == true
+        check op.obLimit == 5'u32
+    check sawOrderBy # PK_ASC_MATCH always emits a poOrderBy op
+
+  test "plan SELECT with LIMIT and OFFSET (no ORDER BY)":
+    # No ORDER BY + LIMIT + OFFSET should still push the (limit+offset)
+    # bound to the scan (storage-order skip is well-defined).
+    let tid = testTableId()
+    seedTable(client, "default", "public", "users", tid,
+      @[("id", "INT"), ("name", "TEXT")], @["id"])
+    let stmt = parseStatement("SELECT * FROM users LIMIT 5 OFFSET 7")
+    let plan = planStatement(stmt, client)
+    check plan.ops[0].kind == poScan
+    check plan.ops[0].scLimit == 12'u32
+    check plan.ops[0].scHasOffset == true
+    check plan.ops[0].scOffset == 7'u32
+
+  test "plan SELECT with OFFSET 0 is tracked but value is zero":
+    # OFFSET 0 must be distinguished from "no OFFSET clause" via hasOffset.
+    let tid = testTableId()
+    seedTable(client, "default", "public", "users", tid,
+      @[("id", "INT"), ("name", "TEXT")], @["id"])
+    let stmt = parseStatement("SELECT * FROM users LIMIT 5 OFFSET 0")
+    let plan = planStatement(stmt, client)
+    check plan.ops[0].kind == poScan
+    check plan.ops[0].scLimit == 5'u32
+    check plan.ops[0].scHasOffset == true
+    check plan.ops[0].scOffset == 0'u32
+
+  test "plan SELECT with non-literal OFFSET is treated as zero":
+    # The SQL parser turns unary-minus literals (e.g. `OFFSET -1`) into a
+    # binary expression `0 - 1` rather than a literal int, so the planner
+    # cannot statically validate the sign. For consistency with how LIMIT
+    # handles the same parser quirk, a non-literal OFFSET silently falls
+    # back to offset=0 (no rows skipped). This test pins that behavior so
+    # a future parser change is forced to update the planner check.
+    let tid = testTableId()
+    seedTable(client, "default", "public", "users", tid,
+      @[("id", "INT"), ("name", "TEXT")], @["id"])
+    let stmt = parseStatement("SELECT * FROM users LIMIT 5 OFFSET (1 - 1)")
+    let plan = planStatement(stmt, client)
+    check plan.ops[0].kind == poScan
+    # The planner cannot fold (1-1) at plan time, so it leaves offset at 0.
+    check plan.ops[0].scHasOffset == true
+    check plan.ops[0].scOffset == 0'u32
+    # Scan still has a real limit, so the result is bounded.
+    check plan.ops[0].scLimit == 5'u32
+
+  test "plan SELECT with ORDER BY non-PK + LIMIT + OFFSET (top-K path)":
+    # For non-PK ORDER BY, the scan returns ALL rows; the executor
+    # applies offset+limit post-sort via poOrderBy. The scan should
+    # NOT have scHasOffset set, but poOrderBy should carry the offset.
+    let tid = testTableId()
+    seedTable(client, "default", "public", "users", tid,
+      @[("id", "INT"), ("name", "TEXT"), ("score", "INT")], @["id"])
+    let stmt = parseStatement(
+      "SELECT * FROM users ORDER BY score DESC LIMIT 3 OFFSET 2")
+    let plan = planStatement(stmt, client)
+    check plan.ops[0].kind == poScan
+    # Scan returns all rows; offset is NOT pushed down
+    check plan.ops[0].scHasOffset == false
+    check plan.ops[0].scOffset == 0'u32
+    # Find the OrderBy op and verify the offset is preserved there
+    var orderByOpIdx = -1
+    for i, op in plan.ops:
+      if op.kind == poOrderBy:
+        orderByOpIdx = i
+        break
+    check orderByOpIdx >= 0
+    let ob = plan.ops[orderByOpIdx]
+    check ob.obLimit == 3'u32
+    check ob.hasOffset == true
+    check ob.obOffset == 2'u32
 
   test "plan SELECT specific columns":
     let tid = testTableId()

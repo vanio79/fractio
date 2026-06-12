@@ -431,6 +431,80 @@ suite "SQL Executor — DML":
     check res.kind == erkRows
     check res.rows.len == 2
 
+  test "SELECT with LIMIT and OFFSET (PK ASC)":
+    # Regression for planner OFFSET bug: `LIMIT 5 OFFSET 5` previously
+    # returned rows 1..5 instead of 6..10 because the planner dropped the
+    # offset on the floor (only read selLimit, not selOffset).
+    for i in 1..10:
+      discard client.exec(
+        "INSERT INTO users (id, name, age) VALUES (" &
+        $i & ", 'u" & $i & "', " & $i & "0)")
+
+    # Default order is PK ASC. Skip the first 5, take the next 5.
+    let res = client.exec(
+        "SELECT id FROM users ORDER BY id ASC LIMIT 5 OFFSET 5")
+    check res.kind == erkRows
+    check res.rows.len == 5
+    check res.rows[0][0] == "6"
+    check res.rows[1][0] == "7"
+    check res.rows[2][0] == "8"
+    check res.rows[3][0] == "9"
+    check res.rows[4][0] == "10"
+
+  test "SELECT with LIMIT and OFFSET (no ORDER BY)":
+    # Same fix, but in the no-ORDER-BY path: storage-order skip is
+    # well-defined (it's whatever order the per-group scans return), and
+    # the executor drops the first M rows before applying LIMIT.
+    for i in 1..10:
+      discard client.exec(
+        "INSERT INTO users (id, name, age) VALUES (" &
+        $i & ", 'u" & $i & "', " & $i & "0)")
+
+    let res = client.exec("SELECT id FROM users LIMIT 3 OFFSET 7")
+    check res.kind == erkRows
+    check res.rows.len == 3
+    # Rows 8, 9, 10 — three rows, total table is 10, skip 7.
+    check res.rows[0][0] == "8"
+    check res.rows[1][0] == "9"
+    check res.rows[2][0] == "10"
+
+  test "SELECT with LIMIT 0 wins over OFFSET":
+    # LIMIT 0 always returns empty, regardless of OFFSET (matches the
+    # existing LIMIT-0 behavior: zero rows wins).
+    for i in 1..5:
+      discard client.exec(
+        "INSERT INTO users (id, name, age) VALUES (" &
+        $i & ", 'u" & $i & "', " & $i & "0)")
+
+    let res = client.exec("SELECT * FROM users LIMIT 0 OFFSET 3")
+    check res.kind == erkRows
+    check res.rows.len == 0
+
+  test "SELECT with OFFSET 0 is a no-op":
+    # OFFSET 0 must behave like no OFFSET (returns the first N rows).
+    for i in 1..5:
+      discard client.exec(
+        "INSERT INTO users (id, name, age) VALUES (" &
+        $i & ", 'u" & $i & "', " & $i & "0)")
+
+    let res = client.exec("SELECT id FROM users LIMIT 3 OFFSET 0")
+    check res.kind == erkRows
+    check res.rows.len == 3
+    check res.rows[0][0] == "1"
+    check res.rows[1][0] == "2"
+    check res.rows[2][0] == "3"
+
+  test "SELECT with OFFSET past end returns empty":
+    # OFFSET larger than the result set returns an empty result.
+    for i in 1..5:
+      discard client.exec(
+        "INSERT INTO users (id, name, age) VALUES (" &
+        $i & ", 'u" & $i & "', " & $i & "0)")
+
+    let res = client.exec("SELECT * FROM users LIMIT 5 OFFSET 100")
+    check res.kind == erkRows
+    check res.rows.len == 0
+
   test "SELECT specific columns":
     discard client.exec(
         "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)")
@@ -1137,6 +1211,60 @@ suite "SQL Executor — ORDER BY":
     check res.rows[0][0] == "5"
     check res.rows[1][0] == "4"
     check res.rows[2][0] == "3"
+
+  test "ORDER BY PK DESC with LIMIT and OFFSET":
+    # DESC + LIMIT + OFFSET: skip the top `offset` rows of the sorted
+    # output, then take the next `limit`. For 5 rows, OFFSET 2 LIMIT 2
+    # means we drop 5 and 4, then keep 3 and 2.
+    let res = client.exec(
+        "SELECT id, name FROM users ORDER BY id DESC LIMIT 2 OFFSET 2")
+    check res.kind == erkRows
+    check res.rows.len == 2
+    check res.rows[0][0] == "3"
+    check res.rows[0][1] == "Carol"
+    check res.rows[1][0] == "2"
+    check res.rows[1][1] == "Bob"
+
+  test "ORDER BY PK ASC with LIMIT and OFFSET":
+    # ASC + LIMIT + OFFSET: skip the first `offset` rows, then take the
+    # next `limit`. For 5 rows, OFFSET 2 LIMIT 2 means we drop 1 and 2,
+    # then keep 3 and 4.
+    let res = client.exec(
+        "SELECT id, name FROM users ORDER BY id ASC LIMIT 2 OFFSET 2")
+    check res.kind == erkRows
+    check res.rows.len == 2
+    check res.rows[0][0] == "3"
+    check res.rows[0][1] == "Carol"
+    check res.rows[1][0] == "4"
+    check res.rows[1][1] == "Dave"
+
+  test "ORDER BY non-PK with LIMIT and OFFSET (top-K path)":
+    # Non-PK ORDER BY + LIMIT + OFFSET exercises the top-K heap path
+    # where the scan returns all rows and the executor applies offset
+    # post-sort. Users sorted by score DESC: scores are 85, 92, 78, 88,
+    # 95. DESC sort: Eve(95), Bob(92), Dave(88), Alice(85), Carol(78).
+    # OFFSET 1 LIMIT 2 -> drop Eve, keep Bob and Dave.
+    let res = client.exec(
+        "SELECT name, score FROM users ORDER BY score DESC LIMIT 2 OFFSET 1")
+    check res.kind == erkRows
+    check res.rows.len == 2
+    check res.rows[0][0] == "Bob"
+    check res.rows[0][1] == "92"
+    check res.rows[1][0] == "Dave"
+    check res.rows[1][1] == "88"
+
+  test "EXPLAIN with LIMIT and OFFSET shows offset":
+    # EXPLAIN must surface the offset to the user so they can see what
+    # the planner did (pushdown vs. post-sort application).
+    let res = client.exec(
+        "EXPLAIN SELECT id FROM users ORDER BY id ASC LIMIT 5 OFFSET 10")
+    check res.kind == erkRows
+    var planText = ""
+    for row in res.rows:
+      planText.add(row[0] & "\n")
+    # For PK ASC + LIMIT + OFFSET, the planner pushes the (limit+offset)
+    # bound to the scan. The EXPLAIN output should reflect that.
+    check "offset=10" in planText
 
   test "EXPLAIN ORDER BY PK ASC shows optimization":
     let res = client.exec("EXPLAIN SELECT id FROM users ORDER BY id ASC")

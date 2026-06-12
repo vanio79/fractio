@@ -134,6 +134,15 @@ type
       scColumns*: seq[string]          # columns to return (empty = all)
       scAllColumns*: seq[string]       # all table columns for decoding
       scKeyEncoding*: TableKeyEncoding # key encoding strategy for this table
+      scOffset*: uint32                ## OFFSET to apply during scan (skip first M
+                                       ## rows in storage order). 0 = no offset. Only
+                                       ## set when the planner can push the offset
+                                       ## down safely (PK ASC + LIMIT + OFFSET). The
+                                       ## executor still applies the same offset
+                                       ## post-sort via poOrderBy.obOffset, but when
+                                       ## pushed down, the scan only returns the
+                                       ## (limit+offset) rows it needs.
+      scHasOffset*: bool               ## True if scOffset is meaningful.
       scTopK*: Option[WireTopKSpec]    ## Tier-3b: server-side top-K heap
                                       ## pushdown. When set, each group server runs a bounded top-K heap
                                       ## locally and ships only the K winners over the wire. Used for
@@ -149,6 +158,14 @@ type
                                        ## This distinguishes "no LIMIT clause" (obLimit unused)
                                        ## from "LIMIT 0" (obLimit=0, hasLimit=true) which means
                                        ## "return zero rows".
+      obOffset*: uint32                ## OFFSET to apply AFTER sorting/ordering. Skip
+                                       ## the first obOffset rows of the sorted result,
+                                       ## then apply LIMIT. 0 = no offset. Distinct from
+                                       ## "user wrote OFFSET 0" (hasOffset=true, obOffset=0
+                                       ## means skip nothing — same as no offset clause).
+      hasOffset*: bool                 ## True if the user wrote an OFFSET clause (even
+                                       ## OFFSET 0). Lets the executor distinguish "no
+                                       ## OFFSET clause" from "OFFSET 0".
       obOptimization*: OrderByOptimization ## Optimization type for PK-based sorting
       obServerTopK*: bool              ## Tier-3b: true if the server already ran
                             ## the top-K heap (each group returned ≤K candidates). When true, the
@@ -1138,6 +1155,25 @@ proc planSelect(stmt: Stmt, client: FractioClient,
        limExpr.litValue.kind == dtInt:
       limit = uint32(limExpr.litValue.intValue)
 
+  # Extract OFFSET value. hasOffset tracks whether the user wrote an
+  # OFFSET clause (even OFFSET 0). The executor applies offset AFTER
+  # sorting/ordering, so it works uniformly with all optimizations
+  # (PK ASC, PK DESC, non-PK, etc.) and with streaming or buffered
+  # execution. For PK ASC + LIMIT + OFFSET we also push offset down
+  # to the scan (scanLimit = limit + offset) so the server doesn't
+  # materialize more rows than we need.
+  var offset: uint32 = 0
+  var hasOffset: bool = false
+  if stmt.selOffset.isSome:
+    hasOffset = true
+    let offExpr = stmt.selOffset.get()
+    if offExpr.kind == exLiteral and offExpr.litValue != nil and
+       offExpr.litValue.kind == dtInt:
+      let v = offExpr.litValue.intValue
+      if v < 0:
+        raise planError(&"OFFSET must be non-negative, got {v}")
+      offset = uint32(v)
+
   # Detect ORDER BY PK optimization
   # When ORDER BY matches PK ordering, we can skip or simplify sorting.
   # The k-way merge uses a PK extractor for data table scans to produce
@@ -1214,6 +1250,10 @@ proc planSelect(stmt: Stmt, client: FractioClient,
         obSortSpecs: sortSpecs,
         obColumns: reqCols, # Output columns (original requested)
         obAllColumns: fetchCols, # Columns in the rows (for expression evaluation)
+        obLimit: 0,
+        hasLimit: false,
+        obOffset: offset,
+        hasOffset: hasOffset,
         obOptimization: oboNone,
         obServerTopK: false,
       ))
@@ -1230,9 +1270,18 @@ proc planSelect(stmt: Stmt, client: FractioClient,
   # - No ORDER BY + LIMIT: push LIMIT to scan (scanLimit = limit)
   # - ORDER BY (non-PK) + LIMIT: scan all rows, use top-K heap (scanLimit = 0)
   # - ORDER BY without LIMIT: scan all rows, full sort (scanLimit = 0)
+  #
+  # OFFSET pushdown: for paths where scanAppliesLimit=true (the scan is
+  # the one that bounds output row count), we also push offset down by
+  # setting scanLimit = limit + offset. The executor then drops the first
+  # `offset` rows and takes the next `limit` rows. For paths where the
+  # scan returns all rows (top-K heap, full sort, etc.), the executor
+  # handles both offset and limit uniformly post-sort, so no pushdown.
   var scanLimit: uint32
   var scanReverse: bool = false
   var scanAppliesLimit: bool = false # true if this scan is the one that applies the LIMIT
+  var scanOffset: uint32 = 0 # pushed-down offset (see OFFSET pushdown above)
+  var hasScanOffset: bool = false
   var obOptimization: OrderByOptimization = oboNone
 
   if pkOptimization == oboPkAscMatch:
@@ -1240,8 +1289,23 @@ proc planSelect(stmt: Stmt, client: FractioClient,
     # The k-way merge uses primaryKeyFromDataRowKey to produce globally
     # sorted output across groups, so PK ASC optimization is valid for
     # both single-group and multi-group tables.
-    scanLimit = limit
-    scanAppliesLimit = true
+    #
+    # With OFFSET: there's a downstream poOrderBy that needs to read
+    # up to (limit+offset) rows from the scan to apply offset+limit
+    # post-sort. Push the combined bound (limit+offset) down so the
+    # server doesn't ship more than needed, but mark scAppliesLimit=false
+    # so the executor's streaming iterator doesn't pre-drop the offset
+    # (the iterator's per-row offset-skip is the wrong layer for ORDER
+    # BY — it would skip non-sorted scan rows, and the downstream op
+    # would then re-apply the offset on an already-truncated stream,
+    # producing too few rows). The poOrderBy op applies offset+limit
+    # post-extract, so the scan is purely a row source here.
+    if hasOffset:
+      scanLimit = limit + offset
+      scanAppliesLimit = false
+    else:
+      scanLimit = limit
+      scanAppliesLimit = true
     obOptimization = oboPkAscMatch
   elif pkOptimization == oboPkDescMatch:
     if limit > 0:
@@ -1251,9 +1315,23 @@ proc planSelect(stmt: Stmt, client: FractioClient,
       # reverse mode picks the K largest rows across all groups, giving
       # us the correct global top K by PK DESC. This avoids scanning all
       # N rows and using a top-K heap (was O(N log K) heap operations).
-      scanLimit = limit
+      #
+      # With OFFSET: the per-group server can't know whether the rows it
+      # skips will turn out to be in the global top-K (it only sees its
+      # own group). The k-way merge in reverse mode picks the K largest
+      # across all groups, so we need the server to return (limit+offset)
+      # largest per group, then the merge drops the global (offset)
+      # largest and keeps the next (limit). Same caveat as PK ASC + OFFSET:
+      # set scAppliesLimit=false so the executor's streaming iterator
+      # doesn't pre-drop the offset; the downstream poOrderBy op applies
+      # offset+limit post-extract.
+      if hasOffset:
+        scanLimit = limit + offset
+        scanAppliesLimit = false
+      else:
+        scanLimit = limit
+        scanAppliesLimit = true
       scanReverse = true
-      scanAppliesLimit = true
       # The data arrives already in PK DESC order, so the executor can
       # treat it as if it were PK ASC (the merge already ordered it).
       obOptimization = oboPkAscMatch
@@ -1278,7 +1356,19 @@ proc planSelect(stmt: Stmt, client: FractioClient,
     obOptimization = oboNone
   else:
     # No ORDER BY, apply LIMIT during scan
-    scanLimit = limit
+    #
+    # With OFFSET: scan needs (limit+offset) rows so the executor can
+    # drop the first `offset` and keep the next `limit`. Without
+    # ORDER BY the input order is "wherever the storage layer returns
+    # rows" — pushing the offset down is semantically equivalent to
+    # applying it post-scan as long as the executor applies the same
+    # offset to the post-scan stream.
+    if hasOffset:
+      scanLimit = limit + offset
+      scanOffset = offset
+      hasScanOffset = true
+    else:
+      scanLimit = limit
     scanAppliesLimit = true
 
   plan.add(PlanOp(kind: poScan,
@@ -1289,6 +1379,8 @@ proc planSelect(stmt: Stmt, client: FractioClient,
     # scHasLimit tracks whether the user wrote a LIMIT clause (even LIMIT 0).
       # Used by the executor to distinguish "no LIMIT clause" from "LIMIT 0".
     scHasLimit: hasLimit,
+    scOffset: scanOffset,
+    scHasOffset: hasScanOffset,
     # scAppliesLimit is true ONLY when the scan is the one that applies the
     # LIMIT (i.e., scanLimit is the authoritative limit, not just a placeholder
     # for a downstream op to read). When scanAppliesLimit is true and
@@ -1309,7 +1401,17 @@ proc planSelect(stmt: Stmt, client: FractioClient,
     # top K via k-way merge. We only ship specs whose columnIndex is set
     # (skip sort specs that need expression evaluation — those need a slow
     # path we'll handle later if needed).
-    scTopK: if obOptimization == oboTopK and limit > 0:
+    #
+    # With OFFSET: the server's top-K heap doesn't know about the offset. If
+    # we shipped the spec with `limit: K` (the user's LIMIT N), the server
+    # would emit the top K per group, and the client would then drop the
+    # first `offset` rows and keep only N — but the per-group "top K" might
+    # not include rows that should be in the global [offset, offset+N)
+    # window. To be correct with OFFSET, we need the server to ship the
+    # top (limit+offset) per group, and we should disable the pushdown
+    # here so the client runs the heap. The trade is more bytes over the
+    # wire for OFFSET queries, but correctness wins.
+    scTopK: if obOptimization == oboTopK and limit > 0 and not hasOffset:
       var wireSpecs: seq[WireSortSpec] = @[]
       for spec in (if stmt.selOrderBy.len > 0 and pkOptimization == oboNone:
                      sortSpecs
@@ -1338,6 +1440,8 @@ proc planSelect(stmt: Stmt, client: FractioClient,
         obAllColumns: fetchCols,
         obLimit: limit,
         hasLimit: hasLimit,
+        obOffset: offset,
+        hasOffset: hasOffset,
         obOptimization: oboPkAscMatch,
         obServerTopK: false,
       ))
@@ -1362,6 +1466,8 @@ proc planSelect(stmt: Stmt, client: FractioClient,
           obAllColumns: fetchCols,
           obLimit: limit,
           hasLimit: hasLimit,
+          obOffset: offset,
+          hasOffset: hasOffset,
           obOptimization: oboTopK,
           obServerTopK: hasServerTopK,
         ))
@@ -1373,6 +1479,8 @@ proc planSelect(stmt: Stmt, client: FractioClient,
           obAllColumns: fetchCols,
           obLimit: limit,
           hasLimit: hasLimit,
+          obOffset: offset,
+          hasOffset: hasOffset,
           obOptimization: oboPkDescMatch,
           obServerTopK: false,
         ))
@@ -1395,6 +1503,8 @@ proc planSelect(stmt: Stmt, client: FractioClient,
         obAllColumns: fetchCols,
         obLimit: limit,
         hasLimit: hasLimit,
+        obOffset: offset,
+        hasOffset: hasOffset,
         obOptimization: oboTopK,
         obServerTopK: hasServerTopK,
       ))
@@ -1406,6 +1516,8 @@ proc planSelect(stmt: Stmt, client: FractioClient,
         obAllColumns: fetchCols,
         obLimit: limit,
         hasLimit: hasLimit,
+        obOffset: offset,
+        hasOffset: hasOffset,
         obOptimization: oboNone,
         obServerTopK: false,
       ))
@@ -1553,6 +1665,11 @@ proc formatPlanOp*(op: PlanOp): string =
       s &= &" filter=({formatExpr(op.scFilter.get())})"
     if op.scLimit > 0:
       s &= &" limit={op.scLimit}"
+    # Only show offset when the user wrote one. scHasOffset distinguishes
+    # "no OFFSET clause" from "OFFSET 0" (both have scOffset=0 but only the
+    # latter is meaningful to the user).
+    if op.scHasOffset and op.scOffset > 0:
+      s &= &" offset={op.scOffset}"
     if op.scReverse:
       s &= " reverse=true"
     s
@@ -1570,6 +1687,11 @@ proc formatPlanOp*(op: PlanOp): string =
     s &= &" cols={op.obColumns}"
     if op.obLimit > 0:
       s &= &" limit={op.obLimit}"
+    # Only show offset when the user wrote one. hasOffset distinguishes
+    # "no OFFSET clause" from "OFFSET 0" — the latter is meaningful
+    # to the user but its visible effect is identical to no offset.
+    if op.hasOffset and op.obOffset > 0:
+      s &= &" offset={op.obOffset}"
     s
   of poUpdate:
     var s = &"Update table={op.upTableName} (id={op.upTableId})"

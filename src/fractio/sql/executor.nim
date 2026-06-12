@@ -68,8 +68,16 @@ type
     filter*: Option[Expr] ## WHERE clause filter (optional)
     columns*: seq[string] ## Columns to extract
     allColumns*: seq[string] ## All table columns for decoding
-    limit*: uint32 ## LIMIT value (0 = no limit)
+    limit*: uint32 ## LIMIT value (0 = no limit unless hasLimit is set)
+    hasLimit*: bool ## True if the user wrote a LIMIT clause (even LIMIT 0).
+                      ## Distinguishes "no LIMIT" (hasLimit=false, return all
+                      ## remaining rows) from "LIMIT 0" (hasLimit=true, return
+                      ## zero rows). When the planner pushes (limit+offset) to
+                      ## the scan, hasLimit is forwarded to the iterator so it
+                      ## preserves the user's "LIMIT 0 wins" semantic.
+    offset*: uint32 ## OFFSET value (rows to skip from the start, 0 = none)
     rowsReturned*: int ## Count of rows returned (for LIMIT)
+    rowsSkipped*: int ## Count of rows skipped (for OFFSET)
     exhausted*: bool ## True when no more rows available
     pendingRow*: Option[seq[string]] ## Next row ready for consumption
     error*: Option[string] ## Error message if stream failed
@@ -277,7 +285,8 @@ proc decodeSystemTableRecord*(tableId: TableId, rawValue: string, columns: seq[
 proc newStreamingRowIterator*(stream: StreamingScanClient,
     filter: Option[Expr], columns: seq[string], allColumns: seq[string],
     limit: uint32, isSystemTable: bool = false,
-        systemTableId: TableId = zeroTableId()): StreamingRowIterator =
+        systemTableId: TableId = zeroTableId(),
+        offset: uint32 = 0, hasLimit: bool = true): StreamingRowIterator =
   ## Create a new streaming row iterator.
   new(result)
   result.stream = stream
@@ -285,7 +294,10 @@ proc newStreamingRowIterator*(stream: StreamingScanClient,
   result.columns = columns
   result.allColumns = allColumns
   result.limit = limit
+  result.hasLimit = hasLimit
+  result.offset = offset
   result.rowsReturned = 0
+  result.rowsSkipped = 0
   result.exhausted = false
   result.pendingRow = none(seq[string])
   result.error = none(string)
@@ -299,8 +311,12 @@ proc fetchNextMatchingRow*(iter: StreamingRowIterator): Option[seq[string]] =
   if iter.exhausted:
     return none(seq[string])
 
-  # Check limit
-  if iter.limit > 0 and iter.rowsReturned >= int(iter.limit):
+  # Check limit. hasLimit distinguishes "no LIMIT clause" (return all
+  # rows) from "LIMIT 0" (return zero rows) — the original sentinel of
+  # `iter.limit == 0 = no limit` cannot preserve the LIMIT-0 semantic
+  # when the planner pushed (limit+offset) to the scan and the user-
+  # visible cap is exactly zero.
+  if iter.hasLimit and iter.rowsReturned >= int(iter.limit):
     iter.exhausted = true
     return none(seq[string])
 
@@ -333,6 +349,15 @@ proc fetchNextMatchingRow*(iter: StreamingRowIterator): Option[seq[string]] =
               filterRow.setColumn(colName, newRowValue(rowVals[i]))
           if not matchesFilterDataRow(iter.filter, filterRow):
             continue # Skip non-matching row
+          # Apply OFFSET: drop the first `offset` matching rows
+          if iter.rowsSkipped < int(iter.offset):
+            inc iter.rowsSkipped
+            continue
+          # Re-check limit after the offset skip (in case we crossed the
+          # threshold by skipping): LIMIT 0 wins, so return none.
+          if iter.hasLimit and iter.rowsReturned >= int(iter.limit):
+            iter.exhausted = true
+            return none(seq[string])
           inc iter.rowsReturned
           return some(rowVals)
       else:
@@ -341,7 +366,17 @@ proc fetchNextMatchingRow*(iter: StreamingRowIterator): Option[seq[string]] =
         # Apply filter if present
         if not matchesFilterDataRow(iter.filter, dataRow):
           continue # Skip non-matching row
-        
+
+        # Apply OFFSET: drop the first `offset` matching rows
+        if iter.rowsSkipped < int(iter.offset):
+          inc iter.rowsSkipped
+          continue
+
+        # Re-check limit after the offset skip
+        if iter.hasLimit and iter.rowsReturned >= int(iter.limit):
+          iter.exhausted = true
+          return none(seq[string])
+
         # Extract requested columns
         let extracted = extractColumnsFromDataRow(dataRow, iter.columns)
         inc iter.rowsReturned
@@ -359,8 +394,8 @@ proc hasNextRow*(iter: StreamingRowIterator): bool =
   if iter.exhausted:
     return false
 
-  # Check limit
-  if iter.limit > 0 and iter.rowsReturned >= int(iter.limit):
+  # Check limit. See `fetchNextMatchingRow` for the hasLimit rationale.
+  if iter.hasLimit and iter.rowsReturned >= int(iter.limit):
     iter.exhausted = true
     return false
 
@@ -422,6 +457,31 @@ proc consumeAllRows*(iter: StreamingRowIterator): seq[seq[string]] =
       rows.add(rowOpt.get())
   iter.closeIterator()
   rows
+
+proc applyOffsetAndLimit*(rows: seq[seq[string]],
+                          hasOffset: bool, offset: uint32,
+                          hasLimit: bool, limit: uint32): seq[seq[string]] =
+  ## Apply SQL OFFSET and LIMIT to an in-memory list of rows.
+  ##
+  ## Semantics: drop the first `offset` rows, then return at most `limit`
+  ## rows. Both `hasOffset`/`offset` and `hasLimit`/`limit` follow the
+  ## "user wrote a clause" convention used elsewhere in the executor:
+  ##   - hasOffset=false  -> no OFFSET clause, skip nothing
+  ##   - hasOffset=true   -> user wrote OFFSET (even 0), apply it
+  ##   - hasLimit=false   -> no LIMIT clause, return all remaining rows
+  ##   - hasLimit=true    -> user wrote LIMIT (even 0), apply it
+  ## LIMIT 0 always returns an empty list, regardless of offset.
+  if hasLimit and limit == 0:
+    return @[]
+  if hasOffset and offset > 0 and rows.len > 0:
+    let skip = min(int(offset), rows.len)
+    let result = rows[skip .. ^1]
+    if hasLimit and uint32(result.len) > limit:
+      return result[0 ..< int(limit)]
+    return result
+  if hasLimit and uint32(rows.len) > limit:
+    return rows[0 ..< int(limit)]
+  return rows
 
 proc extractRequestedColumns*(rows: seq[seq[string]],
                               requestedCols: seq[string],
@@ -1302,7 +1362,7 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
         if streamRes.isErr:
           return errorResult(&"failed to start streaming scan: {streamRes.error.msg}")
 
-        # Create streaming row iterator that handles filtering and LIMIT
+        # Create streaming row iterator that handles filtering, LIMIT and OFFSET
         # Pass original Expr filter for complex client-side conditions
         # For system tables, use special decoder
         #
@@ -1311,21 +1371,65 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
         # iterator MUST NOT re-apply the filter — the rows it receives have
         # already been filtered, and the projected DataRow may not even
         # contain the columns the filter would need to read.
+        #
+        # LIMIT/OFFSET wiring:
+        # - The scan's `scLimit` is the bound the server was told to ship.
+        #   For the no-ORDER-BY + LIMIT + OFFSET path, the planner pushes
+        #   `limit + offset` down so the server only ships the rows the
+        #   user could possibly want.
+        # - The scan's `scAppliesLimit` distinguishes "the scan is
+        #   responsible for applying the limit" (e.g. PK ASC + LIMIT, no
+        #   ORDER BY + LIMIT) from "the scan just returns rows and a
+        #   downstream op (poOrderBy top-K heap, external sort) applies
+        #   the limit". For the latter, the iterator must NOT enforce a
+        #   limit — that would short-circuit the stream before the heap
+        #   sees enough candidates.
+        # - The iterator's `hasLimit` is true ONLY when both the user
+        #   wrote a LIMIT clause (`scHasLimit`) AND the scan owns the
+        #   limit (`scAppliesLimit`). For "no LIMIT clause" or "downstream
+        #   op applies limit", the iterator streams all rows.
+        # - The iterator's `limit` is the post-offset user-visible cap
+        #   when the scan owns the limit. Otherwise 0 (no cap).
+        # - The iterator's `offset` is the user-written OFFSET, which the
+        #   iterator enforces by skipping the first `offset` matching rows.
         let clientFilter: Option[Expr] =
           if op.scTopK.isSome: none(Expr) else: op.scFilter
+        # The iterator's `limit` is the post-offset user-visible cap when
+        # the planner pushed (limit+offset) to the scan. When scAppliesLimit
+        # is false (top-K / sort), the iterator gets `limit=0, hasLimit=false`
+        # so it streams all rows (the downstream op applies the limit).
+        let iterLimit: uint32 =
+          if op.scAppliesLimit and op.scHasLimit and op.scHasOffset and
+             op.scOffset <= op.scLimit:
+            op.scLimit - op.scOffset
+          elif op.scAppliesLimit and op.scHasLimit:
+            op.scLimit
+          else:
+            0'u32
+        let iterOffset: uint32 =
+          if op.scAppliesLimit and op.scHasOffset: op.scOffset else: 0'u32
+        let iterHasLimit: bool = op.scAppliesLimit and op.scHasLimit
         let rowIter = newStreamingRowIterator(
           streamRes.value,
           clientFilter,
           op.scColumns,
           op.scAllColumns,
-          op.scLimit,
-          isSysTable,  # iter.isSystemTable
-          op.scTableId # iter.systemTableId
+          iterLimit,
+          isSysTable,   # iter.isSystemTable
+          op.scTableId, # iter.systemTableId
+          iterOffset,
+          iterHasLimit
         )
 
         streamingRowsResult(op.scColumns, rowIter, scanTimer)
       else:
-        # Fallback to buffered scan for mock/testing contexts
+        # Fallback to buffered scan for mock/testing contexts.
+        #
+        # The storage scan returns all matching rows (we pass limit=0 so
+        # the server doesn't truncate), then we apply filter, offset, and
+        # limit in the client. The scLimit=0 here is intentional: the
+        # server has no notion of our offset pushdown, so we always get
+        # the full set and slice client-side in this fallback path.
         let res = execTxnScan(ctx, op.scStartKey, op.scEndKey, 0)
         if res.isErr:
           return errorResult(&"failed to scan: {res.err}")
@@ -1353,6 +1457,28 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
           except ValueError:
             discard # skip malformed rows
 
+        # Apply offset+limit at the scan level. For the no-ORDER-BY +
+        # LIMIT + OFFSET path the scan returns up to `scLimit` rows
+        # (= limit+offset when pushdown is active); we drop the first
+        # `scOffset` rows and keep the next `limit`. This is the
+        # client-side mirror of what the streaming iterator does above
+        # and what `applyOffsetAndLimit` does in the poOrderBy paths.
+        #
+        # Only apply at the scan level when the scan is the op that owns
+        # the limit (scAppliesLimit=true). For the top-K heap and full-
+        # sort paths the scan returns all rows and the downstream
+        # poOrderBy applies offset+limit post-sort.
+        if op.scAppliesLimit and (op.scHasOffset or op.scHasLimit):
+          let bufOffset: uint32 = if op.scHasOffset: op.scOffset else: 0'u32
+          let bufLimit: uint32 =
+            if op.scHasLimit and op.scOffset <= op.scLimit:
+              op.scLimit - op.scOffset
+            else:
+              0'u32
+          resultRows = applyOffsetAndLimit(resultRows,
+            op.scHasOffset, bufOffset,
+            op.scHasLimit, bufLimit)
+
         rowsResult(op.scColumns, resultRows)
 
     of poOrderBy:
@@ -1375,8 +1501,10 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
 
       if op.obOptimization == oboPkAscMatch:
         # Data is already sorted by PK ASC - skip sorting
-        # Just extract requested columns and apply LIMIT
+        # Just extract requested columns and apply LIMIT/OFFSET
         # LIMIT 0 short-circuit: return empty result immediately, before any work.
+        # Note: OFFSET is also short-circuited here — LIMIT 0 with any OFFSET
+        # must still return 0 rows (the user asked for zero rows of output).
         if op.hasLimit and op.obLimit == 0:
           return rowsResult(op.obColumns, @[])
         if lastResult.kind == erkRows:
@@ -1385,22 +1513,33 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
           if op.obColumns.len != lastResult.columns.len:
             outputRows = extractRequestedColumns(outputRows, op.obColumns,
                 op.obAllColumns)
-          # Apply LIMIT (only when user wrote LIMIT and it is non-zero;
-          # LIMIT 0 was short-circuited above)
-          if op.hasLimit and outputRows.len > int(op.obLimit):
-            outputRows = outputRows[0..<int(op.obLimit)]
+          # Apply OFFSET (drop first op.obOffset rows), then LIMIT.
+          # Both clauses are applied in order per SQL semantics:
+          #   "SELECT ... ORDER BY id ASC LIMIT N OFFSET M"
+          # means "skip the first M rows, then return at most N rows".
+          outputRows = applyOffsetAndLimit(outputRows,
+              op.hasOffset, op.obOffset, op.hasLimit, op.obLimit)
           rowsResult(op.obColumns, outputRows)
         elif lastResult.kind == erkStreamingRows:
           # Data is already in PK ASC order from the scan, so no sort needed.
           # Stream rows directly with LIMIT pushdown instead of buffering all.
           orderTimer.stamp("order_start")
           var outputRows: seq[seq[string]] = @[]
-          let limitRows = if op.hasLimit: int(op.obLimit) else: -1
+          # With OFFSET, the stream must produce (limit+offset) rows so the
+          # post-stream slice can drop the first `offset` and keep `limit`.
+          # We compute the streaming target as (limit + offset), then apply
+          # OFFSET+limit at the end.
+          let streamCap = if op.hasOffset and op.hasLimit:
+              int(op.obLimit) + int(op.obOffset)
+            elif op.hasLimit:
+              int(op.obLimit)
+            else:
+              -1
           while lastResult.streamIterator.hasNextRow():
             let rowOpt = lastResult.streamIterator.nextRow()
             if rowOpt.isSome:
               outputRows.add(rowOpt.get())
-              if limitRows > 0 and outputRows.len >= limitRows:
+              if streamCap > 0 and outputRows.len >= streamCap:
                 break
           orderTimer.stamp("stream_consume")
           # CRITICAL: close the iterator to prevent TCP frame bleed.
@@ -1414,6 +1553,9 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
           if op.obColumns.len != lastResult.streamColumns.len:
             outputRows = extractRequestedColumns(outputRows, op.obColumns,
                 op.obAllColumns)
+          # Apply OFFSET (drop first op.obOffset rows), then LIMIT.
+          outputRows = applyOffsetAndLimit(outputRows,
+              op.hasOffset, op.obOffset, op.hasLimit, op.obLimit)
           orderTimer.stamp("column_extract")
           debug &"[exec_timer] obOptimization=PK_ASC_MATCH rows={outputRows.len} {orderTimer.formatBreakdown()}"
           rowsResult(op.obColumns, outputRows)
@@ -1424,6 +1566,8 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
         # Data is sorted by PK ASC but needs to be reversed to DESC
         # Use temp-file based reversal for memory-limited operation
         # LIMIT 0 short-circuit: return empty result immediately.
+        # Same semantics as the oboPkAscMatch case: LIMIT 0 wins, OFFSET
+        # is irrelevant.
         if op.hasLimit and op.obLimit == 0:
           return rowsResult(op.obColumns, @[])
         if lastResult.kind == erkRows:
@@ -1433,15 +1577,17 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
             if op.obColumns.len != lastResult.columns.len:
               outputRows = extractRequestedColumns(outputRows, op.obColumns,
                   op.obAllColumns)
+            outputRows = applyOffsetAndLimit(outputRows,
+                op.hasOffset, op.obOffset, op.hasLimit, op.obLimit)
             rowsResult(op.obColumns, outputRows)
           else:
             # Reverse using temp files
             let reversedRows = reverseRowsWithTempFiles(lastResult.rows,
                 op.obColumns, op.obAllColumns)
             var outputRows = reversedRows
-            # Apply LIMIT after reversal
-            if op.hasLimit and outputRows.len > int(op.obLimit):
-              outputRows = outputRows[0..<int(op.obLimit)]
+            # Apply OFFSET (drop first op.obOffset rows), then LIMIT.
+            outputRows = applyOffsetAndLimit(outputRows,
+                op.hasOffset, op.obOffset, op.hasLimit, op.obLimit)
             rowsResult(op.obColumns, outputRows)
         elif lastResult.kind == erkStreamingRows:
           # Buffer streaming rows, then reverse
@@ -1453,14 +1599,16 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
             if op.obColumns.len != lastResult.streamColumns.len:
               outputRows = extractRequestedColumns(outputRows, op.obColumns,
                   op.obAllColumns)
+            outputRows = applyOffsetAndLimit(outputRows,
+                op.hasOffset, op.obOffset, op.hasLimit, op.obLimit)
             rowsResult(op.obColumns, outputRows)
           else:
             let reversedRows = reverseRowsWithTempFiles(bufferedRows,
                 op.obColumns, op.obAllColumns)
             orderTimer.stamp("reverse")
             var outputRows = reversedRows
-            if op.hasLimit and outputRows.len > int(op.obLimit):
-              outputRows = outputRows[0..<int(op.obLimit)]
+            outputRows = applyOffsetAndLimit(outputRows,
+                op.hasOffset, op.obOffset, op.hasLimit, op.obLimit)
             debug &"[exec_timer] obOptimization=PK_DESC_MATCH rows={outputRows.len} {orderTimer.formatBreakdown()}"
             rowsResult(op.obColumns, outputRows)
         else:
@@ -1477,7 +1625,17 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
         # user wrote no LIMIT clause at all. The previous code defaulted to
         # 10 for obLimit=0, which incorrectly returned 10 rows for
         # "ORDER BY name LIMIT 0" instead of 0 rows.
-        let limitRows = if op.hasLimit: int(op.obLimit) else: 10
+        #
+        # With OFFSET, the heap must keep (limit + offset) winners — we drop
+        # the top `offset` rows at the end. Otherwise the heap would only
+        # retain the (limit) winners and miss rows that would land in the
+        # [offset, offset+limit) range of the sorted output.
+        let limitRows = if op.hasOffset and op.hasLimit:
+            int(op.obLimit) + int(op.obOffset)
+          elif op.hasLimit:
+            int(op.obLimit)
+          else:
+            10
         # LIMIT 0 short-circuit: return an empty result set immediately,
         # before any heap allocation or stream consumption.
         if op.hasLimit and op.obLimit == 0:
@@ -1513,8 +1671,13 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
           if op.obColumns.len != lastResult.streamColumns.len:
             outputRows = extractRequestedColumns(outputRows, op.obColumns,
                 op.obAllColumns)
+          # Apply OFFSET (drop first op.obOffset rows), then LIMIT.
+          # limitRows already includes OFFSET above, so the apply step
+          # only needs to drop the offset prefix and keep the (limit) tail.
+          outputRows = applyOffsetAndLimit(outputRows,
+              op.hasOffset, op.obOffset, op.hasLimit, op.obLimit)
           orderTimer.stamp("column_extract")
-          debug &"[exec_timer] obOptimization=TOP_K_SERVER rows={outputRows.len}/{outputRows.len} {orderTimer.formatBreakdown()}"
+          debug &"[exec_timer] obOptimization=TOP_K_SERVER rows={outputRows.len} {orderTimer.formatBreakdown()}"
           return rowsResult(op.obColumns, outputRows)
 
         # Client-side top-K heap (the original Tier-1+2 path)
@@ -1527,6 +1690,9 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
           let sortedRows = heap.extractSorted()
           var outputRows = extractRequestedColumns(sortedRows, op.obColumns,
               op.obAllColumns)
+          # Apply OFFSET (drop first op.obOffset rows), then LIMIT.
+          outputRows = applyOffsetAndLimit(outputRows,
+              op.hasOffset, op.obOffset, op.hasLimit, op.obLimit)
           rowsResult(op.obColumns, outputRows)
         elif lastResult.kind == erkStreamingRows:
           # Stream rows through the top-K heap
@@ -1541,6 +1707,9 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
           orderTimer.stamp("extract_sorted")
           var outputRows = extractRequestedColumns(sortedRows, op.obColumns,
               op.obAllColumns)
+          # Apply OFFSET (drop first op.obOffset rows), then LIMIT.
+          outputRows = applyOffsetAndLimit(outputRows,
+              op.hasOffset, op.obOffset, op.hasLimit, op.obLimit)
           orderTimer.stamp("column_extract")
           debug &"[exec_timer] obOptimization=TOP_K rows={outputRows.len}/{heap.totalPushed} fast={heap.fastPathHits} slow={heap.slowPathHits} {orderTimer.formatBreakdown()}"
           rowsResult(op.obColumns, outputRows)
@@ -1556,20 +1725,20 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
           # In-memory sort for buffered results
           if lastResult.rows.len <= 1:
             # No sorting needed for empty or single-row results
-            # Still apply LIMIT if present (LIMIT 0 was short-circuited above)
-            if op.hasLimit and lastResult.rows.len > int(op.obLimit):
-              rowsResult(op.obColumns, lastResult.rows[0..<int(op.obLimit)])
-            else:
-              lastResult
+            # Still apply LIMIT/OFFSET (LIMIT 0 was short-circuited above)
+            var outputRows = lastResult.rows
+            outputRows = applyOffsetAndLimit(outputRows,
+                op.hasOffset, op.obOffset, op.hasLimit, op.obLimit)
+            rowsResult(op.obColumns, outputRows)
           else:
             let sortedRows = sortRowsInMemory(lastResult.rows, op.obSortSpecs,
                 op.obAllColumns)
             # Extract only the requested columns after sorting
             var outputRows = extractRequestedColumns(sortedRows, op.obColumns,
                 op.obAllColumns)
-            # Apply LIMIT after sorting
-            if op.hasLimit and outputRows.len > int(op.obLimit):
-              outputRows = outputRows[0..<int(op.obLimit)]
+            # Apply OFFSET (drop first op.obOffset rows), then LIMIT.
+            outputRows = applyOffsetAndLimit(outputRows,
+                op.hasOffset, op.obOffset, op.hasLimit, op.obLimit)
             rowsResult(op.obColumns, outputRows)
         elif lastResult.kind == erkStreamingRows:
           # Stream rows through external merge sort to avoid buffering
@@ -1577,8 +1746,14 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
           # in-memory sort after consuming the stream.
           orderTimer.stamp("order_start")
           const EXTERNAL_SORT_THRESHOLD = 10000
+          # With OFFSET, the sort iterator's limit must include the offset
+          # so the post-sort slice can drop the first `offset` and keep
+          # `limit`. Without OFFSET, behaves as before.
           let hasUserLimit = op.hasLimit
-          let estimatedRows = op.obLimit.int # rough upper bound if LIMIT present
+          let estimatedRows = if op.hasOffset and op.hasLimit:
+              int(op.obLimit) + int(op.obOffset)
+            else:
+              int(op.obLimit)
 
           # For small expected results or when no ORDER BY specs, buffer and
           # sort in memory. For large results, use external merge sort.
@@ -1587,18 +1762,19 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
             let bufferedRows = lastResult.streamIterator.consumeAllRows()
             orderTimer.stamp("stream_consume")
             if bufferedRows.len <= 1:
-              if op.hasLimit and bufferedRows.len > int(op.obLimit):
-                rowsResult(op.obColumns, bufferedRows[0..<int(op.obLimit)])
-              else:
-                rowsResult(op.obColumns, bufferedRows)
+              var outputRows = bufferedRows
+              outputRows = applyOffsetAndLimit(outputRows,
+                  op.hasOffset, op.obOffset, op.hasLimit, op.obLimit)
+              rowsResult(op.obColumns, outputRows)
             else:
               let sortedRows = sortRowsInMemory(bufferedRows, op.obSortSpecs,
                   op.obAllColumns)
               orderTimer.stamp("sort")
               var outputRows = extractRequestedColumns(sortedRows, op.obColumns,
                   op.obAllColumns)
-              if op.hasLimit and outputRows.len > int(op.obLimit):
-                outputRows = outputRows[0..<int(op.obLimit)]
+              # Apply OFFSET (drop first op.obOffset rows), then LIMIT.
+              outputRows = applyOffsetAndLimit(outputRows,
+                  op.hasOffset, op.obOffset, op.hasLimit, op.obLimit)
               debug &"[exec_timer] obOptimization=NONE(inmem) rows={outputRows.len} {orderTimer.formatBreakdown()}"
               rowsResult(op.obColumns, outputRows)
           else:
@@ -1606,8 +1782,14 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
             # to avoid OOM on large datasets.
             let sortIter = newStreamingSortIterator(op.obSortSpecs,
                 op.obAllColumns)
+            # With OFFSET, push (limit + offset) down to the sort iterator
+            # so the post-sort slice has the right number of rows to drop
+            # `offset` and keep `limit`.
             if op.hasLimit:
-              sortIter.limit = uint32(op.obLimit)
+              if op.hasOffset:
+                sortIter.limit = uint32(int(op.obLimit) + int(op.obOffset))
+              else:
+                sortIter.limit = uint32(op.obLimit)
 
             # Feed streaming rows into the sorter in chunks
             const FEED_CHUNK_SIZE = 1000
@@ -1638,7 +1820,9 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
             # not in the output SELECT list)
             var outputRows = extractRequestedColumns(sortedRows, op.obColumns,
                 op.obAllColumns)
-            # LIMIT already applied by StreamingSortIterator if set
+            # Apply OFFSET (drop first op.obOffset rows), then LIMIT.
+            outputRows = applyOffsetAndLimit(outputRows,
+                op.hasOffset, op.obOffset, op.hasLimit, op.obLimit)
             debug &"[exec_timer] obOptimization=NONE(extsort) rows={outputRows.len} {orderTimer.formatBreakdown()}"
             rowsResult(op.obColumns, outputRows)
         else:
