@@ -158,15 +158,16 @@ proc serverThread(state: SharedState) {.thread.} =
   let hsResp = buildHandshakeResponse()
 
   while not state.failServer.load():
-    # Poll the listening socket for incoming connections with 50ms granularity
-    var tv: Timeval
-    tv.tv_sec = posix.Time(0)
-    tv.tv_usec = Suseconds(50_000)
-    let serverFd = cint(serverSock.getFd())
-    var readSet: TFdSet
-    posix.FD_ZERO(readSet)
-    posix.FD_SET(serverFd, readSet)
-    let rc = posix.select(serverFd + 1, addr readSet, nil, nil, addr tv)
+    # Poll the listening socket for incoming connections with 50ms
+    # granularity. We use posix.poll() rather than posix.select() to
+    # match the rest of the codebase — and even though the listening
+    # socket's fd is always low (< 10) so FD_SETSIZE isn't a concern
+    # here, consistency makes the test code easier to reason about.
+    var pfd: TPollfd
+    pfd.fd = cint(serverSock.getFd())
+    pfd.events = cshort(POLLIN or POLLERR or POLLHUP)
+    pfd.revents = 0
+    let rc = posix.poll(addr pfd, Tnfds(1), 50)
     if rc <= 0:
       continue
     try:
