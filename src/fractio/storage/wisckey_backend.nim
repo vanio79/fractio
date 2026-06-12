@@ -539,25 +539,48 @@ proc scan*(backend: WiscKeyBackend, startKey, endKey: string,
   defer: c_leveldb_iter_destroy(iter)
 
   if reverse:
-    # Reverse iteration: seek to endKey, then move backward until we drop
+    # Reverse iteration: start at the largest key strictly less than
+    # endKey (exclusive on the high side, consistent with forward scan
+    # semantics [startKey, endKey)), then move backward until we drop
     # below startKey (exclusive on startKey side) or hit the limit.
+    #
+    # Fix for multi-group bug: previously we used `seek(endKey)` and on
+    # invalid fell back to `seek_to_last()`, which positioned the
+    # iterator at the last key in the ENTIRE database — not the last
+    # key in our requested range. We then iterated backward and stopped
+    # at startKey, but we passed through keys from other groups/tables
+    # (whose groupId sorts > our groupId) and could exceed `limit` on
+    # raw pairs, only some of which belong to our group.
+    #
+    # The fix: in the reverse loop, if the current key is `>= endKey`,
+    # it's out of range (above our exclusive upper bound) — `prev()` and
+    # continue. This correctly skips over keys from other groups/tables
+    # that sort past our endKey, positioning the iterator at the last
+    # key strictly less than endKey. Combined with the existing
+    # `k <= startKey` stop condition, this yields exactly the keys in
+    # the range [startKey, endKey), in descending order.
     if endKey.len > 0:
       c_leveldb_iter_seek(iter, endKey.strPtr, endKey.len.csize_t)
-      # If we landed strictly past endKey, back up one — LevelDB's seek
-      # finds the first key >= target. For descending order, if exact
-      # match, good; if we're past, step back to be at the largest key
-      # <= endKey.
       if c_leveldb_iter_valid(iter) == 0:
+        # No key >= endKey exists; the largest key in the DB is < endKey.
+        # Seek to last to start iterating from the global last key.
         c_leveldb_iter_seek_to_last(iter)
+        # Walk forward to find the first key >= endKey, then prev() to
+        # land on the largest key < endKey. In the common case for our
+        # exclusive upper bound (e.g. "/t/<id>/d/<gid>{"), no key >=
+        # endKey exists, so this is a no-op.
+        # (Loop body handles the `k >= endKey` case via prev() + continue.)
       else:
-        var keylen: csize_t
-        let keyC = c_leveldb_iter_key(iter, addr keylen)
-        if keyC != nil:
-          var k = newString(keylen)
-          if keylen > 0:
-            copyMem(k[0].addr, keyC, keylen)
-          if k > endKey:
-            c_leveldb_iter_prev(iter)
+        # We landed on a key >= endKey. If k == endKey, the caller
+        # treats endKey as exclusive so we must step back. If k >
+        # endKey, we are also past the bound; step back to be at the
+        # largest key <= the one we landed on that is < endKey.
+        # In either case, a single prev() is the correct action: it
+        # moves us to the largest key < the one seek returned. The loop
+        # body will then check k >= endKey (which is now false after
+        # prev() since the new k sorts < the seek result which was >=
+        # endKey, so the new k is < endKey).
+        c_leveldb_iter_prev(iter)
     else:
       c_leveldb_iter_seek_to_last(iter)
 
@@ -568,6 +591,14 @@ proc scan*(backend: WiscKeyBackend, startKey, endKey: string,
       var k = newString(keylen)
       if keylen > 0:
         copyMem(k[0].addr, keyC, keylen)
+
+      # Skip keys above our exclusive upper bound. This handles the
+      # case where seek_to_last() landed on a key from another group/
+      # table that sorts > endKey. Walk backward until we find a key
+      # strictly less than endKey.
+      if endKey.len > 0 and k >= endKey:
+        c_leveldb_iter_prev(iter)
+        continue
 
       # Reverse stop condition: stop when key <= startKey (exclusive)
       if startKey.len > 0 and k <= startKey:
