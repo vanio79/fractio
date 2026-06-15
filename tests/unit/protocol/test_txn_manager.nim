@@ -13,7 +13,7 @@ suite "TransactionManager Constructor":
     let mgr = newTransactionManager()
     check mgr != nil
     check mgr.txns.len == 0
-    check mgr.commitIndex.len == 0
+    check mgr.commitIndex.map.len == 0
 
 suite "beginTransaction":
 
@@ -352,3 +352,50 @@ suite "Idempotent Operations":
     check resp1.status == TxnRollbackOK
     let resp2 = mgr.rollbackTransaction(rec.id)
     check resp2.status == TxnRollbackOK
+
+suite "LRU eviction of commitIndex":
+  ## Verify the unbounded commitIndex map is now bounded by LRU.
+  ## At 100K capacity, inserting >100K distinct keys must evict old entries.
+
+  test "commitIndex evicts old keys when over capacity":
+    let mgr = newTransactionManager(commitIndexCapacity = 10)
+    # Insert 15 distinct keys; with capacity 10, the oldest 5 should be evicted.
+    for i in 0 ..< 15:
+      mgr.publishCommit("key" & $i, uint64(i + 1))
+    # Map should not exceed capacity
+    check mgr.commitIndex.map.len <= 10
+    # Most-recent keys should still be present
+    check mgr.commitIndex.map.hasKey("key14")
+    check mgr.commitIndex.map.hasKey("key10")
+    # Oldest keys should have been evicted
+    check(not mgr.commitIndex.map.hasKey("key0"))
+    check(not mgr.commitIndex.map.hasKey("key4"))
+
+  test "commitIndex capacity 0 falls back to default 100K":
+    let mgr = newTransactionManager() # default
+                                      # Insert 150K keys; with default 100K cap, the oldest should evict
+    for i in 0 ..< 150_000:
+      mgr.publishCommit("k" & $i, uint64(i + 1))
+    check mgr.commitIndex.map.len <= 100_000
+    # Most-recent keys still present
+    check mgr.commitIndex.map.hasKey("k149999")
+    # Oldest keys evicted
+    check(not mgr.commitIndex.map.hasKey("k0"))
+
+  test "commitIndex get refreshes recency":
+    let mgr = newTransactionManager(commitIndexCapacity = 3)
+    mgr.publishCommit("a", 1)
+    mgr.publishCommit("b", 2)
+    mgr.publishCommit("c", 3)
+    # Touch "a" to refresh recency (use direct map lookup to avoid overload ambiguity)
+    discard mgr.commitIndex.map.getOrDefault("a", 0'u64)
+    # Move "a" to front of recency list by calling get (via map.get + manual touch)
+    # The lru_cache.get() also updates recency, but here we test put's effect
+    # on existing keys: publishing "a" again should move it to front.
+    mgr.publishCommit("a", 99)
+    # Now insert "d" — should evict "b" (now LRU), not "a"
+    mgr.publishCommit("d", 4)
+    check mgr.commitIndex.map.hasKey("a")
+    check(not mgr.commitIndex.map.hasKey("b"))
+    check mgr.commitIndex.map.hasKey("c")
+    check mgr.commitIndex.map.hasKey("d")

@@ -800,6 +800,13 @@ type
     vlogCleanThreshold*: int64
     vlogMinCleanThreshold*: int64
     vlogCleanBufferSize*: int64
+    maxFileSize*: int
+      ## LevelDB max SST file size in bytes; 0 = LevelDB default (2 MB).
+      ## Larger files mean fewer L0 SSTs, which reduces L0 compaction backlog.
+    l0CompactionTrigger*: int
+      ## L0 file count threshold for manual c_leveldb_compact_range();
+      ## 0 = disabled. Fork's C API does not expose the standard
+      ## level0_slowdown_writes_trigger knob.
 
 proc newNuRaftCoordinator*(config: CoordinatorConfig): NuRaftCoordinator =
   # The global NuRaft manager causes OOM during 3-replica group creation.
@@ -845,6 +852,8 @@ proc newNuRaftCoordinator*(config: CoordinatorConfig): NuRaftCoordinator =
   let storeCfg = StorageConfig(
     path: config.dataDir, createIfMissing: true, syncWrites: true,
     writeBufferSize: wbs, blockCacheSize: config.blockCacheSize,
+    maxFileSize: config.maxFileSize,
+    l0CompactionTrigger: config.l0CompactionTrigger,
     vlogMaxSize: config.vlogMaxSize,
     vlogCleanThreshold: config.vlogCleanThreshold,
     vlogMinCleanThreshold: config.vlogMinCleanThreshold,

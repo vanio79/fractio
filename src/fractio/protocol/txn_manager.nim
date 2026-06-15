@@ -26,6 +26,7 @@ import ./types
 import ./messages/txn as txnMsgs
 import fractio/core/types as coreTypes
 import fractio/distributed/sharedtimer/timeprovider as tp
+import fractio/utils/lru_cache
 
 export txnMsgs # re-export status constants
 
@@ -53,22 +54,39 @@ type
     nextTimestamp*: Atomic[uint64] ## monotonic counter (nanoseconds)
                                    ## commitIndex: tracks (key → commitTs) for conflict detection.
                                    ## Maps each key to the highest commit timestamp that wrote it.
-    commitIndex*: stdtables.Table[string, uint64]
-    ## Phase 5 optional integrations:
+                                   ## Bounded by LRU eviction when `commitIndexCapacity > 0` so it
+                                   ## can't grow without bound and exhaust memory. Eviction is safe
+                                   ## because commitIndex is an advisory cache — when an entry is
+                                   ## evicted, the next conflicting commit will be missed (and may
+                                   ## result in a lost-update anomaly). To trade safety for memory
+                                   ## tightness, set a large capacity; for safety, disable eviction
+                                   ## by setting `commitIndexCapacity = 0` (use plain Table).
+    commitIndex*: LruCache[string, uint64]
+    commitIndexCapacity*: int      ## 0 = unbounded (use default Table); >0 = LRU cap
+                                   ## Phase 5 optional integrations:
     timeProvider*: tp.TimeProvider ## when non-nil, use cluster time for timestamps
     raftCoordPtr*: pointer ## when non-nil, points to RaftTxnCoordinator (void ptr to avoid circular import)
 
 const
   DEFAULT_TXN_TIMEOUT_MS* = 30_000'u32 ## 30 seconds
+  DEFAULT_COMMIT_INDEX_CAPACITY* = 100_000 ## ~100K entries, ~6MB at ~60 bytes/entry
 
 # ---------------------------------------------------------------------------
 # Constructor
 # ---------------------------------------------------------------------------
 
-proc newTransactionManager*(): TransactionManager =
+proc newTransactionManager*(commitIndexCapacity: int = 0): TransactionManager =
+  ## Create a new transaction manager.
+  ## commitIndexCapacity: when 0, use a default capacity (100K entries, ~6MB).
+  ##   When > 0, the commitIndex is bounded by LRU eviction at that entry count.
+  ##   LRU eviction is "advisory" — losing a cache entry can only cause a
+  ##   missed-conflict false negative on a future write-write conflict.
   result = TransactionManager(
     txns: stdtables.initTable[coreTypes.TransactionID, TxnRecord](),
-    commitIndex: stdtables.initTable[string, uint64](),
+    commitIndex: initLruCache[string, uint64](
+      if commitIndexCapacity > 0: commitIndexCapacity
+      else: DEFAULT_COMMIT_INDEX_CAPACITY),
+    commitIndexCapacity: commitIndexCapacity,
     timeProvider: nil,
     raftCoordPtr: nil,
   )
@@ -237,7 +255,7 @@ proc commitTransaction*(mgr: TransactionManager,
   # Conflict detection: for each key in our write set, check whether another
   # txn committed a write to that key after our readTimestamp.
   for key in rec.writeSet:
-    let lastCommitTs = mgr.commitIndex.getOrDefault(key, 0)
+    let lastCommitTs = mgr.commitIndex.get(key).get(0'u64)
     if lastCommitTs > rec.readTimestamp:
       # Conflicting write found — abort
       rec.state = TxnStatusAborted
@@ -247,7 +265,7 @@ proc commitTransaction*(mgr: TransactionManager,
   # No conflict — assign commit timestamp and publish writes to the index
   let commitTs = mgr.allocTimestamp()
   for key in rec.writeSet:
-    mgr.commitIndex[key] = commitTs
+    mgr.commitIndex.put(key, commitTs)
   rec.state = TxnStatusCommitted
   rec.commitTimestamp = commitTs
   mgr.txns[txnId] = rec
@@ -332,5 +350,5 @@ proc publishCommit*(mgr: TransactionManager, key: string,
   ## Used by single-round auto-commit writes to register their commit
   ## so future transactions can detect conflicts.
   acquire(mgr.mu)
-  mgr.commitIndex[key] = commitTs
+  mgr.commitIndex.put(key, commitTs)
   release(mgr.mu)

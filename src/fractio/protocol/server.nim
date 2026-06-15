@@ -53,6 +53,8 @@ import ../sql/data_row as dataRow
 import ../sql/ast_types as astTypes
 import ../utils/external_merge_sort as extSort
 import ./active_txn_registry
+import ../utils/memory_budget
+import ../utils/lru_cache
 
 # ---------------------------------------------------------------------------
 # Safe logging helper — swallows any logger exception so callers can be raises:[]
@@ -97,12 +99,27 @@ type
     webPort*: int               ## port for the HTTP management dashboard; 0 = disabled
     writeBufferSize*: int       ## LevelDB write buffer in bytes; 0 = default (4 MB)
     blockCacheSize*: int        ## LevelDB block cache in bytes; 0 = LevelDB default (8 MB)
+    maxFileSize*: int           ## LevelDB max SST file size in bytes; 0 = default (2 MB).
+                                ## Larger files mean fewer L0 SSTs, which reduces
+                                ## L0 compaction backlog and RSS. Recommended 16 MB
+                                ## for memory-budgeted deployments.
+    l0CompactionTrigger*: int   ## Number of L0 files that triggers a manual
+                                ## c_leveldb_compact_range() call. 0 = disabled.
+                                ## The fork's LevelDB C API does not expose
+                                ## level0_slowdown_writes_trigger, so we
+                                ## monitor the L0 file count and compact manually.
     vlogMaxSize*: int64         ## Max vlog file size in bytes; 0 = default (1 GB)
     vlogCleanThreshold*: int64  ## Garbage records to trigger vlog GC; 0 = default (100000)
     vlogMinCleanThreshold*: int64 ## Minimum garbage records for manual cleanup; 0 = default (1000)
     vlogCleanBufferSize*: int64 ## Write buffer for vlog GC in bytes; 0 = default (64 MB)
     tempDir*: string            ## Base directory for temporary files (default: dataDir/tmp)
                                 ## Operations use subdirectories: sort/, reverse/, etc.
+    memoryBudgetMB*: int        ## Total RSS budget in MB. 0 = unlimited.
+                                ## When set, the server enforces the budget by:
+                                ##   - capping LevelDB block cache + write buffer
+                                ##   - capping the streaming prefetch buffers
+                                ##   - LRU evicting protocol-layer unbounded maps
+                                ##   - refusing new txns/connections when over budget
 
 proc defaultServerConfig*(): ServerConfig =
   ServerConfig(
@@ -402,9 +419,12 @@ type
     raftCoord*: NuRaftCoordinator ## lifecycle owner; nil until setupRaftNode
     spaceManager*: SpaceManager   ## Space management (CREATE/DROP SPACE)
     activeTxnRegistry*: ActiveTxnRegistry ## Fast liveness tracking for conflict resolution
+    memoryBudget*: MemoryBudget   ## Memory budget enforcement (nil = unlimited)
     # Per-server thread storage
     clientThreadCount*: Atomic[int]
     acceptThreadCount*: Atomic[int]
+    l0CompactionThreadCount*: Atomic[int]
+    perSubsystemLoggerThreadCount*: Atomic[int]
     threadsMu*: Lock
 
 proc serverNowMs*(server: ProtocolServer): int64 {.gcsafe, raises: [].} =
@@ -460,12 +480,14 @@ proc isIdle*(conn: ClientConnection, timeoutSecs: int,
 type
   ClientLoopArgs* = tuple[srv: ProtocolServer, conn: ClientConnection]
   AcceptLoopArgs* = tuple[srv: ProtocolServer, sock: Socket]
+  L0CompactionArgs* = tuple[srv: ProtocolServer, threshold: int]
 
 # Module-level thread storage: keeps Thread objects alive for the process
 # lifetime.  Protected by threadStoreMu. Each thread references its server
 # so we know which threads belong to which server.
 var threadStore {.global.}: seq[ref Thread[ClientLoopArgs]] = @[]
 var acceptThreadStore {.global.}: seq[ref Thread[AcceptLoopArgs]] = @[]
+var l0CompactionThreadStore {.global.}: seq[ref Thread[L0CompactionArgs]] = @[]
 var threadStoreMu {.global.}: Lock
 initLock(threadStoreMu)
 
@@ -488,6 +510,7 @@ proc newProtocolServer*(config: ServerConfig): ProtocolServer =
     authenticator: newAuthenticator(config.authMethod),
     nodeRegistry: reg,
     activeTxnRegistry: newActiveTxnRegistry(),
+    memoryBudget: newMemoryBudget(config.memoryBudgetMB),
     startedAt: getTime().toUnix(), # Set before sharedTimer is available; updated in start()
   )
   initLock(result.clientsMu)
@@ -497,6 +520,8 @@ proc newProtocolServer*(config: ServerConfig): ProtocolServer =
   result.nextClientId.store(1)
   result.clientThreadCount.store(0)
   result.acceptThreadCount.store(0)
+  result.l0CompactionThreadCount.store(0)
+  result.perSubsystemLoggerThreadCount.store(0)
   initLock(result.clientsMu)
   initLock(result.handlersMu)
   initLock(result.threadsMu)
@@ -1105,6 +1130,14 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
       sendError(conn, requestId, ErrProtocol, ErrCatKV, "value too large")
       return
 
+    # Memory budget admission control: refuse puts that would grow the
+    # in-memory state maps (commitIndex, keyVersions) when RSS >= budget.
+    if server.memoryBudget != nil and server.memoryBudget.isOverBudget:
+      server.memoryBudget.recordOverBudgetRefusal
+      sendError(conn, requestId, ErrOverloaded, ErrCatSystem,
+        "memory budget exceeded, retry later")
+      return
+
     # Proactive NOT_LEADER check: determine the group for this key and verify
     # this node is the leader. Return NOT_LEADER immediately if not, avoiding
     # unnecessary MVCC/raft work that would fail anyway.
@@ -1451,7 +1484,7 @@ proc handleBuiltinKV(server: ProtocolServer, conn: ClientConnection,
         for i, p in chunkPairs:
           var ver: uint64 = 1
           withLock server.mvccStore.keyVersionsMu:
-            ver = server.mvccStore.keyVersions.getOrDefault(p.key, 1'u64)
+            ver = server.mvccStore.keyVersions.get(p.key).get(1'u64)
           var outValue = p.value
           if hasProjection:
             try:
@@ -1606,6 +1639,18 @@ proc handleBuiltinTxn(server: ProtocolServer, conn: ClientConnection,
       sendError(conn, requestId, ErrProtocol, ErrCatProtocol, $reqR.error)
       return
     let req = reqR.value
+
+    # Memory budget admission control: refuse new txns when RSS >= budget.
+    # BeginTxn is the cheap first step of a workload, so refusing here keeps
+    # the system from acquiring more in-memory state when already saturated.
+    if server.memoryBudget != nil and server.memoryBudget.isOverBudget:
+      server.memoryBudget.recordOverBudgetRefusal
+      server.logger.logWarn(
+        &"memory budget exceeded (RSS={getCurrentRSSBytes() div 1024 div 1024}MB), " &
+        &"rejecting BeginTxn from {conn.address}")
+      sendError(conn, requestId, ErrOverloaded, ErrCatSystem,
+        "memory budget exceeded, retry later")
+      return
 
     if not server.mvccStore.isNil:
       # Use MVCC store to manage the transaction session
@@ -2519,6 +2564,18 @@ proc acceptLoop(args: AcceptLoopArgs) {.thread.} =
         try: clientSock.close() except CatchableError: discard
         continue
 
+      # Memory budget admission control: refuse new connections when RSS >= budget.
+      # This is a backpressure signal — the client should retry once memory
+      # pressure subsides (e.g. GC completes, requests complete).
+      if server.memoryBudget != nil and server.memoryBudget.isOverBudget:
+        server.memoryBudget.recordOverBudgetRefusal
+        server.logger.logWarn(
+          &"memory budget exceeded (RSS={getCurrentRSSBytes() div 1024 div 1024}MB), " &
+          &"rejecting new connection from {address}")
+        discard server.metrics.connectionsRejected.fetchAdd(1)
+        try: clientSock.close() except CatchableError: discard
+        continue
+
       let id = server.nextClientId.fetchAdd(1)
       let conn = newClientConnection(id, clientSock, address, server)
       server.addClient(conn)
@@ -2534,6 +2591,95 @@ proc acceptLoop(args: AcceptLoopArgs) {.thread.} =
       createThread(tRef[], clientLoopThread, (server, conn))
   finally:
     discard server.acceptThreadCount.fetchSub(1)
+
+# ---------------------------------------------------------------------------
+# L0 Compaction Thread
+# ---------------------------------------------------------------------------
+#
+# The forked LevelDB in this build does not expose level0_slowdown_writes_trigger
+# through its C API. To keep L0 SST count from ballooning (each L0 file
+# contributes ~maxFileSize to RSS, and L0 reads must merge all files, slowing
+# scans), we run a periodic background thread that:
+#
+#   1. Polls every 2 seconds for the L0 file count
+#   2. When L0 file count >= threshold, calls c_leveldb_compact_range() to
+#      force L0 -> L1 compaction (and beyond)
+#   3. Logs each compaction trigger
+#
+# Threshold defaults to 8 (the standard LevelDB default for slowdown) but is
+# user-configurable. Set to 0 to disable the thread.
+
+proc l0CompactionWorker(args: L0CompactionArgs) {.thread, gcsafe.} =
+  let server = args.srv
+  let threshold = args.threshold
+  let store = server.raftCoord.store
+  try:
+    while server.running.load():
+      # Sleep ~2s between checks
+      for _ in 0 ..< 20:
+        if not server.running.load():
+          break
+        sleep(100)
+      if not server.running.load():
+        break
+      if store.isNil:
+        continue
+      # WiscKey store: query L0 file count + maybe compact
+      try:
+        if store.maybeTriggerL0Compaction(threshold):
+          # Re-read after triggering
+          let l0Now = store.getL0FileCount()
+          server.logger.logInfo(
+            &"L0 compaction triggered (threshold={threshold}), L0 files now={l0Now}")
+      except CatchableError as e:
+        server.logger.logError("L0 compaction error: " & e.msg)
+  finally:
+    discard server.l0CompactionThreadCount.fetchSub(1)
+
+# ---------------------------------------------------------------------------
+# Per-subsystem memory logger
+# ---------------------------------------------------------------------------
+#
+# Logs RSS + memtable size + L0 file count + admission control refusals
+# every 10 seconds.  Critical for diagnosing memory growth patterns
+# without having to take /proc/<pid>/smaps snapshots at every step.
+
+type
+  PerSubsystemLoggerArgs* = tuple[srv: ProtocolServer, intervalMs: int]
+
+var perSubsystemLoggerThreadStore {.global.}: seq[ref Thread[
+    PerSubsystemLoggerArgs]] = @[]
+
+proc perSubsystemLoggerWorker(args: PerSubsystemLoggerArgs) {.thread, gcsafe.} =
+  let server = args.srv
+  let intervalMs = args.intervalMs
+  try:
+    while server.running.load():
+      # Sleep in 100ms slices so we can react to shutdown quickly
+      for _ in 0 ..< (intervalMs div 100):
+        if not server.running.load():
+          break
+        sleep(100)
+      if not server.running.load():
+        break
+      # Collect subsystem metrics
+      let rss = getCurrentRSSBytes()
+      let memtable =
+        if not server.raftCoord.isNil and not server.raftCoord.store.isNil:
+          server.raftCoord.store.getMemtableSize()
+        else: 0'i64
+      let l0Count =
+        if not server.raftCoord.isNil and not server.raftCoord.store.isNil:
+          server.raftCoord.store.getL0FileCount()
+        else: 0
+      let refusals =
+        if not server.memoryBudget.isNil:
+          server.memoryBudget.getOverBudgetCount()
+        else: 0'i64
+      server.logger.logInfo(
+        &"[per-subsys] rss={rss div 1024}KB memtable={memtable}B l0={l0Count} refusals={refusals}")
+  finally:
+    discard server.perSubsystemLoggerThreadCount.fetchSub(1)
 
 # ---------------------------------------------------------------------------
 # Cluster membership persistence
@@ -2892,6 +3038,20 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
   let isJoining = not startAsLeader
 
   # NuRaft Coordinator
+  # When a memory budget is configured, derive the storage caps from it.
+  # Otherwise fall back to the user-configured writeBufferSize / blockCacheSize.
+  let (effectiveBlockCache, effectiveWriteBuffer) =
+    if server.memoryBudget != nil and server.memoryBudget.budgetEnabled:
+      (server.memoryBudget.storageCacheBytes,
+       server.memoryBudget.storageWriteBufferBytes)
+    else:
+      (server.config.blockCacheSize, server.config.writeBufferSize)
+  let effectiveVlogBuffer =
+    if server.memoryBudget != nil and server.memoryBudget.budgetEnabled:
+      server.memoryBudget.vlogBufferBytes
+    else:
+      server.config.vlogCleanBufferSize
+
   let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
     nodeId: nodeId,
     port: raftPort,
@@ -2900,12 +3060,14 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
     electionTimeoutLowerMs: 300,
     electionTimeoutUpperMs: 600,
     heartbeatIntervalMs: 100,
-    writeBufferSize: server.config.writeBufferSize,
-    blockCacheSize: server.config.blockCacheSize,
+    writeBufferSize: effectiveWriteBuffer,
+    blockCacheSize: effectiveBlockCache,
+    maxFileSize: server.config.maxFileSize,
+    l0CompactionTrigger: server.config.l0CompactionTrigger,
     vlogMaxSize: server.config.vlogMaxSize,
     vlogCleanThreshold: server.config.vlogCleanThreshold,
     vlogMinCleanThreshold: server.config.vlogMinCleanThreshold,
-    vlogCleanBufferSize: server.config.vlogCleanBufferSize,
+    vlogCleanBufferSize: effectiveVlogBuffer,
   ))
   server.raftCoord = coord
 
@@ -3318,6 +3480,36 @@ proc start*(server: ProtocolServer) {.raises: [].} =
     server.logger.logError("failed to create accept thread: " & e.msg)
     server.running.store(false)
 
+  # Start L0 compaction monitor thread (only if a threshold is set)
+  if server.config.l0CompactionTrigger > 0 and
+     not server.raftCoord.isNil and
+     not server.raftCoord.store.isNil:
+    let l0Ref = new Thread[L0CompactionArgs]
+    withLock(threadStoreMu):
+      l0CompactionThreadStore.add(l0Ref)
+    discard server.l0CompactionThreadCount.fetchAdd(1)
+    try:
+      createThread(l0Ref[], l0CompactionWorker,
+                   (server, server.config.l0CompactionTrigger))
+      server.logger.logInfo(
+        &"L0 compaction monitor started (threshold={server.config.l0CompactionTrigger} files)")
+    except ResourceExhaustedError as e:
+      server.logger.logError("failed to create L0 compaction thread: " & e.msg)
+      discard server.l0CompactionThreadCount.fetchSub(1)
+
+  # Start per-subsystem memory logger thread (logs RSS + memtable + L0 every 10s)
+  if server.perSubsystemLoggerThreadCount.load() == 0:
+    let psRef = new Thread[PerSubsystemLoggerArgs]
+    withLock(threadStoreMu):
+      perSubsystemLoggerThreadStore.add(psRef)
+    discard server.perSubsystemLoggerThreadCount.fetchAdd(1)
+    try:
+      createThread(psRef[], perSubsystemLoggerWorker, (server, 10_000))
+      server.logger.logInfo("per-subsystem memory logger started (interval=10s)")
+    except ResourceExhaustedError as e:
+      server.logger.logError("failed to create per-subsystem logger thread: " & e.msg)
+      discard server.perSubsystemLoggerThreadCount.fetchSub(1)
+
 proc stop*(server: ProtocolServer) {.raises: [].} =
   server.running.store(false)
   server.logger.logInfo("server stopping")
@@ -3355,6 +3547,18 @@ proc stop*(server: ProtocolServer) {.raises: [].} =
       break
     sleep(100)
 
+  # Wait for L0 compaction thread to finish (it exits when running=false)
+  for _ in 0 ..< 50:
+    if server.l0CompactionThreadCount.load() == 0:
+      break
+    sleep(100)
+
+  # Wait for per-subsystem logger thread to finish
+  for _ in 0 ..< 50:
+    if server.perSubsystemLoggerThreadCount.load() == 0:
+      break
+    sleep(100)
+
   if not server.raftStore.isNil:
     try: server.raftStore.stop()
     except Exception as e: server.logger.logError("RaftStore stop failed: " & e.msg)
@@ -3376,3 +3580,5 @@ proc stop*(server: ProtocolServer) {.raises: [].} =
   withLock threadStoreMu:
     threadStore = @[]
     acceptThreadStore = @[]
+    l0CompactionThreadStore = @[]
+    perSubsystemLoggerThreadStore = @[]

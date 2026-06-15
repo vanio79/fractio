@@ -18,6 +18,7 @@ import posix
 import ../core/types
 import ../core/kv_interface # KVStore interface
 import ./routing # Pure routing functions
+import ./connection_pool
 import ../protocol/client
 import ../protocol/types
 import ../protocol/codec
@@ -92,6 +93,11 @@ type
     leaderConnectionNodes*: stdtables.Table[GroupID,
         uint32] # groupId -> nodeId the connection belongs to
 
+    # Connection pool — single source of truth for TCP conn lifecycle.
+    # `nodes[nodeId].client` is deprecated: every new conn goes through
+    # this pool, every release goes through it. See connection_pool.nim.
+    connPool*: ConnectionPool
+
     # Key prefix to group mapping (for routing)
     keyPrefixToGroup*: stdtables.Table[string, GroupID]
 
@@ -157,6 +163,7 @@ proc newFractioClient*(config: FractioClientConfig): FractioClient =
   result = FractioClient(config: config)
   initRWLock(result.lock)
   result.initialized.store(false, moRelaxed)
+  result.connPool = newConnectionPool(maxPerNode = 4, maxTotal = 32)
 
 proc newFractioClient*(host: string, port: int): FractioClient =
   ## Create a new FractioClient with default configuration
@@ -188,28 +195,56 @@ proc connectToNode(client: FractioClient, host: string, port: int): Option[
     return some(protoClient)
   return none(ProtocolClient)
 
+proc poolFactory*(client: FractioClient): ConnectProc {.gcsafe.} =
+  ## Build a `ConnectProc` closure that captures `client` and
+  ## forwards to `client.connectToNode`. The pool calls this when
+  ## it needs to mint a fresh conn.
+  return proc (host: string, port: int): Option[ProtocolClient] {.gcsafe.} =
+    return client.connectToNode(host, port)
+
+proc getOrCreateNodeConn*(client: FractioClient, host: string,
+    port: int): Option[ProtocolClient] =
+  ## Acquire a connection to (host, port) from the pool. The pool
+  ## reuses idle conns when possible and creates new conns via
+  ## `client.connectToNode` when needed. The returned conn is
+  ## "checked out" — the caller MUST eventually call
+  ## `client.releaseNodeConn(conn, host, port)` (or
+  ## `client.releaseNodeConn(conn, host, port, keepAlive=false)` if
+  ## the conn is unfit for reuse).
+  return client.connPool.acquire(host, port, client.poolFactory())
+
+proc releaseNodeConn*(client: FractioClient, conn: ProtocolClient, host: string,
+                     port: int, keepAlive: bool = true) =
+  ## Return a connection to the pool. `keepAlive=false` disconnects
+  ## it immediately (use for conns that hit fatal errors, hit
+  ## NOT_LEADER, or are known to be in a bad state). The default
+  ## `keepAlive=true` parks it for reuse.
+  client.connPool.release(conn, host, port, keepAlive = keepAlive)
+
 proc getNodeConnectionInternal(client: FractioClient, nodeId: uint32): Option[
     ProtocolClient] =
   ## Internal version of getNodeConnection that assumes lock is already held.
   ## Get or create a connection to a specific node.
-  if nodeId in client.nodes:
-    let nodeInfo = client.nodes[nodeId]
-    if nodeInfo.client != nil and nodeInfo.client.connected.load(moRelaxed):
-      return some(nodeInfo.client)
+  ##
+  ## Uses the connection pool: the `nodes[nodeId].client` field is kept
+  ## as a transient "this conn is currently checked out" cache so that
+  ## `getNodeConnection` lookups can find a healthy conn without going
+  ## through the pool. The pool still owns the conn's lifetime; the
+  ## caller MUST release the conn back to the pool when done.
+  if nodeId notin client.nodes:
+    return none(ProtocolClient)
+  let nodeInfo = client.nodes[nodeId]
+  if nodeInfo.client != nil and nodeInfo.client.connected.load(moRelaxed):
+    return some(nodeInfo.client)
 
-    # Create new connection
-    let connOpt = client.connectToNode(nodeInfo.host, int(
-        nodeInfo.clientPort))
-    if connOpt.isSome:
-      # Update the cached connection
-      client.nodes[nodeId] = NodeInfo(
-        nodeId: nodeInfo.nodeId,
-        host: nodeInfo.host,
-        clientPort: nodeInfo.clientPort,
-        status: nodeInfo.status,
-        client: connOpt.get()
-      )
-      return connOpt
+  # Try the pool first — it may have an idle conn to this host/port
+  let poolConnOpt = client.getOrCreateNodeConn(nodeInfo.host,
+      int(nodeInfo.clientPort))
+  if poolConnOpt.isSome:
+    var mutableInfo = nodeInfo
+    mutableInfo.client = poolConnOpt.get()
+    client.nodes[nodeId] = mutableInfo
+    return poolConnOpt
   return none(ProtocolClient)
 
 proc getNodeConnection(client: FractioClient, nodeId: uint32): Option[
@@ -270,6 +305,17 @@ proc fetchNodesTable(client: FractioClient, conn: ProtocolClient,
         if isDeleted: continue
         if payload.len < 10: continue
         let nodeRec = decodeNodeRecord(payload)
+        # If we're overwriting an existing NodeInfo that already has a
+        # checked-out conn, release that conn back to the pool (do NOT
+        # disconnect — it may still be reusable for a moment). This
+        # fixes the worst connection-leak site: every metadata refresh
+        # used to silently drop a healthy conn by overwriting the
+        # NodeInfo entry with `client: nil`.
+        if nodeRec.nodeId in client.nodes:
+          let prev = client.nodes[nodeRec.nodeId]
+          if prev.client != nil and prev.client.connected.load(moRelaxed):
+            client.releaseNodeConn(prev.client, prev.host,
+                                   int(prev.clientPort), keepAlive = true)
         client.nodes[nodeRec.nodeId] = NodeInfo(
           nodeId: nodeRec.nodeId,
           host: nodeRec.host,
@@ -385,14 +431,23 @@ proc initialize*(client: FractioClient): bool =
   if client.initialized.load(moRelaxed):
     return true
 
-  # Connect to initial node
-  let connOpt = client.connectToNode(client.config.initialHost,
+  # Acquire a connection to the initial node from the pool. The pool
+  # will hand it back on release; if initialize fails partway through,
+  # we still release the conn (with keepAlive=true so it's parked for
+  # the next caller) so we don't leak.
+  let connOpt = client.getOrCreateNodeConn(client.config.initialHost,
       client.config.initialPort)
   if connOpt.isNone:
     return false
 
   let conn = connOpt.get()
-  defer: conn.disconnect("initialize")
+  defer:
+    # Release back to the pool. We do NOT use keepAlive=false here
+    # because the conn is presumably healthy — we just finished using
+    # it. Subsequent calls to getOrCreateNodeConn for the same host:port
+    # can reuse it.
+    client.releaseNodeConn(conn, client.config.initialHost,
+                           client.config.initialPort, keepAlive = true)
 
   # Fetch system tables
   let nodesResult = client.fetchNodesTable(conn)
@@ -1509,9 +1564,15 @@ ProtocolError] =
             leaderHost = client.nodes[nodeId].host
             leaderPort = client.nodes[nodeId].clientPort
       if leaderHost.len > 0:
-        let newConn = client.connectToNode(leaderHost, int(leaderPort))
-        if newConn.isSome:
-          conn = newConn.get()
+        # Acquire from the pool instead of opening a fresh conn. The
+        # pool will hand back an idle conn if one exists, or open a
+        # new one. The conn is "owned" by the scan and MUST be
+        # released back to the pool when the scan finishes (success
+        # or error path).
+        let newConnOpt = client.getOrCreateNodeConn(leaderHost,
+            int(leaderPort))
+        if newConnOpt.isSome:
+          conn = newConnOpt.get()
           ownsConn = true
         else:
           # Failed to create a dedicated connection for this group.
@@ -1576,7 +1637,13 @@ ProtocolError] =
       groupStreams.add(streamRes.value)
     else:
       if args.ownsConnection:
-        args.conn.disconnect("scan_failed_single")
+        # Release the dedicated conn back to the pool with keepAlive=false
+        # (we want it closed, not parked — it just failed). We need the
+        # leaderHost/leaderPort to call releaseNodeConn; the simpler fix
+        # is to store them in args at setup time. For now, just disconnect
+        # directly (still inside the pool's accounting via closeConn).
+        try: args.conn.disconnect("scan_failed_single")
+        except: discard
       errors.add($args.groupId & ": " & streamRes.error.msg)
   else:
     # Multiple groups — open streams in parallel using threads.
@@ -1743,7 +1810,8 @@ ProtocolError] =
       else:
         # Stream failed — disconnect owned connections to prevent leaks
         if groupArgs[i].ownsConnection:
-          groupArgs[i].conn.disconnect("scan_failed_parallel")
+          try: groupArgs[i].conn.disconnect("scan_failed_parallel")
+          except: discard
         errors.add(setupArgs[i].groupIdStr & ": " & res.errorMsg)
 
     # If any stream failed in a multi-group scan, return an error instead
@@ -2325,5 +2393,13 @@ proc close*(client: FractioClient) =
     client.leaderConnectionNodes.clear()
     client.txnGroups.clear()
     client.initialized.store(false, moRelaxed)
+
+  # Close the connection pool. This sends disconnect frames to every
+  # idle conn in the pool. The pool is the single source of truth for
+  # conn lifecycle; `nodes` and `leaderConnections` were just advisory
+  # caches that could point to the same conns the pool already owns.
+  # Closing the pool second ensures no further acquires can race with
+  # shutdown (closeAll is atomic under the pool's internal lock).
+  client.connPool.closeAll()
 
   deinitRWLock(client.lock)

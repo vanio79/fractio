@@ -19,6 +19,7 @@ import ./active_txn_registry
 import ./messages/kv
 import ../distributed/sharedtimer/timeprovider as tp
 import ../utils/logging
+import ../utils/lru_cache
 
 # ---------------------------------------------------------------------------
 # Result types
@@ -105,8 +106,14 @@ type
     logger*: Logger
     nextSessionId*: Atomic[uint64]
     # Version tracking for CAS operations
-    keyVersions*: tables.Table[string, uint64]
+    # Bounded by LRU eviction so the map can't grow without bound.
+    # LRU eviction here is "advisory" — losing a version entry means a
+    # future CAS read on that key may see a stale version and the CAS
+    # write will be rejected as a conflict (false-positive, which is the
+    # safe direction: it just means the client must retry).
+    keyVersions*: LruCache[string, uint64]
     keyVersionsMu*: Lock
+    keyVersionsCapacity*: int ## 0 = use default 100K capacity
     # Reverse mapping: TransactionID -> sessionId for wire protocol lookups
     txnToSession*: tables.Table[coreTypes.TransactionID, uint64]
     # Active transaction registry pointer (void ptr to avoid circular import)
@@ -188,15 +195,23 @@ proc decodeVersionKey(encoded: string): tuple[userKey: string,
 # Constructor
 # ---------------------------------------------------------------------------
 
+const DEFAULT_KEY_VERSIONS_CAPACITY* = 100_000 ## ~100K entries, ~6MB at 60 bytes/entry
+
 proc newMvccTransactionStore*(raftStore: RaftKVStoreExt,
     txnManager: TransactionManager,
-    tsProvider: TimestampProvider): MvccTransactionStore =
+    tsProvider: TimestampProvider,
+    keyVersionsCapacity: int = 0): MvccTransactionStore =
+  ## Create a new MVCC transaction store.
+  ## keyVersionsCapacity: 0 = use default 100K-entry LRU. >0 = LRU cap.
   result = MvccTransactionStore(
     raftStore: raftStore,
     txnManager: txnManager,
     tsProvider: tsProvider,
     sessions: initTable[uint64, SessionTxnState](),
-    keyVersions: initTable[string, uint64](),
+    keyVersions: initLruCache[string, uint64](
+      if keyVersionsCapacity > 0: keyVersionsCapacity
+      else: DEFAULT_KEY_VERSIONS_CAPACITY),
+    keyVersionsCapacity: keyVersionsCapacity,
     txnToSession: initTable[coreTypes.TransactionID, uint64](),
     activeTxnRegistryPtr: nil,
     logger: newLogger("protocol.mvcc_store"),
@@ -1182,7 +1197,7 @@ proc snapshotStreamScan*(store: MvccTransactionStore,
   let dedupCount = filteredPairs.len
 
   # No separate sort needed — results are naturally in LevelDB key order.
-  # No separate filter pass needed — filters were applied during dedup.
+  # No separate sort needed — results are naturally in LevelDB key order.
 
   # Apply limit (may already be satisfied from early exit above)
   if hasLimit and filteredPairs.len > limitInt:
@@ -1305,7 +1320,9 @@ proc latestGetWithMeta*(store: MvccTransactionStore,
   # Get version counter
   var version: uint64 = 1
   withLock store.keyVersionsMu:
-    version = store.keyVersions.getOrDefault(key, 1'u64)
+    let v = store.keyVersions.get(key)
+    if v.isSome: version = v.get()
+    if version == 0: version = 1
 
   return mvccOk(some(MvccValueWithMeta(
     value: latestValue,
@@ -1333,7 +1350,7 @@ proc txnGetWithMeta*(store: MvccTransactionStore, sessionId: uint64,
       # Get version for this key
       var ver: uint64 = 1
       withLock store.keyVersionsMu:
-        ver = store.keyVersions.getOrDefault(key, 1'u64)
+        ver = store.keyVersions.get(key).get(1'u64)
       return mvccOk(some(MvccValueWithMeta(
         value: entry.value,
         timestamp: uint64(state.txn.startTimestamp),
@@ -1389,8 +1406,8 @@ proc txnPutWithResult*(store: MvccTransactionStore, sessionId: uint64,
     if needRead:
       newVersion = currentVersion + 1
     else:
-      newVersion = store.keyVersions.getOrDefault(key, 0'u64) + 1
-    store.keyVersions[key] = newVersion
+      newVersion = store.keyVersions.get(key).get(0'u64) + 1
+    store.keyVersions.put(key, newVersion)
 
   let ts = store.getCurrentTimestamp()
   return mvccOk(MvccPutResult(
@@ -1473,8 +1490,8 @@ proc autoPutDirect*(store: MvccTransactionStore, key: string,
   # Increment version counter
   var newVersion: uint64
   withLock store.keyVersionsMu:
-    newVersion = store.keyVersions.getOrDefault(key, 0'u64) + 1
-    store.keyVersions[key] = newVersion
+    newVersion = store.keyVersions.get(key).get(0'u64) + 1
+    store.keyVersions.put(key, newVersion)
 
   return mvccOk(MvccPutResult(
     status: PutStatusOK,
@@ -1535,7 +1552,7 @@ proc autoPutWithResult*(store: MvccTransactionStore, key: string, value: string,
   var newVersion: uint64
   withLock store.keyVersionsMu:
     newVersion = currentVersion + 1
-    store.keyVersions[key] = newVersion
+    store.keyVersions.put(key, newVersion)
 
   let ts = store.getCurrentTimestamp()
   return mvccOk(MvccPutResult(

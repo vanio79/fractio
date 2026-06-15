@@ -34,16 +34,32 @@ type
     raftPort*: int
     clientPort*: int
     dataDir*: string
-    tempDir*: string ## Directory for temporary files (default: dataDir/tmp)
-                     ## Subdirectories are used per operation: sort/, etc.
+    tempDir*: string     ## Directory for temporary files (default: dataDir/tmp)
+                         ## Subdirectories are used per operation: sort/, etc.
     webPort*: int
     writeBufferSizeMB*: int
     blockCacheSizeMB*: int
+    maxFileSizeMB*: int
+      ## LevelDB max SST file size in MB. Larger files = fewer L0 SSTs
+      ## in flight, which reduces L0 compaction backlog. 0 = LevelDB default
+      ## (2 MB). Recommended 16 MB for memory-budgeted deployments.
+    l0CompactionTrigger*: int
+      ## L0 file count that triggers manual c_leveldb_compact_range().
+      ## The fork's LevelDB C API does not expose level0_slowdown_writes_trigger,
+      ## so this is our manual throttling knob. 0 = disabled. 8 = standard default.
     vlogMaxSizeMB*: int
     vlogCleanThreshold*: int
     vlogMinCleanThreshold*: int
     vlogCleanBufferSizeMB*: int
-    ## Daemonization options
+    memoryBudgetMB*: int ## Total RSS budget in MB. 0 = unlimited (default).
+                           ## When set, the server:
+                           ##   - caps LevelDB block cache + write buffer
+                           ##   - caps the streaming prefetch buffers
+                           ##   - enables LRU eviction on protocol-layer
+                           ##     unbounded maps (keyVersions, commitIndex)
+                           ##   - refuses new transactions/connections
+                           ##     when RSS exceeds the budget
+                           ## Daemonization options
     foreground*: bool ## Run in foreground instead of daemonizing (default: false)
     pidFile*: string ## Path to PID file (default: /var/run/fractio/node{id}.pid)
     logFile*: string ## Path to log file for stdout/stderr redirection
@@ -110,6 +126,12 @@ proc loadConfig*(path: string): FractioConfig =
     let bcVal = storage.getOrDefault("block-cache-size-mb")
     result.blockCacheSizeMB = if bcVal.isNil: 8 else: bcVal.getInt().int
 
+    let mfsVal = storage.getOrDefault("max-file-size-mb")
+    result.maxFileSizeMB = if mfsVal.isNil: 0 else: mfsVal.getInt().int
+
+    let l0Val = storage.getOrDefault("l0-compaction-trigger")
+    result.l0CompactionTrigger = if l0Val.isNil: 0 else: l0Val.getInt().int
+
     let vmVal = storage.getOrDefault("vlog-max-size-mb")
     result.vlogMaxSizeMB = if vmVal.isNil: 1024 else: vmVal.getInt().int
 
@@ -121,13 +143,24 @@ proc loadConfig*(path: string): FractioConfig =
 
     let vcbVal = storage.getOrDefault("vlog-clean-buffer-size-mb")
     result.vlogCleanBufferSizeMB = if vcbVal.isNil: 64 else: vcbVal.getInt().int
+
+    let mbVal = storage.getOrDefault("memory-budget-mb")
+    result.memoryBudgetMB = if mbVal.isNil: 0 else: mbVal.getInt().int
   else:
     result.writeBufferSizeMB = 4
     result.blockCacheSizeMB = 8
+    result.maxFileSizeMB = 0
+    result.l0CompactionTrigger = 0
     result.vlogMaxSizeMB = 1024
     result.vlogCleanThreshold = 100_000
     result.vlogMinCleanThreshold = 1000
     result.vlogCleanBufferSizeMB = 64
+    result.memoryBudgetMB = 0
+
+  # Validate memory budget: must be > 0 if set, and >= 64MB to be meaningful
+  if result.memoryBudgetMB != 0 and result.memoryBudgetMB < 64:
+    die("config: memory-budget-mb must be >= 64 (got " &
+        $result.memoryBudgetMB & ")")
 
 # Daemon section (optional)
   let daemon = toml.getOrDefault("daemon")

@@ -1266,6 +1266,26 @@ proc rebalanceLeadershipTask(s: RaftKVStoreExt) {.thread, gcsafe, raises: [].} =
   const maxYieldFailures = 3
   const yieldRevertWindow = 30.0 # seconds - if we become leader again within this time after yield, it's a revert
 
+  # -------------------------------------------------------------------------
+  # CPU-burn fix: loadGroupMembers() does a full scan of sys.groups (and
+  # sys.nodes via populateNodeInfoCache). On a non-META-leader node, the
+  # in-memory caches are updated synchronously by applyBatchToSM when the
+  # Raft log commits, so the full scan is mostly redundant. Calling it
+  # every 2s on every node (one of which may also be CPU-starved) burned
+  # 100% on followers when the table grew.
+  #
+  # Strategy:
+  #  - On the META leader: refresh every 10s (group changes are infrequent
+  #    and the leader is the only writer of sys.groups anyway).
+  #  - On non-META-leader nodes: refresh every 60s as a safety net in case
+  #    a state-machine cache update was missed (e.g., during a rebalance).
+  #  - The leader-persistence channel (above the loop) still propagates
+  #    onLeaderChanged updates immediately, so yielding logic is not
+  #    affected by this rate limit.
+  const loadGroupMembersMinIntervalLeaderNs  = 10_000_000_000'i64  # 10s
+  const loadGroupMembersMinIntervalFollowerNs = 60_000_000_000'i64  # 60s
+  var lastLoadGroupMembersNs: int64 = 0
+
   while s.rebalRunning.load():
     # Poll for leader persistence requests (non-blocking)
     while true:
@@ -1289,10 +1309,24 @@ proc rebalanceLeadershipTask(s: RaftKVStoreExt) {.thread, gcsafe, raises: [].} =
     if not s.rebalRunning.load(): break
 
     if s.coordinator != nil and s.coordinator.running.load():
-      # Refresh group members from storage
-      # Note: We don't call loadSpaces/loadTableSpaces here anymore since
-      # applyBatchToSM updates those caches directly when Raft commits.
-      s.loadGroupMembers(waitForCatchUp = true)
+      # Refresh group members from storage, but rate-limited (see
+      # loadGroupMembersMinInterval* above). On non-leader nodes we use
+      # a much longer interval since applyBatchToSM keeps the caches
+      # in sync on every Raft commit. The leader-persistence channel
+      # continues to drive updates on leader transitions, so this
+      # periodic refresh is only a safety net.
+      let isMetaLeader = s.coordinator.isLeader(META_GROUP_ID)
+      let minIntervalNs = if isMetaLeader:
+                            loadGroupMembersMinIntervalLeaderNs
+                          else:
+                            loadGroupMembersMinIntervalFollowerNs
+      let nowNanos = s.nowNs()
+      if lastLoadGroupMembersNs == 0 or
+         (nowNanos - lastLoadGroupMembersNs) >= minIntervalNs:
+        lastLoadGroupMembersNs = nowNanos
+        # Note: We don't call loadSpaces/loadTableSpaces here anymore since
+        # applyBatchToSM updates those caches directly when Raft commits.
+        s.loadGroupMembers(waitForCatchUp = true)
 
       # Periodic leader sync: compare live NuRaft leaders with sys.groups
       # and update any stale entries. This catches cases where

@@ -1,7 +1,7 @@
 # WiscKey Storage Backend Implementation
 # Implements the StorageBackend interface using WiscKey (LSM-Tree with value log separation)
 
-import std/[options, locks, atomics, typedthreads, deques, os]
+import std/[options, locks, atomics, typedthreads, deques, os, strutils]
 import backend
 
 # WiscKey C bindings - static linking
@@ -105,6 +105,8 @@ proc c_leveldb_options_set_write_buffer_size(options: pointer; size: csize_t) {.
   importc: "leveldb_options_set_write_buffer_size", dynlib: "libleveldb.so".}
 proc c_leveldb_options_set_max_open_files(options: pointer; maxFiles: cint) {.
   importc: "leveldb_options_set_max_open_files", dynlib: "libleveldb.so".}
+proc c_leveldb_options_set_max_file_size(options: pointer; size: csize_t) {.
+  importc: "leveldb_options_set_max_file_size", dynlib: "libleveldb.so".}
 proc c_leveldb_options_set_block_size(options: pointer; size: csize_t) {.
   importc: "leveldb_options_set_block_size", dynlib: "libleveldb.so".}
 proc c_leveldb_options_set_compression(options: pointer; compression: cint) {.
@@ -186,6 +188,13 @@ proc openWiscKey*(backend: WiscKeyBackend, config: StorageConfig): bool =
   c_leveldb_options_set_max_open_files(backend.options, cint(
     config.maxOpenFiles))
   c_leveldb_options_set_block_size(backend.options, csize_t(config.blockSize))
+
+  # Max SST file size — larger files mean fewer L0 SSTs in flight, which
+  # reduces L0 compaction backlog (the dominant RSS consumer under DELETE-heavy
+  # workloads). Default 2 MB → 16 MB reduces L0 file count by ~8x.
+  if config.maxFileSize > 0:
+    c_leveldb_options_set_max_file_size(backend.options, csize_t(
+        config.maxFileSize))
 
   # Block cache
   if backend.blockCache != nil:
@@ -683,6 +692,55 @@ proc getProperty*(backend: WiscKeyBackend, name: string): string =
     return ""
   result = $val
   c_leveldb_free(val)
+
+method getL0FileCount*(backend: WiscKeyBackend): int {.gcsafe.} =
+  ## Return the number of files currently in L0. Returns 0 on error.
+  ## L0 is where freshly-flushed memtable SSTs land; when L0 compaction
+  ## (L0 -> L1) cannot keep up, L0 accumulates and each file costs ~maxFileSize
+  ## of RSS (default 2 MB).
+  let s = getProperty(backend, "leveldb.num-files-at-level0")
+  if s.len == 0:
+    return 0
+  try:
+    return parseInt(s)
+  except ValueError:
+    return 0
+
+method maybeTriggerL0Compaction*(backend: WiscKeyBackend,
+    threshold: int): bool {.gcsafe.} =
+  ## If L0 file count is >= threshold, call c_leveldb_compact_range() with
+  ## nil keys (compacts the entire DB) to force L0 -> L1 compaction.
+  ## Returns true if a compaction was triggered.
+  ##
+  ## The fork's LevelDB C API does not expose level0_slowdown_writes_trigger
+  ## or max_background_compactions, so this is our manual throttling knob.
+  ## Compaction runs on a background thread inside LevelDB and is non-blocking
+  ## from the caller's perspective, but it does consume I/O and CPU for the
+  ## duration.
+  if threshold <= 0:
+    return false
+  let l0Count = backend.getL0FileCount()
+  if l0Count < threshold:
+    return false
+  acquire(backend.mu)
+  defer: release(backend.mu)
+  if not backend.isOpen or backend.db == nil:
+    return false
+  # nil start/limit keys = compact the whole DB (L0 -> L1, L1 -> L2, ...)
+  c_leveldb_compact_range(backend.db, nil, 0, nil, 0)
+  return true
+
+method getMemtableSize*(backend: WiscKeyBackend): int64 {.gcsafe.} =
+  ## Return the current memtable size in bytes. Returns 0 on error.
+  ## This is the size of the in-memory write buffer; when it exceeds
+  ## write_buffer_size, it is flushed to L0 as a new SST.
+  let s = getProperty(backend, "leveldb.mem-table-size")
+  if s.len == 0:
+    return 0'i64
+  try:
+    return parseBiggestInt(s)
+  except ValueError:
+    return 0'i64
 
 method destroy*(backend: WiscKeyBackend): bool =
   # First, close the database to flush any pending writes

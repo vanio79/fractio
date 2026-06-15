@@ -476,3 +476,51 @@ suite "WiscKey Backend - Thread Safety":
     discard backend.put("key", "value") # This acquires lock
     discard backend.get("key") # This acquires lock
     deinitLock(backend.mu)
+
+# =============================================================================
+# Test Suites - L0 Compaction (NEW)
+# =============================================================================
+
+suite "WiscKey Backend - L0 Compaction":
+  test "getL0FileCount returns 0 when backend is closed":
+    var config = defaultStorageConfig("/tmp/test_l0_closed")
+    let backend = newWiscKeyBackend(config)
+    check backend.getL0FileCount() == 0
+    deinitLock(backend.mu)
+
+  test "maybeTriggerL0Compaction returns false when backend is closed":
+    var config = defaultStorageConfig("/tmp/test_l0_trig_closed")
+    let backend = newWiscKeyBackend(config)
+    check backend.maybeTriggerL0Compaction(1) == false
+    deinitLock(backend.mu)
+
+  test "maybeTriggerL0Compaction with threshold=0 is disabled":
+    var config = defaultStorageConfig("/tmp/test_l0_disabled")
+    let backend = newWiscKeyBackend(config)
+    # Even if L0 has files, threshold=0 disables the check.
+    check backend.maybeTriggerL0Compaction(0) == false
+    deinitLock(backend.mu)
+
+  test "StorageConfig has maxFileSize field":
+    var config = defaultStorageConfig("/tmp/test_maxfilesize")
+    config.maxFileSize = 16 * 1024 * 1024
+    check config.maxFileSize == 16 * 1024 * 1024
+    config.maxFileSize = 0 # 0 = default (2 MB)
+    check config.maxFileSize == 0
+
+  test "StorageConfig has l0CompactionTrigger field":
+    var config = defaultStorageConfig("/tmp/test_l0trigger")
+    config.l0CompactionTrigger = 8
+    check config.l0CompactionTrigger == 8
+    config.l0CompactionTrigger = 0
+    check config.l0CompactionTrigger == 0
+
+  test "StorageBackend base methods have L0 defaults":
+    # The base StorageBackend methods should be no-ops returning 0/false.
+    # We can't easily create a vanilla StorageBackend, but we verify that
+    # calling the methods on a WiscKey backend that's not open returns 0/false.
+    var config = defaultStorageConfig("/tmp/test_base_defaults")
+    let backend = newWiscKeyBackend(config)
+    check backend.getL0FileCount() == 0
+    check backend.maybeTriggerL0Compaction(99) == false
+    deinitLock(backend.mu)

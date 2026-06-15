@@ -27,6 +27,17 @@ type
       ## If true, writes are synced to disk before returning (default: false)
     blockCacheSize*: int
       ## LevelDB block cache size in bytes; 0 = LevelDB default (8 MB)
+    maxFileSize*: int
+      ## LevelDB max SST file size in bytes; 0 = LevelDB default (2 MB).
+      ## Larger files mean fewer L0 SSTs for the same data volume, which
+      ## reduces L0 compaction backlog. With 100K+ rows and many small
+      ## tombstone writes, the default 2 MB causes L0 to accumulate
+      ## dozens of files, each held in RSS.
+    l0CompactionTrigger*: int
+      ## Number of L0 files that triggers a manual compaction. 0 = disabled.
+      ## The fork's LevelDB C API does not expose level0_slowdown_writes_trigger,
+      ## so we monitor L0 file count via leveldb_property_value("num-files-at-level0")
+      ## and call c_leveldb_compact_range() to compact L0->L1 when threshold is hit.
 
     # WiscKey-specific options (key-value separation)
     vlogMaxSize*: int64
@@ -203,6 +214,23 @@ method compactRange*(backend: StorageBackend, startKey: Option[string] = none(st
                      endKey: Option[string] = none(string)) {.base.} =
   ## Compact storage in the given key range
   discard
+
+method getL0FileCount*(backend: StorageBackend): int {.base, gcsafe.} =
+  ## Return the number of files currently in L0 (the freshly-flushed
+  ## memtable level). Returns 0 on error or if the backend does not
+  ## expose this metric.
+  result = 0
+
+method maybeTriggerL0Compaction*(backend: StorageBackend,
+    threshold: int): bool {.base, gcsafe.} =
+  ## If the L0 file count is >= threshold, force a full compaction.
+  ## Returns true if compaction was triggered. The default is a no-op.
+  result = false
+
+method getMemtableSize*(backend: StorageBackend): int64 {.base, gcsafe.} =
+  ## Return the current memtable size in bytes. Returns 0 on error or
+  ## if the backend does not expose this metric.
+  result = 0'i64
 
 method getStats*(backend: StorageBackend): StorageStats {.base.} =
   ## Get storage statistics
