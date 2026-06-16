@@ -1229,8 +1229,10 @@ void nuraft_params_set_leadership_transfer_min_wait_time(void* params, int32_t m
 void nuraft_params_set_custom_election_quorum_size(void* params, int32_t size) {
     if (!params) return;
     static_cast<raft_params*>(params)->custom_election_quorum_size_ = size;
-    fprintf(stderr, "[NuRaft Shim] Set custom election quorum size to %d (actual quorum will be %d)\n",
-            size, size > 0 ? size - 1 : 0);
+    // Note: The actual custom_election_quorum_size_ is set to 'size' above.
+    // NuRaft's internal election_quorum_size is get_quorum_for_election() + 1,
+    // which is one less than custom_election_quorum_size_ (see NuRaft docs).
+    fprintf(stderr, "[NuRaft Shim] Set custom_election_quorum_size_ to %d\n", size);
 }
 
 void nuraft_params_set_auto_adjust_quorum(void* params, int32_t enable) {
