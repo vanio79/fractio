@@ -734,7 +734,20 @@ method getMemtableSize*(backend: WiscKeyBackend): int64 {.gcsafe.} =
   ## Return the current memtable size in bytes. Returns 0 on error.
   ## This is the size of the in-memory write buffer; when it exceeds
   ## write_buffer_size, it is flushed to L0 as a new SST.
-  let s = getProperty(backend, "leveldb.mem-table-size")
+  ##
+  ## NOTE: The WiscKey fork of LevelDB only supports the following
+  ## "leveldb.*" properties (see thirdparty/wisckey/db/db_impl.cc
+  ## DBImpl::GetProperty):
+  ##   - leveldb.num-files-at-level<N>
+  ##   - leveldb.stats
+  ##   - leveldb.sstables
+  ##   - leveldb.approximate-memory-usage
+  ##
+  ## The standard property "leveldb.mem-table-size" is NOT supported
+  ## by this fork and returns an empty string, so we fall back to
+  ## "leveldb.approximate-memory-usage" which DOES include the
+  ## memtable (mem_->ApproximateMemoryUsage()) plus the block cache.
+  let s = getProperty(backend, "leveldb.approximate-memory-usage")
   if s.len == 0:
     return 0'i64
   try:

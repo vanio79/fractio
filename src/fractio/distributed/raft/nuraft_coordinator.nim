@@ -829,9 +829,15 @@ proc newNuRaftCoordinator*(config: CoordinatorConfig): NuRaftCoordinator =
   result.electionTimeoutLowerMs = config.electionTimeoutLowerMs
   result.electionTimeoutUpperMs = config.electionTimeoutUpperMs
   result.heartbeatIntervalMs = config.heartbeatIntervalMs
-  if result.electionTimeoutLowerMs == 0: result.electionTimeoutLowerMs = 300
-  if result.electionTimeoutUpperMs == 0: result.electionTimeoutUpperMs = 600
-  if result.heartbeatIntervalMs == 0: result.heartbeatIntervalMs = 100
+  # Bumped from 300/600/100 (May 2026) to 1000/2000/150 to prevent
+  # spurious elections under sustained INSERT load on 3-replica clusters.
+  # With aggressive defaults, the META group experienced term bouncing
+  # (term 1 -> 2 -> 3 -> 4 in <8 min) under 1M-row load, because followers
+  # would start elections before the busy leader could send a heartbeat.
+  # Standard Raft guidance: heartbeat = election_timeout / 10.
+  if result.electionTimeoutLowerMs == 0: result.electionTimeoutLowerMs = 1000
+  if result.electionTimeoutUpperMs == 0: result.electionTimeoutUpperMs = 2000
+  if result.heartbeatIntervalMs == 0: result.heartbeatIntervalMs = 150
   result.kvStorePtr = nil
   result.running.store(false)
   result.groupCreationRunning.store(false)
@@ -1327,6 +1333,14 @@ proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
     cleanupOnFailure()
     freeInstance(inst)
     return false
+
+  # Wire the raft server pointer into the state manager so it can update
+  # the custom_election_quorum_size and custom_commit_quorum_size dynamically
+  # when the cluster config changes (add_srv / remove_srv). Without this, the
+  # state manager's commit_config() has no raft server reference and cannot
+  # propagate quorum changes — leaving the group stuck at the initial quorum=1
+  # even after peers join, which produces split-brain in 3-replica clusters.
+  nuraftSmgrSetRaftServer(inst.smgr, inst.server)
 
   # Set the quorum update callback so quorum is dynamically updated
   # when servers are added/removed via add_srv

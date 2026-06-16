@@ -3038,19 +3038,33 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
   let isJoining = not startAsLeader
 
   # NuRaft Coordinator
-  # When a memory budget is configured, derive the storage caps from it.
-  # Otherwise fall back to the user-configured writeBufferSize / blockCacheSize.
+  # The memory budget acts as a CAP, not the default. When the user has
+  # explicitly set writeBufferSize / blockCacheSize in config, use those
+  # (clamped to the budget's cap). Only fall back to the budget's derived
+  # values when the user has not set them (writeBufferSize = 0 means
+  # "use the budget's default").
   let (effectiveBlockCache, effectiveWriteBuffer) =
     if server.memoryBudget != nil and server.memoryBudget.budgetEnabled:
-      (server.memoryBudget.storageCacheBytes,
-       server.memoryBudget.storageWriteBufferBytes)
+      # User-configured values (when > 0) win over the budget's default,
+      # but are clamped to the budget's cap to prevent OOM.
+      let userCache = server.config.blockCacheSize
+      let userWriteBuf = server.config.writeBufferSize
+      let effCache = if userCache > 0: min(userCache,
+          server.memoryBudget.storageCacheBytes)
+                     else: server.memoryBudget.storageCacheBytes
+      let effWriteBuf = if userWriteBuf > 0: min(userWriteBuf,
+          server.memoryBudget.storageWriteBufferBytes)
+                        else: server.memoryBudget.storageWriteBufferBytes
+      (effCache, effWriteBuf)
     else:
       (server.config.blockCacheSize, server.config.writeBufferSize)
   let effectiveVlogBuffer =
     if server.memoryBudget != nil and server.memoryBudget.budgetEnabled:
-      server.memoryBudget.vlogBufferBytes
+      let userVlog = server.config.vlogCleanBufferSize
+      if userVlog > 0: min(int64(userVlog), server.memoryBudget.vlogBufferBytes)
+      else: server.memoryBudget.vlogBufferBytes
     else:
-      server.config.vlogCleanBufferSize
+      int64(server.config.vlogCleanBufferSize)
 
   let coord = newNuRaftCoordinator(nuraft_coordinator.CoordinatorConfig(
     nodeId: nodeId,
@@ -3070,6 +3084,27 @@ proc setupRaftNode*(server: ProtocolServer, raftPort: int,
     vlogCleanBufferSize: effectiveVlogBuffer,
   ))
   server.raftCoord = coord
+
+  # Start L0 compaction monitor thread (only if a threshold is set).
+  # This MUST be done here (in setupRaftNode) rather than in start(),
+  # because raftCoord.store is initialized during newNuRaftCoordinator()
+  # and is not available when start() runs (start() is called before
+  # setupRaftNode in cli/main.nim).
+  if server.config.l0CompactionTrigger > 0 and
+     not server.raftCoord.isNil and
+     not server.raftCoord.store.isNil:
+    let l0Ref = new Thread[L0CompactionArgs]
+    withLock(threadStoreMu):
+      l0CompactionThreadStore.add(l0Ref)
+    discard server.l0CompactionThreadCount.fetchAdd(1)
+    try:
+      createThread(l0Ref[], l0CompactionWorker,
+                   (server, server.config.l0CompactionTrigger))
+      server.logger.logInfo(
+        &"L0 compaction monitor started (threshold={server.config.l0CompactionTrigger} files)")
+    except ResourceExhaustedError as e:
+      server.logger.logError("failed to create L0 compaction thread: " & e.msg)
+      discard server.l0CompactionThreadCount.fetchSub(1)
 
   # Register peer info in coordinator
   for p in peers:
@@ -3480,22 +3515,9 @@ proc start*(server: ProtocolServer) {.raises: [].} =
     server.logger.logError("failed to create accept thread: " & e.msg)
     server.running.store(false)
 
-  # Start L0 compaction monitor thread (only if a threshold is set)
-  if server.config.l0CompactionTrigger > 0 and
-     not server.raftCoord.isNil and
-     not server.raftCoord.store.isNil:
-    let l0Ref = new Thread[L0CompactionArgs]
-    withLock(threadStoreMu):
-      l0CompactionThreadStore.add(l0Ref)
-    discard server.l0CompactionThreadCount.fetchAdd(1)
-    try:
-      createThread(l0Ref[], l0CompactionWorker,
-                   (server, server.config.l0CompactionTrigger))
-      server.logger.logInfo(
-        &"L0 compaction monitor started (threshold={server.config.l0CompactionTrigger} files)")
-    except ResourceExhaustedError as e:
-      server.logger.logError("failed to create L0 compaction thread: " & e.msg)
-      discard server.l0CompactionThreadCount.fetchSub(1)
+  # NOTE: L0 compaction monitor thread is started in setupRaftNode() AFTER
+  # server.raftCoord (and raftCoord.store) is initialized. Starting it here
+  # would fail the isNil check since setupRaftNode() runs after start().
 
   # Start per-subsystem memory logger thread (logs RSS + memtable + L0 every 10s)
   if server.perSubsystemLoggerThreadCount.load() == 0:

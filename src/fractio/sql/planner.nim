@@ -4,7 +4,7 @@
 # The planner resolves table names to table IDs via catalog lookups
 # and generates the appropriate key encodings for reads/writes.
 
-import std/[options, json, strutils, strformat, sequtils, times]
+import std/[options, json, strutils, strformat, sequtils, times, os]
 import ./ast
 import ./data_row
 import ../distributed/meta/system_tables
@@ -668,15 +668,61 @@ proc resolveTable*(client: FractioClient,
     database, schema, tableName: string): Option[TableDescriptor] =
   ## Look up a table descriptor from the system catalog.
   ## Key format: /t/<SYS_TABLES_TABLE_ID>/<database>.<schema>.<tableName>
+  ##
+  ## Retries on "table not found" (catalog miss) to handle transient
+  ## states during META group leader changes: NuRaft's become_leader()
+  ## sets is_initialized=true BEFORE the state machine has caught up
+  ## to the committed log. A read during that window succeeds at the
+  ## protocol level (no error) but returns found=false because WiscKey
+  ## has not yet replayed the batch. Refreshing metadata and retrying
+  ## routes subsequent attempts through the new (caught-up) leader.
   let catalogKey = encodeTableKey(SYS_TABLES_TABLE_ID,
       database & "." & schema & "." & tableName)
 
-  let res = client.kvGet(catalogKey)
-  if res.isErr or res.val.isNone:
+  # Bumped from 5/25 (May 2026) to 8/50 to handle SM-replay windows up
+  # to ~6.4s. Empirically observed that 1M-row load on a 3-replica cluster
+  # can trigger a META group leader change with a multi-second replay
+  # window during which kvGet returns "not found". The previous 5x25/
+  # 50/100/200/400ms schedule (775ms total) was insufficient — the test
+  # saw hundreds of "table not found" errors. New schedule: 50/100/200/
+  # 400/800/1600/3200/6400ms = ~12.75s total. The retry also now handles
+  # transport errors (NOT_LEADER, connection reset) that occur during
+  # the META leader transition.
+  const maxCatalogMissRetries = 8
+  const catalogMissBaseBackoffMs = 50
+  var recOpt: Option[TableRecord] = none(TableRecord)
+
+  for attempt in 0 ..< maxCatalogMissRetries:
+    let res = client.kvGet(catalogKey)
+    if res.isErr:
+      # Transport / protocol error — treat as a miss and retry. The
+      # META leader transition can produce transient RPC failures
+      # (NOT_LEADER, connection reset) that recover after the client
+      # refreshes metadata and points at the new leader.
+      if attempt < maxCatalogMissRetries - 1:
+        discard client.refreshMetadata()
+        sleep(catalogMissBaseBackoffMs * (1 shl attempt))
+        continue
+      return none(TableDescriptor)
+    if res.val.isSome:
+      try:
+        recOpt = some(decodeTableRecord(res.val.get()))
+        break
+      except ValueError:
+        # Malformed record — treat as miss; retry may yield a fresh leader.
+        discard
+
+    # Catalog miss: refresh metadata (re-resolves META leader) and retry
+    # with exponential backoff. This handles transient SM-replay lag after
+    # a META group leadership change.
+    if attempt < maxCatalogMissRetries - 1:
+      discard client.refreshMetadata()
+      sleep(catalogMissBaseBackoffMs * (1 shl attempt))
+
+  if recOpt.isNone:
     return none(TableDescriptor)
 
-  let raw = res.val.get()
-  let rec = decodeTableRecord(raw)
+  let rec = recOpt.get()
   var desc = TableDescriptor(
     tableId: rec.tableId,
     name: rec.name,

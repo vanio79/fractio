@@ -1337,53 +1337,17 @@ proc rebalanceLeadershipTask(s: RaftKVStoreExt) {.thread, gcsafe, raises: [].} =
       let now = s.nowNs().float / 1_000_000_000.0
 
       withLock s.groupMu:
-        for gid, preferredId in s.preferredLeaders:
-          let isLeader = s.coordinator.isLeader(gid)
-          let failures = yieldFailures.getOrDefault(gid, 0)
-          if isLeader:
-            # Check if this is a revert (we became leader again soon after yielding)
-            let lastYieldTime = lastYieldAttempt.getOrDefault(gid, 0.0)
-            if lastYieldTime > 0.0:
-              let timeSinceYield = now - lastYieldTime
-              if timeSinceYield < yieldRevertWindow and failures < maxYieldFailures:
-                # Leadership reverted - increment failure count
-                let newFailures = failures + 1
-                yieldFailures[gid] = newFailures
-                {.cast(raises: []).}:
-                  {.cast(gcsafe).}:
-                    info("Leadership reverted after yield, incrementing failures", {
-                         "groupId": $gid, "failures": $newFailures}.toTable)
-                lastYieldAttempt.del(gid)
-
-            if not leaderSince.hasKey(gid):
-              leaderSince[gid] = now
-
-            # Only yield if we are leader, not preferred, and have held
-            # leadership for at least 5 seconds (leader lease).
-            let since = leaderSince.getOrDefault(gid, now)
-            # Check if the preferred leader is alive before attempting yield.
-            # Yielding to a dead node is pointless and causes the "revert"
-            # detection to fire on every cycle.
-            let preferredAlive = s.coordinator.isPeerAlive(gid, preferredId)
-            # Skip if we've had too many consecutive failures
-            if s.coordinator.nodeId.uint32 != preferredId and
-               (now - since >= 5.0) and
-               failures < maxYieldFailures and
-               preferredAlive:
-              toYield.add((gid, preferredId))
-            elif failures >= maxYieldFailures or not preferredAlive:
-              # Log when we're backing off due to failures or dead preferred leader
-              {.cast(raises: []).}:
-                {.cast(gcsafe).}:
-                  if not preferredAlive and failures == 0:
-                    debug("Skipping leadership yield: preferred leader not alive", {
-                        "groupId": $gid, "preferred": $preferredId}.toTable)
-                  elif failures >= maxYieldFailures:
-                    debug("Skipping leadership yield due to failures", {
-                        "groupId": $gid, "failures": $failures}.toTable)
-          else:
-            # No longer leader - clear tracking for this group
-            leaderSince.del(gid)
+        # Leadership rebalancing is DISABLED. The transferLeadership call
+        # below is commented out, so this task was only adding overhead and
+        # logging noise. More importantly, the failure-tracking logic was
+        # interfering with the normal Raft election process for data groups
+        # under sustained write load, causing the election timeout death
+        # spiral (12+ term changes in minutes) that broke the 1M test.
+        #
+        # If rebalancing is needed in the future, implement it via
+        # transferLeadership() with proper backoff and coordination with
+        # active writes, not via this passive tracking approach.
+        discard
 
       for (gid, preferredId) in toYield:
         # Check if we should stop before each yield attempt

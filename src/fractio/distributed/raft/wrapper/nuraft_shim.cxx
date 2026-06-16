@@ -603,6 +603,12 @@ private:
 // - Quorum updates to Nim (quorum_update_cb)
 // - High water mark to reject stale config changes during log replay
 
+// Forward declaration for the raft_server update_params helper. The full
+// implementation is in nuraft_server_update_quorum further down in this file,
+// but the state manager needs to invoke it from commit_config() to bump the
+// custom_election_quorum_size after add_srv() commits.
+extern void nuraft_server_update_quorum(void* server, int32_t quorum_size);
+
 class callback_state_mgr : public state_mgr {
 public:
     callback_state_mgr(int32 my_id, const std::string& my_endpoint,
@@ -717,11 +723,33 @@ public:
             }
         }
 
-        // Update quorum based on new server count
+        // Update quorum based on new server count.
+        //
+        // CRITICAL: With auto_adjust_quorum_for_small_cluster DISABLED (see
+        // nuraft_coordinator.nim:1244), NuRaft does NOT auto-adjust the
+        // custom_election_quorum_size after add_srv(). This means once a
+        // group is created with quorum=1, it STAYS at quorum=1 even after
+        // peers join — producing split-brain (any node can declare itself
+        // leader with just its own vote, regardless of cluster size).
+        //
+        // Fix: directly call nuraft_server_update_quorum on the raft server
+        // to bump the custom_election_quorum_size and custom_commit_quorum_size
+        // to a majority of the new server count. The Nim callback (if wired)
+        // is also invoked for observability, but is no longer the critical path.
         size_t num_servers = saved_config_->get_servers().size();
-        if (quorum_update_cb_ && num_servers > 0) {
+        if (num_servers > 0) {
             int32_t majority = (int32_t)(num_servers / 2) + 1;
-            quorum_update_cb_(quorum_update_ctx_, my_id_, majority);
+
+            // Direct path: update raft server params to use majority quorum.
+            // This is the fix for the 3-replica split-brain.
+            if (raft_server_ptr_) {
+                nuraft_server_update_quorum(raft_server_ptr_, majority);
+            }
+
+            // Optional Nim callback (kept for observability/forward compat)
+            if (quorum_update_cb_) {
+                quorum_update_cb_(quorum_update_ctx_, my_id_, majority);
+            }
         }
     }
 
