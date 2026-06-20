@@ -1866,14 +1866,30 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
     of poDelete:
       # MVCC-aware DELETE
       #
-      # MEMORY FIX (2026-06-15): The previous implementation called
+      # FAST PATH: When the WHERE clause is a disjunction of PK equality
+      # conditions (pk = N OR pk = M OR ...), the planner populates
+      # delPkPointLookups with binary-encoded PK values. We do point
+      # GET+DELETE for each key instead of a full table scan.
+      #
+      # This is critical for performance: a DELETE with 1000 OR clauses
+      # on a 100K-row table would otherwise scan ALL rows in every group
+      # (67K rows per shard × 100 batches = 6.7M row scans) and send
+      # 33K rows per scan over the wire in ~430ms-10s per batch. With
+      # point lookups, each DELETE batch is 1000 GETs + 1000 DELETEs,
+      # each taking <1ms — a 100-1000x speedup.
+      #
+      # FALLBACK (full scan): when delPkPointLookups is empty (complex
+      # WHERE clause, non-PK filter, etc.), we fall back to the original
+      # streaming scan + client-side filter strategy.
+      #
+      # MEMORY FIX (2026-06-15): The previous scan implementation called
       # ctx.kv.scan() which materializes ALL key-value pairs in memory
       # before filtering. On a 1M-row table, this allocated 2-3GB on
       # the leader (full table = 1M keys × ~300-500 bytes MVCC-encoded
       # + DataRow). The accumulated seq survived long enough that
       # AtomicArc thread-local heap arenas grew without releasing.
       #
-      # New strategy:
+      # The scan strategy:
       #   Phase 1: streaming scan collects ONLY keys-to-delete (no values)
       #            into a bounded buffer. Server pushes chunks of ~1000
       #            pairs at a time, so the server never materializes
@@ -1893,92 +1909,141 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
       #   silently corrupt the batch payload. So we MUST drain the
       #   scan to completion before issuing any other RPC on the
       #   connection.
-      #
-      # We do NOT push the filter to the server because the server's
-      # dedup_filter step is currently per-raw-entry (slow at 41s for
-      # 700K raw keys) and would tie up server resources during large
-      # deletes. The client-side filter runs in microseconds on the
-      # 1000 keys per chunk, which is negligible.
-      let startKey = encodeDataRowScanBound(op.delTableId, "")
-      let endKey = makeDataRowScanEndKey(op.delTableId)
 
-      # Phase 1: collect keys-to-delete via streaming scan.
-      # Only store keys (not values) — keys are ~30 bytes each, so
-      # 1M keys = ~30MB. Values would be ~150-300 bytes each (~300MB)
-      # and are not needed for deletion.
-      const DELETE_SCAN_CHUNK = 1000 # pairs per streaming chunk
       const DELETE_BATCH_CHUNK = 1000 # keys per batch RPC
 
-      var deleteKeys: seq[string] = @[]
-      var scanStream: StreamingScanClient = nil
-      var scanOpened = false
+      # ── FAST PATH: PK point lookups ──────────────────────────────
+      if op.delPkPointLookups.len > 0:
+        # Build data-row keys from the binary-encoded PK values.
+        # Each PK value was extracted by the planner from `pk = literal`
+        # conditions. We encode each as a data-row scan-bound key
+        # (same format as INSERT uses) and issue a GET to check existence,
+        # then a batch DELETE for all existing keys.
+        var deleteKeys: seq[string] = @[]
+        deleteKeys = newSeqOfCap[string](op.delPkPointLookups.len)
 
-      try:
-        let streamRes = execTxnStreamScan(ctx, startKey, endKey, 0,
-            none(kvMsgs.WireFilterExpr), false, none(seq[string]),
-            none(kvMsgs.WireTopKSpec))
-        if streamRes.isErr:
-          return errorResult(&"failed to start delete scan: " &
-              streamRes.error.msg)
-        scanStream = streamRes.value
-        scanOpened = true
+        for pkBinary in op.delPkPointLookups:
+          let key = encodeDataRowScanBound(op.delTableId, pkBinary)
+          let getRes = ctx.kv.get(key, txnId = ctx.txnId,
+              readTimestamp = ctx.readTimestamp)
+          if getRes.isOk and getRes.val.isSome:
+            deleteKeys.add(key)
+          # If getRes.isErr, we skip — a transient GET error on one key
+          # shouldn't fail the entire DELETE. The row may not exist
+          # (already deleted) or the GET may fail (connection issue).
+          # Either way, we just don't delete that key.
 
-        while scanStream.hasNext():
-          let pairOpt = scanStream.nextPair()
-          if pairOpt.isNone:
+        if deleteKeys.len == 0:
+          return modifiedResult(0, "DELETE 0")
+
+        # Batch delete all existing keys in chunks
+        var totalCount = 0
+        var firstErr: string = ""
+        var i = 0
+        while i < deleteKeys.len:
+          let chunkEnd = min(i + DELETE_BATCH_CHUNK, deleteKeys.len)
+          var batchOps: seq[KVBatchOp] = newSeqOfCap[KVBatchOp](chunkEnd - i)
+          for j in i ..< chunkEnd:
+            batchOps.add(KVBatchOp(kind: bopDelete, key: deleteKeys[j],
+                value: ""))
+          let batchRes = ctx.kv.batch(batchOps, txnId = ctx.txnId)
+          if batchRes.isErr:
+            firstErr = &"batch delete failed: {batchRes.err}"
             break
-          let pair = pairOpt.get()
+          totalCount += batchRes.val.successCount
+          if batchRes.val.failureCount > 0 and
+              batchRes.val.firstError.len > 0:
+            firstErr = &"batch delete had " &
+                $batchRes.val.failureCount & " failures: " &
+                batchRes.val.firstError
+            break
+          i = chunkEnd
 
-          # Client-side filter. The server doesn't pre-filter (see
-          # comment above) so we always need to check here.
-          if op.delFilter.isSome:
-            try:
-              let row = decodeDataRow(pair.value)
-              if not matchesFilterDataRow(op.delFilter, row):
-                continue
-            except ValueError:
-              discard
+        if firstErr.len > 0:
+          return errorResult(firstErr)
 
-          deleteKeys.add(pair.key)
+        modifiedResult(totalCount, &"DELETE {totalCount}")
+      else:
+        # ── FALLBACK: full table scan + client-side filter ─────────
+        let startKey = encodeDataRowScanBound(op.delTableId, "")
+        let endKey = makeDataRowScanEndKey(op.delTableId)
 
-      finally:
-        # Drain the stream to leave the connection in a clean state
-        # for the batch RPC that follows. closeStream handles
-        # non-exhausted streams by reading remaining frames (up to
-        # MAX_DRAIN_FRAMES) or disconnecting on overflow.
-        if scanOpened and scanStream != nil:
-          scanStream.closeStream()
+        # Phase 1: collect keys-to-delete via streaming scan.
+        # Only store keys (not values) — keys are ~30 bytes each, so
+        # 1M keys = ~30MB. Values would be ~150-300 bytes each (~300MB)
+        # and are not needed for deletion.
+        const DELETE_SCAN_CHUNK = 1000 # pairs per streaming chunk
 
-      # Phase 2: delete all collected keys in bounded batch chunks.
-      # Now that the scan stream is closed and the connection is
-      # clean, ctx.kv.batch() can safely issue new requests.
-      var totalCount = 0
-      var firstErr: string = ""
+        var deleteKeys: seq[string] = @[]
+        var scanStream: StreamingScanClient = nil
+        var scanOpened = false
 
-      var i = 0
-      while i < deleteKeys.len:
-        let chunkEnd = min(i + DELETE_BATCH_CHUNK, deleteKeys.len)
-        var batchOps: seq[KVBatchOp] = newSeqOfCap[KVBatchOp](chunkEnd - i)
-        for j in i ..< chunkEnd:
-          batchOps.add(KVBatchOp(kind: bopDelete, key: deleteKeys[j],
-              value: ""))
-        let batchRes = ctx.kv.batch(batchOps, txnId = ctx.txnId)
-        if batchRes.isErr:
-          firstErr = &"batch delete failed: {batchRes.err}"
-          break
-        totalCount += batchRes.val.successCount
-        if batchRes.val.failureCount > 0 and
-            batchRes.val.firstError.len > 0:
-          firstErr = &"batch delete had " &
-              $batchRes.val.failureCount & " failures: " &
-              batchRes.val.firstError
-          break
-        i = chunkEnd
+        try:
+          let streamRes = execTxnStreamScan(ctx, startKey, endKey, 0,
+              none(kvMsgs.WireFilterExpr), false, none(seq[string]),
+              none(kvMsgs.WireTopKSpec))
+          if streamRes.isErr:
+            return errorResult(&"failed to start delete scan: " &
+                streamRes.error.msg)
+          scanStream = streamRes.value
+          scanOpened = true
 
-      if firstErr.len > 0:
-        return errorResult(firstErr)
+          while scanStream.hasNext():
+            let pairOpt = scanStream.nextPair()
+            if pairOpt.isNone:
+              break
+            let pair = pairOpt.get()
 
-      modifiedResult(totalCount, &"DELETE {totalCount}")
+            # Client-side filter. The server doesn't pre-filter (see
+            # comment above) so we always need to check here.
+            if op.delFilter.isSome:
+              try:
+                let row = decodeDataRow(pair.value)
+                if not matchesFilterDataRow(op.delFilter, row):
+                  continue
+              except ValueError:
+                discard
+
+            deleteKeys.add(pair.key)
+
+        finally:
+          # Drain the stream to leave the connection in a clean state
+          # for the batch RPC that follows. closeStream handles
+          # non-exhausted streams by reading remaining frames (up to
+          # MAX_DRAIN_FRAMES) or disconnecting on overflow.
+          if scanOpened and scanStream != nil:
+            scanStream.closeStream()
+
+        # Phase 2: delete all collected keys in bounded batch chunks.
+        # Now that the scan stream is closed and the connection is
+        # clean, ctx.kv.batch() can safely issue new requests.
+        var totalCount = 0
+        var firstErr: string = ""
+
+        var i = 0
+        while i < deleteKeys.len:
+          let chunkEnd = min(i + DELETE_BATCH_CHUNK, deleteKeys.len)
+          var batchOps: seq[KVBatchOp] = newSeqOfCap[KVBatchOp](chunkEnd - i)
+          for j in i ..< chunkEnd:
+            batchOps.add(KVBatchOp(kind: bopDelete, key: deleteKeys[j],
+                value: ""))
+          let batchRes = ctx.kv.batch(batchOps, txnId = ctx.txnId)
+          if batchRes.isErr:
+            firstErr = &"batch delete failed: {batchRes.err}"
+            break
+          totalCount += batchRes.val.successCount
+          if batchRes.val.failureCount > 0 and
+              batchRes.val.firstError.len > 0:
+            firstErr = &"batch delete had " &
+                $batchRes.val.failureCount & " failures: " &
+                batchRes.val.firstError
+            break
+          i = chunkEnd
+
+        if firstErr.len > 0:
+          return errorResult(firstErr)
+
+        modifiedResult(totalCount, &"DELETE {totalCount}")
 
     of poShowDatabases: execShowDatabasesTxn(ctx)
     of poShowSchemas: execShowSchemasTxn(op, ctx)

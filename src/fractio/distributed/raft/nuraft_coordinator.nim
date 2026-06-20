@@ -835,9 +835,16 @@ proc newNuRaftCoordinator*(config: CoordinatorConfig): NuRaftCoordinator =
   # (term 1 -> 2 -> 3 -> 4 in <8 min) under 1M-row load, because followers
   # would start elections before the busy leader could send a heartbeat.
   # Standard Raft guidance: heartbeat = election_timeout / 10.
-  if result.electionTimeoutLowerMs == 0: result.electionTimeoutLowerMs = 1000
-  if result.electionTimeoutUpperMs == 0: result.electionTimeoutUpperMs = 2000
-  if result.heartbeatIntervalMs == 0: result.heartbeatIntervalMs = 150
+  #
+  # Bumped again (Jun 2026) to 3000/5000/300 to handle heavy sustained
+  # load (1M-row bulk inserts). Under 1M load we observed 4+ META
+  # leadership changes in 1 hour (term 1->3->4->5), each triggering
+  # 30+ minute stalls for in-flight INSERT batches. Larger election
+  # windows tolerate longer leader-busy periods without spurious
+  # elections. Heartbeat at 300ms / election at 3000ms = 1:10 ratio.
+  if result.electionTimeoutLowerMs == 0: result.electionTimeoutLowerMs = 3000
+  if result.electionTimeoutUpperMs == 0: result.electionTimeoutUpperMs = 5000
+  if result.heartbeatIntervalMs == 0: result.heartbeatIntervalMs = 300
   result.kvStorePtr = nil
   result.running.store(false)
   result.groupCreationRunning.store(false)

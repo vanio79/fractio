@@ -19,7 +19,7 @@ import std/[os, strutils, times, httpclient, json, osproc, strformat, algorithm]
 
 const
   HOST = "127.0.0.1"
-  WEB_PORT = 9870
+  WEB_PORT = 9871
   BATCH_SIZE = 100
   FIRST_ID = 4501     # resume from where 5000-row test left off
   LAST_ID = 100_000

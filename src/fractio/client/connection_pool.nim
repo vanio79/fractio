@@ -53,6 +53,7 @@
 ##   smoke test) can verify the leak is actually gone.
 
 import std/[tables, locks, options, atomics]
+import posix, nativesockets
 import ../protocol/client
 
 # ---------------------------------------------------------------------------
@@ -136,6 +137,73 @@ proc closeConn(conn: ProtocolClient) {.gcsafe.} =
     try: conn.disconnect("pool_close")
     except CatchableError: discard
 
+proc socketIsAlive(conn: ProtocolClient): bool {.gcsafe.} =
+  ## Probe a parked conn's socket for liveness without doing a real RPC.
+  ##
+  ## The pool's `connected` flag is set false by the client whenever it
+  ## detects an I/O error (short recv, CRC mismatch, peer reset). It does
+  ## NOT catch the case where the server side has closed the socket but
+  ## the client hasn't observed the closure yet — typical after a
+  ## streaming scan ends and the conn is parked on the idle list: the
+  ## kernel buffers the server's FIN, but the next client-side send can
+  ## race with it and either succeed silently (TCP retransmit masks the
+  ## issue) or fail with EPIPE/ECONNRESET on the next syscall.
+  ##
+  ## This probe does a non-blocking `poll(POLLIN)` with 0 timeout. If
+  ## poll returns `>0` with `POLLHUP` or `POLLERR` set (but NOT `POLLIN`),
+  ## the server has half-closed and any subsequent send will fail. We
+  ## drop the conn in that case. If poll returns 0, the socket is idle
+  ## and healthy. If poll returns >0 with `POLLIN`, there is data waiting
+  ## — also a sign the server sent something the client didn't expect
+  ## (stale frame from a previous scan that wasn't fully drained); we
+  ## drop the conn to be safe.
+  ##
+  ## This probe is cheap (~1µs on a healthy conn) and runs OUTSIDE the
+  ## pool lock so it doesn't serialise acquire/release on the lock.
+  ##
+  ## Caveat: when a unit test mints a fake `ProtocolClient` without
+  ## opening a socket (fd is left at its default, typically 0), the poll
+  ## would target stdin or some other unrelated fd. We detect this case
+  ## by checking `fd <= 0` (or uninitialised) and fall back to the
+  ## `connected.load()` heuristic so the pool's tests still pass against
+  ## fake conns. Production conns always have fd > 0 after `connect()`.
+  if conn == nil or not conn.connected.load(moRelaxed):
+    return false
+  if conn.fd <= 0:
+    # Fake conn (unit test) or uninitialised — fall back to the
+    # connected flag. Real conns always have fd > 0 after connect().
+    return true
+
+  var pfd: TPollfd
+  pfd.fd = conn.fd
+  pfd.events = cshort(POLLIN or POLLERR or POLLHUP)
+  pfd.revents = 0
+
+  # 0 timeout = probe only, don't block.
+  let rc = posix.poll(addr pfd, Tnfds(1), 0)
+  if rc < 0:
+    # poll() errored — treat as not-alive so we reconnect.
+    return false
+  if rc == 0:
+    # No events — socket is idle and healthy. Keep it.
+    return true
+
+  # rc > 0: there are events. If POLLIN is set, there's unexpected
+  # data buffered (likely a stale frame from a previous scan that
+  # wasn't fully drained). If only POLLHUP/POLLERR is set, the peer
+  # has closed or errored. Either way, the conn is unsafe to reuse —
+  # drop it and let acquire() open a fresh one.
+  let events = pfd.revents
+  if (events and cshort(POLLIN)) != 0:
+    # Data buffered unexpectedly — discard.
+    return false
+  if (events and cshort(POLLERR)) != 0:
+    return false
+  if (events and cshort(POLLHUP)) != 0:
+    return false
+  # Events we don't recognise but no error/hup/data — assume alive.
+  return true
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -178,8 +246,15 @@ proc acquire*(pool: ConnectionPool, host: string, port: int,
       release(pool.mu)
 
     if popped != nil:
-      # Liveness check outside the lock — connected.load() is atomic
-      if popped.connected.load(moRelaxed):
+      # Liveness check outside the lock. The pool used to rely solely on
+      # `connected.load()` — that's not enough for conns that have been
+      # used for streaming scans. The server can half-close the socket
+      # after the EndOfScan frame (e.g. via idle timeout) without the
+      # client observing the closure; the next send then fails with
+      # EPIPE/ECONNRESET ("send incomplete: sent 0 of N bytes"). The
+      # `socketIsAlive` probe does a non-blocking poll to catch this
+      # race and drop the stale conn before returning it.
+      if popped.socketIsAlive():
         discard pool.acquires.fetchAdd(1)
         return some(popped)
       # Dead conn: close and try again (or fall through to create)

@@ -110,8 +110,10 @@ proc pollForRead*(fd: cint, timeoutMs: int): bool {.gcsafe, raises: [].} =
 
 proc pollForWrite*(fd: cint, timeoutMs: int): bool {.gcsafe, raises: [].} =
   ## Poll socket for write readiness using poll() with timeout.
-  ## Returns true if socket is writable (or POLLERR/POLLHUP), false on
-  ## timeout or error. Safe for any fd value (no FD_SETSIZE limit).
+  ## Returns true if socket is writable (POLLOUT), false on timeout or
+  ## hard error. POLLERR/POLLHUP are NOT treated as "ready for write"
+  ## — see pollForWriteWithDead below for callers that need to detect
+  ## peer-closed connections without first attempting posix.send().
   let waitMs: cint = if timeoutMs <= 0: -1 else: timeoutMs.cint
   var pfd: TPollfd
   pfd.fd = fd
@@ -123,19 +125,43 @@ proc pollForWrite*(fd: cint, timeoutMs: int): bool {.gcsafe, raises: [].} =
   while true:
     let rc = posix.poll(addr pfd, Tnfds(1), waitMs)
     if rc > 0:
-      # Ready. revents may include POLLERR/POLLHUP — treat as "woken".
-      return (pfd.revents and cshort(POLLOUT or POLLERR or POLLHUP)) != 0
+      return (pfd.revents and cshort(POLLOUT)) != 0
     if rc == 0:
-      # Timeout.
       return false
-    # rc < 0 — EINTR is the only retry-worthy error here.
     let err = errno
     if err == EINTR:
       inc attempts
       if attempts >= maxAttempts: return false
       continue
-    # Any other error (EFAULT, EINVAL, ENOMEM, ...).
     return false
+
+proc pollForWriteWithDead*(fd: cint, timeoutMs: int): tuple[ready, dead: bool]
+    {.gcsafe, raises: [].} =
+  ## Like pollForWrite but ALSO reports POLLERR/POLLHUP. Used by
+  ## sendNonBlocking to bail out immediately when the peer closes
+  ## the connection, instead of looping maxRetries times on a dead fd.
+  let waitMs: cint = if timeoutMs <= 0: -1 else: timeoutMs.cint
+  var pfd: TPollfd
+  pfd.fd = fd
+  pfd.events = cshort(POLLOUT or POLLERR or POLLHUP)
+  pfd.revents = 0
+
+  var attempts = 0
+  const maxAttempts = 16
+  while true:
+    let rc = posix.poll(addr pfd, Tnfds(1), waitMs)
+    if rc > 0:
+      let ready = (pfd.revents and cshort(POLLOUT)) != 0
+      let dead = (pfd.revents and cshort(POLLERR or POLLHUP)) != 0
+      return (ready, dead)
+    if rc == 0:
+      return (false, false)
+    let err = errno
+    if err == EINTR:
+      inc attempts
+      if attempts >= maxAttempts: return (false, false)
+      continue
+    return (false, false)
 
 # =============================================================================
 # Non-blocking recv with poll polling
@@ -199,6 +225,8 @@ proc sendNonBlocking*(fd: cint, data: string, timeoutMs: int): int {.gcsafe,
     raises: [].} =
   ## Send data using non-blocking socket with poll polling.
   ## Returns number of bytes sent (< data.len means timeout/error).
+  ## On POLLERR/POLLHUP (peer closed connection), returns -1 immediately
+  ## rather than wasting retries on a dead fd.
   if data.len == 0:
     return 0
 
@@ -208,10 +236,18 @@ proc sendNonBlocking*(fd: cint, data: string, timeoutMs: int): int {.gcsafe,
   let sockFd = SocketHandle(fd)
 
   while total < data.len and retries < maxRetries:
-    # Poll for write readiness
-    if not pollForWrite(fd, timeoutMs):
-      # Timeout or error
-      return total
+    # Poll for write readiness AND check for peer-closed condition
+    let (ready, dead) = pollForWriteWithDead(fd, timeoutMs)
+    if dead:
+      # Peer closed connection (POLLHUP or POLLERR). No point retrying
+      # — posix.send would just return EPIPE/ECONNRESET.
+      errno = EPIPE
+      return -1
+    if not ready:
+      # Timeout or transient error - yield and retry
+      inc retries
+      discard posix.usleep(1000)
+      continue
 
     # Socket is ready - attempt send
     let sent = posix.send(sockFd, addr data[total], data.len - total, 0)
@@ -220,8 +256,9 @@ proc sendNonBlocking*(fd: cint, data: string, timeoutMs: int): int {.gcsafe,
       total += sent
       retries = 0
     elif sent == 0:
-      # Shouldn't happen, but treat as error
-      return total
+      # Shouldn't happen, but treat as EAGAIN
+      inc retries
+      discard posix.usleep(1000)
     else:
       # sent < 0 - check errno
       let err = errno
@@ -229,7 +266,7 @@ proc sendNonBlocking*(fd: cint, data: string, timeoutMs: int): int {.gcsafe,
         inc retries
         discard posix.usleep(1000)
       else:
-        # Real error
+        # Real error (EPIPE, ECONNRESET, etc.)
         return total
 
   total

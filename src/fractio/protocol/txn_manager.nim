@@ -223,6 +223,16 @@ proc commitTransaction*(mgr: TransactionManager,
     txnId: coreTypes.TransactionID): CommitTxnResponse {.gcsafe, raises: [].} =
   ## Attempt to commit txnId.
   ## Returns CommitTxnResponse with appropriate status and commitTimestamp.
+  ##
+  ## Memory: after commit/abort, the txn entry is removed from `txns` to
+  ## bound memory. The `commitIndex` (per-key last-commit-timestamp) is
+  ## kept around — it's the cache that backs conflict detection and has
+  ## its own LRU cap (`commitIndexCapacity`) for bounded growth. The TxnRecord
+  ## itself (with its readSet/writeSet HashSets) is dropped once the
+  ## `txns` entry is deleted, freeing ~200 bytes per txn. Without this
+  ## cleanup, the txns table grows unboundedly — for a 100K insert test
+  ## that's ~20MB just for TxnRecords, and the META leader (which sees
+  ## all BeginTxn traffic) hits this hardest.
   acquire(mgr.mu)
   defer: release(mgr.mu)
 
@@ -231,7 +241,8 @@ proc commitTransaction*(mgr: TransactionManager,
     return CommitTxnResponse(status: TxnCommitNotFound, commitTimestamp: 0)
 
   if rec.state != TxnStatusActive:
-    # Already committed or rolled back — idempotent return
+    # Already committed or rolled back — idempotent return.
+    # The entry may already be gone (we clean up after commit/abort).
     if rec.state == TxnStatusCommitted:
       return CommitTxnResponse(status: TxnCommitOK,
                                commitTimestamp: rec.commitTimestamp)
@@ -241,7 +252,7 @@ proc commitTransaction*(mgr: TransactionManager,
   # Timeout check
   if isExpired(rec, mgr):
     rec.state = TxnStatusAborted
-    mgr.txns[txnId] = rec
+    mgr.txns.del(txnId) # Drop entry — frees readSet/writeSet HashSets
     return CommitTxnResponse(status: TxnCommitTimeout, commitTimestamp: 0)
 
   # Read-only transactions never conflict
@@ -249,7 +260,11 @@ proc commitTransaction*(mgr: TransactionManager,
     let commitTs = mgr.allocTimestamp()
     rec.state = TxnStatusCommitted
     rec.commitTimestamp = commitTs
-    mgr.txns[txnId] = rec
+    # Drop the entry — we don't need to remember read-only txns past commit
+    # (they don't write to commitIndex). The result is returned below;
+    # we don't need to keep `rec` in `txns` for idempotency since the
+    # commitIndex has no entry for read-only txns anyway.
+    mgr.txns.del(txnId)
     return CommitTxnResponse(status: TxnCommitOK, commitTimestamp: commitTs)
 
   # Conflict detection: for each key in our write set, check whether another
@@ -259,16 +274,17 @@ proc commitTransaction*(mgr: TransactionManager,
     if lastCommitTs > rec.readTimestamp:
       # Conflicting write found — abort
       rec.state = TxnStatusAborted
-      mgr.txns[txnId] = rec
+      mgr.txns.del(txnId) # Drop entry on abort too
       return CommitTxnResponse(status: TxnCommitConflict, commitTimestamp: 0)
 
   # No conflict — assign commit timestamp and publish writes to the index
   let commitTs = mgr.allocTimestamp()
   for key in rec.writeSet:
     mgr.commitIndex.put(key, commitTs)
-  rec.state = TxnStatusCommitted
-  rec.commitTimestamp = commitTs
-  mgr.txns[txnId] = rec
+  # Drop the entry — commitIndex has the per-key data we need for future
+  # conflict detection. Keeping the TxnRecord in `txns` was a leak:
+  # every committed txn accumulated readSet/writeSet HashSets forever.
+  mgr.txns.del(txnId)
   CommitTxnResponse(status: TxnCommitOK, commitTimestamp: commitTs)
 
 proc rollbackTransaction*(mgr: TransactionManager,
@@ -283,7 +299,9 @@ proc rollbackTransaction*(mgr: TransactionManager,
 
   if rec.state == TxnStatusActive or rec.state == TxnStatusAborted:
     rec.state = TxnStatusAborted
-    mgr.txns[txnId] = rec
+    # Drop the entry — same reasoning as commitTransaction: abort is final,
+    # and the readSet/writeSet HashSets in TxnRecord would otherwise leak.
+    mgr.txns.del(txnId)
     return RollbackTxnResponse(status: TxnRollbackOK)
 
   # Committed transactions cannot be rolled back — report as "not found"

@@ -187,6 +187,12 @@ type
       delFilter*: Option[Expr]
       delAllColumns*: seq[string]
       delPkColumn*: string
+      delPkSpec*: PrimaryKeySpec ## PK spec for binary encoding (for point-lookup optimisation)
+      delPkPointLookups*: seq[string]  ## Binary-encoded PK values for point-lookup DELETE.
+                                       ## When non-empty, the executor does GET+DELETE per
+                                       ## key instead of a full table scan + client filter.
+                                       ## Populated only when the WHERE clause is a
+                                       ## disjunction of `pk = literal` conditions.
 
     of poShowDatabases:
       discard
@@ -688,8 +694,17 @@ proc resolveTable*(client: FractioClient,
   # 400/800/1600/3200/6400ms = ~12.75s total. The retry also now handles
   # transport errors (NOT_LEADER, connection reset) that occur during
   # the META leader transition.
-  const maxCatalogMissRetries = 8
-  const catalogMissBaseBackoffMs = 50
+  #
+  # Bumped again (Jun 2026) from 8/50 to 16/100 to handle sustained
+  # META leadership instability on 3-replica clusters during heavy load.
+  # CRITICAL: Backoff is CAPPED at maxCatalogMissBackoffMs (5000) to avoid
+  # exponentially exploding waits — raw exponential at attempt 16 would be
+  # 100ms * 2^15 = ~55 minutes per retry. Capped schedule:
+  # 100,200,400,800,1600,3200,5000,... ~52s total. Outer queryWithRetry
+  # provides the longer-window retry budget.
+  const maxCatalogMissRetries = 16
+  const catalogMissBaseBackoffMs = 100
+  const maxCatalogMissBackoffMs = 5000 # Cap backoff at 5s to prevent runaway waits
   var recOpt: Option[TableRecord] = none(TableRecord)
 
   for attempt in 0 ..< maxCatalogMissRetries:
@@ -701,7 +716,9 @@ proc resolveTable*(client: FractioClient,
       # refreshes metadata and points at the new leader.
       if attempt < maxCatalogMissRetries - 1:
         discard client.refreshMetadata()
-        sleep(catalogMissBaseBackoffMs * (1 shl attempt))
+        let backoff = min(catalogMissBaseBackoffMs * (1 shl attempt),
+                          maxCatalogMissBackoffMs)
+        sleep(backoff)
         continue
       return none(TableDescriptor)
     if res.val.isSome:
@@ -713,11 +730,13 @@ proc resolveTable*(client: FractioClient,
         discard
 
     # Catalog miss: refresh metadata (re-resolves META leader) and retry
-    # with exponential backoff. This handles transient SM-replay lag after
-    # a META group leadership change.
+    # with exponential backoff (capped). This handles transient SM-replay
+    # lag after a META group leadership change.
     if attempt < maxCatalogMissRetries - 1:
       discard client.refreshMetadata()
-      sleep(catalogMissBaseBackoffMs * (1 shl attempt))
+      let backoff = min(catalogMissBaseBackoffMs * (1 shl attempt),
+                        maxCatalogMissBackoffMs)
+      sleep(backoff)
 
   if recOpt.isNone:
     return none(TableDescriptor)
@@ -1631,6 +1650,72 @@ proc planUpdate(stmt: Stmt, client: FractioClient,
   ))
   plan
 
+proc extractPkEqualityDisjunction(expr: Expr, pkCol: string,
+    pkSpec: PrimaryKeySpec): seq[string] =
+  ## Extract binary-encoded PK values from a WHERE clause that is a
+  ## disjunction (OR-chain) of PK equality conditions:
+  ##   pk = N OR pk = M OR pk = P ...
+  ## Returns the encoded PK values. If the expression is not a pure
+  ## disjunction of PK equalities, returns an empty seq (caller falls
+  ## back to full-scan DELETE).
+  ##
+  ## Supported shapes:
+  ##   1. Single: pk = N
+  ##   2. OR-chain: pk = N OR pk = M OR ...
+  ##   3. IN-list: pk IN (N, M, P)
+  ##
+  ## If ANY disjunct is not a PK equality (or IN-list on PK), we return
+  ## empty to signal "cannot optimise — fall back to scan+filter".
+  if expr == nil:
+    return @[]
+
+  # Case 3: IN-list on PK column
+  if expr.kind == exIn and not expr.inNot:
+    let inExpr = expr.inExpr
+    if inExpr.kind == exColumn and inExpr.colName == pkCol:
+      for item in expr.inList:
+        if item.kind != exLiteral:
+          return @[] # Non-literal in IN-list — can't optimise
+        let pkValOpt = extractPkValueFromLiteral(item, pkSpec)
+        if pkValOpt.isNone:
+          return @[]
+        result.add(pkValOpt.get())
+      return
+
+  # Case 1: single pk = N
+  if expr.kind == exBinOp and expr.binOp == boEq:
+    let pkValOpt = extractPkValueFromLiteral(expr.binRight, pkSpec)
+    let pkValOpt2 = extractPkValueFromLiteral(expr.binLeft, pkSpec)
+    if pkValOpt.isSome and expr.binLeft.kind == exColumn and
+       expr.binLeft.colName == pkCol:
+      result.add(pkValOpt.get())
+      return
+    if pkValOpt2.isSome and expr.binRight.kind == exColumn and
+       expr.binRight.colName == pkCol:
+      result.add(pkValOpt2.get())
+      return
+    # Not a PK equality — fall back
+    return @[]
+
+  # Case 2: OR-chain
+  if expr.kind == exBinOp and expr.binOp == boOr:
+    # Recursively extract from left and right
+    let leftVals = extractPkEqualityDisjunction(expr.binLeft, pkCol, pkSpec)
+    let rightVals = extractPkEqualityDisjunction(expr.binRight, pkCol, pkSpec)
+    if leftVals.len > 0 or rightVals.len > 0:
+      # But only valid if BOTH sides are non-empty (or one side is a
+      # single equality that produced exactly 1 value). If either side
+      # returned empty, it means that disjunct wasn't a PK equality.
+      # Exception: a single OR of two equalities where both return 1.
+      if leftVals.len == 0 or rightVals.len == 0:
+        return @[] # One side wasn't a PK equality — can't optimise
+      result = leftVals & rightVals
+      return
+    return @[]
+
+  # Unsupported shape
+  return @[]
+
 proc planDelete(stmt: Stmt, client: FractioClient,
     database, schema: string): Plan =
   let plan = newPlan()
@@ -1640,12 +1725,27 @@ proc planDelete(stmt: Stmt, client: FractioClient,
     raise planError(&"table '{stmt.delTableRef.fullName()}' not found")
   let desc = descOpt.get()
 
+  let pkCol = findPkColumn(desc)
+
+  # Optimisation: if the WHERE clause is a disjunction of PK equality
+  # conditions (pk = N OR pk = M OR ...), extract the PK values and do
+  # point GET+DELETE instead of a full table scan. This is critical for
+  # Phase B of the smoke test: 100 batches × 1000 OR clauses would
+  # otherwise scan 67K rows per group per batch = 6.7M row scans.
+  var pkPointLookups: seq[string] = @[]
+  if stmt.delWhere.isSome and pkCol.len > 0 and
+     desc.pkSpec.columns.len >= 1:
+    pkPointLookups = extractPkEqualityDisjunction(
+      stmt.delWhere.get(), pkCol, desc.pkSpec)
+
   plan.add(PlanOp(kind: poDelete,
     delTableId: desc.tableId,
     delTableName: desc.name,
     delFilter: stmt.delWhere,
     delAllColumns: columnNames(desc),
-    delPkColumn: findPkColumn(desc),
+    delPkColumn: pkCol,
+    delPkSpec: desc.pkSpec,
+    delPkPointLookups: pkPointLookups,
   ))
   plan
 
@@ -1789,6 +1889,8 @@ proc formatPlanOp*(op: PlanOp): string =
     s
   of poDelete:
     var s = &"Delete table={op.delTableName} (id={op.delTableId})"
+    if op.delPkPointLookups.len > 0:
+      s &= &" pk_point_lookups={op.delPkPointLookups.len}"
     if op.delFilter.isSome:
       s &= &" filter=({formatExpr(op.delFilter.get())})"
     s

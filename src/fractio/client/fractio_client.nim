@@ -247,6 +247,30 @@ proc getNodeConnectionInternal(client: FractioClient, nodeId: uint32): Option[
     return poolConnOpt
   return none(ProtocolClient)
 
+proc connectToNodeById(client: FractioClient, nodeId: uint32): Option[
+    ProtocolClient] =
+  ## Create a DIRECT (non-pooled) connection to a specific node by ID.
+  ##
+  ## This is used by `getGroupLeaderConnection` for the leader cache
+  ## (`leaderConnections[groupId]`). The leader cache manages its OWN
+  ## connection lifecycle — connections are disconnected on
+  ## invalidation, leader change, or client close. Routing these
+  ## through the connection pool would exhaust the pool's `maxTotal`
+  ## cap because cached leader connections are long-lived and never
+  ## released back to the pool (they're "permanently checked out" from
+  ## the pool's perspective). With maxTotal=32 and a 3-node cluster
+  ## having ~8 groups, the pool fills up after a few metadata refreshes
+  ## and ALL subsequent `acquire()` calls return `none`, causing
+  ## "too many retries" errors.
+  ##
+  ## By bypassing the pool, the leader cache's connections don't count
+  ## against `maxTotal`, leaving the pool free for short-lived
+  ## operations (scans, one-shot metadata fetches).
+  if nodeId notin client.nodes:
+    return none(ProtocolClient)
+  let nodeInfo = client.nodes[nodeId]
+  return client.connectToNode(nodeInfo.host, int(nodeInfo.clientPort))
+
 proc getNodeConnection(client: FractioClient, nodeId: uint32): Option[
     ProtocolClient] =
   ## Get or create a connection to a specific node
@@ -682,8 +706,11 @@ proc getGroupLeaderConnection*(client: FractioClient, groupId: GroupID): Option[
         client.leaderConnections.del(groupId)
         client.leaderConnectionNodes.del(groupId)
 
-      # Try to connect to leader (use internal version since we hold the lock)
-      let connOpt = client.getNodeConnectionInternal(groupInfo.leaderNodeId)
+      # Try to connect to leader directly (bypass pool — leader cache
+      # manages its own conn lifecycle; pool conns are for short-lived ops).
+      # Using the pool here would exhaust maxTotal since cached leader
+      # connections are never released back to the pool.
+      let connOpt = client.connectToNodeById(groupInfo.leaderNodeId)
       if connOpt.isSome:
         client.leaderConnections[groupId] = connOpt.get()
         client.leaderConnectionNodes[groupId] = groupInfo.leaderNodeId
@@ -692,7 +719,7 @@ proc getGroupLeaderConnection*(client: FractioClient, groupId: GroupID): Option[
 
     # Leader unknown or connection to known leader failed - try all replicas
     for nodeId in groupInfo.replicaNodeIds:
-      let connOpt = client.getNodeConnectionInternal(nodeId)
+      let connOpt = client.connectToNodeById(nodeId)
       if connOpt.isSome:
         # We'll try this connection; if it's not the leader,
         # the operation will fail and we'll retry
@@ -1515,7 +1542,9 @@ ProtocolError] =
     conn: ProtocolClient
     filter: Option[kvMsgs.WireFilterExpr]
     ownsConnection: bool ## True if we created a dedicated connection (must close after)
-    limit: uint32 ## Per-group scan limit. 0 means no limit (full scan).
+    leaderHost: string ## For owned conns: where to release the conn back to the pool.
+    leaderPort: int ## For owned conns: port of the leader node.
+    limit: uint32   ## Per-group scan limit. 0 means no limit (full scan).
     columns: Option[seq[string]] ## Column names for server-side projection (Tier-3a)
     topK: Option[kvMsgs.WireTopKSpec] ## Top-K spec for server-side heap pushdown (Tier-3b)
 
@@ -1550,19 +1579,25 @@ ProtocolError] =
     # frame interleaving when parallel streams run concurrently.
     var conn: ProtocolClient = cachedConn
     var ownsConn: bool = false
+    # Lifted out of the `if seenConns.contains` block so GroupScanArgs
+    # below can carry them for the eventual releaseNodeConn call in
+    # closeStream (via ownedConnRelease). When ownsConn=false these
+    # remain empty/0 and are ignored.
+    var leaderHost: string
+    var leaderPort: int = 0
 
     if seenConns.contains(cachedConn):
       # Shared connection — create a new one for this group to avoid
       # frame interleaving when parallel streams run concurrently on
       # the same TCP socket.
-      var leaderHost: string
-      var leaderPort: uint16
+      var lp: uint16
       withReadLock client.lock:
         if groupId in client.groups:
           let nodeId = client.groups[groupId].leaderNodeId
           if nodeId != 0 and nodeId in client.nodes:
             leaderHost = client.nodes[nodeId].host
-            leaderPort = client.nodes[nodeId].clientPort
+            lp = client.nodes[nodeId].clientPort
+      leaderPort = int(lp)
       if leaderHost.len > 0:
         # Acquire from the pool instead of opening a fresh conn. The
         # pool will hand back an idle conn if one exists, or open a
@@ -1592,6 +1627,8 @@ ProtocolError] =
       conn: conn,
       filter: filter,
       ownsConnection: ownsConn,
+      leaderHost: leaderHost,
+      leaderPort: int(leaderPort),
       limit: limit,
       columns: columns,
       topK: topK
@@ -1634,16 +1671,32 @@ ProtocolError] =
         chunkSize, 0, txnId, readTimestamp, args.groupId, args.filter, reverse,
         args.columns, args.topK)
     if streamRes.isOk:
+      # Attach the owned-conn release hook so closeStream returns the
+      # dedicated conn to the pool. See the parallel path below for the
+      # full rationale; the single-group path has the same leak.
+      if args.ownsConnection:
+        let argsRef = args
+        streamRes.value.ownedConnRelease =
+          proc(c: ProtocolClient) {.closure, gcsafe, raises: [].} =
+            # keepAlive=true: see parallel-path comment — the pool
+            # probes for socket liveness on acquire and drops stale conns.
+            try:
+              client.releaseNodeConn(c, argsRef.leaderHost, argsRef.leaderPort,
+                                     keepAlive = true)
+            except CatchableError, KeyError:
+              discard # Pool internals may raise on Table access races; best-effort.
       groupStreams.add(streamRes.value)
     else:
       if args.ownsConnection:
         # Release the dedicated conn back to the pool with keepAlive=false
-        # (we want it closed, not parked — it just failed). We need the
-        # leaderHost/leaderPort to call releaseNodeConn; the simpler fix
-        # is to store them in args at setup time. For now, just disconnect
-        # directly (still inside the pool's accounting via closeConn).
-        try: args.conn.disconnect("scan_failed_single")
-        except: discard
+        # (we want it dropped, not parked — the scan failed and the conn
+        # state may be unreliable). The pool checks connected.load() and
+        # disconnects dead conns as part of release().
+        try:
+          client.releaseNodeConn(args.conn, args.leaderHost, args.leaderPort,
+                                 keepAlive = false)
+        except CatchableError:
+          discard
       errors.add($args.groupId & ": " & streamRes.error.msg)
   else:
     # Multiple groups — open streams in parallel using threads.
@@ -1806,19 +1859,55 @@ ProtocolError] =
     for i in 0 ..< groupArgs.len:
       let res = setupResults[i]
       if res.ok:
-        groupStreams.add(cast[StreamingScanClient](res.streamPtr))
-      else:
-        # Stream failed — disconnect owned connections to prevent leaks
+        # Attach an owned-conn release hook so closeStream (called later
+        # by the caller, e.g. the SQL executor's `finally` block) returns
+        # this scan's dedicated connection to the pool. Without this,
+        # every successful multi-group scan leaks one pool slot per
+        # shared-leader group, eventually exhausting the pool's per-node
+        # cap. The next scan then acquires a stale conn (or fails to
+        # acquire one entirely) and produces "send incomplete: sent 0 of
+        # N bytes" errors when the conn's TCP state diverged from
+        # `connected=true`. See ConnReleaseFn in protocol/client.nim for
+        # the pool-side behavior on release.
+        let stream = cast[StreamingScanClient](res.streamPtr)
         if groupArgs[i].ownsConnection:
-          try: groupArgs[i].conn.disconnect("scan_failed_parallel")
-          except: discard
+          let argsRef = groupArgs[i]
+          stream.ownedConnRelease = proc(c: ProtocolClient) {.closure, gcsafe,
+              raises: [].} =
+            # Capture-by-reference for argsRef/host/port. The closure
+            # is called exactly once from closeStream.
+            #
+            # keepAlive=true: the conn was successfully used for a scan
+            # and the drain cleared any buffered frames, so it's safe to
+            # park for reuse. The pool's acquire() path probes for
+            # socket liveness (POLLIN with 0 revents would indicate EOF)
+            # and discards any conn that the server has half-closed in
+            # the meantime, so we don't need to force a reconnect here.
+            try:
+              client.releaseNodeConn(c, argsRef.leaderHost, argsRef.leaderPort,
+                                     keepAlive = true)
+            except CatchableError, KeyError:
+              discard # Pool internals may raise on Table access races; best-effort.
+        groupStreams.add(stream)
+      else:
+        # Stream failed — release the owned conn back to the pool with
+        # keepAlive=false (we don't want to park a half-broken conn).
+        # The pool will check connected.load() and drop it if dead.
+        if groupArgs[i].ownsConnection:
+          try:
+            client.releaseNodeConn(groupArgs[i].conn, groupArgs[i].leaderHost,
+                groupArgs[i].leaderPort, keepAlive = false)
+          except CatchableError:
+            discard
         errors.add(setupArgs[i].groupIdStr & ": " & res.errorMsg)
 
     # If any stream failed in a multi-group scan, return an error instead
     # of producing partial results. Partial data silently returns wrong
     # answers (e.g., 322 rows instead of 999) and corrupts ORDER BY results.
     if errors.len > 0:
-      # Clean up any successfully opened streams before returning error
+      # Clean up any successfully opened streams before returning error.
+      # closeStream handles owned-conn release via the closure attached
+      # above, so even on this error path the pool gets its conns back.
       for stream in groupStreams:
         stream.closeStream()
       groupStreams = @[]

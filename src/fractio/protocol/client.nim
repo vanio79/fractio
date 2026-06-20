@@ -153,8 +153,11 @@ proc pollForRead(fd: cint, timeoutMs: int): bool {.gcsafe, raises: [].} =
 
 proc pollForWrite(fd: cint, timeoutMs: int): bool {.gcsafe, raises: [].} =
   ## Poll socket for write readiness using poll() with timeout.
-  ## Returns true if socket is writable (or POLLERR/POLLHUP), false on
-  ## timeout or error. Safe for any fd value (no FD_SETSIZE limit).
+  ## Returns true if socket is writable (POLLOUT), false on timeout or
+  ## hard error. POLLERR/POLLHUP are NOT treated as "ready for write"
+  ## — the caller in sendNonBlocking explicitly checks revents and bails
+  ## out if the peer is gone (since posix.send() will then return EPIPE
+  ## and we want to surface that as a real error, not loop forever).
   let waitMs: cint = if timeoutMs <= 0: -1 else: timeoutMs.cint
   var pfd: TPollfd
   pfd.fd = fd
@@ -166,8 +169,10 @@ proc pollForWrite(fd: cint, timeoutMs: int): bool {.gcsafe, raises: [].} =
   while true:
     let rc = posix.poll(addr pfd, Tnfds(1), waitMs)
     if rc > 0:
-      # Ready. revents may include POLLERR/POLLHUP — treat as "woken".
-      return (pfd.revents and cshort(POLLOUT or POLLERR or POLLHUP)) != 0
+      # POLLOUT means writable. POLLERR/POLLHUP mean peer is gone;
+      # we store the revents in pfd.revents so the caller can inspect
+      # them after this returns.
+      return (pfd.revents and cshort(POLLOUT)) != 0
     if rc == 0:
       # Timeout.
       return false
@@ -239,18 +244,55 @@ proc recvNNonBlocking(fd: cint, n: int, timeoutMs: int): string {.gcsafe,
 # Non-blocking send with poll() polling
 # ---------------------------------------------------------------------------
 
+proc pollForWriteWithDead(fd: cint, timeoutMs: int): tuple[ready, dead: bool]
+    {.gcsafe, raises: [].} =
+  ## Like pollForWrite but ALSO reports POLLERR/POLLHUP. Used by
+  ## sendNonBlocking so it can bail out immediately when the peer closes
+  ## the connection, instead of looping maxRetries times on a dead fd.
+  let waitMs: cint = if timeoutMs <= 0: -1 else: timeoutMs.cint
+  var pfd: TPollfd
+  pfd.fd = fd
+  pfd.events = cshort(POLLOUT or POLLERR or POLLHUP)
+  pfd.revents = 0
+
+  var attempts = 0
+  const maxAttempts = 16
+  while true:
+    let rc = posix.poll(addr pfd, Tnfds(1), waitMs)
+    if rc > 0:
+      let ready = (pfd.revents and cshort(POLLOUT)) != 0
+      let dead = (pfd.revents and cshort(POLLERR or POLLHUP)) != 0
+      return (ready, dead)
+    if rc == 0:
+      return (false, false)
+    let err = errno
+    if err == EINTR:
+      inc attempts
+      if attempts >= maxAttempts: return (false, false)
+      continue
+    return (false, false)
+
 proc sendNonBlocking(fd: cint, data: string, timeoutMs: int): int {.gcsafe,
     raises: [].} =
   ## Send data using non-blocking socket with poll() polling.
   ## Returns number of bytes sent (< data.len means timeout/error).
+  ## On POLLERR/POLLHUP (peer closed connection), returns -1 immediately
+  ## rather than wasting retries on a dead fd.
   var total = 0
   var retries = 0
   const maxRetries = 100
   let sockFd = SocketHandle(fd)
 
   while total < data.len and retries < maxRetries:
-    # Poll for write readiness
-    if not pollForWrite(fd, timeoutMs):
+    # Poll for write readiness AND check for peer-closed condition
+    let (ready, dead) = pollForWriteWithDead(fd, timeoutMs)
+    if dead:
+      # Peer closed connection (POLLHUP or POLLERR). No point retrying
+      # — posix.send would just return EPIPE/ECONNRESET. Surface a
+      # negative total so callers treat this as a real error.
+      errno = EPIPE
+      return -1
+    if not ready:
       # pollForWrite can spuriously report "not writable" on a freshly-
       # established socket (e.g., right after connect(), or with MSG_NOSIGNAL
       # semantics). Treat it like EAGAIN: brief yield, then retry.
@@ -280,7 +322,7 @@ proc sendNonBlocking(fd: cint, data: string, timeoutMs: int): int {.gcsafe,
         when defined(posix):
           discard posix.usleep(1000)
       else:
-        # Real error
+        # Real error (EPIPE, ECONNRESET, etc.)
         return total
 
   total
@@ -298,8 +340,13 @@ proc sendRaw(client: ProtocolClient, data: string): PResult {.gcsafe, raises: []
 
     let sent = sendNonBlocking(client.fd, data, client.config.timeoutMs)
     if sent != data.len:
-      # Partial send or timeout - treat as error
+      # Partial send or timeout - treat as error. sendNonBlocking returns
+      # -1 when POLLHUP/POLLERR fires (peer closed the connection); the
+      # error message reflects that for clearer debugging.
       client.connected.store(false)
+      if sent < 0:
+        return pErr(newProtocolError(peInternal,
+          "send failed: peer closed connection (EPIPE/POLLHUP)"))
       return pErr(newProtocolError(peInternal,
         "send incomplete: sent " & $sent & " of " & $data.len & " bytes"))
 
@@ -609,6 +656,21 @@ type
     peekPair*: Option[kvMsgs.ScanPair]
     exhausted*: bool
 
+  ConnReleaseFn* = proc (conn: ProtocolClient) {.closure, gcsafe, raises: [].}
+    ## Optional connection-release callback. When attached to a
+    ## StreamingScanClient via `ownedConnRelease`, closeStream will call it
+    ## to return the underlying ProtocolClient to its connection pool
+    ## (with keepAlive driven by the pool's view of conn health).
+    ##
+    ## This is how FractioClient's connection pool reclaims dedicated
+    ## connections that were opened for parallel multi-group scans — the
+    ## streaming client wraps a pool-owned conn, and once the scan ends,
+    ## the pool must get the conn back so it can be reused or replaced
+    ## under its bounded cap. Without this callback, every multi-group
+    ## scan on a shared-leader cluster leaks one conn per shared leader,
+    ## eventually hitting the pool's per-node cap and causing subsequent
+    ## scans to fail with "send incomplete" on stale conns.
+
   StreamingScanClient* = ref object
     ## Client-side streaming scan state - reads multiple frames from server.
     ## Supports two modes:
@@ -625,6 +687,14 @@ type
     framePos*: int
     totalReceived*: int
     error*: Option[ProtocolError]
+
+    # Connection-pool integration
+    ownedConnRelease*: ConnReleaseFn
+      ## If non-nil, this stream "owns" its conn (acquired from a pool
+      ## specifically to avoid parallel-stream frame interleaving on a
+      ## shared leader). closeStream calls this exactly once to return
+      ## the conn to the pool — see ConnReleaseFn docstring for the
+      ## leak this prevents.
 
     # K-way merge mode fields
     pairsSent*: int
@@ -1194,6 +1264,16 @@ proc closeStream*(ss: StreamingScanClient) {.gcsafe, raises: [].} =
   ## For non-exhausted streams, we drain remaining server frames instead of
   ## disconnecting the TCP connection. This preserves the connection cache
   ## and avoids the ~100ms reconnect cost on subsequent queries.
+  ##
+  ## If the stream owns its connection (acquired from a pool to avoid
+  ## parallel-stream frame interleaving on a shared leader), closeStream
+  ## invokes `ownedConnRelease` exactly once after the drain finishes so
+  ## the pool can reclaim the conn. Without this hook, every multi-group
+  ## scan on a shared-leader cluster leaks one pool slot per shared leader
+  ## — eventually hitting the pool's per-node cap and triggering
+  ## "send incomplete: sent 0 of N bytes" errors on the next scan when a
+  ## stale conn is returned. The exact-once guard prevents double-release
+  ## when both the parent k-way merge and the sub-stream call closeStream.
   let wasExhausted = ss.exhausted
   let wasKWay = ss.kWayMergeMode
   let hadMore = ss.hasMore
@@ -1222,6 +1302,19 @@ proc closeStream*(ss: StreamingScanClient) {.gcsafe, raises: [].} =
           ", totalReceived=" & $ss.totalReceived & ")")
 
   ss.exhausted = true
+
+  # Release the owned conn back to the pool exactly once. We do this AFTER
+  # drain so the conn is in a known clean state for the next acquirer. If
+  # drain disconnected the conn (server crashed mid-stream), the release
+  # callback will see `connected=false` and drop the conn instead of
+  # parking a dead conn on the idle list.
+  if ss.ownedConnRelease != nil and ss.client != nil:
+    try:
+      ss.ownedConnRelease(ss.client)
+    except CatchableError:
+      discard # Best-effort; the pool's own try/except handles failures.
+    ss.ownedConnRelease = nil
+    ss.client = nil
   ss.hasMore = false
 
 proc getError*(ss: StreamingScanClient): Option[ProtocolError] {.gcsafe,

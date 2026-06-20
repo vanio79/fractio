@@ -210,7 +210,13 @@ proc buildDeleteByIdBatch(ids: seq[int]): string =
 
 proc isTransientError(msg: string): bool =
   ## Heuristic: errors that look transient (admission control, connection refused,
-  ## leader handover, "no connection to group leader") and worth retrying.
+  ## leader handover, "no connection to group leader", pool conn races) and
+  ## worth retrying. The pool-conn races (send incomplete, partial stream
+  ## failure) happen when a pooled conn's underlying TCP connection dies
+  ## between the socketIsAlive probe and the first send — typically when the
+  ## server-side idle timeout closes the conn while it's parked. The next
+  ## scan gets an EPIPE on send and the conn is replaced; retrying once
+  ## succeeds against the fresh conn.
   if msg.len == 0: return false
   let lower = msg.toLowerAscii()
   return "memory budget" in lower or
@@ -218,18 +224,24 @@ proc isTransientError(msg: string): bool =
          "no connection" in lower or
          "connection refused" in lower or
          "connection reset" in lower or
+         "send incomplete" in lower or
+         "partial stream failure" in lower or
          "table " in lower and "not found" in lower or
          "timed out" in lower or
-         "leader" in lower
+         "leader" in lower or
+         "too many retries" in lower or
+         "raft append failed" in lower
 
 proc queryWithRetry(
     client: FractioClient,
     sql: string,
     database, schema: string,
-    maxAttempts: int = 5,
+    maxAttempts: int = 20,
     backoffMs: int = 2000
   ): ExecResultKind {.discardable.} =
   ## Run client.query, retrying on transient errors. Returns the final kind.
+  ## 20 attempts with exponential backoff up to 60s covers ~10 minutes of
+  ## META group instability during heavy 1M-row loads.
   var attempt = 0
   var lastErr = ""
   while attempt < maxAttempts:
@@ -242,7 +254,8 @@ proc queryWithRetry(
       echo &"    non-retryable error: {lastErr}"
       return res.kind
     if attempt < maxAttempts:
-      let wait = backoffMs * attempt
+      # Capped exponential backoff: 2s, 4s, 6s, ..., up to 30s
+      let wait = min(backoffMs * attempt, 30_000)
       echo &"    transient error (attempt {attempt}/{maxAttempts}): {lastErr} - retrying in {wait}ms"
       sleep(wait)
   echo &"    giving up after {maxAttempts} attempts: {lastErr}"

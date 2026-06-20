@@ -15,7 +15,7 @@
 # All shared mutable state is protected by Locks.
 
 import std/[net, tables as stdtables, strformat, strutils, times, atomics,
-    locks, options, algorithm, os]
+    locks, options, algorithm, os, sequtils]
 import posix as posixSys
 import nativesockets
 import ../utils/socket_utils
@@ -482,10 +482,29 @@ type
   AcceptLoopArgs* = tuple[srv: ProtocolServer, sock: Socket]
   L0CompactionArgs* = tuple[srv: ProtocolServer, threshold: int]
 
+  ## Heap-resident holder for client-loop thread arguments.
+  ## Indirection allows the worker thread to null out the `conn` field
+  ## in its `finally` block, releasing the ClientConnection ref so it can
+  ## be GC-collected. Without this, every client connection would leak a
+  ## ClientConnection (Socket, Lock, address string) pinned by the
+  ## Thread[]'s hidden args tuple.
+  ##
+  ## The Thread[ClientLoopHolder] itself remains in `threadStore` (so the
+  ## Nim GC won't collect the thread's stack), but the holder no longer
+  ## references the connection once the thread finishes.
+  ClientLoopHolder* = ref object
+    srv*: ProtocolServer
+    conn*: ClientConnection
+    done*: Atomic[bool] ## Set to true in worker finally (signals completion)
+
 # Module-level thread storage: keeps Thread objects alive for the process
 # lifetime.  Protected by threadStoreMu. Each thread references its server
 # so we know which threads belong to which server.
-var threadStore {.global.}: seq[ref Thread[ClientLoopArgs]] = @[]
+#
+# IMPORTANT: `threadStore` only stores Thread[ClientLoopHolder] entries —
+# the ClientLoopHolder is an indirection that can release its refs. Do not
+# add Thread[ClientLoopArgs] entries here or the connection will leak.
+var threadStore {.global.}: seq[ref Thread[ClientLoopHolder]] = @[]
 var acceptThreadStore {.global.}: seq[ref Thread[AcceptLoopArgs]] = @[]
 var l0CompactionThreadStore {.global.}: seq[ref Thread[L0CompactionArgs]] = @[]
 var threadStoreMu {.global.}: Lock
@@ -596,13 +615,32 @@ proc sendRaw(conn: ClientConnection, data: string) {.gcsafe, raises: [].} =
   ## one go (e.g. a 170KB scan response) — without that, partial sends
   ## would interleave with subsequent frames on the wire, corrupting
   ## the stream.
+  ##
+  ## FIX: We previously closed the socket on any partial send or timeout.
+  ## That was wrong: a slow consumer can drain data over several seconds,
+  ## but closing the socket guarantees the client gets a "send incomplete"
+  ## error on the next request (the conn is gone, but the client hasn't
+  ## noticed yet). The kernel TCP buffer is the source of truth — if it
+  ## accepted the bytes, they WILL be delivered eventually. So we now:
+  ##   - Wait longer (30s per poll call, up to 100 retries = 3000s cap)
+  ##     to handle slow consumers on the wire
+  ##   - Only close the socket on a HARD error (sendNonBlocking returns
+  ##     -1 with errno=EPIPE) so the reader thread exits cleanly when
+  ##     the peer is genuinely gone
+  ##
+  ## sendNonBlocking now returns -1 when POLLHUP/POLLERR fires (peer
+  ## closed), distinguishing it from a partial send (returned value > 0
+  ## but < data.len — kernel has the bytes, just slow to drain).
   let fd = conn.socket.getFd().cint
-  let timeoutMs = 5000
+  let timeoutMs = 30000 ## Generous timeout — clients may need 5-10s to drain
   let sent = sendNonBlocking(fd, data, timeoutMs)
   if sent != data.len:
-    # Partial send or timeout - the connection is likely broken. Close it
-    # so the reader thread exits cleanly on its next loop iteration.
-    try: conn.socket.close() except CatchableError: discard
+    # sent < 0 = peer closed (EPIPE/POLLHUP); truly dead conn, close it.
+    # 0 <= sent < data.len = partial-send timeout; kernel may still have
+    #   the bytes — DO NOT close (would cause "send incomplete" errors
+    #   on the client side for already-buffered data).
+    if sent < 0:
+      try: conn.socket.close() except CatchableError: discard
 
 proc sendFrame(conn: ClientConnection, payload: string,
     requestId: uint32, flags: uint16 = FlagIsResponse) {.gcsafe, raises: [].} =
@@ -2521,11 +2559,22 @@ proc clientLoop(server: ProtocolServer,
 # Thread entry points
 # ---------------------------------------------------------------------------
 
-proc clientLoopThread(args: ClientLoopArgs) {.thread.} =
+proc clientLoopThread(holder: ClientLoopHolder) {.thread.} =
+  ## Worker entry point for a client connection.
+  ##
+  ## `holder` is a ref object so we can null out its fields in `finally`
+  ## to release the strong refs the Thread holds. Without this indirection,
+  ## the hidden args tuple inside Thread[ClientLoopArgs] would keep every
+  ## past ClientConnection alive forever, leaking a Socket + Lock per
+  ## connection. See ClientLoopHolder for details.
   try:
-    clientLoop(args.srv, args.conn)
+    clientLoop(holder.srv, holder.conn)
   finally:
-    discard args.srv.clientThreadCount.fetchSub(1)
+    # Release the connection ref so the ClientConnection (Socket, Lock,
+    # mvcc session) can be GC-collected. The server ref is shared and
+    # stays alive in many other places, so leave it.
+    holder.conn = nil
+    holder.done.store(true, moRelease)
 
 proc acceptLoop(args: AcceptLoopArgs) {.thread.} =
   let server = args.srv
@@ -2583,12 +2632,21 @@ proc acceptLoop(args: AcceptLoopArgs) {.thread.} =
 
       # Allocate a heap-resident Thread so its lifetime is not tied to this
       # stack frame.  Store in the module-level threadStore so GC won't collect.
-      let tRef = new Thread[ClientLoopArgs]
+      #
+      # IMPORTANT: We pass a `ClientLoopHolder` ref (not the raw tuple)
+      # so the worker can null out `holder.conn` in its `finally` block
+      # and release the ClientConnection ref. Without this indirection,
+      # every past connection would be pinned forever inside the
+      # Thread[]'s hidden args, leaking Socket+Lock+address per request
+      # — observed as Node 1 RSS growing to 2 GB under sustained writes.
+      let holder = ClientLoopHolder(srv: server, conn: conn)
+      holder.done.store(false, moRelaxed)
+      let tRef = new Thread[ClientLoopHolder]
       {.cast(gcsafe).}:
         withLock(threadStoreMu):
           threadStore.add(tRef)
         discard server.clientThreadCount.fetchAdd(1)
-      createThread(tRef[], clientLoopThread, (server, conn))
+      createThread(tRef[], clientLoopThread, holder)
   finally:
     discard server.acceptThreadCount.fetchSub(1)
 
@@ -2751,12 +2809,13 @@ proc addPeerToRaft*(server: ProtocolServer, peerNodeId: uint32,
 
   # Only the meta leader should drive peer addition.
   # CRITICAL: During cluster startup, the seed node may not have won the META
-  # group election yet (election timeout is 300-600ms). If we bail immediately,
+  # group election yet. With electionTimeoutLower=3000ms + electionTimeoutUpper=5000ms,
+  # the first election can take up to ~5s in the worst case. If we bail early,
   # JoinGroup RPCs are never sent and the joining node falls back to creating
   # a single-member group, causing split-brain with the same GroupID.
-  # Wait up to 1.5 seconds for the election to complete.
+  # Wait up to 15 seconds for the election to complete (covers 3 retry cycles).
   var isMetaLeader = false
-  for attempt in 0 ..< 15:
+  for attempt in 0 ..< 150:
     if coord.isLeader(META_GROUP_ID):
       isMetaLeader = true
       break
@@ -2767,7 +2826,7 @@ proc addPeerToRaft*(server: ProtocolServer, peerNodeId: uint32,
     sleep(100)
   if not isMetaLeader:
     {.cast(gcsafe).}: {.cast(raises: []).}:
-      warn("addPeerToRaft: NOT meta leader after 1.5s, skipping add_srv",
+      warn("addPeerToRaft: NOT meta leader after 15s, skipping add_srv",
         {"peerNodeId": $peerNodeId}.toTable)
     # Still register peer info so this node knows about the new peer
     coord.peerInfo[peerNodeId] = (host: host, port: raftPort)
@@ -2815,14 +2874,17 @@ proc addPeerToRaft*(server: ProtocolServer, peerNodeId: uint32,
 
   # Add all known peers
   for (nodeId, peerData) in coord.peerInfo.pairs:
+    # Skip ourselves - we already added ourselves above, and adding again
+    # would cause duplicate entries in the members list, leading to wrong
+    # quorum calculation (e.g., quorum=3 instead of 2 for a 3-node cluster).
+    if nodeId == uint32(server.config.serverId):
+      continue
     # Look up the correct client port from the node registry or KV store.
     # peerData.port is the RAFT port, NOT the client port — deriving it
     # as raft+100 is wrong because the mapping is config-dependent.
     var memberClientPort = uint16(0)
     if nodeId == peerNodeId:
       memberClientPort = uint16(clientPort)
-    elif nodeId == uint32(server.config.serverId):
-      memberClientPort = uint16(server.config.port)
     else:
       # Try node registry first (fast, in-memory)
       if server.nodeRegistry != nil:
@@ -2846,6 +2908,23 @@ proc addPeerToRaft*(server: ProtocolServer, peerNodeId: uint32,
   let myNodeId = server.config.serverId
   let myRaftPort = coord.port
   let myHost = server.config.host
+
+  # CRITICAL: For a freshly-started seed node, the META and DATA groups
+  # were created as single-member groups. As peers join, we use
+  # addServerToGroup (NOT recreation) to add them. The save_config callback
+  # in the C++ shim handles updating the quorum to the correct value.
+  #
+  # We previously tried to destroy+recreate the group to fix the
+  # single-member-quorum-stuck-at-1 problem, but that approach has a fatal
+  # flaw: the callback_state_mgr in the C++ shim LOADs the saved config
+  # from disk and APPENDS the new servers to it, instead of replacing it.
+  # This results in num_servers doubling on each recreation
+  # (e.g., 1->2 actually becomes 1->3, 2->3 actually becomes 3->4, etc.),
+  # causing quorum miscalculation and split-brain in 3-replica clusters.
+  #
+  # The C++ bug would require a shim rebuild to fix. Until then, the
+  # correct flow is addServerToGroup + save_config -> update_quorum.
+  discard
 
   for groupId in [META_GROUP_ID, DATA_GROUP_START_ID]:
     let groupUlid = groupIDToULID(groupId)

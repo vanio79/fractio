@@ -166,14 +166,21 @@ proc newMultiplexedRaftTransport*(nodeId: core_types.NodeID, host: string,
 const
   RaftMagic = 0x52414654'u32 # "RAFT" in hex
   FrameHeaderSize = 20       # magic(4) + groupId(16)
+                             # On-wire frame: [magic(4)][groupId(16)][length(4 BE)][payload(N)]
+                       # The 4-byte length prefix is written by encodeRaftFrame and consumed by
+                       # readOneMessage. Without it, the reader would consume 4 bytes of the actual
+                       # payload as the length, corrupting every small message (heartbeats,
+                       # append_entries) and only "accidentally" working for messages whose first
+                             # 4 payload bytes happened to encode a reasonable length.
 
 proc encodeRaftFrame(groupId: GroupID, payload: string): string =
   ## Encode a message with GroupID prefix.
   # Frame format:
   # [4 bytes]  magic (0x52414654)
   # [16 bytes] GroupID (ULID)
+  # [4 bytes]  payload length (big-endian uint32)
   # [N bytes]  payload
-  result = newString(FrameHeaderSize + payload.len)
+  result = newString(FrameHeaderSize + 4 + payload.len)
   var pos = 0
 
   # Magic
@@ -188,6 +195,14 @@ proc encodeRaftFrame(groupId: GroupID, payload: string): string =
   for i in 0..<16:
     result[pos + i] = char(ulid.data[i])
   pos += 16
+
+  # Payload length (4 bytes, big-endian uint32)
+  let plen = uint32(payload.len)
+  result[pos] = char((plen shr 24) and 0xFF)
+  result[pos + 1] = char((plen shr 16) and 0xFF)
+  result[pos + 2] = char((plen shr 8) and 0xFF)
+  result[pos + 3] = char(plen and 0xFF)
+  pos += 4
 
   # Payload
   if payload.len > 0:
