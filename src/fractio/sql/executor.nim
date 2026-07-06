@@ -2012,7 +2012,12 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
           # non-exhausted streams by reading remaining frames (up to
           # MAX_DRAIN_FRAMES) or disconnecting on overflow.
           if scanOpened and scanStream != nil:
+            debug("execDeleteScanCloseStart: draining stream after Phase 1 scan")
             scanStream.closeStream()
+            debug("execDeleteScanCloseDone: stream closed, connection clean for Phase 2")
+
+        debug(&"execDeleteTxnPhase2Start: collected {deleteKeys.len} keys, " &
+            "batchChunk={DELETE_BATCH_CHUNK}, tableId={$op.delTableId}")
 
         # Phase 2: delete all collected keys in bounded batch chunks.
         # Now that the scan stream is closed and the connection is
@@ -2021,15 +2026,20 @@ proc executeWithTxn*(plan: Plan, ctx: ExecutorContext): ExecResult =
         var firstErr: string = ""
 
         var i = 0
+        debug(&"execDeleteBatchRpcStart: starting batch delete loop for " &
+            "{deleteKeys.len} keys against tableId={$op.delTableId}")
         while i < deleteKeys.len:
           let chunkEnd = min(i + DELETE_BATCH_CHUNK, deleteKeys.len)
           var batchOps: seq[KVBatchOp] = newSeqOfCap[KVBatchOp](chunkEnd - i)
           for j in i ..< chunkEnd:
             batchOps.add(KVBatchOp(kind: bopDelete, key: deleteKeys[j],
                 value: ""))
+          debug(&"execDeleteBatchRpcIter: keys={i}-{chunkEnd}/{deleteKeys.len}, " &
+              "batchSize={batchOps.len}")
           let batchRes = ctx.kv.batch(batchOps, txnId = ctx.txnId)
           if batchRes.isErr:
-            firstErr = &"batch delete failed: {batchRes.err}"
+            firstErr = &"batch delete failed at key {i}: {batchRes.err}"
+            debug(&"execDeleteBatchRpcError: " & firstErr)
             break
           totalCount += batchRes.val.successCount
           if batchRes.val.failureCount > 0 and

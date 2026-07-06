@@ -557,6 +557,18 @@ proc getBackend*(store: RaftKVStoreExt): WiscKeyBackend {.inline.} =
   ## Return the WiscKey backend from the coordinator's store.
   store.coordinator.store
 
+proc getMemtableSize*(store: RaftKVStoreExt): int64 {.inline, gcsafe.} =
+  ## Get the memtable size from the backend.
+  let backend = store.getBackend()
+  if backend == nil or not backend.isOpen: return 0'i64
+  return backend.getMemtableSize()
+
+proc getL0FileCount*(store: RaftKVStoreExt): int {.inline, gcsafe.} =
+  ## Get the L0 file count from the backend.
+  let backend = store.getBackend()
+  if backend == nil or not backend.isOpen: return 0
+  return backend.getL0FileCount()
+
 # Forward declaration — defined after lookupNodeInfo
 proc populateNodeInfoCache*(store: RaftKVStoreExt) {.gcsafe, raises: [].}
 

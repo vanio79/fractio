@@ -755,6 +755,24 @@ method getMemtableSize*(backend: WiscKeyBackend): int64 {.gcsafe.} =
   except ValueError:
     return 0'i64
 
+method getTotalSizeBytes*(backend: WiscKeyBackend): int64 {.gcsafe.} =
+  ## Return the total size of all SST files on disk (LevelDB data dir).
+  ## This is the persisted size; combined with memtable + block cache, it
+  ## represents the full storage footprint. Returns 0 on error.
+  if backend.path.len == 0:
+    return 0'i64
+  var total: int64 = 0
+  try:
+    for kind, path in walkDir(backend.path, relative = true):
+      if kind == pcFile:
+        try:
+          total += getFileSize(backend.path / path).int64
+        except OSError:
+          discard
+  except OSError:
+    discard
+  return total
+
 method destroy*(backend: WiscKeyBackend): bool =
   # First, close the database to flush any pending writes
   if backend.isOpen:

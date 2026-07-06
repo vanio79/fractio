@@ -177,17 +177,33 @@ proc encodeMVCCValue*(value: string, timestamp: Timestamp,
     isDeleted: bool = false, txnId: TransactionID = InvalidTransactionID): string =
   ## Encode MVCC value with metadata
   ## Format: <MAGIC (4 bytes)><timestamp (8 bytes)><txn_id ULID (16 bytes)><is_deleted (1 byte)><value>
-  var tsBytes = toBigEndian64(timestamp)
-  var txnBytes = ulidToBytes(ULID(txnId))
-  var delByte = if isDeleted: "1" else: "0"
-
-  # Build result string manually
-  result = MVCC_MAGIC
+  ##
+  ## MEMORY FIX (2026-07-06): Originally built with repeated `add` calls, each of
+  ## which could trigger a string reallocation. Under bursty allocation (1000+ ops
+  ## per mtBatch), this gave the Nim allocator ~5 reallocations per MVCC value and
+  ## a high fragmentation rate that pinned ~1.8GB of pages in the free list. Using
+  ## `newStringOfCap` + direct byte writes gives a single allocation per call.
+  let tsBytes = toBigEndian64(timestamp)
+  let txnBytes = ulidToBytes(ULID(txnId))
+  let totalLen = MVCC_HEADER_SIZE + value.len
+  result = newStringOfCap(totalLen)
+  result.setLen(totalLen)
+  # Magic
+  result[0] = 'M'
+  result[1] = 'V'
+  result[2] = 'C'
+  result[3] = 'C'
+  # Timestamp (big-endian, 8 bytes at offset 4)
   for i in 0..7:
-    result.add(chr(int(tsBytes[i])))
-  result.add(txnBytes)
-  result.add(delByte)
-  result.add(value)
+    result[4 + i] = chr(int(tsBytes[i]))
+  # Txn ULID (16 bytes at offset 12)
+  for i in 0..15:
+    result[12 + i] = txnBytes[i]
+  # Delete flag (1 byte at offset 28)
+  result[28] = if isDeleted: '1' else: '0'
+  # Value payload
+  for i in 0..<value.len:
+    result[MVCC_HEADER_SIZE + i] = value[i]
 
 proc isLikelyMVCCValue*(data: string): bool {.inline.} =
   ## Fast check if data starts with MVCC magic
@@ -236,7 +252,24 @@ proc decodeMVCCValue*(encodedValue: string): MVCCValue =
 proc encodeIntentKey*(userKey: string, txnId: TransactionID): string =
   ## Encode intent key for transaction resolution
   ## Format: <user_key><INTENT_SUFFIX><txn_id ULID (16 bytes)>
-  result = userKey & INTENT_SUFFIX & ulidToBytes(ULID(txnId))
+  ##
+  ## MEMORY FIX (2026-07-06): The original `userKey & INTENT_SUFFIX & ulidToBytes(...)`
+  ## used two string concatenations, each a fresh allocation. Using
+  ## `newStringOfCap` + manual copy gives a single allocation per call.
+  let txnBytes = ulidToBytes(ULID(txnId))
+  let totalLen = userKey.len + INTENT_SUFFIX.len + ULID_SIZE
+  result = newStringOfCap(totalLen)
+  result.setLen(totalLen)
+  var pos = 0
+  for i in 0..<userKey.len:
+    result[pos] = userKey[i]
+    inc pos
+  for i in 0..<INTENT_SUFFIX.len:
+    result[pos] = INTENT_SUFFIX[i]
+    inc pos
+  for i in 0..<ULID_SIZE:
+    result[pos] = txnBytes[i]
+    inc pos
 
 proc decodeIntentKey*(encodedKey: string): tuple[userKey: string,
     txnId: TransactionID] =

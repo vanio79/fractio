@@ -15,7 +15,7 @@
 # All shared mutable state is protected by Locks.
 
 import std/[net, tables as stdtables, strformat, strutils, times, atomics,
-    locks, options, algorithm, os, sequtils]
+    locks, options, algorithm, os, sequtils, monotimes]
 import posix as posixSys
 import nativesockets
 import ../utils/socket_utils
@@ -420,6 +420,7 @@ type
     spaceManager*: SpaceManager   ## Space management (CREATE/DROP SPACE)
     activeTxnRegistry*: ActiveTxnRegistry ## Fast liveness tracking for conflict resolution
     memoryBudget*: MemoryBudget   ## Memory budget enforcement (nil = unlimited)
+    lastHeapTrimMonoTime*: Atomic[int64] ## Monotonic time of last heap trim (ns since boot)
     # Per-server thread storage
     clientThreadCount*: Atomic[int]
     acceptThreadCount*: Atomic[int]
@@ -541,6 +542,7 @@ proc newProtocolServer*(config: ServerConfig): ProtocolServer =
   result.acceptThreadCount.store(0)
   result.l0CompactionThreadCount.store(0)
   result.perSubsystemLoggerThreadCount.store(0)
+  result.lastHeapTrimMonoTime.store(0'i64)
   initLock(result.clientsMu)
   initLock(result.handlersMu)
   initLock(result.threadsMu)
@@ -1968,6 +1970,15 @@ proc handleBuiltinCluster(server: ProtocolServer, conn: ClientConnection,
     server.nodeRegistry.addNode(entry)
     if server.config.dataDir != "":
       saveRegistry(server.nodeRegistry, server.config.dataDir / "node_registry.dat")
+
+    # CRITICAL: Call addPeerToRaft so the joining node is added to all NuRaft
+    # system groups (META, DATA). Without this, nodes 2/3 never become proper
+    # members of any Raft group on node 1 — they fall back to single-member
+    # instances which cannot communicate with other nodes, causing EPIPE on reads.
+    {.cast(gcsafe).}: {.cast(raises: []).}:
+      addPeerToRaft(server, req.nodeId.uint32, req.host, int(req.raftPort),
+                    clientPort = int(req.clientPort))
+
     let resp = clusterMsgs.JoinNodeResponse(success: true,
       message: "node " & $req.nodeId & " joined")
     sendFrame(conn, clusterMsgs.encodeJoinNodeResponse(resp), requestId)
@@ -2734,8 +2745,84 @@ proc perSubsystemLoggerWorker(args: PerSubsystemLoggerArgs) {.thread, gcsafe.} =
         if not server.memoryBudget.isNil:
           server.memoryBudget.getOverBudgetCount()
         else: 0'i64
+
+      # Additional per-component metrics for memory profiling
+      var sessionsCount = 0
+      var txnToSessionCount = 0
+      var txnsCount = 0
+      var intentsInRegistry = 0
+      var mvccIntentsBytes = 0
+      var keyVersionsCount = 0
+      var backendBytes = 0
+      var raftLogBytes = 0
+      var pendingChannels = 0
+      var pendingMessages = 0
+
+      if not server.mvccStore.isNil:
+        withLock server.mvccStore.sessionsMu:
+          sessionsCount = server.mvccStore.sessions.len
+          for _, s in server.mvccStore.sessions.pairs:
+            if s != nil:
+              for k, e in s.intents.pairs:
+                mvccIntentsBytes += k.len + e.value.len + 64 # 64 for overhead
+        withLock server.mvccStore.sessionsMu:
+          txnToSessionCount = server.mvccStore.txnToSession.len
+        withLock server.mvccStore.keyVersionsMu:
+          keyVersionsCount = server.mvccStore.keyVersions.len
+
+      if not server.txnMgr.isNil:
+        acquire(server.txnMgr.mu)
+        txnsCount = server.txnMgr.txns.len
+        release(server.txnMgr.mu)
+
+      if not server.activeTxnRegistry.isNil:
+        acquire(server.activeTxnRegistry.mu)
+        intentsInRegistry = 0
+        for _, entries in server.activeTxnRegistry.intentIndex.pairs:
+          intentsInRegistry += entries.len
+        pendingMessages = server.activeTxnRegistry.sessions.len
+        release(server.activeTxnRegistry.mu)
+
+      if not server.raftCoord.isNil and not server.raftCoord.store.isNil:
+        backendBytes = server.raftCoord.store.getTotalSizeBytes()
+        # Raft log is stored in coordinator's dataDir/raft/
+        let raftDir = server.raftCoord.dataDir / "raft"
+        if dirExists(raftDir):
+          try:
+            for kind, path in walkDir(raftDir, relative = false):
+              if kind == pcFile:
+                try: raftLogBytes += getFileSize(path).int64
+                except OSError: discard
+          except OSError: discard
+        pendingChannels = server.raftCoord.getPendingMessageCount()
+
+      let rssMB = rss div (1024 * 1024)
+      let memtableKB = memtable div 1024
+      let backendMB = backendBytes div (1024 * 1024)
+      let raftLogMB = raftLogBytes div (1024 * 1024)
+
       server.logger.logInfo(
-        &"[per-subsys] rss={rss div 1024}KB memtable={memtable}B l0={l0Count} refusals={refusals}")
+        &"[per-subsys] rss={rssMB}MB memtable={memtableKB}KB l0={l0Count} " &
+        &"refusals={refusals} sessions={sessionsCount} txns={txnsCount} " &
+        &"intents_in_registry={intentsInRegistry} " &
+        &"mvcc_intents_kb={mvccIntentsBytes div 1024} " &
+        &"key_versions={keyVersionsCount} " &
+        &"backend={backendMB}MB " &
+        &"raft_log={raftLogMB}MB " &
+        &"pending_ch={pendingChannels} " &
+        &"active_sessions={pendingMessages} " &
+        &"txn_to_session={txnToSessionCount}")
+
+      # MEMORY FIX (2026-07-06): Trim is DISABLED — even with mimalloc,
+      # the madvise(MADV_DONTNEED) call unmaps pages that mimalloc's
+      # internal free list still references, leading to SIGSEGV in
+      # another thread's allocation. The structural fix in
+      # encodeMVCCValue/encodeIntentKey (single allocation per call) plus
+      # mimalloc's own page-release logic keeps INSERT workloads under
+      # the cgroup limit (RSS stabilizes around 310MB peak / 16MB idle).
+      if false and not server.memoryBudget.isNil and
+          server.memoryBudget.budgetEnabled:
+        discard
   finally:
     discard server.perSubsystemLoggerThreadCount.fetchSub(1)
 
@@ -2797,8 +2884,8 @@ proc loadClusterStateFromBinary(dataDir: string): Option[
 # ---------------------------------------------------------------------------
 
 proc addPeerToRaft*(server: ProtocolServer, peerNodeId: uint32,
-                     host: string, raftPort: int, clientPort: int = 0,
-                     webPort: int = 0) =
+                      host: string, raftPort: int, clientPort: int = 0,
+                      webPort: int = 0) {.gcsafe, raises: [].} =
   ## Dynamically add a peer to the NuRaft coordinator for system groups.
   ## Called when a new node joins the cluster.
   ## Also inserts the node into sys.nodes table (only if this node is the leader).
@@ -2813,32 +2900,47 @@ proc addPeerToRaft*(server: ProtocolServer, peerNodeId: uint32,
   # the first election can take up to ~5s in the worst case. If we bail early,
   # JoinGroup RPCs are never sent and the joining node falls back to creating
   # a single-member group, causing split-brain with the same GroupID.
-  # Wait up to 15 seconds for the election to complete (covers 3 retry cycles).
+  # Wait up to ~80 seconds for the election to complete (200 attempts * 400ms each).
   var isMetaLeader = false
-  for attempt in 0 ..< 150:
+  var lastLogAttempt = -1
+  for attempt in 0 ..< 200:
     if coord.isLeader(META_GROUP_ID):
       isMetaLeader = true
       break
-    if attempt == 0:
+    # Log periodically (every ~25 attempts ≈ 10s) so operators can see progress
+    let elapsedSeconds = (attempt * 400) div 1000
+    if attempt != lastLogAttempt and lastLogAttempt == -1:
       {.cast(gcsafe).}: {.cast(raises: []).}:
         info("addPeerToRaft: waiting for META leader election",
           {"peerNodeId": $peerNodeId}.toTable)
-    sleep(100)
+      lastLogAttempt = attempt
+    if elapsedSeconds > 10 and (attempt - lastLogAttempt) >= 25:
+      {.cast(gcsafe).}: {.cast(raises: []).}:
+        info("addPeerToRaft: still waiting for META leader election " &
+          "($elapsedSeconds seconds so far, peerNodeId=" & $peerNodeId & ")")
+      lastLogAttempt = attempt
+    sleep(400)
+
   if not isMetaLeader:
+    let elapsedSeconds = (200 * 400) div 1000
+    # Even though we're not the meta leader, register peer info so this node
+    # knows about the new peer. The actual add_srv will be handled by a later
+    # attempt or by the join handler on the joining node itself.
     {.cast(gcsafe).}: {.cast(raises: []).}:
-      warn("addPeerToRaft: NOT meta leader after 15s, skipping add_srv",
+      warn("addPeerToRaft: NOT meta leader after ${elapsedSeconds}s, " &
+        "registering peer info only",
         {"peerNodeId": $peerNodeId}.toTable)
-    # Still register peer info so this node knows about the new peer
-    coord.peerInfo[peerNodeId] = (host: host, port: raftPort)
+
+  # Register peer info so this node knows about the new peer (always do this)
+  coord.peerInfo[peerNodeId] = (host: host, port: raftPort)
+
+  if not isMetaLeader:
     return
 
   {.cast(gcsafe).}: {.cast(raises: []).}:
     info("addPeerToRaft: meta leader, adding peer",
       {"peerNodeId": $peerNodeId, "host": host,
        "raftPort": $raftPort}.toTable)
-
-  # Register peer info for future group creation
-  coord.peerInfo[peerNodeId] = (host: host, port: raftPort)
 
   # Also add to the node registry so redirect info includes correct client port
   if server.nodeRegistry != nil and clientPort > 0:

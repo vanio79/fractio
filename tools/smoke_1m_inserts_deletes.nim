@@ -242,6 +242,7 @@ proc queryWithRetry(
   ## Run client.query, retrying on transient errors. Returns the final kind.
   ## 20 attempts with exponential backoff up to 60s covers ~10 minutes of
   ## META group instability during heavy 1M-row loads.
+  ## RAISES: CatchableError if all retries exhausted (permanent failure).
   var attempt = 0
   var lastErr = ""
   while attempt < maxAttempts:
@@ -252,14 +253,15 @@ proc queryWithRetry(
     inc attempt
     if not isTransientError(lastErr):
       echo &"    non-retryable error: {lastErr}"
-      return res.kind
+      raise newException(CatchableError,
+          &"Permanent query failure after {attempt} attempts: {lastErr}")
     if attempt < maxAttempts:
       # Capped exponential backoff: 2s, 4s, 6s, ..., up to 30s
       let wait = min(backoffMs * attempt, 30_000)
       echo &"    transient error (attempt {attempt}/{maxAttempts}): {lastErr} - retrying in {wait}ms"
       sleep(wait)
-  echo &"    giving up after {maxAttempts} attempts: {lastErr}"
-  return erkError
+  # All retries exhausted — permanent failure
+  raise newException(CatchableError, &"Permanent query failure: all {maxAttempts} attempts failed. Last error: {lastErr}")
 
 # ---------------------------------------------------------------------------
 # Main
@@ -412,6 +414,27 @@ proc main() =
   if maxRes.kind == erkRows and maxRes.rows.len > 0:
     echo &"  MAX(id)  = {maxRes.rows[0][0]} (expected {totalInserts})"
 
+  # --- Routing/leadership test: SELECT TOP 5 ORDER BY non-PK column ---
+  # This verifies that the catching_up fix prevents split-leadership issues
+  # when routing queries to non-META groups with ORDER BY on a non-PRIMARY KEY column.
+  echo ""
+  echo "--- Routing Test: SELECT TOP 5 ORDER BY value DESC (non-PK) ---"
+  let orderRes = client.query(
+    &"SELECT id, name, value FROM {DATABASE}.{SCHEMA}.{TABLE} " &
+    "ORDER BY value DESC LIMIT 5",
+    database = DATABASE, schema = SCHEMA)
+  if orderRes.kind == erkRows and orderRes.rows.len > 0:
+    echo "  Top 5 rows by value (descending):"
+    for row in orderRes.rows[0 ..< min(5, orderRes.rows.len)]:
+      let id = parseInt(row[0])
+      let name = row[1]
+      let val = parseInt(row[2])
+      echo &"    id={id}, name='{name}', value={val}"
+  elif orderRes.kind == erkError:
+    echo "  ERROR: ", orderRes.error
+  else:
+    echo "  WARNING: unexpected result kind for ORDER BY query"
+
   # =====================================================================
   # Phase B: bulk DELETE (every 10th id)
   # =====================================================================
@@ -481,25 +504,32 @@ proc main() =
       echo &"  id={probeId:>6} found={found:<5} expected={shouldExist:<5} [{tag}]"
 
   # =====================================================================
-  # Phase C: interleaved INSERT/DELETE
+  # Phase C: interleaved INSERT/DELETE/UPDATE (mixed workload with updates)
   # =====================================================================
   echo ""
   echo "================================================================"
-  echo "Phase C: INTERLEAVED INSERT/DELETE (mixed workload)"
-  echo "  ops:     ", INTERLEAVED_OPS, " (alternating insert/delete of 1 row)"
+  echo "Phase C: INTERLEAVED INSERT/DELETE/UPDATE (mixed workload)"
+  echo "  ops:     ", INTERLEAVED_OPS, " (3-way cycle: insert/delete/update)"
   echo "================================================================"
 
   var interStats = LatencyStats()
   var interInsertsOk = 0
   var interDeletesOk = 0
+  var interUpdatesOk = 0
   let t3 = epochTime()
   let baseId = totalInserts + 1 # use new id range for inserts
 
   for opIdx in 0 ..< INTERLEAVED_OPS:
-    let sql = if opIdx mod 2 == 0:
+    let sql = if opIdx mod 3 == 0:
+                # INSERT new row
                 &"INSERT INTO {DATABASE}.{SCHEMA}.{TABLE} (id, name, value) VALUES ({baseId + opIdx}, 'inter{opIdx:05d}', {opIdx})"
+              elif opIdx mod 3 == 1:
+                # UPDATE an existing row's value column
+                let targetId = ((opIdx * 7) mod (
+                    totalInserts div DELETE_STRIDE)) * DELETE_STRIDE + 2
+                &"UPDATE {DATABASE}.{SCHEMA}.{TABLE} SET value = {targetId * 100} WHERE id = {targetId}"
               else:
-                # Delete a random previously-inserted row
+                # DELETE a random previously-inserted row
                 let targetId = (opIdx * 13) mod totalInserts + 1
                 &"DELETE FROM {DATABASE}.{SCHEMA}.{TABLE} WHERE id = {targetId}"
 
@@ -509,14 +539,16 @@ proc main() =
     let ok = kind == erkModified
     interStats.record(be, ok)
     if ok:
-      if opIdx mod 2 == 0: inc interInsertsOk
+      case opIdx mod 3
+      of 0: inc interInsertsOk
+      of 1: inc interUpdatesOk
       else: inc interDeletesOk
     elif kind == erkError:
-      echo &"  ERROR op {opIdx}: failed after retries"
+      echo &"  ERROR op {opIdx}: failed after retries (kind={kind})"
 
   let t3End = epochTime() - t3
   echo ""
-  echo &"Phase C complete: {interInsertsOk} inserts + {interDeletesOk} deletes in {t3End:.2f}s"
+  echo &"Phase C complete: {interInsertsOk} inserts + {interUpdatesOk} updates + {interDeletesOk} deletes in {t3End:.2f}s"
   interStats.summary("INTERLEAVED ops", INTERLEAVED_OPS)
 
   # =====================================================================

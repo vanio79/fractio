@@ -16,6 +16,7 @@ import ../core/primary_key
 import ../core/kv_interface # for KVOpResult isErr/isOk procs
 import ../protocol/messages/kv # for WireFilterExpr types
 import ../utils/external_merge_sort # for SortSpec, orderItemsToSortSpecs
+import ../utils/logging as fractioLogging
 
 # ---------------------------------------------------------------------------
 # Plan types
@@ -702,43 +703,86 @@ proc resolveTable*(client: FractioClient,
   # 100ms * 2^15 = ~55 minutes per retry. Capped schedule:
   # 100,200,400,800,1600,3200,5000,... ~52s total. Outer queryWithRetry
   # provides the longer-window retry budget.
-  const maxCatalogMissRetries = 16
-  const catalogMissBaseBackoffMs = 100
-  const maxCatalogMissBackoffMs = 5000 # Cap backoff at 5s to prevent runaway waits
+  #
+  # Bumped again (Jun 29 2026): increased to 40/200 with higher backoff cap
+  # to handle extended WiscKey replay windows during heavy INSERT load on
+  # 3-replica clusters. Previously, all 16 retries exhausted within ~12.75s
+  # while the META group leader was stuck in a long replay window (catalog_miss
+  # on every attempt). New schedule: 200ms * (1..40 with cap at 8s) = ~33s total,
+  # with max elapsed time guard of 60s to prevent runaway waits.
+  const maxCatalogMissRetries = 40
+  const catalogMissBaseBackoffMs = 200
+  const maxCatalogMissBackoffMs = 8000 # Cap backoff at 8s (was 5s)
+  const maxCatalogMissElapsedSec = 60 # Hard timeout: stop after 60s total
+
   var recOpt: Option[TableRecord] = none(TableRecord)
+  let retryStartTime = epochTime() # Track elapsed time across retries (seconds since epoch)
 
   for attempt in 0 ..< maxCatalogMissRetries:
+    # Elapsed time guard: abort after maxCatalogMissElapsedSec to avoid
+    # runaway waits if the META group is permanently stuck.
+    let elapsedSec = epochTime() - retryStartTime
+    if elapsedSec > maxCatalogMissElapsedSec:
+      fractioLogging.error(&"resolveTable ABORTED: catalogKey={catalogKey} attempt={attempt} table={tableName} schema={schema} elapsedSec={elapsedSec:.1f} " &
+        &"error=reached {maxCatalogMissElapsedSec}s timeout")
+      return none(TableDescriptor)
+
+    # DIAGNOSTIC LOGGING - Track resolveTable retry behavior with timing
+    fractioLogging.debug(&"resolveTable: catalogKey={catalogKey} attempt={attempt} table={tableName} schema={schema} " &
+      &"elapsedSec={elapsedSec:.1f}")
+
+    let kvStart = epochTime()
     let res = client.kvGet(catalogKey)
+    let kvElapsedMs = ((epochTime() - kvStart) * 1000.0).int
     if res.isErr:
       # Transport / protocol error — treat as a miss and retry. The
       # META leader transition can produce transient RPC failures
-      # (NOT_LEADER, connection reset) that recover after the client
-      # refreshes metadata and points at the new leader.
+      # (NOT_LEADER, connection reset). Under sustained META instability
+      # during heavy load, calling refreshMetadata() adds Raft traffic
+      # that may trigger additional leadership changes — so we skip it
+      # here and rely on the outer queryWithRetry budget for longer-window
+      # recovery. The inner loop uses pure exponential backoff only.
+      fractioLogging.warn(&"resolveTable: catalogKey={catalogKey} attempt={attempt} ERROR={res.err} kvElapsedMs={kvElapsedMs}")
+
       if attempt < maxCatalogMissRetries - 1:
-        discard client.refreshMetadata()
         let backoff = min(catalogMissBaseBackoffMs * (1 shl attempt),
                           maxCatalogMissBackoffMs)
+        fractioLogging.debug(&"resolveTable: catalogKey={catalogKey} attempt={attempt} status=transport_error " &
+          &"backoffMs={backoff}")
         sleep(backoff)
         continue
       return none(TableDescriptor)
+
     if res.val.isSome:
       try:
         recOpt = some(decodeTableRecord(res.val.get()))
+        fractioLogging.debug(&"resolveTable: catalogKey={catalogKey} attempt={attempt} SUCCESS table={recOpt.get().name} " &
+          &"kvElapsedMs={kvElapsedMs}")
         break
       except ValueError:
         # Malformed record — treat as miss; retry may yield a fresh leader.
-        discard
+        fractioLogging.warn(&"resolveTable: catalogKey={catalogKey} attempt={attempt} ERROR=malformed table record")
 
-    # Catalog miss: refresh metadata (re-resolves META leader) and retry
-    # with exponential backoff (capped). This handles transient SM-replay
-    # lag after a META group leadership change.
+    # Catalog miss during WiscKey replay window after META leadership change.
+    # The new leader's state machine hasn't caught up yet, so sys.tables reads
+    # return found=false even though the table was written before the election.
+    # We skip refreshMetadata() here to avoid adding Raft traffic that could
+    # trigger additional elections during heavy load. Pure backoff + wait for
+    # WiscKey replay to complete.
     if attempt < maxCatalogMissRetries - 1:
-      discard client.refreshMetadata()
+      fractioLogging.debug(&"resolveTable: catalogKey={catalogKey} attempt={attempt} status=catalog_miss " &
+        &"kvElapsedMs={kvElapsedMs}")
+
       let backoff = min(catalogMissBaseBackoffMs * (1 shl attempt),
                         maxCatalogMissBackoffMs)
+      fractioLogging.debug(&"resolveTable: catalogKey={catalogKey} attempt={attempt} status=catalog_miss " &
+        &"backoffMs={backoff}")
+
       sleep(backoff)
 
   if recOpt.isNone:
+    # DIAGNOSTIC LOGGING - Log final failure with all retry attempts exhausted
+    fractioLogging.error(&"resolveTable FAILED: catalogKey={catalogKey} table={tableName} schema={schema} database={database} error=all retries exhausted")
     return none(TableDescriptor)
 
   let rec = recOpt.get()
@@ -808,7 +852,16 @@ proc resolveQualifiedTableRef*(client: FractioClient,
   # from any database.
   let catalogDbName = if scName == "sys": "sys" else: dbName
 
-  resolveTable(client, catalogDbName, scName, tableRef.table)
+  # DIAGNOSTIC LOGGING - Track all table resolutions
+  fractioLogging.debug(&"resolveQualifiedTableRef: database={dbName} schema={scName} table={tableRef.table}")
+
+  let result = resolveTable(client, catalogDbName, scName, tableRef.table)
+
+  # DIAGNOSTIC LOGGING - Log resolution success/failure
+  if result.isNone:
+    fractioLogging.warn(&"resolveQualifiedTableRef FAILED: database={dbName} schema={scName} table={tableRef.table} error=table not found")
+
+  return result
 
 proc genNewTableId*(timeProvider: TimeProvider = nil): TableId =
   ## Generate a new globally unique TableId using ULID.
@@ -1718,11 +1771,20 @@ proc extractPkEqualityDisjunction(expr: Expr, pkCol: string,
 
 proc planDelete(stmt: Stmt, client: FractioClient,
     database, schema: string): Plan =
+  # DIAGNOSTIC LOGGING - Track DELETE table resolution
+  fractioLogging.info(&"planDelete: database={database} schema={schema} table={stmt.delTableRef.table}")
+
   let plan = newPlan()
   let descOpt = resolveQualifiedTableRef(client, database, schema,
       stmt.delTableRef)
+
+  # DIAGNOSTIC LOGGING - Log resolution result for DELETE
   if descOpt.isNone:
+    fractioLogging.error(&"planDelete ERROR: database={database} schema={schema} table={stmt.delTableRef.table} error=table not found in catalog")
     raise planError(&"table '{stmt.delTableRef.fullName()}' not found")
+
+  fractioLogging.info(&"planDelete SUCCESS: table={stmt.delTableRef.table} resolvedTableId={$descOpt.get().tableId}")
+
   let desc = descOpt.get()
 
   let pkCol = findPkColumn(desc)

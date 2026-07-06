@@ -732,6 +732,18 @@ proc clearPendingMessages(c: NuRaftCoordinator) {.gcsafe, raises: [].} =
   ## (addToSharedFreeList crash).
   ## Instead, we just reset the running flag (already done) and leave the table
   ## to be cleaned up by GC when the coordinator object is collected. The
+
+proc getPendingMessageCount*(c: NuRaftCoordinator): int {.gcsafe.} =
+  ## Return the total number of pending (not-yet-delivered) Raft messages
+  ## across all groups. Used for memory diagnostics.
+  withLock c.pendingMessagesLock:
+    result = 0
+    for _, msgs in c.pendingMessages.pairs:
+      result += msgs.len
+
+proc getDataDir*(c: NuRaftCoordinator): string {.gcsafe.} =
+  ## Return the data directory path used for Raft persistence.
+  return c.dataDir
   ## transport has been destroyed, so no new messages will arrive. Any
   ## in-flight callbacks will find running=false and return early.
   discard
@@ -1163,14 +1175,16 @@ proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
     return false
 
   # Determine if we're a joining node (not the preferred leader)
-  # For SINGLE-MEMBER clusters only, use catching_up=true to prevent auto-leader
-  # promotion. For multi-member clusters, we need election timers enabled so
-  # nodes can participate in failover when the leader dies.
-  # IMPORTANT: catching_up=true disables election_timer_allowed, preventing
-  # the node from starting elections even when heartbeats stop!
+  # For ALL cluster sizes, set catching_up=true for non-preferred leaders so that
+  # NuRaft's handle_election_timeout() ignores their election timeouts until they
+  # receive heartbeats from the preferred leader. Without this, non-preferred
+  # leaders' timers can expire before heartbeats arrive (since election_timer_allowed
+  # is only checked during initial scheduling, not in the timeout handler), causing
+  # split-leadership across user-data groups. When heartbeats arrive, handle_append_entries
+  # auto-clears catching_up_, allowing normal election participation for failover.
   let isJoiningNode = (preferredLeader > 0'u32 and
                        preferredLeader != uint32(c.nodeId))
-  let useCatchingUp = isJoiningNode and members.len == 1
+  let useCatchingUp = isJoiningNode
 
   # Create WiscKey-backed persistent store for this group's Raft log and state.
   # This replaces the old per-group binary state file approach with durable
@@ -1212,16 +1226,17 @@ proc createAndStartGroup*(c: NuRaftCoordinator, groupId: GroupID,
       c.electionTimeoutUpperMs)
   nuraftParamsSetHeartbeatInterval(params, c.heartbeatIntervalMs)
   nuraftParamsSetReturnMethod(params, 0)
-  # Snapshot distance: set to 0 to disable automatic snapshots.
-  # NuRaft's snapshot mechanism requires a properly functioning state machine
-  # snapshot implementation. Our callback_state_machine's create_snapshot()
-  # stores metadata only (no KV state), and the log compaction that follows
-  # snapshot creation causes large allocations in callback_log_store::pack().
-  # TODO: Re-enable after implementing proper snapshot transfer and fixing
-  # the pack() memory allocation issue.
-  nuraftParamsSetSnapshotDistance(params, 0)
+  # Snapshot distance: enable automatic snapshots every 50K log entries.
+  # This allows NuRaft to periodically compact old log entries from both
+  # disk and memory, preventing unbounded growth during heavy write loads.
+  # The callback_state_machine's create_snapshot() stores metadata only (no KV state),
+  # which is sufficient for our use case since all data is persisted through WiscKey.
+  nuraftParamsSetSnapshotDistance(params, 50000)
   nuraftParamsSetClientReqTimeout(params, 5000)
-  nuraftParamsSetMaxAppendSize(params, 100)
+  # Reduced from 100 to 50 to limit pack() allocation size (each entry ~64KB).
+  # With cnt=50: pack() allocates ~3.2 MB instead of ~6.4 MB per call,
+  # reducing memory pressure during snapshot creation and heavy replication.
+  nuraftParamsSetMaxAppendSize(params, 50)
   nuraftParamsSetLeadershipTransferMinWaitTime(params, 1000)
 
   # Set proper election quorum: majority = floor(N/2) + 1
@@ -1397,10 +1412,16 @@ type
     members: seq[tuple[nodeId: uint32, host: string, port: int]]
     preferredLeader: uint32
     success: bool
+    staggerDelayMs: int
 
 proc groupCreationWorker(arg: ptr GroupCreationArg) {.thread.} =
   let coord = cast[NuRaftCoordinator](arg.coord)
   {.cast(gcsafe).}:
+    # Stagger non-preferred leaders so the preferred leader has time to win
+    # elections before followers start their own groups and run independent
+    # elections. This prevents split-leadership in multi-member user-data groups.
+    if arg.staggerDelayMs > 0:
+      os.sleep(arg.staggerDelayMs)
     arg.success = coord.createAndStartGroup(
       arg.groupId, arg.members, arg.preferredLeader)
 
@@ -1425,12 +1446,19 @@ proc createAndStartGroupsParallel*(c: NuRaftCoordinator,
 
   {.cast(raises: []).}:
     for i, gid in groupIds:
+      let isPreferred = (preferredLeader > 0'u32 and preferredLeader == uint32(c.nodeId))
+      # Non-preferred leaders wait LONGER so the preferred leader has time to win
+      # elections and start sending heartbeats before followers begin their groups.
+      # With election timeout of 3000-5000ms and stagger delay of 10s, the preferred
+      # leader will have become leader (term + heartbeat) long before followers start.
+      let delay = if isPreferred: 0 else: 10000
       args[i] = GroupCreationArg(
         coord: cast[pointer](c),
         groupId: gid,
         members: members,
         preferredLeader: preferredLeader,
-        success: false
+        success: false,
+        staggerDelayMs: delay
       )
       createThread(threads[i], groupCreationWorker, addr args[i])
 

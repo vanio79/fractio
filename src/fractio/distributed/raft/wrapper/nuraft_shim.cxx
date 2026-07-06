@@ -1116,6 +1116,7 @@ struct server_wrapper {
     // Storing it here would cause double-free when server is destroyed
     ptr<callback_state_machine> sm;
     smgr_handle* smgr;  // Tagged handle (dynamic or callback)
+
 };
 
 // =============================================================================
@@ -1168,9 +1169,13 @@ void nuraft_free_buffer(void* buf) {
 
 void* nuraft_params_create() {
     auto* p = new raft_params();
-    p->heart_beat_interval_ = 100;
-    p->election_timeout_lower_bound_ = 200;
-    p->election_timeout_upper_bound_ = 400;
+    // Heartbeat at 300ms, election timeout 3000-5000ms.
+    // These match the coordinator defaults and provide enough spread between
+    // nodes' random election timeouts to avoid split votes in multi-member
+    // groups (each node picks a random value in [lower, upper]).
+    p->heart_beat_interval_ = 300;
+    p->election_timeout_lower_bound_ = 3000;
+    p->election_timeout_upper_bound_ = 5000;
     p->return_method_ = raft_params::blocking;
     p->snapshot_distance_ = 100;
     p->reserved_log_items_ = 10;
@@ -1678,7 +1683,11 @@ void* nuraft_server_create(
         return nullptr;
     }
 
-    // Start server
+    // Start server with optional initial election skip.
+    // Non-preferred leaders get skip_initial_election=true, preventing the
+    // initial election burst when all nodes start simultaneously. NuRaft's
+    // built-in handle_append_entries auto-clear handles clearing catch-up state
+    // when heartbeats arrive from a leader, allowing normal follower behavior.
     server->start_server(skip_initial_election != 0);
 
     // Wrap
@@ -1688,6 +1697,10 @@ void* nuraft_server_create(
     // Note: mp_ctx is owned by Nim (rpcContext), not stored here
     wrapper->sm = sm_sp;
     wrapper->smgr = smgr_h;
+
+    // NuRaft's built-in skip_initial_election mechanism prevents the initial
+    // election burst. handle_append_entries auto-clears catch-up state when
+    // heartbeats arrive, allowing normal follower behavior.
 
     return wrapper;
 }
@@ -1712,6 +1725,7 @@ void nuraft_server_shutdown(void* server) {
         wrapper->server->shutdown();
     }
 }
+
 
 bool nuraft_server_is_leader(void* server) {
     if (!server) return false;

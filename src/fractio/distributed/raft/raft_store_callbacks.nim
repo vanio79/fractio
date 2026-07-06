@@ -22,6 +22,11 @@ proc logAppendCb*(ctx: pointer, term: uint64, valType: int32,
   ## NuRaft val_type values: app_log=1, conf=2, cluster_server=3, log_pack=4.
   ## Our LogValType enum matches these values directly.
   let store = cast[RaftPersistentStore](ctx)
+  # Validate valType is within expected range (1..4) before casting to enum
+  if valType < 1 or valType > 4:
+    echo "[raft_store_callbacks] WARNING: ignoring log append with invalid valType=",
+        valType, " term=", term
+    return 0'u64
   let valTypeEnum = LogValType(valType)
   let dataStr = if entryLen > 0 and not entryData.isNil:
     var s = newString(int(entryLen))
@@ -39,6 +44,11 @@ proc logWriteAtCb*(ctx: pointer, index: uint64, term: uint64,
   ## NuRaft val_type values: app_log=1, conf=2, cluster_server=3, log_pack=4.
   ## Our LogValType enum matches these values directly.
   let store = cast[RaftPersistentStore](ctx)
+  # Validate valType is within expected range (1..4) before casting to enum
+  if valType < 1 or valType > 4:
+    echo "[raft_store_callbacks] WARNING: ignoring log write_at with invalid valType=",
+        valType, " index=", index, " term=", term
+    return
   let valTypeEnum = LogValType(valType)
   let dataStr = if entryLen > 0 and not entryData.isNil:
     var s = newString(int(entryLen))

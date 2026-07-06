@@ -896,8 +896,8 @@ proc getTableIdFromKey*(client: FractioClient, key: string): TableId =
 # =============================================================================
 
 method get*(client: FractioClient, key: string,
-           txnId: TransactionID = zeroTransactionID(),
-           readTimestamp: uint64 = 0): KVOpResult[Option[string]] =
+            txnId: TransactionID = zeroTransactionID(),
+            readTimestamp: uint64 = 0): KVOpResult[Option[string]] =
   ## Get a value by key, routing to the correct group leader.
   ## Implements KVStore interface.
   ##
@@ -912,7 +912,6 @@ method get*(client: FractioClient, key: string,
   let rewrittenKey = addGroupIdToKey(key, groupId)
 
   let maxRetries = client.getMaxRetries()
-  const baseBackoffMs = 50
 
   # Try multiple times (in case of leader changes or connection failures)
   for attempt in 0 ..< maxRetries:
@@ -920,7 +919,7 @@ method get*(client: FractioClient, key: string,
     if connOpt.isNone:
       if attempt < maxRetries - 1:
         discard client.refreshMetadata()
-        sleep(baseBackoffMs + attempt * 5)
+        sleep(50 + attempt * 5)
         continue
       return kvOpErr[Option[string]]("no connection to group leader")
 
@@ -941,21 +940,28 @@ method get*(client: FractioClient, key: string,
       else:
         discard client.refreshMetadata()
       if attempt < maxRetries - 1:
-        sleep(baseBackoffMs + attempt * 5)
+        sleep(50 + attempt * 5)
       continue
 
     # Handle connection failures (peInternal) - invalidate connection and retry
     if res.error.kind == peInternal:
-      # Invalidate the cached connection for this group
       client.invalidateGroupLeader(groupId)
       if attempt < maxRetries - 1:
         discard client.refreshMetadata()
-        sleep(baseBackoffMs + attempt * 5)
+        sleep(50 + attempt * 5)
         continue
 
-    return kvOpErr[Option[string]](res.error.msg)
+    # Handle invalid frame errors (peInvalidFrame, timeout) - connection issues
+    # These indicate the server didn't respond properly (e.g., Raft election in progress)
+    if res.error.kind == peInvalidFrame:
+      client.invalidateGroupLeader(groupId)
+      if attempt < maxRetries - 1:
+        discard client.refreshMetadata()
+        sleep(50 + attempt * 5)
+        continue
 
-  return kvOpErr[Option[string]]("too many retries")
+    # Non-retryable error (NOT_LEADER, peInternal, and peInvalidFrame are handled above).
+    return kvOpErr[Option[string]](res.error.msg)
 
 proc getWithFilter*(client: FractioClient, key: string,
                     filter: Option[kvMsgs.WireFilterExpr],
@@ -2171,11 +2177,14 @@ method getInGroup*(client: FractioClient, key: string, groupId: GroupID,
       discard client.refreshMetadata()
       if attempt < maxRetries - 1:
         sleep(baseBackoffMs + attempt * 5)
-      continue
+        continue
 
+    # Non-retryable error - return immediately (NOT_LEADER and peInternal are
+    # handled above). This can happen for ProtocolError from send() or readOneFrame.
     return kvOpErr[Option[string]](res.error.msg)
 
-  return kvOpErr[Option[string]]("too many retries")
+  # All retries exhausted
+
 
 method putInGroup*(client: FractioClient, key: string, value: string, groupId: GroupID,
                   txnId: TransactionID = zeroTransactionID()): KVOpVoidResult =

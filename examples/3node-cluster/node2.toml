@@ -11,8 +11,9 @@ host = "127.0.0.1"
 raft-port = 8302
 client-port = 9002
 web-port = 9872
-data-dir = "examples/3node-cluster/data/node2"
+data-dir = "/mnt/fractio_ramdisk/node2"
 
 [storage]
 write-buffer-size-mb = 2
 block-cache-size-mb = 4
+memory-budget-mb = 250

@@ -89,6 +89,7 @@ type
 type
   SessionTxnState* = ref object
     txn*: coreTxn.MVCCTransaction
+    txnId*: Option[coreTypes.TransactionID] ## Tracked to clean txnToSession on close
     intents*: tables.Table[string, coreTxn.WriteEntry]
     createdAtNs*: int64
 
@@ -244,6 +245,10 @@ proc closeSession*(store: MvccTransactionStore, sessionId: uint64) {.gcsafe,
     if not state.isNil:
       if state.txn != nil and state.txn.status == mvccTypes.TXN_PENDING:
         discard store.txnManager.rollbackTransaction(state.txn.id)
+      # Clean up the reverse mapping to prevent unbounded growth of txnToSession.
+      # Without this, every transaction leaks a ULID -> sessionId entry.
+      if state.txnId.isSome:
+        store.txnToSession.del(state.txnId.get())
       store.sessions.del(sessionId)
 
 proc getSessionState*(store: MvccTransactionStore,
@@ -253,6 +258,44 @@ proc getSessionState*(store: MvccTransactionStore,
     if state.isNil:
       return none(SessionTxnState)
     return some(state)
+
+# ---------------------------------------------------------------------------
+# ActiveTxnRegistry lifecycle helpers
+#
+# mvcc_store's beginTransaction/commitTransaction are called from multiple
+# paths:
+#   1. Explicit mtBeginTxn / mtCommitTxn wire protocol (server.nim) — the
+#      server handler also calls activeTxnRegistry.register/unregister, so
+#      these helpers are redundant for that path but harmless.
+#   2. withAutoTransactionResult from mtBatch (server.nim line 1353) — the
+#      server does NOT register/unregister for this path. Without these
+#      helpers, every mtBatch call leaks 1000+ intent keys into the
+#      ActiveTxnRegistry's intentIndex, accumulating forever.
+#   3. Internal transactions used by DDL (CREATE/DROP DATABASE, etc.).
+#
+# Net effect: every transaction (no matter how begun) now registers on
+# begin and unregisters on commit/abort, eliminating the registry leak.
+# ---------------------------------------------------------------------------
+
+proc registryRegisterTxn(store: MvccTransactionStore,
+    txnId: coreTypes.TransactionID, sessionId: uint64) {.gcsafe, raises: [].} =
+  if store.activeTxnRegistryPtr != nil:
+    {.cast(raises: []).}:
+      try:
+        let registry = cast[ActiveTxnRegistry](store.activeTxnRegistryPtr)
+        registry.register(txnId, sessionId)
+      except:
+        discard
+
+proc registryUnregisterTxn(store: MvccTransactionStore,
+    txnId: coreTypes.TransactionID) {.gcsafe, raises: [].} =
+  if store.activeTxnRegistryPtr != nil:
+    {.cast(raises: []).}:
+      try:
+        let registry = cast[ActiveTxnRegistry](store.activeTxnRegistryPtr)
+        registry.unregister(txnId)
+      except:
+        discard
 
 # ---------------------------------------------------------------------------
 # Transaction lifecycle
@@ -279,9 +322,16 @@ proc beginTransaction*(store: MvccTransactionStore,
       writeSet: coreTxn.WriteSet(entries: @[]),
       readSet: coreTxn.ReadSet(keys: @[], timestamps: @[]),
     )
+    state.txnId = some(txnRec.id)
     state.intents = initTable[string, coreTxn.WriteEntry]()
     # Store the reverse mapping
     store.txnToSession[txnRec.id] = sessionId
+    # Register in the ActiveTxnRegistry so intent keys written by this
+    # txn (via txnPut / txnDelete) are cleaned up on commit/abort.
+    # Without this, mtBatch's withAutoTransactionResult creates a txn
+    # that records intent keys but is never unregistered, leaking
+    # 1000+ intent keys per batch RPC forever.
+    store.registryRegisterTxn(txnRec.id, sessionId)
     return mvccOk(state.txn.id)
 
 proc getSessionIdByTxnId*(store: MvccTransactionStore,
@@ -345,6 +395,10 @@ proc commitTransaction*(store: MvccTransactionStore,
           kind: mseStorageError, msg: "Failed to commit batch: " &
           batchRes.error.msg))
 
+      # Unregister from the ActiveTxnRegistry BEFORE clearing state so
+      # the registry entry (and its intent keys) is released even if
+      # downstream cleanup is slow.
+      store.registryUnregisterTxn(state.txn.id)
       state.intents = initTable[string, coreTxn.WriteEntry]()
       state.txn = nil
       return mvccOk(commitTs)
@@ -356,6 +410,7 @@ proc commitTransaction*(store: MvccTransactionStore,
       for key, entry in state.intents.pairs:
         rollbackDeletes.add(encodeIntentKey(key, state.txn.id))
       discard store.raftStore.raftWriteBatch(@[], rollbackDeletes)
+      store.registryUnregisterTxn(state.txn.id)
       state.intents = initTable[string, coreTxn.WriteEntry]()
       state.txn = nil
       return mvccErr[coreTypes.Timestamp](MvccStoreError(
@@ -368,6 +423,7 @@ proc commitTransaction*(store: MvccTransactionStore,
       for key, entry in state.intents.pairs:
         rollbackDeletes.add(encodeIntentKey(key, state.txn.id))
       discard store.raftStore.raftWriteBatch(@[], rollbackDeletes)
+      store.registryUnregisterTxn(state.txn.id)
       state.intents = initTable[string, coreTxn.WriteEntry]()
       state.txn = nil
       return mvccErr[coreTypes.Timestamp](MvccStoreError(
@@ -397,6 +453,8 @@ proc rollbackTransaction*(store: MvccTransactionStore,
       rollbackDeletes.add(encodeIntentKey(key, state.txn.id))
     discard store.raftStore.raftWriteBatch(@[], rollbackDeletes)
 
+    # Unregister from the ActiveTxnRegistry to release intent keys.
+    store.registryUnregisterTxn(state.txn.id)
     state.txn.status = mvccTypes.TXN_ABORTED
     state.intents = initTable[string, coreTxn.WriteEntry]()
     state.txn = nil

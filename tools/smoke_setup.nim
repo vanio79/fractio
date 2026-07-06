@@ -4,7 +4,7 @@
 #   nim c --mm:atomicArc --threads:on -p:src -o:bin/smoke_setup tools/smoke_setup.nim
 #   bin/smoke_setup [host] [port]
 
-import std/[os, strutils, options, times]
+import std/[os, strutils, options, times, tables]
 import fractio/core/types
 import fractio/distributed/meta/system_tables
 import fractio/protocol/client
@@ -81,16 +81,17 @@ proc main() =
       client.close()
       quit(1)
 
-  # Wait for elections
+  # Wait for elections (increased from 8s to ensure full stabilization)
   echo ""
-  echo "Step 2: Waiting 8s for user-data group leader elections..."
-  sleep(8000)
+  echo "Step 2: Waiting 15s for user-data group leader elections..."
+  sleep(15000)
   discard client.forceMetadataRefresh()
-  sleep(1000)
+  sleep(2000)
 
   # Probe: does the table already exist?
   echo ""
   echo "Step 3: probe ", SPACE, ".", SCHEMA, ".", TABLE, "..."
+
   let probe = client.query(
     "SELECT id FROM " & SPACE & "." & SCHEMA & "." & TABLE &
     " ORDER BY id ASC LIMIT 1",

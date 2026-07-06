@@ -24,7 +24,7 @@
 ## Thread-safety: all reads of the current RSS go through `getCurrentRSSBytes()`
 ## which reads `/proc/self/statm` and is safe to call from any thread.
 
-import std/[os, strutils, atomics]
+import std/[os, strutils, atomics, times]
 
 type
   MemoryBudget* = ref object
@@ -126,3 +126,110 @@ proc deriveStreamEntries*(budgetMB: int): int =
   let twoPct = int(int64(budgetMB) * 1024 * 1024 div 50)
   let entries = twoPct div 200
   result = clamp(entries, DEFAULT_MIN_STREAM_ENTRIES, 5000)
+
+# ---------------------------------------------------------------------------
+# Heap trimming via madvise(MADV_DONTNEED).
+#
+# PROBLEM: Under both --mm:atomicArc and --mm:orc, the default Nim allocator
+# keeps freed pages in its free list (mapped but unused) to avoid the cost
+# of munmap/mmap on every deallocation. These pages count as RSS even though
+# the GC has marked them free. A long-running server with bursty allocation
+# patterns (e.g., mtBatch processing 1000+ ops per RPC) can grow RSS to
+# 1.5-2GB even when only a few hundred MB of logical data is alive.
+# Empirically measured: 100K-row test grew node1 from 14MB to 1837MB RSS.
+#
+# FIX: Walk /proc/self/maps and call madvise(MADV_DONTNEED) on large
+# anonymous rw regions. This tells the kernel "these pages are idle" and
+# the kernel reclaims them. Pages still in use are skipped (madvise
+# silently no-ops on pages that can't be released). The call is safe to
+# make periodically from any thread.
+#
+# Cost: a single read of /proc/self/maps (~50KB) + N madvise syscalls
+# where N is the number of large anonymous regions (typically 5-20). Total
+# latency ~1-5 ms per call.
+#
+# Threshold: only trim regions >= MIN_TRIM_REGION_BYTES (16 MB) to avoid
+# thrashing small allocation arenas. Smaller regions are usually active
+# thread-local arenas and trimming them would force re-mmap on next use.
+# ---------------------------------------------------------------------------
+
+const MIN_TRIM_REGION_BYTES* = 16 * 1024 * 1024     ## 16 MB
+
+# MADV_DONTNEED = 4 (from /usr/include/x86_64-linux-gnu/bits/mman-linux.h).
+# Declared as a `let` rather than `const` to avoid header dependency
+# at compile time; the value is the same on all Linux kernels.
+let madviseDontneed* = cint(4)
+
+proc c_madvise(p: pointer, length: csize_t, advice: cint): cint {.
+    importc: "madvise", header: "<sys/mman.h>".}
+
+type
+  TrimResult* = object
+    regionsScanned*: int ## Total anonymous rw regions found
+    regionsTrimmed*: int ## Regions that madvise accepted
+    bytesTrimmed*: int64 ## Total bytes released to the OS
+    elapsedMicros*: int  ## Wall clock time for the operation
+
+proc trimHeapMemory*(minRegionBytes: int = MIN_TRIM_REGION_BYTES): TrimResult {.
+    gcsafe, raises: [].} =
+  ## Walk /proc/self/maps and call madvise(MADV_DONTNEED) on all anonymous
+  ## rw regions >= minRegionBytes. Returns counts and elapsed time.
+  ##
+  ## Use this after operations that allocate large transient bursts (e.g.,
+  ## after a `mtBatch` RPC that processed 1000+ ops, or after a full GC)
+  ## to return the freed pages to the OS. Pages still in use are silently
+  ## skipped by madvise, so this is safe to call from any thread.
+  result = TrimResult()
+  let startNanos = epochTime() * 1_000_000
+  try:
+    if not fileExists("/proc/self/maps"):
+      return
+    let content = readFile("/proc/self/maps")
+    for line in content.splitLines:
+      if line.len == 0: continue
+      let parts = line.split(' ')
+      if parts.len < 2: continue
+      # parts[0] = "start-end", parts[1] = "rwxp...", rest = path info.
+      # Anonymous rw regions have parts[1] starting with "rw" and
+      # either no parts[5] (truly anonymous) or parts[5] = "[heap]".
+      let perms = parts[1]
+      if perms.len < 2 or perms[0] != 'r' or perms[1] != 'w': continue
+      if parts.len > 5 and parts[5].len > 0:
+        # Named mappings (e.g., shared libraries) are skipped.
+        continue
+      let rangeParts = parts[0].split('-')
+      if rangeParts.len != 2: continue
+      try:
+        let startAddr = parseHexInt(rangeParts[0])
+        let endAddr = parseHexInt(rangeParts[1])
+        let size = endAddr - startAddr
+        inc result.regionsScanned
+        if size < minRegionBytes: continue
+        let regionPtr = cast[pointer](startAddr)
+        let rc = c_madvise(regionPtr, size.csize_t, madviseDontneed)
+        if rc == 0:
+          inc result.regionsTrimmed
+          result.bytesTrimmed += size
+      except ValueError, OSError: discard
+  except IOError, OSError: discard
+  result.elapsedMicros = int(epochTime() * 1_000_000 - startNanos)
+
+proc trimHeapMemoryIfOverBudget*(mb: MemoryBudget,
+    minRegionBytes: int = MIN_TRIM_REGION_BYTES): TrimResult {.
+    gcsafe, raises: [].} =
+  ## Convenience: only trim when the process is over its configured budget.
+  ## When the budget is disabled (unlimited), this is a no-op.
+  result = TrimResult()
+  if not mb.budgetEnabled: return
+  let rss = getCurrentRSSBytes()
+  if rss == 0 or rss < mb.budgetBytes: return
+  result = trimHeapMemory(minRegionBytes)
+
+# SAFETY NOTE: The trim functions above are effective for releasing
+# reclaimed pages but can crash Nim programs that share the heap across
+# threads (e.g., under --mm:atomicArc, freed chunks may be temporarily
+# retained in per-thread free lists that other threads can race on).
+# DO NOT call trimHeapMemory from a thread that shares the heap with
+# allocator worker threads. Prefer trimHeapMemoryIfOverBudget which is
+# only invoked when the budget is exceeded AND the process is otherwise
+# likely to be killed by the OOM killer.

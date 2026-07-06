@@ -395,7 +395,8 @@ proc createSpace*(sm: SpaceManager, req: CreateSpaceRequest): CreateSpaceRespons
     # Build a map of nodeId -> clientPort from sys.nodes
     var nodeClientPorts = initTable[uint32, int]()
     for n in nodes:
-      nodeClientPorts[n.nodeId] = int(n.clientPort)
+      if n.clientPort > 0:  # Only use valid ports; skip zero-value entries from bootstrap
+        nodeClientPorts[n.nodeId] = int(n.clientPort)
     
     try:
       let coord = sm.store.coordinator

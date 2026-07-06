@@ -232,6 +232,12 @@ method getMemtableSize*(backend: StorageBackend): int64 {.base, gcsafe.} =
   ## if the backend does not expose this metric.
   result = 0'i64
 
+method getTotalSizeBytes*(backend: StorageBackend): int64 {.base, gcsafe.} =
+  ## Return the total size of all persisted data (SST files) on disk in bytes.
+  ## This is the cold-storage footprint; combined with memtable/block cache,
+  ## it gives the full storage size. Returns 0 on error.
+  result = 0'i64
+
 method getStats*(backend: StorageBackend): StorageStats {.base.} =
   ## Get storage statistics
   result = StorageStats()
